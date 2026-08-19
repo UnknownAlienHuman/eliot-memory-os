@@ -1,13 +1,8 @@
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
 
-use eliot_host::{
-    HOST_JOURNAL_RELATIVE_PATH, HostComposition, HostError, HostLaunchOptions, PROTOCOL_VERSION,
-    SERVICE_NAME,
-};
 #[cfg(windows)]
 use eliot_host::{HostBranchDisposition, HostLivenessTick};
-use eliot_platform_windows::protected_program_data_path;
+use eliot_host::{HostComposition, HostError, HostLaunchOptions, PROTOCOL_VERSION, SERVICE_NAME};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -97,13 +92,7 @@ fn run_console() -> bool {
 }
 
 fn open_host(launch_options: HostLaunchOptions) -> Result<HostComposition, HostError> {
-    let path = state_path()?;
-    HostComposition::open(path, launch_options)
-}
-
-fn state_path() -> Result<PathBuf, HostError> {
-    protected_program_data_path(HOST_JOURNAL_RELATIVE_PATH)
-        .map_err(|error| HostError::Platform(error.to_string()))
+    HostComposition::open(launch_options)
 }
 
 fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
@@ -346,7 +335,7 @@ unsafe fn service_launch_options(
     use std::os::windows::ffi::OsStringExt;
     const MAX_SERVICE_ARG_UNITS: usize = 64 * 1024;
 
-    if service_arg_vector.is_null() || service_arg_count != 11 {
+    if service_arg_vector.is_null() || service_arg_count != 13 {
         return Err(HostError::Platform(
             "SCM did not provide the canonical nonce-bound service argv".to_owned(),
         ));
@@ -378,12 +367,7 @@ unsafe fn service_launch_options(
 fn spawn_credential_control(
     host: &HostComposition,
 ) -> Result<std::thread::JoinHandle<()>, HostError> {
-    let journal = state_path()?;
-    let host_state_root = journal
-        .parent()
-        .ok_or_else(|| HostError::Platform("Host journal has no state root".to_owned()))?
-        .to_path_buf();
-    let control = host.credential_control(host_state_root)?;
+    let control = host.credential_control()?;
     std::thread::Builder::new()
         .name("eliot-host-credential-control".to_owned())
         .spawn(move || {

@@ -50,8 +50,9 @@ use eliot_platform::{
 };
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerLease, HostOwnerLeaseError,
-    HostOwnerLeaseReleaseError, ProtectedPathLease, ServiceAccount, ServiceRegistrationInspection,
-    ServiceRegistrationRequest, ServiceStartMode, WindowsPlatform, fresh_kernel_activation_nonce,
+    HostOwnerLeaseReleaseError, ProtectedPathLease, ProtectedRootLease, ServiceAccount,
+    ServiceRegistrationInspection, ServiceRegistrationRequest, ServiceStartMode, WindowsPlatform,
+    fresh_kernel_activation_nonce,
 };
 use eliot_runtime_contracts::{
     HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
@@ -66,6 +67,7 @@ use uuid::Uuid;
 pub const SERVICE_NAME: &str = ELIOT_HOST_SERVICE_NAME;
 pub const PROTOCOL_VERSION: &str = "eliot.host.v1";
 pub const HOST_JOURNAL_RELATIVE_PATH: &str = "Eliot/host/host-state-journal.redb";
+const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
 /// Exact launch authority supplied by the Runtime Live SCM registration.
 ///
@@ -77,17 +79,18 @@ pub struct HostLaunchOptions {
     config_descriptor_digest: PlatformHandle,
     installation: PlatformHandle,
     transaction_plan_generation: u64,
+    host_state_root: PathBuf,
     registration_nonce: Option<PlatformHandle>,
 }
 
 impl HostLaunchOptions {
     /// Parses the canonical SCM argv after argv[0] (the service name).
     ///
-    /// The four authority pairs must appear exactly once and in the order
+    /// The five authority pairs must appear exactly once and in the order
     /// rendered by [`ServiceBootstrapArguments`].  The established optional
     /// registration nonce is accepted only as the final pair. That nonce is
     /// effect-scoped SCM readback evidence, not a Host admission binding; the
-    /// approved manifest's four authority values remain independently required.
+    /// approved manifest's five authority values remain independently required.
     /// All other flags and all substitutions are rejected.
     ///
     /// # Errors
@@ -100,8 +103,8 @@ impl HostLaunchOptions {
         S: Into<OsString>,
     {
         let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-        if args.len() != 8 && args.len() != 10 {
-            return Err(Self::invalid_argv("expected exactly four authority pairs"));
+        if args.len() != 10 && args.len() != 12 {
+            return Err(Self::invalid_argv("expected exactly five authority pairs"));
         }
         let flag = |index: usize, expected: &str| {
             args.get(index)
@@ -112,12 +115,13 @@ impl HostLaunchOptions {
             || !flag(2, "--config-descriptor-sha256")
             || !flag(4, "--installation-id")
             || !flag(6, "--tx-plan-generation")
+            || !flag(8, "--host-state-root")
         {
             return Err(Self::invalid_argv(
                 "authority flags are missing, reordered, or substituted",
             ));
         }
-        if args.len() == 10 && !flag(8, "--registration-nonce") {
+        if args.len() == 12 && !flag(10, "--registration-nonce") {
             return Err(Self::invalid_argv("unknown or substituted trailing flag"));
         }
 
@@ -148,8 +152,17 @@ impl HostLaunchOptions {
                 .ok_or_else(|| {
                     Self::invalid_argv("transaction plan generation must be non-zero")
                 })?;
-        let registration_nonce = if args.len() == 10 {
-            let nonce = parse_launch_text(&args[9], "registration nonce")?;
+        let host_state_root = PathBuf::from(&args[9]);
+        if !host_state_root.is_absolute()
+            || host_state_root.as_os_str().is_empty()
+            || !valid_launch_os_path(host_state_root.as_os_str())
+        {
+            return Err(Self::invalid_argv(
+                "Host state root must be an absolute valid OS path",
+            ));
+        }
+        let registration_nonce = if args.len() == 12 {
+            let nonce = parse_launch_text(&args[11], "registration nonce")?;
             if !valid_sha256_text(&nonce) {
                 return Err(Self::invalid_argv(
                     "registration nonce must be lowercase SHA-256",
@@ -171,6 +184,7 @@ impl HostLaunchOptions {
             config_descriptor_digest,
             installation,
             transaction_plan_generation,
+            host_state_root,
             registration_nonce,
         })
     }
@@ -218,6 +232,13 @@ impl HostLaunchOptions {
     #[must_use]
     pub const fn transaction_plan_generation(&self) -> u64 {
         self.transaction_plan_generation
+    }
+
+    /// Returns the exact per-installation Host runtime root selected by the
+    /// trusted service bootstrap.
+    #[must_use]
+    pub fn host_state_root(&self) -> &Path {
+        &self.host_state_root
     }
 
     #[must_use]
@@ -268,6 +289,9 @@ mod launch_options_tests {
             7,
             std::iter::empty::<String>(),
         )
+        .and_then(|bootstrap| {
+            bootstrap.with_host_state_root(std::env::temp_dir().join("eliot-host-state"))
+        })
         .and_then(|bootstrap| bootstrap.with_registration_nonce("b".repeat(64)))
         .unwrap_or_else(|error| panic!("{error}"))
     }
@@ -293,6 +317,10 @@ mod launch_options_tests {
         assert_eq!(options.installation().as_str(), "installation-7");
         assert_eq!(options.transaction_plan_generation(), 7);
         assert_eq!(
+            options.host_state_root(),
+            std::env::temp_dir().join("eliot-host-state")
+        );
+        assert_eq!(
             options.registration_nonce().map(PlatformHandle::as_str),
             Some("b".repeat(64).as_str())
         );
@@ -301,9 +329,7 @@ mod launch_options_tests {
     #[test]
     fn launch_options_reject_missing_duplicate_reordered_unknown_and_substituted_args() {
         let mut missing = valid_args();
-        missing.truncate(8);
-        missing.remove(6);
-        missing.remove(6);
+        missing.drain(8..10);
         assert!(HostLaunchOptions::parse(missing).is_err());
 
         let mut duplicate = valid_args();
@@ -327,7 +353,7 @@ mod launch_options_tests {
     #[test]
     fn system_service_launch_options_require_registration_nonce() {
         let mut without_nonce = valid_args();
-        without_nonce.truncate(8);
+        without_nonce.truncate(10);
         assert!(HostLaunchOptions::parse(without_nonce.clone()).is_ok());
         assert!(HostLaunchOptions::parse_system_service(without_nonce).is_err());
         assert!(HostLaunchOptions::parse_system_service(valid_args()).is_ok());
@@ -4083,22 +4109,23 @@ fn open_production_epoch(
     ),
     HostError,
 > {
-    let inspection = RedbJournalBackend::inspect_existing(path).map_err(JournalError::Backend)?;
-    let last_host = inspection
-        .as_ref()
-        .and_then(|value| value.image.epochs.last())
+    let mut backend = RedbJournalBackend::open_at(path).map_err(JournalError::Backend)?;
+    let last_host = backend
+        .load()
+        .map_err(JournalError::Backend)?
+        .epochs
+        .last()
         .map(|epoch| epoch.host.clone());
-    drop(inspection);
 
     let (journal, host, activation_generation) = if let Some(last_host) = last_host {
-        let current = ProductionHostStateJournal::open(path, last_host.clone())?;
+        let current = HostStateJournalService::from_backend(backend, last_host.clone())?;
         let (journal, host, activation_generation) =
             reopen_existing_epoch(current, &last_host, &installation, pending)?;
         (journal, host, activation_generation)
     } else {
         let host = fresh_host_epoch(installation, None)?;
         (
-            ProductionHostStateJournal::open(path, host.clone())?,
+            HostStateJournalService::from_backend(backend, host.clone())?,
             host,
             root_epoch(fresh_identity("activation-lineage")?),
         )
@@ -4150,13 +4177,15 @@ impl HostComposition {
         let launch = &manifest.runtime_launch;
         // The optional registration nonce belongs to the installer effect
         // receipt. It has no approved-generation field to bind here, so it is
-        // deliberately excluded; none of the four Host authority fields may
+        // deliberately excluded; none of the five Host authority fields may
         // be substituted by it.
         let manifest_descriptor_path = PathBuf::from(launch.authority_descriptor_path.as_str());
+        let manifest_host_root = PathBuf::from(launch.runtime_state_roots.host_state_root.as_str());
         if manifest_descriptor_path != options.config_descriptor_path
             || launch.authority_descriptor_digest != *options.config_descriptor_digest()
             || launch.installation_epoch.installation != *options.installation()
             || launch.authority_generation.value() != options.transaction_plan_generation()
+            || manifest_host_root != options.host_state_root
         {
             return Err(HostError::ProcessContour(
                 "SCM launch authority does not match the approved generation".to_owned(),
@@ -4188,22 +4217,29 @@ impl HostComposition {
     ///
     /// Returns an error if installation identity, owner-lease acquisition,
     /// durable admission, recovery state, or approved process startup fails.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "the public constructor owns the installation identity while retaining its established API"
-    )]
-    pub fn open(
-        path: impl AsRef<Path>,
-        launch_options: HostLaunchOptions,
-    ) -> Result<Self, HostError> {
-        let path = path.as_ref();
+    pub fn open(launch_options: HostLaunchOptions) -> Result<Self, HostError> {
         if launch_options.installation().as_str().trim().is_empty() {
             return Err(HostError::MissingInstallation);
         }
         let installation = launch_options.installation().clone();
         let owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
-        let registry_path = path.with_file_name("installation-registry.redb");
-        let registry_store = RedbInstallationRegistry::open(registry_path)?;
+        let host_state_root = launch_options.host_state_root().to_path_buf();
+        let root_lease = ProtectedRootLease::open_existing(&host_state_root)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let canonical_root = root_lease
+            .canonical_path()
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        if canonical_root != host_state_root {
+            return Err(HostError::ProcessContour(
+                "SCM Host state root is not the exact retained installation root".to_owned(),
+            ));
+        }
+        let registry_store =
+            RedbInstallationRegistry::open_existing_at(root_lease)?.ok_or_else(|| {
+                HostError::ProcessContour(
+                    "SCM Host state root has no approved-generation registry".to_owned(),
+                )
+            })?;
         let mut registry = registry_store.load()?;
         let pending_for_reopen = registry.pending_activation().cloned();
         Self::validate_launch_options_for_registry(
@@ -4243,8 +4279,9 @@ impl HostComposition {
             )?;
             return Err(HostError::RecoveryRequired(reason.to_owned()));
         }
+        let journal_path = host_state_root.join(HOST_JOURNAL_FILE_NAME);
         let (journal, host, activation_generation, activation_id) =
-            open_production_epoch(path, installation, pending_for_reopen.as_ref())?;
+            open_production_epoch(&journal_path, installation, pending_for_reopen.as_ref())?;
         #[cfg(windows)]
         let jobs =
             HostJobBranches::new(&host).map_err(|error| HostError::Platform(error.to_string()))?;
@@ -4294,16 +4331,17 @@ impl HostComposition {
     /// Returns an error if the live Host owner capability or protected state
     /// root cannot be admitted.
     #[cfg(windows)]
-    pub fn credential_control(
-        &self,
-        host_state_root: std::path::PathBuf,
-    ) -> Result<HostCredentialControl, HostError> {
+    pub fn credential_control(&self) -> Result<HostCredentialControl, HostError> {
         let capability = self
             .owner_lease
             .credential_mutation_capability()
             .map_err(|error| HostError::Platform(error.to_string()))?;
-        HostCredentialControl::new(self.host.clone(), host_state_root, capability)
-            .map_err(HostError::Platform)
+        HostCredentialControl::new(
+            self.host.clone(),
+            self.launch_options.host_state_root().to_path_buf(),
+            capability,
+        )
+        .map_err(HostError::Platform)
     }
 
     /// Returns the canonical owner-object name held for this composition.
@@ -6537,6 +6575,13 @@ mod journal_tests {
                 .installation
                 .clone(),
             transaction_plan_generation: manifest.runtime_launch.authority_generation.value(),
+            host_state_root: PathBuf::from(
+                manifest
+                    .runtime_launch
+                    .runtime_state_roots
+                    .host_state_root
+                    .as_str(),
+            ),
             registration_nonce: Some(PlatformHandle::new("e".repeat(64)).unwrap()),
         };
         assert!(HostComposition::validate_launch_options_for_manifest(&options, &manifest).is_ok());
@@ -6554,6 +6599,18 @@ mod journal_tests {
             .unwrap_or_else(|| unreachable!());
         assert!(
             HostComposition::validate_launch_options_for_manifest(&nonce_substitution, &manifest,)
+                .is_err()
+        );
+        let mut wrong_root = options.clone();
+        wrong_root.host_state_root = wrong_root.host_state_root.with_file_name("wrong-host");
+        assert!(
+            HostComposition::validate_launch_options_for_manifest(&wrong_root, &manifest).is_err()
+        );
+        let mut wrong_installation = options.clone();
+        wrong_installation.installation =
+            PlatformHandle::new("installation-substitution").unwrap_or_else(|_| unreachable!());
+        assert!(
+            HostComposition::validate_launch_options_for_manifest(&wrong_installation, &manifest,)
                 .is_err()
         );
         assert!(

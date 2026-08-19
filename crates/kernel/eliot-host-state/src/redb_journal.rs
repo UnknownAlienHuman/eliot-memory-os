@@ -3,7 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use eliot_platform::{PlatformHandle, UnknownReason};
-use eliot_platform_windows::{ProtectedPathLease, require_protected_program_data_path};
+use eliot_platform_windows::{
+    ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
+    require_protected_program_data_path,
+};
 use redb::{
     Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
 };
@@ -45,8 +48,8 @@ struct StoredPrepared {
 
 /// Production `HostStateJournal` backend backed by a separate Host-owned redb file.
 ///
-/// The retained [`ProtectedPathLease`] is held for the lifetime of the database,
-/// so redb never reopens a path whose final component could have been replaced.
+/// The retained path lease is held for the lifetime of the database, so redb
+/// never reopens a path whose final component could have been replaced.
 pub struct RedbJournalBackend {
     database: Database,
     path: PathBuf,
@@ -67,6 +70,10 @@ enum JournalPathLease {
     Protected {
         _lease: ProtectedPathLease,
     },
+    Runtime {
+        _root_lease: ProtectedRootLease,
+        _path_lease: ProtectedRuntimePathLease,
+    },
     #[cfg(test)]
     Unprotected,
 }
@@ -80,6 +87,22 @@ struct BackendSnapshot {
 struct ReadBudget {
     used: usize,
     limit: usize,
+}
+
+/// Retains the already-provisioned runtime parent before any journal-file
+/// operation. Keeping this lease beside the file lease makes a missing file
+/// distinguishable from a missing or substituted installation contour and
+/// prevents parent replacement for the complete redb lifetime.
+fn retain_runtime_parent(path: &Path) -> Result<ProtectedRootLease, BackendError> {
+    let parent = path.parent().ok_or(BackendError::Unavailable)?;
+    let lease = ProtectedRootLease::open_existing(parent).map_err(|_| BackendError::Unavailable)?;
+    let canonical = lease
+        .canonical_path()
+        .map_err(|_| BackendError::Unavailable)?;
+    if canonical != parent {
+        return Err(BackendError::Unavailable);
+    }
+    Ok(lease)
 }
 
 impl ReadBudget {
@@ -156,6 +179,64 @@ impl RedbJournalBackend {
         }))
     }
 
+    /// Inspects an existing journal at one explicit protected path.
+    ///
+    /// The path must be an exact descendant of the canonical `ProgramData`
+    /// root. The runtime lease proves the installer-provisioned `BA+LS+SY`
+    /// ACL and owns the no-follow contour; no environment, current directory,
+    /// alias, or copy is accepted.
+    pub fn inspect_existing_at(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<RedbJournalInspection>, BackendError> {
+        let path = path.as_ref();
+        let root_lease = retain_runtime_parent(path)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => return Err(BackendError::Unavailable),
+        }
+        let path_lease = ProtectedRuntimePathLease::open_existing_absolute(path)
+            .map_err(|_| BackendError::Unavailable)?;
+        if path_lease.path() != path {
+            return Err(BackendError::Unavailable);
+        }
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| BackendError::Unavailable)?;
+        let database =
+            ReadOnlyDatabase::open(path_lease.path()).map_err(|_| BackendError::Unavailable)?;
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| BackendError::Unavailable)?;
+        let read = database
+            .begin_read()
+            .map_err(|_| BackendError::Unavailable)?;
+        let snapshot = snapshot_from_read(&read, MAX_TOTAL_BYTES)?;
+        let prepared = snapshot
+            .prepared
+            .iter()
+            .map(|(_, item)| item.descriptor.clone())
+            .collect();
+        let image = DurableImage {
+            epochs: snapshot.epochs.into_iter().map(|(_, item)| item).collect(),
+            receipts: snapshot
+                .receipts
+                .into_iter()
+                .map(|(_, item)| item)
+                .collect(),
+        };
+        drop(read);
+        Ok(Some(RedbJournalInspection {
+            image,
+            prepared,
+            _database: database,
+            _path_lease: JournalPathLease::Runtime {
+                _root_lease: root_lease,
+                _path_lease: path_lease,
+            },
+        }))
+    }
+
     /// Opens or creates the dedicated Host journal database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, BackendError> {
         let path = path.as_ref();
@@ -178,6 +259,42 @@ impl RedbJournalBackend {
             database,
             path: path.to_path_buf(),
             _path_lease: JournalPathLease::Protected { _lease: path_lease },
+        })
+        .and_then(|backend| {
+            backend.ensure_schema()?;
+            backend.snapshot()?;
+            Ok(backend)
+        })
+    }
+
+    /// Opens or creates the dedicated Host journal at one explicit protected
+    /// path. The path must be the per-installation
+    /// `RuntimeStateRoots.host_state_root` selected by a trusted bootstrap;
+    /// its runtime lease preserves the installer-provisioned ACL without an
+    /// ACL rewrite or `WRITE_DAC` request.
+    pub fn open_at(path: impl AsRef<Path>) -> Result<Self, BackendError> {
+        let path = path.as_ref();
+        let root_lease = retain_runtime_parent(path)?;
+        let path_lease = ProtectedRuntimePathLease::open_or_create_absolute(path)
+            .map_err(|_| BackendError::Unavailable)?;
+        if path_lease.path() != path {
+            return Err(BackendError::Unavailable);
+        }
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| BackendError::Unavailable)?;
+        let database =
+            Database::create(path_lease.path()).map_err(|_| BackendError::Unavailable)?;
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| BackendError::Unavailable)?;
+        Ok(Self {
+            database,
+            path: path.to_path_buf(),
+            _path_lease: JournalPathLease::Runtime {
+                _root_lease: root_lease,
+                _path_lease: path_lease,
+            },
         })
         .and_then(|backend| {
             backend.ensure_schema()?;
@@ -1776,6 +1893,82 @@ mod tests {
                 .is_none()
         );
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn production_openers_reject_working_directory_paths_without_creation() {
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("eliot-redb-untrusted-root-{serial}"));
+        let path = root.join("host-state-journal.redb");
+        assert!(RedbJournalBackend::open(&path).is_err());
+        assert!(RedbJournalBackend::inspect_existing(&path).is_err());
+        assert!(RedbJournalBackend::open_at(&path).is_err());
+        assert!(RedbJournalBackend::inspect_existing_at(&path).is_err());
+        assert!(!root.exists(), "no opener may create an alias root");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_fixed_opener_rejects_a_retained_installation_path() {
+        let relative = format!(
+            "Eliot/installations/codex-host-state-legacy-test-{}/host/host-state-journal.redb",
+            std::process::id()
+        );
+        let path = eliot_platform_windows::protected_program_data_path(relative)
+            .unwrap_or_else(|_| unreachable!());
+        assert!(RedbJournalBackend::open(&path).is_err());
+        assert!(RedbJournalBackend::inspect_existing(&path).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_opener_requires_installer_root_without_creating_or_rewriting_acl() {
+        let relative = format!(
+            "Eliot/installations/codex-host-state-runtime-test-{}/host/host-state-journal.redb",
+            std::process::id()
+        );
+        let path = eliot_platform_windows::protected_program_data_path(relative)
+            .unwrap_or_else(|_| unreachable!());
+        let parent = path.parent().unwrap_or_else(|| unreachable!());
+        if parent.exists() {
+            // Never touch a real installation from a unit test.
+            return;
+        }
+        assert!(RedbJournalBackend::open_at(&path).is_err());
+        assert!(RedbJournalBackend::inspect_existing_at(&path).is_err());
+        assert!(!parent.exists(), "runtime open must not provision a root");
+        assert!(!path.exists(), "runtime open must not leave an alias file");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_openers_reject_reparse_parent_without_touching_target() {
+        use std::process::Command;
+
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("eliot-redb-runtime-reparse-{serial}"));
+        let target = root.join("outside");
+        let link = root.join("installation");
+        std::fs::create_dir_all(&target).unwrap_or_else(|_| unreachable!());
+        let output = Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap_or_else(|_| unreachable!());
+        assert!(output.status.success());
+        assert!(link.exists(), "mklink must create the junction fixture");
+
+        let path = link.join("host").join("host-state-journal.redb");
+        assert!(RedbJournalBackend::open_at(&path).is_err());
+        assert!(RedbJournalBackend::inspect_existing_at(&path).is_err());
+        assert!(
+            !path.exists(),
+            "reparse substitution must not create a file"
+        );
+
+        std::fs::remove_dir(&link).unwrap_or_else(|_| unreachable!());
+        std::fs::remove_dir_all(&root).unwrap_or_else(|_| unreachable!());
     }
 
     #[test]

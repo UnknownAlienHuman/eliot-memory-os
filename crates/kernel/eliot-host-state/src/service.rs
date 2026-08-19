@@ -64,4 +64,14 @@ impl HostStateJournalService<RedbJournalBackend> {
         let backend = RedbJournalBackend::open(path).map_err(JournalError::Backend)?;
         Self::from_backend(backend, host)
     }
+
+    /// Opens the production journal at the exact per-installation Host root
+    /// selected by the trusted Runtime Live bootstrap.
+    pub fn open_at(
+        path: impl AsRef<Path>,
+        host: HostInstallationEpoch,
+    ) -> Result<Self, JournalError> {
+        let backend = RedbJournalBackend::open_at(path).map_err(JournalError::Backend)?;
+        Self::from_backend(backend, host)
+    }
 }

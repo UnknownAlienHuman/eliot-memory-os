@@ -910,18 +910,14 @@ fn open_runtime_file(path: &Path, create: bool) -> Result<std::fs::File, Protect
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
     let mut options = std::fs::OpenOptions::new();
     options
         .read(true)
         .write(create)
-        .access_mode(if create {
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE
-        } else {
-            FILE_GENERIC_READ
-        })
+        .access_mode(runtime_file_access_mode(create))
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = if create {
@@ -931,7 +927,7 @@ fn open_runtime_file(path: &Path, create: bool) -> Result<std::fs::File, Protect
                 existing
                     .read(true)
                     .write(true)
-                    .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+                    .access_mode(runtime_file_access_mode(true))
                     .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                     .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                     .open(path)
@@ -951,6 +947,16 @@ fn open_runtime_file(path: &Path, create: bool) -> Result<std::fs::File, Protect
         .map_err(|_| ProtectedPathError::AclMismatch)?;
     verify_readonly_acl(&file, &descriptor)?;
     Ok(file)
+}
+
+#[cfg(windows)]
+fn runtime_file_access_mode(create: bool) -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+    if create {
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE
+    } else {
+        FILE_GENERIC_READ
+    }
 }
 
 #[cfg(windows)]
@@ -1750,12 +1756,12 @@ fn open_protected_directory(path: &Path) -> Result<std::fs::File, ProtectedPathE
 fn open_protected_file(path: &Path, create: bool) -> Result<std::fs::File, ProtectedPathError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true);
-    options.access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC);
+    options.access_mode(legacy_protected_file_access_mode());
     // Deliberately omit FILE_SHARE_DELETE.  The retained handle is the
     // substitution barrier for redb's path-based open.
     options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
@@ -1765,7 +1771,7 @@ fn open_protected_file(path: &Path, create: bool) -> Result<std::fs::File, Prote
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 let mut existing = std::fs::OpenOptions::new();
                 existing.read(true).write(true);
-                existing.access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC);
+                existing.access_mode(legacy_protected_file_access_mode());
                 existing.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
                 existing.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
                 existing.open(path)
@@ -1785,6 +1791,14 @@ fn open_protected_file(path: &Path, create: bool) -> Result<std::fs::File, Prote
         return Err(ProtectedPathError::ReparsePoint);
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+fn legacy_protected_file_access_mode() -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, WRITE_DAC,
+    };
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC
 }
 
 #[cfg(windows)]
@@ -4276,6 +4290,7 @@ pub struct ServiceBootstrapArguments {
     config_descriptor_digest: String,
     installation_id: String,
     transaction_plan_generation: u64,
+    host_state_root: Option<PathBuf>,
     registration_nonce: Option<String>,
     extra_args: Vec<String>,
 }
@@ -4316,9 +4331,30 @@ impl ServiceBootstrapArguments {
             config_descriptor_digest,
             installation_id,
             transaction_plan_generation,
+            host_state_root: None,
             registration_nonce: None,
             extra_args,
         })
+    }
+
+    /// Binds a Host service bootstrap to one explicit installer-provisioned
+    /// runtime root. Other service roles may leave this selector absent.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the root is not an absolute valid OS path.
+    pub fn with_host_state_root(
+        mut self,
+        host_state_root: impl Into<PathBuf>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let host_state_root = host_state_root.into();
+        if !host_state_root.is_absolute()
+            || host_state_root.as_os_str().is_empty()
+            || !valid_os_path(&host_state_root)
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        self.host_state_root = Some(host_state_root);
+        Ok(self)
     }
 
     /// Binds this bootstrap to one durable installer registration intent.
@@ -4357,6 +4393,13 @@ impl ServiceBootstrapArguments {
         self.transaction_plan_generation
     }
 
+    /// Returns the exact per-installation Host runtime-root selector, when
+    /// this bootstrap is for the Host service.
+    #[must_use]
+    pub fn host_state_root(&self) -> Option<&Path> {
+        self.host_state_root.as_deref()
+    }
+
     #[must_use]
     pub const fn tx_plan_generation(&self) -> u64 {
         self.transaction_plan_generation
@@ -4386,6 +4429,12 @@ impl ServiceBootstrapArguments {
             "--tx-plan-generation".to_owned(),
             self.transaction_plan_generation.to_string(),
         ];
+        if let Some(root) = &self.host_state_root {
+            argv.extend([
+                "--host-state-root".to_owned(),
+                exact_path_text(root.as_path()),
+            ]);
+        }
         if let Some(nonce) = &self.registration_nonce {
             argv.extend(["--registration-nonce".to_owned(), nonce.clone()]);
         }
@@ -4405,6 +4454,12 @@ impl ServiceBootstrapArguments {
             std::ffi::OsString::from("--tx-plan-generation"),
             std::ffi::OsString::from(self.transaction_plan_generation.to_string()),
         ];
+        if let Some(root) = &self.host_state_root {
+            argv.extend([
+                std::ffi::OsString::from("--host-state-root"),
+                root.as_os_str().to_os_string(),
+            ]);
+        }
         if let Some(nonce) = &self.registration_nonce {
             argv.extend([
                 std::ffi::OsString::from("--registration-nonce"),
@@ -4479,6 +4534,7 @@ fn is_reserved_bootstrap_arg(value: &str) -> bool {
             | "--config-descriptor-sha256"
             | "--installation-id"
             | "--tx-plan-generation"
+            | "--host-state-root"
             | "--registration-nonce"
     )
 }
@@ -10967,6 +11023,26 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn test_root_lease(
+        root: &Path,
+        relative: &Path,
+    ) -> Result<ProtectedRootLease, ProtectedPathError> {
+        let mut current = root.to_path_buf();
+        let mut directories = vec![pin_directory(root).map_err(|_| ProtectedPathError::Io)?];
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            directories.push(pin_directory(&current).map_err(|_| ProtectedPathError::Io)?);
+        }
+        let retained = directories.last().ok_or(ProtectedPathError::InvalidPath)?;
+        let identity = file_identity_from_handle(retained).map_err(|_| ProtectedPathError::Io)?;
+        Ok(ProtectedRootLease {
+            path: current,
+            identity,
+            directories,
+        })
+    }
+
+    #[cfg(windows)]
     fn directory_security_descriptor_bytes(path: &Path) -> Vec<u8> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
@@ -11756,6 +11832,54 @@ mod tests {
                 1,
                 vec!["--installation-id".to_owned()],
             ),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+        assert_eq!(
+            ServiceBootstrapArguments::new(
+                PathBuf::from(r"C:\runtime.json"),
+                "a".repeat(64),
+                "installation",
+                1,
+                vec!["--host-state-root".to_owned()],
+            ),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn host_bootstrap_root_is_typed_and_ordered_before_effect_nonce() {
+        let host_root = PathBuf::from(
+            r"C:\ProgramData\Eliot\installations\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\host",
+        );
+        let bootstrap = ServiceBootstrapArguments::new(
+            PathBuf::from(r"C:\ProgramData\Eliot\authority.json"),
+            "a".repeat(64),
+            "installation",
+            7,
+            Vec::<String>::new(),
+        )
+        .and_then(|value| value.with_host_state_root(&host_root))
+        .and_then(|value| value.with_registration_nonce("b".repeat(64)))
+        .unwrap_or_else(|error| panic!("bootstrap failed: {error}"));
+        assert_eq!(bootstrap.host_state_root(), Some(host_root.as_path()));
+        assert_eq!(
+            &bootstrap.argv()[8..],
+            [
+                "--host-state-root",
+                host_root.to_str().unwrap_or_else(|| unreachable!()),
+                "--registration-nonce",
+                &"b".repeat(64),
+            ]
+        );
+        assert_eq!(
+            ServiceBootstrapArguments::new(
+                PathBuf::from(r"C:\ProgramData\Eliot\authority.json"),
+                "a".repeat(64),
+                "installation",
+                7,
+                Vec::<String>::new(),
+            )
+            .and_then(|value| value.with_host_state_root("relative\\host")),
             Err(WindowsAdapterError::InvalidInput)
         );
     }
@@ -12920,6 +13044,76 @@ mod tests {
         );
         drop(reopened);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_root_lease_blocks_parent_substitution_until_drop() {
+        let root = std::env::temp_dir().join(format!("eliot-protected-root-{}", unique_suffix()));
+        let relative = Path::new("Eliot/installations/fixture/host");
+        let retained = root.join(relative);
+        let substituted = retained.with_file_name("host-substituted");
+        std::fs::create_dir_all(&retained).unwrap_or_else(|_| unreachable!());
+
+        let lease = test_root_lease(&root, relative)
+            .unwrap_or_else(|error| panic!("protected root lease open failed: {error}"));
+        lease
+            .verify_stable_identity()
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            lease.canonical_path().unwrap_or_else(|_| unreachable!()),
+            retained
+        );
+        assert!(
+            std::fs::rename(&retained, &substituted).is_err(),
+            "the retained root must reject path substitution"
+        );
+
+        drop(lease);
+        std::fs::rename(&retained, &substituted)
+            .unwrap_or_else(|error| panic!("rename after lease drop failed: {error}"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_file_access_is_ba_ls_sy_verify_only_while_legacy_keeps_write_dac() {
+        use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, GetAce};
+        use windows_sys::Win32::Storage::FileSystem::{WRITE_DAC, WRITE_OWNER};
+
+        assert_ne!(legacy_protected_file_access_mode() & WRITE_DAC, 0);
+        for access in [
+            runtime_file_access_mode(false),
+            runtime_file_access_mode(true),
+        ] {
+            assert_eq!(access & (WRITE_DAC | WRITE_OWNER), 0);
+        }
+
+        let descriptor = OwnedSecurityDescriptor::for_installer_system_object(false)
+            .unwrap_or_else(|error| panic!("runtime descriptor failed: {error}"));
+        assert_eq!(
+            sid_to_string(descriptor.owner().unwrap_or_else(|_| unreachable!()))
+                .unwrap_or_else(|_| unreachable!()),
+            "S-1-5-18"
+        );
+        let dacl = descriptor.dacl().unwrap_or_else(|_| unreachable!());
+        let mut principals = std::collections::BTreeSet::new();
+        let ace_count = unsafe { (*dacl).AceCount };
+        for index in 0..u32::from(ace_count) {
+            let mut ace = std::ptr::null_mut();
+            assert_ne!(unsafe { GetAce(dacl, index, &raw mut ace) }, 0);
+            assert!(!ace.is_null());
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid = (&raw const allowed.SidStart).cast_mut().cast();
+            principals.insert(sid_to_string(sid).unwrap_or_else(|_| unreachable!()));
+        }
+        assert_eq!(
+            principals,
+            ["S-1-5-18", "S-1-5-19", "S-1-5-32-544"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
     }
 
     #[cfg(windows)]
