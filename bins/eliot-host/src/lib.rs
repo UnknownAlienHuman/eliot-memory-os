@@ -20,9 +20,8 @@ use eliot_host_state::{
     EliotActivationRecord, EpochIdentity, EpochTransition, HostInstallationEpoch,
     HostKernelStoreLineage, HostObservationRecord, HostState, HostStateJournalService,
     HostStateRecord, IdempotencyIdentity, JOURNAL_VERSION, JournalBackend, JournalError,
-    JournalManifest, LegacyHostStateImporter, LifecycleTimestamps, ProductionHostStateJournal,
-    ReadinessEvidence, ReconcileOutcome, RecordFence, RecoveryLineageEvidence,
-    RecoveryLineageReason, RedbJournalBackend, WakeDisposition,
+    JournalManifest, LifecycleTimestamps, ProductionHostStateJournal, ReadinessEvidence,
+    ReconcileOutcome, RecordFence, RecoveryLineageEvidence, RedbJournalBackend, WakeDisposition,
 };
 use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, InstallationProfile,
@@ -54,7 +53,6 @@ use uuid::Uuid;
 pub const SERVICE_NAME: &str = "eliot-host";
 pub const PROTOCOL_VERSION: &str = "eliot.host.v1";
 pub const HOST_JOURNAL_RELATIVE_PATH: &str = "Eliot/host/host-state-journal.redb";
-pub const LEGACY_HOST_STATE_RELATIVE_PATH: &str = "Eliot/host/host-state.redb";
 
 #[derive(Debug, Error)]
 pub enum HostError {
@@ -2065,87 +2063,6 @@ impl HostComposition {
         Ok(composition)
     }
 
-    /// Explicitly imports a clean, offline legacy `host-state.redb` projection
-    /// into a distinct journal lineage. Normal Host startup never calls this.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if exclusive Host ownership cannot be established, the
-    /// legacy projection is absent or not clean and offline, the target journal
-    /// already exists, replay verification fails, the legacy file cannot be
-    /// renamed, or the owner lease cannot be released after migration.
-    pub fn migrate_legacy_host_state(
-        legacy_path: impl AsRef<Path>,
-        journal_path: impl AsRef<Path>,
-        installation: PlatformHandle,
-        source_evidence_refs: Vec<PlatformHandle>,
-    ) -> Result<PathBuf, HostError> {
-        let legacy_path = legacy_path.as_ref();
-        let mut owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
-        let snapshot =
-            LegacyHostStateImporter::inspect_existing(legacy_path)?.ok_or_else(|| {
-                HostError::OwnerLeaseRecovery("legacy Host state is absent".to_owned())
-            })?;
-        if snapshot.state.installation != installation
-            || snapshot.state.active_process.is_some()
-            || !snapshot.state.managed_dependencies.is_empty()
-            || snapshot.state.disposition.is_release_pending()
-        {
-            return Err(HostError::OwnerLeaseRecovery(
-                "legacy Host state is not a clean offline migration source".to_owned(),
-            ));
-        }
-        if RedbJournalBackend::inspect_existing(journal_path.as_ref())
-            .map_err(JournalError::Backend)?
-            .is_some()
-        {
-            return Err(HostError::OwnerLeaseRecovery(
-                "migration target journal already exists".to_owned(),
-            ));
-        }
-        let mut evidence = source_evidence_refs;
-        let encoded = serde_json::to_vec(&snapshot.state)
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        evidence.push(
-            PlatformHandle::new(format!("sha256-{:x}", Sha256::digest(encoded)))
-                .map_err(|error| HostError::Platform(error.to_string()))?,
-        );
-        let host = fresh_host_epoch(
-            installation,
-            Some(RecoveryLineageEvidence {
-                reason: RecoveryLineageReason::Migration,
-                source_evidence_refs: evidence,
-            }),
-        )?;
-        let journal = ProductionHostStateJournal::open(journal_path.as_ref(), host.clone())?;
-        let activation_generation = root_epoch(fresh_identity("activation-lineage")?);
-        let activation_id = fresh_identity("activation")?;
-        append_reconciled(
-            &journal,
-            HostStateRecord::Activation(initial_activation_record(
-                &host,
-                &activation_id,
-                &activation_generation,
-                ActivationState::Stopped,
-                "legacy-migration-open",
-            )?),
-        )?;
-        append_clean_marker(&journal, &host, &activation_id, &activation_generation)?;
-        drop(journal);
-        let verified = ProductionHostStateJournal::open(journal_path.as_ref(), host)?;
-        if verified.snapshot()?.clean_marker.is_none() {
-            return Err(HostError::OwnerLeaseRecovery(
-                "migrated Host journal did not replay its clean marker".to_owned(),
-            ));
-        }
-        drop(verified);
-        let migrated_path =
-            legacy_path.with_extension(format!("redb.migrated-{}", Uuid::new_v4().simple()));
-        std::fs::rename(legacy_path, &migrated_path)?;
-        owner_lease.release().map_err(owner_lease_release_error)?;
-        Ok(migrated_path)
-    }
-
     /// Returns the Host epoch bound to this process.
     #[must_use]
     pub const fn host_epoch(&self) -> &HostInstallationEpoch {
@@ -3122,45 +3039,6 @@ mod journal_tests {
             HostStateJournalService::from_backend(ImageBackend { image }, host),
             Err(JournalError::Torn { .. })
         ));
-    }
-
-    #[test]
-    fn explicit_migration_lineage_replays_without_legacy_normal_path() {
-        let installation = PlatformHandle::new("migration-installation").unwrap();
-        let host = fresh_host_epoch(
-            installation,
-            Some(RecoveryLineageEvidence {
-                reason: RecoveryLineageReason::Migration,
-                source_evidence_refs: vec![PlatformHandle::new("legacy-state-digest").unwrap()],
-            }),
-        )
-        .unwrap();
-        let generation = root_epoch(fresh_identity("migration-lineage").unwrap());
-        let activation_id = fresh_identity("migration-activation").unwrap();
-        let journal =
-            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone()).unwrap();
-        append_reconciled(
-            &journal,
-            HostStateRecord::Activation(
-                initial_activation_record(
-                    &host,
-                    &activation_id,
-                    &generation,
-                    ActivationState::Stopped,
-                    "migration-open",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
-        append_clean_marker(&journal, &host, &activation_id, &generation).unwrap();
-        let backend = journal.into_backend().unwrap();
-        let replayed = HostStateJournalService::from_backend(backend, host).unwrap();
-        assert_eq!(
-            replayed.snapshot().unwrap().host.recovery.unwrap().reason,
-            RecoveryLineageReason::Migration
-        );
-        assert_ne!(HOST_JOURNAL_RELATIVE_PATH, LEGACY_HOST_STATE_RELATIVE_PATH);
     }
 }
 

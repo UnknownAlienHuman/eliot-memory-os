@@ -500,6 +500,8 @@ fn apply(
                 && state.dependencies.is_empty()
                 && state.drain.is_none()
                 && state.drain_commit.is_none()
+                && state.wakes.is_empty()
+                && state.observations.is_empty()
                 && state.readiness_observations.is_empty();
             if next.manifest.schema_version != JOURNAL_VERSION
                 || next.manifest.last_sequence != state.sequence

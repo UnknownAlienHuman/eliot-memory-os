@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use eliot_observation_contracts::{
+    CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
+};
 use eliot_platform::{PlatformHandle, PortOutcome, UnknownReason};
 use eliot_runtime_contracts::{
     HealthDimension, KernelActivationState, ServiceProcessRecord, WakeIntent,
@@ -494,6 +497,40 @@ fn partial_runtime_contours_cannot_use_genesis_clean_marker_exception() {
                 drain_generation: generation.clone(),
                 state: DrainState::Requested,
                 evidence_refs: vec![h("partial-drain-evidence")],
+            }),
+        ),
+        (
+            "wake",
+            wake(
+                &host,
+                &generation,
+                "partial-wake",
+                "partial-wake-id",
+                "PENDING",
+            ),
+        ),
+        (
+            "observation",
+            HostStateRecord::Observation(HostObservationRecord {
+                fence: fence(&host, &generation),
+                operation: operation("partial-observation"),
+                observation: ObservationRecordEnvelope {
+                    record_id: "partial-observation".to_owned(),
+                    kind: ObservationRecordKind::CoverageGap,
+                    event: None,
+                    coverage_gap: Some(CoverageGap {
+                        gap_id: "partial-observation-gap".to_owned(),
+                        obligation_profile_ref: "runtime-live-v3".to_owned(),
+                        reason_ref: "partial-runtime-contour".to_owned(),
+                        affected_interval: None,
+                        disposition: GapDisposition::BlockDependentTransition,
+                        protected: true,
+                        evidence_refs: vec!["partial-observation-evidence".to_owned()],
+                    }),
+                    journal_control_event: false,
+                    parent_record_id: None,
+                },
+                binding_evidence_refs: vec![h("partial-observation-binding")],
             }),
         ),
     ] {
