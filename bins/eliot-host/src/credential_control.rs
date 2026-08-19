@@ -1,0 +1,1217 @@
+//! LocalService-only Store credential provisioning behind the Host owner epoch.
+
+use std::path::{Path, PathBuf};
+
+use eliot_host_state::HostInstallationEpoch;
+use eliot_installation::{
+    CredentialAccessReceipt, CredentialOwnershipMarkerIdentity, HOST_CREDENTIAL_CONTROL_PIPE,
+    HostCredentialControlOperation, HostCredentialControlRequest, HostCredentialControlResponse,
+    LOCAL_SERVICE_SID, StoreCredentialAbsentSnapshot, credential_absent_response_digest,
+    credential_control_response_frame, credential_deleted_response_digest,
+    credential_matching_response_digest, decode_credential_control_request_frame,
+};
+use eliot_ipc::{NamedPipeServer, TransportLimits};
+use eliot_platform::PlatformHandle;
+use eliot_platform_windows::{
+    CredentialSecret, InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation,
+    InstallerRootPrimitiveSpec, InstallerRootProfile, WindowsInstallerRootPrimitive,
+    WindowsLocalServiceCredentialProvider, observe_named_pipe_peer_process,
+    protected_program_data_root, windows_path_identity_digest, windows_paths_equal,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+const MARKER_LIMIT: u64 = 16 * 1024;
+const ENVELOPE_VERSION: &str = "eliot.store-credential-envelope.v1";
+const MARKER_VERSION: &str = "eliot.store-credential-marker.v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum MarkerPhase {
+    Reserved,
+    Finalized,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarkerRecord {
+    version: String,
+    transaction_id: PlatformHandle,
+    effect_id: PlatformHandle,
+    effect_binding_digest: PlatformHandle,
+    marker: CredentialOwnershipMarkerIdentity,
+    phase: MarkerPhase,
+    credential_envelope_digest: Option<PlatformHandle>,
+    mac: PlatformHandle,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialEnvelope {
+    version: String,
+    transaction_id: PlatformHandle,
+    effect_id: PlatformHandle,
+    effect_binding_digest: PlatformHandle,
+    generation: eliot_contracts::ResourceGeneration,
+    config_digest: PlatformHandle,
+    target: PlatformHandle,
+    principal_sid: PlatformHandle,
+    host_owner_epoch: PlatformHandle,
+    marker: CredentialOwnershipMarkerIdentity,
+    secret: Vec<u8>,
+    mac: PlatformHandle,
+}
+
+impl Drop for CredentialEnvelope {
+    fn drop(&mut self) {
+        self.secret.fill(0);
+    }
+}
+
+trait CredentialBackend {
+    fn principal_sid(&self) -> Result<PlatformHandle, String>;
+    fn read(&self, target: &PlatformHandle) -> Result<Option<CredentialSecret>, String>;
+    fn generate(&self) -> Result<CredentialSecret, String>;
+    fn write(&self, target: &PlatformHandle, bytes: Vec<u8>) -> Result<(), String>;
+    fn delete(&self, target: &PlatformHandle) -> Result<(), String>;
+}
+
+struct ProductionCredentialBackend(WindowsLocalServiceCredentialProvider);
+
+impl CredentialBackend for ProductionCredentialBackend {
+    fn principal_sid(&self) -> Result<PlatformHandle, String> {
+        self.0.principal_sid().map_err(|error| error.to_string())
+    }
+
+    fn read(&self, target: &PlatformHandle) -> Result<Option<CredentialSecret>, String> {
+        self.0
+            .read_optional(target)
+            .map_err(|error| error.to_string())
+    }
+
+    fn generate(&self) -> Result<CredentialSecret, String> {
+        self.0.generate_secret().map_err(|error| error.to_string())
+    }
+
+    fn write(&self, target: &PlatformHandle, bytes: Vec<u8>) -> Result<(), String> {
+        let secret = CredentialSecret::from_bytes(bytes).map_err(|error| error.to_string())?;
+        self.0
+            .write(target, &secret)
+            .map_err(|error| error.to_string())
+    }
+
+    fn delete(&self, target: &PlatformHandle) -> Result<(), String> {
+        self.0.delete(target).map_err(|error| error.to_string())
+    }
+}
+
+/// Exact Host-owned credential mutation boundary. Construction requires the
+/// already-open durable Host epoch and exact host-state root.
+pub struct HostCredentialControl {
+    core: HostCredentialControlCore<ProductionCredentialBackend>,
+}
+
+struct HostCredentialControlCore<B> {
+    _host_epoch: HostInstallationEpoch,
+    host_epoch_digest: PlatformHandle,
+    host_process_digest: PlatformHandle,
+    host_process_image: PathBuf,
+    root_spec: InstallerRootPrimitiveSpec,
+    primitive: WindowsInstallerRootPrimitive,
+    backend: B,
+}
+
+impl HostCredentialControl {
+    /// Creates the handler after Host owner epoch acquisition.
+    pub fn new(
+        host_epoch: HostInstallationEpoch,
+        host_state_root: PathBuf,
+    ) -> Result<Self, String> {
+        let installation_root = host_state_root
+            .parent()
+            .ok_or_else(|| "host_state_root has no installation parent".to_owned())?
+            .to_path_buf();
+        let profile_anchor = protected_program_data_root().map_err(|error| error.to_string())?;
+        let host_epoch_digest = handle_digest(
+            &serde_json::to_vec(&host_epoch)
+                .map_err(|error| format!("serialize Host owner epoch: {error}"))?,
+        )?;
+        let process = observe_named_pipe_peer_process(std::process::id())
+            .map_err(|error| error.to_string())?;
+        let host_process_digest = handle_digest(process.identity().stable_key().as_bytes())?;
+        let host_process_image = PathBuf::from(process.image_path());
+        Ok(Self {
+            core: HostCredentialControlCore {
+                _host_epoch: host_epoch,
+                host_epoch_digest,
+                host_process_digest,
+                host_process_image,
+                root_spec: InstallerRootPrimitiveSpec {
+                    root: host_state_root,
+                    installation_root,
+                    profile_anchor,
+                    profile: InstallerRootProfile::SystemService,
+                },
+                primitive: WindowsInstallerRootPrimitive::new(),
+                backend: ProductionCredentialBackend(WindowsLocalServiceCredentialProvider::new()),
+            },
+        })
+    }
+
+    /// Handles one already-authenticated request. No secret is returned.
+    pub fn handle(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
+        self.core.handle(request)
+    }
+
+    /// Serves one bounded request through the existing authenticated EBP
+    /// named-pipe transport. The DACL and impersonated client token both
+    /// require enabled built-in Administrators membership.
+    pub async fn serve_one(&self, timeout: std::time::Duration) -> Result<(), String> {
+        let installer =
+            eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
+                .map_err(|error| error.to_string())?;
+        let mut server = NamedPipeServer::create(HOST_CREDENTIAL_CONTROL_PIPE, &installer)
+            .map_err(|error| error.to_string())?;
+        server
+            .wait_for_authenticated_client(timeout, &installer)
+            .await
+            .map_err(|error| error.to_string())?;
+        let limits = TransportLimits::default();
+        let frame = server
+            .receive_frame(limits)
+            .await
+            .map_err(|error| error.to_string())?;
+        let connection_id = frame.connection_id.clone();
+        let request =
+            decode_credential_control_request_frame(&frame).map_err(|error| error.to_string())?;
+        let response = self.handle(&request);
+        let response = credential_control_response_frame(connection_id, &response)
+            .map_err(|error| error.to_string())?;
+        server
+            .send_frame(&response, limits)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+impl<B: CredentialBackend> HostCredentialControlCore<B> {
+    fn handle(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
+        if request.validate().is_err()
+            || !windows_paths_equal(
+                Path::new(request.intent.provision.host_state_root.as_str()),
+                &self.root_spec.root,
+            )
+            || !windows_paths_equal(
+                Path::new(request.intent.provision.expected_host_executable.as_str()),
+                &self.host_process_image,
+            )
+            || self
+                .backend
+                .principal_sid()
+                .ok()
+                .as_ref()
+                .map(PlatformHandle::as_str)
+                != Some(LOCAL_SERVICE_SID)
+        {
+            return unknown("credential-control-admission");
+        }
+        match request.intent.operation {
+            HostCredentialControlOperation::Inspect => self.inspect(request),
+            HostCredentialControlOperation::Provision
+            | HostCredentialControlOperation::Reconcile => self.provision_or_reconcile(request),
+            HostCredentialControlOperation::Delete => self.delete(request),
+        }
+    }
+
+    fn inspect(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
+        let root = match self.primitive.inspect(&self.root_spec) {
+            Ok(InstallerRootPrimitiveObservation::Matching(root)) => root,
+            _ => return unknown("credential-host-root"),
+        };
+        let marker_path = marker_path(&self.root_spec.root, request);
+        let marker_absent = match path_absent(&marker_path) {
+            Ok(absent) => absent,
+            Err(()) => return unknown("credential-marker-absence"),
+        };
+        let target_absent = match self.backend.read(&request.intent.provision.target) {
+            Ok(value) => value.is_none(),
+            Err(_) => return unknown("credential-target-absence"),
+        };
+        if !marker_absent || !target_absent {
+            return unknown("credential-preexisting-marker-or-target");
+        }
+        let snapshot = StoreCredentialAbsentSnapshot {
+            host_owner_epoch: self.host_epoch_digest.clone(),
+            host_process_identity: self.host_process_digest.clone(),
+            host_state_root: marker_identity(&root),
+            marker_path_digest: match path_digest(&marker_path) {
+                Ok(value) => value,
+                Err(_) => return unknown("credential-marker-path"),
+            },
+            marker_absent: true,
+            target_absent: true,
+        };
+        let response_digest =
+            match credential_absent_response_digest(&request.intent.request_digest, &snapshot) {
+                Ok(value) => value,
+                Err(_) => return unknown("credential-inspect-digest"),
+            };
+        HostCredentialControlResponse::Absent {
+            snapshot,
+            response_digest,
+        }
+    }
+
+    fn provision_or_reconcile(
+        &self,
+        request: &HostCredentialControlRequest,
+    ) -> HostCredentialControlResponse {
+        let marker_path = marker_path(&self.root_spec.root, request);
+        let key = request.ownership_key.as_slice();
+        let marker = match self.primitive.read_local_service_protected_file(
+            &self.root_spec,
+            &marker_path,
+            MARKER_LIMIT,
+        ) {
+            Ok(readback) => match decode_marker(request, key, &readback.object, &readback.bytes) {
+                Ok(marker) => (readback.object, marker),
+                Err(()) => return unknown("credential-marker-mac"),
+            },
+            Err(_) => {
+                let target = match self.backend.read(&request.intent.provision.target) {
+                    Ok(value) => value,
+                    Err(_) => return unknown("credential-target-before-marker-read"),
+                };
+                if request.intent.operation == HostCredentialControlOperation::Reconcile
+                    && request.expected_receipt.is_some()
+                {
+                    let receipt = request
+                        .expected_receipt
+                        .as_ref()
+                        .unwrap_or_else(|| unreachable!());
+                    return if target.is_none() {
+                        deleted_response(
+                            request,
+                            &self.host_epoch_digest,
+                            &self.host_process_digest,
+                            &receipt.marker,
+                        )
+                    } else {
+                        unknown("credential-target-without-marker")
+                    };
+                }
+                if target.is_some() {
+                    return unknown("credential-target-before-marker");
+                }
+                let created = self.primitive.create_local_service_protected_file(
+                    &self.root_spec,
+                    &marker_path,
+                    |identity| marker_bytes(request, key, identity, MarkerPhase::Reserved, None),
+                );
+                let identity = match created {
+                    Ok(identity) => identity,
+                    Err(_) => return unknown("credential-marker-create"),
+                };
+                let readback = match self.primitive.read_local_service_protected_file(
+                    &self.root_spec,
+                    &marker_path,
+                    MARKER_LIMIT,
+                ) {
+                    Ok(value) if value.object == identity => value,
+                    Ok(_) => return unknown("credential-marker-created-identity"),
+                    Err(_) => return unknown("credential-marker-flush-readback"),
+                };
+                let marker = match decode_marker(request, key, &readback.object, &readback.bytes) {
+                    Ok(marker) => marker,
+                    Err(()) => return unknown("credential-marker-created-mac"),
+                };
+                (readback.object, marker)
+            }
+        };
+        if request.expected_receipt.as_ref().is_some_and(|receipt| {
+            receipt.marker != marker_identity(&marker.0)
+                || receipt.host_owner_epoch != self.host_epoch_digest
+                || receipt.host_process_identity != self.host_process_digest
+        }) {
+            return unknown("credential-reconcile-receipt-binding");
+        }
+        let existing = match self.backend.read(&request.intent.provision.target) {
+            Ok(value) => value,
+            Err(_) => return unknown("credential-target-read"),
+        };
+        let envelope_bytes = if let Some(existing) = existing {
+            if decode_envelope(
+                request,
+                key,
+                &self.host_epoch_digest,
+                &marker.0,
+                existing.expose(),
+            )
+            .is_err()
+            {
+                return unknown("credential-target-binding");
+            }
+            if request.expected_receipt.as_ref().is_some_and(|receipt| {
+                handle_digest(existing.expose()).ok().as_ref()
+                    != Some(&receipt.credential_envelope_digest)
+            }) {
+                return unknown("credential-reconcile-envelope-digest");
+            }
+            existing.expose().to_vec()
+        } else {
+            if request.expected_receipt.is_some() {
+                if self.primitive.delete_file(&marker_path, &marker.0).is_err()
+                    || !matches!(path_absent(&marker_path), Ok(true))
+                {
+                    return unknown("credential-reconcile-marker-delete");
+                }
+                return deleted_response(
+                    request,
+                    &self.host_epoch_digest,
+                    &self.host_process_digest,
+                    &marker_identity(&marker.0),
+                );
+            }
+            if matches!(marker.1.phase, MarkerPhase::Finalized) {
+                return unknown("credential-final-marker-without-target");
+            }
+            // Required second absence check after the create-new marker.
+            match self.backend.read(&request.intent.provision.target) {
+                Ok(None) => {}
+                Ok(Some(_)) => return unknown("credential-target-raced-after-marker"),
+                Err(_) => return unknown("credential-target-second-read"),
+            }
+            let generated = match self.backend.generate() {
+                Ok(value) => value,
+                Err(_) => return unknown("credential-csprng"),
+            };
+            let bytes = match envelope_bytes(
+                request,
+                key,
+                &self.host_epoch_digest,
+                &marker.0,
+                generated.expose(),
+            ) {
+                Ok(value) => value,
+                Err(_) => return unknown("credential-envelope"),
+            };
+            // Final immediate pre-write observation makes injected/cooperating
+            // races fail closed. The unpredictable target and marker are the
+            // same-LocalService trust boundary until this exact Host call.
+            let readback = match write_after_final_absence(
+                &self.backend,
+                &request.intent.provision.target,
+                bytes.clone(),
+            ) {
+                Ok(readback) => readback,
+                Err(label) => return unknown(label),
+            };
+            if readback.expose() != bytes
+                || decode_envelope(
+                    request,
+                    key,
+                    &self.host_epoch_digest,
+                    &marker.0,
+                    readback.expose(),
+                )
+                .is_err()
+            {
+                return unknown("credential-write-mismatch");
+            }
+            bytes
+        };
+        let envelope_digest = match handle_digest(&envelope_bytes) {
+            Ok(value) => value,
+            Err(_) => return unknown("credential-envelope-digest"),
+        };
+        let final_bytes = match marker_bytes(
+            request,
+            key,
+            &marker.0,
+            MarkerPhase::Finalized,
+            Some(&envelope_digest),
+        ) {
+            Ok(value) => value,
+            Err(_) => return unknown("credential-final-marker"),
+        };
+        if self
+            .primitive
+            .rewrite_local_service_protected_file(
+                &self.root_spec,
+                &marker_path,
+                &marker.0,
+                &final_bytes,
+            )
+            .is_err()
+        {
+            return unknown("credential-final-marker-write");
+        }
+        let response_digest = match credential_matching_response_digest(
+            &request.intent.request_digest,
+            &self.host_epoch_digest,
+            &self.host_process_digest,
+            &marker_identity(&marker.0),
+            &envelope_digest,
+        ) {
+            Ok(value) => value,
+            Err(_) => return unknown("credential-response-digest"),
+        };
+        let receipt = CredentialAccessReceipt {
+            transaction_id: request.intent.transaction_id.clone(),
+            effect_id: request.intent.effect_id.clone(),
+            generation: request.intent.provision.generation,
+            config_digest: request.intent.provision.config_digest.clone(),
+            target: request.intent.provision.target.clone(),
+            provider: request.intent.provision.provider,
+            scope: request.intent.provision.scope,
+            principal_sid: request.intent.provision.expected_principal_sid.clone(),
+            host_owner_epoch: self.host_epoch_digest.clone(),
+            host_process_identity: self.host_process_digest.clone(),
+            marker: marker_identity(&marker.0),
+            credential_envelope_digest: envelope_digest,
+            request_digest: request.intent.request_digest.clone(),
+            response_digest,
+        };
+        HostCredentialControlResponse::Matching { receipt }
+    }
+
+    fn delete(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
+        let marker_path = marker_path(&self.root_spec.root, request);
+        let readback = match self.primitive.read_local_service_protected_file(
+            &self.root_spec,
+            &marker_path,
+            MARKER_LIMIT,
+        ) {
+            Ok(value) => value,
+            Err(_) => return unknown("credential-delete-marker"),
+        };
+        if decode_marker(
+            request,
+            &request.ownership_key,
+            &readback.object,
+            &readback.bytes,
+        )
+        .is_err()
+        {
+            return unknown("credential-delete-marker-mac");
+        }
+        let Some(expected_receipt) = request.expected_receipt.as_ref() else {
+            return unknown("credential-delete-receipt");
+        };
+        if expected_receipt.marker != marker_identity(&readback.object)
+            || expected_receipt.host_owner_epoch != self.host_epoch_digest
+            || expected_receipt.host_process_identity != self.host_process_digest
+        {
+            return unknown("credential-delete-receipt-binding");
+        }
+        if delete_credential_with_readback(
+            &self.backend,
+            request,
+            &request.ownership_key,
+            &self.host_epoch_digest,
+            &readback.object,
+            expected_receipt,
+        )
+        .is_err()
+            || self
+                .primitive
+                .delete_file(&marker_path, &readback.object)
+                .is_err()
+            || !matches!(path_absent(&marker_path), Ok(true))
+        {
+            return unknown("credential-delete-readback");
+        }
+        let absence_digest = match credential_deleted_response_digest(
+            &request.intent.request_digest,
+            &self.host_epoch_digest,
+            &self.host_process_digest,
+            &marker_identity(&readback.object),
+        ) {
+            Ok(value) => value,
+            Err(_) => return unknown("credential-delete-digest"),
+        };
+        HostCredentialControlResponse::Deleted { absence_digest }
+    }
+}
+
+fn delete_credential_with_readback<B: CredentialBackend>(
+    backend: &B,
+    request: &HostCredentialControlRequest,
+    ownership_key: &[u8],
+    host_epoch: &PlatformHandle,
+    marker: &InstallerRootObjectSnapshot,
+    expected_receipt: &CredentialAccessReceipt,
+) -> Result<(), ()> {
+    if let Some(target) = backend
+        .read(&request.intent.provision.target)
+        .map_err(|_| ())?
+    {
+        let target_digest = handle_digest(target.expose()).map_err(|_| ())?;
+        if target_digest != expected_receipt.credential_envelope_digest
+            || decode_envelope(request, ownership_key, host_epoch, marker, target.expose()).is_err()
+        {
+            return Err(());
+        }
+        backend
+            .delete(&request.intent.provision.target)
+            .map_err(|_| ())?;
+    }
+    match backend.read(&request.intent.provision.target) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) | Err(_) => Err(()),
+    }
+}
+
+fn marker_path(root: &Path, request: &HostCredentialControlRequest) -> PathBuf {
+    let digest = sha256_hex(
+        format!(
+            "{}\0{}\0{}",
+            request.intent.transaction_id.as_str(),
+            request.intent.effect_id.as_str(),
+            request.intent.provision.target.as_str()
+        )
+        .as_bytes(),
+    );
+    root.join(format!(".eliot-store-credential-{digest}.owner"))
+}
+
+fn marker_identity(value: &InstallerRootObjectSnapshot) -> CredentialOwnershipMarkerIdentity {
+    CredentialOwnershipMarkerIdentity {
+        canonical_path_digest: PlatformHandle::new(value.canonical_path_digest.clone())
+            .unwrap_or_else(|_| unreachable!()),
+        volume_serial_number: value.volume_serial_number,
+        file_index: value.file_index,
+        security_descriptor_digest: PlatformHandle::new(value.security_descriptor_digest.clone())
+            .unwrap_or_else(|_| unreachable!()),
+    }
+}
+
+fn marker_bytes(
+    request: &HostCredentialControlRequest,
+    key: &[u8],
+    identity: &InstallerRootObjectSnapshot,
+    phase: MarkerPhase,
+    envelope_digest: Option<&PlatformHandle>,
+) -> Result<Vec<u8>, eliot_platform_windows::InstallerRootError> {
+    #[derive(Serialize)]
+    struct MacInput<'a> {
+        version: &'static str,
+        transaction_id: &'a PlatformHandle,
+        effect_id: &'a PlatformHandle,
+        effect_binding_digest: &'a PlatformHandle,
+        marker: CredentialOwnershipMarkerIdentity,
+        phase: MarkerPhase,
+        credential_envelope_digest: Option<&'a PlatformHandle>,
+    }
+    let input = MacInput {
+        version: MARKER_VERSION,
+        transaction_id: &request.intent.transaction_id,
+        effect_id: &request.intent.effect_id,
+        effect_binding_digest: &request.intent.effect_binding_digest,
+        marker: marker_identity(identity),
+        phase,
+        credential_envelope_digest: envelope_digest,
+    };
+    let mac = PlatformHandle::new(hmac_sha256_hex(
+        key,
+        &serde_json::to_vec(&input)
+            .map_err(|_| eliot_platform_windows::InstallerRootError::Indeterminate)?,
+    ))
+    .map_err(|_| eliot_platform_windows::InstallerRootError::Indeterminate)?;
+    serde_json::to_vec(&MarkerRecord {
+        version: MARKER_VERSION.to_owned(),
+        transaction_id: request.intent.transaction_id.clone(),
+        effect_id: request.intent.effect_id.clone(),
+        effect_binding_digest: request.intent.effect_binding_digest.clone(),
+        marker: marker_identity(identity),
+        phase,
+        credential_envelope_digest: envelope_digest.cloned(),
+        mac,
+    })
+    .map_err(|_| eliot_platform_windows::InstallerRootError::Indeterminate)
+}
+
+fn decode_marker(
+    request: &HostCredentialControlRequest,
+    key: &[u8],
+    identity: &InstallerRootObjectSnapshot,
+    bytes: &[u8],
+) -> Result<MarkerRecord, ()> {
+    let marker: MarkerRecord = serde_json::from_slice(bytes).map_err(|_| ())?;
+    let expected = marker_bytes(
+        request,
+        key,
+        identity,
+        marker.phase,
+        marker.credential_envelope_digest.as_ref(),
+    )
+    .map_err(|_| ())?;
+    let expected: MarkerRecord = serde_json::from_slice(&expected).map_err(|_| ())?;
+    if !constant_time_handle_equal(&marker.mac, &expected.mac)
+        || marker.marker != marker_identity(identity)
+        || marker.version != MARKER_VERSION
+    {
+        return Err(());
+    }
+    Ok(marker)
+}
+
+fn envelope_bytes(
+    request: &HostCredentialControlRequest,
+    key: &[u8],
+    host_owner_epoch: &PlatformHandle,
+    identity: &InstallerRootObjectSnapshot,
+    secret: &[u8],
+) -> Result<Vec<u8>, ()> {
+    #[derive(Serialize)]
+    struct MacInput<'a> {
+        version: &'static str,
+        transaction_id: &'a PlatformHandle,
+        effect_id: &'a PlatformHandle,
+        effect_binding_digest: &'a PlatformHandle,
+        generation: eliot_contracts::ResourceGeneration,
+        config_digest: &'a PlatformHandle,
+        target: &'a PlatformHandle,
+        principal_sid: &'a PlatformHandle,
+        host_owner_epoch: &'a PlatformHandle,
+        marker: CredentialOwnershipMarkerIdentity,
+        secret: &'a [u8],
+    }
+    let input = MacInput {
+        version: ENVELOPE_VERSION,
+        transaction_id: &request.intent.transaction_id,
+        effect_id: &request.intent.effect_id,
+        effect_binding_digest: &request.intent.effect_binding_digest,
+        generation: request.intent.provision.generation,
+        config_digest: &request.intent.provision.config_digest,
+        target: &request.intent.provision.target,
+        principal_sid: &request.intent.provision.expected_principal_sid,
+        host_owner_epoch,
+        marker: marker_identity(identity),
+        secret,
+    };
+    let mac = PlatformHandle::new(hmac_sha256_hex(
+        key,
+        &serde_json::to_vec(&input).map_err(|_| ())?,
+    ))
+    .map_err(|_| ())?;
+    serde_json::to_vec(&CredentialEnvelope {
+        version: ENVELOPE_VERSION.to_owned(),
+        transaction_id: request.intent.transaction_id.clone(),
+        effect_id: request.intent.effect_id.clone(),
+        effect_binding_digest: request.intent.effect_binding_digest.clone(),
+        generation: request.intent.provision.generation,
+        config_digest: request.intent.provision.config_digest.clone(),
+        target: request.intent.provision.target.clone(),
+        principal_sid: request.intent.provision.expected_principal_sid.clone(),
+        host_owner_epoch: host_owner_epoch.clone(),
+        marker: marker_identity(identity),
+        secret: secret.to_vec(),
+        mac,
+    })
+    .map_err(|_| ())
+}
+
+fn decode_envelope(
+    request: &HostCredentialControlRequest,
+    key: &[u8],
+    host_owner_epoch: &PlatformHandle,
+    identity: &InstallerRootObjectSnapshot,
+    bytes: &[u8],
+) -> Result<(), ()> {
+    let envelope: CredentialEnvelope = serde_json::from_slice(bytes).map_err(|_| ())?;
+    let expected = envelope_bytes(request, key, host_owner_epoch, identity, &envelope.secret)?;
+    let expected: CredentialEnvelope = serde_json::from_slice(&expected).map_err(|_| ())?;
+    if !constant_time_handle_equal(&envelope.mac, &expected.mac)
+        || envelope.marker != marker_identity(identity)
+        || envelope.version != ENVELOPE_VERSION
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn unknown(label: &str) -> HostCredentialControlResponse {
+    HostCredentialControlResponse::Unknown {
+        pending_ref: PlatformHandle::new(label).unwrap_or_else(|_| unreachable!()),
+    }
+}
+
+fn deleted_response(
+    request: &HostCredentialControlRequest,
+    host_owner_epoch: &PlatformHandle,
+    host_process_identity: &PlatformHandle,
+    marker: &CredentialOwnershipMarkerIdentity,
+) -> HostCredentialControlResponse {
+    match credential_deleted_response_digest(
+        &request.intent.request_digest,
+        host_owner_epoch,
+        host_process_identity,
+        marker,
+    ) {
+        Ok(absence_digest) => HostCredentialControlResponse::Deleted { absence_digest },
+        Err(_) => unknown("credential-delete-digest"),
+    }
+}
+
+fn path_absent(path: &Path) -> Result<bool, ()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Err(()),
+    }
+}
+
+fn write_after_final_absence<B: CredentialBackend>(
+    backend: &B,
+    target: &PlatformHandle,
+    bytes: Vec<u8>,
+) -> Result<CredentialSecret, &'static str> {
+    match backend.read(target) {
+        Ok(None) => {}
+        Ok(Some(_)) => return Err("credential-target-prewrite-race"),
+        Err(_) => return Err("credential-target-prewrite-read"),
+    }
+    backend
+        .write(target, bytes)
+        .map_err(|_| "credential-write")?;
+    backend
+        .read(target)
+        .map_err(|_| "credential-write-readback")?
+        .ok_or("credential-write-readback")
+}
+
+fn path_digest(path: &Path) -> Result<PlatformHandle, String> {
+    PlatformHandle::new(windows_path_identity_digest(path)).map_err(|error| error.to_string())
+}
+
+fn handle_digest(bytes: &[u8]) -> Result<PlatformHandle, String> {
+    PlatformHandle::new(sha256_hex(bytes)).map_err(|error| error.to_string())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut normalized = [0_u8; BLOCK];
+    if key.len() > BLOCK {
+        normalized[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; BLOCK];
+    let mut outer_pad = [0x5c_u8; BLOCK];
+    for index in 0..BLOCK {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    normalized.fill(0);
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    inner_pad.fill(0);
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer_pad.fill(0);
+    format!("{:x}", outer.finalize())
+}
+
+fn constant_time_handle_equal(left: &PlatformHandle, right: &PlatformHandle) -> bool {
+    let left = left.as_str().as_bytes();
+    let right = right.as_str().as_bytes();
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().min(right.len()) {
+        difference |= usize::from(left[index] ^ right[index]);
+    }
+    difference == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use eliot_installation::{
+        HostCredentialControlIntent, StoreCredentialProvider, StoreCredentialProvisionPlan,
+        StoreCredentialScope,
+    };
+
+    use super::*;
+
+    fn handle(value: impl Into<String>) -> PlatformHandle {
+        PlatformHandle::new(value.into()).unwrap_or_else(|error| panic!("test handle: {error}"))
+    }
+
+    fn provision() -> StoreCredentialProvisionPlan {
+        StoreCredentialProvisionPlan {
+            host_state_root: handle(r"C:\ProgramData\Eliot\host"),
+            expected_host_executable: handle(r"C:\ProgramData\Eliot\eliot-host.exe"),
+            target: handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
+            provider: StoreCredentialProvider::WindowsCredentialManager,
+            scope: StoreCredentialScope::LocalService,
+            expected_principal_sid: handle(LOCAL_SERVICE_SID),
+            generation: eliot_contracts::ResourceGeneration::genesis(),
+            config_digest: handle("c".repeat(64)),
+        }
+    }
+
+    fn request(operation: HostCredentialControlOperation) -> HostCredentialControlRequest {
+        let intent = HostCredentialControlIntent::new(
+            operation,
+            handle("tx:test"),
+            handle("effect:test"),
+            provision(),
+            handle("a".repeat(64)),
+        )
+        .unwrap_or_else(|error| panic!("test intent: {error}"));
+        HostCredentialControlRequest {
+            intent,
+            ownership_key: if operation == HostCredentialControlOperation::Inspect {
+                Vec::new()
+            } else {
+                vec![7; 32]
+            },
+            expected_receipt: None,
+        }
+    }
+
+    fn identity() -> InstallerRootObjectSnapshot {
+        InstallerRootObjectSnapshot {
+            canonical_path_digest: "b".repeat(64),
+            volume_serial_number: 7,
+            file_index: 11,
+            security_descriptor_digest: "d".repeat(64),
+        }
+    }
+
+    #[test]
+    fn marker_and_envelope_reject_key_byte_and_host_epoch_substitution() {
+        let request = request(HostCredentialControlOperation::Provision);
+        let identity = identity();
+        let marker = marker_bytes(
+            &request,
+            &request.ownership_key,
+            &identity,
+            MarkerPhase::Reserved,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("marker: {error}"));
+        assert!(decode_marker(&request, &request.ownership_key, &identity, &marker).is_ok());
+        let mut wrong_key = request.ownership_key.clone();
+        wrong_key[0] ^= 1;
+        assert!(decode_marker(&request, &wrong_key, &identity, &marker).is_err());
+        let mut changed = marker.clone();
+        let last = changed.len().saturating_sub(2);
+        changed[last] ^= 1;
+        assert!(decode_marker(&request, &request.ownership_key, &identity, &changed).is_err());
+
+        let epoch = handle("epoch:one");
+        let envelope = envelope_bytes(
+            &request,
+            &request.ownership_key,
+            &epoch,
+            &identity,
+            &[9; 32],
+        )
+        .unwrap_or_else(|()| panic!("envelope"));
+        assert!(
+            decode_envelope(
+                &request,
+                &request.ownership_key,
+                &epoch,
+                &identity,
+                &envelope,
+            )
+            .is_ok()
+        );
+        assert!(
+            decode_envelope(
+                &request,
+                &request.ownership_key,
+                &handle("epoch:two"),
+                &identity,
+                &envelope,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn marker_before_credential_crash_is_resumable_and_finalization_is_bound() {
+        let request = request(HostCredentialControlOperation::Provision);
+        let identity = identity();
+        let reserved_bytes = marker_bytes(
+            &request,
+            &request.ownership_key,
+            &identity,
+            MarkerPhase::Reserved,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("reserved marker: {error}"));
+        let reserved = decode_marker(&request, &request.ownership_key, &identity, &reserved_bytes)
+            .unwrap_or_else(|()| panic!("reserved marker readback"));
+        assert_eq!(reserved.phase, MarkerPhase::Reserved);
+        assert!(reserved.credential_envelope_digest.is_none());
+
+        let envelope = envelope_bytes(
+            &request,
+            &request.ownership_key,
+            &handle("epoch:one"),
+            &identity,
+            &[9; 32],
+        )
+        .unwrap_or_else(|()| panic!("envelope"));
+        let envelope_digest =
+            handle_digest(&envelope).unwrap_or_else(|error| panic!("envelope digest: {error}"));
+        let finalized_bytes = marker_bytes(
+            &request,
+            &request.ownership_key,
+            &identity,
+            MarkerPhase::Finalized,
+            Some(&envelope_digest),
+        )
+        .unwrap_or_else(|error| panic!("final marker: {error}"));
+        let finalized = decode_marker(
+            &request,
+            &request.ownership_key,
+            &identity,
+            &finalized_bytes,
+        )
+        .unwrap_or_else(|()| panic!("final marker readback"));
+        assert_eq!(finalized.phase, MarkerPhase::Finalized);
+        assert_eq!(finalized.credential_envelope_digest, Some(envelope_digest));
+    }
+
+    #[test]
+    fn receipt_digest_rejects_host_process_substitution_and_short_key() {
+        let request_value = request(HostCredentialControlOperation::Provision);
+        let marker = marker_identity(&identity());
+        let epoch = handle("epoch:one");
+        let process = handle("1".repeat(64));
+        let envelope = handle("2".repeat(64));
+        let response_digest = credential_matching_response_digest(
+            &request_value.intent.request_digest,
+            &epoch,
+            &process,
+            &marker,
+            &envelope,
+        )
+        .unwrap_or_else(|error| panic!("response digest: {error}"));
+        let receipt = CredentialAccessReceipt {
+            transaction_id: request_value.intent.transaction_id.clone(),
+            effect_id: request_value.intent.effect_id.clone(),
+            generation: request_value.intent.provision.generation,
+            config_digest: request_value.intent.provision.config_digest.clone(),
+            target: request_value.intent.provision.target.clone(),
+            provider: request_value.intent.provision.provider,
+            scope: request_value.intent.provision.scope,
+            principal_sid: request_value
+                .intent
+                .provision
+                .expected_principal_sid
+                .clone(),
+            host_owner_epoch: epoch,
+            host_process_identity: process,
+            marker,
+            credential_envelope_digest: envelope,
+            request_digest: request_value.intent.request_digest.clone(),
+            response_digest,
+        };
+        assert!(
+            HostCredentialControlResponse::Matching {
+                receipt: receipt.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+        let mut substituted = receipt;
+        substituted.host_process_identity = handle("3".repeat(64));
+        assert!(
+            HostCredentialControlResponse::Matching {
+                receipt: substituted
+            }
+            .validate()
+            .is_err()
+        );
+
+        let mut short = request(HostCredentialControlOperation::Provision);
+        short.ownership_key.pop();
+        assert!(short.validate().is_err());
+    }
+
+    struct SequenceBackend {
+        reads: Mutex<VecDeque<Result<Option<Vec<u8>>, String>>>,
+        writes: Mutex<Vec<Vec<u8>>>,
+        deletes: Mutex<usize>,
+    }
+
+    impl CredentialBackend for SequenceBackend {
+        fn principal_sid(&self) -> Result<PlatformHandle, String> {
+            Ok(handle(LOCAL_SERVICE_SID))
+        }
+
+        fn read(&self, _target: &PlatformHandle) -> Result<Option<CredentialSecret>, String> {
+            let value = self
+                .reads
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+                .unwrap_or(Ok(None))?;
+            value
+                .map(CredentialSecret::from_bytes)
+                .transpose()
+                .map_err(|error| error.to_string())
+        }
+
+        fn generate(&self) -> Result<CredentialSecret, String> {
+            CredentialSecret::from_bytes(vec![3; 32]).map_err(|error| error.to_string())
+        }
+
+        fn write(&self, _target: &PlatformHandle, bytes: Vec<u8>) -> Result<(), String> {
+            self.writes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(bytes);
+            Ok(())
+        }
+
+        fn delete(&self, _target: &PlatformHandle) -> Result<(), String> {
+            *self
+                .deletes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn injected_race_after_second_precheck_never_writes_or_claims_ownership() {
+        let backend = SequenceBackend {
+            reads: Mutex::new(VecDeque::from([Ok(None), Ok(Some(vec![5; 32]))])),
+            writes: Mutex::new(Vec::new()),
+            deletes: Mutex::new(0),
+        };
+        assert!(matches!(backend.read(&provision().target), Ok(None)));
+        assert_eq!(
+            write_after_final_absence(&backend, &provision().target, vec![7; 64]).err(),
+            Some("credential-target-prewrite-race")
+        );
+        assert!(
+            backend
+                .writes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn preexisting_target_is_never_overwritten() {
+        let backend = SequenceBackend {
+            reads: Mutex::new(VecDeque::from([Ok(Some(vec![5; 32]))])),
+            writes: Mutex::new(Vec::new()),
+            deletes: Mutex::new(0),
+        };
+        assert_eq!(
+            write_after_final_absence(&backend, &provision().target, vec![7; 64]).err(),
+            Some("credential-target-prewrite-race")
+        );
+        assert!(
+            backend
+                .writes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn request_rejects_wrong_sid_and_operation_binding_is_distinct() {
+        let provision_intent = request(HostCredentialControlOperation::Provision)
+            .intent
+            .clone();
+        let reconcile_intent = request(HostCredentialControlOperation::Reconcile)
+            .intent
+            .clone();
+        assert_eq!(
+            provision_intent.effect_binding_digest,
+            reconcile_intent.effect_binding_digest
+        );
+        assert_ne!(
+            provision_intent.request_digest,
+            reconcile_intent.request_digest
+        );
+
+        let mut wrong = request(HostCredentialControlOperation::Provision);
+        wrong.intent.provision.expected_principal_sid = handle("S-1-5-18");
+        assert!(wrong.validate().is_err());
+    }
+
+    #[test]
+    fn delete_restart_after_credential_delete_accepts_only_authoritative_absence() {
+        let request = request(HostCredentialControlOperation::Delete);
+        let marker = identity();
+        let receipt = CredentialAccessReceipt {
+            transaction_id: request.intent.transaction_id.clone(),
+            effect_id: request.intent.effect_id.clone(),
+            generation: request.intent.provision.generation,
+            config_digest: request.intent.provision.config_digest.clone(),
+            target: request.intent.provision.target.clone(),
+            provider: request.intent.provision.provider,
+            scope: request.intent.provision.scope,
+            principal_sid: request.intent.provision.expected_principal_sid.clone(),
+            host_owner_epoch: handle("epoch:one"),
+            host_process_identity: handle("1".repeat(64)),
+            marker: marker_identity(&marker),
+            credential_envelope_digest: handle("2".repeat(64)),
+            request_digest: request.intent.request_digest.clone(),
+            response_digest: handle("3".repeat(64)),
+        };
+        let absent = SequenceBackend {
+            reads: Mutex::new(VecDeque::from([Ok(None), Ok(None)])),
+            writes: Mutex::new(Vec::new()),
+            deletes: Mutex::new(0),
+        };
+        assert_eq!(
+            delete_credential_with_readback(
+                &absent,
+                &request,
+                &request.ownership_key,
+                &receipt.host_owner_epoch,
+                &marker,
+                &receipt,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            *absent
+                .deletes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            0,
+            "a restart after CredDelete must verify absence and must not invent another delete"
+        );
+
+        let indeterminate = SequenceBackend {
+            reads: Mutex::new(VecDeque::from([Err("cred-read".to_owned())])),
+            writes: Mutex::new(Vec::new()),
+            deletes: Mutex::new(0),
+        };
+        assert_eq!(
+            delete_credential_with_readback(
+                &indeterminate,
+                &request,
+                &request.ownership_key,
+                &receipt.host_owner_epoch,
+                &marker,
+                &receipt,
+            ),
+            Err(())
+        );
+    }
+}

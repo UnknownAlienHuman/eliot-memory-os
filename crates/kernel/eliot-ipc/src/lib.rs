@@ -1214,7 +1214,7 @@ impl PipeSecurityDescriptor {
     ) -> Result<Self, TransportError> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-        let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{})", expectation.expected_sid());
+        let sddl = pipe_security_sddl(expectation);
         let sddl = std::ffi::OsStr::new(&sddl)
             .encode_wide()
             .chain(Some(0))
@@ -1255,6 +1255,19 @@ impl PipeSecurityDescriptor {
 
     fn raw_attributes(&mut self) -> *mut core::ffi::c_void {
         (&raw mut self.attributes).cast()
+    }
+}
+
+#[cfg(windows)]
+fn pipe_security_sddl(expectation: &eliot_platform_windows::NamedPipePeerExpectation) -> String {
+    if expectation.requires_builtin_administrators() {
+        // The one-shot installer control pipe admits only an elevated
+        // Administrators client, while the client independently pins the
+        // LocalService Host. Both authenticators therefore read back the same
+        // exact SY+BA+LS kernel-object DACL.
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)".to_owned()
+    } else {
+        format!("D:P(A;;GA;;;SY)(A;;GA;;;{})", expectation.expected_sid())
     }
 }
 
@@ -2174,5 +2187,17 @@ mod tests {
             Ok(DeliveryOutcome::Delivered)
         );
         assert!(child.wait().expect("child exit").success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installer_control_pipe_dacl_binds_admin_client_and_local_service_host() {
+        let expectation =
+            eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
+                .expect("administrator expectation");
+        assert_eq!(
+            pipe_security_sddl(&expectation),
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)"
+        );
     }
 }

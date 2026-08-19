@@ -33,7 +33,7 @@ pub use installer_root::{
     InstallerProtectedFileReadback, InstallerRootAbsentSnapshot, InstallerRootCreateDisposition,
     InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveCreate,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
-    WindowsInstallerRootPrimitive,
+    WindowsInstallerRootPrimitive, windows_path_identity_digest, windows_paths_equal,
 };
 pub use tcp_listener_owner::{
     TcpListenerOwnerError, TcpListenerOwnerObservation, observe_loopback_tcp_listener_owner,
@@ -2386,6 +2386,13 @@ pub struct NamedPipePeerExpectation {
     expected_session_id: u32,
     approved_process: Option<NamedPipePeerProcessBinding>,
     approved_job_process: Option<NamedPipePeerJobBinding>,
+    builtin_administrators: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NamedPipeAuthDiscriminator {
+    Ordinary,
+    BuiltinAdministrators,
 }
 
 /// Installer-pinned inputs for the separately registered Watchdog fallback
@@ -3217,6 +3224,26 @@ impl NamedPipePeerExpectation {
             expected_session_id,
             approved_process: None,
             approved_job_process: None,
+            builtin_administrators: false,
+        })
+    }
+
+    /// Creates inert policy for an elevated installer client. The live pipe
+    /// client is impersonated and its token must have the built-in
+    /// Administrators group enabled; its exact user SID/session are still
+    /// returned as evidence and bound to the connected process.
+    ///
+    /// # Errors
+    ///
+    /// This constructor currently cannot fail; the `Result` preserves the
+    /// constructor shape shared with validated peer expectations.
+    pub fn new_for_builtin_administrators() -> Result<Self, WindowsAdapterError> {
+        Ok(Self {
+            expected_sid: "S-1-5-32-544".to_owned(),
+            expected_session_id: 0,
+            approved_process: None,
+            approved_job_process: None,
+            builtin_administrators: true,
         })
     }
 
@@ -3290,6 +3317,21 @@ impl NamedPipePeerExpectation {
         self.expected_session_id
     }
 
+    /// Whether admission requires enabled built-in Administrators membership
+    /// instead of equality with one account SID/session.
+    #[must_use]
+    pub const fn requires_builtin_administrators(&self) -> bool {
+        self.builtin_administrators
+    }
+
+    fn auth_discriminator(&self) -> NamedPipeAuthDiscriminator {
+        if self.builtin_administrators {
+            NamedPipeAuthDiscriminator::BuiltinAdministrators
+        } else {
+            NamedPipeAuthDiscriminator::Ordinary
+        }
+    }
+
     /// Returns the optional exact OS-observed process binding admitted by this
     /// policy.
     #[must_use]
@@ -3359,6 +3401,17 @@ impl ProtectedSecret {
 pub struct CredentialSecret(Vec<u8>);
 
 impl CredentialSecret {
+    /// Moves already-secret bytes into a zeroizing owner.
+    ///
+    /// # Errors
+    /// Empty or oversized `WinCred` blobs are rejected.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, WindowsAdapterError> {
+        if bytes.is_empty() || bytes.len() > 2560 {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self(bytes))
+    }
+
     #[must_use]
     pub fn expose(&self) -> &[u8] {
         &self.0
@@ -3520,6 +3573,81 @@ impl WindowsInstallerSecretProvider {
             return Err(WindowsAdapterError::InvalidInput);
         }
         credential_delete(reference.as_str())
+    }
+}
+
+/// Raw current-token Credential Manager primitive used by the `LocalService` Host.
+///
+/// This type grants no installation ownership. The caller must independently
+/// prove `S-1-5-19`, durable intent, an exact create-new marker, and readback.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsLocalServiceCredentialProvider;
+
+impl WindowsLocalServiceCredentialProvider {
+    /// Creates the primitive without reading or mutating Credential Manager.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Returns the current process-token SID.
+    ///
+    /// # Errors
+    /// Returns an error when the process token cannot be observed.
+    pub fn principal_sid(&self) -> Result<PlatformHandle, WindowsAdapterError> {
+        let sid = current_process_sid().map_err(|_| WindowsAdapterError::Unavailable)?;
+        PlatformHandle::new(sid).map_err(|_| WindowsAdapterError::InvalidInput)
+    }
+
+    /// Generates 256 secret bits in a zeroizing value without persisting them.
+    ///
+    /// # Errors
+    /// Returns an error when the Windows CSPRNG is unavailable.
+    pub fn generate_secret(&self) -> Result<CredentialSecret, WindowsAdapterError> {
+        let mut secret = vec![0_u8; 32];
+        fill_system_random(&mut secret)?;
+        Ok(CredentialSecret(secret))
+    }
+
+    /// Reads an exact target under the current token.
+    ///
+    /// # Errors
+    /// Returns an error for invalid targets or provider failure.
+    pub fn read_optional(
+        &self,
+        target: &PlatformHandle,
+    ) -> Result<Option<CredentialSecret>, WindowsAdapterError> {
+        if !valid_credential_key(target.as_str()) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        credential_read_optional(target.as_str())
+    }
+
+    /// Writes exact bytes. This raw `WinCred` call can replace an entry; durable
+    /// marker ownership and an immediately preceding absence check are required.
+    ///
+    /// # Errors
+    /// Returns an error for invalid targets or provider failure.
+    pub fn write(
+        &self,
+        target: &PlatformHandle,
+        secret: &CredentialSecret,
+    ) -> Result<(), WindowsAdapterError> {
+        if !valid_credential_key(target.as_str()) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        credential_write(target.as_str(), secret.expose())
+    }
+
+    /// Deletes the exact target.
+    ///
+    /// # Errors
+    /// Missing and inaccessible targets fail closed.
+    pub fn delete(&self, target: &PlatformHandle) -> Result<(), WindowsAdapterError> {
+        if !valid_credential_key(target.as_str()) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        credential_delete(target.as_str())
     }
 }
 
@@ -4083,6 +4211,10 @@ impl OwnedSecurityDescriptor {
         Self::from_sddl(&format!(
             "O:SYD:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)(A;{inheritance};FA;;;LS)"
         ))
+    }
+
+    fn for_local_service_host_marker() -> Result<Self, WindowsAdapterError> {
+        Self::from_sddl("O:LSD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)")
     }
 
     fn for_user_owned_storage(sid: &str, directory: bool) -> Result<Self, WindowsAdapterError> {
@@ -7159,13 +7291,27 @@ pub fn authenticate_named_pipe_client(
             .map_err(|error| windows_adapter_from_io(&error))?;
         admit_named_pipe_peer_process(&identity, expectation)?;
         let process_token = process_token_identity(process)?;
-        let impersonation = ImpersonationGuard::begin(pipe_handle)?;
-        let thread_token = thread_token_identity()?;
-        impersonation.revert()?;
-        if process_token != thread_token
-            || process_token.0 != expectation.expected_sid
-            || process_token.1 != expectation.expected_session_id
-        {
+        let principal_matches = match expectation.auth_discriminator() {
+            NamedPipeAuthDiscriminator::Ordinary => {
+                // Ordinary peers are admitted by the identity observed from
+                // the retained process handle. Do not compare that primary
+                // token with an impersonation token: they are distinct token
+                // objects even when they represent the same client.
+                process_token.0 == expectation.expected_sid
+                    && process_token.1 == expectation.expected_session_id
+            }
+            NamedPipeAuthDiscriminator::BuiltinAdministrators => {
+                let process_is_admin = process_token_is_builtin_administrator(process)?;
+                let impersonation = ImpersonationGuard::begin(pipe_handle)?;
+                let thread_is_admin = thread_token_is_builtin_administrator()?;
+                impersonation.revert()?;
+                // The process token and the impersonated token are checked
+                // independently through TokenGroups. Never pass a primary
+                // process token to CheckTokenMembership.
+                process_is_admin && thread_is_admin && process_token.0 != "S-1-5-18"
+            }
+        };
+        if !principal_matches {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
         Ok(NamedPipePeerEvidence {
@@ -8400,7 +8546,23 @@ fn process_token_identity(
 }
 
 #[cfg(windows)]
-fn thread_token_identity() -> Result<(String, u32), WindowsAdapterError> {
+fn process_token_is_builtin_administrator(
+    process: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<bool, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    let result = token_is_builtin_administrator(token);
+    unsafe { CloseHandle(token) };
+    result
+}
+
+#[cfg(windows)]
+fn thread_token_is_builtin_administrator() -> Result<bool, WindowsAdapterError> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::TOKEN_QUERY;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
@@ -8408,9 +8570,84 @@ fn thread_token_identity() -> Result<(String, u32), WindowsAdapterError> {
     if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &raw mut token) } == 0 {
         return Err(last_windows_adapter_error());
     }
-    let result = token_identity(token);
+    let result = token_is_builtin_administrator(token);
     unsafe { CloseHandle(token) };
     result
+}
+
+#[cfg(windows)]
+fn token_is_builtin_administrator(
+    token: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<bool, WindowsAdapterError> {
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, EqualSid, GetTokenInformation, SECURITY_MAX_SID_SIZE,
+        SID_AND_ATTRIBUTES, TOKEN_GROUPS, TokenGroups, WinBuiltinAdministratorsSid,
+    };
+    use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
+    let mut sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut sid_bytes = u32::try_from(sid.len()).map_err(|_| WindowsAdapterError::Failed)?;
+    if unsafe {
+        CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            std::ptr::null_mut(),
+            sid.as_mut_ptr().cast(),
+            &raw mut sid_bytes,
+        )
+    } == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+
+    let mut required = 0_u32;
+    let _ = unsafe {
+        GetTokenInformation(
+            token,
+            TokenGroups,
+            std::ptr::null_mut(),
+            0,
+            &raw mut required,
+        )
+    };
+    if required == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    let required_bytes = usize::try_from(required).map_err(|_| WindowsAdapterError::Failed)?;
+    let words = required_bytes
+        .checked_add(std::mem::size_of::<usize>() - 1)
+        .ok_or(WindowsAdapterError::Failed)?
+        / std::mem::size_of::<usize>();
+    let mut buffer = vec![0_usize; words];
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenGroups,
+            buffer.as_mut_ptr().cast(),
+            required,
+            &raw mut required,
+        )
+    } == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+
+    let groups = unsafe { &*buffer.as_ptr().cast::<TOKEN_GROUPS>() };
+    let group_count =
+        usize::try_from(groups.GroupCount).map_err(|_| WindowsAdapterError::Failed)?;
+    let groups_offset = std::mem::size_of::<TOKEN_GROUPS>()
+        .checked_sub(std::mem::size_of::<SID_AND_ATTRIBUTES>())
+        .ok_or(WindowsAdapterError::Failed)?;
+    let max_group_count = required_bytes
+        .checked_sub(groups_offset)
+        .ok_or(WindowsAdapterError::Failed)?
+        / std::mem::size_of::<SID_AND_ATTRIBUTES>();
+    if group_count > max_group_count {
+        return Err(WindowsAdapterError::Failed);
+    }
+    let groups = unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), group_count) };
+    Ok(groups.iter().any(|group| {
+        group.Attributes & (SE_GROUP_ENABLED as u32) != 0
+            && unsafe { EqualSid(group.Sid, sid.as_ptr().cast_mut().cast()) != 0 }
+    }))
 }
 
 #[cfg(windows)]
@@ -8551,7 +8788,7 @@ fn validate_pipe_dacl(
             let text = sid_to_string(sid)?;
             if text == expected_sid {
                 expected_present = true;
-            } else if !matches!(text.as_str(), "S-1-5-18" | "S-1-5-32-544") {
+            } else if !pipe_dacl_principal_allowed(expected_sid, &text) {
                 return Err(WindowsAdapterError::AclMismatch);
             }
         }
@@ -8561,6 +8798,12 @@ fn validate_pipe_dacl(
     })();
     unsafe { LocalFree(descriptor.cast()) };
     result
+}
+
+fn pipe_dacl_principal_allowed(expected_sid: &str, observed_sid: &str) -> bool {
+    observed_sid == "S-1-5-18"
+        || observed_sid == "S-1-5-32-544"
+        || (matches!(expected_sid, "S-1-5-19" | "S-1-5-32-544") && observed_sid == "S-1-5-19")
 }
 
 #[cfg(windows)]
@@ -9781,6 +10024,67 @@ pub fn observe_named_pipe_peer_process_in_job(
     Err(WindowsAdapterError::Unavailable)
 }
 
+/// Queries the canonical `EliotHost` service and retains its live PID, process
+/// creation time and image identity for subsequent named-pipe admission.
+/// Request data cannot supply any of those identity fields.
+///
+/// # Errors
+///
+/// Returns a typed adapter error when the service cannot be queried, is not
+/// running, or its live process identity cannot be observed.
+#[cfg(windows)]
+pub fn observe_running_eliot_host_process()
+-> Result<NamedPipePeerProcessBinding, WindowsAdapterError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
+        SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS_PROCESS,
+    };
+    let name = std::ffi::OsStr::new(ELIOT_HOST_SERVICE_NAME)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(last_windows_adapter_error());
+    }
+    let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_STATUS) };
+    if service.is_null() {
+        unsafe { CloseServiceHandle(manager) };
+        return Err(last_windows_adapter_error());
+    }
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0;
+    let status_bytes = u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>())
+        .map_err(|_| WindowsAdapterError::Failed)?;
+    let ok = unsafe {
+        QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            (&raw mut status).cast(),
+            status_bytes,
+            &raw mut needed,
+        )
+    };
+    unsafe {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+    if ok == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    if status.dwCurrentState != SERVICE_RUNNING || status.dwProcessId == 0 {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    observe_named_pipe_peer_process(status.dwProcessId)
+}
+
+#[cfg(not(windows))]
+pub fn observe_running_eliot_host_process()
+-> Result<NamedPipePeerProcessBinding, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
 #[cfg(windows)]
 fn classify_service_error(name: &str, error: &std::io::Error) -> PortOutcome<ServiceObservation> {
     use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
@@ -10449,6 +10753,34 @@ mod tests {
             NamedPipePeerExpectation::new("current-user", 1),
             Err(WindowsAdapterError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn named_pipe_expectations_select_ordinary_or_admin_auth_discriminator() {
+        let ordinary =
+            NamedPipePeerExpectation::new("S-1-5-19", 1).unwrap_or_else(|_| unreachable!());
+        let admin = NamedPipePeerExpectation::new_for_builtin_administrators()
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            ordinary.auth_discriminator(),
+            NamedPipeAuthDiscriminator::Ordinary
+        );
+        assert_eq!(
+            admin.auth_discriminator(),
+            NamedPipeAuthDiscriminator::BuiltinAdministrators
+        );
+    }
+
+    #[test]
+    fn installer_control_pipe_dacl_allows_only_system_admin_and_local_service() {
+        for expected in ["S-1-5-19", "S-1-5-32-544"] {
+            for observed in ["S-1-5-18", "S-1-5-32-544", "S-1-5-19"] {
+                assert!(pipe_dacl_principal_allowed(expected, observed));
+            }
+            assert!(!pipe_dacl_principal_allowed(expected, "S-1-5-20"));
+            assert!(!pipe_dacl_principal_allowed(expected, "S-1-5-21-1000"));
+        }
+        assert!(!pipe_dacl_principal_allowed("S-1-5-21-1000", "S-1-5-19"));
     }
 
     #[cfg(windows)]

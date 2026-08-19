@@ -2,7 +2,8 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use eliot_host::{
-    HOST_JOURNAL_RELATIVE_PATH, HostComposition, HostError, PROTOCOL_VERSION, SERVICE_NAME,
+    HOST_JOURNAL_RELATIVE_PATH, HostComposition, HostCredentialControl, HostError,
+    PROTOCOL_VERSION, SERVICE_NAME,
 };
 #[cfg(windows)]
 use eliot_host::{HostBranchDisposition, HostLivenessTick};
@@ -242,6 +243,13 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         unsafe { SetServiceStatus(handle, &raw const status) };
         return;
     };
+    let Ok(credential_thread) = spawn_credential_control(&host) else {
+        status.dwCurrentState = SERVICE_STOPPED;
+        status.dwWin32ExitCode = 1;
+        let _ = host.stop();
+        unsafe { SetServiceStatus(handle, &raw const status) };
+        return;
+    };
     status.dwCurrentState = SERVICE_RUNNING;
     status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
     status.dwCheckPoint = 0;
@@ -281,6 +289,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    STOP_REQUESTED.store(true, Ordering::Release);
+    let _ = credential_thread.join();
     status.dwCurrentState = SERVICE_STOP_PENDING;
     status.dwControlsAccepted = 0;
     status.dwCheckPoint = 1;
@@ -302,6 +312,44 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     }
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
+}
+
+#[cfg(windows)]
+fn spawn_credential_control(
+    host: &HostComposition,
+) -> Result<std::thread::JoinHandle<()>, HostError> {
+    let journal = state_path()?;
+    let host_state_root = journal
+        .parent()
+        .ok_or_else(|| HostError::Platform("Host journal has no state root".to_owned()))?
+        .to_path_buf();
+    let control = HostCredentialControl::new(host.host_epoch().clone(), host_state_root)
+        .map_err(HostError::Platform)?;
+    std::thread::Builder::new()
+        .name("eliot-host-credential-control".to_owned())
+        .spawn(move || {
+            use std::sync::atomic::Ordering;
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(_) => {
+                    STOP_REQUESTED.store(true, Ordering::Release);
+                    return;
+                }
+            };
+            while !STOP_REQUESTED.load(Ordering::Acquire) {
+                if runtime
+                    .block_on(control.serve_one(std::time::Duration::from_millis(500)))
+                    .is_err()
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        })
+        .map_err(|error| HostError::Platform(error.to_string()))
 }
 
 #[cfg(windows)]

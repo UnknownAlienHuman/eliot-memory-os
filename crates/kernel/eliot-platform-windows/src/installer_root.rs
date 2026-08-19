@@ -340,7 +340,32 @@ impl WindowsInstallerRootPrimitive {
     where
         F: FnOnce(&InstallerRootObjectSnapshot) -> Result<Vec<u8>, InstallerRootError>,
     {
-        create_protected_file(spec.profile, path, build)
+        create_protected_file(
+            ProtectedFileSecurity::Installation(spec.profile),
+            path,
+            build,
+        )
+    }
+
+    /// Creates a raw protected marker owned by the calling `LocalService` host.
+    ///
+    /// This primitive returns only OS identity/security readback. It does not
+    /// confer installation ownership or mint an installation receipt.
+    ///
+    /// # Errors
+    /// Rejects non-system contours, collisions, wrong security/path readback,
+    /// oversized content or an indeterminate create/write/flush result.
+    pub fn create_local_service_protected_file<F>(
+        &self,
+        spec: &InstallerRootPrimitiveSpec,
+        path: &Path,
+        build: F,
+    ) -> Result<InstallerRootObjectSnapshot, InstallerRootError>
+    where
+        F: FnOnce(&InstallerRootObjectSnapshot) -> Result<Vec<u8>, InstallerRootError>,
+    {
+        ensure_system_service_spec(spec)?;
+        create_protected_file(ProtectedFileSecurity::LocalServiceHostMarker, path, build)
     }
 
     /// # Errors
@@ -353,7 +378,70 @@ impl WindowsInstallerRootPrimitive {
         path: &Path,
         limit: u64,
     ) -> Result<InstallerProtectedFileReadback, InstallerRootError> {
-        read_protected_file(spec.profile, path, limit)
+        read_protected_file(
+            ProtectedFileSecurity::Installation(spec.profile),
+            path,
+            limit,
+        )
+    }
+
+    /// Reads a raw LocalService-owned protected marker without following a
+    /// reparse point and verifies its exact owner and protected DACL.
+    ///
+    /// # Errors
+    /// Rejects non-system contours, missing/reparse/oversized files, wrong
+    /// owner or DACL, and indeterminate observations.
+    pub fn read_local_service_protected_file(
+        &self,
+        spec: &InstallerRootPrimitiveSpec,
+        path: &Path,
+        limit: u64,
+    ) -> Result<InstallerProtectedFileReadback, InstallerRootError> {
+        ensure_system_service_spec(spec)?;
+        read_protected_file(ProtectedFileSecurity::LocalServiceHostMarker, path, limit)
+    }
+
+    /// Replaces a protected marker's bytes while retaining and re-verifying
+    /// its exact file identity, canonical path, owner, DACL and flush result.
+    ///
+    /// # Errors
+    /// Rejects substitution, reparse, wrong security, oversized bytes or an
+    /// indeterminate write/flush/readback.
+    pub fn rewrite_protected_file(
+        &self,
+        spec: &InstallerRootPrimitiveSpec,
+        path: &Path,
+        expected: &InstallerRootObjectSnapshot,
+        bytes: &[u8],
+    ) -> Result<InstallerProtectedFileReadback, InstallerRootError> {
+        rewrite_protected_file(
+            ProtectedFileSecurity::Installation(spec.profile),
+            path,
+            expected,
+            bytes,
+        )
+    }
+
+    /// Rewrites a raw LocalService-owned marker while retaining and verifying
+    /// its exact file identity, owner, protected DACL and flush readback.
+    ///
+    /// # Errors
+    /// Rejects non-system contours, substitution, reparse, wrong security,
+    /// oversized bytes or an indeterminate write/flush/readback.
+    pub fn rewrite_local_service_protected_file(
+        &self,
+        spec: &InstallerRootPrimitiveSpec,
+        path: &Path,
+        expected: &InstallerRootObjectSnapshot,
+        bytes: &[u8],
+    ) -> Result<InstallerProtectedFileReadback, InstallerRootError> {
+        ensure_system_service_spec(spec)?;
+        rewrite_protected_file(
+            ProtectedFileSecurity::LocalServiceHostMarker,
+            path,
+            expected,
+            bytes,
+        )
     }
 
     /// # Errors
@@ -403,6 +491,20 @@ fn primitive_request(spec: &InstallerRootPrimitiveSpec) -> InstallerRootRequest 
         profile_anchor: spec.profile_anchor.clone(),
         profile: spec.profile,
     }
+}
+
+fn ensure_system_service_spec(spec: &InstallerRootPrimitiveSpec) -> Result<(), InstallerRootError> {
+    if spec.profile == InstallerRootProfile::SystemService {
+        Ok(())
+    } else {
+        Err(InstallerRootError::InvalidPath)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProtectedFileSecurity {
+    Installation(InstallerRootProfile),
+    LocalServiceHostMarker,
 }
 
 fn snapshot_identity(snapshot: &InstallerRootObjectSnapshot) -> FileIdentity {
@@ -508,7 +610,7 @@ impl RootReadback {
 
 #[cfg(windows)]
 fn create_protected_file<F>(
-    profile: InstallerRootProfile,
+    security: ProtectedFileSecurity,
     path: &Path,
     build: F,
 ) -> Result<InstallerRootObjectSnapshot, InstallerRootError>
@@ -525,7 +627,7 @@ where
         CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_HIDDEN, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     };
 
-    let descriptor = expected_descriptor(profile, false)?;
+    let descriptor = expected_protected_file_descriptor(security)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
             .map_err(|_| InstallerRootError::Indeterminate)?,
@@ -566,7 +668,7 @@ where
         canonical_path_digest: windows_path_digest(&canonical),
         volume_serial_number: identity.volume_serial_number,
         file_index: identity.file_index,
-        security_descriptor_digest: verify_security(&file, profile, false)?,
+        security_descriptor_digest: verify_protected_file_security(&file, security)?,
     };
     let bytes = build(&object)?;
     if bytes.len() as u64 > RECEIPT_LIMIT {
@@ -575,7 +677,7 @@ where
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(|_| InstallerRootError::Indeterminate)?;
-    let final_digest = verify_security(&file, profile, false)?;
+    let final_digest = verify_protected_file_security(&file, security)?;
     if final_digest != object.security_descriptor_digest {
         return Err(InstallerRootError::SecurityMismatch);
     }
@@ -584,7 +686,7 @@ where
 
 #[cfg(not(windows))]
 fn create_protected_file<F>(
-    _profile: InstallerRootProfile,
+    _security: ProtectedFileSecurity,
     _path: &Path,
     _build: F,
 ) -> Result<InstallerRootObjectSnapshot, InstallerRootError>
@@ -595,7 +697,7 @@ where
 }
 
 fn read_protected_file(
-    profile: InstallerRootProfile,
+    security: ProtectedFileSecurity,
     path: &Path,
     limit: u64,
 ) -> Result<InstallerProtectedFileReadback, InstallerRootError> {
@@ -618,7 +720,7 @@ fn read_protected_file(
         canonical_path_digest: windows_path_digest(&canonical),
         volume_serial_number: identity.volume_serial_number,
         file_index: identity.file_index,
-        security_descriptor_digest: verify_security(&file, profile, false)?,
+        security_descriptor_digest: verify_protected_file_security(&file, security)?,
     };
     let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
     file.take(limit.saturating_add(1))
@@ -628,6 +730,77 @@ fn read_protected_file(
         return Err(InstallerRootError::ReceiptMismatch);
     }
     Ok(InstallerProtectedFileReadback { object, bytes })
+}
+
+#[cfg(windows)]
+fn rewrite_protected_file(
+    security: ProtectedFileSecurity,
+    path: &Path,
+    expected: &InstallerRootObjectSnapshot,
+    bytes: &[u8],
+) -> Result<InstallerProtectedFileReadback, InstallerRootError> {
+    use std::io::{Seek as _, Write as _};
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE,
+    };
+
+    if bytes.len() as u64 > RECEIPT_LIMIT {
+        return Err(InstallerRootError::ReceiptMismatch);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let mut file = options
+        .open(path)
+        .map_err(|_| InstallerRootError::Indeterminate)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| InstallerRootError::Indeterminate)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || metadata.is_dir() {
+        return Err(InstallerRootError::ReparsePoint);
+    }
+    let canonical = final_windows_path_from_handle(&file).map_err(map_protected_error)?;
+    if !windows_paths_equal(&canonical, path) {
+        return Err(InstallerRootError::IdentityMismatch);
+    }
+    let identity =
+        file_identity_from_handle(&file).map_err(|_| InstallerRootError::Indeterminate)?;
+    let actual = InstallerRootObjectSnapshot {
+        canonical_path_digest: windows_path_digest(&canonical),
+        volume_serial_number: identity.volume_serial_number,
+        file_index: identity.file_index,
+        security_descriptor_digest: verify_protected_file_security(&file, security)?,
+    };
+    if &actual != expected {
+        return Err(InstallerRootError::IdentityMismatch);
+    }
+    file.set_len(0)
+        .and_then(|()| file.rewind())
+        .and_then(|()| file.write_all(bytes))
+        .and_then(|()| file.sync_all())
+        .map_err(|_| InstallerRootError::Indeterminate)?;
+    drop(file);
+    let readback = read_protected_file(security, path, RECEIPT_LIMIT)?;
+    if readback.object != *expected || readback.bytes != bytes {
+        return Err(InstallerRootError::IdentityMismatch);
+    }
+    Ok(readback)
+}
+
+#[cfg(not(windows))]
+fn rewrite_protected_file(
+    _security: ProtectedFileSecurity,
+    _path: &Path,
+    _expected: &InstallerRootObjectSnapshot,
+    _bytes: &[u8],
+) -> Result<InstallerProtectedFileReadback, InstallerRootError> {
+    Err(InstallerRootError::UnsupportedPlatform)
 }
 
 #[cfg(windows)]
@@ -761,6 +934,26 @@ fn expected_descriptor(
     .map_err(|_| InstallerRootError::SecurityMismatch)
 }
 
+#[cfg(windows)]
+fn expected_protected_file_descriptor(
+    security: ProtectedFileSecurity,
+) -> Result<OwnedSecurityDescriptor, InstallerRootError> {
+    match security {
+        ProtectedFileSecurity::Installation(profile) => expected_descriptor(profile, false),
+        ProtectedFileSecurity::LocalServiceHostMarker => {
+            OwnedSecurityDescriptor::for_local_service_host_marker()
+                .map_err(|_| InstallerRootError::SecurityMismatch)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn expected_protected_file_descriptor(
+    _security: ProtectedFileSecurity,
+) -> Result<OwnedSecurityDescriptor, InstallerRootError> {
+    Err(InstallerRootError::UnsupportedPlatform)
+}
+
 #[cfg(not(windows))]
 fn expected_descriptor(
     _profile: InstallerRootProfile,
@@ -775,6 +968,40 @@ fn verify_security(
     profile: InstallerRootProfile,
     directory: bool,
 ) -> Result<String, InstallerRootError> {
+    let expected = expected_descriptor(profile, directory)?;
+    let expected_owner = match profile {
+        InstallerRootProfile::SystemService => "S-1-5-18".to_owned(),
+        InstallerRootProfile::UserMode | InstallerRootProfile::PortableDev => {
+            current_process_sid().map_err(map_protected_error)?
+        }
+    };
+    verify_security_exact(file, &expected, &expected_owner)
+}
+
+#[cfg(windows)]
+fn verify_protected_file_security(
+    file: &std::fs::File,
+    security: ProtectedFileSecurity,
+) -> Result<String, InstallerRootError> {
+    let expected = expected_protected_file_descriptor(security)?;
+    let expected_owner = match security {
+        ProtectedFileSecurity::Installation(InstallerRootProfile::SystemService) => {
+            "S-1-5-18".to_owned()
+        }
+        ProtectedFileSecurity::Installation(
+            InstallerRootProfile::UserMode | InstallerRootProfile::PortableDev,
+        ) => current_process_sid().map_err(map_protected_error)?,
+        ProtectedFileSecurity::LocalServiceHostMarker => "S-1-5-19".to_owned(),
+    };
+    verify_security_exact(file, &expected, &expected_owner)
+}
+
+#[cfg(windows)]
+fn verify_security_exact(
+    file: &std::fs::File,
+    expected: &OwnedSecurityDescriptor,
+    expected_owner: &str,
+) -> Result<String, InstallerRootError> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
@@ -783,16 +1010,6 @@ fn verify_security(
         PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
     };
 
-    let expected = match profile {
-        InstallerRootProfile::SystemService => {
-            OwnedSecurityDescriptor::for_installer_system_object(directory)
-        }
-        InstallerRootProfile::UserMode | InstallerRootProfile::PortableDev => {
-            let sid = current_process_sid().map_err(map_protected_error)?;
-            OwnedSecurityDescriptor::for_user_owned_storage(&sid, directory)
-        }
-    }
-    .map_err(|_| InstallerRootError::SecurityMismatch)?;
     let expected_dacl = expected
         .dacl()
         .map_err(|_| InstallerRootError::SecurityMismatch)?;
@@ -850,14 +1067,7 @@ fn verify_security(
     let observed_owner = (!owner.is_null())
         .then(|| sid_to_string(owner).ok())
         .flatten();
-    let current_owner = match profile {
-        InstallerRootProfile::SystemService => None,
-        InstallerRootProfile::UserMode | InstallerRootProfile::PortableDev => {
-            Some(current_process_sid().map_err(map_protected_error)?)
-        }
-    };
-    let owner_matches =
-        owner_sid_matches(profile, observed_owner.as_deref(), current_owner.as_deref());
+    let owner_matches = observed_owner.as_deref() == Some(expected_owner);
     let length = unsafe {
         // SAFETY: descriptor is live and self-relative descriptor length is bounded by Windows.
         GetSecurityDescriptorLength(descriptor)
@@ -933,6 +1143,7 @@ fn observe_security_descriptor_digest(_file: &std::fs::File) -> Result<String, I
     Err(InstallerRootError::UnsupportedPlatform)
 }
 
+#[cfg(test)]
 fn owner_sid_matches(
     profile: InstallerRootProfile,
     observed_owner: Option<&str>,
@@ -951,6 +1162,14 @@ fn verify_security(
     _file: &std::fs::File,
     _profile: InstallerRootProfile,
     _directory: bool,
+) -> Result<String, InstallerRootError> {
+    Err(InstallerRootError::UnsupportedPlatform)
+}
+
+#[cfg(not(windows))]
+fn verify_protected_file_security(
+    _file: &std::fs::File,
+    _security: ProtectedFileSecurity,
 ) -> Result<String, InstallerRootError> {
     Err(InstallerRootError::UnsupportedPlatform)
 }
@@ -1106,7 +1325,9 @@ fn windows_path_is_within(path: &Path, contour: &Path) -> bool {
             .all(|(left, right)| windows_os_strings_equal(left.as_os_str(), right.as_os_str()))
 }
 
-fn windows_paths_equal(left: &Path, right: &Path) -> bool {
+/// Compares canonicalized paths with Windows ordinal Unicode case semantics.
+#[must_use]
+pub fn windows_paths_equal(left: &Path, right: &Path) -> bool {
     windows_os_strings_equal(left.as_os_str(), right.as_os_str())
 }
 
@@ -1143,6 +1364,12 @@ fn windows_path_digest(path: &Path) -> String {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
     digest(&bytes)
+}
+
+/// Digests an exact Windows path as UTF-16 code units for receipt binding.
+#[must_use]
+pub fn windows_path_identity_digest(path: &Path) -> String {
+    windows_path_digest(path)
 }
 
 #[cfg(not(windows))]
@@ -1369,6 +1596,40 @@ mod primitive_tests {
     }
 
     #[test]
+    fn protected_marker_create_new_flush_rewrite_and_identity_delete_are_exercised() {
+        let fixture = Fixture::new();
+        fixture.ensure_user_parent();
+        let primitive = fixture.primitive(true);
+        let spec = fixture.user_spec("marker-lifecycle");
+        let snapshot = absent(&primitive, &spec);
+        let created = primitive
+            .create(&spec, &snapshot)
+            .unwrap_or_else(|error| panic!("root create: {error}"));
+        assert_eq!(created.disposition, InstallerRootCreateDisposition::Created);
+        let marker_path = spec.root.join(".credential.owner");
+        let marker = primitive
+            .create_protected_file(&spec, &marker_path, |_| Ok(b"reserved".to_vec()))
+            .unwrap_or_else(|error| panic!("marker create-new: {error}"));
+        let readback = primitive
+            .read_protected_file(&spec, &marker_path, 64)
+            .unwrap_or_else(|error| panic!("marker readback: {error}"));
+        assert_eq!(readback.object, marker);
+        assert_eq!(readback.bytes, b"reserved");
+        let rewritten = primitive
+            .rewrite_protected_file(&spec, &marker_path, &marker, b"finalized")
+            .unwrap_or_else(|error| panic!("marker rewrite: {error}"));
+        assert_eq!(rewritten.object, marker);
+        assert_eq!(rewritten.bytes, b"finalized");
+        primitive
+            .delete_file(&marker_path, &marker)
+            .unwrap_or_else(|error| panic!("marker identity delete: {error}"));
+        assert!(matches!(
+            std::fs::symlink_metadata(&marker_path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
     fn non_elevated_system_profile_is_rejected_before_os_observation() {
         let fixture = Fixture::new();
         let primitive = fixture.primitive(false);
@@ -1381,7 +1642,7 @@ mod primitive_tests {
     }
 
     #[test]
-    fn system_root_and_receipt_descriptors_declare_exact_local_system_owner() {
+    fn system_root_receipt_and_host_marker_descriptors_declare_exact_owners() {
         use windows_sys::Win32::Security::{
             GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
         };
@@ -1428,5 +1689,26 @@ mod primitive_tests {
                 "S-1-5-18"
             );
         }
+
+        let marker = OwnedSecurityDescriptor::for_local_service_host_marker()
+            .unwrap_or_else(|error| panic!("marker descriptor creation failed: {error}"));
+        let mut marker_owner: PSID = std::ptr::null_mut();
+        let mut marker_defaulted = 0;
+        let marker_ok = unsafe {
+            // SAFETY: the descriptor and output locals remain live for the call.
+            GetSecurityDescriptorOwner(marker.raw, &raw mut marker_owner, &raw mut marker_defaulted)
+        };
+        assert_ne!(marker_ok, 0);
+        assert_eq!(
+            sid_to_string(marker_owner)
+                .unwrap_or_else(|error| panic!("marker owner SID failed: {error}")),
+            "S-1-5-19"
+        );
+
+        let fixture = Fixture::new();
+        assert_eq!(
+            ensure_system_service_spec(&fixture.user_spec("not-system")),
+            Err(InstallerRootError::InvalidPath)
+        );
     }
 }

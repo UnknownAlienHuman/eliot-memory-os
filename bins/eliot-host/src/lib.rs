@@ -7,6 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+mod credential_control;
+
+pub use credential_control::HostCredentialControl;
+
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};

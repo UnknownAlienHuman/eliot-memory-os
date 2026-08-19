@@ -1214,14 +1214,17 @@ name = "eliot-installation"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-ipc",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-protocol",
  "redb",
  "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
