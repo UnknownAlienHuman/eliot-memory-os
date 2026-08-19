@@ -83,6 +83,14 @@ pub const DEFAULT_PIPE_NAME: &str = KERNEL_CONTROL_PIPE;
 const STORE_BRIDGE_ROUTE: &str = "store_bridge";
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
+#[cfg(any(windows, test))]
+const fn probe_ready_state_admitted(state: KernelServiceState) -> bool {
+    matches!(
+        state,
+        KernelServiceState::Activating | KernelServiceState::Ready | KernelServiceState::Degraded
+    )
+}
+
 /// The only transport implementation admitted by the Windows-first Kernel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum IpcImplementation {
@@ -2854,8 +2862,9 @@ impl KernelComposition {
                 .service
                 .lock()
                 .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?;
-            if service.state() != KernelServiceState::Activating
+            if !probe_ready_state_admitted(service.state())
                 || service.handshake() != Some(handshake)
+                || service.authority_epoch() != handshake.kernel_epoch
             {
                 return Err(KernelServiceError::ReadinessNotProven);
             }
@@ -2912,24 +2921,28 @@ impl KernelComposition {
                 .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
             ],
         };
-        Ok(KernelReadyReceipt {
+        let mut evidence_refs = KernelReadyReceipt::probe_binding_evidence(request)?;
+        evidence_refs.extend([
+            PlatformHandle::new(format!(
+                "kernel-store-validation:{}",
+                snapshot.validation_revision
+            ))
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
+            PlatformHandle::new(format!(
+                "kernel-store-health:{}",
+                health.manifest_digest.as_str()
+            ))
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
+        ]);
+        let receipt = KernelReadyReceipt {
             activation_id: handshake.activation_id.clone(),
             activation_nonce: handshake.activation_nonce.clone(),
             process,
             health: HealthVector::healthy(),
-            evidence_refs: vec![
-                PlatformHandle::new(format!(
-                    "kernel-store-validation:{}",
-                    snapshot.validation_revision
-                ))
-                .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
-                PlatformHandle::new(format!(
-                    "kernel-store-health:{}",
-                    health.manifest_digest.as_str()
-                ))
-                .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
-            ],
-        })
+            evidence_refs,
+        };
+        receipt.validate_for_probe(request)?;
+        Ok(receipt)
     }
 
     /// Applies one authenticated Host control request after binding the
@@ -3140,6 +3153,29 @@ mod tests {
     };
     use eliot_runtime_contracts::ModuleContract;
     use eliot_store_api::{RevisionHead, RevisionKey};
+
+    #[test]
+    fn runtime_probe_gate_admits_only_initial_repeat_and_recovery_states() {
+        for state in [
+            KernelServiceState::Activating,
+            KernelServiceState::Ready,
+            KernelServiceState::Degraded,
+        ] {
+            assert!(probe_ready_state_admitted(state));
+        }
+        for state in [
+            KernelServiceState::Cold,
+            KernelServiceState::Reconciling,
+            KernelServiceState::ShadowNoAuthority,
+            KernelServiceState::HandoffPrepared,
+            KernelServiceState::Draining,
+            KernelServiceState::Stopped,
+            KernelServiceState::Failed,
+            KernelServiceState::ManualRecovery,
+        ] {
+            assert!(!probe_ready_state_admitted(state));
+        }
+    }
 
     fn test_client(policy: &ServerHandshakePolicy) -> eliot_protocol::ClientHello {
         eliot_protocol::ClientHello {

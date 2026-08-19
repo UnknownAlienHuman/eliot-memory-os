@@ -354,7 +354,8 @@ impl KernelService {
         Ok(())
     }
 
-    /// Publishes a readiness receipt after exact handshake and health checks.
+    /// Publishes an initial, repeated, or recovery readiness receipt after
+    /// exact handshake and health checks.
     pub fn mark_ready(&mut self, receipt: KernelReadyReceipt) -> Result<(), KernelServiceError> {
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
@@ -365,7 +366,12 @@ impl KernelService {
             .ok_or(KernelServiceError::HandshakeMismatch {
                 field: "missing_handshake",
             })?;
-        if self.state != KernelServiceState::Activating {
+        if !matches!(
+            self.state,
+            KernelServiceState::Activating
+                | KernelServiceState::Ready
+                | KernelServiceState::Degraded
+        ) {
             return Err(KernelServiceError::IllegalTransition {
                 from: self.state,
                 to: KernelServiceState::Ready,
@@ -374,7 +380,9 @@ impl KernelService {
         receipt.validate(handshake)?;
         self.ready = Some(receipt);
         self.failure = None;
-        self.transition(KernelServiceState::Ready)?;
+        if self.state != KernelServiceState::Ready {
+            self.transition(KernelServiceState::Ready)?;
+        }
         Ok(())
     }
 
@@ -521,6 +529,84 @@ impl KernelService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{
+        HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostProcessBinding,
+        ProcessObservation, RestartBudget,
+    };
+    use eliot_platform::PlatformHandle;
+    use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
+
+    fn handle(value: &str) -> PlatformHandle {
+        PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    }
+
+    fn handshake() -> HostKernelHandshake {
+        HostKernelHandshake {
+            installation_id: handle("installation-1"),
+            host_epoch: AuthorityEpoch::new(1).unwrap_or_else(|_| unreachable!()),
+            kernel_epoch: AuthorityEpoch::genesis(),
+            activation_id: handle("activation-1"),
+            artifact_hash: handle("artifact-1"),
+            config_hash: handle("config-1"),
+            activation_nonce: handle("nonce-1"),
+            job_object_id: handle("Local\\Eliot-Host-Kernel-test"),
+            pipe_identity: handle(crate::protocol::KERNEL_CONTROL_PIPE),
+            host_process: HostProcessBinding {
+                process_id: 7,
+                start_time_100ns: 9,
+                image_path: "C:\\\\eliot\\\\host.exe".to_owned(),
+            },
+            job_binding: HostJobBinding {
+                job: HostJobIdentity {
+                    name: "Local\\Eliot-Host-Kernel-test".to_owned(),
+                },
+                root: HostJobRoot {
+                    process: HostProcessBinding {
+                        process_id: 42,
+                        start_time_100ns: 10,
+                        image_path: "C:\\\\eliot\\\\kernel.exe".to_owned(),
+                    },
+                    executable: HostFileIdentity {
+                        volume_serial_number: 1,
+                        file_index: 2,
+                    },
+                },
+            },
+            restart_budget: RestartBudget::new(1, 1).unwrap_or_else(|_| unreachable!()),
+            containment_action: None,
+        }
+    }
+
+    fn ready_receipt(handshake: &HostKernelHandshake, evidence: &str) -> KernelReadyReceipt {
+        KernelReadyReceipt {
+            activation_id: handshake.activation_id.clone(),
+            activation_nonce: handshake.activation_nonce.clone(),
+            process: ProcessObservation {
+                process_id: handle("pid:42:start:10"),
+                job_object_id: handshake.job_object_id.clone(),
+                state: ServiceProcessState::Ready,
+                health: HealthVector::healthy(),
+                evidence_refs: vec![handle("process-evidence")],
+            },
+            health: HealthVector::healthy(),
+            evidence_refs: vec![handle(evidence)],
+        }
+    }
+
+    fn activate(service: &mut KernelService, handshake: HostKernelHandshake) {
+        service
+            .apply(KernelControlCommand::Reconcile(handshake))
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .apply(KernelControlCommand::Shadow)
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .apply(KernelControlCommand::PrepareHandoff)
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .apply(KernelControlCommand::Activate)
+            .unwrap_or_else(|_| unreachable!());
+    }
 
     #[test]
     fn durable_epoch_sync_is_direct_and_rejects_oversized_values()
@@ -564,5 +650,76 @@ mod tests {
         ));
         assert_eq!(service.state(), KernelServiceState::Cold);
         Ok(())
+    }
+
+    #[test]
+    fn ready_probe_replaces_receipt_without_reactivation_or_epoch_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut service = KernelService::new([13; 32], 2, 4)?;
+        let handshake = handshake();
+        activate(&mut service, handshake.clone());
+        let initial = ready_receipt(&handshake, "ready-initial");
+        service.publish_ready(initial)?;
+        let epoch = service.authority_epoch();
+        let retained_handshake = service.handshake().cloned();
+
+        let repeated = ready_receipt(&handshake, "ready-repeat");
+        service.publish_ready(repeated.clone())?;
+
+        assert_eq!(service.state(), KernelServiceState::Ready);
+        assert_eq!(service.ready_receipt(), Some(&repeated));
+        assert_eq!(service.authority_epoch(), epoch);
+        assert_eq!(service.handshake(), retained_handshake.as_ref());
+        assert_eq!(
+            service.handshake().map(|value| &value.activation_nonce),
+            Some(&handshake.activation_nonce)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn degraded_probe_recovers_only_after_fresh_full_receipt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut service = KernelService::new([15; 32], 2, 4)?;
+        let handshake = handshake();
+        activate(&mut service, handshake.clone());
+        service.publish_ready(ready_receipt(&handshake, "ready-initial"))?;
+        service.apply(KernelControlCommand::Degrade(handle("store-lost")))?;
+        assert_eq!(service.state(), KernelServiceState::Degraded);
+
+        let recovery = ready_receipt(&handshake, "ready-recovery");
+        service.publish_ready(recovery.clone())?;
+
+        assert_eq!(service.state(), KernelServiceState::Ready);
+        assert_eq!(service.ready_receipt(), Some(&recovery));
+        assert!(service.failure().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn probe_publication_rejects_every_forbidden_state() {
+        let handshake = handshake();
+        let forbidden = [
+            KernelServiceState::Cold,
+            KernelServiceState::Reconciling,
+            KernelServiceState::ShadowNoAuthority,
+            KernelServiceState::HandoffPrepared,
+            KernelServiceState::Draining,
+            KernelServiceState::Stopped,
+            KernelServiceState::Failed,
+            KernelServiceState::ManualRecovery,
+        ];
+        for state in forbidden {
+            let mut service = KernelService::new([17; 32], 2, 4).unwrap_or_else(|_| unreachable!());
+            service.handshake = Some(handshake.clone());
+            service.state = state;
+            assert!(matches!(
+                service.publish_ready(ready_receipt(&handshake, "ready-forbidden")),
+                Err(KernelServiceError::IllegalTransition {
+                    from,
+                    to: KernelServiceState::Ready
+                }) if from == state
+            ));
+        }
     }
 }

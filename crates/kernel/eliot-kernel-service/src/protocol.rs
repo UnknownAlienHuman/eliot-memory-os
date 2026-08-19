@@ -28,6 +28,13 @@ pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 1;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
+const PROBE_BINDING_PREFIXES: [&str; 5] = [
+    "kernel-probe-request:",
+    "kernel-probe-generation:",
+    "kernel-probe-authority-epoch:",
+    "kernel-probe-config:",
+    "kernel-probe-artifact:",
+];
 
 /// Handle-bound process identity carried as an inert Host claim.
 ///
@@ -1107,13 +1114,14 @@ impl ContainmentAction {
     }
 }
 
-/// Receipt proving that a Kernel candidate consumed its Host handoff nonce.
+/// Kernel-authored receipt proving live readiness for one activation lineage.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelReadyReceipt {
     /// Activation identity echoed from the handshake.
     pub activation_id: PlatformHandle,
-    /// Activation nonce echoed from the handshake.
+    /// Activation nonce echoed from the handshake. Repeat probes retain this
+    /// lineage binding without consuming the nonce again.
     pub activation_nonce: PlatformHandle,
     /// Process and Job Object observation at readiness time.
     pub process: ProcessObservation,
@@ -1124,6 +1132,44 @@ pub struct KernelReadyReceipt {
 }
 
 impl KernelReadyReceipt {
+    /// Returns the evidence handles that bind one self-authored readiness
+    /// receipt to the exact `ProbeReady` request and its authority contour.
+    ///
+    /// The response digest covers both `request_digest` and this receipt. The
+    /// repeated handles keep the receipt fail-closed when it is retained as a
+    /// standalone observation after the response envelope is gone.
+    pub fn probe_binding_evidence(
+        request: &KernelControlRequest,
+    ) -> Result<Vec<PlatformHandle>, KernelServiceError> {
+        request.validate()?;
+        if !matches!(&request.command, KernelControlCommand::ProbeReady) {
+            return Err(KernelServiceError::InvalidField {
+                field: "ready.probe_command",
+                reason: "readiness evidence requires ProbeReady",
+            });
+        }
+        [
+            format!("kernel-probe-request:{}", request.payload_digest),
+            format!("kernel-probe-generation:{}", request.generation.value()),
+            format!(
+                "kernel-probe-authority-epoch:{}",
+                request.handshake.kernel_epoch.value()
+            ),
+            format!(
+                "kernel-probe-config:{}",
+                request.handshake.config_hash.as_str()
+            ),
+            format!(
+                "kernel-probe-artifact:{}",
+                request.handshake.artifact_hash.as_str()
+            ),
+        ]
+        .into_iter()
+        .map(PlatformHandle::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(KernelServiceError::from)
+    }
+
     /// Validates readiness without inferring success from process existence.
     pub fn validate(&self, handshake: &HostKernelHandshake) -> Result<(), KernelServiceError> {
         handle(&self.activation_id, "ready.activation_id")?;
@@ -1158,6 +1204,28 @@ impl KernelReadyReceipt {
         }
         for evidence in &self.evidence_refs {
             handle(evidence, "ready.evidence_refs")?;
+        }
+        Ok(())
+    }
+
+    /// Validates a receipt against the exact authenticated readiness request.
+    ///
+    /// This rejects a valid receipt replayed for another request, generation,
+    /// authority fence, configuration, or approved artifact.
+    pub fn validate_for_probe(
+        &self,
+        request: &KernelControlRequest,
+    ) -> Result<(), KernelServiceError> {
+        self.validate(&request.handshake)?;
+        let expected = Self::probe_binding_evidence(request)?;
+        for (prefix, binding) in PROBE_BINDING_PREFIXES.into_iter().zip(expected) {
+            let mut matching = self
+                .evidence_refs
+                .iter()
+                .filter(|evidence| evidence.as_str().starts_with(prefix));
+            if matching.next() != Some(&binding) || matching.next().is_some() {
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
         }
         Ok(())
     }
@@ -1333,6 +1401,30 @@ mod tests {
         }
     }
 
+    fn probe_request(handshake: HostKernelHandshake) -> KernelControlRequest {
+        KernelControlRequest {
+            wire_id: KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: KERNEL_CONTROL_WIRE_VERSION,
+            message_id: handle_value("probe-message-1"),
+            sequence: 5,
+            peer_process_id: 7,
+            generation: ResourceGeneration::new(3).expect("generation"),
+            handshake,
+            command: KernelControlCommand::ProbeReady,
+            payload_digest: String::new(),
+        }
+        .with_computed_digest()
+        .expect("probe digest")
+    }
+
+    fn bound_ready_receipt(request: &KernelControlRequest) -> KernelReadyReceipt {
+        let mut receipt = ready_receipt(&request.handshake);
+        receipt
+            .evidence_refs
+            .extend(KernelReadyReceipt::probe_binding_evidence(request).expect("probe bindings"));
+        receipt
+    }
+
     #[test]
     fn ready_receipt_rejects_nonce_job_health_and_evidence_substitution() {
         let handshake = control_handshake();
@@ -1370,6 +1462,76 @@ mod tests {
             }
         });
         assert!(serde_json::from_value::<KernelControlCommand>(forged).is_err());
+    }
+
+    #[test]
+    fn ready_receipt_is_bound_to_exact_probe_generation_and_fence() {
+        let request = probe_request(control_handshake());
+        let receipt = bound_ready_receipt(&request);
+        assert!(receipt.validate_for_probe(&request).is_ok());
+
+        let mut stale_request = request.clone();
+        stale_request.message_id = handle_value("probe-message-2");
+        stale_request.sequence = 6;
+        stale_request.payload_digest = stale_request.compute_digest().expect("stale digest");
+        assert!(receipt.validate_for_probe(&stale_request).is_err());
+        let repeated = bound_ready_receipt(&stale_request);
+        assert!(repeated.validate_for_probe(&stale_request).is_ok());
+        assert_ne!(request.payload_digest, stale_request.payload_digest);
+        assert_ne!(receipt.evidence_refs, repeated.evidence_refs);
+        assert_eq!(receipt.activation_nonce, repeated.activation_nonce);
+        let mut next_repeat_request = stale_request.clone();
+        next_repeat_request.message_id = handle_value("probe-message-3");
+        next_repeat_request.sequence = 7;
+        next_repeat_request.payload_digest = next_repeat_request
+            .compute_digest()
+            .expect("next repeat digest");
+        let next_repeated = bound_ready_receipt(&next_repeat_request);
+        assert!(
+            next_repeated
+                .validate_for_probe(&next_repeat_request)
+                .is_ok()
+        );
+        assert!(repeated.validate_for_probe(&next_repeat_request).is_err());
+        assert_ne!(repeated.evidence_refs, next_repeated.evidence_refs);
+        assert_eq!(repeated.activation_nonce, next_repeated.activation_nonce);
+
+        let mut other_generation = request.clone();
+        other_generation.generation = ResourceGeneration::new(4).expect("generation");
+        other_generation.payload_digest = other_generation.compute_digest().expect("digest");
+        assert!(receipt.validate_for_probe(&other_generation).is_err());
+
+        let mut other_fence = request.clone();
+        other_fence.handshake.kernel_epoch = AuthorityEpoch::new(2).expect("epoch");
+        other_fence.payload_digest = other_fence.compute_digest().expect("digest");
+        assert!(receipt.validate_for_probe(&other_fence).is_err());
+
+        let mut other_config = request.clone();
+        other_config.handshake.config_hash = handle_value("config-2");
+        other_config.payload_digest = other_config.compute_digest().expect("digest");
+        assert!(receipt.validate_for_probe(&other_config).is_err());
+
+        let mut ambiguous = receipt.clone();
+        ambiguous
+            .evidence_refs
+            .push(handle_value("kernel-probe-authority-epoch:99"));
+        assert!(ambiguous.validate_for_probe(&request).is_err());
+
+        let mut substituted = receipt;
+        substituted.evidence_refs.retain(|evidence| {
+            !evidence
+                .as_str()
+                .starts_with("kernel-probe-authority-epoch:")
+        });
+        substituted
+            .evidence_refs
+            .push(handle_value("kernel-probe-authority-epoch:99"));
+        assert!(substituted.validate_for_probe(&request).is_err());
+
+        let mut non_probe = request;
+        non_probe.command = KernelControlCommand::Drain;
+        non_probe.payload_digest = non_probe.compute_digest().expect("digest");
+        assert!(KernelReadyReceipt::probe_binding_evidence(&non_probe).is_err());
     }
 
     #[test]
