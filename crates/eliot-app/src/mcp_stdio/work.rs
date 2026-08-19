@@ -142,18 +142,10 @@ pub(super) fn dispatch_patch_status(state: &McpState, arguments: Value) -> Resul
 pub(super) async fn dispatch_work_create(state: &McpState, arguments: Value) -> Result<Value> {
     let input: WorkCreateToolInput = serde_json::from_value(arguments)?;
     let mut work_state = load_work_state(&state.root)?;
-    let project_id = project_id_from_label(&input.project);
     let task_id = task_id_from_label(&input.task);
+    let (project_id, scope, required_verifiers) =
+        work_create_scope(&input.project, input.read, input.write)?;
     let session = AgentSessionService.create_controller(&mut work_state, project_id);
-    let write_set = input
-        .write
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| vec!["crates/eliot-engine/src/work.rs".to_owned()]);
-    let read_set = input
-        .read
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| write_set.clone());
-    let verifier = default_work_verifier(&write_set);
     let item = WorkQueueService.create_work_item(
         &mut work_state,
         WorkCreateRequest {
@@ -162,18 +154,10 @@ pub(super) async fn dispatch_work_create(state: &McpState, arguments: Value) -> 
             project: input.project.clone(),
             task: input.task.clone(),
             goal: input.goal,
-            scope: default_work_scope(
-                std::env::current_dir()?.display().to_string(),
-                read_set,
-                write_set,
-                verifier
-                    .iter()
-                    .map(|requirement| requirement.command_display.clone())
-                    .collect(),
-            ),
+            scope,
             required: true,
             created_by: session.agent_session_id,
-            required_verifiers: verifier,
+            required_verifiers,
         },
     );
     write_work_entities(

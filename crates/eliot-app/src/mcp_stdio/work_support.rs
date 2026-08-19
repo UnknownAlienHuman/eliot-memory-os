@@ -366,6 +366,95 @@ fn parse_mailbox_recipient(value: &str) -> Result<MailboxRecipient> {
     anyhow::bail!("unknown mailbox recipient: {value}")
 }
 
+/// Build the scope for the MCP work-create surface from caller-owned inputs.
+///
+/// The canonical project key may itself be an absolute repository path; when a
+/// non-path identity is used, the explicit governed repository environment is
+/// required.  Either authority is validated against Git before it enters
+/// durable scope state. Missing or invalid authority fails closed instead of
+/// silently selecting a process CWD or an installed package directory.
+fn work_create_scope(
+    project: &str,
+    read: Option<Vec<String>>,
+    write: Option<Vec<String>>,
+) -> Result<(ProjectId, eliot_types::WorkScope, Vec<VerifierRequirement>)> {
+    let project_id = project_id_from_label(project);
+    let write_set = write.unwrap_or_default();
+    let read_set = read.unwrap_or_else(|| write_set.clone());
+    let required_verifiers = if write_set.is_empty() {
+        Vec::new()
+    } else {
+        default_work_verifier(&write_set)
+    };
+    let verifier_set = required_verifiers
+        .iter()
+        .map(|requirement| requirement.command_display.clone())
+        .collect();
+    let repo_root = governed_work_repo_root(project)?;
+    Ok((
+        project_id,
+        default_work_scope(repo_root.display().to_string(), read_set, write_set, verifier_set),
+        required_verifiers,
+    ))
+}
+
+fn governed_work_repo_root(project: &str) -> Result<PathBuf> {
+    let configured_root = std::env::var_os("ELIOT_GOVERNOR_REPO_ROOT").map(PathBuf::from);
+    governed_work_repo_root_from(project, configured_root.as_deref())
+}
+
+fn governed_work_repo_root_from(project: &str, configured_root: Option<&Path>) -> Result<PathBuf> {
+    let project_path = Path::new(project);
+    let candidate = if project_path.is_absolute() {
+        project_path.to_path_buf()
+    } else {
+        configured_root
+            .context("work create requires an absolute project key or ELIOT_GOVERNOR_REPO_ROOT")?
+            .to_path_buf()
+    };
+    anyhow::ensure!(
+        candidate.is_absolute(),
+        "governed work repository root must be an absolute path: {}",
+        candidate.display()
+    );
+    let canonical = std::fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "governed work repository root does not resolve: {}",
+            candidate.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical.is_dir(),
+        "governed work repository root must be a directory: {}",
+        canonical.display()
+    );
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&canonical)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .with_context(|| format!("validate governed work root with git: {}", canonical.display()))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "governed work repository root is not a Git checkout: {}",
+        canonical.display()
+    );
+    let git_root = String::from_utf8(output.stdout)
+        .context("git returned a non-UTF-8 governed work repository root")?;
+    let canonical_git_root = std::fs::canonicalize(git_root.trim()).with_context(|| {
+        format!(
+            "canonicalize Git root returned for governed work root {}",
+            canonical.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical_git_root == canonical,
+        "governed work root must name the exact Git root: {}",
+        canonical.display()
+    );
+    Ok(canonical)
+}
+
 fn production_worktree_root(
     repo_root: &Path,
     project_id: ProjectId,
@@ -1496,4 +1585,117 @@ fn runtime_root(config_path: &Path) -> PathBuf {
         .and_then(Path::parent)
         .unwrap_or_else(|| Path::new(".eliot-governor"))
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod work_scope_tests {
+    use super::*;
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    }
+
+    #[test]
+    fn canonical_project_work_create_preserves_read_only_scope_and_root() -> Result<()> {
+        let project_root = std::fs::canonicalize(workspace_root())?;
+        let canonical_project = project_root.display().to_string();
+        let (project_id, scope, required_verifiers) = work_create_scope(
+            &canonical_project,
+            Some(vec!["crates/eliot-app/src/mcp_stdio/work.rs".to_owned()]),
+            Some(Vec::new()),
+        )?;
+
+        assert_eq!(project_id, project_id_from_label(&canonical_project));
+        assert_eq!(scope.repo_root, project_root.display().to_string());
+        assert_eq!(
+            scope.read_set,
+            vec!["crates/eliot-app/src/mcp_stdio/work.rs".to_owned()]
+        );
+        assert!(scope.write_set.is_empty());
+        assert!(scope.verifier_set.is_empty());
+        assert!(required_verifiers.is_empty());
+        assert!(!scope
+            .write_set
+            .contains(&"crates/eliot-engine/src/work.rs".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn absolute_project_key_is_the_scope_root_and_identity_source() -> Result<()> {
+        let project_root = std::fs::canonicalize(workspace_root())?;
+        let absolute_project_key = project_root.display().to_string();
+        let (_project_id, scope, _verifier) = work_create_scope(
+            &absolute_project_key,
+            Some(vec!["docs".to_owned()]),
+            Some(vec!["crates/eliot-app/src/mcp_stdio/work.rs".to_owned()]),
+        )?;
+        assert_eq!(scope.repo_root, project_root.display().to_string());
+        assert_eq!(scope.read_set, vec!["docs".to_owned()]);
+        assert_eq!(
+            scope.write_set,
+            vec!["crates/eliot-app/src/mcp_stdio/work.rs".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_path_identity_uses_only_an_explicit_governed_root() -> Result<()> {
+        let project_root = std::fs::canonicalize(workspace_root())?;
+        let resolved = governed_work_repo_root_from(
+            "4b751723-9cf1-84a1-8611-7e1f2a090dd7",
+            Some(&project_root),
+        )?;
+        assert_eq!(resolved, project_root);
+        Ok(())
+    }
+
+    #[test]
+    fn governed_root_validation_is_stack_neutral() -> Result<()> {
+        let temp_root = std::env::temp_dir().join(format!(
+            "eliot-work-scope-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)?;
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(&temp_root)
+            .output()?;
+        anyhow::ensure!(
+            init.status.success(),
+            "git init failed for stack-neutral scope test: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let expected_root = std::fs::canonicalize(&temp_root)?;
+        let root_result = governed_work_repo_root_from(&temp_root.display().to_string(), None);
+        let cleanup_result = std::fs::remove_dir_all(&temp_root);
+        let root = root_result?;
+        cleanup_result?;
+        assert_eq!(root, expected_root);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_relative_project_key_fails_closed() {
+        let missing = match governed_work_repo_root_from("eliot-memory-os", None) {
+            Ok(root) => panic!(
+                "non-path project key unexpectedly resolved to governed root {}",
+                root.display()
+            ),
+            Err(error) => error,
+        };
+        assert!(missing.to_string().contains("absolute project key"));
+
+        let relative = match governed_work_repo_root_from("projects/eliot-memory-os", None) {
+            Ok(root) => panic!(
+                "relative project key unexpectedly resolved to governed root {}",
+                root.display()
+            ),
+            Err(error) => error,
+        };
+        assert!(relative.to_string().contains("absolute project key"));
+    }
 }
