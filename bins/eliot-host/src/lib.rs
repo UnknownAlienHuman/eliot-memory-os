@@ -1898,6 +1898,7 @@ fn clean_marker_record(
     }))
 }
 
+#[cfg(test)]
 fn append_clean_marker<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     host: &HostInstallationEpoch,
