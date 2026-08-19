@@ -15,7 +15,8 @@ use std::os::windows::process::CommandExt as _;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const OWNED_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 
 fn daemon_run_arguments(instance_name: &str) -> [&str; 4] {
@@ -47,7 +48,9 @@ pub(crate) async fn ensure_daemon_ready(
 ) -> Result<Value> {
     let instance = RuntimeInstance::select(config_path, Some(instance_name))?;
     if let Ok(publication) = live_publication(&instance, protocol_version).await {
-        let report = readiness_report(&publication, governor, requester, false, false);
+        validate_runtime_request_binding(&publication, governor, config_path)
+            .context("existing Eliot daemon does not match the requested runtime")?;
+        let report = readiness_report(&publication, governor, config_path, requester, false, false);
         write_report(&instance, &report)?;
         return Ok(report);
     }
@@ -77,9 +80,21 @@ pub(crate) async fn ensure_daemon_ready(
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     loop {
         if let Ok(publication) = live_publication(&instance, protocol_version).await {
+            if let Err(error) =
+                validate_runtime_request_binding(&publication, governor, config_path)
+            {
+                if child.try_wait()?.is_none() {
+                    stop_owned_daemon(&instance, &mut child)
+                        .await
+                        .context("stop owned daemon after runtime binding mismatch")?;
+                }
+                return Err(error)
+                    .context("started Eliot daemon does not match the requested runtime");
+            }
             let report = readiness_report(
                 &publication,
                 governor,
+                config_path,
                 requester,
                 true,
                 stale_runtime_recovered,
@@ -93,8 +108,7 @@ pub(crate) async fn ensure_daemon_ready(
             );
         }
         if tokio::time::Instant::now() >= deadline {
-            child
-                .kill()
+            stop_owned_daemon(&instance, &mut child)
                 .await
                 .context("stop owned daemon after readiness timeout")?;
             bail!(
@@ -104,6 +118,21 @@ pub(crate) async fn ensure_daemon_ready(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+async fn stop_owned_daemon(
+    instance: &RuntimeInstance,
+    child: &mut tokio::process::Child,
+) -> Result<()> {
+    std::fs::create_dir_all(instance.runtime_dir())?;
+    std::fs::write(
+        instance.stop_marker(),
+        time::OffsetDateTime::now_utc().to_string(),
+    )?;
+    tokio::time::timeout(OWNED_STOP_TIMEOUT, child.wait())
+        .await
+        .context("owned Eliot daemon did not stop cooperatively")??;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -227,6 +256,7 @@ async fn live_publication(
 fn readiness_report(
     publication: &RuntimePublication,
     governor: &Path,
+    config_path: &Path,
     requester: &str,
     started_by_request: bool,
     stale_runtime_recovered: bool,
@@ -241,6 +271,13 @@ fn readiness_report(
     let requested_hash = file_hash(&requested_executable);
     let runtime_hash = file_hash(&published);
     let executable_bytes_match = runtime_hash.is_some() && runtime_hash == requested_hash;
+    let requested_config = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    let published_config = publication
+        .config_path
+        .canonicalize()
+        .unwrap_or_else(|_| publication.config_path.clone());
     json!({
         "schema_version": "eliot-runtime-bootstrap-readiness-v1",
         "status": "ready",
@@ -257,8 +294,55 @@ fn readiness_report(
         "runtime_executable_hash": runtime_hash,
         "requested_executable_hash": requested_hash,
         "runtime_executable_bytes_match_request": executable_bytes_match,
+        "runtime_config": published_config,
+        "requested_config": requested_config,
+        "runtime_config_matches_request": path_eq_case_insensitive(&published_config, &requested_config),
         "service_registry_or_admin_mutation": false
     })
+}
+
+fn validate_runtime_request_binding(
+    publication: &RuntimePublication,
+    governor: &Path,
+    config_path: &Path,
+) -> Result<()> {
+    let requested_executable = governor
+        .canonicalize()
+        .unwrap_or_else(|_| governor.to_path_buf());
+    let published_executable = publication
+        .executable
+        .canonicalize()
+        .unwrap_or_else(|_| publication.executable.clone());
+    if !path_eq_case_insensitive(&published_executable, &requested_executable) {
+        bail!(
+            "Eliot daemon executable mismatch: requested {}, published {}",
+            requested_executable.display(),
+            published_executable.display()
+        );
+    }
+    let requested_hash =
+        file_hash(&requested_executable).context("hash requested Eliot Governor executable")?;
+    let published_hash =
+        file_hash(&published_executable).context("hash published Eliot Governor executable")?;
+    if requested_hash != published_hash {
+        bail!("Eliot daemon executable bytes differ from the requested Governor");
+    }
+
+    let requested_config = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    let published_config = publication
+        .config_path
+        .canonicalize()
+        .unwrap_or_else(|_| publication.config_path.clone());
+    if !path_eq_case_insensitive(&published_config, &requested_config) {
+        bail!(
+            "Eliot daemon config mismatch: requested {}, published {}",
+            requested_config.display(),
+            published_config.display()
+        );
+    }
+    Ok(())
 }
 
 fn write_report(instance: &RuntimeInstance, report: &Value) -> Result<()> {
@@ -288,6 +372,31 @@ fn file_hash(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn publication_for_binding(
+        executable: &Path,
+        config_path: &Path,
+        root: &Path,
+    ) -> RuntimePublication {
+        RuntimePublication {
+            schema_version: "test".to_owned(),
+            protocol_version: "test".to_owned(),
+            instance_name: "test".to_owned(),
+            runtime_id: uuid::Uuid::now_v7().to_string(),
+            auth_generation: uuid::Uuid::now_v7().to_string(),
+            pipe_name: r"\\.\pipe\eliot-test".to_owned(),
+            daemon_pid: 1,
+            process_start_identity: "test".to_owned(),
+            executable: executable.to_path_buf(),
+            executable_sha256: String::new(),
+            config_path: config_path.to_path_buf(),
+            store_root: root.to_path_buf(),
+            publication_root: root.to_path_buf(),
+            state: crate::runtime_instance::RuntimePublicationState::Ready,
+            auth_ref: root.join("auth.bin"),
+            published_at: "test".to_owned(),
+        }
+    }
+
     #[test]
     fn unique_bootstrap_target_never_falls_back_to_default() -> Result<()> {
         let config = std::env::temp_dir().join("eliot-bootstrap-instance-regression.toml");
@@ -311,5 +420,33 @@ mod tests {
             daemon_run_arguments(DEFAULT_INSTANCE_NAME),
             ["daemon", "run", "--instance", DEFAULT_INSTANCE_NAME]
         );
+    }
+
+    #[test]
+    fn runtime_binding_requires_exact_executable_and_config() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("eliot-bootstrap-binding-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root)?;
+        let governor = root.join("eliot-governor.exe");
+        let other_governor = root.join("other-governor.exe");
+        let config = root.join("governor.toml");
+        let other_config = root.join("other.toml");
+        std::fs::write(&governor, b"governor")?;
+        std::fs::write(&other_governor, b"governor")?;
+        std::fs::write(&config, b"config")?;
+        std::fs::write(&other_config, b"config")?;
+
+        let exact = publication_for_binding(&governor, &config, &root);
+        validate_runtime_request_binding(&exact, &governor, &config)?;
+
+        let substituted_executable = publication_for_binding(&other_governor, &config, &root);
+        assert!(
+            validate_runtime_request_binding(&substituted_executable, &governor, &config).is_err()
+        );
+        let substituted_config = publication_for_binding(&governor, &other_config, &root);
+        assert!(validate_runtime_request_binding(&substituted_config, &governor, &config).is_err());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

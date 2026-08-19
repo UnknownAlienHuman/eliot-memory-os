@@ -735,6 +735,17 @@ async fn execute_real(
     preregistration: &ProviderReviewPreRegistration,
 ) -> Result<DelegationExecutionEvidence> {
     let started = Instant::now();
+    let governor = std::env::current_exe()
+        .context("resolve Eliot Governor executable for provider runtime bootstrap")?;
+    crate::runtime_bootstrap::ensure_default_daemon_ready(
+        config_path,
+        &governor,
+        crate::named_pipe_ipc::IPC_PROTOCOL_VERSION,
+        "delegate_execute_provider",
+    )
+    .await
+    .context("ensure the matching Eliot daemon is ready before provider supervision")?;
+
     let service = AntigravityDisposableWorktreeSmokeService;
     let repo_root = PathBuf::from(&work_lease.scope.repo_root).canonicalize()?;
     let live_before = service.snapshot_live_tree(&repo_root)?;
