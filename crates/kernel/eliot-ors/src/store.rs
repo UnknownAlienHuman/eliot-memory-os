@@ -629,22 +629,26 @@ impl RedbRecoveryStore {
         Ok(result)
     }
 
-    /// Atomically reserves one typed authority handoff by create-if-absent.
-    pub fn begin_authority_handoff(
+    /// Test-only admission hook without a freshness check.
+    ///
+    /// Production callers must use [`Self::begin_authority_handoff_fresh`],
+    /// which samples the system clock inside the write transaction.
+    #[cfg(test)]
+    pub(crate) fn begin_authority_handoff(
         &self,
         record: &AuthorityHandoffRecord,
     ) -> Result<AuthorityHandoffBegin, OrsError> {
         self.begin_authority_handoff_with_now(record, None)
     }
 
-    /// Atomically reserves one typed authority handoff after checking its
-    /// fresh-admission interval against the supplied clock observation.
+    /// Test-only deterministic-clock admission hook.
     ///
     /// The freshness check is performed inside the same redb write
     /// transaction as the create-if-absent decision. Callers that already
     /// have a deterministic clock observation (for example, acceptance
     /// tests) can use this method to exercise the exact boundary.
-    pub fn begin_authority_handoff_at(
+    #[cfg(test)]
+    pub(crate) fn begin_authority_handoff_at(
         &self,
         record: &AuthorityHandoffRecord,
         now_ms: i64,
@@ -673,6 +677,7 @@ impl RedbRecoveryStore {
         Ok(outcome)
     }
 
+    #[cfg(test)]
     fn begin_authority_handoff_with_now(
         &self,
         record: &AuthorityHandoffRecord,
