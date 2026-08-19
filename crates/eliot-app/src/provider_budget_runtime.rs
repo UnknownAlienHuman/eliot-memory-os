@@ -102,7 +102,7 @@ fn seal_or_reuse_preregistration_unlocked(
         bail!("provider execution campaign does not contain a frozen baseline");
     }
 
-    let project_root = project_root(root);
+    let project_root = calibration_runtime::campaign_project_root(root, project_id, task_id)?;
     let mut frozen_input_refs = campaign.frozen_input_refs.clone();
     frozen_input_refs.sort();
     let frozen_input_digests = recompute_frozen_input_refs(&project_root, &frozen_input_refs)?;
@@ -225,7 +225,12 @@ pub fn validate_sealed_preregistration(
     let execution_token = ProviderReviewPreRegistrationService::execution_token(preregistration);
     ProviderReviewPreRegistrationService::validate_token(preregistration, &execution_token)
         .map_err(anyhow::Error::msg)?;
-    let current_digests = recompute_frozen_inputs(&project_root(root), preregistration)?;
+    let project_root = calibration_runtime::campaign_project_root(
+        root,
+        preregistration.project_id,
+        preregistration.real_task_id,
+    )?;
+    let current_digests = recompute_frozen_inputs(&project_root, preregistration)?;
     if current_digests != preregistration.frozen_input_digests
         || digest_set_hash(&current_digests)? != preregistration.frozen_input_hash
     {
@@ -366,11 +371,24 @@ fn validate_preregistration_identity(
     Ok(())
 }
 
-fn project_root(root: &Path) -> PathBuf {
-    root.parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf()
+pub(crate) fn canonical_provider_idempotency_key(
+    project_root: &Path,
+    campaign_id: &str,
+    task_id: TaskId,
+    baseline_commit: &str,
+    frozen_input_refs: &[String],
+) -> Result<String> {
+    let mut frozen_input_refs = frozen_input_refs.to_vec();
+    frozen_input_refs.sort();
+    let frozen_input_digests = recompute_frozen_input_refs(project_root, &frozen_input_refs)?;
+    let frozen_input_hash = digest_set_hash(&frozen_input_digests)?;
+    Ok(ProviderReviewPreRegistrationService::idempotency_key(
+        campaign_id,
+        task_id,
+        PROVIDER,
+        baseline_commit,
+        &frozen_input_hash,
+    ))
 }
 
 fn with_provider_gate_lock<T, F>(root: &Path, operation: F) -> Result<T>
@@ -450,12 +468,14 @@ mod tests {
     use super::*;
     use eliot_engine::{
         ProviderCallCampaignRequest, ProviderCallReservationDecision, ProviderCallReservationOwner,
-        ProviderCallReservationRequest,
+        ProviderCallReservationRequest, WorkState, default_work_scope,
     };
     use eliot_types::{
-        DelegationCalibrationCampaignBudget, DelegationCalibrationCampaignCloseoutStatus,
-        DelegationCalibrationTaskFamily, DelegationEvidenceFloorSnapshot, DelegationOrigin,
-        DelegationProviderPreference, DelegationReviewKind,
+        AgentId, AgentRole, AgentSessionId, DelegationCalibrationCampaignBudget,
+        DelegationCalibrationCampaignCloseoutStatus, DelegationCalibrationTaskFamily,
+        DelegationEvidenceFloorSnapshot, DelegationOrigin, DelegationProviderPreference,
+        DelegationReviewKind, WorkItemId, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind,
+        WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
     };
     use serde_json::json;
 
@@ -473,10 +493,55 @@ mod tests {
                 std::env::temp_dir().join(format!("eliot-antigravity-prereg-{}", TaskId::new_v7()));
             let root = project_root.join(".eliot-governor");
             std::fs::create_dir_all(&project_root)?;
+            let git_init = Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&project_root)
+                .output()?;
+            anyhow::ensure!(
+                git_init.status.success(),
+                "git init failed: {}",
+                String::from_utf8_lossy(&git_init.stderr)
+            );
             let input_path = project_root.join("frozen-input.txt");
             std::fs::write(&input_path, b"frozen evidence v1")?;
             let project_id = ProjectId::new_v7();
             let task_id = TaskId::new_v7();
+            let now = OffsetDateTime::now_utc();
+            let work_lease_id = WorkLeaseId::new_v7();
+            let mut work_state = WorkState::default();
+            work_state.leases.push(WorkLease {
+                work_lease_id,
+                work_item_id: WorkItemId::new_v7(),
+                agent_session_id: AgentSessionId::new_v7(),
+                agent_id: AgentId::new_v7(),
+                project_id,
+                task_id,
+                role: AgentRole::Auditor,
+                state: WorkLeaseState::Granted,
+                epoch: 1,
+                scope: default_work_scope(
+                    project_root.display().to_string(),
+                    vec![".".to_owned()],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                decision: WorkLeaseDecision {
+                    kind: WorkLeaseDecisionKind::Granted,
+                    reason: WorkLeaseDecisionReason::NoConflict,
+                    message: "test audit lease".to_owned(),
+                    work_lease_id: Some(work_lease_id),
+                    conflicting_lease_ids: Vec::new(),
+                    expires_at: Some(now + time::Duration::hours(1)),
+                },
+                conflict_refs: Vec::new(),
+                granted_at: now,
+                expires_at: now + time::Duration::hours(1),
+                renewed_at: None,
+                released_at: None,
+                revoked_at: None,
+                write_receipt: None,
+            });
+            crate::delegation_runtime::save_work_state(&root, &work_state)?;
             let campaign_id = format!("campaign:{task_id}");
             let campaign = DelegationCalibrationCampaign {
                 campaign_id: campaign_id.clone(),

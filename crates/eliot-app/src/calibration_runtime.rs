@@ -75,10 +75,18 @@ pub fn campaign_preview(
             && campaign.task_family == input.task_family
             && !DelegationCalibrationCampaignService::is_terminal(campaign.state)
     }) {
+        let idempotency_key = crate::provider_budget_runtime::canonical_provider_idempotency_key(
+            &project_root,
+            &existing.campaign_id,
+            input.task_id,
+            &existing.baseline_commit,
+            &existing.frozen_input_refs,
+        )?;
         return Ok(json!({
             "component":"delegation_calibration_campaign_preview",
             "created":false,
             "campaign":existing,
+            "idempotency_key":idempotency_key,
             "provider_process_started":false
         }));
     }
@@ -114,6 +122,13 @@ pub fn campaign_preview(
     DelegationCalibrationCampaignService
         .transition(&mut campaign, DelegationCalibrationCampaignState::Ready)
         .map_err(anyhow::Error::msg)?;
+    let idempotency_key = crate::provider_budget_runtime::canonical_provider_idempotency_key(
+        &project_root,
+        &campaign.campaign_id,
+        input.task_id,
+        &campaign.baseline_commit,
+        &campaign.frozen_input_refs,
+    )?;
     state.campaigns.push(campaign.clone());
     save(root, &state)?;
     write_pair(root, "delegation-calibration-campaign", &campaign)?;
@@ -121,11 +136,16 @@ pub fn campaign_preview(
         "component":"delegation_calibration_campaign_preview",
         "created":true,
         "campaign":campaign,
+        "idempotency_key":idempotency_key,
         "provider_process_started":false
     }))
 }
 
-fn campaign_project_root(root: &Path, project_id: ProjectId, task_id: TaskId) -> Result<PathBuf> {
+pub(crate) fn campaign_project_root(
+    root: &Path,
+    project_id: ProjectId,
+    task_id: TaskId,
+) -> Result<PathBuf> {
     let work_state = crate::delegation_runtime::load_work_state(root)?;
     let declared_root = select_campaign_repo_root(&work_state, project_id, task_id)?;
     let project_root = PathBuf::from(declared_root)
