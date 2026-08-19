@@ -1573,6 +1573,12 @@ pub struct RuntimeLaunchDescriptor {
     pub eliotd_executable_path: PlatformHandle,
     /// SHA-256 digest of the approved `eliotd.exe` image.
     pub eliotd_artifact_digest: PlatformHandle,
+    /// Explicit protected `GovernorLaunchConfig` path consumed only by
+    /// `eliotd`. This is a distinct schema and artifact domain from the
+    /// concrete Store configuration.
+    pub eliotd_config_path: PlatformHandle,
+    /// SHA-256 digest of the exact `GovernorLaunchConfig` bytes.
+    pub eliotd_config_digest: PlatformHandle,
     /// Explicit serialized `EliotdLaunchDescriptor` path.
     pub eliotd_descriptor_path: PlatformHandle,
     /// SHA-256 digest of the serialized `EliotdLaunchDescriptor` bytes.
@@ -1581,10 +1587,9 @@ pub struct RuntimeLaunchDescriptor {
     /// It is not an authority credential; process/Job/pipe evidence is.
     pub eliotd_launch_nonce: PlatformHandle,
     /// Explicit concrete Store bridge configuration path. Its digest is the
-    /// parent [`CandidateManifest::config_digest`] binding and is checked
-    /// against the serialized eliotd descriptor by Host; it is intentionally
-    /// not duplicated here because the config digest projection contains this
-    /// launch descriptor and a second back-reference would be cyclic.
+    /// parent [`CandidateManifest::config_digest`] binding. It is never
+    /// consumed as the daemon's `GovernorLaunchConfig`; that independent
+    /// domain is bound by `eliotd_config_path` and `eliotd_config_digest`.
     pub store_config_path: PlatformHandle,
     /// Exact Credential Manager target provisioned for this Store generation.
     ///
@@ -1767,6 +1772,8 @@ impl RuntimeLaunchDescriptor {
             kernel_artifact_digest: &'a PlatformHandle,
             eliotd_executable_path: &'a PlatformHandle,
             eliotd_artifact_digest: &'a PlatformHandle,
+            eliotd_config_path: &'a PlatformHandle,
+            eliotd_config_digest: &'a PlatformHandle,
             eliotd_descriptor_path: &'a PlatformHandle,
             eliotd_descriptor_digest: &'a PlatformHandle,
             eliotd_launch_nonce: &'a PlatformHandle,
@@ -1798,6 +1805,8 @@ impl RuntimeLaunchDescriptor {
             kernel_artifact_digest: &self.kernel_artifact_digest,
             eliotd_executable_path: &self.eliotd_executable_path,
             eliotd_artifact_digest: &self.eliotd_artifact_digest,
+            eliotd_config_path: &self.eliotd_config_path,
+            eliotd_config_digest: &self.eliotd_config_digest,
             eliotd_descriptor_path: &self.eliotd_descriptor_path,
             eliotd_descriptor_digest: &self.eliotd_descriptor_digest,
             eliotd_launch_nonce: &self.eliotd_launch_nonce,
@@ -1819,6 +1828,13 @@ impl RuntimeLaunchDescriptor {
             field: "manifest.runtime_launch".to_owned(),
             reason: error.to_string(),
         })
+    }
+
+    /// Computes the canonical self-digest after all explicit launch bindings
+    /// have been populated. Installers use this while materializing a new
+    /// immutable descriptor; validation never repairs or infers a digest.
+    pub fn compute_digest(&self) -> Result<String, InstallationError> {
+        Ok(sha256_hex(&self.unsigned_bytes()?))
     }
 
     /// Validates the explicit launch contour and its self-digest.
@@ -1886,6 +1902,14 @@ impl RuntimeLaunchDescriptor {
         sha256_handle(
             &self.eliotd_artifact_digest,
             "runtime_launch.eliotd_artifact_digest",
+        )?;
+        approved_path(
+            &self.eliotd_config_path,
+            "runtime_launch.eliotd_config_path",
+        )?;
+        sha256_handle(
+            &self.eliotd_config_digest,
+            "runtime_launch.eliotd_config_digest",
         )?;
         approved_path(
             &self.eliotd_descriptor_path,
@@ -2006,6 +2030,10 @@ impl RuntimeLaunchDescriptor {
             ),
             (&self.store_config_path, "runtime_launch.store_config_path"),
             (
+                &self.eliotd_config_path,
+                "runtime_launch.eliotd_config_path",
+            ),
+            (
                 &self.store_bootstrap_descriptor_path,
                 "runtime_launch.store_bootstrap_descriptor_path",
             ),
@@ -2034,6 +2062,10 @@ impl RuntimeLaunchDescriptor {
                 "runtime_launch.authority_descriptor_path",
             ),
             (&self.store_config_path, "runtime_launch.store_config_path"),
+            (
+                &self.eliotd_config_path,
+                "runtime_launch.eliotd_config_path",
+            ),
             (
                 &self.store_bootstrap_descriptor_path,
                 "runtime_launch.store_bootstrap_descriptor_path",
@@ -2091,7 +2123,7 @@ impl RuntimeLaunchDescriptor {
         }
         self.validate_canonical_store_arguments()?;
         sha256_handle(&self.descriptor_digest, "runtime_launch.descriptor_digest")?;
-        if sha256_hex(&self.unsigned_bytes()?) != self.descriptor_digest.as_str() {
+        if self.compute_digest()? != self.descriptor_digest.as_str() {
             return Err(InstallationError::InvalidField {
                 field: "runtime_launch.descriptor_digest".to_owned(),
                 reason: "descriptor digest mismatch".to_owned(),
@@ -2175,6 +2207,18 @@ impl CandidateManifest {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.store_config_path".to_owned(),
                 reason: "must exactly equal the approved manifest config_path".to_owned(),
+            });
+        }
+        if self.runtime_launch.eliotd_config_path == self.config_path
+            || self.runtime_launch.eliotd_config_path
+                == self.runtime_launch.authority_descriptor_path
+            || self.runtime_launch.eliotd_config_path
+                == self.runtime_launch.store_bootstrap_descriptor_path
+            || self.runtime_launch.eliotd_config_path == self.runtime_launch.eliotd_descriptor_path
+        {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.runtime_launch.eliotd_config_path".to_owned(),
+                reason: "eliotd Governor config must be distinct from Store config and authority descriptors".to_owned(),
             });
         }
         if self.runtime_launch.eliotd_descriptor_path == self.config_path
@@ -2785,6 +2829,58 @@ struct PrePendingRegistryWire {
     last_known_good_generation: Option<PlatformHandle>,
 }
 
+fn is_pre_eliotd_config_registry(bytes: &[u8]) -> bool {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    let Some(generations) = value
+        .get_mut("generations")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    if generations.is_empty() {
+        return false;
+    }
+    for (index, generation) in generations.iter_mut().enumerate() {
+        let Some(runtime) = generation
+            .get_mut("manifest")
+            .and_then(|manifest| manifest.get_mut("runtime_launch"))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return false;
+        };
+        if runtime.contains_key("eliotd_config_path")
+            || runtime.contains_key("eliotd_config_digest")
+        {
+            return false;
+        }
+        runtime.insert(
+            "eliotd_config_path".to_owned(),
+            serde_json::Value::String(format!(
+                r"C:\ProgramData\Eliot\Migration\eliotd-governor-{index}.json"
+            )),
+        );
+        runtime.insert(
+            "eliotd_config_digest".to_owned(),
+            serde_json::Value::String("0".repeat(64)),
+        );
+    }
+    let Ok(mut registry) = serde_json::from_value::<ApprovedGenerationRegistry>(value) else {
+        return false;
+    };
+    for generation in &mut registry.generations {
+        let Ok(bytes) = generation.manifest.runtime_launch.unsigned_bytes() else {
+            return false;
+        };
+        let Ok(digest) = PlatformHandle::new(sha256_hex(&bytes)) else {
+            return false;
+        };
+        generation.manifest.runtime_launch.descriptor_digest = digest;
+    }
+    registry.validate().is_ok()
+}
+
 fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, InstallationError> {
     match serde_json::from_slice::<ApprovedGenerationRegistry>(bytes) {
         Ok(registry) => {
@@ -2796,7 +2892,12 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             Ok(registry)
         }
         Err(_) => {
-            if serde_json::from_slice::<PreCredentialBindingRegistryWire>(bytes).is_ok() {
+            if is_pre_eliotd_config_registry(bytes) {
+                Err(InstallationError::MigrationRequired {
+                    reason: "approved-generation registry predates the separate eliotd Governor config binding and requires explicit re-stage"
+                        .to_owned(),
+                })
+            } else if serde_json::from_slice::<PreCredentialBindingRegistryWire>(bytes).is_ok() {
                 Err(InstallationError::MigrationRequired {
                     reason: "approved-generation registry predates the descriptor-bound Store credential target and requires explicit re-stage"
                         .to_owned(),
@@ -8912,6 +9013,8 @@ mod tests {
                     kernel_artifact_digest: test_handle("0".repeat(64)),
                     eliotd_executable_path: test_path(&root, "eliotd.exe"),
                     eliotd_artifact_digest: test_handle("8".repeat(64)),
+                    eliotd_config_path: test_path(&root, "eliotd-governor.json"),
+                    eliotd_config_digest: test_handle("4".repeat(64)),
                     eliotd_descriptor_path: test_path(&root, "eliotd.json"),
                     eliotd_descriptor_digest: test_handle("9".repeat(64)),
                     eliotd_launch_nonce: test_handle(format!("eliotd:{}", "a".repeat(32))),
@@ -10719,6 +10822,21 @@ mod tests {
             original.as_str()
         );
 
+        let mut daemon_config_path = descriptor.clone();
+        daemon_config_path.eliotd_config_path =
+            test_path(&std::env::temp_dir(), "alternate-eliotd-governor.json");
+        assert_ne!(
+            sha256_hex(&must(daemon_config_path.unsigned_bytes())),
+            original.as_str()
+        );
+
+        let mut daemon_config_digest = descriptor.clone();
+        daemon_config_digest.eliotd_config_digest = test_handle("6".repeat(64));
+        assert_ne!(
+            sha256_hex(&must(daemon_config_digest.unsigned_bytes())),
+            original.as_str()
+        );
+
         let mut child_argument_swap = descriptor;
         let config_path = transaction.candidate_manifest.config_path;
         child_argument_swap.kernel_arguments[11] = test_handle("9".repeat(64));
@@ -10900,6 +11018,8 @@ mod tests {
         for field in [
             "eliotd_executable_path",
             "eliotd_artifact_digest",
+            "eliotd_config_path",
+            "eliotd_config_digest",
             "eliotd_descriptor_path",
             "eliotd_descriptor_digest",
             "eliotd_launch_nonce",
@@ -10946,6 +11066,8 @@ mod tests {
         for field in [
             "eliotd_executable_path",
             "eliotd_artifact_digest",
+            "eliotd_config_path",
+            "eliotd_config_digest",
             "eliotd_descriptor_path",
             "eliotd_descriptor_digest",
             "eliotd_launch_nonce",
@@ -10987,12 +11109,39 @@ mod tests {
         for field in [
             "eliotd_executable_path",
             "eliotd_artifact_digest",
+            "eliotd_config_path",
+            "eliotd_config_digest",
             "eliotd_descriptor_path",
             "eliotd_descriptor_digest",
             "eliotd_launch_nonce",
         ] {
             runtime.remove(field);
         }
+        value
+    }
+
+    fn pre_eliotd_config_registry_value() -> serde_json::Value {
+        let transaction = registering_transaction();
+        let generation = transaction.candidate_manifest.generation.clone();
+        let registry = ApprovedGenerationRegistry {
+            generations: vec![ApprovedGeneration {
+                manifest: transaction.candidate_manifest,
+                approval_ref: test_handle("approval:pre-eliotd-config"),
+                active: true,
+                last_known_good: false,
+            }],
+            active_generation: Some(generation),
+            last_known_good_generation: None,
+            pending_activation: None,
+            last_terminal_activation: None,
+        };
+        let mut value = must(serde_json::to_value(registry));
+        let Some(runtime) = value["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
+        else {
+            panic!("pre-eliotd-config fixture runtime launch");
+        };
+        runtime.remove("eliotd_config_path");
+        runtime.remove("eliotd_config_digest");
         value
     }
 
@@ -11015,6 +11164,19 @@ mod tests {
             error,
             InstallationError::MigrationRequired { reason }
                 if reason.contains("descriptor-bound Store credential target")
+        ));
+    }
+
+    #[test]
+    fn pre_eliotd_config_registry_requires_explicit_restage() {
+        let bytes = must(serde_json::to_vec(&pre_eliotd_config_registry_value()));
+        let Err(error) = decode_registry_bytes(&bytes) else {
+            panic!("pre-eliotd-config registry must require migration");
+        };
+        assert!(matches!(
+            error,
+            InstallationError::MigrationRequired { reason }
+                if reason.contains("separate eliotd Governor config")
         ));
     }
 
@@ -11343,6 +11505,30 @@ mod tests {
         assert!(
             matches!(error, InstallationError::InvalidField { field, .. } if field == "manifest.runtime_launch.store_config_path")
         );
+    }
+
+    #[test]
+    fn manifest_rejects_eliotd_governor_config_domain_substitution() {
+        let mut store_alias = registering_transaction().candidate_manifest;
+        store_alias.runtime_launch.eliotd_config_path = store_alias.config_path.clone();
+        reseal(&mut store_alias.runtime_launch);
+        assert!(matches!(
+            store_alias.validate(),
+            Err(InstallationError::InvalidField { field, .. })
+                if field == "manifest.runtime_launch.eliotd_config_path"
+        ));
+
+        let mut descriptor_alias = registering_transaction().candidate_manifest;
+        descriptor_alias.runtime_launch.eliotd_config_path = descriptor_alias
+            .runtime_launch
+            .eliotd_descriptor_path
+            .clone();
+        reseal(&mut descriptor_alias.runtime_launch);
+        assert!(matches!(
+            descriptor_alias.validate(),
+            Err(InstallationError::InvalidField { field, .. })
+                if field == "manifest.runtime_launch.eliotd_config_path"
+        ));
     }
 
     #[test]

@@ -84,6 +84,12 @@ impl ProcessStartReplayRecord {
         })?;
         match (&self.state, &self.receipt) {
             (ProcessStartReplayState::Completed, Some(receipt)) => {
+                receipt
+                    .validate()
+                    .map_err(|error| OrsError::IntegrityProblem {
+                        record_type: "process_start_replay",
+                        reason: error.to_string(),
+                    })?;
                 if receipt.operation_id().as_str() != self.operation_id.as_str() {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "process_start_replay",

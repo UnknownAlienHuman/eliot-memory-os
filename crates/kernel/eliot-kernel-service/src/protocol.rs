@@ -33,8 +33,6 @@ pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.eliotd-launch";
 /// Version of the exact `eliotd` child launch contract.
 pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION: u16 = 1;
-/// Maximum number of argv entries admitted for one daemon launch.
-const MAX_ELIOTD_LAUNCH_ARGUMENTS: usize = 64;
 const PROBE_BINDING_PREFIXES: [&str; 5] = [
     "kernel-probe-request:",
     "kernel-probe-generation:",
@@ -139,10 +137,26 @@ impl EliotdLaunchDescriptor {
             "eliotd.config_descriptor_sha256",
         )?;
         validate_digest(&self.descriptor_sha256, "eliotd.descriptor_sha256")?;
-        if self.arguments.is_empty() || self.arguments.len() > MAX_ELIOTD_LAUNCH_ARGUMENTS {
+        let expected_arguments = [
+            "--config-descriptor",
+            self.config_descriptor.as_str(),
+            "--config-descriptor-sha256",
+            self.config_descriptor_sha256.as_str(),
+            "--launch-nonce",
+            self.launch_nonce.as_str(),
+            "--executable-sha256",
+            self.executable_sha256.as_str(),
+        ];
+        if self.arguments.len() != expected_arguments.len()
+            || self
+                .arguments
+                .iter()
+                .map(PlatformHandle::as_str)
+                .ne(expected_arguments)
+        {
             return Err(KernelServiceError::InvalidField {
                 field: "eliotd.arguments",
-                reason: "must be bounded and non-empty",
+                reason: "must be the exact canonical ordered 8-value child argv",
             });
         }
         for argument in &self.arguments {
@@ -154,26 +168,6 @@ impl EliotdLaunchDescriptor {
                 });
             }
         }
-        require_exact_argument(
-            &self.arguments,
-            "--config-descriptor",
-            self.config_descriptor.as_str(),
-        )?;
-        require_exact_argument(
-            &self.arguments,
-            "--config-descriptor-sha256",
-            self.config_descriptor_sha256.as_str(),
-        )?;
-        require_exact_argument(
-            &self.arguments,
-            "--executable-sha256",
-            self.executable_sha256.as_str(),
-        )?;
-        require_exact_argument(
-            &self.arguments,
-            "--launch-nonce",
-            self.launch_nonce.as_str(),
-        )?;
         if self.generation.value() == 0 || self.authority_epoch.value() == 0 {
             return Err(KernelServiceError::InvalidField {
                 field: "eliotd.generation",
@@ -230,23 +224,6 @@ fn validate_launch_nonce(value: &PlatformHandle) -> Result<(), KernelServiceErro
 fn is_absolute_windows_path(value: &str) -> bool {
     value.len() >= 3 && value.as_bytes()[1] == b':' && matches!(value.as_bytes()[2], b'\\' | b'/')
         || Path::new(value).is_absolute()
-}
-
-fn require_exact_argument(
-    arguments: &[PlatformHandle],
-    flag: &str,
-    expected: &str,
-) -> Result<(), KernelServiceError> {
-    let mut matches = arguments
-        .windows(2)
-        .filter(|pair| pair[0].as_str() == flag && pair[1].as_str() == expected);
-    if matches.next().is_none() || matches.next().is_some() {
-        return Err(KernelServiceError::InvalidField {
-            field: "eliotd.arguments",
-            reason: "required binding is missing or duplicated",
-        });
-    }
-    Ok(())
 }
 
 /// Handle-bound process identity carried as an inert Host claim.
@@ -1787,6 +1764,27 @@ mod tests {
         short.arguments[5] = short.launch_nonce.clone();
         short.descriptor_sha256 = short.compute_digest().expect("digest");
         assert!(short.validate().is_err());
+    }
+
+    #[test]
+    fn eliotd_descriptor_requires_exact_canonical_child_argv() {
+        let descriptor = eliotd_launch_descriptor();
+
+        let mut extra = descriptor.clone();
+        extra.arguments.push(handle_value("--unexpected"));
+        extra.descriptor_sha256 = extra.compute_digest().expect("extra digest");
+        assert!(extra.validate().is_err());
+
+        let mut reordered = descriptor.clone();
+        reordered.arguments.swap(0, 2);
+        reordered.descriptor_sha256 = reordered.compute_digest().expect("reordered digest");
+        assert!(reordered.validate().is_err());
+
+        let mut duplicated = descriptor;
+        duplicated.arguments[6] = handle_value("--launch-nonce");
+        duplicated.arguments[7] = duplicated.launch_nonce.clone();
+        duplicated.descriptor_sha256 = duplicated.compute_digest().expect("duplicate digest");
+        assert!(duplicated.validate().is_err());
     }
 
     fn requirement() -> HostStoreBootstrapRequirement {

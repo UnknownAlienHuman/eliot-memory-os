@@ -1423,8 +1423,8 @@ mod tests {
     use eliot_platform::ClockObservation;
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
-        FencingToken, KernelDispatchKey, PermitIssuance, ProcessHealth, ProcessId, ProcessIntent,
-        ProcessRequest, ProcessState, SuspendedProcessIdentity,
+        FencingToken, KernelDispatchKey, PermitIssuance, PhysicalProcessBinding, ProcessHealth,
+        ProcessId, ProcessIntent, ProcessRequest, ProcessState, SuspendedProcessIdentity,
     };
     use std::sync::{
         Arc, Mutex,
@@ -1836,7 +1836,13 @@ mod tests {
                 request.image_id().clone(),
                 request.session_id().clone(),
                 request.generation(),
-                42,
+                PhysicalProcessBinding::new(
+                    42,
+                    11,
+                    request.executable(),
+                    r"Local\Eliot-User-Broker-Test",
+                )
+                .map_err(|error| PortError::Invalid(error.to_string()))?,
                 100,
                 request.executable_sha256(),
             )

@@ -13,10 +13,11 @@
 use eliot_instrument_api::EvidenceAxes;
 use eliot_process::{
     CancellationReceipt, CancellationRequest, ContractError, DescendantEvidence, ExitDisposition,
-    ExitStatus, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
-    ProcessExecutionView, ProcessExecutor, ProcessHealth, ProcessHealthStatus, ProcessId,
-    ProcessLaunchAdmission, ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState,
-    SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
+    ExitStatus, OperationId, PhysicalProcessBinding, ProcessEvidence, ProcessEvidenceSink,
+    ProcessExecutionError, ProcessExecutionView, ProcessExecutor, ProcessHealth,
+    ProcessHealthStatus, ProcessId, ProcessLaunchAdmission, ProcessLifecycle, ProcessRequest,
+    ProcessStartReceipt, ProcessState, SuspendedLaunchEvidence, SuspendedProcessIdentity,
+    ValidatedDispatch,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -711,7 +712,12 @@ fn suspended_identity(
         request.image_id().clone(),
         request.session_id().clone(),
         request.generation(),
-        evidence.process().process_id,
+        PhysicalProcessBinding::new(
+            evidence.process().process_id,
+            evidence.process().start_time_100ns,
+            evidence.process().image_path.clone(),
+            evidence.job_identity().name(),
+        )?,
         now_ms(),
         request.executable_sha256(),
     )

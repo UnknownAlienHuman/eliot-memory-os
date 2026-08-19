@@ -337,6 +337,23 @@ fn success_disposition() -> Value {
     json!({"kind": "SUCCESS", "proof": "SCOPED_VERIFICATION"})
 }
 
+fn assert_invalid_physical_replay_receipt_is_rejected(
+    completed: &ProcessStartReplayRecord,
+    receipt: &eliot_process::ProcessStartReceipt,
+) -> TestResult {
+    let mut wire = serde_json::to_value(receipt)?;
+    wire["identity"]["suspended"]["physical"]["start_time_100ns"] = json!(0);
+    let invalid_completed = ProcessStartReplayRecord {
+        receipt: Some(serde_json::from_value(wire)?),
+        ..completed.clone()
+    };
+    assert!(matches!(
+        invalid_completed.validate(),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    Ok(())
+}
+
 #[test]
 fn envelope_validation_rejects_tamper_version_and_bad_fence() -> TestResult {
     let original = request(
@@ -443,6 +460,7 @@ fn process_start_replay_has_one_atomic_winner_and_rejects_substitution() -> Test
         receipt: Some(completed_receipt.clone()),
         ..completed_reservation.clone()
     };
+    assert_invalid_physical_replay_receipt_is_rejected(&completed, &completed_receipt)?;
     store.begin_process_start(&completed_reservation)?;
     store.persist_process_start(&completed)?;
     store.persist_process_start(&completed)?;
@@ -596,7 +614,12 @@ fn process_start_receipt(
                 "image_id": "image-1",
                 "session_id": "session-1",
                 "generation": 1,
-                "pid": 1,
+                "physical": {
+                    "process_id": 1,
+                    "start_time_100ns": 1,
+                    "image_path": "C:\\ProgramData\\Eliot\\bin\\eliot-test.exe",
+                    "executor_job_name": "Local\\Eliot-ORS-Test"
+                },
                 "created_suspended_at_unix_ms": 1,
                 "executable_sha256": "aa".repeat(32)
             },

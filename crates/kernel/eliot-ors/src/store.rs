@@ -3683,7 +3683,12 @@ mod process_start_abort_tests {
                     "image_id": "image-1",
                     "session_id": "session-1",
                     "generation": 1,
-                    "pid": 1,
+                    "physical": {
+                        "process_id": 1,
+                        "start_time_100ns": 1,
+                        "image_path": "C:\\ProgramData\\Eliot\\bin\\eliot-test.exe",
+                        "executor_job_name": "Local\\Eliot-ORS-Abort-Test"
+                    },
                     "created_suspended_at_unix_ms": 1,
                     "executable_sha256": "aa".repeat(32)
                 },

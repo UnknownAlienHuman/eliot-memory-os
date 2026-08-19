@@ -19,11 +19,13 @@ use std::sync::Arc;
 use thiserror::Error;
 
 /// Current provider-neutral process contract revision.
-pub const PROCESS_CONTRACT_SCHEMA_VERSION: &str = "eliot-process-contract-v2";
+pub const PROCESS_CONTRACT_SCHEMA_VERSION: &str = "eliot-process-contract-v3";
 /// The sole admitted Windows semantic implementation identifier.
 pub const PROCESS_IMPLEMENTATION_ID: &str = "eliot.process.windows.v1";
 
 const MAX_ID_BYTES: usize = 256;
+const MAX_EXECUTOR_JOB_NAME_UTF16: usize = 240;
+const MAX_PROCESS_IMAGE_PATH_UTF16: usize = 32_767;
 const MAX_ARGUMENTS: usize = 4096;
 const MAX_ENVIRONMENT_ENTRIES: usize = 512;
 const MAX_DESCENDANTS: usize = 4096;
@@ -72,7 +74,7 @@ opaque_id!(ProcessId, "process_id", "One physical process generation.");
 opaque_id!(
     JobId,
     "job_id",
-    "One exact operating-system Job/container identity."
+    "One logical caller-owned Job/container identity, never an OS Job object name."
 );
 opaque_id!(
     ImageId,
@@ -1439,6 +1441,89 @@ impl DispatchValidationContext {
     }
 }
 
+/// Inert physical process/Job binding observed by P-02 from retained OS handles.
+///
+/// This value grants no dispatch authority. It keeps the executor-created Job
+/// identity separate from the caller's logical [`JobId`] and gives recovery
+/// consumers the exact PID/start/image tuple required to reject PID reuse.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalProcessBinding {
+    process_id: u32,
+    start_time_100ns: u64,
+    image_path: String,
+    executor_job_name: String,
+}
+
+impl PhysicalProcessBinding {
+    /// Creates one bounded physical binding from fresh executor evidence.
+    pub fn new(
+        process_id: u32,
+        start_time_100ns: u64,
+        image_path: impl Into<String>,
+        executor_job_name: impl Into<String>,
+    ) -> Result<Self, ContractError> {
+        let binding = Self {
+            process_id,
+            start_time_100ns,
+            image_path: image_path.into(),
+            executor_job_name: executor_job_name.into(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<(), ContractError> {
+        if self.process_id == 0 || self.start_time_100ns == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "physical_process_binding",
+                reason: "process id and creation time must be non-zero",
+            });
+        }
+        let image_length = self.image_path.encode_utf16().count();
+        if self.image_path.trim().is_empty()
+            || image_length > MAX_PROCESS_IMAGE_PATH_UTF16
+            || self.image_path.chars().any(char::is_control)
+        {
+            return Err(ContractError::InvalidValue {
+                field: "physical_process_binding.image_path",
+                reason: "must be a non-empty bounded control-free image locator",
+            });
+        }
+        let job_length = self.executor_job_name.encode_utf16().count();
+        if self.executor_job_name.trim().is_empty()
+            || job_length > MAX_EXECUTOR_JOB_NAME_UTF16
+            || self.executor_job_name.chars().any(char::is_control)
+        {
+            return Err(ContractError::InvalidValue {
+                field: "physical_process_binding.executor_job_name",
+                reason: "must be one bounded control-free executor Job identity",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the exact OS process identifier.
+    pub const fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
+    /// Returns the exact OS process creation marker.
+    pub const fn start_time_100ns(&self) -> u64 {
+        self.start_time_100ns
+    }
+
+    /// Returns the executor-observed process image path.
+    pub fn image_path(&self) -> &str {
+        &self.image_path
+    }
+
+    /// Returns the executor-created OS Job identity, never the logical `JobId`.
+    pub fn executor_job_name(&self) -> &str {
+        &self.executor_job_name
+    }
+}
+
 /// Fresh P-02 evidence for a child that is assigned to its Job but still suspended.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1449,7 +1534,7 @@ pub struct SuspendedProcessIdentity {
     image_id: ImageId,
     session_id: SessionId,
     generation: Generation,
-    pid: u32,
+    physical: PhysicalProcessBinding,
     created_suspended_at_unix_ms: u64,
     executable_sha256: String,
 }
@@ -1516,7 +1601,7 @@ impl SuspendedProcessIdentity {
         image_id: ImageId,
         session_id: SessionId,
         generation: Generation,
-        pid: u32,
+        physical: PhysicalProcessBinding,
         created_suspended_at_unix_ms: u64,
         executable_sha256: impl Into<String>,
     ) -> Result<Self, ContractError> {
@@ -1527,7 +1612,7 @@ impl SuspendedProcessIdentity {
             image_id,
             session_id,
             generation,
-            pid,
+            physical,
             created_suspended_at_unix_ms,
             executable_sha256: executable_sha256.into(),
         };
@@ -1541,10 +1626,11 @@ impl SuspendedProcessIdentity {
         self.job_id.validate()?;
         self.image_id.validate()?;
         self.session_id.validate()?;
-        if self.pid == 0 || self.created_suspended_at_unix_ms == 0 {
+        self.physical.validate()?;
+        if self.created_suspended_at_unix_ms == 0 {
             return Err(ContractError::InvalidValue {
                 field: "suspended_process_identity",
-                reason: "PID and creation time must be non-zero",
+                reason: "suspended observation time must be non-zero",
             });
         }
         validate_hex_digest("executable_sha256", &self.executable_sha256)
@@ -1558,6 +1644,11 @@ impl SuspendedProcessIdentity {
     /// Returns the Job identity.
     pub const fn job_id(&self) -> &JobId {
         &self.job_id
+    }
+
+    /// Returns the mandatory inert physical OS process/Job binding.
+    pub const fn physical(&self) -> &PhysicalProcessBinding {
+        &self.physical
     }
 
     /// Returns the observed executable digest captured before resume.
@@ -1623,7 +1714,12 @@ impl ProcessIdentity {
 
     /// Returns the OS PID lookup value.
     pub const fn pid(&self) -> u32 {
-        self.suspended.pid
+        self.suspended.physical.process_id()
+    }
+
+    /// Returns the exact executor-observed physical OS process/Job binding.
+    pub const fn physical(&self) -> &PhysicalProcessBinding {
+        self.suspended.physical()
     }
 
     /// Returns the observed executable digest.
@@ -2572,11 +2668,28 @@ impl ProcessStartReceipt {
         if !state.binding.matches_identity(&identity) {
             return Err(ContractError::IdentityMismatch);
         }
-        Ok(Self {
+        let receipt = Self {
             binding: state.binding.clone(),
             identity,
             lifecycle: state.lifecycle,
-        })
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    /// Revalidates a deserialized durable receipt before replay admission.
+    ///
+    /// A receipt is inert historical data until the physical executor also
+    /// proves the exact process is still Running.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.binding.validate()?;
+        self.identity.suspended.validate()?;
+        if self.lifecycle != ProcessLifecycle::Running
+            || !self.binding.matches_identity(&self.identity)
+        {
+            return Err(ContractError::IdentityMismatch);
+        }
+        Ok(())
     }
 
     /// Returns the exact authority/process binding.
@@ -3026,7 +3139,12 @@ mod tests {
             intent.image_id.clone(),
             intent.session_id.clone(),
             intent.generation,
-            4242,
+            PhysicalProcessBinding::new(
+                4242,
+                11,
+                intent.executable.clone(),
+                r"Local\Eliot-Process-Test",
+            )?,
             120,
             intent.executable_sha256.clone(),
         )

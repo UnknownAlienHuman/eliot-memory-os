@@ -6,10 +6,10 @@ use eliot_process::{
     ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
     DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
     EnvironmentInheritance, EnvironmentProjection, ExitDisposition, ExitStatus, FencingToken,
-    Generation, ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidence,
-    ProcessHealth, ProcessHealthStatus, ProcessId, ProcessIntent, ProcessLifecycle, ProcessRequest,
-    ProcessStartReceipt, ProcessState, ProcessTreeId, ResourceLimits as ProcessLimits, SessionId,
-    SuspendedProcessIdentity,
+    Generation, ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance,
+    PhysicalProcessBinding, ProcessEvidence, ProcessHealth, ProcessHealthStatus, ProcessId,
+    ProcessIntent, ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState,
+    ProcessTreeId, ResourceLimits as ProcessLimits, SessionId, SuspendedProcessIdentity,
 };
 use eliot_runtime_contracts::{ModuleGeneration, RuntimeLease};
 use eliot_security_contracts::{PrivacyClass, SourceAssurance};
@@ -484,7 +484,8 @@ impl P03ProcessPort for ProcessMock {
             request.image_id().clone(),
             request.session_id().clone(),
             request.generation(),
-            4242,
+            PhysicalProcessBinding::new(4242, 11, request.executable(), r"Local\Eliot-Wasm-Test")
+                .map_err(|_| PortError::Denied)?,
             120,
             request.executable_sha256(),
         )

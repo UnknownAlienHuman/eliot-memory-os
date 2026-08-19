@@ -18,10 +18,11 @@ use eliot_process::{
     ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
     DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext, EnvironmentProjection,
     EvidenceSinkError, ExitDisposition, ExitStatus, FencingToken, Generation, ImageId, JobId,
-    KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
-    ProcessExecutionError, ProcessExecutionView, ProcessExecutor, ProcessHealth,
-    ProcessHealthStatus, ProcessId, ProcessIntent, ProcessRequest, ProcessStartReceipt,
-    ProcessState, ProcessTreeId, ResourceLimits, SessionId, SuspendedProcessIdentity,
+    KernelDispatchKey, OperationId, PermitIssuance, PhysicalProcessBinding, ProcessEvidence,
+    ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
+    ProcessHealth, ProcessHealthStatus, ProcessId, ProcessIntent, ProcessRequest,
+    ProcessStartReceipt, ProcessState, ProcessTreeId, ResourceLimits, SessionId,
+    SuspendedProcessIdentity,
 };
 
 use super::*;
@@ -619,7 +620,12 @@ fn validated_process_state(request: ProcessRequest) -> Result<ProcessState, Proc
         intent.image_id().clone(),
         intent.session_id().clone(),
         intent.generation(),
-        4242,
+        PhysicalProcessBinding::new(
+            4242,
+            11,
+            intent.executable(),
+            r"Local\Eliot-Native-Worker-Test",
+        )?,
         120,
         intent.executable_sha256(),
     )?;

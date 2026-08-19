@@ -702,9 +702,10 @@ mod tests {
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
         EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
-        KernelDispatchKey, OperationId, PermitIssuance, ProcessExecutionView, ProcessHealth,
-        ProcessHealthStatus, ProcessId, ProcessIntent, ProcessState, ProcessTreeId, ResourceLimits,
-        SessionId as ProcessSessionId, SuspendedProcessIdentity,
+        KernelDispatchKey, OperationId, PermitIssuance, PhysicalProcessBinding,
+        ProcessExecutionView, ProcessHealth, ProcessHealthStatus, ProcessId, ProcessIntent,
+        ProcessState, ProcessTreeId, ResourceLimits, SessionId as ProcessSessionId,
+        SuspendedProcessIdentity,
     };
     use eliot_source_assurance::{
         AdmissibleUse, AxisStatus, GoverningSourceIdentity, GoverningSourceSet, InstructionTaint,
@@ -888,7 +889,7 @@ mod tests {
             intent.image_id().clone(),
             intent.session_id().clone(),
             intent.generation(),
-            4242,
+            PhysicalProcessBinding::new(4242, 11, intent.executable(), r"Local\Eliot-Codex-Test")?,
             120,
             intent.executable_sha256(),
         )?;

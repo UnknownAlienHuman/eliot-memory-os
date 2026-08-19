@@ -59,6 +59,9 @@ pub const MAX_CONFIG_BYTES: u64 = 128 * 1024;
 /// account SID/session expectation is observed from the current installed
 /// service token and then checked against the live authenticated peer.
 const KERNEL_PIPE_NAME: &str = r"\\.\pipe\eliot\kernel\frontdoor";
+const KERNEL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const PRE_ADMISSION_RETRY_DELAY: Duration = Duration::from_millis(25);
+const ELIOTD_RECEIPT_PENDING_REJECTION: &str = "required lower-layer adapter is unavailable: eliotd-process-receipt (exact launched process receipt publication is pending)";
 
 fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
     let expectation = current_process_named_pipe_expectation()
@@ -296,6 +299,33 @@ enum KernelClientError {
     Unknown(String),
     #[error("Kernel transport: {0}")]
     Transport(String),
+    #[error("Kernel has not yet published the exact launched eliotd process receipt")]
+    PreAdmissionPending,
+}
+
+#[cfg(windows)]
+async fn retry_pre_admission<T, F, Fut>(
+    timeout: Duration,
+    mut operation: F,
+    deadline_error: &'static str,
+) -> Result<T, KernelClientError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, KernelClientError>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match operation().await {
+            Err(KernelClientError::PreAdmissionPending) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(KernelClientError::Transport(deadline_error.to_owned()));
+                }
+                tokio::time::sleep(PRE_ADMISSION_RETRY_DELAY.min(deadline - now)).await;
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -351,7 +381,7 @@ impl DaemonKernelClient {
                 .build()
                 .map_err(|error| DaemonError::Kernel(error.to_string()))?;
             let snapshot = runtime
-                .block_on(client.snapshot_request())
+                .block_on(client.snapshot_request_with_pre_admission_retry())
                 .map_err(|error| DaemonError::Kernel(error.to_string()))?;
             let mut client = client;
             client.snapshot = snapshot;
@@ -375,13 +405,7 @@ impl DaemonKernelClient {
                 .build()
                 .map_err(|error| DaemonError::Kernel(error.to_string()))?;
             runtime
-                .block_on(self.transact_async(
-                    "daemon_ready",
-                    serde_json::json!({
-                        "generation": self.snapshot.generation.value(),
-                        "authority_epoch": self.snapshot.authority_epoch.value(),
-                    }),
-                ))
+                .block_on(self.report_ready_with_pre_admission_retry())
                 .map(|_| ())
                 .map_err(|error| DaemonError::Kernel(error.to_string()))
         }
@@ -458,6 +482,38 @@ impl DaemonKernelClient {
                 KernelClientError::Unsupported.to_string(),
             ))
         }
+    }
+
+    #[cfg(windows)]
+    async fn snapshot_request_with_pre_admission_retry(
+        &self,
+    ) -> Result<KernelGenerationSnapshot, KernelClientError> {
+        retry_pre_admission(
+            KERNEL_OPERATION_TIMEOUT,
+            || self.snapshot_request(),
+            "exact launched process receipt was not published before the Kernel operation deadline",
+        )
+        .await
+    }
+
+    #[cfg(windows)]
+    async fn report_ready_with_pre_admission_retry(
+        &self,
+    ) -> Result<serde_json::Value, KernelClientError> {
+        retry_pre_admission(
+            KERNEL_OPERATION_TIMEOUT,
+            || {
+                self.transact_async(
+                    "daemon_ready",
+                    serde_json::json!({
+                        "generation": self.snapshot.generation.value(),
+                        "authority_epoch": self.snapshot.authority_epoch.value(),
+                    }),
+                )
+            },
+            "exact launched process receipt was not published before daemon ready deadline",
+        )
+        .await
     }
 
     #[cfg(windows)]
@@ -623,6 +679,9 @@ impl DaemonKernelClient {
             .receive_frame(limits)
             .await
             .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if is_pre_admission_pending_rejection(&response, &self.connection_id) {
+            return Err(KernelClientError::PreAdmissionPending);
+        }
         let server = eliot_ipc::decode_server_hello_frame(&response, &self.connection_id)
             .map_err(|error| KernelClientError::Contract(error.to_string()))?;
         validate_server_hello(&self.launch, &self.kernel_binding, &server)?;
@@ -957,6 +1016,27 @@ fn client_hello(binding: &KernelLaunchBinding) -> Result<ClientHello, KernelClie
 }
 
 #[cfg(windows)]
+fn is_pre_admission_pending_rejection(frame: &Frame, expected_connection_id: &str) -> bool {
+    if frame.validate().is_err()
+        || frame.connection_id != expected_connection_id
+        || frame.kind != FrameKind::Control
+        || frame.message_type != MessageType::Fatal
+        || frame.request_id.is_some()
+        || frame.request_identity.is_some()
+    {
+        return false;
+    }
+    let ProtocolPayload::Json(serde_json::Value::Object(payload)) = &frame.payload else {
+        return false;
+    };
+    payload.len() == 1
+        && payload
+            .get("rejection_reason")
+            .and_then(serde_json::Value::as_str)
+            == Some(ELIOTD_RECEIPT_PENDING_REJECTION)
+}
+
+#[cfg(windows)]
 fn validate_server_hello(
     launch: &GovernorLaunchConfig,
     binding: &KernelLaunchBinding,
@@ -1013,6 +1093,9 @@ fn kernel_port_error(error: KernelClientError) -> KernelPortError {
         KernelClientError::Contract(error) => KernelPortError::Contract(error),
         KernelClientError::Unknown(error) => KernelPortError::Unknown(error),
         KernelClientError::Transport(error) => KernelPortError::NotAdmitted(error),
+        KernelClientError::PreAdmissionPending => KernelPortError::NotAdmitted(
+            "Kernel has not published the exact launched process receipt".to_owned(),
+        ),
         #[cfg(not(windows))]
         KernelClientError::Unsupported => {
             KernelPortError::NotAdmitted("Windows Kernel transport is required".to_owned())
@@ -1294,6 +1377,104 @@ mod tests {
             child_bound.kernel_binding.artifact_hash,
             kernel_digest_substitution.kernel_binding.artifact_hash
         );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_server_hello_requires_observed_sid_and_session_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = valid_launch_config()?;
+        let config = DaemonConfig::from_launch_with_binding(
+            launch.clone(),
+            PathBuf::from(r"C:\ProgramData\Eliot\governor\eliotd.json"),
+            "eliotd:0123456789abcdef0123456789abcdef",
+            &"c".repeat(64),
+        )?;
+        let mut hello = ServerHello {
+            selected_protocol: ProtocolVersion::CURRENT,
+            session_principal_binding: format!(
+                "sid={};session={}",
+                config.kernel_binding.expected_kernel_sid,
+                config.kernel_binding.expected_kernel_session_id
+            ),
+            allowed_capabilities: vec!["daemon".to_owned()],
+            allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
+            config_snapshot: serde_json::json!({
+                "service": launch.kernel.service,
+                "protocol": launch.kernel.protocol,
+                "generation": launch.kernel.generation.value(),
+                "authority_epoch": launch.kernel.authority_epoch.value(),
+                "artifact_digest": launch.kernel.artifact_digest,
+            }),
+            heartbeat_ms: 1_000,
+            control_channel: KERNEL_PIPE_NAME.to_owned(),
+            rejection_reason: None,
+            authority_epoch: launch.kernel.authority_epoch,
+        };
+        validate_server_hello(&launch, &config.kernel_binding, &hello)?;
+
+        hello.session_principal_binding = "local-user".to_owned();
+        assert!(validate_server_hello(&launch, &config.kernel_binding, &hello).is_err());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn receipt_publication_race_retries_only_exact_pre_admission_rejection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection_id = "eliotd:race:test";
+        let pending =
+            eliot_ipc::handshake_rejection_frame(connection_id, ELIOTD_RECEIPT_PENDING_REJECTION)?;
+        assert!(is_pre_admission_pending_rejection(&pending, connection_id));
+        assert!(!is_pre_admission_pending_rejection(
+            &pending,
+            "eliotd:substituted:connection"
+        ));
+        let identity_rejection =
+            eliot_ipc::handshake_rejection_frame(connection_id, "session is fenced or closed")?;
+        assert!(!is_pre_admission_pending_rejection(
+            &identity_rejection,
+            connection_id
+        ));
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let race_attempts = Arc::clone(&attempts);
+        let admitted = retry_pre_admission(
+            Duration::from_secs(1),
+            move || {
+                let attempt = race_attempts.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if attempt == 0 {
+                        Err(KernelClientError::PreAdmissionPending)
+                    } else {
+                        Ok("same-bound-peer-admitted")
+                    }
+                }
+            },
+            "test deadline",
+        )
+        .await?;
+        assert_eq!(admitted, "same-bound-peer-admitted");
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        let substituted_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&substituted_attempts);
+        let rejected = retry_pre_admission(
+            Duration::from_secs(1),
+            move || {
+                observed_attempts.fetch_add(1, Ordering::Relaxed);
+                async {
+                    Err::<(), _>(KernelClientError::Contract(
+                        "authenticated peer identity mismatch".to_owned(),
+                    ))
+                }
+            },
+            "test deadline",
+        )
+        .await;
+        assert!(matches!(rejected, Err(KernelClientError::Contract(_))));
+        assert_eq!(substituted_attempts.load(Ordering::Relaxed), 1);
         Ok(())
     }
 }
