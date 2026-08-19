@@ -2067,6 +2067,13 @@ impl HostComposition {
 
     /// Explicitly imports a clean, offline legacy `host-state.redb` projection
     /// into a distinct journal lineage. Normal Host startup never calls this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if exclusive Host ownership cannot be established, the
+    /// legacy projection is absent or not clean and offline, the target journal
+    /// already exists, replay verification fails, the legacy file cannot be
+    /// renamed, or the owner lease cannot be released after migration.
     pub fn migrate_legacy_host_state(
         legacy_path: impl AsRef<Path>,
         journal_path: impl AsRef<Path>,
@@ -2170,11 +2177,11 @@ impl HostComposition {
     }
 
     fn resume_pending_record(&mut self) -> Result<(), HostError> {
-        if let Some(pending) = self.pending_record.take() {
-            if let Err(error) = append_reconciled(&self.journal, pending.clone()) {
-                self.pending_record = Some(pending);
-                return Err(error);
-            }
+        if let Some(pending) = self.pending_record.take()
+            && let Err(error) = append_reconciled(&self.journal, pending.clone())
+        {
+            self.pending_record = Some(pending);
+            return Err(error);
         }
         Ok(())
     }
@@ -2712,6 +2719,10 @@ impl HostComposition {
     ///
     /// Returns an error if the Host is already stopped or if process
     /// termination, durable shutdown finalization, or owner-lease release fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered durable drain, process termination, clean-marker commit, and lease-release sequence is one security-critical transaction"
+    )]
     pub fn stop(&mut self) -> Result<(), HostError> {
         if !self.running {
             return Err(HostError::Stopped);
@@ -2998,9 +3009,15 @@ mod journal_tests {
         ) -> &HostStateJournalService<RedbJournalBackend> {
             &composition.journal
         }
-        let _typed_reachability: fn(
+        let typed_reachability: fn(
             &HostComposition,
         ) -> &HostStateJournalService<RedbJournalBackend> = production_journal;
+        assert_eq!(
+            std::any::type_name_of_val(&typed_reachability),
+            std::any::type_name::<
+                fn(&HostComposition) -> &HostStateJournalService<RedbJournalBackend>,
+            >()
+        );
     }
 
     #[test]
