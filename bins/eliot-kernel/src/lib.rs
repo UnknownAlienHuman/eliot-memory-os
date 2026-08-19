@@ -33,7 +33,7 @@ use eliot_kernel_service::{
     KERNEL_CONTROL_PIPE, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
     KernelControlResponse, KernelReadyReceipt, KernelService, KernelServiceError,
     KernelServiceState, ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest,
-    ProcessExecutionResponse, ProcessObservation, StoreClientError,
+    ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff, StoreClientError,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
@@ -74,7 +74,7 @@ use sha2::{Digest as _, Sha256};
 #[cfg(windows)]
 use eliot_ipc::{NamedPipeServer, NamedPipeTransport};
 #[cfg(windows)]
-use eliot_platform_windows::NamedPipePeerExpectation;
+use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
 
 /// Stable Kernel process identity and wire revision.
 pub const SERVICE_NAME: &str = "eliot-kernel";
@@ -273,6 +273,8 @@ pub struct KernelComposition {
     front_door_policy: Mutex<ServerHandshakePolicy>,
     process_gateway: Option<Arc<ProcessExecutionGateway>>,
     store_bootstrap: Option<HostStoreBootstrapRequirement>,
+    #[cfg(windows)]
+    store_handoff: Mutex<Option<StoreBootstrapHandoff>>,
     approved_config_hash: Option<String>,
     canonical_store_claimed: AtomicBool,
     #[cfg(windows)]
@@ -2242,6 +2244,8 @@ impl KernelComposition {
             front_door_policy: Mutex::new(policy),
             process_gateway,
             store_bootstrap,
+            #[cfg(windows)]
+            store_handoff: Mutex::new(None),
             approved_config_hash,
             canonical_store_claimed: AtomicBool::new(false),
             #[cfg(windows)]
@@ -2272,6 +2276,33 @@ impl KernelComposition {
     #[must_use]
     pub fn store_bootstrap(&self) -> Option<&HostStoreBootstrapRequirement> {
         self.store_bootstrap.as_ref()
+    }
+
+    #[cfg(windows)]
+    /// Retains the one fresh post-launch Store process/Job handoff.
+    pub fn install_store_bootstrap(
+        &self,
+        handoff: StoreBootstrapHandoff,
+    ) -> Result<(), KernelBuildError> {
+        handoff
+            .validate()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        if self.store_bootstrap.as_ref() != Some(&handoff.requirement) {
+            return Err(KernelBuildError::Service(
+                "Store handoff does not match the immutable bootstrap descriptor".to_owned(),
+            ));
+        }
+        let mut retained = self
+            .store_handoff
+            .lock()
+            .map_err(|_| KernelBuildError::Service("Store handoff lock poisoned".to_owned()))?;
+        if retained.is_some() {
+            return Err(KernelBuildError::Service(
+                "Store bootstrap handoff is already retained".to_owned(),
+            ));
+        }
+        *retained = Some(handoff);
+        Ok(())
     }
 
     /// Returns whether Host/installation authority bindings were injected.
@@ -2306,12 +2337,33 @@ impl KernelComposition {
             .store_bootstrap
             .clone()
             .ok_or(KernelBuildError::StoreBootstrapRequired)?;
+        let handoff = self
+            .store_handoff
+            .lock()
+            .map_err(|_| KernelBuildError::Service("Store handoff lock poisoned".to_owned()))?
+            .clone()
+            .ok_or(KernelBuildError::StoreBootstrapRequired)?;
         requirement
             .validate()
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-        let expectation = NamedPipePeerExpectation::new(
+        let process = &handoff.process_binding.process;
+        let observed = observe_named_pipe_peer_process_in_job(
+            handoff.process_binding.job.as_str(),
+            process.process_id,
+        )
+        .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+        if observed.process_binding().process_id() != process.process_id
+            || observed.process_binding().start_time_100ns() != process.start_time_100ns
+            || observed.process_binding().image_path() != process.image_path
+        {
+            return Err(KernelBuildError::Principal(
+                "Store process binding changed before pipe admission".to_owned(),
+            ));
+        }
+        let expectation = NamedPipePeerExpectation::new_with_process_and_job_binding(
             requirement.expected_peer_sid.as_str(),
             requirement.expected_peer_session_id,
+            observed,
         )
         .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
         let transport = NamedPipeTransport::connect_authenticated(
@@ -3021,6 +3073,10 @@ impl KernelComposition {
         #[cfg(windows)]
         self.validate_candidate_process_binding(&request.candidate)
             .map_err(|_| TransportError::SessionFenced)?;
+        let bootstrap = match &request.command {
+            KernelControlCommand::BootstrapStore(handoff) => Some(handoff.clone()),
+            _ => None,
+        };
         {
             let mut policy = self
                 .front_door_policy
@@ -3048,6 +3104,20 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?;
                 policy.module_generation.state_fence =
                     StateFence::new(request.candidate.kernel_epoch, request.generation);
+            }
+        }
+        if let Some(handoff) = bootstrap {
+            self.install_store_bootstrap(handoff.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+            if let Err(error) = self
+                .connect_canonical_store(Duration::from_millis(handoff.requirement.timeout_ms()))
+                .await
+            {
+                if let Ok(mut retained) = self.store_handoff.lock() {
+                    *retained = None;
+                }
+                let _ = error;
+                return Err(TransportError::SessionFenced);
             }
         }
         let is_probe = matches!(&request.command, KernelControlCommand::ProbeReady);
@@ -3097,7 +3167,8 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?
                     .reconcile(request.candidate.clone())
                     .map_err(|_| TransportError::SessionFenced)?,
-                KernelControlCommand::Activate(_)
+                KernelControlCommand::BootstrapStore(_)
+                | KernelControlCommand::Activate(_)
                 | KernelControlCommand::ReconcileActivation(_) => {}
                 command => {
                     self.apply_control(command.clone())

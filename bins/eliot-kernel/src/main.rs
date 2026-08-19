@@ -1,7 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use eliot_kernel::{AuthorityDescriptorContour, KernelBuildError, KernelComposition, KernelConfig};
 use eliot_kernel_service::HostStoreBootstrapRequirement;
@@ -161,26 +160,6 @@ async fn main() {
     }
     #[cfg(windows)]
     {
-        if let Some(prepared) = prepared_store {
-            let timeout = Duration::from_millis(prepared.requirement.timeout_ms());
-            let mut connected = false;
-            for attempt in 0..3 {
-                match kernel.connect_canonical_store(timeout).await {
-                    Ok(_) => {
-                        connected = true;
-                        break;
-                    }
-                    Err(error) if attempt < 2 => {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        let _ = error;
-                    }
-                    Err(error) => exit_build_error(&error),
-                }
-            }
-            if !connected {
-                exit_error("STORE_UNAVAILABLE", "canonical Store did not become ready");
-            }
-        }
         let observed_host = match startup_binding.observe_host() {
             Ok(binding) => binding,
             Err(error) => exit_error("PRINCIPAL_FAILURE", &error),

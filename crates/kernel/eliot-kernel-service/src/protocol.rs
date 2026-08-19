@@ -52,6 +52,57 @@ pub struct HostProcessBinding {
     pub image_path: String,
 }
 
+/// Host-observed identity of the Store process and its owner Job.
+///
+/// This is an inert handoff projection.  Kernel must re-observe the process
+/// through the Windows adapter and prove current membership in the named Job
+/// before it uses the binding for named-pipe authentication.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreProcessBinding {
+    /// Handle-bound Store process identity observed by Host after launch.
+    pub process: HostProcessBinding,
+    /// Exact owner-scoped Windows Job identity selected by Host.
+    pub job: PlatformHandle,
+}
+
+impl StoreProcessBinding {
+    /// Validates the bounded, inert wire projection.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.process.validate()?;
+        handle(&self.job, "store_process_binding.job")?;
+        if self.job.as_str().encode_utf16().count() > 240
+            || self.job.as_str().chars().any(char::is_control)
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "store_process_binding.job",
+                reason: "must be a bounded Windows Job identity",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One typed post-launch Store handoff on the existing Host↔Kernel control
+/// wire.  The descriptor remains immutable; this value binds its exact
+/// approved contents to Host's fresh Store process/Job observation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreBootstrapHandoff {
+    /// The immutable descriptor bytes already admitted by Host and Kernel.
+    pub requirement: HostStoreBootstrapRequirement,
+    /// Fresh process/Job evidence captured after the Store was launched.
+    pub process_binding: StoreProcessBinding,
+}
+
+impl StoreBootstrapHandoff {
+    /// Validates both descriptor and fresh process/Job projection.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.requirement.validate()?;
+        self.process_binding.validate()
+    }
+}
+
 impl HostProcessBinding {
     /// Validates the bounded, inert wire projection.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
@@ -228,6 +279,9 @@ impl KernelControlRequest {
             });
         }
         self.candidate.validate()?;
+        if let KernelControlCommand::BootstrapStore(handoff) = &self.command {
+            handoff.validate()?;
+        }
         if let KernelControlCommand::Activate(permit) = &self.command {
             permit.validate(&self.candidate, self.generation)?;
         }
@@ -1427,6 +1481,9 @@ impl KernelReadyReceipt {
     reason = "the one-use activation permit remains self-describing on the single control wire"
 )]
 pub enum KernelControlCommand {
+    /// Bind the freshly launched Store process/Job and establish the one
+    /// canonical Store route before ordinary lifecycle commands are admitted.
+    BootstrapStore(StoreBootstrapHandoff),
     /// Begin reconciliation of the request's nonce-free candidate binding.
     Reconcile,
     /// Enter side-by-side candidate mode without authority.
@@ -1501,6 +1558,40 @@ mod tests {
         let mut wrong_digest = requirement();
         wrong_digest.approved_config_hash = handle_value(&"C".repeat(64));
         assert!(wrong_digest.validate().is_err());
+    }
+
+    #[test]
+    fn store_handoff_rejects_process_reuse_image_and_job_substitution() {
+        let handoff = StoreBootstrapHandoff {
+            requirement: requirement(),
+            process_binding: StoreProcessBinding {
+                process: HostProcessBinding {
+                    process_id: 41,
+                    start_time_100ns: 42,
+                    image_path: r"C:\Eliot\eliot-store-surreal.exe".to_owned(),
+                },
+                job: handle_value(r"Local\Eliot-Host-Store-test"),
+            },
+        };
+        assert!(handoff.validate().is_ok());
+
+        let mut pid_reuse = handoff.clone();
+        pid_reuse.process_binding.process.start_time_100ns = 43;
+        assert!(pid_reuse.validate().is_ok());
+        assert_ne!(pid_reuse, handoff);
+
+        let mut wrong_image = handoff.clone();
+        wrong_image.process_binding.process.image_path = r"C:\Evil\store.exe".to_owned();
+        assert!(wrong_image.validate().is_ok());
+        assert_ne!(wrong_image, handoff);
+
+        let mut outside_job = handoff;
+        outside_job.process_binding.job = handle_value(r"Local\Other-Job");
+        assert!(outside_job.validate().is_ok());
+        assert_ne!(
+            outside_job.process_binding.job,
+            handle_value(r"Local\Eliot-Host-Store-test")
+        );
     }
 
     #[test]

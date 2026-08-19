@@ -2257,6 +2257,42 @@ impl NamedPipePeerProcessBinding {
     }
 }
 
+/// OS-observed process identity retained together with one exact owner Job.
+///
+/// The Job name is only a lookup key.  Admission reopens and re-observes the
+/// named Job, process identity, and current membership before accepting a
+/// pipe peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedPipePeerJobBinding {
+    process: NamedPipePeerProcessBinding,
+    job_name: String,
+}
+
+impl NamedPipePeerJobBinding {
+    fn from_observed(
+        process: NamedPipePeerProcessBinding,
+        job_name: impl Into<String>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let job_name = job_name.into();
+        if !valid_named_job_identity(&job_name) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self { process, job_name })
+    }
+
+    /// Returns the retained handle-bound process evidence.
+    #[must_use]
+    pub const fn process_binding(&self) -> &NamedPipePeerProcessBinding {
+        &self.process
+    }
+
+    /// Returns the exact owner-scoped Job identity.
+    #[must_use]
+    pub fn job_name(&self) -> &str {
+        &self.job_name
+    }
+}
+
 /// Expected authorization context for a named-pipe server.
 ///
 /// The expectation is inert policy input.  It becomes evidence only after the
@@ -2266,6 +2302,7 @@ pub struct NamedPipePeerExpectation {
     expected_sid: String,
     expected_session_id: u32,
     approved_process: Option<NamedPipePeerProcessBinding>,
+    approved_job_process: Option<NamedPipePeerJobBinding>,
 }
 
 /// Installer-pinned inputs for the separately registered Watchdog fallback
@@ -3096,6 +3133,7 @@ impl NamedPipePeerExpectation {
             expected_sid,
             expected_session_id,
             approved_process: None,
+            approved_job_process: None,
         })
     }
 
@@ -3115,6 +3153,22 @@ impl NamedPipePeerExpectation {
         Ok(expectation)
     }
 
+    /// Creates an expectation that requires one exact OS-observed process and
+    /// its current membership in one exact owner Job.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the SID, session, or Job identity is invalid.
+    pub fn new_with_process_and_job_binding(
+        expected_sid: impl Into<String>,
+        expected_session_id: u32,
+        approved_process: NamedPipePeerJobBinding,
+    ) -> Result<Self, WindowsAdapterError> {
+        let mut expectation = Self::new(expected_sid, expected_session_id)?;
+        expectation.approved_process = Some(approved_process.process.clone());
+        expectation.approved_job_process = Some(approved_process);
+        Ok(expectation)
+    }
+
     /// Adds one exact OS-observed process binding to this expectation.
     ///
     /// This is a typed builder rather than a request-field setter: admission
@@ -3127,6 +3181,19 @@ impl NamedPipePeerExpectation {
         approved_process: NamedPipePeerProcessBinding,
     ) -> Result<Self, WindowsAdapterError> {
         self.approved_process = Some(approved_process);
+        Ok(self)
+    }
+
+    /// Adds one exact OS-observed process and Job binding to this expectation.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the retained Job identity is invalid.
+    pub fn with_process_and_job_binding(
+        mut self,
+        approved_process: NamedPipePeerJobBinding,
+    ) -> Result<Self, WindowsAdapterError> {
+        self.approved_process = Some(approved_process.process.clone());
+        self.approved_job_process = Some(approved_process);
         Ok(self)
     }
 
@@ -3145,6 +3212,12 @@ impl NamedPipePeerExpectation {
     #[must_use]
     pub fn approved_process_binding(&self) -> Option<&NamedPipePeerProcessBinding> {
         self.approved_process.as_ref()
+    }
+
+    /// Returns the optional exact process/Job binding admitted by this policy.
+    #[must_use]
+    pub fn approved_process_job_binding(&self) -> Option<&NamedPipePeerJobBinding> {
+        self.approved_job_process.as_ref()
     }
 }
 
@@ -6827,11 +6900,23 @@ fn admit_named_pipe_peer_process(
     observed: &ProcessIdentity,
     expectation: &NamedPipePeerExpectation,
 ) -> Result<(), WindowsAdapterError> {
-    if expectation
-        .approved_process_binding()
-        .is_some_and(|approved| !same_process_identity(observed, approved.identity()))
+    if let Some(approved) = expectation.approved_process_binding()
+        && !same_process_identity(observed, approved.identity())
     {
         return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    if let Some(approved) = expectation.approved_process_job_binding() {
+        if !same_process_identity(observed, approved.process_binding().identity()) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let current =
+            observe_named_pipe_peer_process_in_job(approved.job_name(), observed.process_id)?;
+        if !same_process_identity(
+            current.process_binding().identity(),
+            approved.process_binding().identity(),
+        ) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
     }
     Ok(())
 }
@@ -9506,6 +9591,61 @@ pub fn observe_named_pipe_peer_process(
     Err(WindowsAdapterError::Unavailable)
 }
 
+fn valid_named_job_identity(value: &str) -> bool {
+    let length = value.encode_utf16().count();
+    length != 0 && length <= 240 && !value.chars().any(char::is_control)
+}
+
+/// Observes one process and proves that the same PID is currently a member of
+/// the named owner Job.  The returned value is sealed evidence, not a caller
+/// constructed process or Job authority token.
+///
+/// # Errors
+/// Returns a typed adapter error when the process, Job, or current membership
+/// cannot be observed and validated.
+#[cfg(windows)]
+pub fn observe_named_pipe_peer_process_in_job(
+    job_name: &str,
+    process_id: u32,
+) -> Result<NamedPipePeerJobBinding, WindowsAdapterError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
+    const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
+
+    if process_id == 0 || !valid_named_job_identity(job_name) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let mut wide = std::ffi::OsStr::new(job_name)
+        .encode_wide()
+        .collect::<Vec<_>>();
+    wide.push(0);
+    // SAFETY: `wide` is NUL terminated and the returned handle is owned below.
+    let handle = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY_ACCESS, 0, wide.as_ptr()) };
+    if handle.is_null() {
+        return Err(windows_adapter_from_io(&std::io::Error::last_os_error()));
+    }
+    let member = job_process_ids(handle)
+        .map_err(|error| windows_adapter_from_io(&error))?
+        .into_iter()
+        .any(|member| member == process_id);
+    // SAFETY: `handle` is the live Job handle returned by OpenJobObjectW.
+    unsafe { CloseHandle(handle) };
+    if !member {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let process = observe_named_pipe_peer_process(process_id)?;
+    NamedPipePeerJobBinding::from_observed(process, job_name)
+}
+
+#[cfg(not(windows))]
+pub fn observe_named_pipe_peer_process_in_job(
+    _job_name: &str,
+    _process_id: u32,
+) -> Result<NamedPipePeerJobBinding, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
 #[cfg(windows)]
 fn classify_service_error(name: &str, error: &std::io::Error) -> PortOutcome<ServiceObservation> {
     use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
@@ -10192,6 +10332,36 @@ mod tests {
             admit_named_pipe_peer_process(&observed, &expectation),
             Ok(())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_job_binding_rejects_process_substitution_and_stale_job() {
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+        let process = test_process_binding();
+        let job =
+            observe_named_pipe_peer_process_in_job(r"Local\Eliot-Missing-Store-Job", unsafe {
+                GetCurrentProcessId()
+            });
+        assert!(job.is_err());
+
+        let sealed = NamedPipePeerJobBinding::from_observed(
+            process.clone(),
+            r"Local\Eliot-Missing-Store-Job",
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let expectation = current_process_named_pipe_expectation()
+            .unwrap_or_else(|_| unreachable!())
+            .with_process_and_job_binding(sealed)
+            .unwrap_or_else(|_| unreachable!());
+        let mut wrong_start = process.identity().clone();
+        wrong_start.start_time_100ns = wrong_start.start_time_100ns.saturating_add(1);
+        assert_eq!(
+            admit_named_pipe_peer_process(&wrong_start, &expectation),
+            Err(WindowsAdapterError::IdentityMismatch)
+        );
+        assert!(admit_named_pipe_peer_process(process.identity(), &expectation).is_err());
     }
 
     #[cfg(windows)]

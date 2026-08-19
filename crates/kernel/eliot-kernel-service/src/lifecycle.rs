@@ -311,6 +311,12 @@ impl KernelService {
             return Err(KernelServiceError::GenerationFenced);
         }
         match command {
+            KernelControlCommand::BootstrapStore(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "store_bootstrap",
+                    reason: "Store bootstrap requires the authenticated Kernel composition boundary",
+                });
+            }
             KernelControlCommand::Reconcile => {
                 return Err(KernelServiceError::InvalidField {
                     field: "candidate",

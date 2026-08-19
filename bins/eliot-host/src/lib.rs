@@ -34,7 +34,8 @@ use eliot_kernel_service::{
     HostJobBinding, HostKernelCandidateBinding, HostProcessBinding, HostStoreBootstrapRequirement,
     KERNEL_CONTROL_PIPE, KernelActivationPermit, KernelActivationQuery, KernelActivationReceipt,
     KernelControlCommand, KernelControlRequest, KernelControlResponse, KernelReadyReceipt,
-    KernelServiceState, RestartBudget, control_request_frame, decode_control_response_frame,
+    KernelServiceState, RestartBudget, StoreBootstrapHandoff, StoreProcessBinding,
+    control_request_frame, decode_control_response_frame,
 };
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
@@ -1144,6 +1145,10 @@ struct ReconciliationState<S, K> {
 }
 
 #[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Store restart must rebind and, when needed, restart Kernel in one ordered state machine"
+)]
 fn reconcile_state_machine<S, K, SO, KO, ST, KT, SL, KL>(
     state: &mut ReconciliationState<S, K>,
     mut observe_store: SO,
@@ -1183,6 +1188,30 @@ where
                     store_degraded = true;
                     if terminate_store(&mut state.store).is_err() {
                         store_degraded = true;
+                    }
+                } else if state.kernel.is_some() {
+                    // A fresh Store process necessarily has a new PID/start
+                    // binding. Restart Kernel before publishing a contour so
+                    // its one-shot Store handoff cannot retain the old peer.
+                    if terminate_kernel(&mut state.kernel).is_err()
+                        || state.kernel_restart_attempts >= 1
+                    {
+                        kernel_degraded = true;
+                    } else {
+                        state.kernel_restart_attempts += 1;
+                        if let Ok(kernel) = launch_kernel() {
+                            state.kernel = Some(kernel);
+                            if observe_kernel(state.kernel.as_ref())
+                                != ReconciliationObservation::Live
+                            {
+                                kernel_degraded = true;
+                                if terminate_kernel(&mut state.kernel).is_err() {
+                                    kernel_degraded = true;
+                                }
+                            }
+                        } else {
+                            kernel_degraded = true;
+                        }
                     }
                 }
             } else {
@@ -1224,6 +1253,30 @@ where
                     store_degraded = true;
                     if terminate_store(&mut state.store).is_err() {
                         store_degraded = true;
+                    }
+                } else if state.kernel.is_some() {
+                    // Store peer identity is immutable for one Kernel
+                    // lineage; a Store restart therefore requires a fresh
+                    // Kernel handoff before the contour can be healthy.
+                    if terminate_kernel(&mut state.kernel).is_err()
+                        || state.kernel_restart_attempts >= 1
+                    {
+                        kernel_degraded = true;
+                    } else {
+                        state.kernel_restart_attempts += 1;
+                        if let Ok(kernel) = launch_kernel() {
+                            state.kernel = Some(kernel);
+                            if observe_kernel(state.kernel.as_ref())
+                                != ReconciliationObservation::Live
+                            {
+                                kernel_degraded = true;
+                                if terminate_kernel(&mut state.kernel).is_err() {
+                                    kernel_degraded = true;
+                                }
+                            }
+                        } else {
+                            kernel_degraded = true;
+                        }
                     }
                 }
             } else {
@@ -1542,6 +1595,40 @@ impl HostJobBranches {
             kernel_generation,
             process_record,
         )?;
+        let store = self.store.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("Store process is missing before Kernel bootstrap".to_owned())
+        })?;
+        let store_process = store.evidence().process();
+        if !store
+            .job_processes()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            .iter()
+            .any(|observed| observed == store_process)
+        {
+            return Err(HostError::ProcessContour(
+                "Store Job observation does not contain the exact launched Store process"
+                    .to_owned(),
+            ));
+        }
+        let store_handoff = StoreBootstrapHandoff {
+            requirement: self.store_bootstrap_requirement.clone().ok_or_else(|| {
+                HostError::ProcessContour(
+                    "Store bootstrap requirement is missing before Kernel bootstrap".to_owned(),
+                )
+            })?,
+            process_binding: StoreProcessBinding {
+                process: HostProcessBinding {
+                    process_id: store_process.process_id,
+                    start_time_100ns: store_process.start_time_100ns,
+                    image_path: store_process.image_path.clone(),
+                },
+                job: PlatformHandle::new(store.job_identity().name())
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            },
+        };
+        store_handoff
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         // Host deliberately authors no readiness receipt. Readiness is proven
         // by Kernel from its own live process, Job, authority, configuration
         // and Store observations, and arrives on the ProbeReady response.
@@ -1566,7 +1653,8 @@ impl HostJobBranches {
                 &expected_kernel_image,
             )?;
             let limits = TransportLimits::default();
-            let commands = [
+            let commands = vec![
+                KernelControlCommand::BootstrapStore(store_handoff),
                 KernelControlCommand::Reconcile,
                 KernelControlCommand::Shadow,
                 KernelControlCommand::PrepareHandoff,
@@ -1637,7 +1725,7 @@ impl HostJobBranches {
                 &candidate,
                 launch.authority_generation,
                 KernelControlCommand::Activate(permit.clone()),
-                4,
+                5,
             )?;
             let activate_digest = activate_request.payload_digest.clone();
             let activate_frame = control_request_frame(
@@ -1673,7 +1761,7 @@ impl HostJobBranches {
                 .transpose()?
                 .flatten();
             let (activation_receipt, probe_sequence) = if let Some(receipt) = direct_receipt {
-                (receipt, 5)
+                (receipt, 6)
             } else {
                 // Do not resend the permit.  Reconnect and query the exact
                 // operation/request digest without carrying nonce material.
@@ -2271,6 +2359,15 @@ impl HostJobBranches {
                 )
             },
             |store| -> Result<(), StoreLivenessEvidence> {
+                let process = store.evidence().process();
+                let member = store
+                    .job_processes()
+                    .map(|members| members.iter().any(|observed| observed == process));
+                if !matches!(member, Ok(true)) {
+                    return Err(StoreLivenessEvidence::Unknown(
+                        "Store process is not an exact member of its approved Job".to_owned(),
+                    ));
+                }
                 match store.observe() {
                     Ok(eliot_platform_windows::RunningJobObservation::Running {
                         active_processes,
