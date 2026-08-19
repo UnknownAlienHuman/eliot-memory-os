@@ -349,6 +349,7 @@ pub struct ProcessDispatchAuthorityController {
     authority: DispatchPermitAuthority,
     store: Arc<dyn OperationalRecoveryStore>,
     codec: Arc<dyn DispatchSnapshotCodec>,
+    snapshot_receipt: Option<AuthoritySnapshotReceipt>,
     poisoned: bool,
 }
 
@@ -369,6 +370,7 @@ impl ProcessDispatchAuthorityController {
             authority,
             store,
             codec,
+            snapshot_receipt: None,
             poisoned: false,
         }
     }
@@ -456,6 +458,7 @@ impl ProcessDispatchAuthorityController {
             authority,
             store,
             codec,
+            snapshot_receipt: Some(recovered.receipt().clone()),
             poisoned: false,
         })
     }
@@ -559,8 +562,14 @@ impl ProcessDispatchAuthorityController {
                 return Err(error.into());
             }
         };
-        match self.store.commit_authority_snapshot(snapshot) {
-            Ok(receipt) => Ok(receipt),
+        match self
+            .store
+            .commit_authority_snapshot_cas(snapshot, self.snapshot_receipt.as_ref())
+        {
+            Ok(receipt) => {
+                self.snapshot_receipt = Some(receipt.clone());
+                Ok(receipt)
+            }
             Err(error) => {
                 self.poisoned = true;
                 Err(error.into())

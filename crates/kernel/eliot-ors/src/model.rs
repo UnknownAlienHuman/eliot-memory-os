@@ -2058,6 +2058,8 @@ pub enum OrsError {
     InvalidEpochLineage,
     #[error("expiry must be strictly later than creation")]
     InvalidExpiry,
+    #[error("authority handoff is not fresh at its reservation linearization point")]
+    AuthorityHandoffNotFresh,
     #[error("at least one Ordering Scope is required")]
     EmptyScopeSet,
     #[error("an Ordering Scope occurs more than once")]

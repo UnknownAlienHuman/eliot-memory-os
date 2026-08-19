@@ -1423,6 +1423,96 @@ fn authority_handoff_terminal_consume_can_follow_expired_admission() -> TestResu
 }
 
 #[test]
+fn authority_handoff_freshness_is_checked_at_begin_without_reserved_race() -> TestResult {
+    let path = database_path("authority-handoff-freshness-race");
+    cleanup(&path);
+    let store = Arc::new(RedbRecoveryStore::open(&path)?);
+    let mut expired = handoff_record(AuthorityHandoffState::Reserved)?;
+    expired.handoff_id = OperationIdentity::new("authority-handoff-expired-race")?;
+    expired.issued_at_ms = 100;
+    expired.expires_at_ms = 200;
+    let mut future = expired.clone();
+    future.handoff_id = OperationIdentity::new("authority-handoff-future-race")?;
+    future.issued_at_ms = 201;
+    future.expires_at_ms = 300;
+
+    let barrier = Arc::new(Barrier::new(8));
+    let mut workers = Vec::new();
+    for _ in 0..8 {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let record = expired.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            matches!(
+                store.begin_authority_handoff_at(&record, 200),
+                Err(OrsError::AuthorityHandoffNotFresh)
+            )
+        }));
+    }
+    for worker in workers {
+        assert!(
+            worker
+                .join()
+                .map_err(|_| "expired freshness worker panicked")?
+        );
+    }
+    assert!(store.load_authority_handoff(&expired.handoff_id)?.is_none());
+    assert!(matches!(
+        store.begin_authority_handoff_at(&future, 200),
+        Err(OrsError::AuthorityHandoffNotFresh)
+    ));
+    assert!(store.load_authority_handoff(&future.handoff_id)?.is_none());
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn authority_snapshot_cas_updates_same_record_and_rejects_stale_history_writer() -> TestResult {
+    let path = database_path("authority-snapshot-cas");
+    cleanup(&path);
+    let store = RedbRecoveryStore::open(&path)?;
+    let lineage = epoch("authority-cas-lineage", 1)?;
+    let initial = KernelAuthoritySnapshot::new(operational_input(
+        "authority-snapshot-cas-record",
+        "authority-snapshot-cas",
+        lineage.clone(),
+        "replay-revision-1",
+    )?)?;
+    let initial_receipt = store.commit_authority_snapshot(initial)?;
+    let next = KernelAuthoritySnapshot::new(operational_input(
+        "authority-snapshot-cas-record",
+        "authority-snapshot-cas",
+        lineage,
+        "replay-revision-2",
+    )?)?;
+    let expected_payload = next.record().payload.clone();
+    let stale_candidate = next.clone();
+    let next_receipt = store.commit_authority_snapshot_cas(next, Some(&initial_receipt))?;
+    assert!(next_receipt.receipt().operation_order() > initial_receipt.receipt().operation_order());
+    assert!(matches!(
+        store.commit_authority_snapshot_cas(stale_candidate, Some(&initial_receipt)),
+        Err(OrsError::DuplicateConflict)
+    ));
+    let current = store
+        .load_authority_snapshot(&OperationIdentity::new("authority-snapshot-cas")?)?
+        .ok_or("current authority snapshot")?;
+    assert_eq!(current.receipt(), &next_receipt);
+    assert_eq!(current.snapshot().record().payload, expected_payload);
+    let forensic = store.logical_snapshot(OrsSnapshotRequest::new(0, 64, 500)?)?;
+    assert!(forensic.entry_refs().len() >= 2);
+    drop(store);
+    let reopened = RedbRecoveryStore::open(&path)?;
+    let restarted = reopened
+        .load_authority_snapshot(&OperationIdentity::new("authority-snapshot-cas")?)?
+        .ok_or("restarted authority snapshot")?;
+    assert_eq!(restarted.receipt(), &next_receipt);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
 fn multi_scope_reservation_is_atomic_ordered_and_conflict_on_duplicate() -> TestResult {
     let path = database_path("atomic");
     cleanup(&path);

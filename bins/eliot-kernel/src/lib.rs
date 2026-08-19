@@ -39,8 +39,9 @@ use eliot_kernel_service::{
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
 use eliot_ors::{
-    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, ProcessEvidenceRecord,
-    ProcessStartReplayRecord as OrsReplayRecord, ProcessStartReplayState as OrsReplayState,
+    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, OrsError,
+    ProcessEvidenceRecord, ProcessStartReplayRecord as OrsReplayRecord,
+    ProcessStartReplayState as OrsReplayState,
 };
 use eliot_ors::{OperationalRecoveryStore, RedbRecoveryStore};
 use eliot_platform::{ClockObservation, PlatformHandle, PortError};
@@ -286,6 +287,9 @@ pub enum AuthorityPreparationError {
     DigestMismatch,
     /// The descriptor failed its closed contract validation.
     DescriptorInvalid,
+    /// The descriptor is absent from ORS and outside its fresh admission
+    /// interval at the reservation linearization point.
+    DescriptorNotFresh,
     /// Credential Manager did not return an acceptable secret.
     CredentialUnavailable,
     /// The credential was not exactly one non-zero 32-byte dispatch key.
@@ -302,6 +306,7 @@ impl fmt::Display for AuthorityPreparationError {
             Self::ProtectedInput => "protected authority input unavailable",
             Self::DigestMismatch => "authority descriptor digest mismatch",
             Self::DescriptorInvalid => "authority descriptor is invalid",
+            Self::DescriptorNotFresh => "authority descriptor is not fresh for admission",
             Self::CredentialUnavailable => "authority credential unavailable",
             Self::CredentialInvalid => "authority credential is invalid",
             Self::Replay => "authority handoff replay or recovery is required",
@@ -2195,9 +2200,9 @@ impl KernelComposition {
                     .map(|controller| Arc::new(Mutex::new(controller)));
                 }
                 let now = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
-                if descriptor.expires_at_ms <= now {
+                if !Self::authority_descriptor_is_fresh(descriptor, now) {
                     return Err(KernelError::RecoveryUnavailable(
-                        "fresh authority admission interval has expired".to_owned(),
+                        "fresh authority admission interval is not active".to_owned(),
                     ));
                 }
                 ProcessDispatchAuthorityController::activate_and_persist_initial(
@@ -2266,6 +2271,13 @@ impl KernelComposition {
             && left.expires_at_ms == right.expires_at_ms
     }
 
+    fn authority_descriptor_is_fresh(
+        descriptor: &ProcessAuthorityHandoffDescriptor,
+        now_ms: i64,
+    ) -> bool {
+        descriptor.issued_at_ms <= now_ms && now_ms < descriptor.expires_at_ms
+    }
+
     /// Reads, validates, and reserves one protected authority descriptor.
     ///
     /// This remains Kernel-private until the live Store-derived validation
@@ -2331,6 +2343,26 @@ impl KernelComposition {
         descriptor
             .validate_structure()
             .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?;
+        let candidate = Self::authority_handoff_candidate(&descriptor)?;
+
+        // Inspect the immutable handoff identity before touching Credential
+        // Manager. An exact existing handoff is replay evidence and may be
+        // recovered after its admission interval; only an absent handoff is
+        // required to be fresh before the credential boundary is crossed.
+        let existing = ors
+            .load_authority_handoff(&candidate.handoff_id)
+            .map_err(|_| AuthorityPreparationError::PersistenceUnknown)?;
+        if let Some(existing) = &existing {
+            if !Self::same_authority_handoff_identity(existing, &candidate) {
+                return Err(AuthorityPreparationError::Replay);
+            }
+        } else {
+            let now = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
+            if !Self::authority_descriptor_is_fresh(&descriptor, now) {
+                return Err(AuthorityPreparationError::DescriptorNotFresh);
+            }
+        }
+
         let secret = platform
             .read_credential(descriptor.dispatch_key.key.as_str())
             .map_err(|_| AuthorityPreparationError::CredentialUnavailable)?;
@@ -2342,9 +2374,33 @@ impl KernelComposition {
         let key = KernelDispatchKey::from_secret_bytes(key_bytes)
             .map_err(|_| AuthorityPreparationError::CredentialInvalid)?;
 
+        let outcome = match ors.begin_authority_handoff_fresh(&candidate) {
+            Ok(outcome) => outcome,
+            Err(OrsError::AuthorityHandoffNotFresh) => {
+                return Err(AuthorityPreparationError::DescriptorNotFresh);
+            }
+            Err(_) => return Err(AuthorityPreparationError::PersistenceUnknown),
+        };
+        let handoff = match outcome {
+            AuthorityHandoffBegin::Acquired => candidate,
+            AuthorityHandoffBegin::Existing(existing) => match existing.state {
+                AuthorityHandoffState::Reserved | AuthorityHandoffState::Consumed => existing,
+                AuthorityHandoffState::Unknown => return Err(AuthorityPreparationError::Replay),
+            },
+        };
+        Ok(PreparedAuthorityMaterial {
+            descriptor,
+            key,
+            handoff,
+        })
+    }
+
+    fn authority_handoff_candidate(
+        descriptor: &ProcessAuthorityHandoffDescriptor,
+    ) -> Result<AuthorityHandoffRecord, AuthorityPreparationError> {
         let handoff_id = eliot_ors::OperationIdentity::new(descriptor.handoff_id.as_str())
             .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?;
-        let candidate = AuthorityHandoffRecord {
+        Ok(AuthorityHandoffRecord {
             contract_version: eliot_ors::CONTRACT_VERSION,
             handoff_id,
             descriptor_digest: descriptor.descriptor_sha256.clone(),
@@ -2364,21 +2420,6 @@ impl KernelComposition {
             expires_at_ms: descriptor.expires_at_ms,
             consumed_at_ms: None,
             reconciliation_evidence: None,
-        };
-        let handoff = match ors
-            .begin_authority_handoff(&candidate)
-            .map_err(|_| AuthorityPreparationError::PersistenceUnknown)?
-        {
-            AuthorityHandoffBegin::Acquired => candidate,
-            AuthorityHandoffBegin::Existing(existing) => match existing.state {
-                AuthorityHandoffState::Reserved | AuthorityHandoffState::Consumed => existing,
-                AuthorityHandoffState::Unknown => return Err(AuthorityPreparationError::Replay),
-            },
-        };
-        Ok(PreparedAuthorityMaterial {
-            descriptor,
-            key,
-            handoff,
         })
     }
 
@@ -6529,6 +6570,93 @@ mod tests {
     }
 
     #[test]
+    fn process_authority_first_issue_is_versioned_and_stale_controller_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-process-authority-cas-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let ors_path = root.join("kernel-ors.redb");
+        let authority_id = DispatchAuthorityId::new("kernel-cas-authority").expect("authority");
+        let binding = authority_binding(&authority_id);
+        let codec: Arc<dyn DispatchSnapshotCodec> = Arc::new(JsonSnapshotCodec);
+        let store = Arc::new(RedbRecoveryStore::open(&ors_path).expect("real ORS store"));
+        let authority_store: Arc<dyn OperationalRecoveryStore> = store.clone();
+        let key = || KernelDispatchKey::from_secret_bytes([0x4a; 32]).expect("dispatch key");
+        let issuance = |nonce: &str| {
+            PermitIssuance::new(
+                ActionLeaseRef::new("cas-lease").expect("lease"),
+                FencingToken::new(1, Generation::new(1).expect("generation"), "cas-fence")
+                    .expect("fence"),
+                BTreeMap::from([("authority".to_owned(), "a".repeat(64))]),
+                1,
+                2,
+                nonce,
+            )
+            .expect("issuance")
+        };
+
+        let mut winner = ProcessDispatchAuthorityController::activate_and_persist_initial(
+            authority_id.clone(),
+            key(),
+            Arc::clone(&authority_store),
+            Arc::clone(&codec),
+            &binding,
+        )
+        .expect("initial snapshot");
+        let mut stale = ProcessDispatchAuthorityController::restore(
+            authority_id.clone(),
+            key(),
+            Arc::clone(&authority_store),
+            Arc::clone(&codec),
+            &binding,
+        )
+        .expect("stale controller restore");
+        winner
+            .issue(&seed_intent(), issuance("cas-winner"), &binding)
+            .expect("one controller wins the CAS");
+        assert!(matches!(
+            stale.issue(&seed_intent(), issuance("cas-stale"), &binding),
+            Err(KernelError::RecoveryState(
+                eliot_ors::OrsError::DuplicateConflict
+            ))
+        ));
+        assert!(matches!(
+            stale.issue(&seed_intent(), issuance("cas-stale-retry"), &binding),
+            Err(KernelError::DependencyUnavailable(_))
+        ));
+
+        let subject = OperationIdentity::new(authority_id.as_str()).expect("subject");
+        let current = store
+            .load_authority_snapshot(&subject)
+            .expect("load current snapshot")
+            .expect("current snapshot");
+        assert!(current.operation_order() > 1);
+        let mut restarted = ProcessDispatchAuthorityController::restore(
+            authority_id,
+            key(),
+            authority_store,
+            codec,
+            &binding,
+        )
+        .expect("restart snapshot");
+        assert!(
+            restarted
+                .issue(&seed_intent(), issuance("cas-winner"), &binding)
+                .is_err()
+        );
+        drop(restarted);
+        drop(stale);
+        drop(winner);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn process_authority_constructor_reuses_one_real_ors_store() {
         let root = std::env::temp_dir().join(format!(
@@ -6913,17 +7041,63 @@ mod tests {
         expired.expires_at_ms = 2;
         expired = expired.with_computed_digest().expect("expired digest");
         let (expired_path, expired_digest) = write_authority_descriptor(&root, "expired", &expired);
+        let expired_key = expired.dispatch_key.key.as_str().to_owned();
+        let expired_cleanup = credential_cleanup(&platform, &expired_key);
+        platform
+            .write_credential(&expired_key, &[0x4a; 32])
+            .expect("expired credential");
         assert!(matches!(
             kernel.prepare_authority_descriptor(
                 &expired_path,
                 &expired_digest,
                 AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
             ),
-            // Structural inspection intentionally precedes fresh-admission
-            // expiry validation; this path has no credential and therefore
-            // fails before it can reserve or activate anything.
-            Err(AuthorityPreparationError::CredentialUnavailable)
+            Err(AuthorityPreparationError::DescriptorNotFresh)
         ));
+        let expired_id = OperationIdentity::new(expired.handoff_id.as_str()).expect("handoff id");
+        assert!(
+            kernel
+                .generation_gateway
+                .ors
+                .load_authority_handoff(&expired_id)
+                .expect("expired handoff lookup")
+                .is_none()
+        );
+        drop(expired_cleanup);
+
+        let now = i64::try_from(unix_ms()).expect("test clock");
+        let mut future = authority_descriptor(
+            &format!("{suffix}-future-issued"),
+            "windows-credential-manager",
+        );
+        future.issued_at_ms = now.saturating_add(60_000);
+        future.expires_at_ms = now.saturating_add(120_000);
+        future = future.with_computed_digest().expect("future-issued digest");
+        let (future_path, future_digest) =
+            write_authority_descriptor(&root, "future-issued", &future);
+        let future_key = future.dispatch_key.key.as_str().to_owned();
+        let future_cleanup = credential_cleanup(&platform, &future_key);
+        platform
+            .write_credential(&future_key, &[0x4b; 32])
+            .expect("future-issued credential");
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &future_path,
+                &future_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::DescriptorNotFresh)
+        ));
+        let future_id = OperationIdentity::new(future.handoff_id.as_str()).expect("handoff id");
+        assert!(
+            kernel
+                .generation_gateway
+                .ors
+                .load_authority_handoff(&future_id)
+                .expect("future-issued handoff lookup")
+                .is_none()
+        );
+        drop(future_cleanup);
 
         let valid_substitution = authority_descriptor(
             &format!("{suffix}-substitution"),
@@ -7024,7 +7198,7 @@ mod tests {
         let mut descriptor =
             authority_descriptor(&format!("{suffix}-expiry"), "windows-credential-manager");
         descriptor.issued_at_ms = now.saturating_sub(1_000);
-        descriptor.expires_at_ms = now.saturating_add(250);
+        descriptor.expires_at_ms = now.saturating_add(2_000);
         descriptor = descriptor
             .with_computed_digest()
             .expect("descriptor digest");
@@ -7035,22 +7209,60 @@ mod tests {
             .write_credential(&key, &[0x4d; 32])
             .expect("credential");
 
-        let first = KernelComposition::new_with_authority_descriptor(
-            KernelConfig::new(&root),
-            &path,
-            &digest,
-            AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+        // Persist the initial replay snapshot while the activation intent is
+        // still Reserved.  This is the exact crash boundary that must remain
+        // recoverable after the descriptor's one-shot admission interval.
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("composition");
+        let prepared = kernel
+            .prepare_authority_descriptor(
+                &path,
+                &digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            )
+            .expect("reserve handoff before admission expiry");
+        assert_eq!(prepared.handoff.state, AuthorityHandoffState::Reserved);
+        let binding = AuthoritySnapshotBinding::from_wire(
+            prepared.descriptor.snapshot_binding.clone(),
+            &prepared.descriptor.authority_id,
         )
-        .expect("first boot before admission expiry");
-        drop(first);
-        std::thread::sleep(Duration::from_millis(400));
+        .expect("snapshot binding");
+        let codec: Arc<dyn DispatchSnapshotCodec> = Arc::new(WindowsDispatchSnapshotCodec::new(
+            Arc::clone(&platform),
+            prepared.descriptor.dispatch_key.clone(),
+        ));
+        let controller = KernelComposition::prepare_descriptor_controller(
+            prepared.descriptor.authority_id.clone(),
+            prepared.key,
+            Arc::clone(&kernel.generation_gateway.ors) as Arc<dyn OperationalRecoveryStore>,
+            codec,
+            &binding,
+            &prepared.descriptor,
+            &prepared.handoff,
+        )
+        .expect("initial snapshot before handoff consume");
+        let handoff_id =
+            OperationIdentity::new(descriptor.handoff_id.as_str()).expect("handoff id");
+        assert_eq!(
+            kernel
+                .generation_gateway
+                .ors
+                .load_authority_handoff(&handoff_id)
+                .expect("reserved handoff")
+                .expect("reserved handoff record")
+                .state,
+            AuthorityHandoffState::Reserved
+        );
+        drop(controller);
+        drop(kernel);
+        std::thread::sleep(Duration::from_millis(2_200));
+
         let restarted = KernelComposition::new_with_authority_descriptor(
             KernelConfig::new(&root),
             &path,
             &digest,
             AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
         )
-        .expect("exact restart after admission expiry");
+        .expect("exact Reserved restart after admission expiry");
         assert!(restarted.process_execution_configured());
         drop(restarted);
         drop(credential);

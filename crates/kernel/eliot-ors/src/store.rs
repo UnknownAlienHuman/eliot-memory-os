@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_platform::PlatformHandle;
 use eliot_receipts::{ReceiptDispositionKind, ReceiptEnvelope};
@@ -68,6 +69,15 @@ const SUPERVISION_LEASE_HISTORY: TableDefinition<&str, &str> =
 const SUPERVISION_LEASE_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_results_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
+
+fn current_unix_ms() -> Result<i64, OrsError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| OrsError::Storage(format!("system clock before Unix epoch: {error}")))?
+        .as_millis();
+    i64::try_from(millis)
+        .map_err(|_| OrsError::Storage("system clock exceeds signed millisecond range".to_owned()))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ScopeReservationHead {
@@ -282,6 +292,14 @@ pub trait OperationalRecoveryStore: Send + Sync {
     fn commit_authority_snapshot(
         &self,
         snapshot: KernelAuthoritySnapshot,
+    ) -> Result<AuthoritySnapshotReceipt, OrsError>;
+    /// Commits one replay snapshot only if the caller still owns the exact
+    /// current receipt. A missing expected receipt is valid only for the
+    /// first snapshot on an otherwise empty authority subject.
+    fn commit_authority_snapshot_cas(
+        &self,
+        snapshot: KernelAuthoritySnapshot,
+        expected: Option<&AuthoritySnapshotReceipt>,
     ) -> Result<AuthoritySnapshotReceipt, OrsError>;
     /// Loads one active opaque authority snapshot with fresh ORS integrity
     /// validation. The returned value is not Kernel authority.
@@ -616,6 +634,31 @@ impl RedbRecoveryStore {
         &self,
         record: &AuthorityHandoffRecord,
     ) -> Result<AuthorityHandoffBegin, OrsError> {
+        self.begin_authority_handoff_with_now(record, None)
+    }
+
+    /// Atomically reserves one typed authority handoff after checking its
+    /// fresh-admission interval against the supplied clock observation.
+    ///
+    /// The freshness check is performed inside the same redb write
+    /// transaction as the create-if-absent decision. Callers that already
+    /// have a deterministic clock observation (for example, acceptance
+    /// tests) can use this method to exercise the exact boundary.
+    pub fn begin_authority_handoff_at(
+        &self,
+        record: &AuthorityHandoffRecord,
+        now_ms: i64,
+    ) -> Result<AuthorityHandoffBegin, OrsError> {
+        self.begin_authority_handoff_with_now(record, Some(now_ms))
+    }
+
+    /// Atomically reserves one typed authority handoff using a clock sample
+    /// taken after the ORS write transaction has acquired its serialization
+    /// point. This is the production fresh-admission entry point.
+    pub fn begin_authority_handoff_fresh(
+        &self,
+        record: &AuthorityHandoffRecord,
+    ) -> Result<AuthorityHandoffBegin, OrsError> {
         record.validate()?;
         if record.state != AuthorityHandoffState::Reserved {
             return Err(OrsError::IntegrityProblem {
@@ -624,6 +667,48 @@ impl RedbRecoveryStore {
             });
         }
         let write = self.database.begin_write().map_err(storage)?;
+        let now_ms = current_unix_ms()?;
+        let outcome = Self::begin_authority_handoff_in_write(&write, record, Some(now_ms))?;
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    fn begin_authority_handoff_with_now(
+        &self,
+        record: &AuthorityHandoffRecord,
+        now_ms: Option<i64>,
+    ) -> Result<AuthorityHandoffBegin, OrsError> {
+        record.validate()?;
+        if record.state != AuthorityHandoffState::Reserved {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "authority_handoff",
+                reason: "begin requires a RESERVED candidate".to_owned(),
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = Self::begin_authority_handoff_in_write(&write, record, now_ms)?;
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    fn begin_authority_handoff_in_write(
+        write: &redb::WriteTransaction,
+        record: &AuthorityHandoffRecord,
+        now_ms: Option<i64>,
+    ) -> Result<AuthorityHandoffBegin, OrsError> {
+        if now_ms.is_some_and(|now| record.issued_at_ms > now || record.expires_at_ms <= now) {
+            // An already-existing exact handoff remains replay evidence; the
+            // freshness gate applies only to a new Reserved durable intent.
+            let table = write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?;
+            let existing = table
+                .get(record.handoff_id.as_str())
+                .map_err(storage)?
+                .is_some();
+            drop(table);
+            if !existing {
+                return Err(OrsError::AuthorityHandoffNotFresh);
+            }
+        }
         let outcome = {
             let mut table = write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?;
             if let Some(existing) = table.get(record.handoff_id.as_str()).map_err(storage)? {
@@ -644,7 +729,6 @@ impl RedbRecoveryStore {
                 AuthorityHandoffBegin::Acquired
             }
         };
-        write.commit().map_err(storage)?;
         Ok(outcome)
     }
 
@@ -2581,6 +2665,67 @@ impl RedbRecoveryStore {
         write.commit().map_err(storage)?;
         Ok(snapshots)
     }
+
+    /// Commits one authority replay snapshot with a receipt-fenced compare
+    /// and swap. The expected receipt is checked while the write transaction
+    /// owns the ORS serialization point; every successful replacement gets a
+    /// new operation order and an additional history row.
+    pub fn commit_authority_snapshot_cas(
+        &self,
+        snapshot: KernelAuthoritySnapshot,
+        expected: Option<&AuthoritySnapshotReceipt>,
+    ) -> Result<AuthoritySnapshotReceipt, OrsError> {
+        let input = snapshot.0;
+        input.validate()?;
+        let key = Self::operational_key(OperationalKind::AuthoritySnapshot, &input.subject_id);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = Self::decode_operational_current(&write, &key)?;
+        match expected {
+            None if existing.is_some() => return Err(OrsError::DuplicateConflict),
+            None => {}
+            Some(expected) => {
+                let Some(existing) = existing.as_ref() else {
+                    return Err(OrsError::DuplicateConflict);
+                };
+                if existing.kind != OperationalKind::AuthoritySnapshot
+                    || existing.phase != OperationalPhase::Active
+                    || existing.input.subject_id != input.subject_id
+                    || existing.input.record_id != input.record_id
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "authority_snapshot",
+                        reason: "current snapshot identity or phase is invalid".to_owned(),
+                    });
+                }
+                existing.input.validate()?;
+                if existing.input.authority_epoch != input.authority_epoch
+                    || existing.input.state_fence != input.state_fence
+                    || existing.input.created_at_ms != input.created_at_ms
+                    || existing.input.cleanup_after_ms != input.cleanup_after_ms
+                {
+                    return Err(OrsError::FenceMismatch);
+                }
+                let actual = AuthoritySnapshotReceipt::from_receipt(Self::receipt_for(existing)?);
+                if actual != *expected {
+                    return Err(OrsError::DuplicateConflict);
+                }
+            }
+        }
+        let durable = DurableOperationalRecord {
+            kind: OperationalKind::AuthoritySnapshot,
+            input,
+            phase: OperationalPhase::Active,
+            operation_order: Self::next_operational_order(&write)?,
+            terminal_receipt_id: None,
+            terminal_receipt_sha256: None,
+            generation_cutover: None,
+        };
+        Self::persist_operational_record(&write, &key, &durable)?;
+        write.commit().map_err(storage)?;
+        Ok(AuthoritySnapshotReceipt::from_receipt(Self::receipt_for(
+            &durable,
+        )?))
+    }
 }
 
 impl OperationalRecoveryStore for RedbRecoveryStore {
@@ -2891,6 +3036,14 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             OperationalPhase::Active,
         )
         .map(AuthoritySnapshotReceipt::from_receipt)
+    }
+
+    fn commit_authority_snapshot_cas(
+        &self,
+        snapshot: KernelAuthoritySnapshot,
+        expected: Option<&AuthoritySnapshotReceipt>,
+    ) -> Result<AuthoritySnapshotReceipt, OrsError> {
+        RedbRecoveryStore::commit_authority_snapshot_cas(self, snapshot, expected)
     }
 
     fn load_authority_snapshot(
