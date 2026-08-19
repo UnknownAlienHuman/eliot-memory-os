@@ -416,6 +416,110 @@ fn active_journal() -> (
     (journal, host, generation)
 }
 
+fn exact_clean_marker(
+    journal: &HostStateJournal<MemoryBackend>,
+    host: &HostInstallationEpoch,
+    generation: &EpochTransition,
+    op: &str,
+) -> HostStateRecord {
+    let snapshot = journal.snapshot().unwrap_or_else(|_| unreachable!());
+    HostStateRecord::CleanMarker(CleanMarker {
+        fence: fence(host, generation),
+        operation: operation(op),
+        manifest: JournalManifest {
+            schema_version: JOURNAL_VERSION,
+            last_sequence: snapshot.sequence,
+            last_checksum: h(snapshot.last_checksum.as_deref().unwrap_or("GENESIS")),
+        },
+        shutdown_evidence_refs: vec![h("host-owner-release-fenced")],
+    })
+}
+
+#[test]
+fn stopped_genesis_without_runtime_contour_accepts_exact_clean_marker_and_replays() {
+    let host = host(1);
+    let generation = step("activation-lineage", 1);
+    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone())
+        .unwrap_or_else(|_| unreachable!());
+    journal
+        .append(activation(
+            &host,
+            &generation,
+            "genesis-stopped",
+            ActivationState::Stopped,
+        ))
+        .unwrap_or_else(|error| panic!("genesis append failed: {error}"));
+    journal
+        .append(exact_clean_marker(
+            &journal,
+            &host,
+            &generation,
+            "genesis-clean",
+        ))
+        .unwrap_or_else(|error| panic!("clean marker failed: {error}"));
+
+    let backend = journal.into_backend().unwrap_or_else(|_| unreachable!());
+    let reopened = HostStateJournal::open(backend, host).unwrap_or_else(|_| unreachable!());
+    assert!(reopened.snapshot().unwrap().clean_marker.is_some());
+}
+
+#[test]
+fn partial_runtime_contours_cannot_use_genesis_clean_marker_exception() {
+    let host = host(1);
+    let generation = step("activation-lineage", 1);
+    for (label, record) in [
+        (
+            "starting-activation",
+            activation(
+                &host,
+                &generation,
+                "partial-starting",
+                ActivationState::Starting,
+            ),
+        ),
+        (
+            "dependency",
+            HostStateRecord::Dependency(dependency_record(
+                &host,
+                &generation,
+                "partial-dependency",
+                DependencyState::Starting,
+            )),
+        ),
+        (
+            "drain",
+            HostStateRecord::Drain(DrainRecord {
+                fence: fence(&host, &generation),
+                operation: operation("partial-drain"),
+                drain_generation: generation.clone(),
+                state: DrainState::Requested,
+                evidence_refs: vec![h("partial-drain-evidence")],
+            }),
+        ),
+    ] {
+        let journal = HostStateJournal::open(MemoryBackend::default(), host.clone())
+            .unwrap_or_else(|_| unreachable!());
+        journal
+            .append(activation(
+                &host,
+                &generation,
+                &format!("{label}-stopped"),
+                ActivationState::Stopped,
+            ))
+            .unwrap_or_else(|_| unreachable!());
+        journal.append(record).unwrap_or_else(|_| unreachable!());
+        assert!(matches!(
+            journal.append(exact_clean_marker(
+                &journal,
+                &host,
+                &generation,
+                &format!("{label}-clean")
+            )),
+            Err(JournalError::Invalid(_))
+        ));
+    }
+}
+
 fn active_kernel_journal() -> (
     HostStateJournal<MemoryBackend>,
     HostInstallationEpoch,

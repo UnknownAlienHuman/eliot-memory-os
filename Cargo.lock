@@ -1144,6 +1144,7 @@ dependencies = [
  "eliot-installation",
  "eliot-ipc",
  "eliot-kernel-service",
+ "eliot-observation-contracts",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-runtime-contracts",
@@ -1152,6 +1153,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror",
  "tokio",
+ "uuid",
  "windows-sys",
 ]
 

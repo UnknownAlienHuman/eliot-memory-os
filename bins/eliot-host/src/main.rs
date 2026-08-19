@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 #[cfg(windows)]
 use eliot_host::HostBranchDisposition;
-use eliot_host::{HostComposition, HostError, PROTOCOL_VERSION, SERVICE_NAME};
+use eliot_host::{
+    HOST_JOURNAL_RELATIVE_PATH, HostComposition, HostError, PROTOCOL_VERSION, SERVICE_NAME,
+};
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::protected_program_data_path;
 use serde::{Deserialize, Serialize};
@@ -95,7 +97,7 @@ fn open_host() -> Result<HostComposition, HostError> {
 }
 
 fn state_path() -> Result<PathBuf, HostError> {
-    protected_program_data_path("Eliot/host/host-state.redb")
+    protected_program_data_path(HOST_JOURNAL_RELATIVE_PATH)
         .map_err(|error| HostError::Platform(error.to_string()))
 }
 
@@ -105,8 +107,12 @@ fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
             match host.snapshot() {
                 Ok(state) => Response::State {
                     running: host.running(),
-                    active_process: state.active_process.is_some(),
-                    managed_dependencies: state.managed_dependencies.len(),
+                    active_process: state
+                        .kernel
+                        .as_ref()
+                        .and_then(|record| record.process.as_ref())
+                        .is_some(),
+                    managed_dependencies: state.dependencies.len(),
                 },
                 Err(error) => Response::Error {
                     error: error.to_string(),

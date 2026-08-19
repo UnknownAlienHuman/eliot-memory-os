@@ -16,6 +16,7 @@ eliot-installation.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-service.workspace = true
 eliot-host-state.workspace = true
+eliot-observation-contracts.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-runtime-contracts.workspace = true
@@ -24,6 +25,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Services"] }
 
 [lints.rust]

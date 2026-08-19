@@ -489,12 +489,25 @@ fn apply(
             state.clean_marker = None;
         }
         HostStateRecord::CleanMarker(next) => {
+            let genesis_without_runtime_contour = state
+                .activation
+                .as_ref()
+                .is_some_and(|activation| activation.state == crate::ActivationState::Stopped)
+                && state.kernel.is_none()
+                && state.kernel_history.is_empty()
+                && state.prior_kernel.is_none()
+                && !state.prior_kernel_unknown
+                && state.dependencies.is_empty()
+                && state.drain.is_none()
+                && state.drain_commit.is_none()
+                && state.readiness_observations.is_empty();
             if next.manifest.schema_version != JOURNAL_VERSION
                 || next.manifest.last_sequence != state.sequence
                 || next.manifest.last_checksum.as_str()
                     != state.last_checksum.as_deref().unwrap_or("GENESIS")
-                || state.activation.as_ref().map(|value| value.state)
+                || (state.activation.as_ref().map(|value| value.state)
                     != Some(crate::ActivationState::StoppedClean)
+                    && !genesis_without_runtime_contour)
             {
                 return Err(JournalError::Invalid(
                     "clean marker does not cover a cleanly stopped journal".into(),

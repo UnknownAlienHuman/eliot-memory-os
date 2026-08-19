@@ -1,7 +1,7 @@
 //! Production Host composition root.
 //!
-//! Host is the outer Windows lifecycle owner. It opens the redb Host state
-//! store under the installation's durable data root, keeps approved
+//! Host is the outer Windows lifecycle owner. It opens the crash-safe Host
+//! journal under the installation's durable data root, keeps approved
 //! generations separate from semantic state, and owns independent Job Object
 //! branches for Kernel and the canonical store dependency.
 
@@ -16,8 +16,13 @@ use eliot_contracts::{
     SourceId, StateFence,
 };
 use eliot_host_state::{
-    HostAdmissionState, HostInstallationEpoch, HostRecoverySnapshot, RedbHostReleaseToken,
-    RedbHostStateStore,
+    ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
+    EliotActivationRecord, EpochIdentity, EpochTransition, HostInstallationEpoch,
+    HostKernelStoreLineage, HostObservationRecord, HostState, HostStateJournalService,
+    HostStateRecord, IdempotencyIdentity, JOURNAL_VERSION, JournalBackend, JournalError,
+    JournalManifest, LegacyHostStateImporter, LifecycleTimestamps, ProductionHostStateJournal,
+    ReadinessEvidence, ReconcileOutcome, RecordFence, RecoveryLineageEvidence,
+    RecoveryLineageReason, RedbJournalBackend, WakeDisposition,
 };
 use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, InstallationProfile,
@@ -29,29 +34,34 @@ use eliot_kernel_service::{
     KERNEL_CONTROL_PIPE, KernelControlCommand, KernelControlRequest, KernelReadyReceipt,
     KernelServiceState, RestartBudget, control_request_frame, decode_control_response_frame,
 };
+use eliot_observation_contracts::{
+    CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
+};
 use eliot_platform::{
-    HostBranchKind, HostBranchRecoveryFence, HostInstallationState, HostJobDisposition,
-    HostProcessRecoveryBinding, HostRecoveryEvidence, HostStateStore, PlatformHandle, PortOutcome,
-    ServiceOperation, ServicePort, ServiceRequest, ServiceState,
+    PlatformHandle, PortOutcome, ServiceOperation, ServicePort, ServiceRequest, ServiceState,
 };
 use eliot_platform_windows::{
     HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError, ProtectedPathLease,
     ServiceAccount, ServiceRegistrationRequest, ServiceStartMode, WindowsPlatform,
 };
-use eliot_runtime_contracts::{HealthVector, ServiceProcessRecord, ServiceProcessState};
 use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
 use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
 use thiserror::Error;
+use uuid::Uuid;
 
 pub const SERVICE_NAME: &str = "eliot-host";
 pub const PROTOCOL_VERSION: &str = "eliot.host.v1";
+pub const HOST_JOURNAL_RELATIVE_PATH: &str = "Eliot/host/host-state-journal.redb";
+pub const LEGACY_HOST_STATE_RELATIVE_PATH: &str = "Eliot/host/host-state.redb";
 
 #[derive(Debug, Error)]
 pub enum HostError {
     #[error("host state store: {0}")]
     State(#[from] eliot_platform::HostStateError),
+    #[error("host state journal: {0}")]
+    Journal(#[from] JournalError),
     #[error("installation registry: {0}")]
     Installation(#[from] InstallationError),
     #[error("host platform: {0}")]
@@ -1668,24 +1678,318 @@ impl HostJobBranches {
             || self.kernel_executable.is_some()
             || self.canonical_store_executable.is_some()
     }
+}
 
-    fn kernel_recovery_binding(
-        &self,
-        generation: &PlatformHandle,
-        observed_process: &ServiceProcessRecord,
-        installation: &PlatformHandle,
-    ) -> Result<HostProcessRecoveryBinding, HostError> {
-        let process = self
-            .kernel_process()
-            .ok_or_else(|| HostError::ProcessContour("Kernel process is unavailable".to_owned()))?;
-        process_recovery_binding(
-            process,
-            generation,
-            &self.kernel_identity,
-            installation,
-            observed_process,
-        )
+fn fresh_identity(prefix: &str) -> Result<PlatformHandle, HostError> {
+    PlatformHandle::new(format!("{prefix}-{}", Uuid::new_v4().simple()))
+        .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+fn root_epoch(lineage: PlatformHandle) -> EpochTransition {
+    EpochTransition {
+        current: EpochIdentity {
+            lineage,
+            sequence: 1,
+        },
+        parent: None,
     }
+}
+
+fn fresh_host_epoch(
+    installation: PlatformHandle,
+    recovery: Option<RecoveryLineageEvidence>,
+) -> Result<HostInstallationEpoch, HostError> {
+    Ok(HostInstallationEpoch {
+        installation,
+        epoch: root_epoch(fresh_identity("host-lineage")?),
+        nonce: fresh_identity("host-process-nonce")?,
+        recovery,
+    })
+}
+
+fn child_host_epoch(parent: &HostInstallationEpoch) -> Result<HostInstallationEpoch, HostError> {
+    Ok(HostInstallationEpoch {
+        installation: parent.installation.clone(),
+        epoch: parent.epoch.direct_child()?,
+        nonce: fresh_identity("host-process-nonce")?,
+        recovery: None,
+    })
+}
+
+fn operation(label: &str) -> Result<IdempotencyIdentity, HostError> {
+    Ok(IdempotencyIdentity {
+        operation_id: fresh_identity(label)?,
+        idempotency_key: fresh_identity(&format!("{label}-idempotency"))?,
+    })
+}
+
+fn record_fence(
+    host: &HostInstallationEpoch,
+    activation_id: &PlatformHandle,
+    activation_generation: &EpochTransition,
+) -> RecordFence {
+    RecordFence {
+        host: host.clone(),
+        activation_id: activation_id.clone(),
+        activation_generation: activation_generation.clone(),
+    }
+}
+
+fn initial_activation_record(
+    host: &HostInstallationEpoch,
+    activation_id: &PlatformHandle,
+    activation_generation: &EpochTransition,
+    state: ActivationState,
+    label: &str,
+) -> Result<EliotActivationRecord, HostError> {
+    let ready = matches!(
+        state,
+        ActivationState::ControlReady | ActivationState::Active
+    );
+    let drain_generation = matches!(
+        state,
+        ActivationState::Draining | ActivationState::StoppedClean
+    )
+    .then(|| activation_generation.clone());
+    Ok(EliotActivationRecord {
+        fence: record_fence(host, activation_id, activation_generation),
+        operation: operation(label)?,
+        activation_id: activation_id.clone(),
+        trigger_class: PlatformHandle::new("host-runtime-lifecycle")
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        trigger_evidence: vec![
+            PlatformHandle::new("host-owner-lease-held")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        ],
+        requester_principal_session_or_scheduler: PlatformHandle::new("host-composition")
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        requested_capabilities: vec![
+            PlatformHandle::new("runtime-supervision")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        ],
+        candidate_scope: host.installation.clone(),
+        state,
+        drain_generation,
+        lineage: HostKernelStoreLineage {
+            host_epoch: host.epoch.current.clone(),
+            kernel_epoch: EpochIdentity {
+                lineage: fresh_identity("kernel-lineage")?,
+                sequence: 1,
+            },
+            watchdog_epoch: EpochIdentity {
+                lineage: fresh_identity("watchdog-lineage")?,
+                sequence: 1,
+            },
+            store_generation: EpochIdentity {
+                lineage: fresh_identity("store-lineage")?,
+                sequence: 1,
+            },
+        },
+        readiness: ReadinessEvidence {
+            supervision_ready: ready,
+            control_ready: ready,
+            evidence_refs: vec![
+                PlatformHandle::new(if ready {
+                    "kernel-ready-receipt-validated"
+                } else {
+                    "host-lifecycle-not-ready"
+                })
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            ],
+        },
+        governance_profile: PlatformHandle::new("runtime-live-v3")
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        runtime_lease_refs: Vec::new(),
+        supervision_lease_refs: Vec::new(),
+        wake_intent_refs: Vec::new(),
+        drain_commit_ref: None,
+        wake_during_drain_disposition: None,
+        boot_session_evidence: vec![
+            PlatformHandle::new("host-process-epoch")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        ],
+        power_transition_evidence: Vec::new(),
+        timestamps: LifecycleTimestamps {
+            started_at: (state != ActivationState::Stopped)
+                .then(|| fresh_identity("host-started-at"))
+                .transpose()?,
+            ready_at: ready.then(|| fresh_identity("host-ready-at")).transpose()?,
+            draining_at: (state == ActivationState::Draining)
+                .then(|| fresh_identity("host-draining-at"))
+                .transpose()?,
+            stopped_at: (state == ActivationState::StoppedClean)
+                .then(|| fresh_identity("host-stopped-at"))
+                .transpose()?,
+        },
+        failure_and_recovery_directive: None,
+    })
+}
+
+fn transition_activation_record(
+    current: &EliotActivationRecord,
+    state: ActivationState,
+    label: &str,
+) -> Result<EliotActivationRecord, HostError> {
+    let mut next = current.clone();
+    next.operation = operation(label)?;
+    next.state = state;
+    let ready = matches!(
+        state,
+        ActivationState::ControlReady | ActivationState::Active
+    );
+    next.readiness.control_ready = ready;
+    next.readiness.supervision_ready = ready;
+    if ready {
+        next.readiness.evidence_refs = vec![
+            PlatformHandle::new("kernel-ready-receipt-validated")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        ];
+        next.timestamps.ready_at = Some(fresh_identity("host-ready-at")?);
+    }
+    if state == ActivationState::Draining {
+        next.drain_generation = Some(next.fence.activation_generation.clone());
+        next.timestamps.draining_at = Some(fresh_identity("host-draining-at")?);
+    }
+    if state == ActivationState::StoppedClean {
+        next.timestamps.stopped_at = Some(fresh_identity("host-stopped-at")?);
+    }
+    Ok(next)
+}
+
+fn append_reconciled<B: JournalBackend>(
+    journal: &HostStateJournalService<B>,
+    record: HostStateRecord,
+) -> Result<AppendReceipt, HostError> {
+    match journal.append(record.clone()) {
+        Ok(receipt) => Ok(receipt),
+        Err(JournalError::OutcomeUnknown { transaction_id }) => {
+            match journal.reconcile(&transaction_id)? {
+                ReconcileOutcome::Committed => journal.append(record).map_err(HostError::Journal),
+                ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
+                    Err(HostError::Journal(JournalError::OutcomeUnknown {
+                        transaction_id,
+                    }))
+                }
+            }
+        }
+        Err(error) => Err(HostError::Journal(error)),
+    }
+}
+
+fn clean_marker_record(
+    snapshot: &HostState,
+    host: &HostInstallationEpoch,
+    activation_id: &PlatformHandle,
+    activation_generation: &EpochTransition,
+) -> Result<HostStateRecord, HostError> {
+    Ok(HostStateRecord::CleanMarker(CleanMarker {
+        fence: record_fence(host, activation_id, activation_generation),
+        operation: operation("host-clean-marker")?,
+        manifest: JournalManifest {
+            schema_version: JOURNAL_VERSION,
+            last_sequence: snapshot.sequence,
+            last_checksum: PlatformHandle::new(
+                snapshot.last_checksum.as_deref().unwrap_or("GENESIS"),
+            )
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        },
+        shutdown_evidence_refs: vec![
+            PlatformHandle::new("host-owner-release-fenced")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        ],
+    }))
+}
+
+fn append_clean_marker<B: JournalBackend>(
+    journal: &HostStateJournalService<B>,
+    host: &HostInstallationEpoch,
+    activation_id: &PlatformHandle,
+    activation_generation: &EpochTransition,
+) -> Result<(), HostError> {
+    let snapshot = journal.snapshot()?;
+    append_reconciled(
+        journal,
+        clean_marker_record(&snapshot, host, activation_id, activation_generation)?,
+    )?;
+    Ok(())
+}
+
+fn open_production_epoch(
+    path: &Path,
+    installation: PlatformHandle,
+) -> Result<
+    (
+        ProductionHostStateJournal,
+        HostInstallationEpoch,
+        EpochTransition,
+        PlatformHandle,
+    ),
+    HostError,
+> {
+    let inspection = RedbJournalBackend::inspect_existing(path).map_err(JournalError::Backend)?;
+    let last_host = inspection
+        .as_ref()
+        .and_then(|value| value.image.epochs.last())
+        .map(|epoch| epoch.host.clone());
+    drop(inspection);
+
+    let (journal, host, activation_generation) = if let Some(last_host) = last_host {
+        if last_host.installation != installation {
+            return Err(HostError::OwnerLeaseRecovery(
+                "Host journal installation identity does not match admission".to_owned(),
+            ));
+        }
+        let current = ProductionHostStateJournal::open(path, last_host.clone())?;
+        for pending in current.pending_transactions()? {
+            match current.reconcile(&pending.transaction_id)? {
+                ReconcileOutcome::Committed => {}
+                ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
+                    return Err(HostError::Journal(JournalError::OutcomeUnknown {
+                        transaction_id: pending.transaction_id,
+                    }));
+                }
+            }
+        }
+        let replayed = current.snapshot()?;
+        if replayed.clean_marker.is_none() {
+            return Err(HostError::OwnerLeaseRecovery(
+                "current Host journal epoch is unclean; explicit new-lineage recovery is required"
+                    .to_owned(),
+            ));
+        }
+        let activation_generation = replayed
+            .activation
+            .as_ref()
+            .map(|activation| activation.fence.activation_generation.direct_child())
+            .transpose()?
+            .unwrap_or(root_epoch(fresh_identity("activation-lineage")?));
+        let host = child_host_epoch(&last_host)?;
+        let backend = current.into_backend()?;
+        (
+            HostStateJournalService::from_backend(backend, host.clone())?,
+            host,
+            activation_generation,
+        )
+    } else {
+        let host = fresh_host_epoch(installation, None)?;
+        (
+            ProductionHostStateJournal::open(path, host.clone())?,
+            host,
+            root_epoch(fresh_identity("activation-lineage")?),
+        )
+    };
+    let activation_id = fresh_identity("activation")?;
+    append_reconciled(
+        &journal,
+        HostStateRecord::Activation(initial_activation_record(
+            &host,
+            &activation_id,
+            &activation_generation,
+            ActivationState::Stopped,
+            "host-open",
+        )?),
+    )?;
+    Ok((journal, host, activation_generation, activation_id))
 }
 
 /// Host-owned lifecycle state and installation activation registry.
@@ -1694,16 +1998,17 @@ impl HostJobBranches {
     reason = "the lifecycle flags are independent durable shutdown and lease-release fences"
 )]
 pub struct HostComposition {
-    state_store: RedbHostStateStore,
+    journal: ProductionHostStateJournal,
     registry_store: RedbInstallationRegistry,
     registry: ApprovedGenerationRegistry,
     host: HostInstallationEpoch,
-    host_process: ServiceProcessRecord,
+    activation_generation: EpochTransition,
+    activation_id: PlatformHandle,
     running: bool,
     #[cfg(windows)]
     jobs: HostJobBranches,
     owner_lease: HostOwnerLease,
-    pending_release: Option<RedbHostReleaseToken>,
+    pending_record: Option<HostStateRecord>,
     durable_finalized: bool,
     owner_released: bool,
     shutdown_failed: bool,
@@ -1727,52 +2032,26 @@ impl HostComposition {
             return Err(HostError::MissingInstallation);
         }
         let owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
-        match RedbHostStateStore::inspect_admission(path, &installation).map_err(|error| {
-            HostError::OwnerLeaseRecovery(format!(
-                "durable Host admission inspection failed; recovery required: {error}"
-            ))
-        })? {
-            HostAdmissionState::FirstInstall | HostAdmissionState::Clean => {}
-            HostAdmissionState::RecoveryRequired => {
-                return Err(HostError::OwnerLeaseRecovery(
-                    "durable Host state is unclean or still running; explicit recovery evidence is required"
-                        .to_owned(),
-                ));
-            }
-        }
-        let (state_store, host) = RedbHostStateStore::open_epoch(path, installation.clone())?;
+        let (journal, host, activation_generation, activation_id) =
+            open_production_epoch(path, installation)?;
         let registry_path = path.with_file_name("installation-registry.redb");
         let registry_store = RedbInstallationRegistry::open(registry_path)?;
         let registry = registry_store.load()?;
-        let host_process = host_process_record(&host)?;
-        let host_recovery = host_process_recovery_binding(&host, &host_process)?;
-        // Every Host invocation records an activation boundary.  If a prior
-        // projection had no clean marker, this deliberately remains an
-        // unclean recovery until stop() writes the shutdown receipt.
-        state_store
-            .commit_activation(
-                eliot_platform::HostActivationTransition {
-                    context: lifecycle_context(&host, "host-open")?,
-                    installation: host.installation.clone(),
-                    process: host_process.clone(),
-                },
-                host_recovery,
-            )
-            .map_err(HostError::State)?;
         #[cfg(windows)]
         let jobs =
             HostJobBranches::new(&host).map_err(|error| HostError::Platform(error.to_string()))?;
         let mut composition = Self {
-            state_store,
+            journal,
             registry_store,
             registry,
             host,
-            host_process,
+            activation_generation,
+            activation_id,
             running: true,
             #[cfg(windows)]
             jobs,
             owner_lease,
-            pending_release: None,
+            pending_record: None,
             durable_finalized: false,
             owner_released: false,
             shutdown_failed: false,
@@ -1786,54 +2065,78 @@ impl HostComposition {
         Ok(composition)
     }
 
-    /// Clears an unclean durable Host admission gate using typed evidence that
-    /// exactly matches the inspected stale process, epoch and Job disposition.
-    /// This path does not advance an epoch or fabricate process identity and
-    /// is intended for bounded offline recovery only.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the owner lease cannot be acquired, durable state
-    /// cannot be inspected, evidence mismatches, or recovery cannot finalize.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "the recovery API retains its established owned installation identity parameter"
-    )]
-    pub fn recover_unclean(
-        path: impl AsRef<Path>,
+    /// Explicitly imports a clean, offline legacy `host-state.redb` projection
+    /// into a distinct journal lineage. Normal Host startup never calls this.
+    pub fn migrate_legacy_host_state(
+        legacy_path: impl AsRef<Path>,
+        journal_path: impl AsRef<Path>,
         installation: PlatformHandle,
-        evidence: HostRecoveryEvidence,
-    ) -> Result<(), HostError> {
-        if installation.as_str().trim().is_empty() {
-            return Err(HostError::MissingInstallation);
-        }
+        source_evidence_refs: Vec<PlatformHandle>,
+    ) -> Result<PathBuf, HostError> {
+        let legacy_path = legacy_path.as_ref();
         let mut owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
-        let snapshot = RedbHostStateStore::inspect_recovery(path.as_ref(), &installation).map_err(
-            |error| {
-                HostError::OwnerLeaseRecovery(format!(
-                    "durable Host admission inspection failed; recovery required: {error}"
-                ))
-            },
+        let snapshot =
+            LegacyHostStateImporter::inspect_existing(legacy_path)?.ok_or_else(|| {
+                HostError::OwnerLeaseRecovery("legacy Host state is absent".to_owned())
+            })?;
+        if snapshot.state.installation != installation
+            || snapshot.state.active_process.is_some()
+            || !snapshot.state.managed_dependencies.is_empty()
+            || snapshot.state.disposition.is_release_pending()
+        {
+            return Err(HostError::OwnerLeaseRecovery(
+                "legacy Host state is not a clean offline migration source".to_owned(),
+            ));
+        }
+        if RedbJournalBackend::inspect_existing(journal_path.as_ref())
+            .map_err(JournalError::Backend)?
+            .is_some()
+        {
+            return Err(HostError::OwnerLeaseRecovery(
+                "migration target journal already exists".to_owned(),
+            ));
+        }
+        let mut evidence = source_evidence_refs;
+        let encoded = serde_json::to_vec(&snapshot.state)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        evidence.push(
+            PlatformHandle::new(format!("sha256-{:x}", Sha256::digest(encoded)))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        );
+        let host = fresh_host_epoch(
+            installation,
+            Some(RecoveryLineageEvidence {
+                reason: RecoveryLineageReason::Migration,
+                source_evidence_refs: evidence,
+            }),
         )?;
-        validate_recovery_evidence(&snapshot, &evidence)?;
-        let state_store = RedbHostStateStore::open_existing(path, &installation)?;
-        let token = state_store
-            .prepare_recovery_pending(evidence)
-            .map_err(HostError::State)?;
-        // Compare-and-clear is durable while the owner mutex is still held.
-        // The RecoveryFinalized disposition remains a gate until the owner
-        // release is proven and the exact token is cleanly finalized.
-        state_store
-            .finalize_recovery_clear(&token)
-            .map_err(HostError::State)?;
-        // Keep the installation owner mutex through both durable recovery
-        // mutations. Releasing first would allow a second Host to observe
-        // the intermediate RecoveryFinalized projection and race the final
-        // clean transition.
-        state_store
-            .finalize_clean_shutdown(token)
-            .map_err(HostError::State)?;
-        owner_lease.release().map_err(owner_lease_release_error)
+        let journal = ProductionHostStateJournal::open(journal_path.as_ref(), host.clone())?;
+        let activation_generation = root_epoch(fresh_identity("activation-lineage")?);
+        let activation_id = fresh_identity("activation")?;
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &activation_generation,
+                ActivationState::Stopped,
+                "legacy-migration-open",
+            )?),
+        )?;
+        append_clean_marker(&journal, &host, &activation_id, &activation_generation)?;
+        drop(journal);
+        let verified = ProductionHostStateJournal::open(journal_path.as_ref(), host)?;
+        if verified.snapshot()?.clean_marker.is_none() {
+            return Err(HostError::OwnerLeaseRecovery(
+                "migrated Host journal did not replay its clean marker".to_owned(),
+            ));
+        }
+        drop(verified);
+        let migrated_path =
+            legacy_path.with_extension(format!("redb.migrated-{}", Uuid::new_v4().simple()));
+        std::fs::rename(legacy_path, &migrated_path)?;
+        owner_lease.release().map_err(owner_lease_release_error)?;
+        Ok(migrated_path)
     }
 
     /// Returns the Host epoch bound to this process.
@@ -1851,21 +2154,55 @@ impl HostComposition {
         self.owner_lease.name()
     }
 
-    /// Reads the Host-only operational state from redb.
+    /// Reads the Host-only operational state from the crash-safe journal.
     ///
     /// # Errors
     ///
     /// Returns an error if the durable Host state cannot be loaded.
-    pub fn snapshot(&self) -> Result<HostInstallationState, HostError> {
-        self.state_store
-            .load_installation()
-            .map_err(HostError::State)
+    pub fn snapshot(&self) -> Result<HostState, HostError> {
+        self.journal.snapshot().map_err(HostError::Journal)
     }
 
     /// Returns the installation-owned approved-generation registry.
     #[must_use]
     pub const fn registry(&self) -> &ApprovedGenerationRegistry {
         &self.registry
+    }
+
+    fn resume_pending_record(&mut self) -> Result<(), HostError> {
+        if let Some(pending) = self.pending_record.take() {
+            if let Err(error) = append_reconciled(&self.journal, pending.clone()) {
+                self.pending_record = Some(pending);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn append_record(&mut self, record: HostStateRecord) -> Result<AppendReceipt, HostError> {
+        self.resume_pending_record()?;
+        match append_reconciled(&self.journal, record.clone()) {
+            Ok(receipt) => Ok(receipt),
+            Err(error @ HostError::Journal(JournalError::OutcomeUnknown { .. })) => {
+                self.pending_record = Some(record);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn transition_activation(
+        &mut self,
+        state: ActivationState,
+        label: &str,
+    ) -> Result<(), HostError> {
+        let current = self.journal.snapshot()?.activation.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        self.append_record(HostStateRecord::Activation(transition_activation_record(
+            &current, state, label,
+        )?))?;
+        Ok(())
     }
 
     /// Approves an immutable generation for a later activation.
@@ -2044,10 +2381,11 @@ impl HostComposition {
         store_executable: impl AsRef<Path>,
     ) -> Result<(), HostError> {
         self.ensure_admission_open()?;
-        let active = self
-            .registry
-            .active()
-            .ok_or_else(|| HostError::ProcessContour("no approved active generation".to_owned()))?;
+        let active =
+            self.registry.active().cloned().ok_or_else(|| {
+                HostError::ProcessContour("no approved active generation".to_owned())
+            })?;
+        self.transition_activation(ActivationState::Starting, "host-start-approved")?;
         self.request_watchdog(&active.manifest.runtime_launch)?;
         let (kernel_artifact, store_artifact, _canonical_store_artifact) = active
             .manifest
@@ -2078,6 +2416,16 @@ impl HostComposition {
             Err(error) => return self.cleanup_launched_contour(error),
         };
         if let Err(error) = self.accept_kernel_ready(&handshake, &receipt) {
+            return self.cleanup_launched_contour(error);
+        }
+        if let Err(error) =
+            self.transition_activation(ActivationState::ControlReady, "host-kernel-control-ready")
+        {
+            return self.cleanup_launched_contour(error);
+        }
+        if let Err(error) =
+            self.transition_activation(ActivationState::Active, "host-runtime-active")
+        {
             return self.cleanup_launched_contour(error);
         }
         if let Err(error) = self.persist_process_observations(&active.manifest.generation) {
@@ -2224,10 +2572,10 @@ impl HostComposition {
     #[cfg(windows)]
     pub fn reconcile_approved_contour(&mut self) -> Result<HostBranchDisposition, HostError> {
         self.ensure_admission_open()?;
-        let active = self
-            .registry
-            .active()
-            .ok_or_else(|| HostError::ProcessContour("no approved active generation".to_owned()))?;
+        let active =
+            self.registry.active().cloned().ok_or_else(|| {
+                HostError::ProcessContour("no approved active generation".to_owned())
+            })?;
         let (kernel_artifact, store_artifact, _canonical_store_artifact) = active
             .manifest
             .runtime_artifact_digests()
@@ -2263,7 +2611,10 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
-    fn persist_process_observations(&self, generation: &PlatformHandle) -> Result<(), HostError> {
+    fn persist_process_observations(
+        &mut self,
+        generation: &PlatformHandle,
+    ) -> Result<(), HostError> {
         self.persist_process_observations_with_disposition(
             generation,
             HostBranchDisposition::Healthy,
@@ -2272,73 +2623,41 @@ impl HostComposition {
 
     #[cfg(windows)]
     fn persist_process_observations_with_disposition(
-        &self,
+        &mut self,
         generation: &PlatformHandle,
         disposition: HostBranchDisposition,
     ) -> Result<(), HostError> {
-        if let Some(kernel) = self.jobs.kernel_process() {
-            let kernel_record = process_record(kernel, "Kernel", &self.host)?;
-            let kernel_recovery = self.jobs.kernel_recovery_binding(
-                generation,
-                &kernel_record,
-                &self.host.installation,
-            )?;
-            self.state_store
-                .commit_activation(
-                    eliot_platform::HostActivationTransition {
-                        context: lifecycle_context(&self.host, "kernel-activation")?,
-                        installation: self.host.installation.clone(),
-                        process: kernel_record,
-                    },
-                    kernel_recovery,
-                )
-                .map_err(HostError::State)?;
-        }
-        if let Some(store) = self.jobs.store_process() {
-            let store_record = process_record(store, "Store", &self.host)?;
-            self.state_store
-                .record_dependency(eliot_platform::ManagedDependencyTransition {
-                    context: lifecycle_context(&self.host, "store-observation")?,
-                    installation: self.host.installation.clone(),
-                    dependency: store_record,
-                })
-                .map_err(HostError::State)?;
-        }
-        if !matches!(disposition, HostBranchDisposition::Healthy) {
-            let state = self.snapshot()?;
-            let store_process = state
-                .managed_dependencies
-                .iter()
-                .find(|process| process.owner == "Store")
-                .cloned();
-            let mut fences = Vec::new();
-            if matches!(
-                disposition,
-                HostBranchDisposition::KernelDegraded | HostBranchDisposition::BothDegraded
-            ) {
-                fences.push((HostBranchKind::Kernel, state.active_process.clone()));
-            }
-            if matches!(
-                disposition,
-                HostBranchDisposition::StoreDegraded | HostBranchDisposition::BothDegraded
-            ) {
-                fences.push((HostBranchKind::Store, store_process));
-            }
-            for (branch, observed_process) in fences {
-                self.state_store
-                    .record_branch_recovery(HostBranchRecoveryFence {
-                        installation: self.host.installation.clone(),
-                        generation: generation.clone(),
-                        branch,
-                        observed_process,
-                        reason: PlatformHandle::new(format!(
-                            "host-branch-degraded:{disposition:?}"
-                        ))
-                        .map_err(|error| HostError::Platform(error.to_string()))?,
-                    })
-                    .map_err(HostError::State)?;
-            }
-        }
+        let state = self.journal.snapshot()?;
+        let activation = state.activation.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        let observation_id = fresh_identity("host-branch-observation")?;
+        let reason = if matches!(disposition, HostBranchDisposition::Healthy) {
+            "authoritative-readiness-observation-pending-wave-4"
+        } else {
+            "host-branch-degraded"
+        };
+        self.append_record(HostStateRecord::Observation(HostObservationRecord {
+            fence: activation.fence,
+            operation: operation("host-process-observation")?,
+            observation: ObservationRecordEnvelope {
+                record_id: observation_id.as_str().to_owned(),
+                kind: ObservationRecordKind::CoverageGap,
+                event: None,
+                coverage_gap: Some(CoverageGap {
+                    gap_id: observation_id.as_str().to_owned(),
+                    obligation_profile_ref: "runtime-live-v3-readiness".to_owned(),
+                    reason_ref: reason.to_owned(),
+                    affected_interval: None,
+                    disposition: GapDisposition::BlockDependentTransition,
+                    protected: true,
+                    evidence_refs: vec![generation.as_str().to_owned()],
+                }),
+                journal_control_event: false,
+                parent_record_id: None,
+            },
+            binding_evidence_refs: vec![generation.clone()],
+        }))?;
         Ok(())
     }
 
@@ -2349,7 +2668,14 @@ impl HostComposition {
     ///
     /// Returns an error if the durable Host state cannot be loaded.
     pub fn has_durable_branch_fence(&self) -> Result<bool, HostError> {
-        Ok(self.snapshot()?.recovery_fence.is_some())
+        let state = self.snapshot()?;
+        Ok(self.pending_record.is_some()
+            || state.activation.as_ref().is_some_and(|activation| {
+                matches!(
+                    activation.state,
+                    ActivationState::Failed | ActivationState::DegradedRecovery
+                )
+            }))
     }
 
     #[cfg(windows)]
@@ -2371,15 +2697,9 @@ impl HostComposition {
         if !self.running {
             return Err(HostError::Stopped);
         }
-        if self.pending_release.is_some() || self.shutdown_failed {
+        if self.pending_record.is_some() || self.shutdown_failed {
             return Err(HostError::OwnerLeaseRecovery(
                 "durable Host release/recovery is still pending".to_owned(),
-            ));
-        }
-        let state = self.snapshot()?;
-        if state.disposition.is_release_pending() || state.recovery_fence.is_some() {
-            return Err(HostError::OwnerLeaseRecovery(
-                "durable Host release/recovery fence is still active".to_owned(),
             ));
         }
         Ok(())
@@ -2396,52 +2716,113 @@ impl HostComposition {
         if !self.running {
             return Err(HostError::Stopped);
         }
-        if self.pending_release.is_none() {
-            let state = self.snapshot()?;
-            let process = state
-                .active_process
-                .unwrap_or_else(|| self.host_process.clone());
+        self.resume_pending_record()?;
+        if !self.durable_finalized {
+            let state = self.journal.snapshot()?;
+            let activation = state.activation.clone().ok_or_else(|| {
+                HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+            })?;
+            match activation.state {
+                ActivationState::Stopped => {}
+                ActivationState::Active => {
+                    let drain_generation = activation.fence.activation_generation.clone();
+                    if state.drain.is_none() {
+                        self.append_record(HostStateRecord::Drain(DrainRecord {
+                            fence: activation.fence.clone(),
+                            operation: operation("host-drain-request")?,
+                            drain_generation: drain_generation.clone(),
+                            state: DrainState::Requested,
+                            evidence_refs: vec![
+                                PlatformHandle::new("scm-stop-request")
+                                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                            ],
+                        }))?;
+                    }
+                    if self
+                        .journal
+                        .snapshot()?
+                        .drain
+                        .as_ref()
+                        .is_some_and(|drain| drain.state == DrainState::Requested)
+                    {
+                        self.append_record(HostStateRecord::Drain(DrainRecord {
+                            fence: activation.fence.clone(),
+                            operation: operation("host-drain-start")?,
+                            drain_generation: drain_generation.clone(),
+                            state: DrainState::Draining,
+                            evidence_refs: vec![
+                                PlatformHandle::new("host-admission-closed")
+                                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                            ],
+                        }))?;
+                    }
+                    if self
+                        .journal
+                        .snapshot()?
+                        .activation
+                        .as_ref()
+                        .is_some_and(|current| current.state == ActivationState::Active)
+                    {
+                        self.transition_activation(ActivationState::Draining, "host-draining")?;
+                    }
+                    if self.journal.snapshot()?.drain_commit.is_none() {
+                        self.append_record(HostStateRecord::DrainCommit(DrainCommitRecord {
+                            fence: activation.fence.clone(),
+                            operation: operation("host-drain-commit")?,
+                            drain_generation,
+                            last_admission_closed_at: fresh_identity("host-admission-closed-at")?,
+                            lease_and_pending_operation_snapshot: Vec::new(),
+                            authority_epochs_fenced: vec![activation.lineage.kernel_epoch.clone()],
+                            processes_modules_and_store_branches_to_stop: vec![
+                                PlatformHandle::new("canonical-store-branch")
+                                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                                PlatformHandle::new("kernel-branch")
+                                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                            ],
+                            wake_during_drain_disposition: WakeDisposition::QueueNextGeneration,
+                            irreversible_stage: PlatformHandle::new("authority-fenced")
+                                .map_err(|error| HostError::Platform(error.to_string()))?,
+                            recovery_owner: PlatformHandle::new("host-composition")
+                                .map_err(|error| HostError::Platform(error.to_string()))?,
+                            committed_at: fresh_identity("host-drain-committed-at")?,
+                        }))?;
+                    }
+                }
+                ActivationState::Draining if state.drain_commit.is_some() => {}
+                other => {
+                    return Err(HostError::OwnerLeaseRecovery(format!(
+                        "Host activation {other:?} cannot enter clean shutdown"
+                    )));
+                }
+            }
             #[cfg(windows)]
-            let termination = {
+            {
                 let store = self.jobs.terminate_store();
                 let kernel = self.jobs.terminate_kernel();
-                (store, kernel)
-            };
-            let marker = eliot_platform::HostShutdownMarker {
-                context: lifecycle_context(&self.host, "host-stop")?,
-                installation: self.host.installation.clone(),
-                process,
-            };
-            let token = self
-                .state_store
-                .prepare_release_pending(marker)
-                .map_err(HostError::State)?;
-            self.pending_release = Some(token);
-            self.durable_finalized = false;
-            #[cfg(windows)]
-            if termination.0.is_err() || termination.1.is_err() {
-                self.shutdown_failed = true;
-                return Err(HostError::RecoveryRequired(format!(
-                    "Store-first stop requires recovery: store={:?}; kernel={:?}",
-                    termination.0, termination.1
-                )));
+                if store.is_err() || kernel.is_err() {
+                    self.shutdown_failed = true;
+                    return Err(HostError::RecoveryRequired(format!(
+                        "Store-first stop requires recovery: store={store:?}; kernel={kernel:?}"
+                    )));
+                }
             }
-        }
-        let token = self.pending_release.take().ok_or_else(|| {
-            HostError::OwnerLeaseRecovery("release token is unavailable".to_owned())
-        })?;
-        if !self.durable_finalized {
-            if let Err(error) = self
-                .state_store
-                .finalize_clean_shutdown(token.clone())
-                .map_err(HostError::State)
+            if self
+                .journal
+                .snapshot()?
+                .activation
+                .as_ref()
+                .is_some_and(|current| current.state == ActivationState::Draining)
             {
-                // ReleasePending remains durable and ownership is retained;
-                // a retry must complete this mutation before release.
-                self.pending_release = Some(token);
-                self.shutdown_failed = true;
-                return Err(error);
+                self.transition_activation(ActivationState::StoppedClean, "host-stopped-clean")?;
             }
+            let state = self.journal.snapshot()?;
+            let marker = clean_marker_record(
+                &state,
+                &self.host,
+                &self.activation_id,
+                &self.activation_generation,
+            )?;
+            self.append_record(marker)?;
             self.durable_finalized = true;
         }
         if !self.owner_released {
@@ -2450,7 +2831,6 @@ impl HostComposition {
                 .release()
                 .map_err(owner_lease_release_error)
             {
-                self.pending_release = Some(token);
                 self.shutdown_failed = true;
                 return Err(error);
             }
@@ -2479,104 +2859,6 @@ impl HostComposition {
     pub const fn jobs(&self) -> &HostJobBranches {
         &self.jobs
     }
-}
-
-fn host_process_record(host: &HostInstallationEpoch) -> Result<ServiceProcessRecord, HostError> {
-    let authority_epoch = AuthorityEpoch::new(host.epoch.current.sequence)
-        .map_err(|error| HostError::Platform(error.to_string()))?;
-    Ok(ServiceProcessRecord {
-        process_id: format!(
-            "host:{}:{}:{}",
-            host.epoch.current.lineage, host.epoch.current.sequence, host.nonce
-        ),
-        owner: SERVICE_NAME.to_owned(),
-        state: ServiceProcessState::Ready,
-        health: HealthVector::healthy(),
-        authority_epoch,
-    })
-}
-
-fn host_process_recovery_binding(
-    host: &HostInstallationEpoch,
-    observed_process: &ServiceProcessRecord,
-) -> Result<HostProcessRecoveryBinding, HostError> {
-    let image_path = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .map_err(|error| {
-            HostError::Platform(format!("Host image identity unavailable: {error}"))
-        })?;
-    Ok(HostProcessRecoveryBinding {
-        installation: host.installation.clone(),
-        observed_process: observed_process.clone(),
-        process_generation: host.nonce.clone(),
-        process_id: std::process::id(),
-        image_path: PlatformHandle::new(image_path.to_string_lossy().into_owned()).map_err(
-            |error| HostError::Platform(format!("invalid Host image identity: {error}")),
-        )?,
-        job: HostJobDisposition::NotAssigned,
-    })
-}
-
-#[cfg(windows)]
-fn process_recovery_binding(
-    process: &ProcessIdentity,
-    generation: &PlatformHandle,
-    job: &JobObjectIdentity,
-    installation: &PlatformHandle,
-    observed_process: &ServiceProcessRecord,
-) -> Result<HostProcessRecoveryBinding, HostError> {
-    Ok(HostProcessRecoveryBinding {
-        installation: installation.clone(),
-        observed_process: observed_process.clone(),
-        process_generation: generation.clone(),
-        process_id: process.process_id,
-        image_path: PlatformHandle::new(process.image_path.clone()).map_err(|error| {
-            HostError::ProcessContour(format!("invalid observed image identity: {error}"))
-        })?,
-        job: HostJobDisposition::Assigned {
-            job: PlatformHandle::new(job.name()).map_err(|error| {
-                HostError::ProcessContour(format!("invalid Job identity: {error}"))
-            })?,
-        },
-    })
-}
-
-fn validate_recovery_evidence(
-    snapshot: &HostRecoverySnapshot,
-    evidence: &HostRecoveryEvidence,
-) -> Result<(), HostError> {
-    evidence.validate().map_err(HostError::State)?;
-    let disposition_matches = snapshot.disposition == evidence.observed_disposition
-        || snapshot.recovery_evidence.as_ref() == Some(evidence);
-    if snapshot.installation != evidence.installation
-        || snapshot.host_epoch != evidence.host_epoch
-        || snapshot.active_process != evidence.stale_active_process
-        || snapshot.process != evidence.process
-        || !disposition_matches
-    {
-        return Err(HostError::OwnerLeaseRecovery(
-            "recovery evidence does not exactly match the inspected stale Host projection"
-                .to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn process_record(
-    process: &ProcessIdentity,
-    owner: &str,
-    host: &HostInstallationEpoch,
-) -> Result<ServiceProcessRecord, HostError> {
-    let authority_epoch = AuthorityEpoch::new(host.epoch.current.sequence)
-        .map_err(|error| HostError::Platform(error.to_string()))?;
-    Ok(ServiceProcessRecord {
-        process_id: format!("{}:{}", process.process_id, process.start_time_100ns),
-        owner: owner.to_owned(),
-        state: ServiceProcessState::Ready,
-        health: HealthVector::healthy(),
-        authority_epoch,
-    })
 }
 
 fn lifecycle_context(
@@ -2646,6 +2928,223 @@ fn configured_image(name: &str) -> Result<PathBuf, HostError> {
         )));
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+    use eliot_host_state::{
+        BackendError, BackendReconcileState, DurableImage, FaultPoint, MemoryBackend,
+        PreparedAppend,
+    };
+
+    struct ImageBackend {
+        image: DurableImage,
+    }
+
+    impl JournalBackend for ImageBackend {
+        fn load(&mut self) -> Result<DurableImage, BackendError> {
+            Ok(self.image.clone())
+        }
+
+        fn prepared_appends(&mut self) -> Result<Vec<PreparedAppend>, BackendError> {
+            Ok(Vec::new())
+        }
+
+        fn prepare(&mut self, _append: &PreparedAppend) -> Result<(), BackendError> {
+            Err(BackendError::Unavailable)
+        }
+
+        fn append_prepared(
+            &mut self,
+            _transaction_id: &PlatformHandle,
+            _bytes: &[u8],
+        ) -> Result<(), BackendError> {
+            Err(BackendError::Unavailable)
+        }
+
+        fn flush(&mut self, _transaction_id: &PlatformHandle) -> Result<(), BackendError> {
+            Err(BackendError::Unavailable)
+        }
+
+        fn sync(&mut self, _transaction_id: &PlatformHandle) -> Result<(), BackendError> {
+            Err(BackendError::Unavailable)
+        }
+
+        fn commit(&mut self, _transaction_id: &PlatformHandle) -> Result<(), BackendError> {
+            Err(BackendError::Unavailable)
+        }
+
+        fn reconcile(
+            &mut self,
+            _transaction_id: &PlatformHandle,
+        ) -> Result<BackendReconcileState, BackendError> {
+            Ok(BackendReconcileState::Absent)
+        }
+    }
+
+    fn test_host() -> HostInstallationEpoch {
+        fresh_host_epoch(
+            PlatformHandle::new("test-installation").unwrap_or_else(|_| unreachable!()),
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn host_composition_production_field_is_the_redb_journal_service() {
+        fn production_journal(
+            composition: &HostComposition,
+        ) -> &HostStateJournalService<RedbJournalBackend> {
+            &composition.journal
+        }
+        let _typed_reachability: fn(
+            &HostComposition,
+        ) -> &HostStateJournalService<RedbJournalBackend> = production_journal;
+    }
+
+    #[test]
+    fn open_activation_clean_stop_and_child_reopen_replay() {
+        let host = test_host();
+        let generation = root_epoch(fresh_identity("test-activation-lineage").unwrap());
+        let activation_id = fresh_identity("test-activation").unwrap();
+        let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())
+            .unwrap_or_else(|_| unreachable!());
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(
+                initial_activation_record(
+                    &host,
+                    &activation_id,
+                    &generation,
+                    ActivationState::Stopped,
+                    "test-open",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        append_clean_marker(&journal, &host, &activation_id, &generation).unwrap();
+        let backend = journal.into_backend().unwrap();
+
+        let child = child_host_epoch(&host).unwrap();
+        let reopened = HostStateJournalService::from_backend(backend, child.clone()).unwrap();
+        assert_eq!(reopened.snapshot().unwrap().retained_epochs.len(), 1);
+        let child_generation = generation.direct_child().unwrap();
+        let child_activation = fresh_identity("test-child-activation").unwrap();
+        append_reconciled(
+            &reopened,
+            HostStateRecord::Activation(
+                initial_activation_record(
+                    &child,
+                    &child_activation,
+                    &child_generation,
+                    ActivationState::Stopped,
+                    "test-child-open",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(reopened.snapshot().unwrap().sequence, 1);
+        assert!(reopened.snapshot().unwrap().clean_marker.is_none());
+    }
+
+    #[test]
+    fn unknown_commit_is_reconciled_by_transaction_identity() {
+        let host = test_host();
+        let generation = root_epoch(fresh_identity("unknown-lineage").unwrap());
+        let activation_id = fresh_identity("unknown-activation").unwrap();
+        let journal = HostStateJournalService::from_backend(
+            MemoryBackend::with_fault(FaultPoint::CommitAfterUnknown),
+            host.clone(),
+        )
+        .unwrap();
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(
+                initial_activation_record(
+                    &host,
+                    &activation_id,
+                    &generation,
+                    ActivationState::Stopped,
+                    "unknown-open",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(journal.snapshot().unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn torn_current_epoch_fails_closed() {
+        let host = test_host();
+        let generation = root_epoch(fresh_identity("torn-lineage").unwrap());
+        let activation_id = fresh_identity("torn-activation").unwrap();
+        let journal =
+            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone()).unwrap();
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(
+                initial_activation_record(
+                    &host,
+                    &activation_id,
+                    &generation,
+                    ActivationState::Stopped,
+                    "torn-open",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let backend = journal.into_backend().unwrap();
+        let mut image = backend.durable_image().clone();
+        image.epochs[0].bytes.pop();
+        assert!(matches!(
+            HostStateJournalService::from_backend(ImageBackend { image }, host),
+            Err(JournalError::Torn { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_migration_lineage_replays_without_legacy_normal_path() {
+        let installation = PlatformHandle::new("migration-installation").unwrap();
+        let host = fresh_host_epoch(
+            installation,
+            Some(RecoveryLineageEvidence {
+                reason: RecoveryLineageReason::Migration,
+                source_evidence_refs: vec![PlatformHandle::new("legacy-state-digest").unwrap()],
+            }),
+        )
+        .unwrap();
+        let generation = root_epoch(fresh_identity("migration-lineage").unwrap());
+        let activation_id = fresh_identity("migration-activation").unwrap();
+        let journal =
+            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone()).unwrap();
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(
+                initial_activation_record(
+                    &host,
+                    &activation_id,
+                    &generation,
+                    ActivationState::Stopped,
+                    "migration-open",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        append_clean_marker(&journal, &host, &activation_id, &generation).unwrap();
+        let backend = journal.into_backend().unwrap();
+        let replayed = HostStateJournalService::from_backend(backend, host).unwrap();
+        assert_eq!(
+            replayed.snapshot().unwrap().host.recovery.unwrap().reason,
+            RecoveryLineageReason::Migration
+        );
+        assert_ne!(HOST_JOURNAL_RELATIVE_PATH, LEGACY_HOST_STATE_RELATIVE_PATH);
+    }
 }
 
 #[cfg(all(test, windows))]
