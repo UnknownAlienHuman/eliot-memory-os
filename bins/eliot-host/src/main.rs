@@ -1,11 +1,11 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-#[cfg(windows)]
-use eliot_host::HostBranchDisposition;
 use eliot_host::{
     HOST_JOURNAL_RELATIVE_PATH, HostComposition, HostError, PROTOCOL_VERSION, SERVICE_NAME,
 };
+#[cfg(windows)]
+use eliot_host::{HostBranchDisposition, HostLivenessTick};
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::protected_program_data_path;
 use serde::{Deserialize, Serialize};
@@ -267,14 +267,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
             }
         }
         if host.has_process_contour() {
-            match host.reconcile_approved_contour() {
-                Ok(HostBranchDisposition::Healthy) => {}
-                Ok(disposition) => {
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "eliot-host: independent contour disposition: {disposition:?}"
-                    );
-                }
+            match run_scm_contour_tick(&mut host) {
+                Ok(outcome) => report_scm_tick(outcome),
                 Err(error) => {
                     let _ = writeln!(
                         io::stderr().lock(),
@@ -311,6 +305,58 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
 }
 
 #[cfg(windows)]
+trait ScmContourHost {
+    fn liveness_tick(&mut self) -> Result<HostLivenessTick, HostError>;
+    fn full_reconcile(&mut self) -> Result<HostBranchDisposition, HostError>;
+}
+
+#[cfg(windows)]
+impl ScmContourHost for HostComposition {
+    fn liveness_tick(&mut self) -> Result<HostLivenessTick, HostError> {
+        HostComposition::liveness_tick(self)
+    }
+
+    fn full_reconcile(&mut self) -> Result<HostBranchDisposition, HostError> {
+        self.reconcile_approved_contour()
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScmContourTickOutcome {
+    LeasePreserved,
+    ReadinessRetryPending,
+    Reconciled(HostBranchDisposition),
+}
+
+#[cfg(windows)]
+fn run_scm_contour_tick(
+    host: &mut impl ScmContourHost,
+) -> Result<ScmContourTickOutcome, HostError> {
+    match host.liveness_tick()? {
+        HostLivenessTick::HealthyLeasePreserved => Ok(ScmContourTickOutcome::LeasePreserved),
+        HostLivenessTick::ReadinessRetryPending => Ok(ScmContourTickOutcome::ReadinessRetryPending),
+        HostLivenessTick::FullReconcileDue => {
+            host.full_reconcile().map(ScmContourTickOutcome::Reconciled)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn report_scm_tick(outcome: ScmContourTickOutcome) {
+    let disposition = match outcome {
+        ScmContourTickOutcome::LeasePreserved
+        | ScmContourTickOutcome::Reconciled(HostBranchDisposition::Healthy) => return,
+        ScmContourTickOutcome::ReadinessRetryPending => HostBranchDisposition::ReadinessDegraded,
+        ScmContourTickOutcome::Reconciled(disposition) => disposition,
+    };
+    let _ = writeln!(
+        io::stderr().lock(),
+        "eliot-host: independent contour disposition: {disposition:?}"
+    );
+}
+
+#[cfg(windows)]
 unsafe extern "system" fn service_control(
     control: u32,
     _event_type: u32,
@@ -334,4 +380,66 @@ unsafe extern "system" fn service_control(
         return 0;
     }
     0
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    struct ScmCallGraphSpy {
+        next_tick: HostLivenessTick,
+        liveness_ticks: usize,
+        full_reconciles: usize,
+        file_digest_verifications: usize,
+        pipe_exchanges: usize,
+        durable_journal_operations: usize,
+    }
+
+    impl ScmContourHost for ScmCallGraphSpy {
+        fn liveness_tick(&mut self) -> Result<HostLivenessTick, HostError> {
+            self.liveness_ticks += 1;
+            Ok(self.next_tick)
+        }
+
+        fn full_reconcile(&mut self) -> Result<HostBranchDisposition, HostError> {
+            self.full_reconciles += 1;
+            self.file_digest_verifications += 1;
+            self.pipe_exchanges += 1;
+            self.durable_journal_operations += 1;
+            Ok(HostBranchDisposition::Healthy)
+        }
+    }
+
+    #[test]
+    fn scm_tick_skips_full_operations_until_exact_lease_is_due() {
+        let mut spy = ScmCallGraphSpy {
+            next_tick: HostLivenessTick::HealthyLeasePreserved,
+            liveness_ticks: 0,
+            full_reconciles: 0,
+            file_digest_verifications: 0,
+            pipe_exchanges: 0,
+            durable_journal_operations: 0,
+        };
+
+        assert_eq!(
+            run_scm_contour_tick(&mut spy).unwrap(),
+            ScmContourTickOutcome::LeasePreserved
+        );
+        assert_eq!(spy.liveness_ticks, 1);
+        assert_eq!(spy.full_reconciles, 0);
+        assert_eq!(spy.file_digest_verifications, 0);
+        assert_eq!(spy.pipe_exchanges, 0);
+        assert_eq!(spy.durable_journal_operations, 0);
+
+        spy.next_tick = HostLivenessTick::FullReconcileDue;
+        assert_eq!(
+            run_scm_contour_tick(&mut spy).unwrap(),
+            ScmContourTickOutcome::Reconciled(HostBranchDisposition::Healthy)
+        );
+        assert_eq!(spy.liveness_ticks, 2);
+        assert_eq!(spy.full_reconciles, 1);
+        assert_eq!(spy.file_digest_verifications, 1);
+        assert_eq!(spy.pipe_exchanges, 1);
+        assert_eq!(spy.durable_journal_operations, 1);
+    }
 }

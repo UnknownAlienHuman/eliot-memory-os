@@ -20,10 +20,10 @@ use eliot_host_state::{
     EliotActivationRecord, EpochIdentity, EpochTransition, HostInstallationEpoch,
     HostKernelStoreLineage, HostObservationRecord, HostState, HostStateJournalService,
     HostStateRecord, IdempotencyIdentity, JOURNAL_VERSION, JournalBackend, JournalError,
-    JournalManifest, KernelJobBinding, KernelRecord, LifecycleTimestamps, NonceState,
-    OneTimeNonceState, PriorKernelDisposition, PriorKernelSource, ProductionHostStateJournal,
-    ReadinessEvidence, ReconcileOutcome, RecordFence, RecoveryLineageEvidence, RedbJournalBackend,
-    WakeDisposition,
+    JournalManifest, KernelJobBinding, KernelReadinessObservationRecord, KernelRecord,
+    LifecycleTimestamps, NonceState, OneTimeNonceState, PriorKernelDisposition, PriorKernelSource,
+    ProductionHostStateJournal, ReadinessApprovedContour, ReadinessEvidence, ReconcileOutcome,
+    RecordFence, RecoveryLineageEvidence, RedbJournalBackend, WakeDisposition, record_checksum,
 };
 use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, InstallationProfile,
@@ -312,20 +312,6 @@ fn finish_active_kernel_cleanup(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReconcileObservationCleanup {
-    ActiveKernel,
-    GenericContour,
-}
-
-const fn reconcile_observation_cleanup(kernel_reactivated: bool) -> ReconcileObservationCleanup {
-    if kernel_reactivated {
-        ReconcileObservationCleanup::ActiveKernel
-    } else {
-        ReconcileObservationCleanup::GenericContour
-    }
-}
-
 #[cfg(windows)]
 impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
     fn resume(journal: &'a HostStateJournalService<B>, current: KernelRecord) -> Self {
@@ -599,6 +585,116 @@ fn validate_authenticated_kernel_peer(
     Ok(())
 }
 
+fn unique_ready_evidence<'a>(
+    ready: &'a KernelReadyReceipt,
+    prefix: &str,
+) -> Result<&'a PlatformHandle, HostError> {
+    let mut matching = ready
+        .evidence_refs
+        .iter()
+        .filter(|evidence| evidence.as_str().starts_with(prefix));
+    let evidence = matching.next().ok_or_else(|| {
+        HostError::ProcessContour(format!("Kernel readiness is missing {prefix} evidence"))
+    })?;
+    if matching.next().is_some() {
+        return Err(HostError::ProcessContour(format!(
+            "Kernel readiness contains ambiguous {prefix} evidence"
+        )));
+    }
+    Ok(evidence)
+}
+
+fn validated_store_proof_fence(
+    requirement: &HostStoreBootstrapRequirement,
+    ready: &KernelReadyReceipt,
+    approved_store_artifact: &PlatformHandle,
+    approved_config: &PlatformHandle,
+    request_generation: ResourceGeneration,
+) -> Result<PlatformHandle, HostError> {
+    requirement
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if requirement.approved_artifact_hash != *approved_store_artifact
+        || requirement.approved_config_hash != *approved_config
+        || requirement.store_generation != request_generation
+        || requirement.state_fence.resource_generation != request_generation
+    {
+        return Err(HostError::ProcessContour(
+            "Store proof is not bound to the approved generation contour".to_owned(),
+        ));
+    }
+    let validation = unique_ready_evidence(ready, "kernel-store-validation:")?;
+    let revision = validation
+        .as_str()
+        .strip_prefix("kernel-store-validation:")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            HostError::ProcessContour(
+                "Kernel readiness carries a stale or invalid Store validation snapshot".to_owned(),
+            )
+        })?;
+    let health = unique_ready_evidence(ready, "kernel-store-health:")?;
+    let health_binding = health
+        .as_str()
+        .strip_prefix("kernel-store-health:")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            HostError::ProcessContour(
+                "Kernel readiness carries an invalid Store health proof".to_owned(),
+            )
+        })?;
+    let digest = sha256_json(&(
+        &requirement.state_fence,
+        requirement.store_generation,
+        approved_store_artifact,
+        approved_config,
+        revision,
+        health_binding,
+    ))?;
+    PlatformHandle::new(digest).map_err(|error| HostError::Platform(error.to_string()))
+}
+
+fn validate_probe_response(
+    request: &KernelControlRequest,
+    activation: &KernelActivationReceipt,
+    response: &KernelControlResponse,
+) -> Result<KernelReadyReceipt, HostError> {
+    request
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    response
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if !matches!(&request.command, KernelControlCommand::ProbeReady)
+        || response.message_id != request.message_id
+        || response.request_digest != request.payload_digest
+        || response.error.is_some()
+        || response.state != KernelServiceState::Ready
+        || response.activation_receipt.is_some()
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel ProbeReady response binding failed".to_owned(),
+        ));
+    }
+    let ready = response.receipt.clone().ok_or_else(|| {
+        HostError::ProcessContour("Kernel did not return a ready receipt".to_owned())
+    })?;
+    ready
+        .validate_for_probe(request, activation)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    Ok(ready)
+}
+
+#[cfg(windows)]
+struct AuthenticatedKernelReadiness {
+    request: KernelControlRequest,
+    response: KernelControlResponse,
+    ready: KernelReadyReceipt,
+    store_fence: PlatformHandle,
+    peer_evidence: PlatformHandle,
+}
+
 #[cfg(windows)]
 pub struct HostJobBranches {
     kernel: Option<RunningJobChild<PlatformHandle>>,
@@ -612,12 +708,16 @@ pub struct HostJobBranches {
     config_path: Option<PathBuf>,
     config_lease: Option<LaunchLease>,
     store_bootstrap_lease: Option<LaunchLease>,
+    store_bootstrap_requirement: Option<HostStoreBootstrapRequirement>,
     config_pin: Option<PinnedRuntimeFile>,
     portable_root: Option<UserOwnedRootLease>,
     launch: Option<RuntimeLaunchDescriptor>,
     kernel_artifact_digest: Option<PlatformHandle>,
     store_artifact_digest: Option<PlatformHandle>,
     config_digest: Option<PlatformHandle>,
+    approved_generation: Option<PlatformHandle>,
+    kernel_candidate: Option<HostKernelCandidateBinding>,
+    kernel_activation_receipt: Option<KernelActivationReceipt>,
     kernel_restart_attempts: u8,
     store_restart_attempts: u8,
 }
@@ -626,14 +726,290 @@ pub struct HostJobBranches {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostBranchDisposition {
-    /// Both Host-owned process branches are healthy.
+    /// Both Host-owned branches are live but have not yet supplied a fresh
+    /// authenticated readiness proof.
+    LiveAwaitingReadiness,
+    /// Both Host-owned branches have an authenticated readiness proof inside
+    /// its exact bounded lease.
     Healthy,
+    /// Both branches may still be live, but the authoritative readiness proof
+    /// is absent, expired, rejected, or durably unknown.  The retained contour
+    /// remains independently recoverable and is not killed by this outcome.
+    ReadinessDegraded,
     /// Kernel authority is unavailable; the canonical store is not stopped.
     KernelDegraded,
     /// Canonical store is unavailable; Kernel is not stopped.
     StoreDegraded,
     /// Both process branches are unavailable after their independent bounds.
     BothDegraded,
+}
+
+#[cfg(windows)]
+const DEFAULT_READINESS_CADENCE: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(windows)]
+const MIN_READINESS_CADENCE: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(windows)]
+const MAX_READINESS_CADENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReadinessCadence(std::time::Duration);
+
+#[cfg(windows)]
+impl ReadinessCadence {
+    fn bounded(interval: std::time::Duration) -> Result<Self, HostError> {
+        if !(MIN_READINESS_CADENCE..=MAX_READINESS_CADENCE).contains(&interval) {
+            return Err(HostError::ProcessContour(format!(
+                "readiness cadence must be between {}ms and {}ms",
+                MIN_READINESS_CADENCE.as_millis(),
+                MAX_READINESS_CADENCE.as_millis()
+            )));
+        }
+        Ok(Self(interval))
+    }
+
+    fn deadline(self, now: std::time::Instant) -> std::time::Instant {
+        now.checked_add(self.0).unwrap_or(now)
+    }
+}
+
+#[cfg(windows)]
+impl Default for ReadinessCadence {
+    fn default() -> Self {
+        match Self::bounded(DEFAULT_READINESS_CADENCE) {
+            Ok(cadence) => cadence,
+            Err(_) => Self(DEFAULT_READINESS_CADENCE),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReadinessContourIdentity {
+    approved_generation: PlatformHandle,
+    approved_kernel_artifact: PlatformHandle,
+    approved_store_artifact: PlatformHandle,
+    approved_config: PlatformHandle,
+    active_kernel_record_checksum: PlatformHandle,
+    candidate_binding_digest: PlatformHandle,
+    store_requirement_digest: PlatformHandle,
+    store_proof_fence: Option<PlatformHandle>,
+}
+
+#[cfg(windows)]
+impl ReadinessContourIdentity {
+    fn same_authority_contour(&self, other: &Self) -> bool {
+        self.approved_generation == other.approved_generation
+            && self.approved_kernel_artifact == other.approved_kernel_artifact
+            && self.approved_store_artifact == other.approved_store_artifact
+            && self.approved_config == other.approved_config
+            && self.active_kernel_record_checksum == other.active_kernel_record_checksum
+            && self.candidate_binding_digest == other.candidate_binding_digest
+            && self.store_requirement_digest == other.store_requirement_digest
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadinessFailureKind {
+    ContourUnavailable,
+    ProbeRejected,
+    DeliveryUnknown,
+    JournalRejected,
+    JournalOutcomeUnknown,
+}
+
+#[cfg(windows)]
+fn readiness_failure_kind(error: &HostError) -> ReadinessFailureKind {
+    match error {
+        HostError::RecoveryRequired(_) => ReadinessFailureKind::DeliveryUnknown,
+        HostError::Journal(JournalError::OutcomeUnknown { .. }) => {
+            ReadinessFailureKind::JournalOutcomeUnknown
+        }
+        HostError::Journal(_) => ReadinessFailureKind::JournalRejected,
+        HostError::ProcessContour(_)
+        | HostError::State(_)
+        | HostError::Installation(_)
+        | HostError::Platform(_)
+        | HostError::Stopped
+        | HostError::MissingInstallation
+        | HostError::StoreNotLive { .. }
+        | HostError::OwnerLeaseHeld
+        | HostError::OwnerLeaseRecovery(_) => ReadinessFailureKind::ProbeRejected,
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct ReadinessLease {
+    contour: ReadinessContourIdentity,
+    valid_until: std::time::Instant,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct ReadinessRetry {
+    contour: Option<ReadinessContourIdentity>,
+    failure: ReadinessFailureKind,
+    retry_at: std::time::Instant,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct HostReadinessGate {
+    cadence: ReadinessCadence,
+    lease: Option<ReadinessLease>,
+    retry: Option<ReadinessRetry>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadinessGateAction {
+    PreserveAuthenticatedHealth,
+    ProbeDue,
+    RetryPending(ReadinessFailureKind),
+}
+
+#[cfg(windows)]
+impl HostReadinessGate {
+    fn with_cadence(cadence: ReadinessCadence) -> Self {
+        Self {
+            cadence,
+            lease: None,
+            retry: None,
+        }
+    }
+
+    fn action(
+        &mut self,
+        contour: Option<&ReadinessContourIdentity>,
+        now: std::time::Instant,
+    ) -> ReadinessGateAction {
+        if self.lease.as_ref().is_some_and(|lease| {
+            contour == Some(&lease.contour)
+                && lease.contour.store_proof_fence.is_some()
+                && now < lease.valid_until
+        }) {
+            return ReadinessGateAction::PreserveAuthenticatedHealth;
+        }
+        self.lease = None;
+        if let Some(retry) = self
+            .retry
+            .as_ref()
+            .filter(|retry| retry.contour.as_ref() == contour && now < retry.retry_at)
+        {
+            return ReadinessGateAction::RetryPending(retry.failure);
+        }
+        self.retry = None;
+        ReadinessGateAction::ProbeDue
+    }
+
+    fn grant(&mut self, contour: ReadinessContourIdentity, now: std::time::Instant) -> bool {
+        if contour.store_proof_fence.is_none() {
+            self.lease = None;
+            return false;
+        }
+        self.lease = Some(ReadinessLease {
+            contour,
+            valid_until: self.cadence.deadline(now),
+        });
+        self.retry = None;
+        true
+    }
+
+    fn fail(
+        &mut self,
+        contour: Option<ReadinessContourIdentity>,
+        failure: ReadinessFailureKind,
+        now: std::time::Instant,
+    ) {
+        self.lease = None;
+        self.retry = Some(ReadinessRetry {
+            contour,
+            failure,
+            retry_at: self.cadence.deadline(now),
+        });
+    }
+
+    fn branch_degraded(&mut self) {
+        self.lease = None;
+        self.retry = None;
+    }
+
+    #[cfg(test)]
+    fn last_failure(&self) -> Option<ReadinessFailureKind> {
+        self.retry.as_ref().map(|retry| retry.failure)
+    }
+}
+
+#[cfg(windows)]
+fn reconcile_authenticated_readiness(
+    gate: &mut HostReadinessGate,
+    contour: Result<ReadinessContourIdentity, HostError>,
+    now: std::time::Instant,
+    authenticate_and_journal: impl FnOnce() -> Result<ReadinessContourIdentity, HostError>,
+) -> HostBranchDisposition {
+    let contour = match contour {
+        Ok(contour) => contour,
+        Err(_error) => {
+            gate.fail(None, ReadinessFailureKind::ContourUnavailable, now);
+            return HostBranchDisposition::ReadinessDegraded;
+        }
+    };
+    match gate.action(Some(&contour), now) {
+        ReadinessGateAction::PreserveAuthenticatedHealth => HostBranchDisposition::Healthy,
+        ReadinessGateAction::RetryPending(_failure) => HostBranchDisposition::ReadinessDegraded,
+        ReadinessGateAction::ProbeDue => match authenticate_and_journal() {
+            Ok(journaled_contour) => {
+                if gate.grant(journaled_contour, now) {
+                    HostBranchDisposition::Healthy
+                } else {
+                    gate.fail(None, ReadinessFailureKind::ContourUnavailable, now);
+                    HostBranchDisposition::ReadinessDegraded
+                }
+            }
+            Err(error) => {
+                let failure = readiness_failure_kind(&error);
+                gate.fail(Some(contour), failure, now);
+                HostBranchDisposition::ReadinessDegraded
+            }
+        },
+    }
+}
+
+/// Result of one cheap SCM liveness tick.  The tick never performs bounded
+/// restart, file/digest verification, Kernel pipe I/O, or journal append.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostLivenessTick {
+    /// A prior authenticated proof remains valid for the entire exact contour.
+    HealthyLeasePreserved,
+    /// A failed proof is still inside its bounded retry cadence.
+    ReadinessRetryPending,
+    /// Full reconciliation and, if live, authoritative readiness are due.
+    FullReconcileDue,
+}
+
+#[cfg(windows)]
+fn classify_liveness_tick(
+    gate: &mut HostReadinessGate,
+    liveness: HostBranchDisposition,
+    contour: Option<Result<ReadinessContourIdentity, HostError>>,
+    now: std::time::Instant,
+) -> HostLivenessTick {
+    if liveness != HostBranchDisposition::LiveAwaitingReadiness {
+        gate.branch_degraded();
+        return HostLivenessTick::FullReconcileDue;
+    }
+    let contour = match contour {
+        Some(Ok(contour)) => Some(contour),
+        Some(Err(_)) | None => None,
+    };
+    match gate.action(contour.as_ref(), now) {
+        ReadinessGateAction::PreserveAuthenticatedHealth => HostLivenessTick::HealthyLeasePreserved,
+        ReadinessGateAction::RetryPending(_failure) => HostLivenessTick::ReadinessRetryPending,
+        ReadinessGateAction::ProbeDue => HostLivenessTick::FullReconcileDue,
+    }
 }
 
 #[cfg(windows)]
@@ -775,7 +1151,7 @@ where
         store_degraded = true;
     }
     match (kernel_degraded, store_degraded) {
-        (false, false) => HostBranchDisposition::Healthy,
+        (false, false) => HostBranchDisposition::LiveAwaitingReadiness,
         (true, false) => HostBranchDisposition::KernelDegraded,
         (false, true) => HostBranchDisposition::StoreDegraded,
         (true, true) => HostBranchDisposition::BothDegraded,
@@ -811,12 +1187,16 @@ impl HostJobBranches {
             config_path: None,
             config_lease: None,
             store_bootstrap_lease: None,
+            store_bootstrap_requirement: None,
             config_pin: None,
             portable_root: None,
             launch: None,
             kernel_artifact_digest: None,
             store_artifact_digest: None,
             config_digest: None,
+            approved_generation: None,
+            kernel_candidate: None,
+            kernel_activation_receipt: None,
             kernel_restart_attempts: 0,
             store_restart_attempts: 0,
         })
@@ -886,7 +1266,7 @@ impl HostJobBranches {
         reason = "the explicit durable activation transaction preserves the ordered generation, journal, prior-disposition, and authority bindings"
     )]
     fn complete_kernel_control<B: JournalBackend>(
-        &self,
+        &mut self,
         generation: &PlatformHandle,
         host: &HostInstallationEpoch,
         journal: &HostStateJournalService<B>,
@@ -1309,7 +1689,166 @@ impl HostJobBranches {
                 )),
             });
         }
+        self.kernel_candidate = Some(candidate);
+        self.kernel_activation_receipt = Some(activation_receipt.clone());
         Ok((activation_receipt, ready))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the authenticated repeat keeps retained contour, peer, request, response, and Store proof checks in one fail-closed boundary"
+    )]
+    fn probe_kernel_readiness(
+        &self,
+        approved_generation: &PlatformHandle,
+        approved_kernel_artifact: &PlatformHandle,
+        approved_store_artifact: &PlatformHandle,
+        approved_config: &PlatformHandle,
+    ) -> Result<AuthenticatedKernelReadiness, HostError> {
+        let launch = self.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
+        })?;
+        let candidate = self.kernel_candidate.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("retained Kernel candidate binding is missing".to_owned())
+        })?;
+        let activation = self.kernel_activation_receipt.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("retained Kernel activation receipt is missing".to_owned())
+        })?;
+        let requirement = self.store_bootstrap_requirement.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("retained Store bootstrap requirement is missing".to_owned())
+        })?;
+        if self.approved_generation.as_ref() != Some(approved_generation)
+            || self.kernel_artifact_digest.as_ref() != Some(approved_kernel_artifact)
+            || self.store_artifact_digest.as_ref() != Some(approved_store_artifact)
+            || self.config_digest.as_ref() != Some(approved_config)
+            || candidate.artifact_hash != *approved_kernel_artifact
+            || candidate.config_hash != *approved_config
+            || activation.candidate_binding_digest
+                != candidate
+                    .compute_digest()
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            || activation.generation != launch.authority_generation
+            || activation.authority_epoch != candidate.kernel_epoch
+        {
+            return Err(HostError::ProcessContour(
+                "retained Kernel control contour is not the approved active generation".to_owned(),
+            ));
+        }
+        let kernel = self
+            .kernel
+            .as_ref()
+            .ok_or_else(|| HostError::ProcessContour("Kernel process is missing".to_owned()))?;
+        let process = kernel.evidence().process();
+        if !kernel
+            .job_processes()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            .iter()
+            .any(|observed| observed == process)
+        {
+            return Err(HostError::ProcessContour(
+                "Job observation does not contain the exact active Kernel process".to_owned(),
+            ));
+        }
+        match kernel
+            .observe()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+        {
+            eliot_platform_windows::RunningJobObservation::Running { active_processes }
+                if active_processes > 0 => {}
+            _ => {
+                return Err(HostError::ProcessContour(
+                    "active Kernel Job is not live for ProbeReady".to_owned(),
+                ));
+            }
+        }
+        let expected_kernel_image = self
+            .kernel_executable
+            .as_ref()
+            .ok_or_else(|| HostError::ProcessContour("Kernel image is missing".to_owned()))?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        runtime.block_on(async {
+            let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let mut transport = NamedPipeTransport::connect_authenticated(
+                candidate.pipe_identity.as_str(),
+                std::time::Duration::from_secs(5),
+                &expectation,
+            )
+            .await
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            validate_authenticated_kernel_peer(
+                transport.peer_identity(),
+                process.process_id,
+                process.start_time_100ns,
+                expected_kernel_image,
+            )?;
+            let peer_digest = sha256_json(&(
+                process.process_id,
+                process.start_time_100ns,
+                expected_kernel_image,
+                approved_kernel_artifact,
+            ))?;
+            let peer_evidence = PlatformHandle::new(format!("kernel-peer:{peer_digest}"))
+                .map_err(|error| HostError::Platform(error.to_string()))?;
+            let request = KernelControlRequest {
+                wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+                wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+                message_id: fresh_identity("kernel-probe")?,
+                sequence: 1,
+                peer_process_id: std::process::id(),
+                generation: launch.authority_generation,
+                candidate: candidate.clone(),
+                command: KernelControlCommand::ProbeReady,
+                payload_digest: String::new(),
+            }
+            .with_computed_digest()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let frame = control_request_frame(
+                format!(
+                    "host-probe:{}:{}",
+                    approved_generation.as_str(),
+                    candidate.activation_id.as_str()
+                ),
+                &request,
+            )
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            match transport
+                .send_frame(&frame, TransportLimits::default())
+                .await
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            {
+                DeliveryOutcome::Delivered => {}
+                DeliveryOutcome::UnknownOutcome => {
+                    return Err(HostError::RecoveryRequired(
+                        "Kernel repeat ProbeReady delivery outcome is unknown".to_owned(),
+                    ));
+                }
+            }
+            let frame = transport
+                .receive_frame(TransportLimits::default())
+                .await
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let response = decode_control_response_frame(&frame)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let ready = validate_probe_response(&request, activation, &response)?;
+            let store_fence = validated_store_proof_fence(
+                requirement,
+                &ready,
+                approved_store_artifact,
+                approved_config,
+                request.generation,
+            )?;
+            Ok(AuthenticatedKernelReadiness {
+                request,
+                response,
+                ready,
+                store_fence,
+                peer_evidence,
+            })
+        })
     }
 
     #[allow(
@@ -1541,7 +2080,7 @@ impl HostJobBranches {
             portable_root.as_ref(),
             &store_bootstrap_path,
         )?;
-        validate_store_bootstrap_descriptor(
+        let store_bootstrap_requirement = validate_store_bootstrap_descriptor(
             &store_bootstrap_lease,
             &launch.store_bootstrap_descriptor_digest,
             store_artifact,
@@ -1648,12 +2187,16 @@ impl HostJobBranches {
                 self.config_path = Some(config_path);
                 self.config_lease = Some(config_lease);
                 self.store_bootstrap_lease = Some(store_bootstrap_lease);
+                self.store_bootstrap_requirement = Some(store_bootstrap_requirement);
                 self.config_pin = Some(config_pin);
                 self.portable_root = portable_root;
                 self.launch = Some(launch.clone());
                 self.kernel_artifact_digest = Some(kernel_artifact.clone());
                 self.store_artifact_digest = Some(store_artifact.clone());
                 self.config_digest = Some(config_digest.clone());
+                self.approved_generation = Some(generation.clone());
+                self.kernel_candidate = None;
+                self.kernel_activation_receipt = None;
                 self.kernel_restart_attempts = 0;
                 self.store_restart_attempts = 0;
                 self.kernel = Some(kernel);
@@ -1703,12 +2246,16 @@ impl HostJobBranches {
                 self.config_path = Some(config_path);
                 self.config_lease = Some(config_lease);
                 self.store_bootstrap_lease = Some(store_bootstrap_lease);
+                self.store_bootstrap_requirement = Some(store_bootstrap_requirement);
                 self.config_pin = Some(config_pin);
                 self.portable_root = portable_root;
                 self.launch = Some(launch.clone());
                 self.kernel_artifact_digest = Some(kernel_artifact.clone());
                 self.store_artifact_digest = Some(store_artifact.clone());
                 self.config_digest = Some(config_digest.clone());
+                self.approved_generation = Some(generation.clone());
+                self.kernel_candidate = None;
+                self.kernel_activation_receipt = None;
                 self.kernel_restart_attempts = 0;
                 self.store_restart_attempts = 0;
                 self.store = Some(store);
@@ -1872,6 +2419,44 @@ impl HostJobBranches {
             }
             None => Ok(BranchLiveness::Dead),
         }
+    }
+
+    fn liveness_only(&self) -> HostBranchDisposition {
+        let kernel_live = matches!(
+            Self::branch_state(self.kernel.as_ref()),
+            Ok(BranchLiveness::Live)
+        );
+        let store_live = matches!(
+            Self::branch_state(self.store.as_ref()),
+            Ok(BranchLiveness::Live)
+        );
+        match (kernel_live, store_live) {
+            (true, true) => HostBranchDisposition::LiveAwaitingReadiness,
+            (false, true) => HostBranchDisposition::KernelDegraded,
+            (true, false) => HostBranchDisposition::StoreDegraded,
+            (false, false) => HostBranchDisposition::BothDegraded,
+        }
+    }
+
+    fn validate_running_kernel_candidate(
+        &self,
+        candidate: &HostKernelCandidateBinding,
+    ) -> Result<(), HostError> {
+        let running_kernel = self.kernel.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("active Kernel process is missing".to_owned())
+        })?;
+        let running_process = running_kernel.evidence().process();
+        let candidate_job = &candidate.job_binding;
+        if candidate_job.job.name != self.kernel_identity.name()
+            || running_process.process_id != candidate_job.root.process.process_id
+            || running_process.start_time_100ns != candidate_job.root.process.start_time_100ns
+            || running_process.image_path != candidate_job.root.process.image_path
+        {
+            return Err(HostError::ProcessContour(
+                "live Kernel Job/process is not the retained candidate binding".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Reconciles Kernel and store branches independently with one bounded
@@ -2145,6 +2730,8 @@ impl HostJobBranches {
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
             self.kernel.take();
         }
+        self.kernel_candidate = None;
+        self.kernel_activation_receipt = None;
         Ok(())
     }
 
@@ -2182,10 +2769,14 @@ impl HostJobBranches {
         self.config_path = None;
         self.config_lease = None;
         self.store_bootstrap_lease = None;
+        self.store_bootstrap_requirement = None;
         self.config_pin = None;
         self.kernel_artifact_digest = None;
         self.store_artifact_digest = None;
         self.config_digest = None;
+        self.approved_generation = None;
+        self.kernel_candidate = None;
+        self.kernel_activation_receipt = None;
         self.portable_root = None;
         self.launch = None;
         self.kernel_restart_attempts = 0;
@@ -2552,6 +3143,111 @@ fn append_reconciled<B: JournalBackend>(
     }
 }
 
+fn append_reconciled_readiness<B: JournalBackend>(
+    journal: &HostStateJournalService<B>,
+    observation: KernelReadinessObservationRecord,
+    expected: &ReadinessApprovedContour,
+) -> Result<AppendReceipt, HostError> {
+    match journal.append_readiness_observation(observation.clone(), expected) {
+        Ok(receipt) => Ok(receipt),
+        Err(JournalError::OutcomeUnknown { transaction_id }) => {
+            match journal.reconcile(&transaction_id)? {
+                ReconcileOutcome::Committed => journal
+                    .append_readiness_observation(observation, expected)
+                    .map_err(HostError::Journal),
+                ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
+                    Err(HostError::Journal(JournalError::OutcomeUnknown {
+                        transaction_id,
+                    }))
+                }
+            }
+        }
+        Err(error) => Err(HostError::Journal(error)),
+    }
+}
+
+#[cfg(windows)]
+fn append_authenticated_kernel_readiness<B: JournalBackend>(
+    journal: &HostStateJournalService<B>,
+    proof: &AuthenticatedKernelReadiness,
+    approved_kernel_artifact: &PlatformHandle,
+    approved_config: &PlatformHandle,
+) -> Result<AppendReceipt, HostError> {
+    let snapshot = journal.snapshot()?;
+    let active = snapshot.kernel.as_ref().ok_or_else(|| {
+        HostError::ProcessContour("readiness admission has no active Kernel record".to_owned())
+    })?;
+    let active_process = active.process.as_ref().ok_or_else(|| {
+        HostError::ProcessContour("active Kernel process binding is absent".to_owned())
+    })?;
+    let active_job = active.candidate_job_binding.as_ref().ok_or_else(|| {
+        HostError::ProcessContour("active Kernel Job binding is absent".to_owned())
+    })?;
+    let candidate = &proof.request.candidate;
+    let job = &candidate.job_binding;
+    if active.state != KernelActivationState::Active
+        || active.one_time_nonce.state() != NonceState::Consumed
+        || candidate.installation_id != snapshot.host.installation
+        || candidate.host_epoch.value() != snapshot.host.epoch.current.sequence
+        || active.activation_identity != candidate.activation_id
+        || active.approved_artifact_hash != *approved_kernel_artifact
+        || candidate.artifact_hash != *approved_kernel_artifact
+        || candidate.config_hash != *approved_config
+        || active.active_pipe_identity.as_ref() != Some(&candidate.pipe_identity)
+        || active_process.authority_epoch.value() != candidate.kernel_epoch.value()
+        || active_process.process_id != proof.ready.process.process_id.as_str()
+        || active_job.job_name.as_str() != job.job.name
+        || active_job.root_pid != job.root.process.process_id
+        || active_job.root_start_time_100ns != job.root.process.start_time_100ns
+        || active_job.root_image_path.as_str() != job.root.process.image_path
+        || active_job.root_volume_serial_number != job.root.executable.volume_serial_number
+        || active_job.root_file_index != job.root.executable.file_index
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel readiness proof is not bound to the active journal contour".to_owned(),
+        ));
+    }
+    let active_checksum = record_checksum(&HostStateRecord::Kernel(active.clone()))?;
+    let response_digest = PlatformHandle::new(proof.response.payload_digest.clone())
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    let mut evidence_refs = proof.ready.evidence_refs.clone();
+    evidence_refs.push(proof.peer_evidence.clone());
+    evidence_refs.push(
+        PlatformHandle::new(format!("kernel-response:{}", response_digest.as_str()))
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+    );
+    let expected = ReadinessApprovedContour {
+        config_digest: approved_config.clone(),
+        store_fence: proof.store_fence.clone(),
+    };
+    append_reconciled_readiness(
+        journal,
+        KernelReadinessObservationRecord {
+            fence: active.fence.clone(),
+            operation: operation("kernel-readiness-observation")?,
+            active_kernel_record_checksum: PlatformHandle::new(active_checksum)
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            probe_request_digest: PlatformHandle::new(proof.request.payload_digest.clone())
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            ready_receipt_digest: response_digest,
+            kernel_process: ServiceProcessRecord {
+                process_id: proof.ready.process.process_id.as_str().to_owned(),
+                owner: active_process.owner.clone(),
+                state: ServiceProcessState::Ready,
+                health: proof.ready.health,
+                authority_epoch: candidate.kernel_epoch,
+            },
+            kernel_job: active_job.clone(),
+            config_digest: approved_config.clone(),
+            authority_epoch: candidate.kernel_epoch.value(),
+            store_fence: proof.store_fence.clone(),
+            observed_at: fresh_identity("kernel-readiness-observed-at")?,
+            evidence_refs,
+        },
+        &expected,
+    )
+}
+
 fn clean_marker_record(
     snapshot: &HostState,
     host: &HostInstallationEpoch,
@@ -2684,6 +3380,8 @@ pub struct HostComposition {
     running: bool,
     #[cfg(windows)]
     jobs: HostJobBranches,
+    #[cfg(windows)]
+    readiness_gate: HostReadinessGate,
     owner_lease: HostOwnerLease,
     pending_record: Option<HostStateRecord>,
     durable_finalized: bool,
@@ -2727,6 +3425,8 @@ impl HostComposition {
             running: true,
             #[cfg(windows)]
             jobs,
+            #[cfg(windows)]
+            readiness_gate: HostReadinessGate::with_cadence(ReadinessCadence::default()),
             owner_lease,
             pending_record: None,
             durable_finalized: false,
@@ -3306,12 +4006,47 @@ impl HostComposition {
         }
     }
 
+    /// Runs one liveness-only SCM tick against the retained process handles.
+    ///
+    /// This path observes only Job/process liveness and rederives the exact
+    /// readiness identity from in-memory approved bindings plus the journal
+    /// service's in-memory snapshot projection.  It never restarts a branch,
+    /// rehashes a file, opens the Kernel pipe, or performs durable journal I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when Host admission itself is fenced.
+    #[cfg(windows)]
+    pub fn liveness_tick(&mut self) -> Result<HostLivenessTick, HostError> {
+        self.ensure_admission_open()?;
+        let liveness = self.jobs.liveness_only();
+        let contour = (liveness == HostBranchDisposition::LiveAwaitingReadiness).then(|| {
+            let active = self.registry.active().ok_or_else(|| {
+                HostError::ProcessContour("no approved active generation".to_owned())
+            })?;
+            self.current_readiness_contour(
+                &active.manifest.generation,
+                &active.manifest.kernel_artifact_digest,
+                &active.manifest.canonical_store_artifact_digest,
+                &active.manifest.config_digest,
+            )
+        });
+        Ok(classify_liveness_tick(
+            &mut self.readiness_gate,
+            liveness,
+            contour,
+            std::time::Instant::now(),
+        ))
+    }
+
     /// Reconciles the approved contour and records fresh process observations.
     ///
     /// # Errors
     ///
     /// Returns an error if admission is fenced, approved material cannot be
-    /// revalidated, branch reconciliation fails, or observations cannot persist.
+    /// revalidated, or branch reconciliation/activation fails.  Authoritative
+    /// readiness failures return [`HostBranchDisposition::ReadinessDegraded`]
+    /// while preserving the independently recoverable process contour.
     #[cfg(windows)]
     pub fn reconcile_approved_contour(&mut self) -> Result<HostBranchDisposition, HostError> {
         self.ensure_admission_open()?;
@@ -3330,6 +4065,13 @@ impl HostComposition {
             HostJobBranches::branch_state(self.jobs.kernel.as_ref()),
             Ok(BranchLiveness::Dead)
         );
+        let store_requires_restart = matches!(
+            HostJobBranches::branch_state(self.jobs.store.as_ref()),
+            Ok(BranchLiveness::Dead)
+        );
+        if kernel_requires_activation || store_requires_restart {
+            self.readiness_gate.branch_degraded();
+        }
         if kernel_requires_activation {
             let current = self.journal.snapshot()?.kernel.ok_or_else(|| {
                 HostError::OwnerLeaseRecovery(
@@ -3350,7 +4092,6 @@ impl HostComposition {
             store_artifact,
             &self.host,
         )?;
-        let mut kernel_reactivated = false;
         if kernel_requires_activation && self.jobs.kernel.is_some() {
             let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
                 .next_kernel_activation_context(
@@ -3378,20 +4119,44 @@ impl HostComposition {
                     )),
                 });
             }
-            kernel_reactivated = true;
         }
-        if let Err(error) = self
-            .persist_process_observations_with_disposition(&active.manifest.generation, disposition)
-        {
-            return match reconcile_observation_cleanup(kernel_reactivated) {
-                ReconcileObservationCleanup::ActiveKernel => {
-                    self.cleanup_active_kernel_contour(error, "kernel-reconcile-observation-failed")
-                }
-                ReconcileObservationCleanup::GenericContour => self.cleanup_launched_contour(error),
+        Ok(self.reconcile_branch_readiness_at(
+            &active.manifest.generation,
+            kernel_artifact,
+            store_artifact,
+            &active.manifest.config_digest,
+            disposition,
+            std::time::Instant::now(),
+        ))
+    }
+
+    #[cfg(windows)]
+    fn reconcile_branch_readiness_at(
+        &mut self,
+        generation: &PlatformHandle,
+        kernel_artifact: &PlatformHandle,
+        store_artifact: &PlatformHandle,
+        config: &PlatformHandle,
+        disposition: HostBranchDisposition,
+        now: std::time::Instant,
+    ) -> HostBranchDisposition {
+        if disposition != HostBranchDisposition::LiveAwaitingReadiness {
+            self.readiness_gate.branch_degraded();
+            if let Err(error) = self.persist_degraded_process_observation(generation, disposition) {
+                self.readiness_gate
+                    .fail(None, readiness_failure_kind(&error), now);
+                return HostBranchDisposition::ReadinessDegraded;
             }
-            .map(|()| disposition);
+            return disposition;
         }
-        Ok(disposition)
+        let contour =
+            self.current_readiness_contour(generation, kernel_artifact, store_artifact, config);
+        let mut readiness_gate = std::mem::take(&mut self.readiness_gate);
+        let outcome = reconcile_authenticated_readiness(&mut readiness_gate, contour, now, || {
+            self.persist_fresh_authenticated_readiness(generation)
+        });
+        self.readiness_gate = readiness_gate;
+        outcome
     }
 
     /// Returns whether either approved process branch or its bounded recovery
@@ -3407,28 +4172,194 @@ impl HostComposition {
         &mut self,
         generation: &PlatformHandle,
     ) -> Result<(), HostError> {
-        self.persist_process_observations_with_disposition(
-            generation,
-            HostBranchDisposition::Healthy,
-        )
+        let now = std::time::Instant::now();
+        let contour = self.persist_fresh_authenticated_readiness(generation)?;
+        if !self.readiness_gate.grant(contour, now) {
+            return Err(HostError::ProcessContour(
+                "journaled readiness contour has no Store proof fence".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
-    fn persist_process_observations_with_disposition(
+    fn current_readiness_contour(
+        &self,
+        generation: &PlatformHandle,
+        kernel_artifact: &PlatformHandle,
+        store_artifact: &PlatformHandle,
+        config: &PlatformHandle,
+    ) -> Result<ReadinessContourIdentity, HostError> {
+        if self.jobs.approved_generation.as_ref() != Some(generation)
+            || self.jobs.kernel_artifact_digest.as_ref() != Some(kernel_artifact)
+            || self.jobs.store_artifact_digest.as_ref() != Some(store_artifact)
+            || self.jobs.config_digest.as_ref() != Some(config)
+        {
+            return Err(HostError::ProcessContour(
+                "retained readiness contour is not the approved active generation".to_owned(),
+            ));
+        }
+        let candidate = self.jobs.kernel_candidate.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("retained Kernel candidate binding is missing".to_owned())
+        })?;
+        let requirement = self
+            .jobs
+            .store_bootstrap_requirement
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "retained Store bootstrap requirement is missing".to_owned(),
+                )
+            })?;
+        requirement
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if candidate.artifact_hash != *kernel_artifact
+            || candidate.config_hash != *config
+            || requirement.approved_artifact_hash != *store_artifact
+            || requirement.approved_config_hash != *config
+            || requirement.state_fence.authority_epoch != candidate.kernel_epoch
+        {
+            return Err(HostError::ProcessContour(
+                "retained readiness authority or artifact binding is stale".to_owned(),
+            ));
+        }
+        self.jobs.validate_running_kernel_candidate(candidate)?;
+        let candidate_job = &candidate.job_binding;
+        let state = self.journal.snapshot()?;
+        let active = state.kernel.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("readiness contour has no Kernel record".to_owned())
+        })?;
+        let active_process = active.process.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("active Kernel process binding is absent".to_owned())
+        })?;
+        let active_job = active.candidate_job_binding.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("active Kernel Job binding is absent".to_owned())
+        })?;
+        if active.state != KernelActivationState::Active
+            || active.one_time_nonce.state() != NonceState::Consumed
+            || active.activation_identity != candidate.activation_id
+            || active.approved_artifact_hash != *kernel_artifact
+            || active.active_pipe_identity.as_ref() != Some(&candidate.pipe_identity)
+            || active_process.authority_epoch != candidate.kernel_epoch
+            || active_process.process_id
+                != format!(
+                    "pid:{}:start:{}",
+                    candidate_job.root.process.process_id,
+                    candidate_job.root.process.start_time_100ns
+                )
+            || active_job.job_name.as_str() != candidate_job.job.name
+            || active_job.root_pid != candidate_job.root.process.process_id
+            || active_job.root_start_time_100ns != candidate_job.root.process.start_time_100ns
+            || active_job.root_image_path.as_str() != candidate_job.root.process.image_path
+            || active_job.root_volume_serial_number
+                != candidate_job.root.executable.volume_serial_number
+            || active_job.root_file_index != candidate_job.root.executable.file_index
+        {
+            return Err(HostError::ProcessContour(
+                "durable Kernel is not the retained Active+Consumed contour".to_owned(),
+            ));
+        }
+        let active_kernel_record_checksum =
+            PlatformHandle::new(record_checksum(&HostStateRecord::Kernel(active.clone()))?)
+                .map_err(|error| HostError::Platform(error.to_string()))?;
+        let candidate_binding_digest = PlatformHandle::new(
+            candidate
+                .compute_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        )
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+        let store_requirement_digest = PlatformHandle::new(sha256_json(requirement)?)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let store_proof_fence = state.readiness_observations.last().and_then(|observation| {
+            (observation.active_kernel_record_checksum == active_kernel_record_checksum
+                && observation.fence == active.fence
+                && observation.kernel_process.process_id == active_process.process_id
+                && observation.kernel_job == *active_job
+                && observation.config_digest == *config
+                && observation.authority_epoch == candidate.kernel_epoch.value())
+            .then(|| observation.store_fence.clone())
+        });
+        Ok(ReadinessContourIdentity {
+            approved_generation: generation.clone(),
+            approved_kernel_artifact: kernel_artifact.clone(),
+            approved_store_artifact: store_artifact.clone(),
+            approved_config: config.clone(),
+            active_kernel_record_checksum,
+            candidate_binding_digest,
+            store_requirement_digest,
+            store_proof_fence,
+        })
+    }
+
+    #[cfg(windows)]
+    fn persist_fresh_authenticated_readiness(
+        &mut self,
+        generation: &PlatformHandle,
+    ) -> Result<ReadinessContourIdentity, HostError> {
+        let active =
+            self.registry.active().cloned().ok_or_else(|| {
+                HostError::ProcessContour("no approved active generation".to_owned())
+            })?;
+        if active.manifest.generation != *generation {
+            return Err(HostError::ProcessContour(
+                "readiness probe generation is not the approved active generation".to_owned(),
+            ));
+        }
+        let (kernel_artifact, store_artifact, _canonical_store_artifact) = active
+            .manifest
+            .runtime_artifact_digests()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let contour = self.current_readiness_contour(
+            generation,
+            kernel_artifact,
+            store_artifact,
+            &active.manifest.config_digest,
+        )?;
+        let proof = self.jobs.probe_kernel_readiness(
+            generation,
+            kernel_artifact,
+            store_artifact,
+            &active.manifest.config_digest,
+        )?;
+        append_authenticated_kernel_readiness(
+            &self.journal,
+            &proof,
+            kernel_artifact,
+            &active.manifest.config_digest,
+        )?;
+        let confirmed = self.current_readiness_contour(
+            generation,
+            kernel_artifact,
+            store_artifact,
+            &active.manifest.config_digest,
+        )?;
+        if !confirmed.same_authority_contour(&contour)
+            || confirmed.store_proof_fence.as_ref() != Some(&proof.store_fence)
+        {
+            return Err(HostError::ProcessContour(
+                "readiness contour changed while admitting the proof".to_owned(),
+            ));
+        }
+        Ok(confirmed)
+    }
+
+    #[cfg(windows)]
+    fn persist_degraded_process_observation(
         &mut self,
         generation: &PlatformHandle,
         disposition: HostBranchDisposition,
     ) -> Result<(), HostError> {
+        debug_assert_ne!(
+            disposition,
+            HostBranchDisposition::LiveAwaitingReadiness,
+            "degraded observations cannot admit readiness"
+        );
         let state = self.journal.snapshot()?;
         let activation = state.activation.ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
         let observation_id = fresh_identity("host-branch-observation")?;
-        let reason = if matches!(disposition, HostBranchDisposition::Healthy) {
-            "authoritative-readiness-observation-pending-wave-4"
-        } else {
-            "host-branch-degraded"
-        };
         self.append_record(HostStateRecord::Observation(HostObservationRecord {
             fence: activation.fence,
             operation: operation("host-process-observation")?,
@@ -3439,7 +4370,7 @@ impl HostComposition {
                 coverage_gap: Some(CoverageGap {
                     gap_id: observation_id.as_str().to_owned(),
                     obligation_profile_ref: "runtime-live-v3-readiness".to_owned(),
-                    reason_ref: reason.to_owned(),
+                    reason_ref: "host-branch-degraded".to_owned(),
                     affected_interval: None,
                     disposition: GapDisposition::BlockDependentTransition,
                     protected: true,
@@ -3885,6 +4816,59 @@ mod journal_tests {
         image: DurableImage,
     }
 
+    struct UnknownAppendBackend {
+        image: DurableImage,
+        prepared: Option<PreparedAppend>,
+    }
+
+    impl JournalBackend for UnknownAppendBackend {
+        fn load(&mut self) -> Result<DurableImage, BackendError> {
+            Ok(self.image.clone())
+        }
+
+        fn prepared_appends(&mut self) -> Result<Vec<PreparedAppend>, BackendError> {
+            Ok(self.prepared.clone().into_iter().collect())
+        }
+
+        fn prepare(&mut self, append: &PreparedAppend) -> Result<(), BackendError> {
+            self.prepared = Some(append.clone());
+            Ok(())
+        }
+
+        fn append_prepared(
+            &mut self,
+            _transaction_id: &PlatformHandle,
+            _bytes: &[u8],
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn flush(&mut self, _transaction_id: &PlatformHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn sync(&mut self, _transaction_id: &PlatformHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn commit(&mut self, _transaction_id: &PlatformHandle) -> Result<(), BackendError> {
+            Err(BackendError::Unknown(
+                eliot_platform::UnknownReason::Indeterminate,
+            ))
+        }
+
+        fn reconcile(
+            &mut self,
+            _transaction_id: &PlatformHandle,
+        ) -> Result<BackendReconcileState, BackendError> {
+            Ok(if self.prepared.is_some() {
+                BackendReconcileState::Prepared
+            } else {
+                BackendReconcileState::Absent
+            })
+        }
+    }
+
     impl JournalBackend for ImageBackend {
         fn load(&mut self) -> Result<DurableImage, BackendError> {
             Ok(self.image.clone())
@@ -3932,6 +4916,577 @@ mod journal_tests {
             None,
         )
         .unwrap_or_else(|_| unreachable!())
+    }
+
+    #[cfg(windows)]
+    struct ReadinessFixture {
+        journal: HostStateJournalService<MemoryBackend>,
+        candidate: HostKernelCandidateBinding,
+        activation: KernelActivationReceipt,
+        requirement: HostStoreBootstrapRequirement,
+        kernel_artifact: PlatformHandle,
+        store_artifact: PlatformHandle,
+        config: PlatformHandle,
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture establishes one complete durable activation contour for Host-level request/response/journal tests"
+    )]
+    fn active_readiness_fixture() -> ReadinessFixture {
+        let host = test_host();
+        let activation_generation =
+            root_epoch(fresh_identity("readiness-activation-lineage").unwrap());
+        let activation_id = fresh_identity("readiness-activation").unwrap();
+        let journal =
+            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone()).unwrap();
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(
+                initial_activation_record(
+                    &host,
+                    &activation_id,
+                    &activation_generation,
+                    ActivationState::Starting,
+                    "readiness-starting",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let kernel_artifact = PlatformHandle::new("a".repeat(64)).unwrap();
+        let store_artifact = PlatformHandle::new("b".repeat(64)).unwrap();
+        let config = PlatformHandle::new("c".repeat(64)).unwrap();
+        let job_name = PlatformHandle::new("Local\\Eliot-Host-Kernel-readiness").unwrap();
+        let image = "C:\\eliot\\eliot-kernel.exe".to_owned();
+        let candidate = HostKernelCandidateBinding {
+            installation_id: host.installation.clone(),
+            host_epoch: AuthorityEpoch::new(host.epoch.current.sequence).unwrap(),
+            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            activation_id: activation_id.clone(),
+            artifact_hash: kernel_artifact.clone(),
+            config_hash: config.clone(),
+            job_object_id: job_name.clone(),
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
+            host_process: HostProcessBinding {
+                process_id: 7,
+                start_time_100ns: 9,
+                image_path: "C:\\eliot\\eliot-host.exe".to_owned(),
+            },
+            job_binding: HostJobBinding {
+                job: eliot_kernel_service::HostJobIdentity {
+                    name: job_name.as_str().to_owned(),
+                },
+                root: eliot_kernel_service::HostJobRoot {
+                    process: HostProcessBinding {
+                        process_id: 42,
+                        start_time_100ns: 10,
+                        image_path: image.clone(),
+                    },
+                    executable: eliot_kernel_service::HostFileIdentity {
+                        volume_serial_number: 1,
+                        file_index: 2,
+                    },
+                },
+            },
+            restart_budget: RestartBudget::new(1, 1).unwrap(),
+            containment_action: None,
+        };
+        let durable_job = KernelJobBinding {
+            job_name,
+            owner: PlatformHandle::new("Kernel").unwrap(),
+            root_pid: 42,
+            root_start_time_100ns: 10,
+            root_image_path: PlatformHandle::new(image).unwrap(),
+            root_volume_serial_number: 1,
+            root_file_index: 2,
+        };
+        let mut driver = DurableKernelActivationDriver::bind_candidate(
+            &journal,
+            &host,
+            &activation_id,
+            &activation_generation,
+            kernel_artifact.clone(),
+            candidate.pipe_identity.clone(),
+            durable_job,
+            PriorKernelDisposition::NoPriorKernel,
+            root_epoch(fresh_identity("readiness-kernel-lineage").unwrap()),
+            ServiceProcessRecord {
+                process_id: "pid:42:start:10".to_owned(),
+                owner: "Kernel".to_owned(),
+                state: ServiceProcessState::Starting,
+                health: HealthVector::healthy(),
+                authority_epoch: candidate.kernel_epoch,
+            },
+        )
+        .unwrap();
+        driver.handoff_prepared().unwrap();
+        driver.prior_disposition_committed().unwrap();
+        let permit = driver
+            .issue_nonce(&candidate, ResourceGeneration::genesis())
+            .unwrap();
+        driver.activating().unwrap();
+        let activation = KernelActivationReceipt::issue(&permit);
+        let initial_ready = KernelReadyReceipt {
+            activation_id: activation_id.clone(),
+            activation_operation_id: activation.operation_id.clone(),
+            activation_nonce_digest: activation.activation_nonce_digest.clone(),
+            process: eliot_kernel_service::ProcessObservation {
+                process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
+                job_object_id: candidate.job_object_id.clone(),
+                state: ServiceProcessState::Ready,
+                health: HealthVector::healthy(),
+                evidence_refs: vec![PlatformHandle::new("initial-process-proof").unwrap()],
+            },
+            health: HealthVector::healthy(),
+            evidence_refs: vec![PlatformHandle::new("initial-ready-proof").unwrap()],
+        };
+        driver
+            .active(&candidate, &activation, &initial_ready)
+            .unwrap();
+        drop(driver);
+        let requirement = HostStoreBootstrapRequirement {
+            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)
+                .unwrap(),
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-readiness")
+                .unwrap(),
+            store_generation: ResourceGeneration::genesis(),
+            state_fence: StateFence::new(candidate.kernel_epoch, ResourceGeneration::genesis()),
+            launch_nonce: PlatformHandle::new("store-launch-nonce").unwrap(),
+            connection_id: PlatformHandle::new("store-connection").unwrap(),
+            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            expected_peer_session_id: 0,
+            approved_artifact_hash: store_artifact.clone(),
+            approved_config_hash: config.clone(),
+            timeout_ms: 5_000,
+        };
+        ReadinessFixture {
+            journal,
+            candidate,
+            activation,
+            requirement,
+            kernel_artifact,
+            store_artifact,
+            config,
+        }
+    }
+
+    #[cfg(windows)]
+    fn probe_exchange(
+        fixture: &ReadinessFixture,
+        validation_revision: u64,
+    ) -> (
+        KernelControlRequest,
+        KernelControlResponse,
+        KernelReadyReceipt,
+    ) {
+        let request = KernelControlRequest {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: fresh_identity("test-kernel-probe").unwrap(),
+            sequence: 1,
+            peer_process_id: 7,
+            generation: ResourceGeneration::genesis(),
+            candidate: fixture.candidate.clone(),
+            command: KernelControlCommand::ProbeReady,
+            payload_digest: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let mut evidence_refs = KernelReadyReceipt::probe_binding_evidence(&request).unwrap();
+        evidence_refs.extend([
+            PlatformHandle::new(format!("kernel-store-validation:{validation_revision}")).unwrap(),
+            PlatformHandle::new("kernel-store-health:manifest-ready").unwrap(),
+        ]);
+        let ready = KernelReadyReceipt {
+            activation_id: fixture.candidate.activation_id.clone(),
+            activation_operation_id: fixture.activation.operation_id.clone(),
+            activation_nonce_digest: fixture.activation.activation_nonce_digest.clone(),
+            process: eliot_kernel_service::ProcessObservation {
+                process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
+                job_object_id: fixture.candidate.job_object_id.clone(),
+                state: ServiceProcessState::Ready,
+                health: HealthVector::healthy(),
+                evidence_refs: vec![PlatformHandle::new("repeat-process-proof").unwrap()],
+            },
+            health: HealthVector::healthy(),
+            evidence_refs,
+        };
+        let response = KernelControlResponse {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: request.message_id.clone(),
+            request_digest: request.payload_digest.clone(),
+            state: KernelServiceState::Ready,
+            receipt: Some(ready.clone()),
+            activation_receipt: None,
+            error: None,
+            payload_digest: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        (request, response, ready)
+    }
+
+    #[cfg(windows)]
+    fn authenticated_proof(
+        fixture: &ReadinessFixture,
+        validation_revision: u64,
+    ) -> AuthenticatedKernelReadiness {
+        let (request, response, _ready) = probe_exchange(fixture, validation_revision);
+        let ready = validate_probe_response(&request, &fixture.activation, &response).unwrap();
+        let store_fence = validated_store_proof_fence(
+            &fixture.requirement,
+            &ready,
+            &fixture.store_artifact,
+            &fixture.config,
+            request.generation,
+        )
+        .unwrap();
+        AuthenticatedKernelReadiness {
+            request,
+            response,
+            ready,
+            store_fence,
+            peer_evidence: PlatformHandle::new("kernel-peer:test-authenticated").unwrap(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn readiness_contour(fixture: &ReadinessFixture) -> ReadinessContourIdentity {
+        let state = fixture.journal.snapshot().unwrap();
+        let active = state.kernel.unwrap();
+        let active_kernel_record_checksum =
+            PlatformHandle::new(record_checksum(&HostStateRecord::Kernel(active)).unwrap())
+                .unwrap();
+        let store_proof_fence = state
+            .readiness_observations
+            .last()
+            .filter(|observation| {
+                observation.active_kernel_record_checksum == active_kernel_record_checksum
+            })
+            .map(|observation| observation.store_fence.clone());
+        ReadinessContourIdentity {
+            approved_generation: PlatformHandle::new("approved-generation").unwrap(),
+            approved_kernel_artifact: fixture.kernel_artifact.clone(),
+            approved_store_artifact: fixture.store_artifact.clone(),
+            approved_config: fixture.config.clone(),
+            active_kernel_record_checksum,
+            candidate_binding_digest: PlatformHandle::new(
+                fixture.candidate.compute_digest().unwrap(),
+            )
+            .unwrap(),
+            store_requirement_digest: PlatformHandle::new(
+                sha256_json(&fixture.requirement).unwrap(),
+            )
+            .unwrap(),
+            store_proof_fence,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ready_repeat_appends_fresh_proofs_without_mutating_activation_authority() {
+        let fixture = active_readiness_fixture();
+        let before = fixture.journal.snapshot().unwrap().kernel.unwrap();
+        let first = authenticated_proof(&fixture, 7);
+        let first_disposition = append_authenticated_kernel_readiness(
+            &fixture.journal,
+            &first,
+            &fixture.kernel_artifact,
+            &fixture.config,
+        )
+        .map(|_| HostBranchDisposition::Healthy)
+        .unwrap();
+        let second = authenticated_proof(&fixture, 8);
+        let second_disposition = append_authenticated_kernel_readiness(
+            &fixture.journal,
+            &second,
+            &fixture.kernel_artifact,
+            &fixture.config,
+        )
+        .map(|_| HostBranchDisposition::Healthy)
+        .unwrap();
+        let state = fixture.journal.snapshot().unwrap();
+        let after = state.kernel.unwrap();
+        assert_eq!(first_disposition, HostBranchDisposition::Healthy);
+        assert_eq!(second_disposition, HostBranchDisposition::Healthy);
+        assert_eq!(state.readiness_observations.len(), 2);
+        assert_ne!(first.request.payload_digest, second.request.payload_digest);
+        assert!(matches!(
+            first.request.command,
+            KernelControlCommand::ProbeReady
+        ));
+        assert!(matches!(
+            second.request.command,
+            KernelControlCommand::ProbeReady
+        ));
+        assert_eq!(after.one_time_nonce, before.one_time_nonce);
+        assert_eq!(after.kernel_generation, before.kernel_generation);
+        assert_eq!(
+            after.process.unwrap().authority_epoch,
+            before.process.unwrap().authority_epoch
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn readiness_lease_separates_cheap_polling_from_expired_repeat() {
+        assert_eq!(
+            ReadinessCadence::default().0,
+            std::time::Duration::from_secs(5)
+        );
+        assert!(ReadinessCadence::bounded(std::time::Duration::from_millis(249)).is_err());
+        assert!(ReadinessCadence::bounded(std::time::Duration::from_secs(61)).is_err());
+
+        let fixture = active_readiness_fixture();
+        let contour = readiness_contour(&fixture);
+        let mut gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
+        let now = std::time::Instant::now();
+        let probes = std::cell::Cell::new(0_u8);
+        let admit = |revision| -> Result<ReadinessContourIdentity, HostError> {
+            probes.set(probes.get() + 1);
+            let proof = authenticated_proof(&fixture, revision);
+            append_authenticated_kernel_readiness(
+                &fixture.journal,
+                &proof,
+                &fixture.kernel_artifact,
+                &fixture.config,
+            )?;
+            Ok(readiness_contour(&fixture))
+        };
+
+        let first =
+            reconcile_authenticated_readiness(&mut gate, Ok(contour.clone()), now, || admit(20));
+        assert_eq!(first, HostBranchDisposition::Healthy);
+        assert_eq!(probes.get(), 1);
+        let journaled_contour = readiness_contour(&fixture);
+
+        let cheap = classify_liveness_tick(
+            &mut gate,
+            HostBranchDisposition::LiveAwaitingReadiness,
+            Some(Ok(journaled_contour.clone())),
+            now + std::time::Duration::from_millis(250),
+        );
+        assert_eq!(cheap, HostLivenessTick::HealthyLeasePreserved);
+        assert_eq!(probes.get(), 1);
+
+        let before_expiry = classify_liveness_tick(
+            &mut gate,
+            HostBranchDisposition::LiveAwaitingReadiness,
+            Some(Ok(journaled_contour.clone())),
+            (now + DEFAULT_READINESS_CADENCE)
+                .checked_sub(std::time::Duration::from_millis(1))
+                .unwrap(),
+        );
+        assert_eq!(before_expiry, HostLivenessTick::HealthyLeasePreserved);
+
+        let expired_tick = classify_liveness_tick(
+            &mut gate,
+            HostBranchDisposition::LiveAwaitingReadiness,
+            Some(Ok(journaled_contour.clone())),
+            now + DEFAULT_READINESS_CADENCE,
+        );
+        assert_eq!(expired_tick, HostLivenessTick::FullReconcileDue);
+        let expired = reconcile_authenticated_readiness(
+            &mut gate,
+            Ok(journaled_contour),
+            now + DEFAULT_READINESS_CADENCE,
+            || admit(21),
+        );
+        assert_eq!(expired, HostBranchDisposition::Healthy);
+        assert_eq!(probes.get(), 2);
+        assert_eq!(
+            fixture
+                .journal
+                .snapshot()
+                .unwrap()
+                .readiness_observations
+                .len(),
+            2
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_fast_path_invalidates_every_exact_contour_field() {
+        let fixture = active_readiness_fixture();
+        let mut exact = readiness_contour(&fixture);
+        exact.store_proof_fence = Some(PlatformHandle::new("store-proof-exact").unwrap());
+        let changed = |label: &str| PlatformHandle::new(format!("changed-{label}")).unwrap();
+        let mut variants = Vec::new();
+
+        let mut contour = exact.clone();
+        contour.approved_generation = changed("generation");
+        variants.push(("approved_generation", contour));
+        let mut contour = exact.clone();
+        contour.approved_kernel_artifact = changed("kernel-artifact");
+        variants.push(("approved_kernel_artifact", contour));
+        let mut contour = exact.clone();
+        contour.approved_store_artifact = changed("store-artifact");
+        variants.push(("approved_store_artifact", contour));
+        let mut contour = exact.clone();
+        contour.approved_config = changed("config");
+        variants.push(("approved_config", contour));
+        let mut contour = exact.clone();
+        contour.active_kernel_record_checksum = changed("kernel-checksum");
+        variants.push(("active_kernel_record_checksum", contour));
+        let mut contour = exact.clone();
+        contour.candidate_binding_digest = changed("candidate-binding");
+        variants.push(("candidate_binding_digest", contour));
+        let mut contour = exact.clone();
+        contour.store_requirement_digest = changed("store-requirement");
+        variants.push(("store_requirement_digest", contour));
+        let mut contour = exact.clone();
+        contour.store_proof_fence = Some(changed("store-proof"));
+        variants.push(("store_proof_fence", contour));
+
+        let now = std::time::Instant::now();
+        for (field, current) in variants {
+            let mut gate = HostReadinessGate::default();
+            assert!(gate.grant(exact.clone(), now));
+            assert_eq!(
+                classify_liveness_tick(
+                    &mut gate,
+                    HostBranchDisposition::LiveAwaitingReadiness,
+                    Some(Ok(current)),
+                    now + std::time::Duration::from_millis(250),
+                ),
+                HostLivenessTick::FullReconcileDue,
+                "{field} mismatch preserved an inexact lease"
+            );
+        }
+
+        let mut exact_gate = HostReadinessGate::default();
+        assert!(exact_gate.grant(exact.clone(), now));
+        assert_eq!(
+            classify_liveness_tick(
+                &mut exact_gate,
+                HostBranchDisposition::LiveAwaitingReadiness,
+                Some(Ok(exact)),
+                now + std::time::Duration::from_millis(250),
+            ),
+            HostLivenessTick::HealthyLeasePreserved
+        );
+
+        let mut missing_gate = HostReadinessGate::default();
+        missing_gate.fail(None, ReadinessFailureKind::ContourUnavailable, now);
+        assert_eq!(
+            classify_liveness_tick(
+                &mut missing_gate,
+                HostBranchDisposition::LiveAwaitingReadiness,
+                Some(Err(HostError::ProcessContour(
+                    "retained Store proof is missing".to_owned(),
+                ))),
+                now + std::time::Duration::from_millis(250),
+            ),
+            HostLivenessTick::ReadinessRetryPending
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn degraded_recovery_becomes_healthy_only_after_journaled_probe() {
+        let fixture = active_readiness_fixture();
+        let contour = readiness_contour(&fixture);
+        let mut gate = HostReadinessGate::default();
+        let degraded = HostBranchDisposition::KernelDegraded;
+        gate.branch_degraded();
+        assert_ne!(degraded, HostBranchDisposition::Healthy);
+        let proof = authenticated_proof(&fixture, 9);
+        let request_digest = proof.request.payload_digest.clone();
+        let response_digest = proof.response.payload_digest.clone();
+        let recovered = reconcile_authenticated_readiness(
+            &mut gate,
+            Ok(contour),
+            std::time::Instant::now(),
+            || {
+                append_authenticated_kernel_readiness(
+                    &fixture.journal,
+                    &proof,
+                    &fixture.kernel_artifact,
+                    &fixture.config,
+                )?;
+                Ok(readiness_contour(&fixture))
+            },
+        );
+        assert_eq!(recovered, HostBranchDisposition::Healthy);
+        let state = fixture.journal.snapshot().unwrap();
+        assert_eq!(state.readiness_observations.len(), 1);
+        assert_eq!(
+            state.readiness_observations[0]
+                .probe_request_digest
+                .as_str(),
+            request_digest
+        );
+        assert_eq!(
+            state.readiness_observations[0]
+                .ready_receipt_digest
+                .as_str(),
+            response_digest
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_store_snapshot_and_response_substitution_never_become_healthy() {
+        let fixture = active_readiness_fixture();
+        let (request, response, ready) = probe_exchange(&fixture, 0);
+        validate_probe_response(&request, &fixture.activation, &response).unwrap();
+        let stale_result = validated_store_proof_fence(
+            &fixture.requirement,
+            &ready,
+            &fixture.store_artifact,
+            &fixture.config,
+            request.generation,
+        );
+        assert!(stale_result.is_err());
+
+        let (request, mut substituted, _) = probe_exchange(&fixture, 10);
+        substituted.request_digest = "d".repeat(64);
+        substituted = substituted.with_computed_digest().unwrap();
+        assert!(validate_probe_response(&request, &fixture.activation, &substituted).is_err());
+        let snapshot = fixture.journal.snapshot().unwrap();
+        assert!(snapshot.readiness_observations.is_empty());
+        assert_eq!(
+            snapshot.kernel.unwrap().state,
+            KernelActivationState::Active
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unknown_readiness_journal_outcome_remains_non_healthy() {
+        let fixture = active_readiness_fixture();
+        let proof = authenticated_proof(&fixture, 11);
+        let host = fixture.journal.snapshot().unwrap().host;
+        let backend = fixture.journal.into_backend().unwrap();
+        let journal = HostStateJournalService::from_backend(
+            UnknownAppendBackend {
+                image: backend.durable_image().clone(),
+                prepared: None,
+            },
+            host,
+        )
+        .unwrap();
+        let outcome = append_authenticated_kernel_readiness(
+            &journal,
+            &proof,
+            &fixture.kernel_artifact,
+            &fixture.config,
+        );
+        assert!(matches!(
+            outcome,
+            Err(HostError::Journal(JournalError::OutcomeUnknown { .. }))
+        ));
+        assert!(
+            journal
+                .snapshot()
+                .unwrap()
+                .readiness_observations
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4093,9 +5648,9 @@ mod journal_tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the regression constructs and drives the complete real durable activation record sequence"
+        reason = "the regression constructs a real Active+Consumed record and drives stale, unknown, and recovered readiness admissions"
     )]
-    fn reconciled_active_failure_is_durable_failed_consumed_before_cleanup() {
+    fn reconciled_active_readiness_failure_preserves_contour_then_recovers() {
         let host = test_host();
         let activation_generation =
             root_epoch(fresh_identity("reconcile-activation-lineage").unwrap());
@@ -4124,8 +5679,8 @@ mod journal_tests {
             host_epoch: AuthorityEpoch::new(host.epoch.current.sequence).unwrap(),
             kernel_epoch: AuthorityEpoch::new(2).unwrap(),
             activation_id: activation_id.clone(),
-            artifact_hash: PlatformHandle::new("reconcile-artifact").unwrap(),
-            config_hash: PlatformHandle::new("reconcile-config").unwrap(),
+            artifact_hash: PlatformHandle::new("a".repeat(64)).unwrap(),
+            config_hash: PlatformHandle::new("c".repeat(64)).unwrap(),
             job_object_id: job_name.clone(),
             pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
             host_process: HostProcessBinding {
@@ -4210,31 +5765,123 @@ mod journal_tests {
         assert_eq!(active.state, KernelActivationState::Active);
         assert_eq!(active.one_time_nonce.state(), NonceState::Consumed);
 
-        let cleanup_seen = std::cell::Cell::new(false);
-        let result = match reconcile_observation_cleanup(true) {
-            ReconcileObservationCleanup::ActiveKernel => {
-                let current = journal.snapshot().unwrap().kernel.unwrap();
-                let durable = DurableKernelActivationDriver::resume(&journal, current)
-                    .fail("kernel-reconcile-observation-failed");
-                finish_active_kernel_cleanup(durable, || {
-                    let failed = journal.snapshot().unwrap().kernel.unwrap();
-                    assert_eq!(failed.state, KernelActivationState::Failed);
-                    assert_eq!(failed.one_time_nonce.state(), NonceState::Consumed);
-                    cleanup_seen.set(true);
-                    Err(HostError::ProcessContour(
-                        "injected terminate-and-clear".to_owned(),
-                    ))
-                })
-            }
-            ReconcileObservationCleanup::GenericContour => {
-                panic!("reactivated Kernel selected generic cleanup")
-            }
+        let kernel_artifact = candidate.artifact_hash.clone();
+        let store_artifact = PlatformHandle::new("b".repeat(64)).unwrap();
+        let config = candidate.config_hash.clone();
+        let requirement = HostStoreBootstrapRequirement {
+            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)
+                .unwrap(),
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-readiness")
+                .unwrap(),
+            store_generation: ResourceGeneration::genesis(),
+            state_fence: StateFence::new(candidate.kernel_epoch, ResourceGeneration::genesis()),
+            launch_nonce: PlatformHandle::new("reconcile-store-launch").unwrap(),
+            connection_id: PlatformHandle::new("reconcile-store-connection").unwrap(),
+            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            expected_peer_session_id: 0,
+            approved_artifact_hash: store_artifact.clone(),
+            approved_config_hash: config.clone(),
+            timeout_ms: 5_000,
         };
-        assert!(result.is_err());
-        assert!(cleanup_seen.get());
-        let failed = journal.snapshot().unwrap().kernel.unwrap();
-        assert_eq!(failed.state, KernelActivationState::Failed);
-        assert_eq!(failed.one_time_nonce.state(), NonceState::Consumed);
+        let fixture = ReadinessFixture {
+            journal,
+            candidate,
+            activation: activation_receipt,
+            requirement,
+            kernel_artifact,
+            store_artifact,
+            config,
+        };
+        let contour = readiness_contour(&fixture);
+        let mut gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
+        let now = std::time::Instant::now();
+        let probes = std::cell::Cell::new(0_u8);
+
+        let stale = reconcile_authenticated_readiness(&mut gate, Ok(contour.clone()), now, || {
+            probes.set(probes.get() + 1);
+            let (request, response, ready) = probe_exchange(&fixture, 0);
+            validate_probe_response(&request, &fixture.activation, &response)?;
+            let store_proof_fence = validated_store_proof_fence(
+                &fixture.requirement,
+                &ready,
+                &fixture.store_artifact,
+                &fixture.config,
+                request.generation,
+            )?;
+            Ok(ReadinessContourIdentity {
+                store_proof_fence: Some(store_proof_fence),
+                ..contour.clone()
+            })
+        });
+        assert_eq!(stale, HostBranchDisposition::ReadinessDegraded);
+        assert_eq!(
+            gate.last_failure(),
+            Some(ReadinessFailureKind::ProbeRejected)
+        );
+        assert_eq!(probes.get(), 1);
+
+        let throttled = reconcile_authenticated_readiness(
+            &mut gate,
+            Ok(contour.clone()),
+            now + std::time::Duration::from_millis(250),
+            || panic!("250ms liveness poll must not repeat authoritative readiness"),
+        );
+        assert_eq!(throttled, HostBranchDisposition::ReadinessDegraded);
+
+        let unknown = reconcile_authenticated_readiness(
+            &mut gate,
+            Ok(contour.clone()),
+            now + DEFAULT_READINESS_CADENCE,
+            || {
+                probes.set(probes.get() + 1);
+                Err(HostError::Journal(JournalError::OutcomeUnknown {
+                    transaction_id: fresh_identity("readiness-unknown").unwrap(),
+                }))
+            },
+        );
+        assert_eq!(unknown, HostBranchDisposition::ReadinessDegraded);
+        assert_eq!(
+            gate.last_failure(),
+            Some(ReadinessFailureKind::JournalOutcomeUnknown)
+        );
+        let retained = fixture.journal.snapshot().unwrap().kernel.unwrap();
+        assert_eq!(retained.state, KernelActivationState::Active);
+        assert_eq!(retained.one_time_nonce.state(), NonceState::Consumed);
+        assert!(
+            fixture
+                .journal
+                .snapshot()
+                .unwrap()
+                .readiness_observations
+                .is_empty()
+        );
+
+        let recovered = reconcile_authenticated_readiness(
+            &mut gate,
+            Ok(contour),
+            now + DEFAULT_READINESS_CADENCE + DEFAULT_READINESS_CADENCE,
+            || {
+                probes.set(probes.get() + 1);
+                let proof = authenticated_proof(&fixture, 12);
+                append_authenticated_kernel_readiness(
+                    &fixture.journal,
+                    &proof,
+                    &fixture.kernel_artifact,
+                    &fixture.config,
+                )?;
+                Ok(readiness_contour(&fixture))
+            },
+        );
+        assert_eq!(recovered, HostBranchDisposition::Healthy);
+        assert_eq!(probes.get(), 3);
+        let recovered_state = fixture.journal.snapshot().unwrap();
+        let recovered_kernel = recovered_state.kernel.unwrap();
+        assert_eq!(recovered_kernel.state, KernelActivationState::Active);
+        assert_eq!(
+            recovered_kernel.one_time_nonce.state(),
+            NonceState::Consumed
+        );
+        assert_eq!(recovered_state.readiness_observations.len(), 1);
     }
 }
 
@@ -4488,7 +6135,7 @@ mod tests {
                 Ok(MockChild { id: 2, live: true })
             },
         );
-        assert_eq!(disposition, HostBranchDisposition::Healthy);
+        assert_eq!(disposition, HostBranchDisposition::LiveAwaitingReadiness);
         assert_eq!(
             *events.borrow(),
             ["launch Store", "observe Store", "launch Kernel"]
@@ -4557,7 +6204,10 @@ mod tests {
                 },
             )
         };
-        assert_eq!(run(&mut state), HostBranchDisposition::Healthy);
+        assert_eq!(
+            run(&mut state),
+            HostBranchDisposition::LiveAwaitingReadiness
+        );
         state.kernel.as_mut().expect("kernel restart").live = false;
         assert_eq!(run(&mut state), HostBranchDisposition::KernelDegraded);
         assert_eq!(*kernel_launches.borrow(), 1);
