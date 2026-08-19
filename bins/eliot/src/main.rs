@@ -51,7 +51,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum InstallationCommand {
-    /// Validate an immutable v6 installation plan JSON without applying it.
+    /// Validate an immutable v7 installation plan JSON without applying it.
     Plan {
         /// Absolute path to an existing serialized `InstallationTransaction`.
         #[arg(long, value_parser = absolute_path)]
@@ -161,7 +161,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "contract": "eliot.kernel.installation",
-                    "contract_version": "2.0.0",
+                    "contract_version": "3.0.0",
                     "status": if registry_value.active().is_some() { "ACTIVE_GENERATION" } else { "NO_ACTIVE_GENERATION" },
                     "active_generation": registry_value.active_generation(),
                     "last_known_good_generation": registry_value.last_known_good_generation(),

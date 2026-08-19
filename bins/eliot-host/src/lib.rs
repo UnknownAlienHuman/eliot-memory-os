@@ -590,6 +590,45 @@ fn verify_launch_digest(
 }
 
 #[cfg(windows)]
+fn verify_host_artifact_at(
+    manifest: &CandidateManifest,
+    current_executable: &Path,
+) -> Result<(), HostError> {
+    let (approved_path, approved_digest) = manifest
+        .host_artifact_binding()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let launch = &manifest.runtime_launch;
+    let portable_root = if launch.profile == InstallationProfile::PortableDev {
+        Some(
+            UserOwnedRootLease::open_existing(Path::new(
+                launch
+                    .portable_root
+                    .as_ref()
+                    .ok_or_else(|| {
+                        HostError::ProcessContour("portable root is missing".to_owned())
+                    })?
+                    .as_str(),
+            ))
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let current_executable = approved_locator(current_executable, approved_path, launch.profile)?;
+    let lease = open_launch_lease(launch.profile, portable_root.as_ref(), &current_executable)?;
+    verify_launch_digest(&lease, approved_digest, "runtime.host_artifact")
+}
+
+#[cfg(windows)]
+fn verify_current_host_artifact(manifest: &CandidateManifest) -> Result<(), HostError> {
+    // The OS-reported current image is process identity evidence, never a
+    // fallback for the approved launch descriptor.
+    let current_executable =
+        std::env::current_exe().map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    verify_host_artifact_at(manifest, &current_executable)
+}
+
+#[cfg(windows)]
 fn validate_store_bootstrap_descriptor(
     lease: &LaunchLease,
     approved_digest: &PlatformHandle,
@@ -3936,7 +3975,7 @@ fn pending_activation_binding(
     pending: &eliot_installation::PendingActivation,
 ) -> Result<PlatformHandle, HostError> {
     let digest = sha256_json(&(
-        "pending-activation-binding-v1",
+        "pending-activation-binding-v2",
         &pending.transaction_id,
         &pending.plan_digest,
         &pending.manifest.generation,
@@ -3944,6 +3983,8 @@ fn pending_activation_binding(
         &pending.kernel_artifact_digest,
         &pending.store_bridge_artifact_digest,
         &pending.canonical_store_artifact_digest,
+        &pending.host_executable_path,
+        &pending.host_artifact_digest,
         &pending.runtime_state_roots_digest,
         &pending.manifest_digest,
     ))?;
@@ -4170,6 +4211,19 @@ impl HostComposition {
             &registry,
             pending_for_reopen.as_ref(),
         )?;
+        #[cfg(windows)]
+        {
+            let startup_manifest = pending_for_reopen
+                .as_ref()
+                .map(|pending| &pending.manifest)
+                .or_else(|| registry.active().map(|generation| &generation.manifest))
+                .ok_or_else(|| {
+                    HostError::ProcessContour(
+                        "SCM launch authority has no approved generation".to_owned(),
+                    )
+                })?;
+            verify_current_host_artifact(startup_manifest)?;
+        }
         if let Some(pending) = pending_for_reopen.as_ref()
             && pending
                 .manifest
@@ -6081,41 +6135,6 @@ mod journal_tests {
             handle(root.join(name).to_string_lossy().into_owned())
         }
 
-        #[derive(serde::Serialize)]
-        struct UnsignedLaunch<'a> {
-            profile: InstallationProfile,
-            portable_root: &'a Option<PlatformHandle>,
-            installation_epoch: &'a InstallationEpoch,
-            generation: &'a PlatformHandle,
-            authority_generation: ResourceGeneration,
-            authority_state_fence: &'a StateFence,
-            authority_descriptor_path: &'a PlatformHandle,
-            authority_descriptor_digest: &'a PlatformHandle,
-            runtime_state_roots: &'a RuntimeStateRoots,
-            kernel_work_root: &'a PlatformHandle,
-            kernel_artifact_digest: &'a PlatformHandle,
-            eliotd_executable_path: &'a PlatformHandle,
-            eliotd_artifact_digest: &'a PlatformHandle,
-            eliotd_config_path: &'a PlatformHandle,
-            eliotd_config_digest: &'a PlatformHandle,
-            eliotd_descriptor_path: &'a PlatformHandle,
-            eliotd_descriptor_digest: &'a PlatformHandle,
-            eliotd_launch_nonce: &'a PlatformHandle,
-            store_config_path: &'a PlatformHandle,
-            store_credential_target: &'a PlatformHandle,
-            store_bootstrap_descriptor_path: &'a PlatformHandle,
-            store_bootstrap_descriptor_digest: &'a PlatformHandle,
-            canonical_store_executable_path: &'a PlatformHandle,
-            canonical_store_artifact_digest: &'a PlatformHandle,
-            kernel_arguments: &'a [PlatformHandle],
-            store_bridge_executable_path: &'a PlatformHandle,
-            store_bridge_artifact_digest: &'a PlatformHandle,
-            store_bridge_arguments: &'a [PlatformHandle],
-            canonical_store_arguments: &'a [PlatformHandle],
-            watchdog_executable_path: &'a PlatformHandle,
-            watchdog_artifact_digest: &'a PlatformHandle,
-        }
-
         let root = std::env::temp_dir().join(format!(
             "eliot-host-liveness-store-split-{}",
             Uuid::new_v4()
@@ -6140,6 +6159,7 @@ mod journal_tests {
         let credential_target = handle("eliot/store/v1/0123456789abcdef0123456789abcdef");
         let bridge_path = path(&portable, "eliot-store-surreal.exe");
         let provider_path = path(&portable, "surreal.exe");
+        let host_path = path(&portable, "eliot-host.exe");
         let mut runtime_launch = RuntimeLaunchDescriptor {
             profile: InstallationProfile::PortableDev,
             portable_root: Some(portable_handle.clone()),
@@ -6218,54 +6238,26 @@ mod journal_tests {
                         .replace('\\', "/")
                 )),
             ],
+            host_executable_path: host_path.clone(),
+            host_artifact_digest: handle("e".repeat(64)),
             watchdog_executable_path: path(&portable, "eliot-watchdog.exe"),
             watchdog_artifact_digest: handle("7".repeat(64)),
             descriptor_digest: handle("0".repeat(64)),
         };
-        let unsigned = UnsignedLaunch {
-            profile: runtime_launch.profile,
-            portable_root: &runtime_launch.portable_root,
-            installation_epoch: &runtime_launch.installation_epoch,
-            generation: &runtime_launch.generation,
-            authority_generation: runtime_launch.authority_generation,
-            authority_state_fence: &runtime_launch.authority_state_fence,
-            authority_descriptor_path: &runtime_launch.authority_descriptor_path,
-            authority_descriptor_digest: &runtime_launch.authority_descriptor_digest,
-            runtime_state_roots: &runtime_launch.runtime_state_roots,
-            kernel_work_root: &runtime_launch.kernel_work_root,
-            kernel_artifact_digest: &runtime_launch.kernel_artifact_digest,
-            eliotd_executable_path: &runtime_launch.eliotd_executable_path,
-            eliotd_artifact_digest: &runtime_launch.eliotd_artifact_digest,
-            eliotd_config_path: &runtime_launch.eliotd_config_path,
-            eliotd_config_digest: &runtime_launch.eliotd_config_digest,
-            eliotd_descriptor_path: &runtime_launch.eliotd_descriptor_path,
-            eliotd_descriptor_digest: &runtime_launch.eliotd_descriptor_digest,
-            eliotd_launch_nonce: &runtime_launch.eliotd_launch_nonce,
-            store_config_path: &runtime_launch.store_config_path,
-            store_credential_target: &runtime_launch.store_credential_target,
-            store_bootstrap_descriptor_path: &runtime_launch.store_bootstrap_descriptor_path,
-            store_bootstrap_descriptor_digest: &runtime_launch.store_bootstrap_descriptor_digest,
-            canonical_store_executable_path: &runtime_launch.canonical_store_executable_path,
-            canonical_store_artifact_digest: &runtime_launch.canonical_store_artifact_digest,
-            kernel_arguments: &runtime_launch.kernel_arguments,
-            store_bridge_executable_path: &runtime_launch.store_bridge_executable_path,
-            store_bridge_artifact_digest: &runtime_launch.store_bridge_artifact_digest,
-            store_bridge_arguments: &runtime_launch.store_bridge_arguments,
-            canonical_store_arguments: &runtime_launch.canonical_store_arguments,
-            watchdog_executable_path: &runtime_launch.watchdog_executable_path,
-            watchdog_artifact_digest: &runtime_launch.watchdog_artifact_digest,
-        };
-        let bytes = serde_json::to_vec(&unsigned).unwrap_or_else(|_| unreachable!());
-        runtime_launch.descriptor_digest = handle(format!("{:x}", Sha256::digest(bytes)));
+        runtime_launch = runtime_launch
+            .with_computed_digest()
+            .unwrap_or_else(|error| panic!("runtime launch descriptor: {error}"));
         let manifest = CandidateManifest {
             generation,
             components: vec![handle("component:kernel"), handle("component:store")],
             kernel_artifact_digest: kernel_digest,
             store_bridge_artifact_digest: bridge_digest,
             canonical_store_artifact_digest: provider_digest,
+            host_artifact_digest: handle("e".repeat(64)),
             kernel_executable_path: path(&portable, "eliot-kernel.exe"),
             store_bridge_executable_path: bridge_path,
             canonical_store_executable_path: provider_path,
+            host_executable_path: host_path,
             config_path,
             dependency_closure_refs: vec![handle("evidence:dependency-closure")],
             license_refs: vec![handle("evidence:licenses")],
@@ -6280,6 +6272,39 @@ mod journal_tests {
             .validate()
             .unwrap_or_else(|error| panic!("liveness manifest: {error}"));
         (manifest, root)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn approved_host_artifact_path_and_digest_fail_closed() {
+        let (mut manifest, root) = liveness_manifest_with_distinct_store_digests();
+        let approved_path = PathBuf::from(manifest.host_executable_path.as_str());
+        let approved_bytes = b"approved-host-fixture";
+        std::fs::write(&approved_path, approved_bytes).expect("write approved Host fixture");
+        let approved_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(approved_bytes)))
+            .expect("approved Host digest");
+        manifest.host_artifact_digest = approved_digest.clone();
+        manifest.runtime_launch.host_artifact_digest = approved_digest;
+        manifest.runtime_launch.descriptor_digest = PlatformHandle::new(
+            manifest
+                .runtime_launch
+                .compute_digest()
+                .expect("runtime launch digest"),
+        )
+        .expect("runtime launch digest handle");
+        manifest.validate().expect("approved Host manifest");
+
+        verify_host_artifact_at(&manifest, &approved_path).expect("approved Host artifact");
+
+        let substituted_path = approved_path.with_file_name("substituted-host.exe");
+        std::fs::write(&substituted_path, approved_bytes).expect("write substituted Host fixture");
+        assert!(verify_host_artifact_at(&manifest, &substituted_path).is_err());
+
+        std::fs::write(&approved_path, b"tampered-host-fixture")
+            .expect("tamper approved Host fixture");
+        assert!(verify_host_artifact_at(&manifest, &approved_path).is_err());
+
+        std::fs::remove_dir_all(root).expect("remove Host artifact fixture");
     }
 
     #[cfg(windows)]
@@ -6973,6 +6998,8 @@ mod journal_tests {
             kernel_artifact_digest: manifest.kernel_artifact_digest.clone(),
             store_bridge_artifact_digest: manifest.store_bridge_artifact_digest.clone(),
             canonical_store_artifact_digest: manifest.canonical_store_artifact_digest.clone(),
+            host_executable_path: manifest.host_executable_path.clone(),
+            host_artifact_digest: manifest.host_artifact_digest.clone(),
             runtime_state_roots_digest: manifest.runtime_state_roots_digest.clone(),
             manifest_digest: PlatformHandle::new(sha256_json(&manifest).unwrap()).unwrap(),
             prior_active_generation: None,

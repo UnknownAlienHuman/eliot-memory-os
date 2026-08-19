@@ -155,7 +155,7 @@ fn run_installation_plan_fixture(name: &str, fixture: &str) -> std::process::Out
 }
 
 #[test]
-fn installation_plan_reports_missing_v6_discriminator_as_migration() {
+fn installation_plan_reports_missing_v7_discriminator_as_migration() {
     let result = run_installation_plan_fixture("missing-discriminator", "{}");
 
     assert!(!result.status.success());
@@ -165,7 +165,7 @@ fn installation_plan_reports_missing_v6_discriminator_as_migration() {
     assert!(
         output["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("required v6 discriminator"))
+            .is_some_and(|detail| detail.contains("required v7 discriminator"))
     );
 }
 
@@ -188,10 +188,10 @@ fn installation_plan_reports_v5_discriminator_as_migration() {
 }
 
 #[test]
-fn installation_plan_reports_malformed_v6_as_invalid() {
+fn installation_plan_reports_malformed_v7_as_invalid() {
     let result = run_installation_plan_fixture(
-        "malformed-v6",
-        r#"{"transaction_wire_version":{"major":6,"minor":0,"patch":0},"transaction_id":"malformed"}"#,
+        "malformed-v7",
+        r#"{"transaction_wire_version":{"major":7,"minor":0,"patch":0},"transaction_id":"malformed"}"#,
     );
 
     assert!(!result.status.success());

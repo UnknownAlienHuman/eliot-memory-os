@@ -59,13 +59,16 @@ pub use redb_state::RedbInstallationTransactionStore;
 /// Stable wire name for the installation contract.
 pub const CONTRACT_NAME: &str = "eliot.kernel.installation";
 /// Current installation contract revision.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
+///
+/// Version 3 makes the approved Host executable path and content digest
+/// required members of the CandidateManifest/RuntimeLaunchDescriptor wire.
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 /// Breaking wire revision for durable [`InstallationTransaction`] records.
 ///
 /// This discriminator is intentionally independent from [`CONTRACT_VERSION`]
-/// so the accepted runtime-launch, candidate-manifest and approved-registry
-/// v2 wires remain unchanged.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(6, 0, 0);
+/// so durable transaction records fail closed when their nested candidate
+/// manifest predates the required Host artifact binding.
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(7, 0, 0);
 
 /// Returns the stable contract identity for handshakes and provenance.
 pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
@@ -1513,12 +1516,16 @@ pub struct CandidateManifest {
     pub store_bridge_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved canonical Store engine image.
     pub canonical_store_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved Host image.
+    pub host_artifact_digest: PlatformHandle,
     /// Canonical installation-approved Kernel executable path.
     pub kernel_executable_path: PlatformHandle,
     /// Canonical installation-approved eliot-store-surreal bridge path.
     pub store_bridge_executable_path: PlatformHandle,
     /// Canonical installation-approved Surreal engine path.
     pub canonical_store_executable_path: PlatformHandle,
+    /// Canonical installation-approved Host executable path.
+    pub host_executable_path: PlatformHandle,
     /// Canonical installation-approved generation configuration path.
     pub config_path: PlatformHandle,
     /// Executable/dependency closure evidence.
@@ -1615,6 +1622,10 @@ pub struct RuntimeLaunchDescriptor {
     pub store_bridge_arguments: Vec<PlatformHandle>,
     /// Exact canonical Surreal provider arguments, excluding argv[0].
     pub canonical_store_arguments: Vec<PlatformHandle>,
+    /// Canonical SCM Host image and its approved digest.
+    pub host_executable_path: PlatformHandle,
+    /// SHA-256 digest of the Host image.
+    pub host_artifact_digest: PlatformHandle,
     /// Canonical SCM Watchdog image and its approved digest.
     pub watchdog_executable_path: PlatformHandle,
     /// SHA-256 digest of the Watchdog image.
@@ -1624,6 +1635,26 @@ pub struct RuntimeLaunchDescriptor {
 }
 
 impl RuntimeLaunchDescriptor {
+    /// Recomputes the descriptor digest after all immutable launch fields have
+    /// been materialized.
+    ///
+    /// The digest deliberately excludes itself, so producers can construct a
+    /// descriptor with a zero digest, bind every path and artifact digest, and
+    /// then seal the exact bytes consumed by Host and Watchdog. This is the
+    /// only public sealing operation; callers must not hand-roll the unsigned
+    /// projection.
+    pub fn with_computed_digest(mut self) -> Result<Self, InstallationError> {
+        self.descriptor_digest =
+            PlatformHandle::new(sha256_hex(&self.unsigned_bytes()?)).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "runtime_launch.descriptor_digest".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+        self.validate()?;
+        Ok(self)
+    }
+
     fn expected_store_bridge_arguments(&self, config_path: &PlatformHandle) -> Vec<String> {
         match self.profile {
             InstallationProfile::PortableDev => vec![
@@ -1756,6 +1787,17 @@ impl RuntimeLaunchDescriptor {
         Ok(())
     }
 
+    /// Returns the exact approved Host executable path and content digest.
+    ///
+    /// The descriptor self-digest and all path/digest invariants are checked
+    /// before a consumer receives the binding.
+    pub fn host_artifact_binding(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((&self.host_executable_path, &self.host_artifact_digest))
+    }
+
     fn unsigned_bytes(&self) -> Result<Vec<u8>, InstallationError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
@@ -1788,6 +1830,8 @@ impl RuntimeLaunchDescriptor {
             store_bridge_artifact_digest: &'a PlatformHandle,
             store_bridge_arguments: &'a [PlatformHandle],
             canonical_store_arguments: &'a [PlatformHandle],
+            host_executable_path: &'a PlatformHandle,
+            host_artifact_digest: &'a PlatformHandle,
             watchdog_executable_path: &'a PlatformHandle,
             watchdog_artifact_digest: &'a PlatformHandle,
         }
@@ -1821,6 +1865,8 @@ impl RuntimeLaunchDescriptor {
             store_bridge_artifact_digest: &self.store_bridge_artifact_digest,
             store_bridge_arguments: &self.store_bridge_arguments,
             canonical_store_arguments: &self.canonical_store_arguments,
+            host_executable_path: &self.host_executable_path,
+            host_artifact_digest: &self.host_artifact_digest,
             watchdog_executable_path: &self.watchdog_executable_path,
             watchdog_artifact_digest: &self.watchdog_artifact_digest,
         })
@@ -1966,6 +2012,19 @@ impl RuntimeLaunchDescriptor {
             "runtime_launch.canonical_store_artifact_digest",
         )?;
         approved_path(
+            &self.host_executable_path,
+            "runtime_launch.host_executable_path",
+        )?;
+        approved_filename(
+            &self.host_executable_path,
+            "eliot-host.exe",
+            "runtime_launch.host_executable_path",
+        )?;
+        sha256_handle(
+            &self.host_artifact_digest,
+            "runtime_launch.host_artifact_digest",
+        )?;
+        approved_path(
             &self.store_bridge_executable_path,
             "runtime_launch.store_bridge_executable_path",
         )?;
@@ -2028,6 +2087,10 @@ impl RuntimeLaunchDescriptor {
                 &self.watchdog_executable_path,
                 "runtime_launch.watchdog_executable_path",
             ),
+            (
+                &self.host_executable_path,
+                "runtime_launch.host_executable_path",
+            ),
             (&self.store_config_path, "runtime_launch.store_config_path"),
             (
                 &self.eliotd_config_path,
@@ -2089,6 +2152,10 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.eliotd_descriptor_path,
                 "runtime_launch.eliotd_descriptor_path",
+            ),
+            (
+                &self.host_executable_path,
+                "runtime_launch.host_executable_path",
             ),
         ] {
             self.runtime_state_roots
@@ -2154,6 +2221,7 @@ impl CandidateManifest {
             &self.canonical_store_artifact_digest,
             "manifest.canonical_store_artifact_digest",
         )?;
+        sha256_handle(&self.host_artifact_digest, "manifest.host_artifact_digest")?;
         approved_path(
             &self.kernel_executable_path,
             "manifest.kernel_executable_path",
@@ -2187,9 +2255,21 @@ impl CandidateManifest {
             "surreal.exe",
             "manifest.canonical_store_executable_path",
         )?;
+        approved_path(&self.host_executable_path, "manifest.host_executable_path")?;
+        approved_filename(
+            &self.host_executable_path,
+            "eliot-host.exe",
+            "manifest.host_executable_path",
+        )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(&self.host_executable_path, "manifest.host_executable_path")?;
         if self.kernel_executable_path == self.store_bridge_executable_path
             || self.kernel_executable_path == self.canonical_store_executable_path
+            || self.kernel_executable_path == self.host_executable_path
             || self.store_bridge_executable_path == self.canonical_store_executable_path
+            || self.store_bridge_executable_path == self.host_executable_path
+            || self.canonical_store_executable_path == self.host_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
@@ -2278,6 +2358,11 @@ impl CandidateManifest {
             &self.kernel_executable_path,
             "manifest.kernel_executable_path",
         )?;
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.host_executable_path,
+            "manifest.host_executable_path",
+        )?;
         if self.runtime_launch.canonical_store_executable_path
             != self.canonical_store_executable_path
         {
@@ -2291,6 +2376,8 @@ impl CandidateManifest {
             || self.runtime_launch.store_bridge_artifact_digest != self.store_bridge_artifact_digest
             || self.runtime_launch.canonical_store_artifact_digest
                 != self.canonical_store_artifact_digest
+            || self.runtime_launch.host_executable_path != self.host_executable_path
+            || self.runtime_launch.host_artifact_digest != self.host_artifact_digest
         {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.artifact_bindings".to_owned(),
@@ -2354,6 +2441,18 @@ impl CandidateManifest {
             &self.kernel_artifact_digest,
             &self.store_bridge_artifact_digest,
         ))
+    }
+
+    /// Returns the exact approved Host executable path and content digest.
+    ///
+    /// The complete manifest/descriptor chain is validated before any
+    /// borrowed binding is exposed, so consumers cannot receive a partial or
+    /// defaulted Host identity.
+    pub fn host_artifact_binding(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((&self.host_executable_path, &self.host_artifact_digest))
     }
 
     /// Returns the exact Kernel, Store bridge, and Store config paths consumed
@@ -2464,6 +2563,10 @@ pub struct PendingActivation {
     pub store_bridge_artifact_digest: PlatformHandle,
     /// Candidate canonical Store image digest repeated as an activation binding.
     pub canonical_store_artifact_digest: PlatformHandle,
+    /// Candidate Host executable path repeated as an activation binding.
+    pub host_executable_path: PlatformHandle,
+    /// Candidate Host image digest repeated as an activation binding.
+    pub host_artifact_digest: PlatformHandle,
     /// Candidate mutable-root topology digest repeated as an activation binding.
     pub runtime_state_roots_digest: PlatformHandle,
     /// Canonical digest of `manifest` bytes.
@@ -2736,6 +2839,102 @@ struct V1RuntimeLaunchDescriptorWire {
 
 #[allow(
     dead_code,
+    reason = "pre-Host-binding wire mirror is used for strict migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreHostArtifactBindingRegistryWire {
+    generations: Vec<PreHostArtifactBindingApprovedGenerationWire>,
+    active_generation: Option<PlatformHandle>,
+    last_known_good_generation: Option<PlatformHandle>,
+    #[serde(default)]
+    pending_activation: Option<serde_json::Value>,
+    #[serde(default)]
+    last_terminal_activation: Option<serde_json::Value>,
+}
+
+#[allow(
+    dead_code,
+    reason = "pre-Host-binding wire mirror is used for strict migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreHostArtifactBindingApprovedGenerationWire {
+    manifest: PreHostArtifactBindingCandidateManifestWire,
+    approval_ref: PlatformHandle,
+    active: bool,
+    last_known_good: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "pre-Host-binding wire mirror is used for strict migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreHostArtifactBindingCandidateManifestWire {
+    generation: PlatformHandle,
+    components: Vec<PlatformHandle>,
+    kernel_artifact_digest: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    kernel_executable_path: PlatformHandle,
+    store_bridge_executable_path: PlatformHandle,
+    canonical_store_executable_path: PlatformHandle,
+    config_path: PlatformHandle,
+    dependency_closure_refs: Vec<PlatformHandle>,
+    license_refs: Vec<PlatformHandle>,
+    config_digest: PlatformHandle,
+    store_credential_target: PlatformHandle,
+    supervision_key_fingerprint: PlatformHandle,
+    signature_ref: PlatformHandle,
+    runtime_state_roots_digest: PlatformHandle,
+    runtime_launch: PreHostArtifactBindingRuntimeLaunchDescriptorWire,
+}
+
+#[allow(
+    dead_code,
+    reason = "pre-Host-binding wire mirror is used for strict migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreHostArtifactBindingRuntimeLaunchDescriptorWire {
+    profile: InstallationProfile,
+    portable_root: Option<PlatformHandle>,
+    installation_epoch: InstallationEpoch,
+    generation: PlatformHandle,
+    authority_generation: ResourceGeneration,
+    authority_state_fence: StateFence,
+    authority_descriptor_path: PlatformHandle,
+    authority_descriptor_digest: PlatformHandle,
+    runtime_state_roots: RuntimeStateRoots,
+    kernel_work_root: PlatformHandle,
+    kernel_artifact_digest: PlatformHandle,
+    eliotd_executable_path: PlatformHandle,
+    eliotd_artifact_digest: PlatformHandle,
+    eliotd_config_path: PlatformHandle,
+    eliotd_config_digest: PlatformHandle,
+    eliotd_descriptor_path: PlatformHandle,
+    eliotd_descriptor_digest: PlatformHandle,
+    eliotd_launch_nonce: PlatformHandle,
+    store_config_path: PlatformHandle,
+    store_credential_target: PlatformHandle,
+    store_bridge_executable_path: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    store_bootstrap_descriptor_path: PlatformHandle,
+    store_bootstrap_descriptor_digest: PlatformHandle,
+    canonical_store_executable_path: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    kernel_arguments: Vec<PlatformHandle>,
+    store_bridge_arguments: Vec<PlatformHandle>,
+    canonical_store_arguments: Vec<PlatformHandle>,
+    watchdog_executable_path: PlatformHandle,
+    watchdog_artifact_digest: PlatformHandle,
+    descriptor_digest: PlatformHandle,
+}
+
+#[allow(
+    dead_code,
     reason = "pre-credential-binding wire mirror is used for strict migration discrimination"
 )]
 #[derive(Deserialize)]
@@ -2892,7 +3091,12 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             Ok(registry)
         }
         Err(_) => {
-            if is_pre_eliotd_config_registry(bytes) {
+            if serde_json::from_slice::<PreHostArtifactBindingRegistryWire>(bytes).is_ok() {
+                Err(InstallationError::MigrationRequired {
+                    reason: "approved-generation registry predates the approved Host executable artifact binding and requires explicit re-stage"
+                        .to_owned(),
+                })
+            } else if is_pre_eliotd_config_registry(bytes) {
                 Err(InstallationError::MigrationRequired {
                     reason: "approved-generation registry predates the separate eliotd Governor config binding and requires explicit re-stage"
                         .to_owned(),
@@ -3142,6 +3346,8 @@ impl ApprovedGenerationRegistry {
             kernel_artifact_digest: manifest.kernel_artifact_digest.clone(),
             store_bridge_artifact_digest: manifest.store_bridge_artifact_digest.clone(),
             canonical_store_artifact_digest: manifest.canonical_store_artifact_digest.clone(),
+            host_executable_path: manifest.host_executable_path.clone(),
+            host_artifact_digest: manifest.host_artifact_digest.clone(),
             runtime_state_roots_digest: manifest.runtime_state_roots_digest.clone(),
             manifest,
             manifest_digest,
@@ -3594,6 +3800,11 @@ impl PendingActivation {
                 &self.manifest.canonical_store_artifact_digest,
             ),
             (
+                &self.host_artifact_digest,
+                "host_artifact_digest",
+                &self.manifest.host_artifact_digest,
+            ),
+            (
                 &self.runtime_state_roots_digest,
                 "runtime_state_roots_digest",
                 &self.manifest.runtime_state_roots_digest,
@@ -3603,6 +3814,9 @@ impl PendingActivation {
             if value != expected {
                 return Err(InstallationError::IdentityConflict);
             }
+        }
+        if self.host_executable_path != self.manifest.host_executable_path {
+            return Err(InstallationError::IdentityConflict);
         }
         if let Some(prior) = &self.prior_active_generation {
             handle(prior, "pending_activation.prior_active_generation")?;
@@ -5068,7 +5282,7 @@ impl InstallationTransaction {
     }
 }
 
-/// Decodes the canonical transaction JSON and classifies pre-v6 records as an
+/// Decodes the canonical transaction JSON and classifies pre-v7 records as an
 /// explicit migration requirement rather than synthesizing missing progress.
 pub fn decode_installation_transaction_json(
     bytes: &[u8],
@@ -5079,7 +5293,7 @@ pub fn decode_installation_transaction_json(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v6 discriminator".to_owned(),
+            reason: "installation transaction predates the required v7 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -8982,9 +9196,11 @@ mod tests {
             kernel_artifact_digest: test_handle("0".repeat(64)),
             store_bridge_artifact_digest: test_handle("1".repeat(64)),
             canonical_store_artifact_digest: test_handle("5".repeat(64)),
+            host_artifact_digest: test_handle("8".repeat(64)),
             kernel_executable_path: test_path(&root, "eliot-kernel.exe"),
             store_bridge_executable_path: test_path(&root, "eliot-store-surreal.exe"),
             canonical_store_executable_path: test_path(&root, "surreal.exe"),
+            host_executable_path: test_path(&root, "eliot-host.exe"),
             config_path: test_path(&root, "generation.json"),
             dependency_closure_refs: vec![test_handle("evidence:dependency-closure")],
             license_refs: vec![test_handle("evidence:licenses")],
@@ -9074,6 +9290,8 @@ mod tests {
                                 .replace('\\', "/")
                         )),
                     ],
+                    host_executable_path: test_path(&root, "eliot-host.exe"),
+                    host_artifact_digest: test_handle("8".repeat(64)),
                     watchdog_executable_path: test_path(&root, "eliot-watchdog.exe"),
                     watchdog_artifact_digest: test_handle("4".repeat(64)),
                     descriptor_digest: test_handle("0".repeat(64)),
@@ -10258,7 +10476,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_v6_transaction_json_requires_explicit_migration() {
+    fn pre_v7_transaction_json_requires_explicit_migration() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.remove("transaction_wire_version");
@@ -10267,6 +10485,25 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn v6_transaction_json_requires_explicit_migration_to_v7() {
+        let mut legacy = must(serde_json::to_value(planned_transaction()));
+        let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
+        object.insert(
+            "transaction_wire_version".to_owned(),
+            must(serde_json::to_value(ContractVersion::new(6, 0, 0))),
+        );
+        let bytes = must(serde_json::to_vec(&legacy));
+        let Err(error) = decode_installation_transaction_json(&bytes) else {
+            panic!("v6 transaction must require migration");
+        };
+        assert!(matches!(
+            error,
+            InstallationError::MigrationRequired { reason }
+                if reason.contains("requires explicit migration to 7.0.0")
         ));
     }
 
@@ -10286,8 +10523,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_v6_transaction_json_is_corrupt_registry() {
-        let bytes = br#"{"transaction_wire_version":{"major":6,"minor":0,"patch":0},"transaction_id":"malformed"}"#;
+    fn malformed_v7_transaction_json_is_corrupt_registry() {
+        let bytes = br#"{"transaction_wire_version":{"major":7,"minor":0,"patch":0},"transaction_id":"malformed"}"#;
         assert!(matches!(
             decode_installation_transaction_json(bytes),
             Err(InstallationError::CorruptRegistry { .. })
@@ -11023,6 +11260,8 @@ mod tests {
         else {
             panic!("legacy fixture runtime launch");
         };
+        runtime.remove("host_executable_path");
+        runtime.remove("host_artifact_digest");
         runtime.remove("store_credential_target");
         runtime.remove("store_bridge_arguments");
         runtime.remove("runtime_state_roots");
@@ -11040,6 +11279,8 @@ mod tests {
         let Some(manifest) = legacy["generations"][0]["manifest"].as_object_mut() else {
             panic!("v1 fixture manifest");
         };
+        manifest.remove("host_executable_path");
+        manifest.remove("host_artifact_digest");
         manifest.remove("store_credential_target");
         manifest.remove("runtime_state_roots_digest");
         legacy
@@ -11068,11 +11309,15 @@ mod tests {
         let Some(manifest) = value["generations"][0]["manifest"].as_object_mut() else {
             panic!("pre-split fixture manifest");
         };
+        manifest.remove("host_executable_path");
+        manifest.remove("host_artifact_digest");
         manifest.remove("store_credential_target");
         let Some(runtime) = value["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
         else {
             panic!("pre-split fixture runtime launch");
         };
+        runtime.remove("host_executable_path");
+        runtime.remove("host_artifact_digest");
         runtime.remove("store_credential_target");
         for field in [
             "eliotd_executable_path",
@@ -11111,11 +11356,15 @@ mod tests {
         let Some(manifest) = value["generations"][0]["manifest"].as_object_mut() else {
             panic!("pre-credential-binding fixture manifest");
         };
+        manifest.remove("host_executable_path");
+        manifest.remove("host_artifact_digest");
         manifest.remove("store_credential_target");
         let Some(runtime) = value["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
         else {
             panic!("pre-credential-binding fixture runtime launch");
         };
+        runtime.remove("host_executable_path");
+        runtime.remove("host_artifact_digest");
         runtime.remove("store_credential_target");
         for field in [
             "eliotd_executable_path",
@@ -11156,6 +11405,36 @@ mod tests {
         value
     }
 
+    fn pre_host_artifact_binding_registry_value() -> serde_json::Value {
+        let transaction = registering_transaction();
+        let generation = transaction.candidate_manifest.generation.clone();
+        let registry = ApprovedGenerationRegistry {
+            generations: vec![ApprovedGeneration {
+                manifest: transaction.candidate_manifest,
+                approval_ref: test_handle("approval:pre-host-artifact-binding"),
+                active: true,
+                last_known_good: false,
+            }],
+            active_generation: Some(generation),
+            last_known_good_generation: None,
+            pending_activation: None,
+            last_terminal_activation: None,
+        };
+        let mut value = must(serde_json::to_value(registry));
+        let Some(manifest) = value["generations"][0]["manifest"].as_object_mut() else {
+            panic!("pre-host-artifact-binding fixture manifest");
+        };
+        manifest.remove("host_executable_path");
+        manifest.remove("host_artifact_digest");
+        let Some(runtime) = value["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
+        else {
+            panic!("pre-host-artifact-binding fixture runtime launch");
+        };
+        runtime.remove("host_executable_path");
+        runtime.remove("host_artifact_digest");
+        value
+    }
+
     #[test]
     fn pre_split_argv_registry_requires_explicit_restage() {
         let bytes = must(serde_json::to_vec(&pre_split_registry_value()));
@@ -11188,6 +11467,21 @@ mod tests {
             error,
             InstallationError::MigrationRequired { reason }
                 if reason.contains("separate eliotd Governor config")
+        ));
+    }
+
+    #[test]
+    fn pre_host_artifact_binding_registry_requires_explicit_restage() {
+        let bytes = must(serde_json::to_vec(
+            &pre_host_artifact_binding_registry_value(),
+        ));
+        let Err(error) = decode_registry_bytes(&bytes) else {
+            panic!("pre-Host-artifact-binding registry must require migration");
+        };
+        assert!(matches!(
+            error,
+            InstallationError::MigrationRequired { reason }
+                if reason.contains("approved Host executable artifact binding")
         ));
     }
 
@@ -11540,6 +11834,18 @@ mod tests {
             Err(InstallationError::InvalidField { field, .. })
                 if field == "manifest.runtime_launch.eliotd_config_path"
         ));
+    }
+
+    #[test]
+    fn host_artifact_binding_is_exact_and_self_digest_bound() {
+        let manifest = registering_transaction().candidate_manifest;
+        let (path, digest) = must(manifest.host_artifact_binding());
+        assert_eq!(path, &manifest.runtime_launch.host_executable_path);
+        assert_eq!(digest, &manifest.runtime_launch.host_artifact_digest);
+
+        let mut altered = manifest;
+        altered.runtime_launch.host_artifact_digest = test_handle("9".repeat(64));
+        assert!(altered.host_artifact_binding().is_err());
     }
 
     #[test]

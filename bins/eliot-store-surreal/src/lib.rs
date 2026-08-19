@@ -1057,79 +1057,10 @@ mod tests {
     }
 
     fn reseal_runtime_launch(descriptor: &mut RuntimeLaunchDescriptor) {
-        #[derive(Serialize)]
-        struct Unsigned<'a> {
-            profile: InstallationProfile,
-            portable_root: &'a Option<PlatformHandle>,
-            installation_epoch: &'a InstallationEpoch,
-            generation: &'a PlatformHandle,
-            authority_generation: ResourceGeneration,
-            authority_state_fence: &'a StateFence,
-            authority_descriptor_path: &'a PlatformHandle,
-            authority_descriptor_digest: &'a PlatformHandle,
-            runtime_state_roots: &'a RuntimeStateRoots,
-            kernel_work_root: &'a PlatformHandle,
-            kernel_artifact_digest: &'a PlatformHandle,
-            eliotd_executable_path: &'a PlatformHandle,
-            eliotd_artifact_digest: &'a PlatformHandle,
-            eliotd_config_path: &'a PlatformHandle,
-            eliotd_config_digest: &'a PlatformHandle,
-            eliotd_descriptor_path: &'a PlatformHandle,
-            eliotd_descriptor_digest: &'a PlatformHandle,
-            eliotd_launch_nonce: &'a PlatformHandle,
-            store_config_path: &'a PlatformHandle,
-            store_credential_target: &'a PlatformHandle,
-            store_bootstrap_descriptor_path: &'a PlatformHandle,
-            store_bootstrap_descriptor_digest: &'a PlatformHandle,
-            canonical_store_executable_path: &'a PlatformHandle,
-            canonical_store_artifact_digest: &'a PlatformHandle,
-            kernel_arguments: &'a [PlatformHandle],
-            store_bridge_executable_path: &'a PlatformHandle,
-            store_bridge_artifact_digest: &'a PlatformHandle,
-            store_bridge_arguments: &'a [PlatformHandle],
-            canonical_store_arguments: &'a [PlatformHandle],
-            watchdog_executable_path: &'a PlatformHandle,
-            watchdog_artifact_digest: &'a PlatformHandle,
-        }
-        let unsigned = Unsigned {
-            profile: descriptor.profile,
-            portable_root: &descriptor.portable_root,
-            installation_epoch: &descriptor.installation_epoch,
-            generation: &descriptor.generation,
-            authority_generation: descriptor.authority_generation,
-            authority_state_fence: &descriptor.authority_state_fence,
-            authority_descriptor_path: &descriptor.authority_descriptor_path,
-            authority_descriptor_digest: &descriptor.authority_descriptor_digest,
-            runtime_state_roots: &descriptor.runtime_state_roots,
-            kernel_work_root: &descriptor.kernel_work_root,
-            kernel_artifact_digest: &descriptor.kernel_artifact_digest,
-            eliotd_executable_path: &descriptor.eliotd_executable_path,
-            eliotd_artifact_digest: &descriptor.eliotd_artifact_digest,
-            eliotd_config_path: &descriptor.eliotd_config_path,
-            eliotd_config_digest: &descriptor.eliotd_config_digest,
-            eliotd_descriptor_path: &descriptor.eliotd_descriptor_path,
-            eliotd_descriptor_digest: &descriptor.eliotd_descriptor_digest,
-            eliotd_launch_nonce: &descriptor.eliotd_launch_nonce,
-            store_config_path: &descriptor.store_config_path,
-            store_credential_target: &descriptor.store_credential_target,
-            store_bootstrap_descriptor_path: &descriptor.store_bootstrap_descriptor_path,
-            store_bootstrap_descriptor_digest: &descriptor.store_bootstrap_descriptor_digest,
-            canonical_store_executable_path: &descriptor.canonical_store_executable_path,
-            canonical_store_artifact_digest: &descriptor.canonical_store_artifact_digest,
-            kernel_arguments: &descriptor.kernel_arguments,
-            store_bridge_executable_path: &descriptor.store_bridge_executable_path,
-            store_bridge_artifact_digest: &descriptor.store_bridge_artifact_digest,
-            store_bridge_arguments: &descriptor.store_bridge_arguments,
-            canonical_store_arguments: &descriptor.canonical_store_arguments,
-            watchdog_executable_path: &descriptor.watchdog_executable_path,
-            watchdog_artifact_digest: &descriptor.watchdog_artifact_digest,
-        };
-        descriptor.descriptor_digest = handle(format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&unsigned).expect("serialize unsigned runtime launch")
-            )
-        ));
+        *descriptor = descriptor
+            .clone()
+            .with_computed_digest()
+            .expect("serialize unsigned runtime launch");
     }
 
     fn runtime_launch() -> RuntimeLaunchDescriptor {
@@ -1207,6 +1138,8 @@ mod tests {
                     roots.store_data_root.as_str().replace('\\', "/")
                 )),
             ],
+            host_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-host.exe"),
+            host_artifact_digest: handle("c".repeat(64)),
             watchdog_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-watchdog.exe"),
             watchdog_artifact_digest: handle("4".repeat(64)),
             descriptor_digest: handle("0".repeat(64)),
@@ -1274,7 +1207,6 @@ mod tests {
 
         let mut profile_mismatch = config.clone();
         profile_mismatch.runtime_launch.profile = InstallationProfile::UserMode;
-        reseal_runtime_launch(&mut profile_mismatch.runtime_launch);
         profile_mismatch.approved_config_hash =
             launch_config_digest(&profile_mismatch).expect("mismatched config digest");
         assert!(profile_mismatch.validate().is_err());
@@ -1284,7 +1216,6 @@ mod tests {
             .runtime_launch
             .runtime_state_roots
             .roots_digest = handle("c".repeat(64));
-        reseal_runtime_launch(&mut digest_mismatch.runtime_launch);
         digest_mismatch.approved_config_hash =
             launch_config_digest(&digest_mismatch).expect("mismatched config digest");
         assert!(digest_mismatch.validate().is_err());
@@ -1294,7 +1225,6 @@ mod tests {
             .runtime_launch
             .installation_epoch
             .sequence = 0;
-        reseal_runtime_launch(&mut invalid_installation.runtime_launch);
         invalid_installation.approved_config_hash =
             launch_config_digest(&invalid_installation).expect("mismatched config digest");
         assert!(invalid_installation.validate().is_err());
