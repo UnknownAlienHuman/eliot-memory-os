@@ -3221,6 +3221,10 @@ pub enum ServiceStartMode {
     Disabled,
 }
 
+/// Canonical SCM names owned by the Runtime Live installer.
+pub const ELIOT_HOST_SERVICE_NAME: &str = "EliotHost";
+pub const ELIOT_WATCHDOG_SERVICE_NAME: &str = "EliotWatchdog";
+
 /// Validated, password-free request for registering one own-process service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceRegistrationRequest {
@@ -3250,6 +3254,10 @@ impl ServiceRegistrationRequest {
             || !valid_display_name(&display_name)
             || !binary_path.is_absolute()
             || !binary_path.is_file()
+            || !canonical_runtime_service_name(&service_name)
+            || start_mode != ServiceStartMode::Automatic
+            || account != ServiceAccount::LocalService
+            || binary_path.to_string_lossy().contains('"')
         {
             return Err(WindowsAdapterError::InvalidInput);
         }
@@ -7705,13 +7713,27 @@ fn register_service(
                 if code == ERROR_SERVICE_EXISTS.cast_signed()
                     || code == ERROR_SERVICE_MARKED_FOR_DELETE.cast_signed()
         ) {
-            return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
+            return match existing_service_matches(request) {
+                Ok(true) => match inspect_service(request.service_name()) {
+                    PortOutcome::Known(observation)
+                    | PortOutcome::Partial {
+                        value: observation, ..
+                    } => Ok(ServiceRegistrationOutcome::Registered { observation }),
+                    PortOutcome::Unknown(_) | PortOutcome::Error(_) => {
+                        Ok(ServiceRegistrationOutcome::EffectUnknown)
+                    }
+                },
+                Ok(false) | Err(()) => Ok(ServiceRegistrationOutcome::EffectUnknown),
+            };
         }
         return Err(windows_adapter_from_io(&error));
     }
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
+    }
+    if !service_readback_is_acceptable(existing_service_matches(request)) {
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
     Ok(match inspect_service(request.service_name()) {
         PortOutcome::Known(observation)
@@ -7722,6 +7744,106 @@ fn register_service(
             ServiceRegistrationOutcome::EffectUnknown
         }
     })
+}
+
+fn canonical_runtime_service_name(name: &str) -> bool {
+    matches!(name, ELIOT_HOST_SERVICE_NAME | ELIOT_WATCHDOG_SERVICE_NAME)
+}
+
+fn service_readback_is_acceptable(readback: Result<bool, ()>) -> bool {
+    matches!(readback, Ok(true))
+}
+
+fn exact_service_configuration_matches(
+    request: &ServiceRegistrationRequest,
+    binary: &str,
+    account: &str,
+    own_process: bool,
+    automatic_start: bool,
+) -> bool {
+    let expected_binary = format!("\"{}\"", request.binary_path().display());
+    own_process
+        && automatic_start
+        && binary == expected_binary
+        && account.eq_ignore_ascii_case("NT AUTHORITY\\LocalService")
+}
+
+#[cfg(windows)]
+fn existing_service_matches(request: &ServiceRegistrationRequest) -> Result<bool, ()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
+        QueryServiceConfigW, SC_MANAGER_CONNECT, SERVICE_AUTO_START, SERVICE_QUERY_CONFIG,
+        SERVICE_WIN32_OWN_PROCESS,
+    };
+
+    let name = OsStr::new(request.service_name())
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(());
+    }
+    let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_CONFIG) };
+    if service.is_null() {
+        unsafe { CloseServiceHandle(manager) };
+        return Err(());
+    }
+
+    let mut required = 0;
+    unsafe {
+        QueryServiceConfigW(service, std::ptr::null_mut(), 0, &raw mut required);
+    }
+    if required == 0 {
+        unsafe {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+        }
+        return Err(());
+    }
+    let config_size = std::mem::size_of::<QUERY_SERVICE_CONFIGW>();
+    let words = (required as usize).saturating_add(config_size - 1) / config_size;
+    let mut buffer = vec![QUERY_SERVICE_CONFIGW::default(); words];
+    let config =
+        unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr(), required, &raw mut required) };
+    if config == 0 {
+        unsafe {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+        }
+        return Err(());
+    }
+    let config = &buffer[0];
+    let binary = service_config_string(config.lpBinaryPathName);
+    let account = service_config_string(config.lpServiceStartName);
+    let matches = exact_service_configuration_matches(
+        request,
+        &binary,
+        &account,
+        config.dwServiceType == SERVICE_WIN32_OWN_PROCESS,
+        config.dwStartType == SERVICE_AUTO_START,
+    );
+    unsafe {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+    Ok(matches)
+}
+
+#[cfg(windows)]
+fn service_config_string(pointer: *const u16) -> String {
+    if pointer.is_null() {
+        return String::new();
+    }
+    let mut length = 0;
+    unsafe {
+        while *pointer.add(length) != 0 {
+            length += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(pointer, length))
+    }
 }
 
 #[cfg(not(windows))]
@@ -9048,14 +9170,90 @@ mod tests {
     fn service_registration_plan_accepts_local_service_account() {
         let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
         let request = ServiceRegistrationRequest::new(
-            "EliotHostCanary",
-            "ELIOT Host Canary",
+            ELIOT_HOST_SERVICE_NAME,
+            "Eliot Host",
             image,
             ServiceStartMode::Automatic,
             ServiceAccount::LocalService,
         )
         .unwrap_or_else(|error| panic!("LocalService plan failed: {error}"));
         assert_eq!(request.account(), ServiceAccount::LocalService);
+    }
+
+    #[test]
+    fn service_registration_plan_rejects_non_runtime_shape() {
+        let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+        for (name, start_mode, account) in [
+            (
+                "eliot-host",
+                ServiceStartMode::Automatic,
+                ServiceAccount::LocalService,
+            ),
+            (
+                ELIOT_HOST_SERVICE_NAME,
+                ServiceStartMode::Demand,
+                ServiceAccount::LocalService,
+            ),
+            (
+                ELIOT_HOST_SERVICE_NAME,
+                ServiceStartMode::Automatic,
+                ServiceAccount::LocalSystem,
+            ),
+        ] {
+            assert_eq!(
+                ServiceRegistrationRequest::new(name, "Eliot Host", &image, start_mode, account,),
+                Err(WindowsAdapterError::InvalidInput)
+            );
+        }
+    }
+
+    #[test]
+    fn service_configuration_mismatch_is_not_acceptable() {
+        let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+        let request = ServiceRegistrationRequest::new(
+            ELIOT_HOST_SERVICE_NAME,
+            "Eliot Host",
+            &image,
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+        )
+        .unwrap_or_else(|error| panic!("request failed: {error}"));
+        let binary = format!("\"{}\"", image.display());
+        assert!(exact_service_configuration_matches(
+            &request,
+            &binary,
+            "NT AUTHORITY\\LocalService",
+            true,
+            true,
+        ));
+        assert!(!exact_service_configuration_matches(
+            &request,
+            "\"C:\\wrong\\eliot-host.exe\"",
+            "NT AUTHORITY\\LocalService",
+            true,
+            true,
+        ));
+        assert!(!exact_service_configuration_matches(
+            &request,
+            &binary,
+            "LocalSystem",
+            true,
+            true,
+        ));
+        assert!(!exact_service_configuration_matches(
+            &request,
+            &binary,
+            "NT AUTHORITY\\LocalService",
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn post_create_readback_failure_cannot_report_success() {
+        assert!(!service_readback_is_acceptable(Ok(false)));
+        assert!(!service_readback_is_acceptable(Err(())));
+        assert!(service_readback_is_acceptable(Ok(true)));
     }
 
     #[test]
@@ -9530,46 +9728,6 @@ mod tests {
         assert_eq!(identity.process_id, child.id());
         drop(job);
         assert!(wait_for_child_exit(&mut child));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn real_scm_registration_or_typed_acl_denial_is_reconciled_and_cleaned() {
-        let root = std::env::temp_dir().join(format!("eliot-p02-scm-{}", unique_suffix()));
-        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
-        let adapter = WindowsPlatform::new(&root).unwrap_or_else(|_| unreachable!());
-        let name = format!("EliotP02Test{}", unique_suffix().replace('-', ""));
-        let request = ServiceRegistrationRequest::new(
-            &name,
-            "ELIOT P-02 registration test",
-            std::env::current_exe().unwrap_or_else(|_| unreachable!()),
-            ServiceStartMode::Demand,
-            ServiceAccount::LocalSystem,
-        )
-        .unwrap_or_else(|_| unreachable!());
-        let outcome = adapter.register_service(&request);
-        eprintln!("p02_scm_registration_outcome={outcome:?}");
-        match outcome {
-            Ok(ServiceRegistrationOutcome::Registered { observation }) => {
-                assert_eq!(observation.service.as_str(), name);
-                let cleanup = mutate_service(&name, ServiceOperation::Unregister);
-                assert!(matches!(
-                    cleanup,
-                    PortOutcome::Known(_)
-                        | PortOutcome::Partial { .. }
-                        | PortOutcome::Unknown(UnknownReason::Indeterminate)
-                ));
-            }
-            Ok(ServiceRegistrationOutcome::EffectUnknown) => {
-                let _ = mutate_service(&name, ServiceOperation::Unregister);
-            }
-            Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation) => {
-                panic!("unique service unexpectedly existed")
-            }
-            Err(WindowsAdapterError::PermissionDenied) => {}
-            Err(error) => panic!("unexpected registration error: {error}"),
-        }
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]
