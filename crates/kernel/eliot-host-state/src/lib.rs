@@ -6,12 +6,16 @@
 
 #![forbid(unsafe_code)]
 
+pub use eliot_platform::{HostProcessNonce, KernelActivationNonce};
+
 mod backend;
 mod error;
 mod journal;
+mod legacy;
 mod model;
 mod redb_journal;
 mod redb_store;
+mod service;
 
 pub use backend::{
     BackendReconcileState, CommittedAppend, DurableImage, FaultPoint, JournalBackend,
@@ -22,21 +26,23 @@ pub use journal::{
     AppendDisposition, AppendReceipt, HostStateJournal, JOURNAL_MAGIC, JOURNAL_VERSION,
     record_checksum,
 };
+pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
 pub use model::{
     ActivationState, AppliedOperation, CleanMarker, DependencyLifecycleBudget, DependencyRecord,
     DependencyResourceBudget, DependencyState, DrainCommitRecord, DrainRecord, DrainState,
     EliotActivationRecord, EpochEvidence, EpochIdentity, EpochRetirementRecord, EpochTransition,
     FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage, HostObservationRecord,
     HostState, HostStateRecord, IdempotencyIdentity, ImmutableProcessManifest, JournalManifest,
-    KernelJobBinding, KernelRecord, LifecycleTimestamps, NonceState, OneTimeNonceState,
-    PriorKernelDisposition, PriorKernelSource, ReadinessEvidence, RecordFence,
-    RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass, WakeDisposition,
-    WakeRecord,
+    KernelJobBinding, KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps,
+    NonceState, OneTimeNonceState, PriorKernelDisposition, PriorKernelSource,
+    ReadinessApprovedContour, ReadinessEvidence, RecordFence, RecoveryLineageEvidence,
+    RecoveryLineageReason, ServiceSafetyClass, WakeDisposition, WakeRecord,
 };
 pub use redb_journal::{RedbJournalBackend, RedbJournalInspection};
 pub use redb_store::{
     HostAdmissionState, HostRecoverySnapshot, RedbHostReleaseToken, RedbHostStateInspection,
     RedbHostStateStore,
 };
+pub use service::{HostStateJournalService, ProductionHostStateJournal};
 #[cfg(test)]
 mod tests;

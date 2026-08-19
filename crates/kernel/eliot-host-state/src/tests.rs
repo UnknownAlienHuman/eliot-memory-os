@@ -13,6 +13,10 @@ fn h(value: &str) -> PlatformHandle {
     PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
 }
 
+fn digest_handle(byte: char) -> PlatformHandle {
+    h(&byte.to_string().repeat(64))
+}
+
 fn raw_frame(sequence: u64, payload: &[u8]) -> Vec<u8> {
     let header = json!({
         "version": JOURNAL_VERSION,
@@ -134,6 +138,59 @@ fn stopped_kernel_process() -> ServiceProcessRecord {
     process
 }
 
+fn candidate_kernel_process() -> ServiceProcessRecord {
+    let mut process = ready_kernel_process();
+    process.state = eliot_runtime_contracts::ServiceProcessState::Starting;
+    process
+}
+
+fn rebind_candidate(
+    record: &mut KernelRecord,
+    job_name: &str,
+    pid: u32,
+    start_time_100ns: u64,
+    authority_epoch: u64,
+) {
+    record.candidate_job_binding = Some(KernelJobBinding {
+        job_name: h(job_name),
+        owner: h("Kernel"),
+        root_pid: pid,
+        root_start_time_100ns: start_time_100ns,
+        root_image_path: h("C:/eliot-kernel.exe"),
+        root_volume_serial_number: 1,
+        root_file_index: u64::from(pid),
+    });
+    record.process = Some(
+        serde_json::from_value(json!({
+            "process_id": format!("pid:{pid}:start:{start_time_100ns}"),
+            "owner": "Kernel",
+            "state": "STARTING",
+            "health": {
+                "liveness": "HEALTHY",
+                "readiness": "HEALTHY",
+                "freshness": "HEALTHY",
+                "compatibility": "HEALTHY",
+                "integrity": "HEALTHY",
+                "capacity": "HEALTHY"
+            },
+            "authority_epoch": authority_epoch
+        }))
+        .unwrap_or_else(|_| unreachable!()),
+    );
+}
+
+fn typed_nonce_state(state: NonceState, digest_byte: char) -> OneTimeNonceState {
+    let issued = OneTimeNonceState::issued(
+        KernelActivationNonce::new(digest_handle(digest_byte)).unwrap_or_else(|_| unreachable!()),
+    );
+    match state {
+        NonceState::Unissued => OneTimeNonceState::unissued(),
+        NonceState::Issued => issued,
+        NonceState::Consumed => issued.consume().unwrap_or_else(|_| unreachable!()),
+        NonceState::Revoked => issued.revoke().unwrap_or_else(|_| unreachable!()),
+    }
+}
+
 fn terminated_prior(history_complete: bool, members: &[PlatformHandle]) -> PriorKernelDisposition {
     PriorKernelDisposition::Terminated(PriorKernelSource {
         host: host(1),
@@ -187,24 +244,11 @@ fn kernel_record(
         active_pipe_identity: (state == KernelActivationState::Active)
             .then(|| h("kernel-candidate-pipe")),
         candidate_pipe_identity: handoff.then(|| h("kernel-candidate-pipe")),
-        candidate_job_binding: matches!(
-            state,
-            KernelActivationState::Activating | KernelActivationState::Active
-        )
-        .then_some(live_job),
+        candidate_job_binding: handoff.then_some(live_job),
         prior_kernel_disposition: PriorKernelDisposition::NoPriorKernel,
         kernel_generation: step("kernel-lineage", 1),
-        one_time_nonce: OneTimeNonceState {
-            nonce_ref: matches!(
-                state,
-                KernelActivationState::NonceIssued
-                    | KernelActivationState::Activating
-                    | KernelActivationState::Active
-                    | KernelActivationState::Failed
-                    | KernelActivationState::ManualRecovery
-            )
-            .then(|| h("kernel-nonce")),
-            state: match state {
+        one_time_nonce: typed_nonce_state(
+            match state {
                 KernelActivationState::NonceIssued | KernelActivationState::Activating => {
                     NonceState::Issued
                 }
@@ -214,9 +258,16 @@ fn kernel_record(
                 }
                 _ => NonceState::Unissued,
             },
-        },
+            'a',
+        ),
         state,
-        process: (state == KernelActivationState::Active).then(ready_kernel_process),
+        process: handoff.then(|| {
+            if state == KernelActivationState::Active {
+                ready_kernel_process()
+            } else {
+                candidate_kernel_process()
+            }
+        }),
         readiness_evidence: (state == KernelActivationState::Active)
             .then(|| h("kernel-ready"))
             .into_iter()
@@ -362,6 +413,48 @@ fn active_journal() -> (
         ActivationState::Active,
         "a-active",
     );
+    (journal, host, generation)
+}
+
+fn active_kernel_journal() -> (
+    HostStateJournal<MemoryBackend>,
+    HostInstallationEpoch,
+    EpochTransition,
+) {
+    let (journal, host, generation) = active_journal();
+    for (state, op) in [
+        (KernelActivationState::Idle, "kernel-active-idle"),
+        (
+            KernelActivationState::ShadowNoAuthority,
+            "kernel-active-shadow",
+        ),
+        (
+            KernelActivationState::HandoffPrepared,
+            "kernel-active-handoff",
+        ),
+        (
+            KernelActivationState::OldTerminated,
+            "kernel-active-old-terminated",
+        ),
+        (
+            KernelActivationState::NonceIssued,
+            "kernel-active-nonce-issued",
+        ),
+        (
+            KernelActivationState::Activating,
+            "kernel-active-activating",
+        ),
+        (KernelActivationState::Active, "kernel-active"),
+    ] {
+        journal
+            .append(HostStateRecord::Kernel(kernel_record(
+                &host,
+                &generation,
+                op,
+                state,
+            )))
+            .unwrap_or_else(|error| panic!("Kernel setup failed: {error}"));
+    }
     (journal, host, generation)
 }
 
@@ -1072,7 +1165,7 @@ fn distinct_root_lineage_requires_explicit_recovery_evidence() {
 }
 
 #[test]
-fn restore_and_break_glass_create_new_root_lineages_without_retiring_old_evidence() {
+fn restore_migration_and_break_glass_create_new_root_lineages_without_retiring_old_evidence() {
     let old_host = host(1);
     let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone()).unwrap();
     old.append(activation(
@@ -1086,6 +1179,7 @@ fn restore_and_break_glass_create_new_root_lineages_without_retiring_old_evidenc
 
     for (reason, lineage) in [
         (RecoveryLineageReason::Restore, "restored-host-lineage"),
+        (RecoveryLineageReason::Migration, "migrated-host-lineage"),
         (
             RecoveryLineageReason::BreakGlass,
             "break-glass-host-lineage",
@@ -1403,6 +1497,20 @@ fn legacy_kernel_frame_missing_new_fields_fails_same_host_replay() {
 }
 
 #[test]
+fn legacy_host_state_projection_defaults_kernel_history() {
+    let expected_host = host(1);
+    let mut value = serde_json::to_value(HostState::new(expected_host.clone(), Vec::new()))
+        .unwrap_or_else(|_| unreachable!());
+    value
+        .as_object_mut()
+        .unwrap_or_else(|| unreachable!())
+        .remove("kernel_history");
+    let replayed: HostState = serde_json::from_value(value).unwrap_or_else(|_| unreachable!());
+    assert_eq!(replayed.host, expected_host);
+    assert!(replayed.kernel_history.is_empty());
+}
+
+#[test]
 fn corruption_recovery_fences_kernel_without_exact_prior_source() {
     let old_host = host(1);
     let generation = step("activation-lineage", 1);
@@ -1563,14 +1671,14 @@ fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() {
         root_volume_serial_number: 1,
         root_file_index: 1,
     });
-    assert!(matches!(
+    assert_eq!(
         journal.append(HostStateRecord::Kernel(nonce_with_job)),
-        Err(JournalError::Invalid(_))
-    ));
+        Err(JournalError::StaleFence)
+    );
     let nonce = nonce_issued
         .one_time_nonce
-        .nonce_ref
-        .clone()
+        .nonce_ref()
+        .cloned()
         .unwrap_or_else(|| unreachable!());
     journal
         .append(HostStateRecord::Kernel(nonce_issued))
@@ -1581,7 +1689,7 @@ fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() {
         "nonce-activating",
         KernelActivationState::Activating,
     );
-    assert_eq!(activating.one_time_nonce.nonce_ref, Some(nonce.clone()));
+    assert_eq!(activating.one_time_nonce.nonce_ref(), Some(&nonce));
     journal
         .append(HostStateRecord::Kernel(activating))
         .unwrap_or_else(|error| panic!("activation failed: {error}"));
@@ -1591,7 +1699,7 @@ fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() {
         "nonce-active",
         KernelActivationState::Active,
     );
-    assert_eq!(active.one_time_nonce.nonce_ref, Some(nonce));
+    assert_eq!(active.one_time_nonce.nonce_ref(), Some(&nonce));
     journal
         .append(HostStateRecord::Kernel(active))
         .unwrap_or_else(|error| panic!("active transition failed: {error}"));
@@ -1602,7 +1710,7 @@ fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() {
             .kernel
             .unwrap()
             .one_time_nonce
-            .state,
+            .state(),
         NonceState::Consumed
     );
 }
@@ -1635,7 +1743,7 @@ fn kernel_active_transition_rejects_nonce_job_and_process_substitution() {
         "binding-wrong-nonce",
         KernelActivationState::Active,
     );
-    wrong_nonce.one_time_nonce.nonce_ref = Some(h("substituted-nonce"));
+    wrong_nonce.one_time_nonce = typed_nonce_state(NonceState::Consumed, 'b');
     assert!(matches!(
         journal.append(HostStateRecord::Kernel(wrong_nonce)),
         Err(JournalError::Invalid(_))
@@ -1868,23 +1976,31 @@ fn direct_child_reopen_requires_and_accepts_exact_prior_kernel_source() {
             ActivationState::Starting,
         ))
         .unwrap_or_else(|error| panic!("child activation failed: {error}"));
-    let mut child_idle = kernel_record(
+    let mut child_shadow = kernel_record(
         &child_host,
         &child_generation,
-        "child-kernel-idle",
-        KernelActivationState::Idle,
+        "child-kernel-shadow",
+        KernelActivationState::ShadowNoAuthority,
     );
-    child_idle.kernel_generation = step("kernel-lineage", 2);
-    child_idle.prior_kernel_disposition = disposition;
-    let mut wrong_generation = child_idle.clone();
+    child_shadow.kernel_generation = step("kernel-lineage", 2);
+    child_shadow.prior_kernel_disposition = disposition;
+    rebind_candidate(&mut child_shadow, "child-kernel-job", 2002, 20, 2);
+    let mut wrong_generation = child_shadow.clone();
     wrong_generation.operation = operation("child-kernel-wrong-generation");
     wrong_generation.kernel_generation = step("kernel-lineage", 3);
     assert_eq!(
         child.append(HostStateRecord::Kernel(wrong_generation)),
         Err(JournalError::StaleFence)
     );
+    let mut stale_authority = child_shadow.clone();
+    stale_authority.operation = operation("child-kernel-stale-authority");
+    rebind_candidate(&mut stale_authority, "child-kernel-job-stale", 2001, 19, 1);
+    assert_eq!(
+        child.append(HostStateRecord::Kernel(stale_authority)),
+        Err(JournalError::StaleFence)
+    );
     child
-        .append(HostStateRecord::Kernel(child_idle))
+        .append(HostStateRecord::Kernel(child_shadow))
         .unwrap_or_else(|error| panic!("exact prior source was rejected: {error}"));
 }
 
@@ -1926,10 +2042,7 @@ fn kernel_transition_matrix_rejects_activation_without_handoff() {
         }),
         prior_kernel_disposition: PriorKernelDisposition::NoPriorKernel,
         kernel_generation: step("kernel-lineage", 1),
-        one_time_nonce: OneTimeNonceState {
-            nonce_ref: Some(h("kernel-nonce")),
-            state: NonceState::Consumed,
-        },
+        one_time_nonce: typed_nonce_state(NonceState::Consumed, 'a'),
         state: KernelActivationState::Active,
         process: Some(ready_kernel_process()),
         readiness_evidence: vec![h("kernel-ready")],
@@ -1945,7 +2058,7 @@ fn kernel_transition_matrix_rejects_activation_without_handoff() {
 }
 
 #[test]
-fn kernel_failure_and_manual_recovery_require_no_active_pipe_identity() {
+fn preactivation_failure_and_manual_recovery_reject_active_pipe_identity() {
     let (journal, host, generation) = active_journal();
     journal
         .append(HostStateRecord::Kernel(kernel_record(
@@ -1964,62 +2077,40 @@ fn kernel_failure_and_manual_recovery_require_no_active_pipe_identity() {
         )))
         .unwrap_or_else(|_| unreachable!());
 
-    let mut failed_with_pipe = kernel_record(
-        &host,
-        &generation,
-        "failure-with-pipe",
-        KernelActivationState::Failed,
-    );
-    failed_with_pipe.one_time_nonce = OneTimeNonceState {
-        nonce_ref: None,
-        state: NonceState::Unissued,
-    };
+    let shadow = journal.snapshot().unwrap().kernel.unwrap();
+    let mut failed_with_pipe = shadow.clone();
+    failed_with_pipe.operation = operation("failure-with-pipe");
+    failed_with_pipe.state = KernelActivationState::Failed;
+    failed_with_pipe.one_time_nonce = OneTimeNonceState::unissued();
     failed_with_pipe.active_pipe_identity = Some(h("invalid-failed-pipe"));
     assert!(matches!(
         journal.append(HostStateRecord::Kernel(failed_with_pipe)),
         Err(JournalError::Invalid(_))
     ));
 
-    let mut failed = kernel_record(
-        &host,
-        &generation,
-        "failure-valid",
-        KernelActivationState::Failed,
-    );
-    failed.one_time_nonce = OneTimeNonceState {
-        nonce_ref: None,
-        state: NonceState::Unissued,
-    };
+    let mut failed = shadow;
+    failed.operation = operation("failure-valid");
+    failed.state = KernelActivationState::Failed;
+    failed.one_time_nonce = OneTimeNonceState::unissued();
     journal
         .append(HostStateRecord::Kernel(failed))
         .unwrap_or_else(|_| unreachable!());
 
-    let mut manual_with_pipe = kernel_record(
-        &host,
-        &generation,
-        "manual-with-pipe",
-        KernelActivationState::ManualRecovery,
-    );
-    manual_with_pipe.one_time_nonce = OneTimeNonceState {
-        nonce_ref: None,
-        state: NonceState::Unissued,
-    };
+    let failed = journal.snapshot().unwrap().kernel.unwrap();
+    let mut manual_with_pipe = failed.clone();
+    manual_with_pipe.operation = operation("manual-with-pipe");
+    manual_with_pipe.state = KernelActivationState::ManualRecovery;
+    manual_with_pipe.one_time_nonce = OneTimeNonceState::unissued();
     manual_with_pipe.active_pipe_identity = Some(h("invalid-manual-pipe"));
     assert!(matches!(
         journal.append(HostStateRecord::Kernel(manual_with_pipe)),
         Err(JournalError::Invalid(_))
     ));
 
-    let mut manual = kernel_record(
-        &host,
-        &generation,
-        "manual-valid",
-        KernelActivationState::ManualRecovery,
-    );
-    manual.one_time_nonce = OneTimeNonceState {
-        nonce_ref: None,
-        state: NonceState::Unissued,
-    };
+    let mut manual = failed;
+    manual.operation = operation("manual-valid");
+    manual.state = KernelActivationState::ManualRecovery;
+    manual.one_time_nonce = OneTimeNonceState::unissued();
     journal
         .append(HostStateRecord::Kernel(manual))
         .unwrap_or_else(|_| unreachable!());
@@ -2027,4 +2118,584 @@ fn kernel_failure_and_manual_recovery_require_no_active_pipe_identity() {
         journal.snapshot().unwrap().kernel.unwrap().state,
         KernelActivationState::ManualRecovery
     );
+}
+
+#[test]
+fn typed_nonce_lifecycle_keeps_host_and_kernel_credentials_separate() {
+    let host_epoch = host(1);
+    assert_eq!(
+        host_epoch.host_process_nonce().as_handle(),
+        &host_epoch.nonce
+    );
+    assert!(!format!("{host_epoch:?}").contains(host_epoch.nonce.as_str()));
+
+    let activation_nonce =
+        KernelActivationNonce::new(digest_handle('a')).unwrap_or_else(|_| unreachable!());
+    let issued = OneTimeNonceState::issued(activation_nonce);
+    assert!(!format!("{issued:?}").contains(&"a".repeat(64)));
+    assert_eq!(issued.state(), NonceState::Issued);
+    assert_eq!(issued.consume().unwrap().state(), NonceState::Consumed);
+    assert_eq!(issued.revoke().unwrap().state(), NonceState::Revoked);
+    assert!(OneTimeNonceState::unissued().consume().is_err());
+    assert!(issued.consume().unwrap().revoke().is_err());
+
+    // Public decoding cannot create an opaque activation permit. Compatibility
+    // is owned only by the journal replay boundary exercised below.
+    assert!(
+        serde_json::from_value::<OneTimeNonceState>(json!({
+            "nonce_ref": "legacy-opaque-nonce",
+            "state": "ISSUED"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn opaque_legacy_nonce_is_rejected_by_live_append_but_accepted_during_replay() {
+    let (journal, live_host, generation) = active_journal();
+    for (state, op) in [
+        (KernelActivationState::Idle, "legacy-live-idle"),
+        (
+            KernelActivationState::ShadowNoAuthority,
+            "legacy-live-shadow",
+        ),
+        (
+            KernelActivationState::HandoffPrepared,
+            "legacy-live-handoff",
+        ),
+        (
+            KernelActivationState::OldTerminated,
+            "legacy-live-old-terminated",
+        ),
+    ] {
+        journal
+            .append(HostStateRecord::Kernel(kernel_record(
+                &live_host,
+                &generation,
+                op,
+                state,
+            )))
+            .unwrap_or_else(|error| panic!("legacy live setup failed: {error}"));
+    }
+    let mut opaque_live = kernel_record(
+        &live_host,
+        &generation,
+        "legacy-live-nonce",
+        KernelActivationState::NonceIssued,
+    );
+    opaque_live
+        .restore_legacy_nonce_for_replay(h("legacy-opaque-nonce"))
+        .unwrap_or_else(|_| unreachable!());
+    let opaque_wire = serde_json::to_value(HostStateRecord::Kernel(opaque_live.clone()))
+        .unwrap_or_else(|_| unreachable!());
+    assert!(serde_json::from_value::<HostStateRecord>(opaque_wire).is_err());
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(opaque_live)),
+        Err(JournalError::Invalid(_))
+    ));
+
+    let replay_host = host(1);
+    let replay_generation = step("activation-lineage", 1);
+    let mut records = vec![
+        activation(
+            &replay_host,
+            &replay_generation,
+            "legacy-replay-start",
+            ActivationState::Starting,
+        ),
+        activation(
+            &replay_host,
+            &replay_generation,
+            "legacy-replay-control",
+            ActivationState::ControlReady,
+        ),
+        activation(
+            &replay_host,
+            &replay_generation,
+            "legacy-replay-active-host",
+            ActivationState::Active,
+        ),
+    ];
+    records.extend([
+        HostStateRecord::Kernel(kernel_record(
+            &replay_host,
+            &replay_generation,
+            "legacy-replay-idle",
+            KernelActivationState::Idle,
+        )),
+        HostStateRecord::Kernel(kernel_record(
+            &replay_host,
+            &replay_generation,
+            "legacy-replay-shadow",
+            KernelActivationState::ShadowNoAuthority,
+        )),
+        HostStateRecord::Kernel(kernel_record(
+            &replay_host,
+            &replay_generation,
+            "legacy-replay-handoff",
+            KernelActivationState::HandoffPrepared,
+        )),
+        HostStateRecord::Kernel(kernel_record(
+            &replay_host,
+            &replay_generation,
+            "legacy-replay-old-terminated",
+            KernelActivationState::OldTerminated,
+        )),
+        HostStateRecord::Kernel(kernel_record(
+            &replay_host,
+            &replay_generation,
+            "legacy-replay-nonce",
+            KernelActivationState::NonceIssued,
+        )),
+        HostStateRecord::Kernel(kernel_record(
+            &replay_host,
+            &replay_generation,
+            "legacy-replay-activating",
+            KernelActivationState::Activating,
+        )),
+        HostStateRecord::Kernel(kernel_record(
+            &replay_host,
+            &replay_generation,
+            "legacy-replay-active-kernel",
+            KernelActivationState::Active,
+        )),
+    ]);
+    let mut bytes = Vec::new();
+    for (index, record) in records.into_iter().enumerate() {
+        let mut value = serde_json::to_value(record).unwrap_or_else(|_| unreachable!());
+        if let Some(nonce_ref) = value.pointer_mut("/kernel/one_time_nonce/nonce_ref")
+            && !nonce_ref.is_null()
+        {
+            *nonce_ref = json!("legacy-opaque-nonce");
+        }
+        let payload = serde_json::to_vec(&value).unwrap_or_else(|_| unreachable!());
+        bytes.extend(raw_frame(
+            u64::try_from(index + 1).unwrap_or_else(|_| unreachable!()),
+            &payload,
+        ));
+    }
+    let replayed = HostStateJournal::<MemoryBackend>::replay_bytes(&bytes, replay_host)
+        .unwrap_or_else(|error| panic!("legacy opaque nonce replay failed: {error}"));
+    let replayed_kernel = replayed.kernel.unwrap_or_else(|| unreachable!());
+    assert_eq!(replayed_kernel.state, KernelActivationState::Active);
+    let expected_legacy_nonce = h("legacy-opaque-nonce");
+    assert_eq!(
+        replayed_kernel.one_time_nonce.nonce_ref(),
+        Some(&expected_legacy_nonce)
+    );
+}
+
+#[test]
+fn direct_child_generation_is_exact_and_overflow_safe() {
+    let parent = step("kernel-direct-child", 9);
+    let child = parent.direct_child().unwrap();
+    assert_eq!(child.current.sequence, 10);
+    assert_eq!(child.current.lineage, parent.current.lineage);
+    assert_eq!(child.parent.as_ref(), Some(&parent.current));
+
+    let overflow = EpochTransition {
+        current: EpochIdentity {
+            lineage: h("kernel-direct-child"),
+            sequence: u64::MAX,
+        },
+        parent: Some(EpochIdentity {
+            lineage: h("kernel-direct-child"),
+            sequence: u64::MAX - 1,
+        }),
+    };
+    assert_eq!(overflow.direct_child(), Err(JournalError::Sequence));
+}
+
+#[test]
+fn active_failure_retains_consumed_nonce_and_exact_process_job_binding() {
+    let (journal, _, _) = active_kernel_journal();
+    let active = journal.snapshot().unwrap().kernel.unwrap();
+
+    let mut revoked = active.clone();
+    revoked.operation = operation("active-failed-revoked");
+    revoked.state = KernelActivationState::Failed;
+    revoked.one_time_nonce = typed_nonce_state(NonceState::Revoked, 'a');
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(revoked)),
+        Err(JournalError::Invalid(_))
+    ));
+
+    let mut substituted_job = active.clone();
+    substituted_job.operation = operation("active-failed-substituted-job");
+    substituted_job.state = KernelActivationState::Failed;
+    substituted_job
+        .candidate_job_binding
+        .as_mut()
+        .unwrap_or_else(|| unreachable!())
+        .root_file_index = 2;
+    assert_eq!(
+        journal.append(HostStateRecord::Kernel(substituted_job)),
+        Err(JournalError::StaleFence)
+    );
+
+    let mut failed = active;
+    failed.operation = operation("active-failed-consumed");
+    failed.state = KernelActivationState::Failed;
+    failed.process = Some(stopped_kernel_process());
+    journal
+        .append(HostStateRecord::Kernel(failed))
+        .unwrap_or_else(|error| panic!("Active to Failed was rejected: {error}"));
+
+    let failed = journal.snapshot().unwrap().kernel.unwrap();
+    assert_eq!(failed.state, KernelActivationState::Failed);
+    assert_eq!(failed.one_time_nonce.state(), NonceState::Consumed);
+    assert!(failed.active_pipe_identity.is_some());
+    assert!(failed.candidate_job_binding.is_some());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn failed_kernel_restart_requires_exact_direct_child_and_terminated_prior() {
+    let (journal, host, activation_generation) = active_kernel_journal();
+    let active = journal.snapshot().unwrap().kernel.unwrap();
+    let mut failed = active;
+    failed.operation = operation("restart-failed");
+    failed.state = KernelActivationState::Failed;
+    failed.process = Some(stopped_kernel_process());
+    journal
+        .append(HostStateRecord::Kernel(failed))
+        .unwrap_or_else(|error| panic!("failed state was rejected: {error}"));
+    let failed = journal.snapshot().unwrap().kernel.unwrap();
+    let direct_child = failed.direct_child_generation().unwrap();
+    let prior = PriorKernelDisposition::Terminated(PriorKernelSource {
+        host: failed.fence.host.clone(),
+        activation_identity: failed.activation_identity.clone(),
+        generation: failed.kernel_generation.clone(),
+        job: failed
+            .candidate_job_binding
+            .clone()
+            .unwrap_or_else(|| unreachable!()),
+        process: failed.process.clone().unwrap_or_else(|| unreachable!()),
+        history_complete: true,
+        job_empty: true,
+        root_reaped: true,
+    });
+
+    let mut skipped = kernel_record(
+        &host,
+        &activation_generation,
+        "restart-skipped-generation",
+        KernelActivationState::ShadowNoAuthority,
+    );
+    skipped.kernel_generation = direct_child.direct_child().unwrap();
+    skipped.prior_kernel_disposition = prior.clone();
+    rebind_candidate(&mut skipped, "kernel-job-skipped", 3003, 30, 2);
+    assert_eq!(
+        journal.append(HostStateRecord::Kernel(skipped)),
+        Err(JournalError::StaleFence)
+    );
+
+    let mut next = kernel_record(
+        &host,
+        &activation_generation,
+        "restart-direct-child",
+        KernelActivationState::ShadowNoAuthority,
+    );
+    next.kernel_generation = direct_child.clone();
+    next.prior_kernel_disposition = prior.clone();
+    rebind_candidate(&mut next, "kernel-job-next", 2002, 20, 2);
+    let mut stale_authority = next.clone();
+    stale_authority.operation = operation("restart-stale-authority");
+    rebind_candidate(&mut stale_authority, "kernel-job-stale", 2001, 19, 1);
+    assert_eq!(
+        journal.append(HostStateRecord::Kernel(stale_authority)),
+        Err(JournalError::StaleFence)
+    );
+    journal
+        .append(HostStateRecord::Kernel(next))
+        .unwrap_or_else(|error| panic!("direct-child restart was rejected: {error}"));
+    let snapshot = journal.snapshot().unwrap();
+    assert_eq!(snapshot.kernel.unwrap().kernel_generation, direct_child);
+    assert_eq!(snapshot.prior_kernel, Some(failed));
+
+    for (state, op) in [
+        (KernelActivationState::HandoffPrepared, "restart-handoff"),
+        (
+            KernelActivationState::OldTerminated,
+            "restart-old-terminated",
+        ),
+    ] {
+        let mut record = kernel_record(&host, &activation_generation, op, state);
+        record.kernel_generation = direct_child.clone();
+        record.prior_kernel_disposition = prior.clone();
+        rebind_candidate(&mut record, "kernel-job-next", 2002, 20, 2);
+        journal
+            .append(HostStateRecord::Kernel(record))
+            .unwrap_or_else(|error| panic!("restart handoff failed: {error}"));
+    }
+    let mut reused_nonce = kernel_record(
+        &host,
+        &activation_generation,
+        "restart-reused-nonce",
+        KernelActivationState::NonceIssued,
+    );
+    reused_nonce.kernel_generation = direct_child.clone();
+    reused_nonce.prior_kernel_disposition = prior.clone();
+    rebind_candidate(&mut reused_nonce, "kernel-job-next", 2002, 20, 2);
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(reused_nonce.clone())),
+        Err(JournalError::Invalid(_))
+    ));
+    reused_nonce.operation = operation("restart-fresh-nonce");
+    reused_nonce.one_time_nonce = OneTimeNonceState::issued(
+        KernelActivationNonce::new(digest_handle('b')).unwrap_or_else(|_| unreachable!()),
+    );
+    journal
+        .append(HostStateRecord::Kernel(reused_nonce.clone()))
+        .unwrap_or_else(|error| panic!("fresh restart nonce was rejected: {error}"));
+
+    let mut activating = reused_nonce;
+    activating.operation = operation("restart-activating");
+    activating.state = KernelActivationState::Activating;
+    journal
+        .append(HostStateRecord::Kernel(activating.clone()))
+        .unwrap_or_else(|error| panic!("fresh restart activation was rejected: {error}"));
+
+    let mut active_next = activating;
+    active_next.operation = operation("restart-active");
+    active_next.state = KernelActivationState::Active;
+    active_next.one_time_nonce = active_next
+        .one_time_nonce
+        .consume()
+        .unwrap_or_else(|_| unreachable!());
+    active_next.active_pipe_identity = active_next.candidate_pipe_identity.clone();
+    let active_process = active_next
+        .process
+        .as_mut()
+        .unwrap_or_else(|| unreachable!());
+    active_process.state = eliot_runtime_contracts::ServiceProcessState::Ready;
+    active_next.readiness_evidence = vec![h("restart-ready")];
+    journal
+        .append(HostStateRecord::Kernel(active_next.clone()))
+        .unwrap_or_else(|error| panic!("fresh restart Active was rejected: {error}"));
+
+    let mut failed_next = active_next;
+    failed_next.operation = operation("restart-active-failed");
+    failed_next.state = KernelActivationState::Failed;
+    let failed_process = failed_next
+        .process
+        .as_mut()
+        .unwrap_or_else(|| unreachable!());
+    failed_process.state = eliot_runtime_contracts::ServiceProcessState::Stopped;
+    failed_process.health.liveness = HealthDimension::Unknown;
+    journal
+        .append(HostStateRecord::Kernel(failed_next))
+        .unwrap_or_else(|error| panic!("second failed generation was rejected: {error}"));
+
+    let failed_next = journal.snapshot().unwrap().kernel.unwrap();
+    let grandchild = failed_next.direct_child_generation().unwrap();
+    let prior_next = PriorKernelDisposition::Terminated(PriorKernelSource {
+        host: failed_next.fence.host.clone(),
+        activation_identity: failed_next.activation_identity.clone(),
+        generation: failed_next.kernel_generation.clone(),
+        job: failed_next
+            .candidate_job_binding
+            .clone()
+            .unwrap_or_else(|| unreachable!()),
+        process: failed_next
+            .process
+            .clone()
+            .unwrap_or_else(|| unreachable!()),
+        history_complete: true,
+        job_empty: true,
+        root_reaped: true,
+    });
+    for (state, op) in [
+        (
+            KernelActivationState::ShadowNoAuthority,
+            "grandchild-shadow",
+        ),
+        (KernelActivationState::HandoffPrepared, "grandchild-handoff"),
+        (
+            KernelActivationState::OldTerminated,
+            "grandchild-old-terminated",
+        ),
+    ] {
+        let mut record = kernel_record(&host, &activation_generation, op, state);
+        record.kernel_generation = grandchild.clone();
+        record.prior_kernel_disposition = prior_next.clone();
+        rebind_candidate(&mut record, "kernel-job-grandchild", 3003, 30, 3);
+        journal
+            .append(HostStateRecord::Kernel(record))
+            .unwrap_or_else(|error| panic!("grandchild setup failed: {error}"));
+    }
+    let mut reused_ancestor_nonce = kernel_record(
+        &host,
+        &activation_generation,
+        "grandchild-reused-ancestor-nonce",
+        KernelActivationState::NonceIssued,
+    );
+    reused_ancestor_nonce.kernel_generation = grandchild;
+    reused_ancestor_nonce.prior_kernel_disposition = prior_next;
+    rebind_candidate(
+        &mut reused_ancestor_nonce,
+        "kernel-job-grandchild",
+        3003,
+        30,
+        3,
+    );
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(reused_ancestor_nonce)),
+        Err(JournalError::Invalid(_))
+    ));
+}
+
+#[test]
+fn failure_after_issuance_revokes_exact_nonce() {
+    let (journal, host, generation) = active_journal();
+    for (state, op) in [
+        (KernelActivationState::Idle, "issued-failure-idle"),
+        (
+            KernelActivationState::ShadowNoAuthority,
+            "issued-failure-shadow",
+        ),
+        (
+            KernelActivationState::HandoffPrepared,
+            "issued-failure-handoff",
+        ),
+        (
+            KernelActivationState::OldTerminated,
+            "issued-failure-old-terminated",
+        ),
+        (KernelActivationState::NonceIssued, "issued-failure-nonce"),
+    ] {
+        journal
+            .append(HostStateRecord::Kernel(kernel_record(
+                &host,
+                &generation,
+                op,
+                state,
+            )))
+            .unwrap_or_else(|error| panic!("Kernel setup failed: {error}"));
+    }
+    let issued = journal.snapshot().unwrap().kernel.unwrap();
+
+    let mut consumed = issued.clone();
+    consumed.operation = operation("issued-failure-consumed");
+    consumed.state = KernelActivationState::Failed;
+    consumed.one_time_nonce = typed_nonce_state(NonceState::Consumed, 'a');
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(consumed)),
+        Err(JournalError::Invalid(_))
+    ));
+
+    let mut failed = issued;
+    failed.operation = operation("issued-failure-revoked");
+    failed.state = KernelActivationState::Failed;
+    failed.one_time_nonce = typed_nonce_state(NonceState::Revoked, 'a');
+    journal
+        .append(HostStateRecord::Kernel(failed))
+        .unwrap_or_else(|error| panic!("issued nonce was not revocable: {error}"));
+    assert_eq!(
+        journal
+            .snapshot()
+            .unwrap()
+            .kernel
+            .unwrap()
+            .one_time_nonce
+            .state(),
+        NonceState::Revoked
+    );
+}
+
+fn readiness_observation(
+    active: &KernelRecord,
+    operation_id: &str,
+    request_digest: char,
+    receipt_digest: char,
+) -> KernelReadinessObservationRecord {
+    let checksum = record_checksum(&HostStateRecord::Kernel(active.clone()))
+        .unwrap_or_else(|_| unreachable!());
+    let kernel_process = active.process.clone().unwrap_or_else(|| unreachable!());
+    KernelReadinessObservationRecord {
+        fence: active.fence.clone(),
+        operation: operation(operation_id),
+        active_kernel_record_checksum: h(&checksum),
+        probe_request_digest: digest_handle(request_digest),
+        ready_receipt_digest: digest_handle(receipt_digest),
+        kernel_job: active
+            .candidate_job_binding
+            .clone()
+            .unwrap_or_else(|| unreachable!()),
+        authority_epoch: kernel_process.authority_epoch.value(),
+        kernel_process,
+        config_digest: digest_handle('d'),
+        store_fence: h("store-fence-generation-1"),
+        observed_at: h("2026-08-19T00:00:00Z"),
+        evidence_refs: vec![h("kernel-authored-probe-ready")],
+    }
+}
+
+#[test]
+fn repeat_readiness_is_a_fresh_host_observation_bound_to_active_kernel() {
+    let (journal, _, _) = active_kernel_journal();
+    let active = journal.snapshot().unwrap().kernel.unwrap();
+    let approved = ReadinessApprovedContour {
+        config_digest: digest_handle('d'),
+        store_fence: h("store-fence-generation-1"),
+    };
+    let first = readiness_observation(&active, "readiness-first", '1', '2');
+    assert!(matches!(
+        journal.append(HostStateRecord::ReadinessObservation(first.clone())),
+        Err(JournalError::Invalid(_))
+    ));
+    journal
+        .append_readiness_observation(first, &approved)
+        .unwrap_or_else(|error| panic!("readiness observation was rejected: {error}"));
+
+    let mut stale_kernel = readiness_observation(&active, "readiness-stale", '3', '4');
+    stale_kernel.active_kernel_record_checksum = digest_handle('f');
+    assert_eq!(
+        journal.append_readiness_observation(stale_kernel, &approved),
+        Err(JournalError::StaleFence)
+    );
+
+    let mut wrong_config = readiness_observation(&active, "readiness-wrong-config", '3', '4');
+    wrong_config.config_digest = digest_handle('e');
+    assert_eq!(
+        journal.append_readiness_observation(wrong_config, &approved),
+        Err(JournalError::StaleFence)
+    );
+
+    let mut wrong_store = readiness_observation(&active, "readiness-wrong-store", '3', '4');
+    wrong_store.store_fence = h("store-fence-generation-2");
+    assert_eq!(
+        journal.append_readiness_observation(wrong_store, &approved),
+        Err(JournalError::StaleFence)
+    );
+
+    let duplicate_request = readiness_observation(&active, "readiness-duplicate", '1', '5');
+    assert!(matches!(
+        journal.append_readiness_observation(duplicate_request, &approved),
+        Err(JournalError::Invalid(_))
+    ));
+
+    let second = readiness_observation(&active, "readiness-second", '6', '7');
+    journal
+        .append_readiness_observation(second, &approved)
+        .unwrap_or_else(|error| panic!("fresh repeat readiness was rejected: {error}"));
+    assert_eq!(journal.snapshot().unwrap().readiness_observations.len(), 2);
+}
+
+#[test]
+fn journal_service_facade_delegates_to_the_single_journal_owner() {
+    let host = host(1);
+    let generation = step("service-facade-activation", 1);
+    let service = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())
+        .unwrap_or_else(|_| unreachable!());
+    service
+        .append(activation(
+            &host,
+            &generation,
+            "service-facade-start",
+            ActivationState::Starting,
+        ))
+        .unwrap_or_else(|error| panic!("service append failed: {error}"));
+    assert_eq!(service.snapshot().unwrap().sequence, 1);
 }

@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use eliot_platform::PlatformHandle;
+use eliot_platform::{KernelActivationNonce, PlatformHandle};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
@@ -66,6 +66,35 @@ fn json<T: Serialize>(value: &T) -> Result<Vec<u8>, JournalError> {
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, JournalError> {
     serde_json::from_slice(bytes).map_err(|error| JournalError::Invalid(error.to_string()))
+}
+
+fn decode_record_for_replay(bytes: &[u8]) -> Result<HostStateRecord, JournalError> {
+    let mut wire: serde_json::Value = decode(bytes)?;
+    match serde_json::from_value(wire.clone()) {
+        Ok(record) => Ok(record),
+        Err(strict_error) => {
+            let nonce_slot = wire
+                .pointer_mut("/kernel/one_time_nonce/nonce_ref")
+                .ok_or_else(|| JournalError::Invalid(strict_error.to_string()))?;
+            let nonce_text = nonce_slot
+                .as_str()
+                .ok_or_else(|| JournalError::Invalid(strict_error.to_string()))?
+                .to_owned();
+            let legacy_nonce = PlatformHandle::new(nonce_text)
+                .map_err(|_| JournalError::Invalid(strict_error.to_string()))?;
+            if KernelActivationNonce::new(legacy_nonce.clone()).is_ok() {
+                return Err(JournalError::Invalid(strict_error.to_string()));
+            }
+            *nonce_slot = serde_json::Value::String("0".repeat(64));
+            let mut record: HostStateRecord = serde_json::from_value(wire)
+                .map_err(|error| JournalError::Invalid(error.to_string()))?;
+            let HostStateRecord::Kernel(kernel) = &mut record else {
+                return Err(JournalError::Invalid(strict_error.to_string()));
+            };
+            kernel.restore_legacy_nonce_for_replay(legacy_nonce)?;
+            Ok(record)
+        }
+    }
 }
 
 /// Lowercase SHA-256 digest used for frame integrity and idempotency binding.
@@ -194,7 +223,7 @@ fn scan_frames(bytes: &[u8]) -> Result<Vec<ScannedFrame<'_>>, JournalError> {
         if header.sequence != expected_sequence {
             return Err(JournalError::Sequence);
         }
-        let record: HostStateRecord = decode(payload)?;
+        let record = decode_record_for_replay(payload)?;
         frames.push(ScannedFrame {
             raw: &bytes[frame_start..newline],
             header,
@@ -243,7 +272,7 @@ fn apply(
     state: &mut HostState,
     record: &HostStateRecord,
     sequence: u64,
-    record_checksum: &str,
+    applied_record_checksum: &str,
 ) -> Result<ApplyDisposition, JournalError> {
     record.validate()?;
     if record.fence().host != state.host {
@@ -254,7 +283,7 @@ fn apply(
         .iter()
         .find(|item| item.identity == *record.operation())
     {
-        return if existing.checksum == record_checksum {
+        return if existing.checksum == applied_record_checksum {
             Ok(ApplyDisposition::Replayed(existing.sequence))
         } else {
             Err(JournalError::IdempotencyConflict)
@@ -290,7 +319,12 @@ fn apply(
                 state.drain_commit.is_some(),
             )?;
             if new_generation {
-                state.prior_kernel = state.kernel.take().or_else(|| state.prior_kernel.take());
+                if let Some(current) = state.kernel.take() {
+                    state.kernel_history.push(current.clone());
+                    state.prior_kernel = Some(current);
+                } else {
+                    state.prior_kernel = state.prior_kernel.take();
+                }
                 state.prior_kernel_unknown = state.prior_kernel_unknown
                     || (state.prior_kernel.is_none()
                         && state.retained_epochs.iter().any(|item| !item.retired));
@@ -319,13 +353,34 @@ fn apply(
             }
             if state.kernel.is_none()
                 && let Some(prior) = state.prior_kernel.as_ref()
-                && !next
+            {
+                let authority_advances = prior
+                    .process
+                    .as_ref()
+                    .zip(next.process.as_ref())
+                    .is_some_and(|(prior, candidate)| {
+                        candidate.authority_epoch.value() > prior.authority_epoch.value()
+                    });
+                if !next
                     .kernel_generation
                     .is_direct_child_of(&prior.kernel_generation)?
-            {
-                return Err(JournalError::StaleFence);
+                    || next.state
+                        != eliot_runtime_contracts::KernelActivationState::ShadowNoAuthority
+                    || !authority_advances
+                {
+                    return Err(JournalError::StaleFence);
+                }
             }
-            match state.prior_kernel.as_ref() {
+            let same_activation_restart = state
+                .kernel
+                .as_ref()
+                .is_some_and(|current| current.kernel_generation != next.kernel_generation);
+            let exact_prior = if same_activation_restart {
+                state.kernel.as_ref()
+            } else {
+                state.prior_kernel.as_ref()
+            };
+            match exact_prior {
                 None if matches!(
                     next.prior_kernel_disposition,
                     crate::PriorKernelDisposition::NoPriorKernel
@@ -337,7 +392,27 @@ fn apply(
                     ));
                 }
             }
+            if next.state == eliot_runtime_contracts::KernelActivationState::NonceIssued
+                && state
+                    .kernel_history
+                    .iter()
+                    .chain(state.prior_kernel.iter())
+                    .any(|prior| {
+                        prior.one_time_nonce.nonce_ref().is_some()
+                            && prior.one_time_nonce.nonce_ref() == next.one_time_nonce.nonce_ref()
+                    })
+            {
+                return Err(JournalError::Invalid(
+                    "direct-child Kernel generation requires a fresh activation nonce".into(),
+                ));
+            }
             kernel_transition(state.kernel.as_ref(), next)?;
+            if same_activation_restart {
+                if let Some(current) = state.kernel.clone() {
+                    state.kernel_history.push(current.clone());
+                    state.prior_kernel = Some(current);
+                }
+            }
             state.kernel = Some(next.clone());
             state.clean_marker = None;
         }
@@ -400,6 +475,21 @@ fn apply(
             state.observations.push(next.clone());
             state.clean_marker = None;
         }
+        HostStateRecord::ReadinessObservation(next) => {
+            let active = state.kernel.as_ref().ok_or(JournalError::StaleFence)?;
+            let active_checksum = record_checksum(&HostStateRecord::Kernel(active.clone()))?;
+            next.validate_against(active, &active_checksum)?;
+            if state.readiness_observations.iter().any(|existing| {
+                existing.probe_request_digest == next.probe_request_digest
+                    || existing.ready_receipt_digest == next.ready_receipt_digest
+            }) {
+                return Err(JournalError::Invalid(
+                    "readiness probe request and receipt digests must be fresh".into(),
+                ));
+            }
+            state.readiness_observations.push(next.clone());
+            state.clean_marker = None;
+        }
         HostStateRecord::CleanMarker(next) => {
             if next.manifest.schema_version != JOURNAL_VERSION
                 || next.manifest.last_sequence != state.sequence
@@ -434,7 +524,7 @@ fn apply(
     }
     state.applied_operations.push(AppliedOperation {
         identity: record.operation().clone(),
-        checksum: record_checksum.to_owned(),
+        checksum: applied_record_checksum.to_owned(),
         sequence,
     });
     Ok(ApplyDisposition::Applied)
@@ -768,7 +858,26 @@ impl<B: JournalBackend> HostStateJournal<B> {
 
     #[allow(clippy::needless_pass_by_value)]
     pub fn append(&self, record: HostStateRecord) -> Result<AppendReceipt, JournalError> {
-        record.validate()?;
+        if matches!(&record, HostStateRecord::ReadinessObservation(_)) {
+            return Err(JournalError::Invalid(
+                "readiness observations require exact approved-contour admission".into(),
+            ));
+        }
+        self.append_inner(record)
+    }
+
+    pub fn append_readiness_observation(
+        &self,
+        observation: crate::KernelReadinessObservationRecord,
+        expected: &crate::ReadinessApprovedContour,
+    ) -> Result<AppendReceipt, JournalError> {
+        observation.validate_approved_contour(expected)?;
+        self.append_inner(HostStateRecord::ReadinessObservation(observation))
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn append_inner(&self, record: HostStateRecord) -> Result<AppendReceipt, JournalError> {
+        record.validate_live_admission()?;
         let record_checksum = record_checksum(&record)?;
         let transaction_id = transaction_id(&record, &record_checksum)?;
         let mut state = self

@@ -1,9 +1,11 @@
 //! P-01 provider-neutral platform contracts.
 //!
 //! This crate describes bounded effects only. It does not access an operating
-//! system, own an executor, persist state, spawn processes, or carry secret
-//! bytes. Platform adapters implement the ports and the owning control plane
-//! supplies request identity and fences.
+//! system, own an executor, persist state, or spawn processes. Provider-held
+//! secrets remain references; the two redacted nonce contracts are the narrow
+//! exception used for Host ownership and one-use Kernel activation. Platform
+//! adapters implement the ports and the owning control plane supplies request
+//! identity and fences.
 
 #![forbid(unsafe_code)]
 
@@ -40,6 +42,108 @@ impl PlatformHandle {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Opaque nonce that binds one live Host process to its installation epoch.
+///
+/// This type is deliberately distinct from [`KernelActivationNonce`]. Neither
+/// nonce type implements a conversion into the other, and their formatting is
+/// always redacted so process credentials cannot leak through diagnostics.
+#[derive(Clone, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+#[schemars(with = "String")]
+pub struct HostProcessNonce(PlatformHandle);
+
+impl HostProcessNonce {
+    pub const fn new(value: PlatformHandle) -> Self {
+        Self(value)
+    }
+
+    pub fn as_handle(&self) -> &PlatformHandle {
+        &self.0
+    }
+
+    pub fn into_handle(self) -> PlatformHandle {
+        self.0
+    }
+}
+
+impl fmt::Debug for HostProcessNonce {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HostProcessNonce(<redacted>)")
+    }
+}
+
+impl fmt::Display for HostProcessNonce {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+/// One-use 256-bit permit for an exact Kernel activation transition.
+///
+/// The value is represented as exactly 64 hexadecimal characters so malformed
+/// or truncated permits cannot enter the durable Host journal through typed
+/// APIs. Entropy and generation remain the responsibility of the OS adapter.
+#[derive(Clone, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd)]
+#[schemars(with = "String")]
+pub struct KernelActivationNonce(PlatformHandle);
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum NonceContractError {
+    #[error(
+        "Kernel activation nonce must be exactly 256 bits encoded as 64 hexadecimal characters"
+    )]
+    InvalidKernelActivationNonce,
+}
+
+impl KernelActivationNonce {
+    pub fn new(value: PlatformHandle) -> Result<Self, NonceContractError> {
+        let text = value.as_str();
+        if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(NonceContractError::InvalidKernelActivationNonce);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_handle(&self) -> &PlatformHandle {
+        &self.0
+    }
+
+    pub fn into_handle(self) -> PlatformHandle {
+        self.0
+    }
+}
+
+impl fmt::Debug for KernelActivationNonce {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("KernelActivationNonce(<redacted>)")
+    }
+}
+
+impl fmt::Display for KernelActivationNonce {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl Serialize for KernelActivationNonce {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for KernelActivationNonce {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = PlatformHandle::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1375,6 +1479,26 @@ mod tests {
 
     fn handle(value: &str) -> PlatformHandle {
         PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn host_and_kernel_nonces_are_distinct_redacted_contracts() {
+        let host = HostProcessNonce::new(handle("host-process-secret"));
+        let kernel =
+            KernelActivationNonce::new(handle(&"a".repeat(64))).unwrap_or_else(|_| unreachable!());
+
+        assert_eq!(format!("{host}"), "<redacted>");
+        assert_eq!(format!("{host:?}"), "HostProcessNonce(<redacted>)");
+        assert_eq!(format!("{kernel}"), "<redacted>");
+        assert_eq!(format!("{kernel:?}"), "KernelActivationNonce(<redacted>)");
+        assert_eq!(
+            serde_json::to_value(&kernel).unwrap_or_else(|_| unreachable!()),
+            serde_json::json!("a".repeat(64))
+        );
+        assert!(
+            serde_json::from_value::<KernelActivationNonce>(serde_json::json!("too-short"))
+                .is_err()
+        );
     }
 
     fn process(process_id: &str, owner: &str, state: ServiceProcessState) -> ServiceProcessRecord {

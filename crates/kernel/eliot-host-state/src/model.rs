@@ -1,5 +1,7 @@
+use std::fmt;
+
 use eliot_observation_contracts::ObservationRecordEnvelope;
-use eliot_platform::{PlatformHandle, PortOutcome};
+use eliot_platform::{HostProcessNonce, KernelActivationNonce, PlatformHandle, PortOutcome};
 use eliot_runtime_contracts::{
     HealthDimension, KernelActivationState, ServiceProcessRecord, ServiceProcessState, WakeIntent,
     WakeIntentState,
@@ -21,6 +23,17 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), JournalErro
     let text = value.as_str();
     if text.trim().is_empty() || text.chars().any(char::is_control) {
         return Err(JournalError::Invalid(format!("{field} must be non-blank")));
+    }
+    Ok(())
+}
+
+fn digest(value: &PlatformHandle, field: &'static str) -> Result<(), JournalError> {
+    handle(value, field)?;
+    let text = value.as_str();
+    if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(JournalError::Invalid(format!(
+            "{field} must be a 64-character hexadecimal digest"
+        )));
     }
     Ok(())
 }
@@ -96,6 +109,23 @@ impl EpochTransition {
         parent.validate()?;
         Ok(self.parent.as_ref() == Some(&parent.current))
     }
+
+    /// Creates the only legal next generation in this exact lineage.
+    pub fn direct_child(&self) -> Result<Self, JournalError> {
+        self.validate()?;
+        let sequence = self
+            .current
+            .sequence
+            .checked_add(1)
+            .ok_or(JournalError::Sequence)?;
+        Ok(Self {
+            current: EpochIdentity {
+                lineage: self.current.lineage.clone(),
+                sequence,
+            },
+            parent: Some(self.current.clone()),
+        })
+    }
 }
 
 /// Reasons that require a fresh Host lineage instead of continuing a counter.
@@ -104,6 +134,7 @@ impl EpochTransition {
 pub enum RecoveryLineageReason {
     Corruption,
     Restore,
+    Migration,
     BreakGlass,
 }
 
@@ -126,13 +157,25 @@ impl RecoveryLineageEvidence {
 }
 
 /// Installation identity and exact parent-fenced Host epoch.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostInstallationEpoch {
     pub installation: PlatformHandle,
     pub epoch: EpochTransition,
     pub nonce: PlatformHandle,
     pub recovery: Option<RecoveryLineageEvidence>,
+}
+
+impl fmt::Debug for HostInstallationEpoch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostInstallationEpoch")
+            .field("installation", &self.installation)
+            .field("epoch", &self.epoch)
+            .field("nonce", &"<redacted>")
+            .field("recovery", &self.recovery)
+            .finish()
+    }
 }
 
 impl HostInstallationEpoch {
@@ -154,6 +197,11 @@ impl HostInstallationEpoch {
         parent.validate()?;
         Ok(self.installation == parent.installation
             && self.epoch.is_direct_child_of(&parent.epoch)?)
+    }
+
+    /// Returns the Host-process credential under its canonical, non-activation type.
+    pub fn host_process_nonce(&self) -> HostProcessNonce {
+        HostProcessNonce::new(self.nonce.clone())
     }
 }
 
@@ -521,23 +569,145 @@ impl PriorKernelDisposition {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OneTimeNonceState {
     /// Absent until the old Kernel disposition is durably proven.
-    pub nonce_ref: Option<PlatformHandle>,
-    pub state: NonceState,
+    nonce_ref: Option<PlatformHandle>,
+    state: NonceState,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OneTimeNonceStateWire {
+    nonce_ref: Option<PlatformHandle>,
+    state: NonceState,
+}
+
+impl<'de> Deserialize<'de> for OneTimeNonceState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = OneTimeNonceStateWire::deserialize(deserializer)?;
+        match (wire.nonce_ref, wire.state) {
+            (None, NonceState::Unissued) => Ok(Self::unissued()),
+            (
+                Some(nonce),
+                state @ (NonceState::Issued | NonceState::Consumed | NonceState::Revoked),
+            ) => {
+                let nonce = KernelActivationNonce::new(nonce).map_err(serde::de::Error::custom)?;
+                Ok(Self {
+                    nonce_ref: Some(nonce.into_handle()),
+                    state,
+                })
+            }
+            _ => Err(serde::de::Error::custom(
+                "one-time nonce must be absent before issuance and present thereafter",
+            )),
+        }
+    }
+}
+
+impl fmt::Debug for OneTimeNonceState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OneTimeNonceState")
+            .field("nonce_ref", &self.nonce_ref.as_ref().map(|_| "<redacted>"))
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 impl OneTimeNonceState {
+    pub const fn state(&self) -> NonceState {
+        self.state
+    }
+
+    pub(crate) fn nonce_ref(&self) -> Option<&PlatformHandle> {
+        self.nonce_ref.as_ref()
+    }
+
+    /// Sole compatibility constructor used by the journal replay boundary.
+    const fn from_legacy_raw(nonce_ref: Option<PlatformHandle>, state: NonceState) -> Self {
+        Self { nonce_ref, state }
+    }
+
     fn validate(&self) -> Result<(), JournalError> {
         match (&self.nonce_ref, self.state) {
             (None, NonceState::Unissued) => Ok(()),
             (Some(nonce), NonceState::Issued | NonceState::Consumed | NonceState::Revoked) => {
+                // Old journal frames stored an opaque non-blank handle. Keep
+                // replay compatibility; new issuance must use `issued`, which
+                // accepts only the canonical 256-bit typed nonce.
                 handle(nonce, "kernel.nonce_ref")
             }
             _ => Err(JournalError::Invalid(
                 "one-time nonce must be absent before issuance and present thereafter".into(),
+            )),
+        }
+    }
+
+    fn validate_live_admission(&self) -> Result<(), JournalError> {
+        self.validate()?;
+        if let Some(nonce) = self.nonce_ref.as_ref() {
+            KernelActivationNonce::new(nonce.clone())
+                .map_err(|error| JournalError::Invalid(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub const fn unissued() -> Self {
+        Self {
+            nonce_ref: None,
+            state: NonceState::Unissued,
+        }
+    }
+
+    pub fn issued(nonce: KernelActivationNonce) -> Self {
+        Self {
+            nonce_ref: Some(nonce.into_handle()),
+            state: NonceState::Issued,
+        }
+    }
+
+    pub fn consume(&self) -> Result<Self, JournalError> {
+        if self.state != NonceState::Issued {
+            return Err(JournalError::Invalid(
+                "only an issued Kernel activation nonce may be consumed".into(),
+            ));
+        }
+        Ok(Self {
+            nonce_ref: self.nonce_ref.clone(),
+            state: NonceState::Consumed,
+        })
+    }
+
+    pub fn revoke(&self) -> Result<Self, JournalError> {
+        if self.state != NonceState::Issued {
+            return Err(JournalError::Invalid(
+                "only an issued Kernel activation nonce may be revoked".into(),
+            ));
+        }
+        Ok(Self {
+            nonce_ref: self.nonce_ref.clone(),
+            state: NonceState::Revoked,
+        })
+    }
+
+    pub fn activation_nonce(&self) -> Result<Option<KernelActivationNonce>, JournalError> {
+        match self.state {
+            NonceState::Unissued => Ok(None),
+            NonceState::Issued => self
+                .nonce_ref
+                .as_ref()
+                .map(|nonce| {
+                    KernelActivationNonce::new(nonce.clone())
+                        .map_err(|error| JournalError::Invalid(error.to_string()))
+                })
+                .transpose(),
+            NonceState::Consumed | NonceState::Revoked => Err(JournalError::Invalid(
+                "terminal Kernel activation nonce material cannot be re-issued".into(),
             )),
         }
     }
@@ -566,6 +736,30 @@ pub struct KernelRecord {
 }
 
 impl KernelRecord {
+    /// Computes a fresh direct-child Kernel generation without changing the Host epoch.
+    pub fn direct_child_generation(&self) -> Result<EpochTransition, JournalError> {
+        self.kernel_generation.direct_child()
+    }
+
+    pub(crate) fn restore_legacy_nonce_for_replay(
+        &mut self,
+        nonce_ref: PlatformHandle,
+    ) -> Result<(), JournalError> {
+        if KernelActivationNonce::new(nonce_ref.clone()).is_ok()
+            || !matches!(
+                self.one_time_nonce.state,
+                NonceState::Issued | NonceState::Consumed | NonceState::Revoked
+            )
+        {
+            return Err(JournalError::Invalid(
+                "legacy replay nonce boundary requires opaque issued nonce material".into(),
+            ));
+        }
+        self.one_time_nonce =
+            OneTimeNonceState::from_legacy_raw(Some(nonce_ref), self.one_time_nonce.state);
+        self.one_time_nonce.validate()
+    }
+
     #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
@@ -593,11 +787,19 @@ impl KernelRecord {
         if self.candidate_job_binding.is_some()
             && !matches!(
                 self.state,
-                KernelActivationState::Activating | KernelActivationState::Active
+                KernelActivationState::ShadowNoAuthority
+                    | KernelActivationState::HandoffPrepared
+                    | KernelActivationState::OldTerminated
+                    | KernelActivationState::NonceIssued
+                    | KernelActivationState::Activating
+                    | KernelActivationState::Active
+                    | KernelActivationState::Failed
+                    | KernelActivationState::ManualRecovery
             )
         {
             return Err(JournalError::Invalid(
-                "candidate Job binding may first appear only at Activating".into(),
+                "candidate Job binding is valid only after candidate launch or on retained terminal state"
+                    .into(),
             ));
         }
         if let Some(process) = &self.process {
@@ -626,7 +828,11 @@ impl KernelRecord {
                 self.one_time_nonce.state == NonceState::Issued
             }
             KernelActivationState::Active => self.one_time_nonce.state == NonceState::Consumed,
-            KernelActivationState::Failed | KernelActivationState::ManualRecovery => matches!(
+            KernelActivationState::Failed => matches!(
+                self.one_time_nonce.state,
+                NonceState::Unissued | NonceState::Revoked | NonceState::Consumed
+            ),
+            KernelActivationState::ManualRecovery => matches!(
                 self.one_time_nonce.state,
                 NonceState::Unissued | NonceState::Revoked
             ),
@@ -649,9 +855,29 @@ impl KernelRecord {
                 "candidate Kernel pipe identity is required during handoff".into(),
             ));
         }
-        if self.active_pipe_identity.is_some() != (self.state == KernelActivationState::Active) {
+        if matches!(
+            self.state,
+            KernelActivationState::ShadowNoAuthority
+                | KernelActivationState::HandoffPrepared
+                | KernelActivationState::OldTerminated
+                | KernelActivationState::NonceIssued
+                | KernelActivationState::Activating
+                | KernelActivationState::Active
+        ) && (self.candidate_job_binding.is_none() || self.process.is_none())
+        {
             return Err(JournalError::Invalid(
-                "active Kernel pipe identity must be present if and only if state is Active".into(),
+                "launched Kernel candidate requires exact process and Job binding".into(),
+            ));
+        }
+        if self.active_pipe_identity.is_some()
+            && !matches!(
+                self.state,
+                KernelActivationState::Active | KernelActivationState::Failed
+            )
+        {
+            return Err(JournalError::Invalid(
+                "active Kernel pipe identity is valid only for Active or failed-after-Active"
+                    .into(),
             ));
         }
         match self.state {
@@ -677,6 +903,32 @@ impl KernelRecord {
                     return Err(JournalError::StaleFence);
                 }
             }
+            KernelActivationState::Failed => match self.one_time_nonce.state {
+                NonceState::Consumed => {
+                    let Some(active_pipe) = self.active_pipe_identity.as_ref() else {
+                        return Err(JournalError::Invalid(
+                            "failed-after-Active Kernel must retain its active pipe identity"
+                                .into(),
+                        ));
+                    };
+                    if self.candidate_pipe_identity.as_ref() != Some(active_pipe) {
+                        return Err(JournalError::StaleFence);
+                    }
+                }
+                NonceState::Unissued | NonceState::Revoked
+                    if self.active_pipe_identity.is_some() =>
+                {
+                    return Err(JournalError::Invalid(
+                        "failure before Active cannot carry an active pipe identity".into(),
+                    ));
+                }
+                NonceState::Unissued | NonceState::Revoked => {}
+                NonceState::Issued => {
+                    return Err(JournalError::Invalid(
+                        "failed Kernel cannot retain an issued nonce".into(),
+                    ));
+                }
+            },
             _ => {}
         }
         if matches!(
@@ -691,23 +943,18 @@ impl KernelRecord {
                 "Kernel authority requires exact prior disposition proof".into(),
             ));
         }
-        if matches!(
-            self.state,
-            KernelActivationState::Activating | KernelActivationState::Active
-        ) {
-            let Some(binding) = self.candidate_job_binding.as_ref() else {
-                return Err(JournalError::Invalid(
-                    "activating/active Kernel requires a candidate Job binding".into(),
-                ));
-            };
-            if let Some(process) = &self.process
-                && (process.owner != binding.owner.as_str()
-                    || process.process_id != binding.root_process_handle())
-            {
-                return Err(JournalError::Invalid(
-                    "Kernel process does not match candidate Job root".into(),
-                ));
-            }
+        if self.process.is_some() != self.candidate_job_binding.is_some() {
+            return Err(JournalError::Invalid(
+                "Kernel process and candidate Job binding must appear together".into(),
+            ));
+        }
+        if let (Some(binding), Some(process)) = (&self.candidate_job_binding, &self.process)
+            && (process.owner != binding.owner.as_str()
+                || process.process_id != binding.root_process_handle())
+        {
+            return Err(JournalError::Invalid(
+                "Kernel process does not match candidate Job root".into(),
+            ));
         }
         if self.state == KernelActivationState::Active
             && !self.process.as_ref().is_some_and(|process| {
@@ -1052,6 +1299,133 @@ impl HostObservationRecord {
     }
 }
 
+/// A durable Host observation of one already-validated Kernel-authored readiness proof.
+///
+/// This is deliberately not another Kernel state transition or a readiness receipt.
+/// The journal reducer binds it to the exact active [`KernelRecord`] before it is
+/// accepted, and later probes append additional observations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelReadinessObservationRecord {
+    pub fence: RecordFence,
+    pub operation: IdempotencyIdentity,
+    pub active_kernel_record_checksum: PlatformHandle,
+    pub probe_request_digest: PlatformHandle,
+    pub ready_receipt_digest: PlatformHandle,
+    pub kernel_process: ServiceProcessRecord,
+    pub kernel_job: KernelJobBinding,
+    pub config_digest: PlatformHandle,
+    pub authority_epoch: u64,
+    pub store_fence: PlatformHandle,
+    pub observed_at: PlatformHandle,
+    pub evidence_refs: Vec<PlatformHandle>,
+}
+
+/// Exact approved/current contour observed by Host immediately before journal admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadinessApprovedContour {
+    pub config_digest: PlatformHandle,
+    pub store_fence: PlatformHandle,
+}
+
+impl ReadinessApprovedContour {
+    pub(crate) fn validate(&self) -> Result<(), JournalError> {
+        digest(&self.config_digest, "readiness_contour.config_digest")?;
+        handle(&self.store_fence, "readiness_contour.store_fence")
+    }
+}
+
+impl KernelReadinessObservationRecord {
+    fn validate(&self) -> Result<(), JournalError> {
+        self.fence.validate()?;
+        self.operation.validate()?;
+        digest(
+            &self.active_kernel_record_checksum,
+            "readiness_observation.active_kernel_record_checksum",
+        )?;
+        digest(
+            &self.probe_request_digest,
+            "readiness_observation.probe_request_digest",
+        )?;
+        digest(
+            &self.ready_receipt_digest,
+            "readiness_observation.ready_receipt_digest",
+        )?;
+        digest(&self.config_digest, "readiness_observation.config_digest")?;
+        self.kernel_process
+            .validate()
+            .map_err(|error| JournalError::Invalid(error.to_string()))?;
+        self.kernel_job.validate()?;
+        if self.kernel_process.owner != self.kernel_job.owner.as_str()
+            || self.kernel_process.process_id != self.kernel_job.root_process_handle()
+        {
+            return Err(JournalError::Invalid(
+                "readiness observation process does not match the Kernel Job root".into(),
+            ));
+        }
+        if self.authority_epoch == 0
+            || self.kernel_process.authority_epoch.value() != self.authority_epoch
+        {
+            return Err(JournalError::Invalid(
+                "readiness observation authority epoch does not match the Kernel process".into(),
+            ));
+        }
+        if self.kernel_process.state != ServiceProcessState::Ready
+            || self.kernel_process.health.liveness != HealthDimension::Healthy
+            || self.kernel_process.health.readiness != HealthDimension::Healthy
+        {
+            return Err(JournalError::Invalid(
+                "readiness observation requires a live and ready Kernel process".into(),
+            ));
+        }
+        handle(&self.store_fence, "readiness_observation.store_fence")?;
+        handle(&self.observed_at, "readiness_observation.observed_at")?;
+        handles(
+            &self.evidence_refs,
+            "readiness_observation.evidence_refs",
+            true,
+        )
+    }
+
+    pub(crate) fn validate_against(
+        &self,
+        active: &KernelRecord,
+        active_checksum: &str,
+    ) -> Result<(), JournalError> {
+        self.validate()?;
+        if active.state != KernelActivationState::Active
+            || self.fence != active.fence
+            || self.active_kernel_record_checksum.as_str() != active_checksum
+            || active.candidate_job_binding.as_ref() != Some(&self.kernel_job)
+            || self.authority_epoch != self.kernel_process.authority_epoch.value()
+        {
+            return Err(JournalError::StaleFence);
+        }
+        let Some(active_process) = active.process.as_ref() else {
+            return Err(JournalError::StaleFence);
+        };
+        if active_process.process_id != self.kernel_process.process_id
+            || active_process.owner != self.kernel_process.owner
+            || active_process.authority_epoch != self.kernel_process.authority_epoch
+        {
+            return Err(JournalError::StaleFence);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_approved_contour(
+        &self,
+        expected: &ReadinessApprovedContour,
+    ) -> Result<(), JournalError> {
+        expected.validate()?;
+        if self.config_digest != expected.config_digest || self.store_fence != expected.store_fence
+        {
+            return Err(JournalError::StaleFence);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JournalManifest {
@@ -1119,6 +1493,7 @@ pub enum HostStateRecord {
     DrainCommit(DrainCommitRecord),
     Wake(WakeRecord),
     Observation(HostObservationRecord),
+    ReadinessObservation(KernelReadinessObservationRecord),
     CleanMarker(CleanMarker),
     EpochRetirement(EpochRetirementRecord),
 }
@@ -1133,9 +1508,18 @@ impl HostStateRecord {
             Self::DrainCommit(value) => value.validate(),
             Self::Wake(value) => value.validate(),
             Self::Observation(value) => value.validate(),
+            Self::ReadinessObservation(value) => value.validate(),
             Self::CleanMarker(value) => value.validate(),
             Self::EpochRetirement(value) => value.validate(),
         }
+    }
+
+    pub(crate) fn validate_live_admission(&self) -> Result<(), JournalError> {
+        self.validate()?;
+        if let Self::Kernel(kernel) = self {
+            kernel.one_time_nonce.validate_live_admission()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn fence(&self) -> &RecordFence {
@@ -1147,6 +1531,7 @@ impl HostStateRecord {
             Self::DrainCommit(value) => &value.fence,
             Self::Wake(value) => &value.fence,
             Self::Observation(value) => &value.fence,
+            Self::ReadinessObservation(value) => &value.fence,
             Self::CleanMarker(value) => &value.fence,
             Self::EpochRetirement(value) => &value.fence,
         }
@@ -1161,20 +1546,21 @@ impl HostStateRecord {
             Self::DrainCommit(value) => &value.operation,
             Self::Wake(value) => &value.operation,
             Self::Observation(value) => &value.operation,
+            Self::ReadinessObservation(value) => &value.operation,
             Self::CleanMarker(value) => &value.operation,
             Self::EpochRetirement(value) => &value.operation,
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppliedOperation {
     pub identity: IdempotencyIdentity,
     pub checksum: String,
     pub sequence: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EpochEvidence {
     pub host: HostInstallationEpoch,
     pub last_sequence: u64,
@@ -1184,13 +1570,16 @@ pub struct EpochEvidence {
     pub retired: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostState {
     pub host: HostInstallationEpoch,
     pub sequence: u64,
     pub last_checksum: Option<String>,
     pub activation: Option<EliotActivationRecord>,
     pub kernel: Option<KernelRecord>,
+    /// Terminal/predecessor Kernel generations retained for nonce-reuse rejection.
+    #[serde(default)]
+    pub kernel_history: Vec<KernelRecord>,
     /// Exact previous-generation Kernel projection retained across a Host
     /// activation-generation cutover. This is reducer context, not caller
     /// supplied disposition evidence.
@@ -1203,6 +1592,7 @@ pub struct HostState {
     pub drain_commit: Option<DrainCommitRecord>,
     pub wakes: Vec<WakeRecord>,
     pub observations: Vec<HostObservationRecord>,
+    pub readiness_observations: Vec<KernelReadinessObservationRecord>,
     pub clean_marker: Option<CleanMarker>,
     pub retained_epochs: Vec<EpochEvidence>,
     pub retired_epochs: Vec<HostInstallationEpoch>,
@@ -1217,6 +1607,7 @@ impl HostState {
             last_checksum: None,
             activation: None,
             kernel: None,
+            kernel_history: Vec::new(),
             prior_kernel: None,
             prior_kernel_unknown: false,
             dependencies: Vec::new(),
@@ -1224,6 +1615,7 @@ impl HostState {
             drain_commit: None,
             wakes: Vec::new(),
             observations: Vec::new(),
+            readiness_observations: Vec::new(),
             clean_marker: None,
             retained_epochs,
             retired_epochs: Vec::new(),
@@ -1323,6 +1715,13 @@ pub(crate) fn kernel_transition(
     };
     let same = current.kernel_generation == next.kernel_generation;
     if !same {
+        let authority_advances = current
+            .process
+            .as_ref()
+            .zip(next.process.as_ref())
+            .is_some_and(|(prior, candidate)| {
+                candidate.authority_epoch.value() > prior.authority_epoch.value()
+            });
         if !next
             .kernel_generation
             .is_direct_child_of(&current.kernel_generation)?
@@ -1330,10 +1729,10 @@ pub(crate) fn kernel_transition(
                 current.state,
                 KernelActivationState::Failed | KernelActivationState::ManualRecovery
             )
-            || !matches!(
-                next.state,
-                KernelActivationState::Idle | KernelActivationState::ShadowNoAuthority
-            )
+            || next.state != KernelActivationState::ShadowNoAuthority
+            || !authority_advances
+            || !next.prior_kernel_disposition.binds_to(current)
+            || !next.prior_kernel_disposition.proves_terminated()
         {
             return Err(JournalError::StaleFence);
         }
@@ -1359,13 +1758,21 @@ pub(crate) fn kernel_transition(
         ) | (
             KernelActivationState::Activating,
             KernelActivationState::Active | KernelActivationState::Failed
-        ) | (
-            KernelActivationState::Failed,
-            KernelActivationState::ManualRecovery
-        )
+        ) | (KernelActivationState::Active, KernelActivationState::Failed)
+            | (
+                KernelActivationState::Failed,
+                KernelActivationState::ManualRecovery
+            )
     );
     if !legal {
         return Err(illegal("kernel", current.state, next.state));
+    }
+
+    if current.activation_identity != next.activation_identity
+        || current.approved_artifact_hash != next.approved_artifact_hash
+        || current.fence != next.fence
+    {
+        return Err(JournalError::StaleFence);
     }
 
     if next.state == KernelActivationState::OldTerminated
@@ -1434,12 +1841,46 @@ pub(crate) fn kernel_transition(
     {
         return Err(JournalError::StaleFence);
     }
-    if let (Some(current_candidate), Some(next_candidate)) = (
-        current.candidate_pipe_identity.as_ref(),
-        next.candidate_pipe_identity.as_ref(),
-    ) && current_candidate != next_candidate
+    if next.state == KernelActivationState::Failed
+        && (current.active_pipe_identity != next.active_pipe_identity
+            || current.candidate_pipe_identity != next.candidate_pipe_identity
+            || current.candidate_job_binding != next.candidate_job_binding
+            || current.process.as_ref().map(|process| {
+                (
+                    process.process_id.as_str(),
+                    process.owner.as_str(),
+                    process.authority_epoch,
+                )
+            }) != next.process.as_ref().map(|process| {
+                (
+                    process.process_id.as_str(),
+                    process.owner.as_str(),
+                    process.authority_epoch,
+                )
+            }))
     {
         return Err(JournalError::StaleFence);
+    }
+    if current.candidate_pipe_identity.is_some()
+        && current.candidate_pipe_identity != next.candidate_pipe_identity
+    {
+        return Err(JournalError::StaleFence);
+    }
+    if current.candidate_job_binding.is_some()
+        && current.candidate_job_binding != next.candidate_job_binding
+    {
+        return Err(JournalError::StaleFence);
+    }
+    if let Some(current_process) = current.process.as_ref() {
+        let Some(next_process) = next.process.as_ref() else {
+            return Err(JournalError::StaleFence);
+        };
+        if current_process.process_id != next_process.process_id
+            || current_process.owner != next_process.owner
+            || current_process.authority_epoch != next_process.authority_epoch
+        {
+            return Err(JournalError::StaleFence);
+        }
     }
     if next.state == KernelActivationState::Active
         && next.active_pipe_identity != next.candidate_pipe_identity
@@ -1467,11 +1908,17 @@ pub(crate) fn kernel_transition(
             }
         }
         (Some(current_nonce), KernelActivationState::Failed) => {
+            let expected_state = if current.state == KernelActivationState::Active {
+                NonceState::Consumed
+            } else {
+                NonceState::Revoked
+            };
             if next.one_time_nonce.nonce_ref.as_ref() != Some(current_nonce)
-                || next.one_time_nonce.state != NonceState::Revoked
+                || next.one_time_nonce.state != expected_state
             {
                 return Err(JournalError::Invalid(
-                    "failed Kernel must revoke the exact issued nonce".into(),
+                    "failed Kernel must retain Consumed after Active or revoke an issued nonce"
+                        .into(),
                 ));
             }
         }
