@@ -131,3 +131,76 @@ fn installation_plan_rejects_relative_input() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("path must be absolute"));
 }
+
+fn run_installation_plan_fixture(name: &str, fixture: &str) -> std::process::Output {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-plan-{name}-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_root).expect("create plan fixture");
+    let input = temp_root.join("plan.json");
+    fs::write(&input, fixture).expect("write plan fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "plan",
+            "--input",
+            input.to_str().expect("input is utf8"),
+        ])
+        .output()
+        .expect("run plan command");
+    let _ = fs::remove_dir_all(temp_root);
+    output
+}
+
+#[test]
+fn installation_plan_reports_missing_v5_discriminator_as_migration() {
+    let result = run_installation_plan_fixture("missing-discriminator", "{}");
+
+    assert!(!result.status.success());
+    let output: Value = serde_json::from_slice(&result.stdout).expect("plan JSON error");
+    assert_eq!(output["status"], "error");
+    assert_eq!(output["code"], "INSTALLATION_PLAN_MIGRATION_REQUIRED");
+    assert!(
+        output["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("required v5 discriminator"))
+    );
+}
+
+#[test]
+fn installation_plan_reports_v4_discriminator_as_migration() {
+    let result = run_installation_plan_fixture(
+        "v4",
+        r#"{"transaction_wire_version":{"major":4,"minor":0,"patch":0}}"#,
+    );
+
+    assert!(!result.status.success());
+    let output: Value = serde_json::from_slice(&result.stdout).expect("plan JSON error");
+    assert_eq!(output["status"], "error");
+    assert_eq!(output["code"], "INSTALLATION_PLAN_MIGRATION_REQUIRED");
+    assert!(
+        output["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("wire 4.0.0"))
+    );
+}
+
+#[test]
+fn installation_plan_reports_malformed_v5_as_invalid() {
+    let result = run_installation_plan_fixture(
+        "malformed-v5",
+        r#"{"transaction_wire_version":{"major":5,"minor":0,"patch":0},"transaction_id":"malformed"}"#,
+    );
+
+    assert!(!result.status.success());
+    let output: Value = serde_json::from_slice(&result.stdout).expect("plan JSON error");
+    assert_eq!(output["status"], "error");
+    assert_eq!(output["code"], "INSTALLATION_PLAN_INVALID");
+    assert!(
+        output["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("installation registry is corrupt"))
+    );
+}

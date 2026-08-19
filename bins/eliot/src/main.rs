@@ -6,7 +6,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
-use eliot_installation::{InstallationTransaction, RedbInstallationRegistry};
+use eliot_installation::{
+    InstallationError, RedbInstallationRegistry, decode_installation_transaction_json,
+};
 use serde_json::json;
 use std::path::PathBuf;
 use std::{fs, io::Read, path::Path};
@@ -49,7 +51,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum InstallationCommand {
-    /// Validate an immutable v2 installation plan JSON without applying it.
+    /// Validate an immutable v5 installation plan JSON without applying it.
     Plan {
         /// Absolute path to an existing serialized `InstallationTransaction`.
         #[arg(long, value_parser = absolute_path)]
@@ -119,17 +121,24 @@ fn run() -> Result<i32> {
 fn run_installation(command: InstallationCommand) -> Result<i32> {
     match command {
         InstallationCommand::Plan { input } => {
-            let transaction = match load_json::<InstallationTransaction>(&input) {
-                Ok(transaction) => transaction,
+            let bytes = match load_input(&input) {
+                Ok(bytes) => bytes,
                 Err(error) => {
                     write_json_error("INSTALLATION_PLAN_INVALID", &error.to_string());
                     return Ok(INVALID_REQUEST_EXIT);
                 }
             };
-            if let Err(error) = transaction.validate() {
-                write_json_error("INSTALLATION_PLAN_INVALID", &error.to_string());
-                return Ok(INVALID_REQUEST_EXIT);
-            }
+            let transaction = match decode_installation_transaction_json(&bytes) {
+                Ok(transaction) => transaction,
+                Err(error @ InstallationError::MigrationRequired { .. }) => {
+                    write_json_error("INSTALLATION_PLAN_MIGRATION_REQUIRED", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+                Err(error) => {
+                    write_json_error("INSTALLATION_PLAN_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
             println!("{}", serde_json::to_string_pretty(&transaction)?);
             Ok(0)
         }
@@ -164,10 +173,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
     }
 }
 
-fn load_json<T>(path: &Path) -> Result<T>
-where
-    T: serde::de::DeserializeOwned,
-{
+fn load_input(path: &Path) -> Result<Vec<u8>> {
     let metadata =
         fs::metadata(path).with_context(|| format!("read input metadata: {}", path.display()))?;
     if !metadata.is_file() {
@@ -176,8 +182,7 @@ where
     if metadata.len() > INSTALLATION_INPUT_LIMIT {
         anyhow::bail!("input exceeds the 16 MiB limit: {}", path.display());
     }
-    let bytes = fs::read(path).with_context(|| format!("read input: {}", path.display()))?;
-    serde_json::from_slice(&bytes).context("decode installation JSON")
+    fs::read(path).with_context(|| format!("read input: {}", path.display()))
 }
 
 #[cfg(windows)]
