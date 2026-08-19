@@ -350,11 +350,7 @@ impl WindowsPathIdentity {
 }
 
 fn joined_windows_path(root: &str, suffix: &str) -> String {
-    format!(
-        "{}\\{}",
-        root.trim_end_matches(|character| character == '\\' || character == '/'),
-        suffix
-    )
+    format!("{}\\{}", root.trim_end_matches(['\\', '/']), suffix)
 }
 
 fn same_windows_root(left: &str, right: &str) -> Result<bool, InstallationError> {
@@ -570,7 +566,7 @@ impl InstallationProfile {
 /// Digest-bound mutable runtime roots for one explicitly selected profile.
 ///
 /// `profile_anchor_root` is supplied by the installer after the Windows adapter
-/// proves the corresponding protected ProgramData, LocalAppData, or retained
+/// proves the corresponding protected `ProgramData`, `LocalAppData`, or retained
 /// portable contour. The contract never consults process environment variables
 /// and therefore cannot silently select a different profile root.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -632,7 +628,7 @@ pub struct ValidatedRuntimeRootLeases<L> {
 
 /// Real Windows retained root lease used by production composition.
 pub enum WindowsRuntimeRootLease {
-    /// SystemService lease backed by a retained read-only directory contour.
+    /// `SystemService` lease backed by a retained read-only directory contour.
     Protected {
         /// Contract-declared root path.
         declared_path: String,
@@ -777,7 +773,7 @@ impl RuntimeStateRoots {
         ("watchdog_state_root", "watchdog"),
     ];
 
-    /// Derives SystemService or UserMode roots from an explicit OS-validated
+    /// Derives `SystemService` or `UserMode` roots from an explicit OS-validated
     /// profile anchor and a lowercase SHA-256 installation key.
     pub fn derive_profiled(
         profile: InstallationProfile,
@@ -802,7 +798,7 @@ impl RuntimeStateRoots {
         Self::derived(profile, profile_anchor_root, installation_root)
     }
 
-    /// Derives PortableDev roots below one explicit retained disposable root.
+    /// Derives `PortableDev` roots below one explicit retained disposable root.
     pub fn derive_portable(
         retained_portable_root: PlatformHandle,
     ) -> Result<Self, InstallationError> {
@@ -1002,11 +998,7 @@ impl RuntimeStateRoots {
                     ));
                 }
                 if installation.components.len() >= 3 {
-                    let last = installation
-                        .components
-                        .last()
-                        .map(String::as_str)
-                        .unwrap_or("");
+                    let last = installation.components.last().map_or("", String::as_str);
                     if valid_installation_key(last)
                         && installation.ends_with(&["eliot", "installations", last])
                     {
@@ -2551,7 +2543,7 @@ impl PlannedChange {
     }
 }
 
-/// Service role owned by the elevated SystemService installer.
+/// Service role owned by the elevated `SystemService` installer.
 #[derive(
     Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -2567,7 +2559,7 @@ pub enum InstallerServiceRole {
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum InstallerServiceAccount {
-    /// Built-in least-privileged LocalService identity.
+    /// Built-in least-privileged `LocalService` identity.
     LocalService,
 }
 
@@ -2579,11 +2571,11 @@ pub enum InstallerServiceAccount {
 pub enum InstallerAclPrincipal {
     /// Built-in Administrators group.
     Administrators,
-    /// Built-in LocalService identity used by Host and Watchdog.
+    /// Built-in `LocalService` identity used by Host and Watchdog.
     LocalService,
-    /// Built-in LocalSystem identity retained for installer/OS ownership.
+    /// Built-in `LocalSystem` identity retained for installer/OS ownership.
     LocalSystem,
-    /// Current user, valid only for UserMode or PortableDev.
+    /// Current user, valid only for `UserMode` or `PortableDev`.
     CurrentUser,
 }
 
@@ -2679,6 +2671,10 @@ impl InstallerEffectPlan {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordered fail-closed installer validation is kept in one auditable boundary"
+)]
 fn validate_installer_effects(
     profile: InstallationProfile,
     roots: &RuntimeStateRoots,

@@ -407,11 +407,9 @@ fn apply(
                 ));
             }
             kernel_transition(state.kernel.as_ref(), next)?;
-            if same_activation_restart {
-                if let Some(current) = state.kernel.clone() {
-                    state.kernel_history.push(current.clone());
-                    state.prior_kernel = Some(current);
-                }
+            if same_activation_restart && let Some(current) = state.kernel.clone() {
+                state.kernel_history.push(current.clone());
+                state.prior_kernel = Some(current);
             }
             state.kernel = Some(next.clone());
             state.clean_marker = None;
