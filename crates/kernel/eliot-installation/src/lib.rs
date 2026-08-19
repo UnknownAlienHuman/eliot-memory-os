@@ -25,7 +25,7 @@ use eliot_platform_windows::{
     UserOwnedRootReadLease, current_user_local_app_data_root, protected_program_data_root,
     require_protected_program_data_path,
 };
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -2283,6 +2283,60 @@ impl RedbInstallationRegistry {
         })
     }
 
+    /// Inspects an existing registry without creating a file, database or
+    /// table. The retained protected lease covers the complete read so a
+    /// deletion or replacement race fails closed before redb is opened.
+    pub fn inspect_existing(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<ApprovedGenerationRegistry>, InstallationError> {
+        let path = path.as_ref();
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => {
+                return Err(InstallationError::Platform(
+                    "registry path is not an existing regular file".to_owned(),
+                ));
+            }
+        }
+        require_protected_program_data_path(path, REGISTRY_RELATIVE_PATH)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let path_lease = ProtectedPathLease::open_existing_absolute(path)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if path_lease.path() != path {
+            return Err(InstallationError::Platform(
+                "registry path is not the exact protected ProgramData path".to_owned(),
+            ));
+        }
+        path_lease
+            .verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let database = ReadOnlyDatabase::open(path_lease.path())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        path_lease
+            .verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(REGISTRY_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Ok(Some(ApprovedGenerationRegistry::new()));
+            }
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let Some(value) = table
+            .get("registry")
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        else {
+            return Ok(Some(ApprovedGenerationRegistry::new()));
+        };
+        let registry = decode_registry_bytes(value.value())?;
+        registry.validate()?;
+        Ok(Some(registry))
+    }
+
     /// Loads the registry, returning an empty value on first use.
     pub fn load(&self) -> Result<ApprovedGenerationRegistry, InstallationError> {
         let read = self
@@ -4425,6 +4479,24 @@ mod tests {
         drop(read);
         drop(database);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inspect_existing_missing_registry_does_not_create_one() {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-installation-registry-missing-{}.redb",
+            std::process::id()
+        ));
+        assert!(
+            !path.exists(),
+            "test registry fixture unexpectedly exists: {}",
+            path.display()
+        );
+        assert_eq!(
+            must(RedbInstallationRegistry::inspect_existing(&path)),
+            None
+        );
+        assert!(!path.exists(), "read-only inspection created a registry");
     }
 
     #[test]

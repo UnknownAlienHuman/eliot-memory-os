@@ -6,14 +6,16 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
+use eliot_installation::{InstallationTransaction, RedbInstallationRegistry};
 use serde_json::json;
-use std::io::Read;
 use std::path::PathBuf;
+use std::{fs, io::Read, path::Path};
 use tracing_subscriber::EnvFilter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INVALID_REQUEST_EXIT: i32 = 2;
 const FRONT_DOOR_CLOSED_EXIT: i32 = 69;
+const INSTALLATION_INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "eliot", about = "ELIOT Memory OS command-line client")]
@@ -35,9 +37,30 @@ enum Command {
         #[command(subcommand)]
         command: SystemCommand,
     },
+    /// Inspect or validate the governed installation transaction surfaces.
+    Installation {
+        #[command(subcommand)]
+        command: InstallationCommand,
+    },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
     Ui,
+}
+
+#[derive(Debug, Subcommand)]
+enum InstallationCommand {
+    /// Validate an immutable v2 installation plan JSON without applying it.
+    Plan {
+        /// Absolute path to an existing serialized `InstallationTransaction`.
+        #[arg(long, value_parser = absolute_path)]
+        input: PathBuf,
+    },
+    /// Read the existing approved-generation registry without changing it.
+    Status {
+        /// Absolute path to an existing installation registry redb file.
+        #[arg(long, value_parser = absolute_path)]
+        registry: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -87,9 +110,74 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Command::System { command } => run_system(command),
+        Command::Installation { command } => run_installation(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
+}
+
+fn run_installation(command: InstallationCommand) -> Result<i32> {
+    match command {
+        InstallationCommand::Plan { input } => {
+            let transaction = match load_json::<InstallationTransaction>(&input) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    write_json_error("INSTALLATION_PLAN_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            if let Err(error) = transaction.validate() {
+                write_json_error("INSTALLATION_PLAN_INVALID", &error.to_string());
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+            println!("{}", serde_json::to_string_pretty(&transaction)?);
+            Ok(0)
+        }
+        InstallationCommand::Status { registry } => {
+            let registry_value = match RedbInstallationRegistry::inspect_existing(&registry) {
+                Ok(Some(registry_value)) => registry_value,
+                Ok(None) => {
+                    write_json_error(
+                        "INSTALLATION_STATUS_UNAVAILABLE",
+                        "registry does not exist; status never creates it",
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+                Err(error) => {
+                    write_json_error("INSTALLATION_STATUS_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "contract": "eliot.kernel.installation",
+                    "contract_version": "2.0.0",
+                    "status": if registry_value.active().is_some() { "ACTIVE_GENERATION" } else { "NO_ACTIVE_GENERATION" },
+                    "active_generation": registry_value.active_generation,
+                    "last_known_good_generation": registry_value.last_known_good_generation,
+                    "generations": registry_value.generations,
+                }))?
+            );
+            Ok(0)
+        }
+    }
+}
+
+fn load_json<T>(path: &Path) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let metadata =
+        fs::metadata(path).with_context(|| format!("read input metadata: {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("input is not a regular file: {}", path.display());
+    }
+    if metadata.len() > INSTALLATION_INPUT_LIMIT {
+        anyhow::bail!("input exceeds the 16 MiB limit: {}", path.display());
+    }
+    let bytes = fs::read(path).with_context(|| format!("read input: {}", path.display()))?;
+    serde_json::from_slice(&bytes).context("decode installation JSON")
 }
 
 #[cfg(windows)]

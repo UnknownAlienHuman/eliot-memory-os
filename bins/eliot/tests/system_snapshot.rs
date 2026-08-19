@@ -96,3 +96,38 @@ fn snapshot_binds_explicit_root_when_process_starts_in_non_git_directory() {
 
     let _ = fs::remove_dir_all(temp_root);
 }
+
+#[test]
+fn installation_status_requires_existing_explicit_registry() {
+    let temp_root =
+        std::env::temp_dir().join(format!("eliot-installation-status-{}", std::process::id()));
+    fs::create_dir_all(&temp_root).expect("create status fixture");
+    let registry = temp_root.join("missing.redb");
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "status",
+            "--registry",
+            registry.to_str().expect("registry is utf8"),
+        ])
+        .output()
+        .expect("run status command");
+
+    assert!(!result.status.success());
+    assert!(!registry.exists(), "status created a missing registry");
+    let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
+    assert_eq!(output["code"], "INSTALLATION_STATUS_UNAVAILABLE");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn installation_plan_rejects_relative_input() {
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .args(["installation", "plan", "--input", "plan.json"])
+        .output()
+        .expect("run plan command");
+
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("path must be absolute"));
+}
