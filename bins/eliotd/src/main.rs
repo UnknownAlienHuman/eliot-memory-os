@@ -5,6 +5,7 @@
 //! `ProcessExecutor`, or authority source.
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use eliot_governor::KernelTransitionPort;
@@ -58,7 +59,14 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let config = DaemonConfig::load_protected().map_err(|error| error.to_string())?;
+    let launch = parse_launch_args(std::env::args_os().skip(1))?;
+    let config = DaemonConfig::load_protected_bound(
+        launch.config_path,
+        &launch.config_sha256,
+        &launch.launch_nonce,
+        &launch.executable_sha256,
+    )
+    .map_err(|error| error.to_string())?;
     let kernel = DaemonKernelClient::connect(&config).map_err(|error| error.to_string())?;
     let composition = DaemonComposition::start(
         config,
@@ -110,6 +118,41 @@ fn run() -> Result<(), String> {
             Err(combined)
         }
     }
+}
+
+struct LaunchArgs {
+    config_path: PathBuf,
+    config_sha256: String,
+    launch_nonce: String,
+    executable_sha256: String,
+}
+
+fn parse_launch_args<I>(args: I) -> Result<LaunchArgs, String>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    if args.len() != 8
+        || args[0] != "--config-descriptor"
+        || args[2] != "--config-descriptor-sha256"
+        || args[4] != "--launch-nonce"
+        || args[6] != "--executable-sha256"
+    {
+        return Err("eliotd requires the exact 8-value descriptor binding contour".to_owned());
+    }
+    let text = |index: usize, label: &str| {
+        args[index]
+            .to_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{label} must be valid non-empty UTF-8"))
+    };
+    Ok(LaunchArgs {
+        config_path: PathBuf::from(text(1, "config descriptor path")?),
+        config_sha256: text(3, "config descriptor digest")?,
+        launch_nonce: text(5, "launch nonce")?,
+        executable_sha256: text(7, "executable digest")?,
+    })
 }
 
 async fn run_loop(kernel: Arc<DaemonKernelClient>) -> Result<(), String> {

@@ -25,8 +25,8 @@ pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
 pub use protocol::{
-    ContainmentAction, HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot,
-    HostKernelCandidateBinding, HostProcessBinding, HostStoreBootstrapRequirement,
+    ContainmentAction, EliotdLaunchDescriptor, HostFileIdentity, HostJobBinding, HostJobIdentity,
+    HostJobRoot, HostKernelCandidateBinding, HostProcessBinding, HostStoreBootstrapRequirement,
     KERNEL_CONTROL_PIPE, KERNEL_CONTROL_WIRE_ID, KERNEL_CONTROL_WIRE_VERSION,
     KernelActivationPermit, KernelActivationQuery, KernelActivationReceipt, KernelControlCommand,
     KernelControlRequest, KernelControlResponse, KernelReadyReceipt,

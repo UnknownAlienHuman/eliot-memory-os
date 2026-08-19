@@ -203,6 +203,30 @@ fn sha256_handle(value: &PlatformHandle, field: &str) -> Result<(), Installation
     Ok(())
 }
 
+fn validate_eliotd_launch_nonce(
+    value: &PlatformHandle,
+    field: &str,
+) -> Result<(), InstallationError> {
+    let Some(suffix) = value.as_str().strip_prefix("eliotd:") else {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "must use the opaque eliotd: correlation-nonce prefix".to_owned(),
+        });
+    };
+    if !(32..=120).contains(&suffix.len())
+        || suffix
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+        || value.as_str().contains(['/', '\\'])
+    {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "must be a bounded opaque non-path correlation nonce".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn approved_path(value: &PlatformHandle, field: &str) -> Result<(), InstallationError> {
     handle(value, field)?;
     let path = Path::new(value.as_str());
@@ -1545,7 +1569,22 @@ pub struct RuntimeLaunchDescriptor {
     pub kernel_work_root: PlatformHandle,
     /// SHA-256 digest of the approved Kernel image.
     pub kernel_artifact_digest: PlatformHandle,
-    /// Explicit concrete Store bridge configuration path.
+    /// Explicit installation-approved `eliotd.exe` path.
+    pub eliotd_executable_path: PlatformHandle,
+    /// SHA-256 digest of the approved `eliotd.exe` image.
+    pub eliotd_artifact_digest: PlatformHandle,
+    /// Explicit serialized `EliotdLaunchDescriptor` path.
+    pub eliotd_descriptor_path: PlatformHandle,
+    /// SHA-256 digest of the serialized `EliotdLaunchDescriptor` bytes.
+    pub eliotd_descriptor_digest: PlatformHandle,
+    /// Public correlation nonce embedded in the serialized eliotd descriptor.
+    /// It is not an authority credential; process/Job/pipe evidence is.
+    pub eliotd_launch_nonce: PlatformHandle,
+    /// Explicit concrete Store bridge configuration path. Its digest is the
+    /// parent [`CandidateManifest::config_digest`] binding and is checked
+    /// against the serialized eliotd descriptor by Host; it is intentionally
+    /// not duplicated here because the config digest projection contains this
+    /// launch descriptor and a second back-reference would be cyclic.
     pub store_config_path: PlatformHandle,
     /// Exact Credential Manager target provisioned for this Store generation.
     ///
@@ -1650,8 +1689,7 @@ impl RuntimeLaunchDescriptor {
         Ok(())
     }
 
-    fn expected_kernel_arguments(&self, config_path: &PlatformHandle) -> Vec<String> {
-        let _ = config_path;
+    fn expected_kernel_arguments(&self, _config_path: &PlatformHandle) -> Vec<String> {
         vec![
             "--work-root".to_owned(),
             self.kernel_work_root.as_str().to_owned(),
@@ -1663,6 +1701,12 @@ impl RuntimeLaunchDescriptor {
             self.authority_descriptor_path.as_str().to_owned(),
             "--authority-descriptor-sha256".to_owned(),
             self.authority_descriptor_digest.as_str().to_owned(),
+            "--kernel-artifact-sha256".to_owned(),
+            self.kernel_artifact_digest.as_str().to_owned(),
+            "--eliotd-descriptor".to_owned(),
+            self.eliotd_descriptor_path.as_str().to_owned(),
+            "--eliotd-descriptor-sha256".to_owned(),
+            self.eliotd_descriptor_digest.as_str().to_owned(),
         ]
     }
 
@@ -1721,6 +1765,11 @@ impl RuntimeLaunchDescriptor {
             runtime_state_roots: &'a RuntimeStateRoots,
             kernel_work_root: &'a PlatformHandle,
             kernel_artifact_digest: &'a PlatformHandle,
+            eliotd_executable_path: &'a PlatformHandle,
+            eliotd_artifact_digest: &'a PlatformHandle,
+            eliotd_descriptor_path: &'a PlatformHandle,
+            eliotd_descriptor_digest: &'a PlatformHandle,
+            eliotd_launch_nonce: &'a PlatformHandle,
             store_config_path: &'a PlatformHandle,
             store_credential_target: &'a PlatformHandle,
             store_bootstrap_descriptor_path: &'a PlatformHandle,
@@ -1747,6 +1796,11 @@ impl RuntimeLaunchDescriptor {
             runtime_state_roots: &self.runtime_state_roots,
             kernel_work_root: &self.kernel_work_root,
             kernel_artifact_digest: &self.kernel_artifact_digest,
+            eliotd_executable_path: &self.eliotd_executable_path,
+            eliotd_artifact_digest: &self.eliotd_artifact_digest,
+            eliotd_descriptor_path: &self.eliotd_descriptor_path,
+            eliotd_descriptor_digest: &self.eliotd_descriptor_digest,
+            eliotd_launch_nonce: &self.eliotd_launch_nonce,
             store_config_path: &self.store_config_path,
             store_credential_target: &self.store_credential_target,
             store_bootstrap_descriptor_path: &self.store_bootstrap_descriptor_path,
@@ -1819,6 +1873,31 @@ impl RuntimeLaunchDescriptor {
         sha256_handle(
             &self.kernel_artifact_digest,
             "runtime_launch.kernel_artifact_digest",
+        )?;
+        approved_path(
+            &self.eliotd_executable_path,
+            "runtime_launch.eliotd_executable_path",
+        )?;
+        approved_filename(
+            &self.eliotd_executable_path,
+            "eliotd.exe",
+            "runtime_launch.eliotd_executable_path",
+        )?;
+        sha256_handle(
+            &self.eliotd_artifact_digest,
+            "runtime_launch.eliotd_artifact_digest",
+        )?;
+        approved_path(
+            &self.eliotd_descriptor_path,
+            "runtime_launch.eliotd_descriptor_path",
+        )?;
+        sha256_handle(
+            &self.eliotd_descriptor_digest,
+            "runtime_launch.eliotd_descriptor_digest",
+        )?;
+        validate_eliotd_launch_nonce(
+            &self.eliotd_launch_nonce,
+            "runtime_launch.eliotd_launch_nonce",
         )?;
         handle(&self.store_config_path, "runtime_launch.store_config_path")?;
         approved_path(&self.store_config_path, "runtime_launch.store_config_path")?;
@@ -1930,6 +2009,14 @@ impl RuntimeLaunchDescriptor {
                 &self.store_bootstrap_descriptor_path,
                 "runtime_launch.store_bootstrap_descriptor_path",
             ),
+            (
+                &self.eliotd_executable_path,
+                "runtime_launch.eliotd_executable_path",
+            ),
+            (
+                &self.eliotd_descriptor_path,
+                "runtime_launch.eliotd_descriptor_path",
+            ),
             (&self.kernel_work_root, "runtime_launch.kernel_work_root"),
         ] {
             reject_authority_alias(&self.authority_descriptor_path, candidate, field)?;
@@ -1962,6 +2049,14 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.watchdog_executable_path,
                 "runtime_launch.watchdog_executable_path",
+            ),
+            (
+                &self.eliotd_executable_path,
+                "runtime_launch.eliotd_executable_path",
+            ),
+            (
+                &self.eliotd_descriptor_path,
+                "runtime_launch.eliotd_descriptor_path",
             ),
         ] {
             self.runtime_state_roots
@@ -2080,6 +2175,26 @@ impl CandidateManifest {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.store_config_path".to_owned(),
                 reason: "must exactly equal the approved manifest config_path".to_owned(),
+            });
+        }
+        if self.runtime_launch.eliotd_descriptor_path == self.config_path
+            || self.runtime_launch.eliotd_descriptor_path
+                == self.runtime_launch.authority_descriptor_path
+            || self.runtime_launch.eliotd_descriptor_path
+                == self.runtime_launch.store_bootstrap_descriptor_path
+        {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.runtime_launch.eliotd_descriptor_path".to_owned(),
+                reason: "eliotd descriptor must be distinct from approved config and authority descriptors".to_owned(),
+            });
+        }
+        if self.runtime_launch.eliotd_executable_path == self.kernel_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.store_bridge_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.canonical_store_executable_path
+        {
+            return Err(InstallationError::Duplicate {
+                kind: "manifest.named_artifact_paths".to_owned(),
+                identity: "eliotd executable aliases another approved executable".to_owned(),
             });
         }
         handle(
@@ -8795,6 +8910,11 @@ mod tests {
                     runtime_state_roots: runtime_state_roots.clone(),
                     kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
                     kernel_artifact_digest: test_handle("0".repeat(64)),
+                    eliotd_executable_path: test_path(&root, "eliotd.exe"),
+                    eliotd_artifact_digest: test_handle("8".repeat(64)),
+                    eliotd_descriptor_path: test_path(&root, "eliotd.json"),
+                    eliotd_descriptor_digest: test_handle("9".repeat(64)),
+                    eliotd_launch_nonce: test_handle(format!("eliotd:{}", "a".repeat(32))),
                     store_config_path: test_path(&root, "generation.json"),
                     store_credential_target: test_handle(
                         "eliot/store/v1/0123456789abcdef0123456789abcdef",
@@ -8816,6 +8936,12 @@ mod tests {
                         test_path(&root, "authority.json"),
                         test_handle("--authority-descriptor-sha256"),
                         test_handle("7".repeat(64)),
+                        test_handle("--kernel-artifact-sha256"),
+                        test_handle("0".repeat(64)),
+                        test_handle("--eliotd-descriptor"),
+                        test_path(&root, "eliotd.json"),
+                        test_handle("--eliotd-descriptor-sha256"),
+                        test_handle("9".repeat(64)),
                     ],
                     store_bridge_arguments: vec![
                         test_handle("--portable-dev-root"),
@@ -9545,10 +9671,11 @@ mod tests {
         *store.state.lock().unwrap_or_else(|_| unreachable!()) = Some(created.clone());
 
         let mut restarted = WindowsInstallationCoordinator::new(store.clone());
-        assert!(matches!(
-            must(restarted.drive_effect(&transaction_id)),
-            InstallationStepOutcome::Applied { .. }
-        ));
+        let restart_outcome = must(restarted.drive_effect(&transaction_id));
+        assert!(
+            matches!(restart_outcome, InstallationStepOutcome::Applied { .. }),
+            "unexpected restart outcome: {restart_outcome:?}"
+        );
         let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
         let InstallerRootPrimitiveObservation::Matching(after) =
             primitive.inspect(&spec).unwrap_or_else(|error| {
@@ -10432,6 +10559,12 @@ mod tests {
                 descriptor.authority_descriptor_path.as_str(),
                 "--authority-descriptor-sha256",
                 descriptor.authority_descriptor_digest.as_str(),
+                "--kernel-artifact-sha256",
+                descriptor.kernel_artifact_digest.as_str(),
+                "--eliotd-descriptor",
+                descriptor.eliotd_descriptor_path.as_str(),
+                "--eliotd-descriptor-sha256",
+                descriptor.eliotd_descriptor_digest.as_str(),
             ]
         );
         assert_eq!(descriptor.store_bridge_arguments[2].as_str(), "--config");
@@ -10557,7 +10690,8 @@ mod tests {
 
     #[test]
     fn runtime_launch_digest_covers_store_and_authority_inputs() {
-        let descriptor = registering_transaction().candidate_manifest.runtime_launch;
+        let transaction = registering_transaction();
+        let descriptor = transaction.candidate_manifest.runtime_launch;
         assert!(valid_installation_key(
             descriptor.descriptor_digest.as_str()
         ));
@@ -10571,11 +10705,27 @@ mod tests {
             original.as_str()
         );
 
-        let mut authority_digest = descriptor;
+        let mut authority_digest = descriptor.clone();
         authority_digest.authority_descriptor_digest = test_handle("8".repeat(64));
         assert_ne!(
             sha256_hex(&must(authority_digest.unsigned_bytes())),
             original.as_str()
+        );
+
+        let mut child_digest = descriptor.clone();
+        child_digest.eliotd_artifact_digest = test_handle("9".repeat(64));
+        assert_ne!(
+            sha256_hex(&must(child_digest.unsigned_bytes())),
+            original.as_str()
+        );
+
+        let mut child_argument_swap = descriptor;
+        let config_path = transaction.candidate_manifest.config_path;
+        child_argument_swap.kernel_arguments[11] = test_handle("9".repeat(64));
+        assert!(
+            child_argument_swap
+                .validate_for_config(&config_path)
+                .is_err()
         );
     }
 
@@ -10747,6 +10897,15 @@ mod tests {
         runtime.remove("store_credential_target");
         runtime.remove("store_bridge_arguments");
         runtime.remove("runtime_state_roots");
+        for field in [
+            "eliotd_executable_path",
+            "eliotd_artifact_digest",
+            "eliotd_descriptor_path",
+            "eliotd_descriptor_digest",
+            "eliotd_launch_nonce",
+        ] {
+            runtime.remove(field);
+        }
         let Some(manifest) = legacy["generations"][0]["manifest"].as_object_mut() else {
             panic!("v1 fixture manifest");
         };
@@ -10784,6 +10943,15 @@ mod tests {
             panic!("pre-split fixture runtime launch");
         };
         runtime.remove("store_credential_target");
+        for field in [
+            "eliotd_executable_path",
+            "eliotd_artifact_digest",
+            "eliotd_descriptor_path",
+            "eliotd_descriptor_digest",
+            "eliotd_launch_nonce",
+        ] {
+            runtime.remove(field);
+        }
         let bridge_arguments = runtime
             .remove("store_bridge_arguments")
             .unwrap_or_else(|| panic!("pre-split bridge arguments"));
@@ -10816,6 +10984,15 @@ mod tests {
             panic!("pre-credential-binding fixture runtime launch");
         };
         runtime.remove("store_credential_target");
+        for field in [
+            "eliotd_executable_path",
+            "eliotd_artifact_digest",
+            "eliotd_descriptor_path",
+            "eliotd_descriptor_digest",
+            "eliotd_launch_nonce",
+        ] {
+            runtime.remove(field);
+        }
         value
     }
 

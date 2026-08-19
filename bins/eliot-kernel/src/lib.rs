@@ -29,11 +29,12 @@ use eliot_kernel_core::{
     process_admission_digest,
 };
 use eliot_kernel_service::{
-    EbpCanonicalStoreClient, HostKernelCandidateBinding, HostStoreBootstrapRequirement,
-    KERNEL_CONTROL_PIPE, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
-    KernelControlResponse, KernelReadyReceipt, KernelService, KernelServiceError,
-    KernelServiceState, ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest,
-    ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff, StoreClientError,
+    EbpCanonicalStoreClient, EliotdLaunchDescriptor, HostKernelCandidateBinding,
+    HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationReceipt,
+    KernelControlCommand, KernelControlRequest, KernelControlResponse, KernelReadyReceipt,
+    KernelService, KernelServiceError, KernelServiceState, ProcessAuthorityHandoffDescriptor,
+    ProcessExecutionRequest, ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
+    StoreClientError,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
@@ -47,14 +48,14 @@ use eliot_platform_windows::{
     ProtectedPathLease, ProtectedSecret, RecoverableJobBinding, RecoverableJobObject,
     RetainedProcessPathLease, UserOwnedPathLease, UserOwnedRootLease, WindowsPlatform,
 };
-#[cfg(test)]
-use eliot_process::ProcessIntent;
 use eliot_process::{
-    DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation, KernelDispatchKey,
+    ActionLeaseRef, DispatchAuthorityId, DispatchValidationContext, EnvironmentInheritance,
+    EnvironmentProjection, FencingToken, Generation, ImageId, JobId, KernelDispatchKey,
     PermitIssuance, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest,
-    ProcessExecutionError, ProcessExecutor, ProcessLaunchAdmission, ProcessOwnerBinding,
-    ProcessRequest, ProcessSessionBinding, ProcessStartReceipt, SuspendedLaunchEvidence,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessLaunchAdmission,
+    ProcessOwnerBinding, ProcessRequest, ProcessSessionBinding, ProcessStartReceipt, ProcessTreeId,
+    ResourceLimits, SessionId, SuspendedLaunchEvidence, SuspendedProcessIdentity,
+    ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
@@ -74,7 +75,10 @@ use sha2::{Digest as _, Sha256};
 #[cfg(windows)]
 use eliot_ipc::{NamedPipeServer, NamedPipeTransport};
 #[cfg(windows)]
-use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
+use eliot_platform_windows::{
+    NamedPipePeerExpectation, current_process_named_pipe_expectation,
+    observe_named_pipe_peer_process_in_job,
+};
 
 /// Stable Kernel process identity and wire revision.
 pub const SERVICE_NAME: &str = "eliot-kernel";
@@ -83,7 +87,6 @@ pub const DEFAULT_PIPE_NAME: &str = KERNEL_CONTROL_PIPE;
 const STORE_BRIDGE_ROUTE: &str = "store_bridge";
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
-#[cfg(any(windows, test))]
 const fn probe_ready_state_admitted(state: KernelServiceState) -> bool {
     matches!(
         state,
@@ -136,6 +139,13 @@ pub struct KernelConfig {
     /// Host-approved canonical-store binding. No store gateway is admitted
     /// until this requirement is injected explicitly.
     pub store_bootstrap: Option<HostStoreBootstrapRequirement>,
+    /// Host/installer-approved `eliotd` child launch contour.  Integrated
+    /// startup must inject this explicitly; there is no path or argv default.
+    pub daemon_launch: Option<EliotdLaunchDescriptor>,
+    /// Independent digest of the Kernel executable advertised in the
+    /// daemon's generation snapshot. This is a different artifact domain
+    /// from the `eliotd` child executable digest.
+    pub kernel_artifact_sha256: Option<String>,
 }
 
 impl KernelConfig {
@@ -145,6 +155,8 @@ impl KernelConfig {
             work_root: work_root.into(),
             pipe_name: DEFAULT_PIPE_NAME.to_owned(),
             store_bootstrap: None,
+            daemon_launch: None,
+            kernel_artifact_sha256: None,
         }
     }
 
@@ -161,6 +173,20 @@ impl KernelConfig {
     #[must_use]
     pub fn with_pipe_name(mut self, pipe_name: impl Into<String>) -> Self {
         self.pipe_name = pipe_name.into();
+        self
+    }
+
+    /// Injects the exact approved `eliotd` child launch descriptor.
+    #[must_use]
+    pub fn with_daemon_launch(mut self, launch: EliotdLaunchDescriptor) -> Self {
+        self.daemon_launch = Some(launch);
+        self
+    }
+
+    /// Injects the independently approved Kernel executable digest.
+    #[must_use]
+    pub fn with_kernel_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.kernel_artifact_sha256 = Some(digest.into());
         self
     }
 }
@@ -273,12 +299,29 @@ pub struct KernelComposition {
     front_door_policy: Mutex<ServerHandshakePolicy>,
     process_gateway: Option<Arc<ProcessExecutionGateway>>,
     store_bootstrap: Option<HostStoreBootstrapRequirement>,
+    daemon_launch: Option<EliotdLaunchDescriptor>,
+    kernel_artifact_sha256: Option<String>,
+    daemon_runtime: Mutex<DaemonRuntimeState>,
     #[cfg(windows)]
     store_handoff: Mutex<Option<StoreBootstrapHandoff>>,
     approved_config_hash: Option<String>,
     canonical_store_claimed: AtomicBool,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DaemonRuntimeStatus {
+    NotLaunched,
+    Running,
+    Ready,
+    Degraded(String),
+    Failed(String),
+}
+
+struct DaemonRuntimeState {
+    status: DaemonRuntimeStatus,
+    receipt: Option<ProcessStartReceipt>,
 }
 
 /// Result of the closed Kernel semantic gateway for one authenticated frame.
@@ -298,6 +341,17 @@ pub enum KernelFrameAction {
         request: ProcessExecutionRequest,
         /// Server-derived ephemeral session binding; never wire supplied.
         session_binding: ProcessSessionBinding,
+    },
+    /// Execute one narrow authenticated `eliotd` lifecycle operation.  The
+    /// operation is handled by Kernel's daemon contour, while Store-backed
+    /// health remains an asynchronous physical probe.
+    Daemon {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name from the daemon application wire.
+        operation: String,
+        /// Bounded operation payload.
+        payload: serde_json::Value,
     },
     /// Return a typed rejection, then fence the connection.
     Fence(Frame),
@@ -2117,14 +2171,42 @@ impl KernelComposition {
     ) -> Result<Self, KernelBuildError> {
         let work_root = config.work_root.clone();
         let store_bootstrap = config.store_bootstrap.clone();
-        let approved_config_hash = std::env::var("ELIOT_GENERATION_CONFIG_DIGEST").ok();
-        if let Some(config_hash) = &approved_config_hash
-            && !is_lower_sha256(config_hash)
+        let daemon_launch = config.daemon_launch.clone();
+        let kernel_artifact_sha256 = config.kernel_artifact_sha256.clone();
+        if let Some(launch) = &daemon_launch {
+            launch
+                .validate()
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+            if store_bootstrap.as_ref().is_some_and(|requirement| {
+                requirement.state_fence.authority_epoch != launch.authority_epoch
+                    || requirement.state_fence.resource_generation != launch.generation
+            }) {
+                return Err(KernelBuildError::Service(
+                    "eliotd launch descriptor does not match Store bootstrap fence".to_owned(),
+                ));
+            }
+        }
+        if let Some(digest) = &kernel_artifact_sha256
+            && !is_lower_sha256(digest)
         {
             return Err(KernelBuildError::Service(
-                "ELIOT_GENERATION_CONFIG_DIGEST is not a lowercase SHA-256 digest".to_owned(),
+                "Kernel artifact digest must be lowercase SHA-256".to_owned(),
             ));
         }
+        if daemon_launch.is_some() && kernel_artifact_sha256.is_none() {
+            return Err(KernelBuildError::Service(
+                "integrated eliotd launch requires an independent Kernel artifact digest"
+                    .to_owned(),
+            ));
+        }
+        // The integrated contour has no environment/default authority. The
+        // daemon config digest is carried by the Host-approved launch
+        // descriptor and is checked again by eliotd when its retained file is
+        // opened. Standalone test compositions intentionally have no approved
+        // config hash and therefore cannot admit an integrated daemon.
+        let approved_config_hash = daemon_launch
+            .as_ref()
+            .map(|launch| launch.config_descriptor_sha256.clone());
         let _ = &platform;
         let ipc = IpcImplementation::new(config.pipe_name)?;
         // An integrated Kernel must construct its active store route from the
@@ -2171,13 +2253,13 @@ impl KernelComposition {
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let module_id =
             ContractId::new("eliotd").map_err(|error| KernelBuildError::Core(error.to_string()))?;
-        let artifact_id = match std::env::var("ELIOT_APPROVED_ARTIFACT") {
-            Ok(value) => {
-                ArtifactId::new(value).map_err(|error| KernelBuildError::Core(error.to_string()))?
-            }
-            Err(_) => ArtifactId::new("eliotd-child-generation")
-                .map_err(|error| KernelBuildError::Core(error.to_string()))?,
-        };
+        let artifact_id = daemon_launch
+            .as_ref()
+            .map_or_else(
+                || ArtifactId::new("eliot-kernel-standalone"),
+                |launch| ArtifactId::new(launch.executable_sha256.clone()),
+            )
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         let module_generation = ModuleGeneration {
             module_id: module_id.clone(),
             generation,
@@ -2193,7 +2275,10 @@ impl KernelComposition {
             },
             module_id: module_id.as_str().to_owned(),
             module_generation,
-            launch_nonce: format!("kernel-{}", std::process::id()),
+            launch_nonce: daemon_launch.as_ref().map_or_else(
+                || format!("kernel-{}", std::process::id()),
+                |launch| launch.launch_nonce.as_str().to_owned(),
+            ),
             allowed_capabilities: vec!["daemon".to_owned()],
             allowed_privacy_classes: vec!["PUBLIC".to_owned()],
             allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
@@ -2204,6 +2289,10 @@ impl KernelComposition {
                 "service": SERVICE_NAME,
                 "protocol": PROTOCOL_VERSION,
                 "generation": generation.value(),
+                "authority_epoch": authority_epoch.value(),
+                "artifact_digest": kernel_artifact_sha256
+                    .as_deref()
+                    .unwrap_or("eliot-kernel-standalone"),
             }),
             max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
                 .map_err(|_| KernelBuildError::Core("maximum frame exceeds u32".to_owned()))?,
@@ -2244,6 +2333,12 @@ impl KernelComposition {
             front_door_policy: Mutex::new(policy),
             process_gateway,
             store_bootstrap,
+            daemon_launch,
+            kernel_artifact_sha256,
+            daemon_runtime: Mutex::new(DaemonRuntimeState {
+                status: DaemonRuntimeStatus::NotLaunched,
+                receipt: None,
+            }),
             #[cfg(windows)]
             store_handoff: Mutex::new(None),
             approved_config_hash,
@@ -2310,6 +2405,201 @@ impl KernelComposition {
     #[must_use]
     pub fn process_execution_configured(&self) -> bool {
         self.process_gateway.is_some()
+    }
+
+    /// Returns the immutable approved child contour, if integrated startup
+    /// supplied one.  Absence is an integration error, not a permission to
+    /// infer a sibling executable.
+    #[must_use]
+    pub fn daemon_launch(&self) -> Option<&EliotdLaunchDescriptor> {
+        self.daemon_launch.as_ref()
+    }
+
+    /// Launches the approved `eliotd` through the existing Kernel process
+    /// authority.  Store bootstrap must already be connected; the child is
+    /// never spawned from a raw command or an ambient environment.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the launch admission sequence is intentionally contiguous so every authority check precedes the single process start"
+    )]
+    pub async fn launch_eliotd(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
+        let launch = self.daemon_launch.as_ref().ok_or_else(|| {
+            KernelBuildError::Service("eliotd launch descriptor is required".to_owned())
+        })?;
+        launch
+            .validate()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let gateway = self.process_gateway.as_ref().ok_or_else(|| {
+            KernelBuildError::Service(
+                "process authority is required before eliotd launch".to_owned(),
+            )
+        })?;
+        {
+            let state = self.daemon_runtime.lock().map_err(|_| {
+                KernelBuildError::Service("daemon runtime lock poisoned".to_owned())
+            })?;
+            if state.receipt.is_some() {
+                return Err(KernelBuildError::Service(
+                    "eliotd launch was already admitted for this Kernel generation".to_owned(),
+                ));
+            }
+        }
+        let generation = Generation::new(launch.generation.value())
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let launch_identity = sha256_hex(launch.launch_nonce.as_str().as_bytes());
+        let operation_id = eliot_process::OperationId::new(format!(
+            "eliotd-launch-{}-{}",
+            generation.get(),
+            &launch_identity[..16]
+        ))
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let process_tree_id = ProcessTreeId::new(format!("eliotd-tree-{}", &launch_identity[..16]))
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let job_id = JobId::new(format!("eliotd-job-{}", &launch_identity[..16]))
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let image_id = ImageId::new(format!("eliotd-image-{}", &launch_identity[..16]))
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let session_id = SessionId::new(format!("eliotd-session-{}", &launch_identity[..16]))
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let arguments = launch
+            .arguments
+            .iter()
+            .map(|argument| argument.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            process_tree_id,
+            job_id,
+            image_id,
+            session_id,
+            generation,
+            launch.executable.as_str(),
+            launch.executable_sha256.clone(),
+            arguments,
+            launch.working_directory.as_str(),
+            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+            ResourceLimits::new(86_400_000, None, None, 64 * 1024, 64 * 1024, 4)
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+        )
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let state_fence = FencingToken::new(
+            launch.authority_epoch.value(),
+            generation,
+            format!("eliotd-launch-fence-{launch_identity}"),
+        )
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let admission = ProcessExecutionAdmissionRequest::new(
+            ACTIVE_DAEMON_CALLER,
+            intent,
+            ActionLeaseRef::new(format!("eliotd-kernel-launch-{launch_identity}"))
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+            state_fence,
+            unix_ms().saturating_add(60_000),
+        )
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let kernel_expectation = current_process_named_pipe_expectation()
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+        let owner = ProcessOwnerBinding::new(
+            ACTIVE_DAEMON_CALLER,
+            stable_owner_principal_digest(
+                kernel_expectation.expected_sid(),
+                ACTIVE_DAEMON_CALLER,
+                launch.authority_epoch.value(),
+                generation,
+            ),
+            launch.authority_epoch.value(),
+            generation,
+        )
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let proof = Self::retain_eliotd_path_proof(launch, &admission)?;
+        let receipt = gateway
+            .start(&owner, admission, proof)
+            .await
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let mut state = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| KernelBuildError::Service("daemon runtime lock poisoned".to_owned()))?;
+        state.status = DaemonRuntimeStatus::Running;
+        state.receipt = Some(receipt.clone());
+        Ok(receipt)
+    }
+
+    #[cfg(windows)]
+    fn retain_eliotd_path_proof(
+        launch: &EliotdLaunchDescriptor,
+        admission: &ProcessExecutionAdmissionRequest,
+    ) -> Result<ProcessPathProof, KernelBuildError> {
+        let executable = PathBuf::from(launch.executable.as_str());
+        let working_directory = PathBuf::from(launch.working_directory.as_str());
+        let daemon_platform =
+            WindowsPlatform::new(working_directory.clone()).map_err(KernelBuildError::Platform)?;
+        let lease = daemon_platform
+            .retain_process_path_lease(
+                &executable,
+                &working_directory,
+                admission.intent().executable_sha256(),
+            )
+            .map_err(KernelBuildError::Platform)?;
+        Ok(ProcessPathProof {
+            executable,
+            working_directory,
+            lease: Arc::new(lease),
+        })
+    }
+
+    /// Returns whether `eliotd` has completed its authenticated ready report.
+    #[must_use]
+    pub fn daemon_ready(&self) -> bool {
+        self.daemon_runtime
+            .lock()
+            .is_ok_and(|state| state.status == DaemonRuntimeStatus::Ready)
+    }
+
+    /// Records an authenticated daemon-ready report after generation checks
+    /// have been performed by the front-door dispatcher.
+    pub fn mark_daemon_ready(&self) -> Result<(), KernelServiceError> {
+        let mut state = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?;
+        if state.receipt.is_none() || state.status != DaemonRuntimeStatus::Running {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        state.status = DaemonRuntimeStatus::Ready;
+        Ok(())
+    }
+
+    /// Records a bounded authenticated daemon degradation.
+    pub fn mark_daemon_degraded(&self, reason: String) -> Result<(), KernelServiceError> {
+        let mut state = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?;
+        if state.receipt.is_none() {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        state.status = DaemonRuntimeStatus::Degraded(reason);
+        Ok(())
+    }
+
+    /// Records a bounded authenticated daemon fatal disposition and fences
+    /// Kernel normal admission.  Kernel remains the sole lifecycle owner.
+    pub fn mark_daemon_failed(&self, reason: String) -> Result<(), KernelServiceError> {
+        let mut state = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?;
+        if state.receipt.is_none() {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        state.status = DaemonRuntimeStatus::Failed(reason.clone());
+        self.service
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?
+            .fence_generation(reason)
     }
 
     /// Connects and retains the one Host-approved canonical-store client and
@@ -2459,11 +2749,67 @@ impl KernelComposition {
         if generation_poison.is_some() {
             return Err(TransportError::SessionFenced);
         }
+        #[cfg(windows)]
+        if client.module_bridge_identity == ACTIVE_DAEMON_CALLER {
+            self.validate_eliotd_peer(&peer, client)?;
+        }
         let policy = self
             .front_door_policy
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         Session::establish_with_server(connection_id, peer, client, &policy)
+    }
+
+    #[cfg(windows)]
+    fn validate_eliotd_peer(
+        &self,
+        peer: &PeerIdentity,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<(), TransportError> {
+        let launch = self
+            .daemon_launch
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if client.artifact_hash.as_str() != policy.module_generation.artifact_id.as_str()
+            || client.module_generation.artifact_id.as_str() != launch.executable_sha256.as_str()
+            || client.module_generation.generation != launch.generation
+            || client.authority_epoch != launch.authority_epoch
+            || client.launch_nonce.as_str() != launch.launch_nonce.as_str()
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let peer_binding = peer
+            .process_binding()
+            .ok_or(TransportError::PeerIdentityUnavailable)?;
+        let receipt = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .receipt
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        if peer_binding.process_id() != receipt.identity().pid() {
+            return Err(TransportError::SessionFenced);
+        }
+        let observed = observe_named_pipe_peer_process_in_job(
+            receipt.binding().job_id().as_str(),
+            receipt.identity().pid(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let observed_binding = observed.process_binding();
+        if observed_binding.process_id() != peer_binding.process_id()
+            || observed_binding.start_time_100ns() != peer_binding.start_time_100ns()
+            || !observed_binding
+                .image_path()
+                .eq_ignore_ascii_case(launch.executable.as_str())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2483,6 +2829,10 @@ impl KernelComposition {
     /// shutdown requests, are rejected and fenced until the durable
     /// execution gateway is supplied; this boundary never fabricates
     /// execution success or accepts a peer-owned shutdown authority.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed dispatch matrix keeps session, identity, and service-state gates in one auditable order"
+    )]
     pub fn dispatch_frame(
         &self,
         session: &Session,
@@ -2522,6 +2872,50 @@ impl KernelComposition {
                     "authority_epoch": session.authority_epoch,
                 }),
             )?));
+        }
+
+        if frame.kind == FrameKind::Request && frame.message_type == MessageType::Execute {
+            let request_id = frame
+                .request_id
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            let payload = match &frame.payload {
+                ProtocolPayload::Json(payload) => payload.clone(),
+                _ => return Err(TransportError::SessionFenced),
+            };
+            let operation = payload
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?;
+            if session.module_generation.module_id.as_str() == ACTIVE_DAEMON_CALLER
+                && matches!(
+                    operation,
+                    "snapshot" | "daemon_ready" | "health" | "daemon_degraded" | "daemon_fatal"
+                )
+            {
+                if !probe_ready_state_admitted(
+                    self.service_state()
+                        .map_err(|_| TransportError::SessionFenced)?,
+                ) {
+                    return Err(TransportError::SessionFenced);
+                }
+                let identity = frame
+                    .request_identity
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                if !session
+                    .module_generation
+                    .state_fence
+                    .is_compatible_with(&identity.request.state_fence)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                return Ok(KernelFrameAction::Daemon {
+                    request_id,
+                    operation: operation.to_owned(),
+                    payload,
+                });
+            }
         }
 
         if (frame.kind == FrameKind::Request && frame.message_type == MessageType::Execute)
@@ -2660,6 +3054,152 @@ impl KernelComposition {
                 eliot_kernel_service::ProcessExecutionRejection::from_error(&error),
             )
         })
+    }
+
+    /// Executes one authenticated daemon lifecycle request.  Only the
+    /// narrow handshake/health dispositions are handled here; semantic
+    /// Governor mutations remain owned by `eliotd` and the existing Kernel
+    /// transition gateway.
+    pub async fn execute_daemon_request(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<Frame, TransportError> {
+        if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER {
+            return Err(TransportError::SessionFenced);
+        }
+        let result = match operation {
+            "snapshot" => self.daemon_snapshot().map(|value| {
+                serde_json::json!({
+                    "status": "known",
+                    "value": value,
+                    "recovery": null,
+                })
+            }),
+            "daemon_ready" => {
+                let generation = payload
+                    .get("generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(TransportError::SessionFenced)?;
+                let authority_epoch = payload
+                    .get("authority_epoch")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(TransportError::SessionFenced)?;
+                if generation != session.module_generation.generation.value()
+                    || authority_epoch != session.authority_epoch
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                self.mark_daemon_ready()
+                    .map_err(|_| TransportError::SessionFenced)
+                    .map(|()| {
+                        serde_json::json!({
+                            "status": "known",
+                            "value": { "accepted": true },
+                            "recovery": null,
+                        })
+                    })
+            }
+            "health" => self
+                .daemon_health()
+                .await
+                .map_err(|_| TransportError::SessionFenced)
+                .map(|value| {
+                    serde_json::json!({
+                        "status": "known",
+                        "value": value,
+                        "recovery": null,
+                    })
+                }),
+            "daemon_degraded" => {
+                let reason = payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| {
+                        !value.trim().is_empty()
+                            && value.len() <= 512
+                            && !value.chars().any(char::is_control)
+                    })
+                    .ok_or(TransportError::SessionFenced)?
+                    .to_owned();
+                self.mark_daemon_degraded(reason)
+                    .map_err(|_| TransportError::SessionFenced)
+                    .map(|()| {
+                        serde_json::json!({
+                            "status": "known",
+                            "value": { "accepted": true },
+                            "recovery": null,
+                        })
+                    })
+            }
+            "daemon_fatal" => {
+                let reason = payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| {
+                        !value.trim().is_empty()
+                            && value.len() <= 512
+                            && !value.chars().any(char::is_control)
+                    })
+                    .ok_or(TransportError::SessionFenced)?
+                    .to_owned();
+                self.mark_daemon_failed(reason)
+                    .map_err(|_| TransportError::SessionFenced)
+                    .map(|()| {
+                        serde_json::json!({
+                            "status": "known",
+                            "value": { "accepted": true },
+                            "recovery": null,
+                        })
+                    })
+            }
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let value = result.map_err(|_| TransportError::SessionFenced)?;
+        let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+        frame.request_id = Some(request_id);
+        frame.validate()?;
+        Ok(frame)
+    }
+
+    fn daemon_snapshot(&self) -> Result<serde_json::Value, TransportError> {
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let kernel_artifact_digest = policy
+            .config_snapshot
+            .get("artifact_digest")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "service": SERVICE_NAME,
+            "protocol": PROTOCOL_VERSION,
+            "generation": policy.module_generation.generation.value(),
+            "authority_epoch": policy.module_generation.state_fence.authority_epoch.value(),
+            // This is the Kernel peer artifact domain. The daemon child
+            // artifact remains in module_generation.artifact_id and ClientHello.
+            "artifact_digest": kernel_artifact_digest,
+        }))
+    }
+
+    #[cfg(windows)]
+    async fn daemon_health(&self) -> Result<eliot_store_api::StoreHealth, KernelServiceError> {
+        let gateway = self
+            .canonical_store_gateway
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("store gateway lock poisoned".to_owned()))?
+            .clone()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        gateway.health().await.map_err(KernelServiceError::Platform)
+    }
+
+    #[cfg(not(windows))]
+    async fn daemon_health(&self) -> Result<eliot_store_api::StoreHealth, KernelServiceError> {
+        Err(KernelServiceError::ReadinessNotProven)
     }
 
     fn retain_process_path_proof(
@@ -2985,6 +3525,33 @@ impl KernelComposition {
                 field: "store_state_fence",
             });
         }
+        let daemon_evidence = if self.daemon_launch.is_some() {
+            let daemon_state = self.daemon_runtime.lock().map_err(|_| {
+                KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
+            })?;
+            let daemon_receipt = daemon_state
+                .receipt
+                .as_ref()
+                .filter(|_| {
+                    matches!(
+                        &daemon_state.status,
+                        DaemonRuntimeStatus::Ready | DaemonRuntimeStatus::Degraded(_)
+                    )
+                })
+                .ok_or(KernelServiceError::ReadinessNotProven)?;
+            Some(
+                PlatformHandle::new(format!(
+                    "eliotd-ready:{}:{}",
+                    daemon_receipt.identity().pid(),
+                    self.daemon_launch
+                        .as_ref()
+                        .map_or("", |launch| launch.descriptor_sha256.as_str()),
+                ))
+                .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let process_id = PlatformHandle::new(format!(
             "pid:{}:start:{}",
             current.process_id, current.start_time_100ns
@@ -3023,6 +3590,9 @@ impl KernelComposition {
             ))
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
         ]);
+        if let Some(daemon_evidence) = daemon_evidence {
+            evidence_refs.push(daemon_evidence);
+        }
         let activation = self
             .service
             .lock()
@@ -3087,8 +3657,10 @@ impl KernelComposition {
             if request.generation != policy.module_generation.generation
                 || request.candidate.kernel_epoch.value() < policy_epoch.value()
                 || (!reconcile && request.candidate.kernel_epoch != policy_epoch)
-                || request.candidate.artifact_hash.as_str()
-                    != policy.module_generation.artifact_id.as_str()
+                || self
+                    .kernel_artifact_sha256
+                    .as_deref()
+                    .is_some_and(|digest| request.candidate.artifact_hash.as_str() != digest)
                 || self
                     .approved_config_hash
                     .as_deref()
@@ -3153,6 +3725,14 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?,
             _ => None,
         };
+        #[cfg(windows)]
+        if matches!(&request.command, KernelControlCommand::Activate(_))
+            && self.daemon_launch.is_some()
+        {
+            self.launch_eliotd()
+                .await
+                .map_err(|_| TransportError::SessionFenced)?;
+        }
         if let Some(receipt) = &receipt {
             self.service
                 .lock()

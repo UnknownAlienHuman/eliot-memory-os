@@ -15,6 +15,7 @@ use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use crate::{KernelServiceError, KernelServiceState, validate_text};
 
@@ -28,6 +29,12 @@ pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 2;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
+/// Stable identity for the Kernel-owned `eliotd` launch descriptor.
+pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.eliotd-launch";
+/// Version of the exact `eliotd` child launch contract.
+pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION: u16 = 1;
+/// Maximum number of argv entries admitted for one daemon launch.
+const MAX_ELIOTD_LAUNCH_ARGUMENTS: usize = 64;
 const PROBE_BINDING_PREFIXES: [&str; 5] = [
     "kernel-probe-request:",
     "kernel-probe-generation:",
@@ -35,6 +42,212 @@ const PROBE_BINDING_PREFIXES: [&str; 5] = [
     "kernel-probe-config:",
     "kernel-probe-artifact:",
 ];
+
+/// Immutable, secret-free launch material for the Kernel-owned `eliotd`
+/// child.  The descriptor is loaded from an independently digest-bound file;
+/// it is not inferred from the Kernel executable, current directory, or
+/// environment.  Host/installer must add this descriptor to the approved
+/// generation before the integrated service can start.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EliotdLaunchDescriptor {
+    /// Descriptor wire identity.
+    pub wire_id: String,
+    /// Descriptor wire version.
+    pub wire_version: u16,
+    /// Absolute approved `eliotd.exe` path.
+    pub executable: PlatformHandle,
+    /// Lowercase SHA-256 digest of the approved executable bytes.
+    pub executable_sha256: String,
+    /// Exact child argv, excluding argv[0].
+    pub arguments: Vec<PlatformHandle>,
+    /// Absolute approved child working directory.
+    pub working_directory: PlatformHandle,
+    /// Exact protected daemon configuration path consumed by `eliotd`.
+    pub config_descriptor: PlatformHandle,
+    /// Lowercase SHA-256 digest of the exact daemon configuration bytes.
+    pub config_descriptor_sha256: String,
+    /// Public launch-correlation nonce carried through the explicit argv
+    /// contract. It is not a secret or an authority credential; authenticated
+    /// process/Job/pipe evidence remains the authority proof.
+    pub launch_nonce: PlatformHandle,
+    /// Kernel authority epoch bound to this child generation.
+    pub authority_epoch: AuthorityEpoch,
+    /// Kernel resource generation bound to this child generation.
+    pub generation: ResourceGeneration,
+    /// Lowercase SHA-256 digest over all descriptor fields except this field.
+    pub descriptor_sha256: String,
+}
+
+impl EliotdLaunchDescriptor {
+    /// Current descriptor contract version.
+    pub const CONTRACT_VERSION: u16 = ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION;
+
+    /// Returns canonical bytes covered by `descriptor_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, KernelServiceError> {
+        let mut unsigned = self.clone();
+        unsigned.descriptor_sha256.clear();
+        serde_json::to_vec(&unsigned).map_err(|_| KernelServiceError::InvalidField {
+            field: "eliotd.descriptor_sha256",
+            reason: "cannot canonicalize descriptor",
+        })
+    }
+
+    /// Computes the canonical descriptor digest.
+    pub fn compute_digest(&self) -> Result<String, KernelServiceError> {
+        Ok(sha256_hex(&self.canonical_unsigned_bytes()?))
+    }
+
+    /// Populates the canonical descriptor digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, KernelServiceError> {
+        self.descriptor_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the exact launch contour without opening any path.
+    ///
+    /// Physical no-follow path identity and executable bytes are proven by
+    /// Kernel immediately before process-authority issuance.  This method
+    /// only validates the closed wire shape and required explicit argv
+    /// bindings.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        if self.wire_id != ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "eliotd.wire",
+                reason: "unsupported launch descriptor wire",
+            });
+        }
+        for (value, field) in [
+            (&self.executable, "eliotd.executable"),
+            (&self.working_directory, "eliotd.working_directory"),
+            (&self.config_descriptor, "eliotd.config_descriptor"),
+        ] {
+            handle(value, field)?;
+            if !is_absolute_windows_path(value.as_str()) {
+                return Err(KernelServiceError::InvalidField {
+                    field,
+                    reason: "must be an absolute Windows path",
+                });
+            }
+        }
+        validate_launch_nonce(&self.launch_nonce)?;
+        validate_digest(&self.executable_sha256, "eliotd.executable_sha256")?;
+        validate_digest(
+            &self.config_descriptor_sha256,
+            "eliotd.config_descriptor_sha256",
+        )?;
+        validate_digest(&self.descriptor_sha256, "eliotd.descriptor_sha256")?;
+        if self.arguments.is_empty() || self.arguments.len() > MAX_ELIOTD_LAUNCH_ARGUMENTS {
+            return Err(KernelServiceError::InvalidField {
+                field: "eliotd.arguments",
+                reason: "must be bounded and non-empty",
+            });
+        }
+        for argument in &self.arguments {
+            handle(argument, "eliotd.arguments")?;
+            if argument.as_str().chars().any(char::is_control) {
+                return Err(KernelServiceError::InvalidField {
+                    field: "eliotd.arguments",
+                    reason: "must not contain control characters",
+                });
+            }
+        }
+        require_exact_argument(
+            &self.arguments,
+            "--config-descriptor",
+            self.config_descriptor.as_str(),
+        )?;
+        require_exact_argument(
+            &self.arguments,
+            "--config-descriptor-sha256",
+            self.config_descriptor_sha256.as_str(),
+        )?;
+        require_exact_argument(
+            &self.arguments,
+            "--executable-sha256",
+            self.executable_sha256.as_str(),
+        )?;
+        require_exact_argument(
+            &self.arguments,
+            "--launch-nonce",
+            self.launch_nonce.as_str(),
+        )?;
+        if self.generation.value() == 0 || self.authority_epoch.value() == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "eliotd.generation",
+                reason: "generation and authority epoch must be non-zero",
+            });
+        }
+        if self.compute_digest()? != self.descriptor_sha256 {
+            return Err(KernelServiceError::InvalidField {
+                field: "eliotd.descriptor_sha256",
+                reason: "descriptor digest mismatch",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_digest(value: &str, field: &'static str) -> Result<(), KernelServiceError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(KernelServiceError::InvalidField {
+            field,
+            reason: "must be a lowercase SHA-256 digest",
+        });
+    }
+    Ok(())
+}
+
+fn validate_launch_nonce(value: &PlatformHandle) -> Result<(), KernelServiceError> {
+    handle(value, "eliotd.launch_nonce")?;
+    let nonce = value.as_str();
+    let suffix = nonce
+        .strip_prefix("eliotd:")
+        .ok_or(KernelServiceError::InvalidField {
+            field: "eliotd.launch_nonce",
+            reason: "must use the opaque eliotd launch-correlation format",
+        })?;
+    if suffix.len() < 32
+        || suffix.len() > 120
+        || suffix
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')))
+    {
+        return Err(KernelServiceError::InvalidField {
+            field: "eliotd.launch_nonce",
+            reason: "must be bounded opaque text with at least 32 safe bytes",
+        });
+    }
+    Ok(())
+}
+
+fn is_absolute_windows_path(value: &str) -> bool {
+    value.len() >= 3 && value.as_bytes()[1] == b':' && matches!(value.as_bytes()[2], b'\\' | b'/')
+        || Path::new(value).is_absolute()
+}
+
+fn require_exact_argument(
+    arguments: &[PlatformHandle],
+    flag: &str,
+    expected: &str,
+) -> Result<(), KernelServiceError> {
+    let mut matches = arguments
+        .windows(2)
+        .filter(|pair| pair[0].as_str() == flag && pair[1].as_str() == expected);
+    if matches.next().is_none() || matches.next().is_some() {
+        return Err(KernelServiceError::InvalidField {
+            field: "eliotd.arguments",
+            reason: "required binding is missing or duplicated",
+        });
+    }
+    Ok(())
+}
 
 /// Handle-bound process identity carried as an inert Host claim.
 ///
@@ -1525,6 +1738,55 @@ mod tests {
 
     fn handle_value(value: &str) -> PlatformHandle {
         PlatformHandle::new(value).expect("test handle")
+    }
+
+    fn eliotd_launch_descriptor() -> EliotdLaunchDescriptor {
+        let nonce = "eliotd:0123456789abcdef0123456789abcdef";
+        let executable_sha256 = "a".repeat(64);
+        let config_descriptor_sha256 = "b".repeat(64);
+        EliotdLaunchDescriptor {
+            wire_id: ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID.to_owned(),
+            wire_version: ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION,
+            executable: handle_value(r"C:\Eliot\eliotd.exe"),
+            executable_sha256: executable_sha256.clone(),
+            arguments: vec![
+                handle_value("--config-descriptor"),
+                handle_value(r"C:\ProgramData\Eliot\governor\eliotd.json"),
+                handle_value("--config-descriptor-sha256"),
+                handle_value(&config_descriptor_sha256),
+                handle_value("--launch-nonce"),
+                handle_value(nonce),
+                handle_value("--executable-sha256"),
+                handle_value(&executable_sha256),
+            ],
+            working_directory: handle_value(r"C:\Eliot"),
+            config_descriptor: handle_value(r"C:\ProgramData\Eliot\governor\eliotd.json"),
+            config_descriptor_sha256,
+            launch_nonce: handle_value(nonce),
+            authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+            generation: ResourceGeneration::new(1).expect("generation"),
+            descriptor_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("descriptor digest")
+    }
+
+    #[test]
+    fn eliotd_descriptor_uses_opaque_public_nonce_not_a_path_authority() {
+        let descriptor = eliotd_launch_descriptor();
+        assert!(descriptor.validate().is_ok());
+
+        let mut substituted = descriptor.clone();
+        substituted.launch_nonce = handle_value(r"eliotd:C:\ProgramData\authority.key");
+        substituted.arguments[5] = substituted.launch_nonce.clone();
+        substituted.descriptor_sha256 = substituted.compute_digest().expect("digest");
+        assert!(substituted.validate().is_err());
+
+        let mut short = descriptor;
+        short.launch_nonce = handle_value("eliotd:short");
+        short.arguments[5] = short.launch_nonce.clone();
+        short.descriptor_sha256 = short.compute_digest().expect("digest");
+        assert!(short.validate().is_err());
     }
 
     fn requirement() -> HostStoreBootstrapRequirement {

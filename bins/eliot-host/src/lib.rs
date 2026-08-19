@@ -35,11 +35,12 @@ use eliot_installation::{
     verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
 use eliot_kernel_service::{
-    HostJobBinding, HostKernelCandidateBinding, HostProcessBinding, HostStoreBootstrapRequirement,
-    KERNEL_CONTROL_PIPE, KernelActivationPermit, KernelActivationQuery, KernelActivationReceipt,
-    KernelControlCommand, KernelControlRequest, KernelControlResponse, KernelReadyReceipt,
-    KernelServiceState, RestartBudget, StoreBootstrapHandoff, StoreProcessBinding,
-    control_request_frame, decode_control_response_frame,
+    EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
+    HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationPermit,
+    KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
+    KernelControlResponse, KernelReadyReceipt, KernelServiceState, RestartBudget,
+    StoreBootstrapHandoff, StoreProcessBinding, control_request_frame,
+    decode_control_response_frame,
 };
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
@@ -510,6 +511,13 @@ impl LaunchLease {
                 .map_err(|error| error.to_string()),
         }
     }
+
+    fn read_bounded(&self, limit: u64) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Protected(lease) => lease.read_bounded(limit).map_err(|error| error.to_string()),
+            Self::Portable(lease) => lease.read_bounded(limit).map_err(|error| error.to_string()),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -610,6 +618,44 @@ fn validate_store_bootstrap_descriptor(
         ));
     }
     Ok(requirement)
+}
+
+#[cfg(windows)]
+fn validate_eliotd_launch_descriptor(
+    lease: &LaunchLease,
+    approved_digest: &PlatformHandle,
+    launch: &RuntimeLaunchDescriptor,
+    expected_config_digest: &PlatformHandle,
+) -> Result<(), HostError> {
+    lease.verify().map_err(HostError::ProcessContour)?;
+    let bytes = lease.read_bounded(1024 * 1024).map_err(|error| {
+        HostError::ProcessContour(format!("read eliotd launch descriptor: {error}"))
+    })?;
+    let actual = Sha256::digest(&bytes);
+    if format!("{actual:x}") != approved_digest.as_str() {
+        return Err(HostError::ProcessContour(
+            "eliotd launch descriptor digest changed before launch".to_owned(),
+        ));
+    }
+    let descriptor: EliotdLaunchDescriptor = serde_json::from_slice(&bytes).map_err(|error| {
+        HostError::ProcessContour(format!("parse eliotd launch descriptor: {error}"))
+    })?;
+    descriptor.validate().map_err(|error| {
+        HostError::ProcessContour(format!("validate eliotd launch descriptor: {error}"))
+    })?;
+    if descriptor.executable != launch.eliotd_executable_path
+        || descriptor.executable_sha256 != launch.eliotd_artifact_digest.as_str()
+        || descriptor.working_directory != launch.kernel_work_root
+        || descriptor.config_descriptor != launch.store_config_path
+        || descriptor.config_descriptor_sha256 != expected_config_digest.as_str()
+        || descriptor.launch_nonce != launch.eliotd_launch_nonce
+        || descriptor.authority_epoch != launch.authority_state_fence.authority_epoch
+    {
+        return Err(HostError::ProcessContour(
+            "eliotd launch descriptor is not bound to the approved generation".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1039,6 +1085,7 @@ pub struct HostJobBranches {
     config_path: Option<PathBuf>,
     config_lease: Option<LaunchLease>,
     store_bootstrap_lease: Option<LaunchLease>,
+    eliotd_descriptor_lease: Option<LaunchLease>,
     store_bootstrap_requirement: Option<HostStoreBootstrapRequirement>,
     config_pin: Option<PinnedRuntimeFile>,
     portable_root: Option<UserOwnedRootLease>,
@@ -1603,6 +1650,7 @@ impl HostJobBranches {
             config_path: None,
             config_lease: None,
             store_bootstrap_lease: None,
+            eliotd_descriptor_lease: None,
             store_bootstrap_requirement: None,
             config_pin: None,
             portable_root: None,
@@ -2627,6 +2675,27 @@ impl HostJobBranches {
             config_digest,
             host.host_process_nonce().as_handle(),
         )?;
+        let eliotd_descriptor_path = approved_locator(
+            Path::new(launch.eliotd_descriptor_path.as_str()),
+            &launch.eliotd_descriptor_path,
+            launch.profile,
+        )?;
+        let eliotd_descriptor_lease = open_launch_lease(
+            launch.profile,
+            portable_root.as_ref(),
+            &eliotd_descriptor_path,
+        )?;
+        verify_launch_digest(
+            &eliotd_descriptor_lease,
+            &launch.eliotd_descriptor_digest,
+            "runtime.eliotd_descriptor",
+        )?;
+        validate_eliotd_launch_descriptor(
+            &eliotd_descriptor_lease,
+            &launch.eliotd_descriptor_digest,
+            launch,
+            config_digest,
+        )?;
         let store_config_path = approved_locator(
             Path::new(launch.store_config_path.as_str()),
             approved_config_path,
@@ -2720,6 +2789,7 @@ impl HostJobBranches {
                 self.config_path = Some(config_path);
                 self.config_lease = Some(config_lease);
                 self.store_bootstrap_lease = Some(store_bootstrap_lease);
+                self.eliotd_descriptor_lease = Some(eliotd_descriptor_lease);
                 self.store_bootstrap_requirement = Some(store_bootstrap_requirement);
                 self.config_pin = Some(config_pin);
                 self.portable_root = portable_root;
@@ -2779,6 +2849,7 @@ impl HostJobBranches {
                 self.config_path = Some(config_path);
                 self.config_lease = Some(config_lease);
                 self.store_bootstrap_lease = Some(store_bootstrap_lease);
+                self.eliotd_descriptor_lease = Some(eliotd_descriptor_lease);
                 self.store_bootstrap_requirement = Some(store_bootstrap_requirement);
                 self.config_pin = Some(config_pin);
                 self.portable_root = portable_root;
@@ -2828,6 +2899,20 @@ impl HostJobBranches {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
         })?;
+        let config_handle = PlatformHandle::new(config_path.to_string_lossy().into_owned())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        launch
+            .validate_for_config(&config_handle)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let eliotd_descriptor_lease = self.eliotd_descriptor_lease.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("eliotd launch descriptor lease is missing".to_owned())
+        })?;
+        validate_eliotd_launch_descriptor(
+            eliotd_descriptor_lease,
+            &launch.eliotd_descriptor_digest,
+            launch,
+            config_digest,
+        )?;
         let (kernel_working_directory, _) =
             Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
         let child = Self::launch(
@@ -3288,6 +3373,7 @@ impl HostJobBranches {
         self.config_path = None;
         self.config_lease = None;
         self.store_bootstrap_lease = None;
+        self.eliotd_descriptor_lease = None;
         self.store_bootstrap_requirement = None;
         self.config_pin = None;
         self.kernel_artifact_digest = None;
@@ -5970,6 +6056,11 @@ mod journal_tests {
             runtime_state_roots: &'a RuntimeStateRoots,
             kernel_work_root: &'a PlatformHandle,
             kernel_artifact_digest: &'a PlatformHandle,
+            eliotd_executable_path: &'a PlatformHandle,
+            eliotd_artifact_digest: &'a PlatformHandle,
+            eliotd_descriptor_path: &'a PlatformHandle,
+            eliotd_descriptor_digest: &'a PlatformHandle,
+            eliotd_launch_nonce: &'a PlatformHandle,
             store_config_path: &'a PlatformHandle,
             store_credential_target: &'a PlatformHandle,
             store_bootstrap_descriptor_path: &'a PlatformHandle,
@@ -6028,6 +6119,11 @@ mod journal_tests {
             runtime_state_roots: runtime_state_roots.clone(),
             kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
             kernel_artifact_digest: kernel_digest.clone(),
+            eliotd_executable_path: path(&root, "eliotd.exe"),
+            eliotd_artifact_digest: handle("e".repeat(64)),
+            eliotd_descriptor_path: path(&root, "eliotd.json"),
+            eliotd_descriptor_digest: handle("f".repeat(64)),
+            eliotd_launch_nonce: handle(format!("eliotd:{}", "1".repeat(32))),
             store_config_path: config_path.clone(),
             store_credential_target: credential_target,
             store_bridge_executable_path: bridge_path.clone(),
@@ -6047,6 +6143,12 @@ mod journal_tests {
                 authority_path,
                 handle("--authority-descriptor-sha256"),
                 handle("9".repeat(64)),
+                handle("--kernel-artifact-sha256"),
+                kernel_digest.clone(),
+                handle("--eliotd-descriptor"),
+                path(&root, "eliotd.json"),
+                handle("--eliotd-descriptor-sha256"),
+                handle("f".repeat(64)),
             ],
             store_bridge_arguments: vec![
                 handle("--portable-dev-root"),
@@ -6090,6 +6192,11 @@ mod journal_tests {
             runtime_state_roots: &runtime_launch.runtime_state_roots,
             kernel_work_root: &runtime_launch.kernel_work_root,
             kernel_artifact_digest: &runtime_launch.kernel_artifact_digest,
+            eliotd_executable_path: &runtime_launch.eliotd_executable_path,
+            eliotd_artifact_digest: &runtime_launch.eliotd_artifact_digest,
+            eliotd_descriptor_path: &runtime_launch.eliotd_descriptor_path,
+            eliotd_descriptor_digest: &runtime_launch.eliotd_descriptor_digest,
+            eliotd_launch_nonce: &runtime_launch.eliotd_launch_nonce,
             store_config_path: &runtime_launch.store_config_path,
             store_credential_target: &runtime_launch.store_credential_target,
             store_bootstrap_descriptor_path: &runtime_launch.store_bootstrap_descriptor_path,

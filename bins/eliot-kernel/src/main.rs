@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eliot_kernel::{AuthorityDescriptorContour, KernelBuildError, KernelComposition, KernelConfig};
-use eliot_kernel_service::HostStoreBootstrapRequirement;
+use eliot_kernel_service::{EliotdLaunchDescriptor, HostStoreBootstrapRequirement};
 #[cfg(windows)]
 use eliot_kernel_service::{
     KERNEL_CONTROL_PIPE, KernelControlCommand, control_response_frame, decode_control_request_frame,
@@ -27,7 +27,7 @@ use tokio::task::JoinSet;
 use eliot_contracts::sha256_hex;
 #[cfg(windows)]
 use eliot_platform_windows::{
-    NamedPipePeerProcessBinding, ProtectedPathLease, UserOwnedPathLease, UserOwnedRootLease,
+    NamedPipePeerProcessBinding, ProtectedRuntimePathLease, UserOwnedPathLease, UserOwnedRootLease,
     current_process_named_pipe_expectation, observe_named_pipe_peer_process,
 };
 
@@ -130,6 +130,14 @@ async fn main() {
         Ok(prepared) => prepared,
         Err(error) => exit_error("INVALID_STORE_BOOTSTRAP", &error),
     };
+    let daemon_launch = match prepare_eliotd_launch(&options) {
+        Ok(Some(launch)) => Some(launch),
+        Ok(None) => exit_error(
+            "ELIOTD_LAUNCH_CONTRACT_REQUIRED",
+            "Host launch must inject the exact approved eliotd descriptor and digest",
+        ),
+        Err(error) => exit_error("INVALID_ELIOTD_LAUNCH", &error),
+    };
     let mut kernel_config = KernelConfig::new(options.work_root.clone());
     #[cfg(windows)]
     let pipe_name = startup_binding.control_pipe.clone();
@@ -139,6 +147,16 @@ async fn main() {
     if let Some(prepared) = &prepared_store {
         kernel_config = kernel_config.with_store_bootstrap(prepared.requirement.clone());
     }
+    if let Some(daemon_launch) = daemon_launch {
+        kernel_config = kernel_config.with_daemon_launch(daemon_launch);
+    }
+    let Some(kernel_artifact_sha256) = options.kernel_artifact_sha256.clone() else {
+        exit_error(
+            "KERNEL_ARTIFACT_CONTRACT_REQUIRED",
+            "Host launch must inject the independent Kernel executable digest",
+        );
+    };
+    kernel_config = kernel_config.with_kernel_artifact_sha256(kernel_artifact_sha256);
     let authority_path = options.authority_descriptor.clone();
     let authority_contour = authority_contour(&options.work_root, &authority_path);
     let kernel = Arc::new(
@@ -342,6 +360,19 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::Daemon {
+                request_id,
+                operation,
+                payload,
+            } => {
+                let reply = kernel
+                    .execute_daemon_request(&session, request_id, &operation, payload)
+                    .await?;
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 session.fence();
@@ -428,12 +459,19 @@ struct KernelLaunchOptions {
     store_sha256: String,
     authority_descriptor: PathBuf,
     authority_sha256: String,
+    daemon_descriptor: Option<PathBuf>,
+    daemon_sha256: Option<String>,
+    kernel_artifact_sha256: Option<String>,
 }
 
 struct PreparedStoreBootstrap {
     requirement: HostStoreBootstrapRequirement,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered startup contract is kept in one parser so production cannot accept partially bound contours"
+)]
 fn parse_launch_options<I>(args: I) -> Result<KernelLaunchOptions, std::io::Error>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
@@ -452,15 +490,30 @@ where
             authority_path,
             authority_digest_flag,
             authority_digest,
+            kernel_artifact_flag,
+            kernel_artifact_digest,
+            daemon_flag,
+            daemon_path,
+            daemon_digest_flag,
+            daemon_digest,
         ] if work_flag == "--work-root"
             && store_flag == "--store-bootstrap"
             && store_digest_flag == "--store-bootstrap-sha256"
             && authority_flag == "--authority-descriptor"
-            && authority_digest_flag == "--authority-descriptor-sha256" =>
+            && authority_digest_flag == "--authority-descriptor-sha256"
+            && kernel_artifact_flag == "--kernel-artifact-sha256"
+            && daemon_flag == "--eliotd-descriptor"
+            && daemon_digest_flag == "--eliotd-descriptor-sha256" =>
         {
             let store_digest = store_digest.to_string_lossy();
             let authority_digest = authority_digest.to_string_lossy();
-            if !is_lower_sha256(&store_digest) || !is_lower_sha256(&authority_digest) {
+            let kernel_artifact_digest = kernel_artifact_digest.to_string_lossy();
+            let daemon_digest = daemon_digest.to_string_lossy();
+            if !is_lower_sha256(&store_digest)
+                || !is_lower_sha256(&authority_digest)
+                || !is_lower_sha256(&kernel_artifact_digest)
+                || !is_lower_sha256(&daemon_digest)
+            {
                 return Err(invalid_input(
                     "descriptor digests must be lowercase SHA-256",
                 ));
@@ -473,10 +526,13 @@ where
                 store_sha256: store_digest.into_owned(),
                 authority_descriptor: PathBuf::from(authority_path),
                 authority_sha256: authority_digest.into_owned(),
+                daemon_descriptor: Some(PathBuf::from(daemon_path)),
+                daemon_sha256: Some(daemon_digest.into_owned()),
+                kernel_artifact_sha256: Some(kernel_artifact_digest.into_owned()),
             })
         }
         _ => Err(invalid_input(
-            "expected the exact 10-value Host launch contour",
+            "expected the exact mandatory 16-value Host launch contour",
         )),
     }
 }
@@ -514,6 +570,25 @@ fn prepare_store_bootstrap(
         .validate()
         .map_err(|error| format!("validate neutral store bootstrap descriptor: {error}"))?;
     Ok(Some(PreparedStoreBootstrap { requirement }))
+}
+
+fn prepare_eliotd_launch(
+    options: &KernelLaunchOptions,
+) -> Result<Option<EliotdLaunchDescriptor>, String> {
+    let (Some(path), Some(expected_digest)) = (&options.daemon_descriptor, &options.daemon_sha256)
+    else {
+        return Ok(None);
+    };
+    let bytes = read_descriptor_bounded(path, &options.work_root)?;
+    if sha256_hex(&bytes) != expected_digest.as_str() {
+        return Err("eliotd launch descriptor digest mismatch".to_owned());
+    }
+    let descriptor: EliotdLaunchDescriptor = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse eliotd launch descriptor: {error}"))?;
+    descriptor
+        .validate()
+        .map_err(|error| format!("validate eliotd launch descriptor: {error}"))?;
+    Ok(Some(descriptor))
 }
 
 impl KernelLaunchOptions {
@@ -554,7 +629,7 @@ fn read_descriptor_bounded(path: &Path, work_root: &Path) -> Result<Vec<u8>, Str
         file.read_bounded(1024 * 1024)
             .map_err(|error| format!("bounded descriptor read failed: {error}"))
     } else {
-        let file = ProtectedPathLease::open_existing_absolute(&canonical)
+        let file = ProtectedRuntimePathLease::open_existing_absolute(&canonical)
             .map_err(|error| format!("protected descriptor unavailable: {error}"))?;
         file.verify_stable_identity()
             .and_then(|()| file.verify_path_identity())
@@ -613,13 +688,13 @@ mod tests {
     }
 
     #[test]
-    fn launch_args_require_the_exact_ordered_ten_values() {
+    fn launch_args_reject_legacy_ten_value_contour() {
         let root = TempRoot::new();
         let work = root.0.join("work");
         let descriptor_path = root.0.join("store-bootstrap.json");
         let authority_path = root.0.join("authority.json");
         let digest = "a".repeat(64);
-        let options = parse_launch_options([
+        let result = parse_launch_options([
             "--work-root".into(),
             work.clone().into_os_string(),
             "--store-bootstrap".into(),
@@ -630,18 +705,63 @@ mod tests {
             authority_path.clone().into_os_string(),
             "--authority-descriptor-sha256".into(),
             digest.clone().into(),
+        ]);
+        assert!(
+            result.is_err(),
+            "legacy contour must not bypass eliotd binding"
+        );
+
+        let _ = (work, descriptor_path, digest);
+    }
+
+    #[test]
+    fn launch_args_reject_descriptor_contour_without_kernel_artifact_domain() {
+        let root = TempRoot::new();
+        let digest = "a".repeat(64);
+        let result = parse_launch_options([
+            "--work-root".into(),
+            root.0.join("work").into_os_string(),
+            "--store-bootstrap".into(),
+            root.0.join("store-bootstrap.json").into_os_string(),
+            "--store-bootstrap-sha256".into(),
+            digest.clone().into(),
+            "--authority-descriptor".into(),
+            root.0.join("authority.json").into_os_string(),
+            "--authority-descriptor-sha256".into(),
+            digest.clone().into(),
+            "--eliotd-descriptor".into(),
+            root.0.join("eliotd.json").into_os_string(),
+            "--eliotd-descriptor-sha256".into(),
+            digest.into(),
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn launch_args_accept_the_explicit_kernel_and_eliotd_artifact_domains() {
+        let root = TempRoot::new();
+        let digest = "a".repeat(64);
+        let options = parse_launch_options([
+            "--work-root".into(),
+            root.0.join("work").into_os_string(),
+            "--store-bootstrap".into(),
+            root.0.join("store-bootstrap.json").into_os_string(),
+            "--store-bootstrap-sha256".into(),
+            digest.clone().into(),
+            "--authority-descriptor".into(),
+            root.0.join("authority.json").into_os_string(),
+            "--authority-descriptor-sha256".into(),
+            digest.clone().into(),
+            "--kernel-artifact-sha256".into(),
+            digest.clone().into(),
+            "--eliotd-descriptor".into(),
+            root.0.join("eliotd.json").into_os_string(),
+            "--eliotd-descriptor-sha256".into(),
+            digest.clone().into(),
         ])
-        .expect("neutral args");
-        assert_eq!(
-            options.work_root,
-            std::fs::canonicalize(work).expect("work")
-        );
-        assert_eq!(
-            options.store_config,
-            Some(StoreConfigLocator::NeutralDescriptor(descriptor_path))
-        );
-        assert_eq!(options.store_sha256, digest);
-        assert_eq!(options.authority_sha256, "a".repeat(64));
+        .expect("integrated args");
+        assert_eq!(options.kernel_artifact_sha256, Some(digest));
+        assert_eq!(options.daemon_descriptor, Some(root.0.join("eliotd.json")));
     }
 
     #[test]
@@ -672,6 +792,12 @@ mod tests {
             "authority.json".into(),
             "--authority-descriptor-sha256".into(),
             digest_b.into(),
+            "--kernel-artifact-sha256".into(),
+            "c".repeat(64).into(),
+            "--eliotd-descriptor".into(),
+            root.0.join("eliotd.json").into_os_string(),
+            "--eliotd-descriptor-sha256".into(),
+            "d".repeat(64).into(),
         ];
         let mut case_variant = valid.clone();
         case_variant[0] = "--Work-root".into();

@@ -711,6 +711,326 @@ impl ProtectedPathLease {
     }
 }
 
+/// Read-only retained lease for a file in the installer-provisioned System
+/// runtime contour. Unlike [`ProtectedPathLease`], this adapter never asks
+/// the `LocalService` caller for `WRITE_DAC` and never rewrites ACLs. It proves
+/// the immutable `BA+LS+SY` runtime-file DACL installed by the transaction,
+/// then retains no-follow directory/file handles for the complete read.
+pub struct ProtectedRuntimePathLease {
+    path: PathBuf,
+    identity: FileIdentity,
+    #[cfg(windows)]
+    _directories: Vec<std::fs::File>,
+    #[cfg(windows)]
+    file: std::fs::File,
+}
+
+impl std::fmt::Debug for ProtectedRuntimePathLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProtectedRuntimePathLease")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProtectedRuntimePathLease {
+    /// Opens one existing absolute file under the OS-resolved `ProgramData`
+    /// runtime contour with the installer `BA+LS+SY` ACL proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path, no-follow containment, ACL, or retained
+    /// file identity cannot be proven.
+    pub fn open_existing_absolute(path: &Path) -> Result<Self, ProtectedPathError> {
+        Self::open_absolute(path, false)
+    }
+
+    /// Creates or opens one runtime state file without changing its
+    /// installer-provisioned ACL. Creation requires the already-provisioned
+    /// `LocalService` write permission on the parent runtime root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path, no-follow containment, ACL, or retained
+    /// file identity cannot be proven, or when the caller lacks the required
+    /// write permission for a state file.
+    pub fn open_or_create_absolute(path: &Path) -> Result<Self, ProtectedPathError> {
+        Self::open_absolute(path, true)
+    }
+
+    fn open_absolute(path: &Path, create: bool) -> Result<Self, ProtectedPathError> {
+        let root = expected_root()?;
+        ensure_protected_containment(&root, path)?;
+        let canonical = if create {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => canonical_windows_path(path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let parent = path.parent().ok_or(ProtectedPathError::InvalidPath)?;
+                    let canonical_parent = canonical_windows_path(parent)?;
+                    let leaf = path.file_name().ok_or(ProtectedPathError::InvalidPath)?;
+                    canonical_parent.join(leaf)
+                }
+                Err(_) => return Err(ProtectedPathError::Io),
+            }
+        } else {
+            canonical_windows_path(path)?
+        };
+        ensure_protected_containment(&root, &canonical)?;
+        let relative = canonical
+            .strip_prefix(&root)
+            .map_err(|_| ProtectedPathError::InvalidPath)?;
+        let components = protected_components(relative)?;
+        #[cfg(windows)]
+        {
+            let parent = components[..components.len() - 1].iter().fold(
+                PathBuf::new(),
+                |mut value, component| {
+                    value.push(component);
+                    value
+                },
+            );
+            let directories = if parent.as_os_str().is_empty() {
+                vec![pin_directory(&root).map_err(|_| ProtectedPathError::Io)?]
+            } else {
+                pin_protected_directory_contour(&root, &parent)?
+            };
+            let file = open_runtime_file(&canonical, create)?;
+            let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
+            Ok(Self {
+                path: canonical,
+                identity,
+                _directories: directories,
+                file,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (canonical, components);
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns the exact path retained by this lease.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the retained file identity.
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Rechecks the retained file identity without reopening it by path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained handle cannot be inspected or its
+    /// identity no longer matches the lease.
+    pub fn verify_stable_identity(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let identity =
+                file_identity_from_handle(&self.file).map_err(|_| ProtectedPathError::Io)?;
+            if identity != self.identity {
+                return Err(ProtectedPathError::Io);
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Reopens the exact runtime file read-only and compares its identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path cannot be reopened safely or its identity
+    /// no longer matches the lease.
+    pub fn verify_path_identity(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let file = open_runtime_read_file(&self.path)?;
+            let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
+            if identity != self.identity {
+                return Err(ProtectedPathError::Io);
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Reads bounded bytes through the retained read-only handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained handle cannot be read or the file
+    /// exceeds `limit`.
+    pub fn read_bounded(&self, limit: u64) -> Result<Vec<u8>, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let mut file = self.file.try_clone().map_err(|_| ProtectedPathError::Io)?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|_| ProtectedPathError::Io)?;
+            let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+            if metadata.len() > limit {
+                return Err(ProtectedPathError::SizeExceeded);
+            }
+            let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+            file.read_to_end(&mut bytes)
+                .map_err(|_| ProtectedPathError::Io)?;
+            if bytes.len() as u64 > limit {
+                return Err(ProtectedPathError::SizeExceeded);
+            }
+            Ok(bytes)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = limit;
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_runtime_read_file(path: &Path) -> Result<std::fs::File, ProtectedPathError> {
+    open_runtime_file(path, false)
+}
+
+#[cfg(windows)]
+fn open_runtime_file(path: &Path, create: bool) -> Result<std::fs::File, ProtectedPathError> {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(create)
+        .access_mode(if create {
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE
+        } else {
+            FILE_GENERIC_READ
+        })
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = if create {
+        options.create_new(true).open(path).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                let mut existing = std::fs::OpenOptions::new();
+                existing
+                    .read(true)
+                    .write(true)
+                    .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(path)
+            } else {
+                Err(error)
+            }
+        })
+    } else {
+        options.open(path)
+    }
+    .map_err(|_| ProtectedPathError::Io)?;
+    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    let descriptor = OwnedSecurityDescriptor::for_installer_system_object(false)
+        .map_err(|_| ProtectedPathError::AclMismatch)?;
+    verify_readonly_acl(&file, &descriptor)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn verify_readonly_acl(
+    file: &std::fs::File,
+    expected: &OwnedSecurityDescriptor,
+) -> Result<(), ProtectedPathError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID, SE_DACL_PROTECTED,
+    };
+    let expected_dacl = expected
+        .dacl()
+        .map_err(|_| ProtectedPathError::AclMismatch)?;
+    let expected_owner = expected
+        .owner()
+        .map_err(|_| ProtectedPathError::AclMismatch)?;
+    let expected_owner =
+        sid_to_string(expected_owner).map_err(|_| ProtectedPathError::AclMismatch)?;
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut owner: PSID = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() || owner.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    let mut present = 0;
+    let mut actual_dacl = std::ptr::null_mut();
+    let mut defaulted = 0;
+    let dacl_matches = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut present,
+            &raw mut actual_dacl,
+            &raw mut defaulted,
+        ) != 0
+            && present != 0
+            && !actual_dacl.is_null()
+            && (*actual_dacl).AclSize == (*expected_dacl).AclSize
+            && std::slice::from_raw_parts(
+                actual_dacl.cast::<u8>(),
+                usize::from((*actual_dacl).AclSize),
+            ) == std::slice::from_raw_parts(
+                expected_dacl.cast::<u8>(),
+                usize::from((*expected_dacl).AclSize),
+            )
+    };
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    let protected = unsafe {
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0
+    };
+    let owner_matches = sid_to_string(owner).is_ok_and(|actual| actual == expected_owner);
+    unsafe { LocalFree(descriptor.cast()) };
+    if !owner_matches || !dacl_matches || !protected {
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    Ok(())
+}
+
 /// A user-owned `portable_dev` root lease.
 ///
 /// This contour is intentionally separate from [`ProtectedPathLease`]: it is
@@ -4525,6 +4845,18 @@ impl OwnedSecurityDescriptor {
             return Err(WindowsAdapterError::AclMismatch);
         }
         Ok(dacl.cast_const())
+    }
+
+    fn owner(&self) -> Result<windows_sys::Win32::Security::PSID, WindowsAdapterError> {
+        use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
+        let mut owner = std::ptr::null_mut();
+        let mut defaulted = 0;
+        if unsafe { GetSecurityDescriptorOwner(self.raw, &raw mut owner, &raw mut defaulted) } == 0
+            || owner.is_null()
+        {
+            return Err(WindowsAdapterError::AclMismatch);
+        }
+        Ok(owner)
     }
 
     fn from_sddl(sddl: &str) -> Result<Self, WindowsAdapterError> {

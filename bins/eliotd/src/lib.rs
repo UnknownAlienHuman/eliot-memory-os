@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
     ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, OperationId, ProductId,
-    RequestId, RequestMetadata, ResourceGeneration, SourceId, StateFence,
+    RequestId, RequestMetadata, ResourceGeneration, SourceId, StateFence, sha256_hex,
 };
 use eliot_governor::{
     CompositionError, CompositionReadiness, GovernorComposition, GovernorGenesisRequest,
@@ -26,8 +26,8 @@ use eliot_governor::{
 };
 use eliot_maintenance::MaintenanceJob;
 use eliot_platform_windows::{
-    NamedPipePeerExpectation, ProtectedPathError, ProtectedPathLease, prepare_protected_directory,
-    protected_program_data_path,
+    NamedPipePeerExpectation, ProtectedPathError, ProtectedRuntimePathLease,
+    current_process_named_pipe_expectation, protected_program_data_path,
 };
 use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
@@ -55,14 +55,19 @@ pub const PROTECTED_CONFIG_RELATIVE: &str = r"Eliot\governor\eliotd.json";
 pub const PROTECTED_STATE_RELATIVE: &str = r"Eliot\governor\state";
 /// Maximum accepted launch-config bytes.
 pub const MAX_CONFIG_BYTES: u64 = 128 * 1024;
-/// Host-approved Kernel front-door identity. The Kernel client contract must
-/// eventually provide these values through the protected handoff; until then
-/// this fixed identity is deliberately fail-closed by the authenticated
-/// handshake.
+/// Host-approved Kernel front-door identity. The pipe name is fixed; the
+/// account SID/session expectation is observed from the current installed
+/// service token and then checked against the live authenticated peer.
 const KERNEL_PIPE_NAME: &str = r"\\.\pipe\eliot\kernel\frontdoor";
-const KERNEL_SYSTEM_SID: &str = "S-1-5-18";
-const KERNEL_SYSTEM_SESSION: u32 = 0;
 
+fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
+    let expectation = current_process_named_pipe_expectation()
+        .map_err(|error| DaemonError::Kernel(format!("observe LocalService identity: {error}")))?;
+    Ok((
+        expectation.expected_sid().to_owned(),
+        expectation.expected_session_id(),
+    ))
+}
 #[derive(Clone, Debug)]
 struct KernelLaunchBinding {
     kernel_pipe_name: String,
@@ -95,15 +100,16 @@ pub enum DaemonError {
     Lifecycle(String),
 }
 
-/// Typed protected launch inputs. The values are read from the fixed
-/// `ProgramData` path; environment variables, current directory and arbitrary
-/// caller paths are not authority sources.
+/// Typed protected launch inputs. Production values are read from the exact
+/// Host-approved runtime path and retained by a protected lease; environment
+/// variables, current directory and arbitrary caller paths are not authority
+/// sources.
 #[derive(Debug)]
 pub struct DaemonConfig {
     launch: GovernorLaunchConfig,
     config_path: PathBuf,
     state_root: PathBuf,
-    config_lease: Option<ProtectedPathLease>,
+    config_lease: Option<ProtectedRuntimePathLease>,
     kernel_binding: KernelLaunchBinding,
 }
 
@@ -111,11 +117,58 @@ impl DaemonConfig {
     /// Loads the Host-approved launch file through a bounded protected read.
     pub fn load_protected() -> Result<Self, DaemonError> {
         let config_path = protected_program_data_path(PROTECTED_CONFIG_RELATIVE)?;
-        let config_lease = ProtectedPathLease::open_existing_absolute(&config_path)?;
+        let config_lease = ProtectedRuntimePathLease::open_existing_absolute(&config_path)?;
+        if config_lease.path() != config_path {
+            return Err(DaemonError::LaunchConfig(
+                "launch config path is not the retained canonical runtime identity".to_owned(),
+            ));
+        }
         let bytes = config_lease.read_bounded(MAX_CONFIG_BYTES)?;
         let launch: GovernorLaunchConfig = serde_json::from_slice(&bytes)
             .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
         let mut config = Self::from_launch(launch, config_path)?;
+        config.config_lease = Some(config_lease);
+        Ok(config)
+    }
+
+    /// Loads the exact Host-approved daemon descriptor binding. The path,
+    /// bytes, public launch correlation, and module artifact are all checked
+    /// before the config can become a Kernel client binding.
+    pub fn load_protected_bound(
+        config_path: impl AsRef<Path>,
+        expected_config_sha256: &str,
+        launch_nonce: &str,
+        expected_artifact_sha256: &str,
+    ) -> Result<Self, DaemonError> {
+        let config_path = config_path.as_ref().to_path_buf();
+        if !config_path.is_absolute() {
+            return Err(DaemonError::LaunchConfig(
+                "launch config path must be an absolute approved runtime identity".to_owned(),
+            ));
+        }
+        validate_sha256(expected_config_sha256, "config descriptor digest")?;
+        validate_sha256(expected_artifact_sha256, "executable digest")?;
+        validate_launch_nonce(launch_nonce)?;
+        let config_lease = ProtectedRuntimePathLease::open_existing_absolute(&config_path)?;
+        if config_lease.path() != config_path {
+            return Err(DaemonError::LaunchConfig(
+                "launch config path is not the retained canonical runtime identity".to_owned(),
+            ));
+        }
+        let bytes = config_lease.read_bounded(MAX_CONFIG_BYTES)?;
+        if sha256_hex(&bytes) != expected_config_sha256 {
+            return Err(DaemonError::LaunchConfig(
+                "launch config digest does not match the retained bytes".to_owned(),
+            ));
+        }
+        let launch: GovernorLaunchConfig = serde_json::from_slice(&bytes)
+            .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
+        let mut config = Self::from_launch_with_binding(
+            launch,
+            config_path,
+            launch_nonce,
+            expected_artifact_sha256,
+        )?;
         config.config_lease = Some(config_lease);
         Ok(config)
     }
@@ -128,22 +181,70 @@ impl DaemonConfig {
         config_path: PathBuf,
     ) -> Result<Self, DaemonError> {
         launch.validate()?;
-        let expected_config = protected_program_data_path(PROTECTED_CONFIG_RELATIVE)?;
-        if config_path != expected_config {
+        if !config_path.is_absolute() {
             return Err(DaemonError::LaunchConfig(
-                "launch config path is not the fixed ProgramData identity".to_owned(),
+                "launch config path must be an absolute approved runtime identity".to_owned(),
             ));
         }
-        let state_root = protected_program_data_path(PROTECTED_STATE_RELATIVE)?;
+        let state_root = config_path
+            .parent()
+            .ok_or_else(|| {
+                DaemonError::LaunchConfig(
+                    "launch config path has no approved runtime parent".to_owned(),
+                )
+            })?
+            .join("state");
+        let (expected_kernel_sid, expected_kernel_session_id) = observed_runtime_identity()?;
         let kernel_binding = KernelLaunchBinding {
             kernel_pipe_name: KERNEL_PIPE_NAME.to_owned(),
-            expected_kernel_sid: KERNEL_SYSTEM_SID.to_owned(),
-            expected_kernel_session_id: KERNEL_SYSTEM_SESSION,
+            expected_kernel_sid,
+            expected_kernel_session_id,
             module_generation: launch.kernel.generation,
             authority_epoch: launch.kernel.authority_epoch,
             state_fence: StateFence::new(launch.kernel.authority_epoch, launch.kernel.generation),
             launch_nonce: format!("eliotd:{}", launch.instance_id),
             artifact_hash: launch.kernel.artifact_digest.clone(),
+        };
+        Ok(Self {
+            launch,
+            config_path,
+            state_root,
+            config_lease: None,
+            kernel_binding,
+        })
+    }
+
+    fn from_launch_with_binding(
+        launch: GovernorLaunchConfig,
+        config_path: PathBuf,
+        launch_nonce: &str,
+        expected_artifact_sha256: &str,
+    ) -> Result<Self, DaemonError> {
+        launch.validate()?;
+        validate_launch_nonce(launch_nonce)?;
+        validate_sha256(expected_artifact_sha256, "executable digest")?;
+        let state_root = config_path
+            .parent()
+            .ok_or_else(|| {
+                DaemonError::LaunchConfig(
+                    "launch config path has no approved runtime parent".to_owned(),
+                )
+            })?
+            .join("state");
+        let (expected_kernel_sid, expected_kernel_session_id) = observed_runtime_identity()?;
+        let kernel_binding = KernelLaunchBinding {
+            kernel_pipe_name: KERNEL_PIPE_NAME.to_owned(),
+            expected_kernel_sid,
+            expected_kernel_session_id,
+            module_generation: launch.kernel.generation,
+            authority_epoch: launch.kernel.authority_epoch,
+            state_fence: StateFence::new(launch.kernel.authority_epoch, launch.kernel.generation),
+            launch_nonce: launch_nonce.to_owned(),
+            // The daemon child artifact is a separate domain from the
+            // KernelGenerationExpectation artifact. The former is supplied by
+            // the exact launch descriptor; the latter remains the Kernel
+            // peer/generation snapshot identity.
+            artifact_hash: expected_artifact_sha256.to_owned(),
         };
         Ok(Self {
             launch,
@@ -931,6 +1032,38 @@ fn unix_ms_i64() -> i64 {
     i64::try_from(unix_ms()).unwrap_or(i64::MAX)
 }
 
+fn validate_sha256(value: &str, label: &str) -> Result<(), DaemonError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(DaemonError::LaunchConfig(format!(
+            "{label} must be a lowercase SHA-256 digest"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_launch_nonce(value: &str) -> Result<(), DaemonError> {
+    let Some(suffix) = value.strip_prefix("eliotd:") else {
+        return Err(DaemonError::LaunchConfig(
+            "launch nonce must use the opaque eliotd correlation format".to_owned(),
+        ));
+    };
+    if suffix.len() < 32
+        || suffix.len() > 120
+        || suffix
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')))
+    {
+        return Err(DaemonError::LaunchConfig(
+            "launch nonce must be bounded opaque text with at least 32 safe bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Readiness/status projection emitted by the daemon. It is derived only
 /// after exact Kernel and recovery admission.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -956,8 +1089,8 @@ pub struct DaemonStatus {
 /// physical process execution and canonical persistence remain outside it.
 pub struct DaemonComposition {
     governor: GovernorComposition<dyn KernelGenerationPort>,
-    config_lease: ProtectedPathLease,
-    state_lease: ProtectedPathLease,
+    config_lease: ProtectedRuntimePathLease,
+    state_lease: ProtectedRuntimePathLease,
     config_path: PathBuf,
     state_root: PathBuf,
     started: bool,
@@ -986,11 +1119,8 @@ impl DaemonComposition {
                 "retained config bytes changed before composition".to_owned(),
             ));
         }
-        prepare_protected_directory(config.state_root())?;
         let state_file = config.state_root().join("daemon.lifecycle");
-        let state_lease = ProtectedPathLease::open_or_create(
-            Path::new(PROTECTED_STATE_RELATIVE).join("daemon.lifecycle"),
-        )?;
+        let state_lease = ProtectedRuntimePathLease::open_or_create_absolute(&state_file)?;
         if state_lease.path() != state_file {
             return Err(DaemonError::Lifecycle(
                 "protected lifecycle identity changed during composition".to_owned(),
@@ -1080,6 +1210,22 @@ impl DaemonComposition {
 mod tests {
     use super::*;
 
+    fn valid_launch_config() -> Result<GovernorLaunchConfig, Box<dyn std::error::Error>> {
+        Ok(GovernorLaunchConfig {
+            instance_id: "test-instance".to_owned(),
+            kernel: eliot_governor::KernelGenerationExpectation {
+                service: "eliot-kernel".to_owned(),
+                protocol: "eliot.kernel.v1".to_owned(),
+                artifact_digest: "a".repeat(64),
+                protected_snapshot_digest: "b".repeat(64),
+                principal: "local-service".to_owned(),
+                generation: ResourceGeneration::new(1)?,
+                authority_epoch: AuthorityEpoch::new(1)?,
+            },
+            protected_snapshot_digest: "b".repeat(64),
+        })
+    }
+
     #[test]
     fn production_config_has_no_root_or_environment_override() {
         assert!(!PROTECTED_CONFIG_RELATIVE.contains("ProgramData"));
@@ -1109,20 +1255,45 @@ mod tests {
 
     #[test]
     fn snapshot_expectation_rejects_unbound_digest() -> Result<(), Box<dyn std::error::Error>> {
-        let launch = GovernorLaunchConfig {
-            instance_id: "test-instance".to_owned(),
-            kernel: eliot_governor::KernelGenerationExpectation {
-                service: "eliot-kernel".to_owned(),
-                protocol: "eliot.kernel.v1".to_owned(),
-                artifact_digest: "a".repeat(64),
-                protected_snapshot_digest: "b".repeat(64),
-                principal: "local-user".to_owned(),
-                generation: ResourceGeneration::new(1)?,
-                authority_epoch: AuthorityEpoch::new(1)?,
-            },
-            protected_snapshot_digest: "c".repeat(64),
-        };
+        let mut launch = valid_launch_config()?;
+        launch.kernel.principal = "local-user".to_owned();
+        launch.protected_snapshot_digest = "c".repeat(64);
         assert!(launch.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_and_eliotd_artifact_domains_cannot_rewrite_each_other()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = valid_launch_config()?;
+        let kernel_digest = launch.kernel.artifact_digest.clone();
+        let child_digest = "c".repeat(64);
+        let config_path = PathBuf::from(r"C:\ProgramData\Eliot\runtime\eliotd.json");
+        let nonce = "eliotd:0123456789abcdef0123456789abcdef";
+
+        let child_bound = DaemonConfig::from_launch_with_binding(
+            launch.clone(),
+            config_path.clone(),
+            nonce,
+            &child_digest,
+        )?;
+        assert_eq!(child_bound.launch.kernel.artifact_digest, kernel_digest);
+        assert_eq!(child_bound.kernel_binding.artifact_hash, child_digest);
+
+        let kernel_digest_substitution =
+            DaemonConfig::from_launch_with_binding(launch, config_path, nonce, &kernel_digest)?;
+        assert_eq!(
+            kernel_digest_substitution.launch.kernel.artifact_digest,
+            kernel_digest
+        );
+        assert_eq!(
+            kernel_digest_substitution.kernel_binding.artifact_hash,
+            kernel_digest
+        );
+        assert_ne!(
+            child_bound.kernel_binding.artifact_hash,
+            kernel_digest_substitution.kernel_binding.artifact_hash
+        );
         Ok(())
     }
 }
