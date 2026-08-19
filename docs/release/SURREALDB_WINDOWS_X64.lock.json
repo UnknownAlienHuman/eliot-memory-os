@@ -1,0 +1,9 @@
+{
+  "schema": "eliot-external-release-artifact-lock-v1",
+  "artifact": "surreal.exe",
+  "relative_path": "runtime/surreal.exe",
+  "version": "3.1.4",
+  "architecture": "windows-x64",
+  "pe_machine": "8664",
+  "sha256": "13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1"
+}

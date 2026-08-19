@@ -13,6 +13,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+$surrealCatalogRelativePath = 'docs/release/SURREALDB_WINDOWS_X64.lock.json'
 $runtimeArtifactDefinitions = @(
     [pscustomobject]@{
         package = 'eliot'
@@ -107,7 +108,7 @@ function Get-VerifiedRuntimeArtifacts([object[]]$Plan, [string]$Version) {
         }
         $file = Get-Item -LiteralPath $entry.path
         Assert-NoSecretFile $file $entry.relative_path
-        Assert-WindowsX64Pe $file.FullName $entry.relative_path
+        [void](Assert-WindowsX64Pe $file.FullName $entry.relative_path)
         [ordered]@{
             package = $entry.package
             binary = $entry.binary
@@ -123,7 +124,7 @@ function Get-VerifiedRuntimeArtifacts([object[]]$Plan, [string]$Version) {
     return @($artifacts)
 }
 
-function Assert-WindowsX64Pe([string]$Path, [string]$RelativePath) {
+function Get-WindowsPeMachine([string]$Path, [string]$RelativePath) {
     $stream = [System.IO.File]::Open($Path, 'Open', 'Read', 'Read')
     try {
         $dos = [byte[]]::new(64)
@@ -143,12 +144,17 @@ function Assert-WindowsX64Pe([string]$Path, [string]$RelativePath) {
             throw "release artifact has an invalid PE signature: $RelativePath"
         }
         $machine = [System.BitConverter]::ToUInt16($header, 4)
-        if ($machine -ne 0x8664) {
-            throw "release artifact is not Windows x64 (machine=0x$('{0:X4}' -f $machine)): $RelativePath"
-        }
+        return ('{0:X4}' -f $machine)
     }
     finally {
         $stream.Dispose()
+    }
+}
+
+function Assert-WindowsX64Pe([string]$Path, [string]$RelativePath) {
+    $machine = Get-WindowsPeMachine $Path $RelativePath
+    if ($machine -cne '8664') {
+        throw "release artifact is not Windows x64 (machine=0x$machine): $RelativePath"
     }
 }
 
@@ -176,31 +182,69 @@ function Assert-PinnedExternalPath([string]$Path, [string]$Purpose) {
     return $file
 }
 
-function Get-VerifiedPinnedSurrealArtifact([string]$Path, [string]$ExpectedSha256, [string]$ExpectedVersion) {
+function Get-VerifiedSurrealCatalog([string]$Repo, [string]$SourceCommit) {
+    $catalogPath = Join-Path $Repo $surrealCatalogRelativePath
+    if (-not (Test-Path -LiteralPath $catalogPath -PathType Leaf)) {
+        throw "tracked SurrealDB artifact catalog is missing: $surrealCatalogRelativePath"
+    }
+    $catalogFile = Get-Item -LiteralPath $catalogPath
+    $catalogBlob = Get-GitBlobHash $Repo $SourceCommit $surrealCatalogRelativePath
+    $catalogSourceHash = Get-FilteredFileHash $Repo $surrealCatalogRelativePath $catalogFile.FullName
+    if ($catalogSourceHash -ne $catalogBlob) {
+        throw "tracked SurrealDB artifact catalog differs from pinned source commit: $surrealCatalogRelativePath"
+    }
+    $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
+    if ([string]$catalog.schema -ne 'eliot-external-release-artifact-lock-v1' -or
+        [string]$catalog.artifact -cne 'surreal.exe' -or
+        [string]$catalog.relative_path -cne 'runtime/surreal.exe' -or
+        [string]$catalog.version -cne '3.1.4' -or
+        [string]$catalog.architecture -cne 'windows-x64' -or
+        [string]$catalog.pe_machine -cne '8664' -or
+        [string]$catalog.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'tracked SurrealDB artifact catalog is missing its canonical filename/version/architecture/digest binding'
+    }
+    [pscustomobject]@{
+        path = $catalogPath
+        relative_path = $surrealCatalogRelativePath
+        source_commit = $SourceCommit
+        sha256 = (Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        artifact = [string]$catalog.artifact
+        runtime_path = [string]$catalog.relative_path
+        version = [string]$catalog.version
+        architecture = [string]$catalog.architecture
+        pe_machine = [string]$catalog.pe_machine
+        artifact_sha256 = ([string]$catalog.sha256).ToLowerInvariant()
+    }
+}
+
+function Get-VerifiedPinnedSurrealArtifact([string]$Path, [string]$ExpectedSha256, [string]$ExpectedVersion, [object]$Catalog) {
     if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') {
         throw 'SurrealSha256 must be the caller-supplied 64-character SHA-256 pin'
     }
     if ([string]::IsNullOrWhiteSpace($ExpectedVersion)) {
         throw 'SurrealVersion must be the caller-supplied exact file version pin'
     }
+    if (-not $Catalog -or [string]$Catalog.runtime_path -cne 'runtime/surreal.exe') {
+        throw 'SurrealDB artifact catalog is required for the canonical runtime path'
+    }
+    if ($ExpectedSha256.ToLowerInvariant() -cne [string]$Catalog.artifact_sha256 -or
+        $ExpectedVersion -cne [string]$Catalog.version) {
+        throw 'SurrealVersion and SurrealSha256 must match the tracked SurrealDB artifact catalog'
+    }
     $file = Assert-PinnedExternalPath $Path 'SurrealExe'
     if ($file.Name -cne 'surreal.exe') {
         throw "SurrealExe must name the canonical surreal.exe file: $($file.FullName)"
     }
     Assert-NoSecretFile $file 'runtime/surreal.exe'
-    Assert-WindowsX64Pe $file.FullName 'runtime/surreal.exe'
+    [void](Assert-WindowsX64Pe $file.FullName 'runtime/surreal.exe')
     $actualSha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     $pinnedSha256 = $ExpectedSha256.ToLowerInvariant()
     if ($actualSha256 -ne $pinnedSha256) {
         throw "SurrealExe SHA-256 does not match the caller-supplied pin: $($file.FullName)"
     }
-    $versionOutput = (& $file.FullName version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0) {
-        throw "SurrealExe version probe failed: $($file.FullName)"
-    }
-    $versionMatch = [regex]::Match($versionOutput, '(?m)^(?<version>[0-9A-Za-z.-]+) for windows on x86_64\s*$')
-    if (-not $versionMatch.Success -or $versionMatch.Groups['version'].Value -cne $ExpectedVersion) {
-        throw "SurrealExe version/architecture does not match the caller-supplied pin: expected '$ExpectedVersion windows x86_64', actual '$versionOutput'"
+    $machine = Get-WindowsPeMachine $file.FullName 'runtime/surreal.exe'
+    if ($machine -cne [string]$Catalog.pe_machine) {
+        throw "SurrealExe PE machine does not match the tracked catalog: expected $($Catalog.pe_machine), actual $machine"
     }
     [ordered]@{
         package = 'surrealdb'
@@ -210,6 +254,10 @@ function Get-VerifiedPinnedSurrealArtifact([string]$Path, [string]$ExpectedSha25
         source = 'caller-pinned-absolute-path'
         version = $ExpectedVersion
         architecture = 'windows-x64'
+        catalog_path = $Catalog.relative_path
+        catalog_sha256 = $Catalog.sha256
+        catalog_source_commit = $Catalog.source_commit
+        pe_machine = $Catalog.pe_machine
         sha256 = $actualSha256
         bytes = $file.Length
         signature_policy = 'pre-release-unsigned'
@@ -499,7 +547,8 @@ function Test-ReleaseBundle([string]$Path) {
     }
     if ([string]$runtimeManifest.source_commit -ne [string]$release.source_commit -or
         [string]$runtimeManifest.version -ne [string]$release.version -or
-        [string]$runtimeManifest.architecture -ne 'windows-x64') {
+        [string]$runtimeManifest.architecture -ne 'windows-x64' -or
+        [string]$runtimeManifest.catalog_path -ne $surrealCatalogRelativePath) {
         throw 'runtime artifact manifest does not match RELEASE.json'
     }
     $expectedRuntime = @(Get-RuntimeArtifactDefinitions)
@@ -547,6 +596,10 @@ function Test-ReleaseBundle([string]$Path) {
     if ([string]$surrealEntry.role -ne 'database' -or
         [string]$surrealEntry.path -ne 'runtime/surreal.exe' -or
         [string]$surrealEntry.source -ne 'caller-pinned-absolute-path' -or
+        [string]$surrealEntry.catalog_path -ne $surrealCatalogRelativePath -or
+        [string]$surrealEntry.catalog_source_commit -ne [string]$runtimeManifest.source_commit -or
+        [string]$surrealEntry.catalog_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$surrealEntry.pe_machine -ne '8664' -or
         [string]$surrealEntry.version -ne [string]$runtimeManifest.surreal_version -or
         [string]$surrealEntry.architecture -ne 'windows-x64' -or
         [string]$surrealEntry.sha256 -notmatch '^[0-9a-f]{64}$' -or
@@ -560,15 +613,31 @@ function Test-ReleaseBundle([string]$Path) {
     }
     $surrealPath = Join-Path $resolved 'runtime/surreal.exe'
     $surrealFile = Get-Item -LiteralPath $surrealPath
-    $surrealVersionOutput = (& $surrealPath version 2>&1 | Out-String).Trim()
     if ((Get-FileHash -LiteralPath $surrealPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne [string]$surrealEntry.sha256 -or
         $surrealFile.Length -ne [int64]$surrealEntry.bytes -or
-        [regex]::Match($surrealVersionOutput, '(?m)^(?<version>[0-9A-Za-z.-]+) for windows on x86_64\s*$').Groups['version'].Value -cne [string]$surrealEntry.version) {
+        (Get-WindowsPeMachine $surrealPath 'runtime/surreal.exe') -cne [string]$surrealEntry.pe_machine) {
         throw 'caller-pinned surrealdb artifact readback mismatch'
     }
-    Assert-WindowsX64Pe $surrealPath 'runtime/surreal.exe'
+    [void](Assert-WindowsX64Pe $surrealPath 'runtime/surreal.exe')
+    $catalogPath = Join-Path $resolved $surrealCatalogRelativePath
+    if ((Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne [string]$surrealEntry.catalog_sha256) {
+        throw 'bundled SurrealDB artifact catalog digest mismatch'
+    }
+    $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
+    if ([string]$catalog.schema -ne 'eliot-external-release-artifact-lock-v1' -or
+        [string]$catalog.artifact -cne 'surreal.exe' -or
+        [string]$catalog.relative_path -cne 'runtime/surreal.exe' -or
+        [string]$catalog.version -cne [string]$surrealEntry.version -or
+        [string]$catalog.architecture -ne 'windows-x64' -or
+        [string]$catalog.pe_machine -ne [string]$surrealEntry.pe_machine -or
+        [string]$catalog.sha256 -cne [string]$surrealEntry.sha256) {
+        throw 'bundled SurrealDB artifact catalog content does not bind the shipped artifact'
+    }
     $releaseRuntimeEntries = @($release.runtime_artifacts)
-    if ([int]$release.runtime_artifact_count -ne $declaredRuntime.Count -or
+    if ([string]$release.runtime_artifact_catalog_path -ne $surrealCatalogRelativePath -or
+        [string]$release.runtime_artifact_catalog_sha256 -ne [string]$surrealEntry.catalog_sha256 -or
+        [string]$release.runtime_artifact_catalog_source_commit -ne [string]$release.source_commit -or
+        [int]$release.runtime_artifact_count -ne $declaredRuntime.Count -or
         $releaseRuntimeEntries.Count -ne $declaredRuntime.Count) {
         throw 'RELEASE.json runtime artifact count does not match RUNTIME_ARTIFACTS.json'
     }
@@ -650,12 +719,14 @@ if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
     throw 'failed to resolve the Cargo target directory'
 }
 $runtimeArtifactPlan = Get-RuntimeArtifactPlan $cargoMetadata
-$verifiedPinnedSurreal = Get-VerifiedPinnedSurrealArtifact $SurrealExe $SurrealSha256 $SurrealVersion
 $governorPath = Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-governor.exe'
 $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
     throw 'failed to resolve the release source commit'
 }
+$surrealCatalog = Get-VerifiedSurrealCatalog $repo $sourceCommit
+$verifiedPinnedSurreal = Get-VerifiedPinnedSurrealArtifact $SurrealExe $SurrealSha256 $SurrealVersion $surrealCatalog
+$resolvedSurrealExe = (Resolve-Path -LiteralPath $SurrealExe).Path
 $codexPluginSource = Join-Path $repo 'plugin/eliot-governor'
 $codexPluginManifestPath = Join-Path $codexPluginSource '.codex-plugin/plugin.json'
 $codexPluginManifest = Get-Content -LiteralPath $codexPluginManifestPath -Raw | ConvertFrom-Json
@@ -685,6 +756,9 @@ $plan = [ordered]@{
         version = $verifiedPinnedSurreal.version
         architecture = $verifiedPinnedSurreal.architecture
         source = $verifiedPinnedSurreal.source
+        catalog_path = $surrealCatalog.relative_path
+        catalog_sha256 = $surrealCatalog.sha256
+        catalog_source_commit = $surrealCatalog.source_commit
     }
     runtime_artifacts = @($runtimeArtifactPlan | ForEach-Object {
             [ordered]@{
@@ -753,13 +827,16 @@ try {
     foreach ($artifact in $runtimeArtifactPlan) {
         Copy-Item -LiteralPath $artifact.path -Destination (Join-Path $bundle $artifact.relative_path)
     }
-    Copy-Item -LiteralPath $SurrealExe -Destination (Join-Path $bundle 'runtime/surreal.exe')
+    Copy-Item -LiteralPath $resolvedSurrealExe -Destination (Join-Path $bundle 'runtime/surreal.exe')
     [ordered]@{
         schema = 'eliot-runtime-artifact-set-v1'
         component = 'eliot_runtime_verified_build_artifacts'
         version = $Version
         source_commit = $sourceCommit
         architecture = 'windows-x64'
+        catalog_path = $surrealCatalog.relative_path
+        catalog_sha256 = $surrealCatalog.sha256
+        catalog_source_commit = $surrealCatalog.source_commit
         build_profile = 'release'
         signed = $false
         signature_policy = 'pre-release-unsigned'
@@ -804,6 +881,9 @@ try {
         operator_protocol_hash = $protocolHash
         codex_plugin_base_version = $codexPluginBaseVersion
         runtime_artifacts_manifest = 'runtime/RUNTIME_ARTIFACTS.json'
+        runtime_artifact_catalog_path = $surrealCatalog.relative_path
+        runtime_artifact_catalog_sha256 = $surrealCatalog.sha256
+        runtime_artifact_catalog_source_commit = $surrealCatalog.source_commit
         runtime_artifact_count = $runtimeArtifactPlan.Count + 1
         runtime_artifacts = @($verifiedRuntimeArtifacts + $verifiedPinnedSurreal | ForEach-Object {
                 [ordered]@{

@@ -3,6 +3,11 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$releaseScript = Join-Path $repo 'scripts/build-eliot-windows-x64-release.ps1'
+$releaseScriptText = Get-Content -LiteralPath $releaseScript -Raw
+if ($releaseScriptText -match '(?m)&\s+\$[^\r\n]*\bversion\b') {
+    throw 'release packaging/verification must not execute surreal.exe to obtain version metadata'
+}
 . (Join-Path $repo 'scripts/build-eliot-windows-x64-release.ps1')
 
 $metadata = (& cargo metadata --format-version 1 --no-deps 2>$null | Out-String) | ConvertFrom-Json
@@ -39,8 +44,16 @@ if (-not $missingRejected) {
 }
 
 $externalPathRejected = $false
+$testCatalog = [pscustomobject]@{
+    runtime_path = 'runtime/surreal.exe'
+    artifact_sha256 = ('0' * 64)
+    version = '3.1.4'
+    pe_machine = '8664'
+    sha256 = ('0' * 64)
+    source_commit = 'test'
+}
 try {
-    Get-VerifiedPinnedSurrealArtifact 'surreal.exe' ('0' * 64) '3.1.4' | Out-Null
+    Get-VerifiedPinnedSurrealArtifact 'surreal.exe' ('0' * 64) '3.1.4' $testCatalog | Out-Null
 }
 catch {
     $externalPathRejected = $_.Exception.Message -match 'explicit absolute path'
@@ -51,7 +64,7 @@ if (-not $externalPathRejected) {
 
 $externalPinRejected = $false
 try {
-    Get-VerifiedPinnedSurrealArtifact (Join-Path $env:SystemRoot 'System32\cmd.exe') ('0' * 64) '3.1.4' | Out-Null
+    Get-VerifiedPinnedSurrealArtifact (Join-Path $env:SystemRoot 'System32\cmd.exe') ('0' * 64) '3.1.4' $testCatalog | Out-Null
 }
 catch {
     $externalPinRejected = $_.Exception.Message -match 'resident regular non-reparse|canonical surreal.exe'
