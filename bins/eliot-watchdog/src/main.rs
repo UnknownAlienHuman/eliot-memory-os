@@ -1,5 +1,4 @@
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -39,17 +38,16 @@ fn run_watchdog(stop_signal: Arc<AtomicBool>) -> Result<(), String> {
     // no genesis/default lease in this process: stale or missing durable bytes
     // fail closed before the watchdog can advertise readiness.  The source is
     // retained by the composition and reloaded before every observation.
-    let admission_source = Arc::new(FileWatchdogAdmission::new(
-        lease_path,
-        admission_config_path,
-        registry_path,
-    ));
+    let admission_source = Arc::new(
+        FileWatchdogAdmission::from_registry(lease_path, admission_config_path, registry_path)
+            .map_err(|error| error.to_string())?,
+    );
     let admission = admission_source
         .reload()
         .map_err(|error| error.to_string())?;
     let sensor = Arc::new(
-        IndependentKernelSensor::open_program_data(
-            PathBuf::from("Eliot/watchdog/watchdog.redb"),
+        IndependentKernelSensor::open_runtime_binding(
+            admission_source.runtime_binding(),
             admission.watchdog_epoch().value(),
         )
         .map_err(|error| error.to_string())?,

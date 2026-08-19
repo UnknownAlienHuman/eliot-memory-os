@@ -14,9 +14,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{AuthorityEpoch, sha256_hex};
-use eliot_installation::RedbInstallationRegistry;
+use eliot_installation::{
+    InstallationProfile, RedbInstallationRegistry, RuntimeStateRoots, ValidatedRuntimeRootLeases,
+    WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
+};
 use eliot_platform_windows::{
-    ProtectedPathLease, protected_program_data_path, require_protected_program_data_path,
+    ProtectedPathLease, protected_program_data_root, require_protected_program_data_path,
 };
 use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
@@ -110,7 +113,6 @@ pub trait WatchdogAdmissionSource: Send + Sync + 'static {
 
 /// File-backed admission source for the Host/Kernel lease and its independent
 /// trust/configuration/registry inputs.
-#[derive(Clone, Debug)]
 #[allow(
     clippy::struct_field_names,
     reason = "the explicit path suffix distinguishes three independently protected filesystem inputs"
@@ -119,29 +121,73 @@ pub struct FileWatchdogAdmission {
     lease_path: PathBuf,
     admission_config_path: PathBuf,
     registry_path: PathBuf,
+    installation_id: String,
+    roots_digest: String,
+    binding: WatchdogRuntimeBinding,
+}
+
+/// Approved runtime roots plus the retained no-follow leases that prove them.
+#[derive(Clone)]
+pub struct WatchdogRuntimeBinding {
+    roots: RuntimeStateRoots,
+    _root_leases: Arc<ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>>,
+}
+
+impl WatchdogRuntimeBinding {
+    #[must_use]
+    pub fn watchdog_state_root(&self) -> &Path {
+        Path::new(self.roots.watchdog_state_root.as_str())
+    }
 }
 
 impl FileWatchdogAdmission {
-    #[must_use]
+    /// # Errors
+    ///
+    /// Returns an error when the active registry is missing, invalid, or its
+    /// runtime roots cannot be retained and validated.
+    pub fn from_registry(
+        lease_path: impl Into<PathBuf>,
+        admission_config_path: impl Into<PathBuf>,
+        registry_path: impl Into<PathBuf>,
+    ) -> Result<Self, SpoolError> {
+        let registry_path = registry_path.into();
+        let (installation_id, binding) = load_runtime_binding(&registry_path)?;
+        Ok(Self {
+            lease_path: lease_path.into(),
+            admission_config_path: admission_config_path.into(),
+            registry_path,
+            installation_id,
+            roots_digest: binding.roots.roots_digest.as_str().to_owned(),
+            binding,
+        })
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the active registry is missing, invalid, or its
+    /// runtime roots cannot be retained and validated.
     pub fn new(
         lease_path: impl Into<PathBuf>,
         admission_config_path: impl Into<PathBuf>,
         registry_path: impl Into<PathBuf>,
-    ) -> Self {
-        Self {
-            lease_path: lease_path.into(),
-            admission_config_path: admission_config_path.into(),
-            registry_path: registry_path.into(),
-        }
+    ) -> Result<Self, SpoolError> {
+        Self::from_registry(lease_path, admission_config_path, registry_path)
+    }
+
+    #[must_use]
+    pub fn runtime_binding(&self) -> WatchdogRuntimeBinding {
+        self.binding.clone()
     }
 }
 
 impl WatchdogAdmissionSource for FileWatchdogAdmission {
     fn reload(&self) -> Result<VerifiedWatchdogAdmission, SpoolError> {
-        load_supervision_lease(
+        load_supervision_lease_bound(
             &self.lease_path,
             &self.admission_config_path,
             &self.registry_path,
+            &self.installation_id,
+            &self.roots_digest,
         )
     }
 }
@@ -242,19 +288,22 @@ struct WatchdogSpool {
 }
 
 impl WatchdogSpool {
-    fn open(path: &Path) -> Result<Self, SpoolError> {
-        require_protected_program_data_path(path, SPOOL_RELATIVE_PATH)
-            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        let path_lease = ProtectedPathLease::open_or_create(SPOOL_RELATIVE_PATH)
+    fn open_runtime_binding(binding: &WatchdogRuntimeBinding) -> Result<Self, SpoolError> {
+        let root = binding.watchdog_state_root();
+        let path = root.join("watchdog.redb");
+        let program_data =
+            protected_program_data_root().map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        let relative = runtime_spool_relative_path(&path, &program_data)?;
+        let path_lease = ProtectedPathLease::open_or_create(relative)
             .map_err(|_| SpoolError::InvalidProtectedRoot)?;
         if path_lease.path() != path {
             return Err(SpoolError::InvalidProtectedRoot);
         }
-        let database = Database::create(path_lease.path())
-            .map_err(|error| SpoolError::Database(error.to_string()))?;
         path_lease
             .verify_path_identity()
             .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        let database = Database::open(path_lease.path())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
         let spool = Self {
             database,
             _path_lease: Some(path_lease),
@@ -600,6 +649,12 @@ impl WatchdogSpool {
     }
 }
 
+fn runtime_spool_relative_path(path: &Path, program_data: &Path) -> Result<PathBuf, SpoolError> {
+    path.strip_prefix(program_data)
+        .map(Path::to_path_buf)
+        .map_err(|_| SpoolError::InvalidProtectedRoot)
+}
+
 fn encode_entry(entry: &WatchdogSpoolEntry) -> Result<Vec<u8>, SpoolError> {
     let bytes =
         serde_json::to_vec(entry).map_err(|error| SpoolError::Serialization(error.to_string()))?;
@@ -759,20 +814,21 @@ pub struct GapRecoveryDisposition {
 pub struct IndependentKernelSensor {
     watchdog: Mutex<Watchdog>,
     spool: WatchdogSpool,
+    _runtime_binding: WatchdogRuntimeBinding,
 }
 
 impl IndependentKernelSensor {
-    /// Opens the one canonical protected redb spool below `ProgramData`.
+    /// Opens a sensor from an approved binding and retains its root leases.
     ///
     /// # Errors
     ///
-    /// Returns an error if the path is outside the protected spool location,
-    /// the spool cannot be opened or recovered, or the epoch is invalid.
-    pub fn open(path: impl Into<PathBuf>, watchdog_epoch: u64) -> Result<Self, SpoolError> {
-        let spool = path.into();
-        require_protected_program_data_path(&spool, SPOOL_RELATIVE_PATH)
-            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        let spool_store = WatchdogSpool::open(&spool)?;
+    /// Returns an error when the root or its spool file cannot be opened and
+    /// retained as a protected file, or when the epoch is invalid.
+    pub fn open_runtime_binding(
+        binding: WatchdogRuntimeBinding,
+        watchdog_epoch: u64,
+    ) -> Result<Self, SpoolError> {
+        let spool = WatchdogSpool::open_runtime_binding(&binding)?;
         let watchdog = Watchdog::new(
             eliot_watchdog_core::WatchdogConfig::default(),
             Epoch(watchdog_epoch),
@@ -780,24 +836,9 @@ impl IndependentKernelSensor {
         .map_err(|_| SpoolError::InvalidLease("watchdog epoch is invalid".to_owned()))?;
         Ok(Self {
             watchdog: Mutex::new(watchdog),
-            spool: spool_store,
+            spool,
+            _runtime_binding: binding,
         })
-    }
-
-    /// Opens the exact canonical protected watchdog spool below `ProgramData`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the protected path cannot be resolved, the spool
-    /// cannot be opened or recovered, or the epoch is invalid.
-    pub fn open_program_data(
-        relative_path: impl Into<PathBuf>,
-        watchdog_epoch: u64,
-    ) -> Result<Self, SpoolError> {
-        let relative = relative_path.into();
-        let spool =
-            protected_program_data_path(&relative).map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        Self::open(spool, watchdog_epoch)
     }
 
     /// Reads and validates the ordered spool records for an independent
@@ -816,11 +857,11 @@ impl IndependentKernelSensor {
         if path_lease.path() != path {
             return Err(SpoolError::InvalidProtectedRoot);
         }
-        let database = Database::open(path_lease.path())
-            .map_err(|error| SpoolError::Database(error.to_string()))?;
         path_lease
             .verify_path_identity()
             .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        let database = Database::open(path_lease.path())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
         WatchdogSpool {
             database,
             _path_lease: Some(path_lease),
@@ -1193,17 +1234,66 @@ async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) -> bool {
     }
 }
 
-/// Loads and validates the current Host/Kernel-issued lease.  Missing,
-/// malformed, stale or non-active bytes are a hard startup failure.
-///
-/// # Errors
-///
-/// Returns an error if protected paths, bounded input bytes, registry state,
-/// trust material, signature, freshness, or installation/generation bindings fail validation.
-pub fn load_supervision_lease(
+fn load_runtime_binding(
+    registry_path: &Path,
+) -> Result<(String, WatchdogRuntimeBinding), SpoolError> {
+    let registry = RedbInstallationRegistry::inspect_existing(registry_path)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+        .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
+    let active = registry
+        .active()
+        .ok_or_else(|| SpoolError::InvalidLease("no active approved generation".to_owned()))?;
+    let roots = active.manifest.runtime_launch.runtime_state_roots.clone();
+    if roots.profile != InstallationProfile::SystemService {
+        return Err(SpoolError::InvalidLease(
+            "watchdog has no retained file adapter for this installation profile".to_owned(),
+        ));
+    }
+    let mut provider = WindowsRuntimeRootLeaseProvider::for_roots(&roots)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    let leases = roots
+        .retain_and_validate(&mut provider)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    Ok((
+        active
+            .manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .as_str()
+            .to_owned(),
+        WatchdogRuntimeBinding {
+            roots,
+            _root_leases: Arc::new(leases),
+        },
+    ))
+}
+
+fn validate_runtime_binding(
+    active_installation_id: &str,
+    active_roots_digest: &str,
+    expected_installation_id: &str,
+    expected_roots_digest: &str,
+) -> Result<(), SpoolError> {
+    if active_installation_id != expected_installation_id {
+        return Err(SpoolError::InvalidLease(
+            "active generation installation identity changed after binding".to_owned(),
+        ));
+    }
+    if active_roots_digest != expected_roots_digest {
+        return Err(SpoolError::InvalidLease(
+            "active generation runtime roots changed after binding".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_supervision_lease_bound(
     lease_path: impl AsRef<Path>,
     admission_config_path: impl AsRef<Path>,
     registry_path: impl AsRef<Path>,
+    expected_installation_id: &str,
+    expected_roots_digest: &str,
 ) -> Result<VerifiedWatchdogAdmission, SpoolError> {
     let lease_path = lease_path.as_ref();
     let admission_config_path = admission_config_path.as_ref();
@@ -1216,27 +1306,40 @@ pub fn load_supervision_lease(
         require_protected_program_data_path(path, relative)
             .map_err(|_| SpoolError::InvalidProtectedRoot)?;
     }
-    let installation_id = std::env::var("ELIOT_INSTALLATION_ID")
-        .map_err(|_| SpoolError::InvalidLease("installation identity is unavailable".to_owned()))?;
-    validate_text(&installation_id, "environment.installation_id")?;
+    validate_text(expected_installation_id, "installation_id")?;
     let config_bytes = read_bounded(admission_config_path, ADMISSION_CONFIG_LIMIT)?;
     let config: WatchdogAdmissionConfig = serde_json::from_slice(&config_bytes)
         .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
     config.validate_shape()?;
-    let registry = RedbInstallationRegistry::open(registry_path)
+    let registry = RedbInstallationRegistry::inspect_existing(registry_path)
         .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
-        .load()
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+        .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
     let active = registry
         .active()
         .ok_or_else(|| SpoolError::InvalidLease("no active approved generation".to_owned()))?;
-    if config.installation_id != installation_id
-        || config.trust_anchor.installation_id != installation_id
+    if config.installation_id != expected_installation_id
+        || config.trust_anchor.installation_id != expected_installation_id
     {
         return Err(SpoolError::InvalidLease(
             "admission installation identity does not match the service installation".to_owned(),
         ));
     }
+    validate_runtime_binding(
+        active
+            .manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .as_str(),
+        active
+            .manifest
+            .runtime_launch
+            .runtime_state_roots
+            .roots_digest
+            .as_str(),
+        expected_installation_id,
+        expected_roots_digest,
+    )?;
     if config.approved_generation != active.manifest.generation.as_str() {
         return Err(SpoolError::InvalidLease(
             "admission generation is not the active approved generation".to_owned(),
@@ -1359,6 +1462,24 @@ mod tests {
         header.record_count = 1;
         header.first_sequence = 3;
         assert!(validate_header(&header, &[entry]).is_err());
+    }
+
+    #[test]
+    fn runtime_binding_rejects_missing_or_substituted_root_identity() {
+        assert!(validate_runtime_binding("install-a", "roots-a", "install-a", "roots-a").is_ok());
+        assert!(validate_runtime_binding("install-a", "roots-a", "install-b", "roots-a").is_err());
+        assert!(validate_runtime_binding("install-a", "roots-a", "install-a", "roots-b").is_err());
+        assert!(validate_runtime_binding("", "", "install-a", "roots-a").is_err());
+    }
+
+    #[test]
+    fn runtime_spool_path_rejects_root_substitution() {
+        let program_data = Path::new(r"C:\ProgramData");
+        let outside = Path::new(r"C:\Users\Public\watchdog.redb");
+        assert!(matches!(
+            runtime_spool_relative_path(outside, program_data),
+            Err(SpoolError::InvalidProtectedRoot)
+        ));
     }
 
     #[test]
