@@ -8483,6 +8483,8 @@ mod tests {
     use eliot_platform_windows::{HostOwnerEpochCapability, HostOwnerLease};
 
     static NEXT_TRANSACTION_ROOT: AtomicU64 = AtomicU64::new(0);
+    #[cfg(windows)]
+    static PRODUCTION_INSTALLER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn host_capability() -> HostOwnerEpochCapability {
         #[cfg(not(windows))]
@@ -9735,6 +9737,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn production_restart_reconciles_hmac_receipt_without_duplicate_creation() {
+        let _serial = PRODUCTION_INSTALLER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let transaction = planned_transaction();
         let transaction_id = transaction.transaction_id.clone();
         let mut store = SharedStore::default();
@@ -9796,6 +9801,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn production_missing_receipt_after_create_is_unknown_not_owned() {
+        let _serial = PRODUCTION_INSTALLER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let transaction = planned_transaction();
         let transaction_id = transaction.transaction_id.clone();
         let mut store = SharedStore::default();
@@ -9836,6 +9844,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn production_rollback_rejects_root_identity_substitution() {
+        let _serial = PRODUCTION_INSTALLER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let transaction = planned_transaction();
         let transaction_id = transaction.transaction_id.clone();
         let mut store = SharedStore::default();
