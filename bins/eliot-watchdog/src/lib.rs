@@ -24,9 +24,10 @@ use eliot_installation::{
 };
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
-    NamedPipePeerProcessBinding, ProcessIdentity, ProtectedPathLease, ServiceAccount,
-    ServiceBootstrapArguments, ServiceRegistrationInspection, ServiceRegistrationRequest,
-    ServiceStartMode, WindowsAdapterError, WindowsPlatform, observe_running_eliot_host_process,
+    NamedPipePeerProcessBinding, ProcessIdentity, ProtectedPathLease, ProtectedRootLease,
+    ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
+    ServiceRegistrationInspection, ServiceRegistrationRequest, ServiceStartMode,
+    WindowsAdapterError, WindowsPlatform, observe_running_eliot_host_process,
     protected_program_data_root, require_protected_program_data_path, windows_paths_equal,
 };
 use eliot_runtime::{
@@ -42,6 +43,14 @@ use thiserror::Error;
 
 pub const SERVICE_NAME: &str = "EliotWatchdog";
 pub const PROTOCOL_VERSION: &str = "eliot.watchdog.v1";
+/// Fixed files owned by the installer below the approved per-installation
+/// Host state root. These are never resolved from `ProgramData`, the current
+/// directory, or an environment variable.
+pub const SUPERVISION_LEASE_FILE_NAME: &str = "supervision-lease.json";
+/// Watchdog admission configuration below the approved Host state root.
+pub const WATCHDOG_ADMISSION_FILE_NAME: &str = "watchdog-admission.json";
+/// Approved-generation registry below the approved Host state root.
+pub const INSTALLATION_REGISTRY_FILE_NAME: &str = "installation-registry.redb";
 const ADMISSION_CONFIG_SCHEMA: &str = "eliot.watchdog-admission.v1";
 const ADMISSION_CONFIG_LIMIT: u64 = 1024 * 1024;
 const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
@@ -90,10 +99,11 @@ impl ValidatedWatchdogScmLaunch {
 
 /// Parses the complete argv vector delivered to the SCM service callback.
 ///
-/// `argv[0]` must be the canonical service name and the remaining ten values
-/// must be exactly the ordered bootstrap pairs rendered by
-/// [`ServiceBootstrapArguments`], including the registration nonce.  No
-/// optional or unknown arguments are accepted for the installed service.
+/// `argv[0]` must be the canonical service name and the remaining twelve
+/// values must be exactly the ordered bootstrap pairs rendered by
+/// [`ServiceBootstrapArguments`], including the installer-approved
+/// per-installation Host root and registration nonce. No optional or unknown
+/// arguments are accepted for the installed service.
 ///
 /// # Errors
 ///
@@ -107,9 +117,9 @@ where
     S: Into<OsString>,
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-    if args.len() != 11 {
+    if args.len() != 13 {
         return Err(WatchdogScmLaunchError::InvalidArgv(
-            "expected service name plus five canonical pairs".to_owned(),
+            "expected service name plus six canonical pairs".to_owned(),
         ));
     }
     if args[0].to_str() != Some(SERVICE_NAME) {
@@ -126,7 +136,8 @@ where
         || !flag(3, "--config-descriptor-sha256")
         || !flag(5, "--installation-id")
         || !flag(7, "--tx-plan-generation")
-        || !flag(9, "--registration-nonce")
+        || !flag(9, "--host-state-root")
+        || !flag(11, "--registration-nonce")
     {
         return Err(WatchdogScmLaunchError::InvalidArgv(
             "bootstrap flags are missing, reordered, or substituted".to_owned(),
@@ -144,6 +155,17 @@ where
             "config descriptor path must be absolute and valid".to_owned(),
         ));
     }
+    let host_state_root = PathBuf::from(&args[10]);
+    if !host_state_root.is_absolute()
+        || host_state_root.as_os_str().is_empty()
+        || host_state_root
+            .to_str()
+            .is_none_or(|value| value.is_empty() || value.chars().any(char::is_control))
+    {
+        return Err(WatchdogScmLaunchError::InvalidArgv(
+            "Host state root must be absolute and valid".to_owned(),
+        ));
+    }
     let text = |index: usize, field: &str| {
         args[index]
             .to_str()
@@ -156,7 +178,7 @@ where
     let descriptor_digest = text(4, "config descriptor digest")?;
     let installation_id = text(6, "installation id")?;
     let generation_text = text(8, "transaction plan generation")?;
-    let registration_nonce = text(10, "registration nonce")?;
+    let registration_nonce = text(12, "registration nonce")?;
     let generation = generation_text.parse::<u64>().map_err(|_| {
         WatchdogScmLaunchError::InvalidArgv(
             "transaction plan generation must be non-zero".to_owned(),
@@ -174,6 +196,8 @@ where
         generation,
         std::iter::empty::<String>(),
     )
+    .map_err(|error| WatchdogScmLaunchError::InvalidArgv(error.to_string()))?
+    .with_host_state_root(host_state_root)
     .map_err(|error| WatchdogScmLaunchError::InvalidArgv(error.to_string()))?
     .with_registration_nonce(registration_nonce)
     .map_err(|error| WatchdogScmLaunchError::InvalidArgv(error.to_string()))?;
@@ -283,9 +307,10 @@ pub fn validate_watchdog_scm_bootstrap(
     })
 }
 
-/// Installation-owned Watchdog admission configuration.  It is loaded from a
-/// fixed `ProgramData` path and independently bound to the active registry
-/// manifest digest; no value is selected from the lease envelope.
+/// Installation-owned Watchdog admission configuration. It is loaded from
+/// fixed children of the installer-approved per-installation Host root and
+/// independently bound to the active registry manifest digest; no value is
+/// selected from the lease envelope.
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatchdogAdmissionConfig {
@@ -383,14 +408,27 @@ pub struct FileWatchdogAdmission {
 /// Approved runtime roots plus the retained no-follow leases that prove them.
 #[derive(Clone)]
 pub struct WatchdogRuntimeBinding {
+    /// Canonical installer-approved Host root selected by SCM and the
+    /// registry manifest.
+    host_state_root: PathBuf,
     roots: RuntimeStateRoots,
     selected_manifest: Arc<CandidateManifest>,
     approved_host_image: PathBuf,
+    /// Retained for the complete lifetime of the admission and sensor. This
+    /// is the no-follow proof that the Host-state contour cannot be replaced
+    /// underneath path-based redb/file consumers.
+    host_state_root_lease: Arc<ProtectedRootLease>,
     _approved_host_image_lease: Arc<ProtectedPathLease>,
     _root_leases: Arc<ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>>,
 }
 
 impl WatchdogRuntimeBinding {
+    /// Returns the canonical installer-approved Host state root.
+    #[must_use]
+    pub fn host_state_root(&self) -> &Path {
+        &self.host_state_root
+    }
+
     #[must_use]
     pub fn watchdog_state_root(&self) -> &Path {
         Path::new(self.roots.watchdog_state_root.as_str())
@@ -416,11 +454,19 @@ impl FileWatchdogAdmission {
         registry_path: impl Into<PathBuf>,
         bootstrap: ServiceBootstrapArguments,
     ) -> Result<Self, SpoolError> {
+        let lease_path = lease_path.into();
+        let admission_config_path = admission_config_path.into();
         let registry_path = registry_path.into();
         let (installation_id, binding) = load_runtime_binding(&registry_path, &bootstrap)?;
+        validate_host_admission_paths(
+            &binding,
+            &lease_path,
+            &admission_config_path,
+            &registry_path,
+        )?;
         Ok(Self {
-            lease_path: lease_path.into(),
-            admission_config_path: admission_config_path.into(),
+            lease_path,
+            admission_config_path,
             registry_path,
             installation_id,
             roots_digest: binding.roots.roots_digest.as_str().to_owned(),
@@ -451,15 +497,7 @@ impl FileWatchdogAdmission {
 
 impl WatchdogAdmissionSource for FileWatchdogAdmission {
     fn reload(&self) -> Result<VerifiedWatchdogAdmission, SpoolError> {
-        load_supervision_lease_bound(
-            &self.lease_path,
-            &self.admission_config_path,
-            &self.registry_path,
-            &self.installation_id,
-            &self.roots_digest,
-            &self.bootstrap,
-            &self.binding.selected_manifest,
-        )
+        load_supervision_lease_bound(self)
     }
 
     fn approved_host_image(&self) -> Option<PathBuf> {
@@ -1942,9 +1980,36 @@ fn load_runtime_binding(
     registry_path: &Path,
     bootstrap: &ServiceBootstrapArguments,
 ) -> Result<(String, WatchdogRuntimeBinding), SpoolError> {
-    let registry = RedbInstallationRegistry::inspect_existing(registry_path)
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
-        .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
+    let declared_host_root = bootstrap.host_state_root().ok_or_else(|| {
+        SpoolError::InvalidLease(
+            "Watchdog SCM bootstrap omitted the installer-approved Host state root".to_owned(),
+        )
+    })?;
+    let host_state_root_lease =
+        ProtectedRootLease::open_existing(declared_host_root).map_err(|error| {
+            SpoolError::InvalidLease(format!("Host state root open failed: {error}"))
+        })?;
+    let canonical_host_root = host_state_root_lease.canonical_path().map_err(|error| {
+        SpoolError::InvalidLease(format!("Host state root resolve failed: {error}"))
+    })?;
+    if !windows_paths_equal(&canonical_host_root, declared_host_root) {
+        return Err(SpoolError::InvalidLease(
+            "SCM Host state root is not the exact retained installation root".to_owned(),
+        ));
+    }
+    let expected_registry_path = canonical_host_root.join(INSTALLATION_REGISTRY_FILE_NAME);
+    if !windows_paths_equal(registry_path, &expected_registry_path) {
+        return Err(SpoolError::InvalidLease(
+            "Watchdog registry path is not the exact approved Host child".to_owned(),
+        ));
+    }
+    let registry = RedbInstallationRegistry::inspect_existing_at(
+        ProtectedRootLease::open_existing(&canonical_host_root).map_err(|error| {
+            SpoolError::InvalidLease(format!("Host state root reopen failed: {error}"))
+        })?,
+    )
+    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+    .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
     let selected_manifest = select_runtime_manifest(&registry, bootstrap)?;
     let roots = selected_manifest.runtime_launch.runtime_state_roots.clone();
     let watchdog_image = PathBuf::from(
@@ -1995,13 +2060,47 @@ fn load_runtime_binding(
             .as_str()
             .to_owned(),
         WatchdogRuntimeBinding {
+            host_state_root: canonical_host_root,
             roots,
             selected_manifest: Arc::new(selected_manifest),
             approved_host_image,
+            host_state_root_lease: Arc::new(host_state_root_lease),
             _approved_host_image_lease: Arc::new(approved_host_image_lease),
             _root_leases: Arc::new(leases),
         },
     ))
+}
+
+fn validate_host_admission_paths(
+    binding: &WatchdogRuntimeBinding,
+    lease_path: &Path,
+    admission_config_path: &Path,
+    registry_path: &Path,
+) -> Result<(), SpoolError> {
+    let expected = [
+        (lease_path, SUPERVISION_LEASE_FILE_NAME),
+        (admission_config_path, WATCHDOG_ADMISSION_FILE_NAME),
+        (registry_path, INSTALLATION_REGISTRY_FILE_NAME),
+    ];
+    for (actual, leaf) in expected {
+        validate_host_admission_child(&binding.host_state_root, actual, leaf)?;
+    }
+    Ok(())
+}
+
+fn validate_host_admission_child(
+    host_state_root: &Path,
+    actual: &Path,
+    leaf: &str,
+) -> Result<(), SpoolError> {
+    let expected_path = host_state_root.join(leaf);
+    if windows_paths_equal(actual, &expected_path) {
+        Ok(())
+    } else {
+        Err(SpoolError::InvalidLease(format!(
+            "Watchdog admission path is not the approved Host child: {leaf}"
+        )))
+    }
 }
 
 fn select_runtime_manifest(
@@ -2097,7 +2196,12 @@ fn manifest_matches_bootstrap(
     bootstrap: &ServiceBootstrapArguments,
 ) -> bool {
     let launch = &manifest.runtime_launch;
-    bootstrap.config_descriptor_path() == Path::new(launch.authority_descriptor_path.as_str())
+    bootstrap.host_state_root().is_some_and(|host_state_root| {
+        windows_paths_equal(
+            host_state_root,
+            Path::new(launch.runtime_state_roots.host_state_root.as_str()),
+        )
+    }) && bootstrap.config_descriptor_path() == Path::new(launch.authority_descriptor_path.as_str())
         && bootstrap.config_descriptor_digest() == launch.authority_descriptor_digest.as_str()
         && bootstrap.installation_id() == launch.installation_epoch.installation.as_str()
         && bootstrap.transaction_plan_generation() == launch.authority_generation.value()
@@ -2165,35 +2269,35 @@ fn validate_runtime_binding(
 }
 
 fn load_supervision_lease_bound(
-    lease_path: impl AsRef<Path>,
-    admission_config_path: impl AsRef<Path>,
-    registry_path: impl AsRef<Path>,
-    expected_installation_id: &str,
-    expected_roots_digest: &str,
-    bootstrap: &ServiceBootstrapArguments,
-    expected_manifest: &CandidateManifest,
+    source: &FileWatchdogAdmission,
 ) -> Result<VerifiedWatchdogAdmission, SpoolError> {
-    let lease_path = lease_path.as_ref();
-    let admission_config_path = admission_config_path.as_ref();
-    let registry_path = registry_path.as_ref();
-    for (path, relative) in [
-        (lease_path, "Eliot/host/supervision-lease.json"),
-        (admission_config_path, "Eliot/host/watchdog-admission.json"),
-        (registry_path, "Eliot/host/installation-registry.redb"),
-    ] {
-        require_protected_program_data_path(path, relative)
-            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
-    }
+    let lease_path = source.lease_path.as_path();
+    let admission_config_path = source.admission_config_path.as_path();
+    let registry_path = source.registry_path.as_path();
+    let expected_installation_id = source.installation_id.as_str();
+    let expected_roots_digest = source.roots_digest.as_str();
+    let bootstrap = &source.bootstrap;
+    let expected_manifest = &source.binding.selected_manifest;
+    let binding = &source.binding;
+    binding
+        .host_state_root_lease
+        .verify_stable_identity()
+        .map_err(|error| SpoolError::InvalidLease(format!("Host state root changed: {error}")))?;
+    validate_host_admission_paths(binding, lease_path, admission_config_path, registry_path)?;
     validate_text(expected_installation_id, "installation_id")?;
     let config_bytes = read_bounded(admission_config_path, ADMISSION_CONFIG_LIMIT)?;
     let config: WatchdogAdmissionConfig = serde_json::from_slice(&config_bytes)
         .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
     config.validate_shape()?;
-    let registry = RedbInstallationRegistry::inspect_existing(registry_path)
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
-        .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
+    let registry = RedbInstallationRegistry::inspect_existing_at(
+        ProtectedRootLease::open_existing(binding.host_state_root()).map_err(|error| {
+            SpoolError::InvalidLease(format!("Host state root reopen failed: {error}"))
+        })?,
+    )
+    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+    .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
     let selected_manifest = select_runtime_manifest(&registry, bootstrap)?;
-    if selected_manifest != *expected_manifest {
+    if selected_manifest != **expected_manifest {
         return Err(SpoolError::InvalidLease(
             "selected runtime contour changed after watchdog binding".to_owned(),
         ));
@@ -2282,7 +2386,7 @@ fn current_unix_ms() -> Result<u64, SpoolError> {
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, SpoolError> {
-    ProtectedPathLease::open_existing_absolute(path)
+    ProtectedRuntimePathLease::open_existing_absolute(path)
         .and_then(|lease| lease.read_bounded(limit))
         .map_err(|error| match error {
             eliot_platform_windows::ProtectedPathError::SizeExceeded => SpoolError::InvalidLease(
@@ -2319,6 +2423,11 @@ mod tests {
             7,
             std::iter::empty::<String>(),
         )
+        .and_then(|value| {
+            value.with_host_state_root(PathBuf::from(
+                r"C:\ProgramData\Eliot\installations\installation-7\host",
+            ))
+        })
         .and_then(|value| value.with_registration_nonce("b".repeat(64)))
         .unwrap_or_else(|error| panic!("{error}"));
         let mut args = vec![OsString::from(SERVICE_NAME)];
@@ -2343,7 +2452,10 @@ mod tests {
         let authority_generation = bootstrap.transaction_plan_generation();
         let watchdog_path = r"C:\ProgramData\Eliot\packages\generation-7\eliot-watchdog.exe";
         let host_path = r"C:\ProgramData\Eliot\packages\generation-7\host\eliot-host.exe";
-        let host_root = r"C:\ProgramData\Eliot\state\host";
+        let host_root = bootstrap.host_state_root().map_or_else(
+            || panic!("missing Host state root"),
+            |path| path.to_string_lossy().into_owned(),
+        );
         let kernel_root = r"C:\ProgramData\Eliot\state\kernel\state";
         let kernel_work_root = r"C:\ProgramData\Eliot\state\kernel\work";
         let store_data_root = r"C:\ProgramData\Eliot\state\store\data";
@@ -2484,15 +2596,19 @@ mod tests {
         assert!(parse_watchdog_scm_argv(reordered).is_err());
 
         let mut substituted = args;
-        substituted[10] = OsString::from("C".repeat(64));
+        substituted[12] = OsString::from("C".repeat(64));
         assert!(parse_watchdog_scm_argv(substituted).is_err());
     }
 
     #[test]
     fn scm_argv_requires_registration_nonce_and_exact_service_name() {
         let mut missing_nonce = valid_scm_args();
-        missing_nonce.truncate(9);
+        missing_nonce.truncate(11);
         assert!(parse_watchdog_scm_argv(missing_nonce).is_err());
+
+        let mut missing_root = valid_scm_args();
+        missing_root.drain(9..11);
+        assert!(parse_watchdog_scm_argv(missing_root).is_err());
 
         let mut wrong_service = valid_scm_args();
         wrong_service[0] = OsString::from("EliotHost");
@@ -2585,6 +2701,13 @@ mod tests {
             parse_watchdog_scm_argv(substituted_args).unwrap_or_else(|error| panic!("{error}"));
         let registry = pending_registry_fixture(&bootstrap, 1);
         assert!(select_runtime_manifest(&registry, &substituted).is_err());
+
+        let mut substituted_root_args = valid_scm_args();
+        substituted_root_args[10] =
+            OsString::from(r"C:\ProgramData\Eliot\installations\different-installation\host");
+        let substituted_root = parse_watchdog_scm_argv(substituted_root_args)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(select_runtime_manifest(&registry, &substituted_root).is_err());
 
         let mut unmatched_args = valid_scm_args();
         unmatched_args[2] = OsString::from(r"C:\ProgramData\Eliot\config\other.json");
@@ -2928,6 +3051,59 @@ mod tests {
         assert!(validate_runtime_binding("install-a", "roots-a", "install-b", "roots-a").is_err());
         assert!(validate_runtime_binding("install-a", "roots-a", "install-a", "roots-b").is_err());
         assert!(validate_runtime_binding("", "", "install-a", "roots-a").is_err());
+    }
+
+    #[test]
+    fn host_admission_children_are_exact_and_never_legacy_or_created() {
+        let host_root = Path::new(
+            r"C:\ProgramData\Eliot\installations\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\host",
+        );
+        assert!(
+            validate_host_admission_child(
+                host_root,
+                &host_root.join(SUPERVISION_LEASE_FILE_NAME),
+                SUPERVISION_LEASE_FILE_NAME,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_host_admission_child(
+                host_root,
+                Path::new(r"C:\ProgramData\Eliot\host\supervision-lease.json"),
+                SUPERVISION_LEASE_FILE_NAME,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_host_admission_child(
+                host_root,
+                &host_root.join(r"..\other\supervision-lease.json"),
+                SUPERVISION_LEASE_FILE_NAME,
+            )
+            .is_err()
+        );
+        assert!(validate_host_admission_child(
+            host_root,
+            Path::new(
+                r"C:\ProgramData\Eliot\installations\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\host\installation-registry.redb",
+            ),
+            INSTALLATION_REGISTRY_FILE_NAME,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn watchdog_production_path_is_root_bound_and_read_only() {
+        let source = include_str!("main.rs");
+        let library = include_str!("lib.rs");
+        assert!(source.contains("host_state_root"));
+        assert!(!source.contains("protected_program_data_path"));
+        assert!(library.contains("ProtectedRootLease::open_existing"));
+        assert!(library.contains("RedbInstallationRegistry::inspect_existing_at"));
+        let legacy_registry_call = ["RedbInstallationRegistry::inspect_existing", "("].concat();
+        let mutating_registry_call = ["RedbInstallationRegistry::open_at", "("].concat();
+        assert!(!library.contains(&legacy_registry_call));
+        assert!(!library.contains(&mutating_registry_call));
     }
 
     #[test]

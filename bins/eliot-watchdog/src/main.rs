@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use eliot_platform_windows::{ServiceBootstrapArguments, protected_program_data_path};
+use eliot_platform_windows::ServiceBootstrapArguments;
 use eliot_watchdog::{
-    FileWatchdogAdmission, IndependentKernelSensor, LiveHostObservationSource, SERVICE_NAME,
-    WatchdogAdmissionSource, WatchdogComposition, WatchdogConfig,
+    FileWatchdogAdmission, INSTALLATION_REGISTRY_FILE_NAME, IndependentKernelSensor,
+    LiveHostObservationSource, SERVICE_NAME, SUPERVISION_LEASE_FILE_NAME,
+    WATCHDOG_ADMISSION_FILE_NAME, WatchdogAdmissionSource, WatchdogComposition, WatchdogConfig,
     inspect_approved_host_registration,
 };
 
@@ -40,12 +41,12 @@ fn run_watchdog(
     let bootstrap = scm_launch
         .map(|launch| launch.bootstrap().clone())
         .ok_or_else(|| "SCM bootstrap is required for Runtime contour selection".to_owned())?;
-    let lease_path = protected_program_data_path("Eliot/host/supervision-lease.json")
-        .map_err(|error| error.to_string())?;
-    let admission_config_path = protected_program_data_path("Eliot/host/watchdog-admission.json")
-        .map_err(|error| error.to_string())?;
-    let registry_path = protected_program_data_path("Eliot/host/installation-registry.redb")
-        .map_err(|error| error.to_string())?;
+    let host_state_root = bootstrap
+        .host_state_root()
+        .ok_or_else(|| "SCM bootstrap omitted the installer-approved Host state root".to_owned())?;
+    let lease_path = host_state_root.join(SUPERVISION_LEASE_FILE_NAME);
+    let admission_config_path = host_state_root.join(WATCHDOG_ADMISSION_FILE_NAME);
+    let registry_path = host_state_root.join(INSTALLATION_REGISTRY_FILE_NAME);
     // The lease is issued by the Host/Kernel contour.  There is deliberately
     // no genesis/default lease in this process.  A stale or missing lease
     // starts a gap-only sensor so the Watchdog can remain alive and record a
