@@ -3036,10 +3036,7 @@ where
         service,
         operation: ServiceOperation::Start,
     }) {
-        PortOutcome::Known(observation)
-        | PortOutcome::Partial {
-            value: observation, ..
-        } if observation.state == ServiceState::Running => Ok(()),
+        PortOutcome::Known(observation) if observation.state == ServiceState::Running => Ok(()),
         PortOutcome::Known(observation) => Err(HostError::Platform(format!(
             "Watchdog did not reach Known(Running): {:?}",
             observation.state
@@ -4893,7 +4890,7 @@ mod watchdog_service_tests {
     }
 
     #[test]
-    fn exact_stopped_registration_is_started_and_observed() {
+    fn partial_running_start_outcome_requires_recovery() {
         let mut control = FakeInstalledWatchdog {
             inspection: Some(ServiceRegistrationInspection::Matching {
                 observation: observation(ServiceState::Stopped),
@@ -4905,6 +4902,23 @@ mod watchdog_service_tests {
                         .unwrap_or_else(|_| unreachable!()),
                 ],
             }),
+            starts: 0,
+        };
+
+        assert!(matches!(
+            start_installed_watchdog(&mut control, &registration(), context()),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        assert_eq!(control.starts, 1);
+    }
+
+    #[test]
+    fn exact_stopped_registration_accepts_only_known_running() {
+        let mut control = FakeInstalledWatchdog {
+            inspection: Some(ServiceRegistrationInspection::Matching {
+                observation: observation(ServiceState::Stopped),
+            }),
+            start_outcome: Some(PortOutcome::Known(observation(ServiceState::Running))),
             starts: 0,
         };
 
