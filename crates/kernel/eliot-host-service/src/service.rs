@@ -3,7 +3,9 @@
 use std::fmt;
 
 use eliot_contracts::{RequestId, RequestMetadata};
-use eliot_kernel_service::{HostKernelHandshake, KernelReadyReceipt};
+use eliot_kernel_service::{
+    HostKernelCandidateBinding, KernelActivationReceipt, KernelReadyReceipt,
+};
 use eliot_platform::{
     HostActivationTransition, HostProcessRecoveryBinding, HostShutdownMarker, HostStateError,
     HostStateStore, PlatformHandle, PortError, PortOutcome, ServiceObservation, ServiceOperation,
@@ -356,10 +358,17 @@ where
         })
     }
 
-    /// Accepts a Kernel ready receipt and opens Host's active control contour.
+    /// Accepts the exact Kernel activation lineage and ready receipt, then
+    /// opens Host's active control contour.
+    ///
+    /// The candidate is intentionally nonce-free.  The activation receipt is
+    /// Kernel-authored evidence for the exact Host-issued activation, and the
+    /// ready receipt is validated against both values.  Host never recreates a
+    /// legacy handshake or accepts caller-shaped authority material here.
     pub fn accept_kernel_ready(
         &mut self,
-        handshake: &HostKernelHandshake,
+        candidate: &HostKernelCandidateBinding,
+        activation: &KernelActivationReceipt,
         receipt: &KernelReadyReceipt,
     ) -> Result<(), HostServiceError> {
         if self.state != HostServiceState::ControlReady {
@@ -368,11 +377,15 @@ where
                 to: HostServiceState::Active,
             });
         }
-        if handshake.installation_id != self.installation {
+        if candidate.installation_id != self.installation {
             self.fail(HostFailure::IdentityMismatch);
             return Err(HostServiceError::IdentityMismatch);
         }
-        if let Err(error) = receipt.validate(handshake) {
+        if let Err(error) = candidate.validate() {
+            self.fail(HostFailure::KernelHandoff(error.to_string()));
+            return Err(HostServiceError::KernelHandoff(error.to_string()));
+        }
+        if let Err(error) = receipt.validate(candidate, activation) {
             self.fail(HostFailure::KernelHandoff(error.to_string()));
             return Err(HostServiceError::KernelHandoff(error.to_string()));
         }
