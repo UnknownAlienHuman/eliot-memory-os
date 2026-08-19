@@ -32,7 +32,7 @@ use eliot_watchdog_core::{Epoch, Watchdog};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use thiserror::Error;
 
-pub const SERVICE_NAME: &str = "eliot-watchdog";
+pub const SERVICE_NAME: &str = "EliotWatchdog";
 pub const PROTOCOL_VERSION: &str = "eliot.watchdog.v1";
 const ADMISSION_CONFIG_SCHEMA: &str = "eliot.watchdog-admission.v1";
 const ADMISSION_CONFIG_LIMIT: u64 = 1024 * 1024;
@@ -1428,6 +1428,18 @@ mod tests {
                 coverage_claimed: false,
             },
         }
+    }
+
+    #[test]
+    fn canonical_service_identity_binds_runtime_evidence() {
+        assert_eq!(SERVICE_NAME, "EliotWatchdog");
+        assert_ne!(SERVICE_NAME, "eliot-watchdog");
+
+        let entry = heartbeat(1);
+        let WatchdogSpoolPayload::Gap { service, .. } = entry.payload else {
+            unreachable!();
+        };
+        assert_eq!(service, "EliotWatchdog");
     }
 
     #[test]
