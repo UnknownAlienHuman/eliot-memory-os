@@ -29,11 +29,11 @@ use eliot_kernel_core::{
     process_admission_digest,
 };
 use eliot_kernel_service::{
-    EbpCanonicalStoreClient, HostKernelHandshake, HostStoreBootstrapRequirement,
-    KERNEL_CONTROL_PIPE, KernelControlCommand, KernelControlRequest, KernelControlResponse,
-    KernelReadyReceipt, KernelService, KernelServiceError, KernelServiceState,
-    ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest, ProcessExecutionResponse,
-    ProcessObservation, StoreClientError,
+    EbpCanonicalStoreClient, HostKernelCandidateBinding, HostStoreBootstrapRequirement,
+    KERNEL_CONTROL_PIPE, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
+    KernelControlResponse, KernelReadyReceipt, KernelService, KernelServiceError,
+    KernelServiceState, ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest,
+    ProcessExecutionResponse, ProcessObservation, StoreClientError,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
@@ -2796,6 +2796,43 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    fn validate_candidate_process_binding(
+        &self,
+        candidate: &HostKernelCandidateBinding,
+    ) -> Result<(), KernelServiceError> {
+        let binding: RecoverableJobBinding =
+            serde_json::from_value(serde_json::to_value(&candidate.job_binding).map_err(|_| {
+                KernelServiceError::Platform("Kernel Job binding cannot be encoded".to_owned())
+            })?)
+            .map_err(|_| {
+                KernelServiceError::Platform("Kernel Job binding is malformed".to_owned())
+            })?;
+        if binding.job_identity().name() != candidate.job_object_id.as_str() {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "job_object_id",
+            });
+        }
+        let job = RecoverableJobObject::open(binding)
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let current = self
+            .platform
+            .process_identity(std::process::id())
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        if job.binding().root().process() != &current
+            || !job
+                .live_processes()
+                .map_err(|error| KernelServiceError::Platform(error.to_string()))?
+                .iter()
+                .any(|process| process.process() == &current)
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "candidate_process_job_binding",
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
         reason = "ordered live process, Job, authority, configuration, and Store proof remains explicit"
@@ -2805,26 +2842,26 @@ impl KernelComposition {
         request: &KernelControlRequest,
         peer: &PeerIdentity,
     ) -> Result<KernelReadyReceipt, KernelServiceError> {
-        let handshake: &HostKernelHandshake = &request.handshake;
+        let candidate: &HostKernelCandidateBinding = &request.candidate;
         let observed_peer = peer.process_binding().ok_or(KernelServiceError::Platform(
             "authenticated Host process binding is unavailable".to_owned(),
         ))?;
-        if observed_peer.process_id() != handshake.host_process.process_id
-            || observed_peer.start_time_100ns() != handshake.host_process.start_time_100ns
-            || observed_peer.image_path() != handshake.host_process.image_path
+        if observed_peer.process_id() != candidate.host_process.process_id
+            || observed_peer.start_time_100ns() != candidate.host_process.start_time_100ns
+            || observed_peer.image_path() != candidate.host_process.image_path
         {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "host_process",
             });
         }
         let binding: RecoverableJobBinding =
-            serde_json::from_value(serde_json::to_value(&handshake.job_binding).map_err(|_| {
+            serde_json::from_value(serde_json::to_value(&candidate.job_binding).map_err(|_| {
                 KernelServiceError::Platform("Kernel Job binding cannot be encoded".to_owned())
             })?)
             .map_err(|_| {
                 KernelServiceError::Platform("Kernel Job binding is malformed".to_owned())
             })?;
-        if binding.job_identity().name() != handshake.job_object_id.as_str() {
+        if binding.job_identity().name() != candidate.job_object_id.as_str() {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "job_object_id",
             });
@@ -2852,7 +2889,7 @@ impl KernelComposition {
         {
             return Err(KernelServiceError::ReadinessNotProven);
         }
-        if self.approved_config_hash.as_deref() != Some(handshake.config_hash.as_str()) {
+        if self.approved_config_hash.as_deref() != Some(candidate.config_hash.as_str()) {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "config_hash",
             });
@@ -2863,8 +2900,8 @@ impl KernelComposition {
                 .lock()
                 .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?;
             if !probe_ready_state_admitted(service.state())
-                || service.handshake() != Some(handshake)
-                || service.authority_epoch() != handshake.kernel_epoch
+                || service.candidate_binding() != Some(candidate)
+                || service.authority_epoch() != candidate.kernel_epoch
             {
                 return Err(KernelServiceError::ReadinessNotProven);
             }
@@ -2889,7 +2926,7 @@ impl KernelComposition {
         snapshot
             .validate()
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
-        if snapshot.state_fence.authority_epoch != handshake.kernel_epoch
+        if snapshot.state_fence.authority_epoch != candidate.kernel_epoch
             || snapshot.state_fence.resource_generation != request.generation
         {
             return Err(KernelServiceError::HandshakeMismatch {
@@ -2903,7 +2940,7 @@ impl KernelComposition {
         .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
         let process = ProcessObservation {
             process_id,
-            job_object_id: handshake.job_object_id.clone(),
+            job_object_id: candidate.job_object_id.clone(),
             state: eliot_runtime_contracts::ServiceProcessState::Ready,
             health: HealthVector::healthy(),
             evidence_refs: vec![
@@ -2914,7 +2951,7 @@ impl KernelComposition {
                 .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
                 PlatformHandle::new(format!(
                     "kernel-job:{}:{}",
-                    handshake.job_object_id.as_str(),
+                    candidate.job_object_id.as_str(),
                     job.active_process_count()
                         .map_err(|error| KernelServiceError::Platform(error.to_string()))?
                 ))
@@ -2934,19 +2971,31 @@ impl KernelComposition {
             ))
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
         ]);
+        let activation = self
+            .service
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?
+            .activation_receipt()
+            .cloned()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
         let receipt = KernelReadyReceipt {
-            activation_id: handshake.activation_id.clone(),
-            activation_nonce: handshake.activation_nonce.clone(),
+            activation_id: candidate.activation_id.clone(),
+            activation_operation_id: activation.operation_id.clone(),
+            activation_nonce_digest: activation.activation_nonce_digest.clone(),
             process,
             health: HealthVector::healthy(),
             evidence_refs,
         };
-        receipt.validate_for_probe(request)?;
+        receipt.validate_for_probe(request, &activation)?;
         Ok(receipt)
     }
 
     /// Applies one authenticated Host control request after binding the
     /// transport's handle-proven peer and the approved generation contour.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the authenticated control handler preserves one visible validation and command-order boundary"
+    )]
     pub async fn apply_control_request(
         &self,
         request: KernelControlRequest,
@@ -2962,35 +3011,44 @@ impl KernelComposition {
             .ok_or(TransportError::PeerIdentityUnavailable)?;
         if request.sequence != expected_sequence
             || request.peer_process_id != observed_peer.process_id()
-            || request.handshake.pipe_identity.as_str() != self.ipc.name()
-            || observed_peer.process_id() != request.handshake.host_process.process_id
-            || observed_peer.start_time_100ns() != request.handshake.host_process.start_time_100ns
-            || observed_peer.image_path() != request.handshake.host_process.image_path
+            || request.candidate.pipe_identity.as_str() != self.ipc.name()
+            || observed_peer.process_id() != request.candidate.host_process.process_id
+            || observed_peer.start_time_100ns() != request.candidate.host_process.start_time_100ns
+            || observed_peer.image_path() != request.candidate.host_process.image_path
         {
             return Err(TransportError::SessionFenced);
         }
+        #[cfg(windows)]
+        self.validate_candidate_process_binding(&request.candidate)
+            .map_err(|_| TransportError::SessionFenced)?;
         {
-            let policy = self
+            let mut policy = self
                 .front_door_policy
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
+            let reconcile = matches!(&request.command, KernelControlCommand::Reconcile);
+            let policy_epoch = policy.module_generation.state_fence.authority_epoch;
             if request.generation != policy.module_generation.generation
-                || request.handshake.kernel_epoch
-                    != policy.module_generation.state_fence.authority_epoch
-                || request.handshake.artifact_hash.as_str()
+                || request.candidate.kernel_epoch.value() < policy_epoch.value()
+                || (!reconcile && request.candidate.kernel_epoch != policy_epoch)
+                || request.candidate.artifact_hash.as_str()
                     != policy.module_generation.artifact_id.as_str()
                 || self
                     .approved_config_hash
                     .as_deref()
-                    .is_some_and(|hash| hash != request.handshake.config_hash.as_str())
+                    .is_some_and(|hash| hash != request.candidate.config_hash.as_str())
             {
                 return Err(TransportError::SessionFenced);
             }
-        }
-        if let KernelControlCommand::Reconcile(handshake) = &request.command
-            && handshake != &request.handshake
-        {
-            return Err(TransportError::SessionFenced);
+            if request.candidate.kernel_epoch != policy_epoch {
+                self.service
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .synchronize_authority_epoch(request.candidate.kernel_epoch)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                policy.module_generation.state_fence =
+                    StateFence::new(request.candidate.kernel_epoch, request.generation);
+            }
         }
         let is_probe = matches!(&request.command, KernelControlCommand::ProbeReady);
         let receipt = if is_probe {
@@ -3009,6 +3067,22 @@ impl KernelComposition {
         } else {
             None
         };
+        let activation_receipt: Option<KernelActivationReceipt> = match &request.command {
+            KernelControlCommand::Activate(permit) => Some(
+                self.service
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .activate_permit(permit, request.generation, request.payload_digest.clone())
+                    .map_err(|_| TransportError::SessionFenced)?,
+            ),
+            KernelControlCommand::ReconcileActivation(query) => self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .reconcile_activation(query)
+                .map_err(|_| TransportError::SessionFenced)?,
+            _ => None,
+        };
         if let Some(receipt) = &receipt {
             self.service
                 .lock()
@@ -3016,8 +3090,20 @@ impl KernelComposition {
                 .publish_ready(receipt.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
         } else {
-            self.apply_control(request.command)
-                .map_err(|_| TransportError::SessionFenced)?;
+            match &request.command {
+                KernelControlCommand::Reconcile => self
+                    .service
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .reconcile(request.candidate.clone())
+                    .map_err(|_| TransportError::SessionFenced)?,
+                KernelControlCommand::Activate(_)
+                | KernelControlCommand::ReconcileActivation(_) => {}
+                command => {
+                    self.apply_control(command.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                }
+            }
         }
         let state = self
             .service_state()
@@ -3029,6 +3115,7 @@ impl KernelComposition {
             request_digest: request.payload_digest,
             state,
             receipt,
+            activation_receipt,
             error: None,
             payload_digest: String::new(),
         }

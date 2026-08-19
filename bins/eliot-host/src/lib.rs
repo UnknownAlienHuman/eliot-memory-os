@@ -20,8 +20,10 @@ use eliot_host_state::{
     EliotActivationRecord, EpochIdentity, EpochTransition, HostInstallationEpoch,
     HostKernelStoreLineage, HostObservationRecord, HostState, HostStateJournalService,
     HostStateRecord, IdempotencyIdentity, JOURNAL_VERSION, JournalBackend, JournalError,
-    JournalManifest, LifecycleTimestamps, ProductionHostStateJournal, ReadinessEvidence,
-    ReconcileOutcome, RecordFence, RecoveryLineageEvidence, RedbJournalBackend, WakeDisposition,
+    JournalManifest, KernelJobBinding, KernelRecord, LifecycleTimestamps, NonceState,
+    OneTimeNonceState, PriorKernelDisposition, PriorKernelSource, ProductionHostStateJournal,
+    ReadinessEvidence, ReconcileOutcome, RecordFence, RecoveryLineageEvidence, RedbJournalBackend,
+    WakeDisposition,
 };
 use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, InstallationProfile,
@@ -29,8 +31,9 @@ use eliot_installation::{
     verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
 use eliot_kernel_service::{
-    HostJobBinding, HostKernelHandshake, HostProcessBinding, HostStoreBootstrapRequirement,
-    KERNEL_CONTROL_PIPE, KernelControlCommand, KernelControlRequest, KernelReadyReceipt,
+    HostJobBinding, HostKernelCandidateBinding, HostProcessBinding, HostStoreBootstrapRequirement,
+    KERNEL_CONTROL_PIPE, KernelActivationPermit, KernelActivationQuery, KernelActivationReceipt,
+    KernelControlCommand, KernelControlRequest, KernelControlResponse, KernelReadyReceipt,
     KernelServiceState, RestartBudget, control_request_frame, decode_control_response_frame,
 };
 use eliot_observation_contracts::{
@@ -42,11 +45,15 @@ use eliot_platform::{
 use eliot_platform_windows::{
     HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError, ProtectedPathLease,
     ServiceAccount, ServiceRegistrationRequest, ServiceStartMode, WindowsPlatform,
+    fresh_kernel_activation_nonce,
+};
+use eliot_runtime_contracts::{
+    HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
 };
 use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
-use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
+use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, PeerIdentity, TransportLimits};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -276,6 +283,323 @@ fn validate_store_bootstrap_descriptor(
 }
 
 #[cfg(windows)]
+struct DurableKernelActivationDriver<'a, B: JournalBackend> {
+    journal: &'a HostStateJournalService<B>,
+    current: KernelRecord,
+    issued_permit: Option<KernelActivationPermit>,
+}
+
+fn nonce_after_activation_failure(
+    current: &OneTimeNonceState,
+) -> Result<OneTimeNonceState, JournalError> {
+    match current.state() {
+        NonceState::Issued => current.revoke(),
+        NonceState::Unissued | NonceState::Consumed | NonceState::Revoked => Ok(current.clone()),
+    }
+}
+
+fn finish_active_kernel_cleanup(
+    durable: Result<(), HostError>,
+    cleanup: impl FnOnce() -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    let cleanup = cleanup();
+    match (durable, cleanup) {
+        (Ok(()), cleanup) => cleanup,
+        (Err(durable), Err(cleanup)) => Err(HostError::RecoveryRequired(format!(
+            "durable Kernel failure transition failed ({durable}); contour cleanup result: {cleanup}"
+        ))),
+        (Err(durable), Ok(())) => Err(durable),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconcileObservationCleanup {
+    ActiveKernel,
+    GenericContour,
+}
+
+const fn reconcile_observation_cleanup(kernel_reactivated: bool) -> ReconcileObservationCleanup {
+    if kernel_reactivated {
+        ReconcileObservationCleanup::ActiveKernel
+    } else {
+        ReconcileObservationCleanup::GenericContour
+    }
+}
+
+#[cfg(windows)]
+impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
+    fn resume(journal: &'a HostStateJournalService<B>, current: KernelRecord) -> Self {
+        Self {
+            journal,
+            current,
+            issued_permit: None,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the durable candidate record keeps every authority and mechanics binding explicit"
+    )]
+    fn bind_candidate(
+        journal: &'a HostStateJournalService<B>,
+        host: &HostInstallationEpoch,
+        activation_id: &PlatformHandle,
+        activation_generation: &EpochTransition,
+        approved_artifact_hash: PlatformHandle,
+        candidate_pipe_identity: PlatformHandle,
+        candidate_job_binding: KernelJobBinding,
+        prior_kernel_disposition: PriorKernelDisposition,
+        kernel_generation: EpochTransition,
+        process: ServiceProcessRecord,
+    ) -> Result<Self, HostError> {
+        let current = KernelRecord {
+            fence: record_fence(host, activation_id, activation_generation),
+            operation: operation("kernel-candidate-shadow")?,
+            activation_identity: activation_id.clone(),
+            approved_artifact_hash,
+            active_pipe_identity: None,
+            candidate_pipe_identity: Some(candidate_pipe_identity),
+            candidate_job_binding: Some(candidate_job_binding),
+            prior_kernel_disposition,
+            kernel_generation,
+            one_time_nonce: OneTimeNonceState::unissued(),
+            state: KernelActivationState::ShadowNoAuthority,
+            process: Some(process),
+            readiness_evidence: Vec::new(),
+            disposition_evidence: vec![
+                PlatformHandle::new("candidate-process-job-bound")
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+            ],
+        };
+        append_reconciled(journal, HostStateRecord::Kernel(current.clone()))?;
+        Ok(Self {
+            journal,
+            current,
+            issued_permit: None,
+        })
+    }
+
+    fn transition(
+        &mut self,
+        state: KernelActivationState,
+        label: &str,
+        mutate: impl FnOnce(&mut KernelRecord) -> Result<(), HostError>,
+    ) -> Result<AppendReceipt, HostError> {
+        let mut next = self.current.clone();
+        next.operation = operation(label)?;
+        next.state = state;
+        mutate(&mut next)?;
+        let receipt = append_reconciled(self.journal, HostStateRecord::Kernel(next.clone()))?;
+        self.current = next;
+        Ok(receipt)
+    }
+
+    fn handoff_prepared(&mut self) -> Result<(), HostError> {
+        self.transition(
+            KernelActivationState::HandoffPrepared,
+            "kernel-handoff-prepared",
+            |_| Ok(()),
+        )?;
+        Ok(())
+    }
+
+    fn prior_disposition_committed(&mut self) -> Result<(), HostError> {
+        self.transition(
+            KernelActivationState::OldTerminated,
+            "kernel-prior-disposition",
+            |_| Ok(()),
+        )?;
+        Ok(())
+    }
+
+    fn issue_nonce(
+        &mut self,
+        candidate: &HostKernelCandidateBinding,
+        generation: ResourceGeneration,
+    ) -> Result<KernelActivationPermit, HostError> {
+        if self.current.state != KernelActivationState::OldTerminated {
+            return Err(HostError::ProcessContour(
+                "activation nonce cannot be issued before prior disposition commit".to_owned(),
+            ));
+        }
+        let nonce = fresh_kernel_activation_nonce()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let receipt = self.transition(
+            KernelActivationState::NonceIssued,
+            "kernel-nonce-issued",
+            |next| {
+                next.one_time_nonce = OneTimeNonceState::issued(nonce.clone());
+                Ok(())
+            },
+        )?;
+        let prior_kernel_disposition_digest = sha256_json(&self.current.prior_kernel_disposition)?;
+        let permit = KernelActivationPermit {
+            operation_id: self.current.operation.operation_id.clone(),
+            candidate_binding_digest: candidate
+                .compute_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            prior_kernel_disposition_digest,
+            journal_transaction_id: receipt.transaction_id().clone(),
+            journal_sequence: receipt.sequence(),
+            generation,
+            authority_epoch: candidate.kernel_epoch,
+            activation_nonce: nonce,
+        };
+        permit
+            .validate(candidate, generation)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        self.issued_permit = Some(permit.clone());
+        Ok(permit)
+    }
+
+    fn activating(&mut self) -> Result<(), HostError> {
+        if self.issued_permit.is_none() {
+            return Err(HostError::ProcessContour(
+                "Activate is forbidden before a committed NonceIssued receipt".to_owned(),
+            ));
+        }
+        self.transition(
+            KernelActivationState::Activating,
+            "kernel-activating",
+            |_| Ok(()),
+        )?;
+        Ok(())
+    }
+
+    fn active(
+        &mut self,
+        candidate: &HostKernelCandidateBinding,
+        activation_receipt: &KernelActivationReceipt,
+        ready: &KernelReadyReceipt,
+    ) -> Result<(), HostError> {
+        let permit = self.issued_permit.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("active Kernel is missing its issued permit".to_owned())
+        })?;
+        activation_receipt
+            .validate(permit)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        ready
+            .validate(candidate, activation_receipt)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        self.transition(KernelActivationState::Active, "kernel-active", |next| {
+            next.active_pipe_identity = next.candidate_pipe_identity.clone();
+            next.one_time_nonce = next.one_time_nonce.consume()?;
+            let process = next.process.as_mut().ok_or_else(|| {
+                HostError::ProcessContour("active Kernel process binding is absent".to_owned())
+            })?;
+            process.state = ServiceProcessState::Ready;
+            process.health = ready.health;
+            next.readiness_evidence.clone_from(&ready.evidence_refs);
+            next.readiness_evidence.push(
+                PlatformHandle::new(format!(
+                    "kernel-activation-receipt:{}",
+                    activation_receipt.operation_id.as_str()
+                ))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn fail(&mut self, evidence: &str) -> Result<(), HostError> {
+        if self.current.state == KernelActivationState::Failed {
+            return Ok(());
+        }
+        let evidence = PlatformHandle::new(evidence)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        self.transition(
+            KernelActivationState::Failed,
+            "kernel-activation-failed",
+            |next| {
+                next.one_time_nonce = nonce_after_activation_failure(&next.one_time_nonce)?;
+                if next.one_time_nonce.state() != NonceState::Consumed {
+                    next.active_pipe_identity = None;
+                }
+                next.readiness_evidence.clear();
+                next.disposition_evidence.push(evidence);
+                if let Some(process) = next.process.as_mut() {
+                    process.state = ServiceProcessState::Failed;
+                    process.health.liveness = HealthDimension::Unknown;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn kernel_control_request(
+    candidate: &HostKernelCandidateBinding,
+    generation: ResourceGeneration,
+    command: KernelControlCommand,
+    sequence: u64,
+) -> Result<KernelControlRequest, HostError> {
+    KernelControlRequest {
+        wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+        wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+        message_id: PlatformHandle::new(format!("{}:{sequence}", candidate.activation_id.as_str()))
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        sequence,
+        peer_process_id: std::process::id(),
+        generation,
+        candidate: candidate.clone(),
+        command,
+        payload_digest: String::new(),
+    }
+    .with_computed_digest()
+    .map_err(|error| HostError::ProcessContour(error.to_string()))
+}
+
+#[cfg(windows)]
+fn activation_response_or_reconcile(
+    response: Result<KernelControlResponse, HostError>,
+    expected_message_id: &PlatformHandle,
+    expected_request_digest: &str,
+) -> Result<Option<KernelActivationReceipt>, HostError> {
+    let Ok(response) = response else {
+        return Ok(None);
+    };
+    if response.message_id != *expected_message_id
+        || response.request_digest != expected_request_digest
+    {
+        return Ok(None);
+    }
+    if let Some(error) = response.error {
+        return Err(HostError::ProcessContour(format!(
+            "Kernel rejected Activate: {error}"
+        )));
+    }
+    Ok(response.activation_receipt)
+}
+
+#[cfg(windows)]
+fn validate_authenticated_kernel_peer(
+    peer: &PeerIdentity,
+    expected_pid: u32,
+    expected_start_time_100ns: u64,
+    expected_image: &Path,
+) -> Result<(), HostError> {
+    let peer = peer.process_binding().ok_or_else(|| {
+        HostError::ProcessContour("Kernel peer identity is unavailable".to_owned())
+    })?;
+    let observed_image = std::fs::canonicalize(peer.image_path())
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let approved_image = std::fs::canonicalize(expected_image)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if peer.process_id() != expected_pid
+        || peer.start_time_100ns() != expected_start_time_100ns
+        || observed_image != approved_image
+    {
+        return Err(HostError::ProcessContour(
+            "authenticated Kernel peer is not the retained approved process".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 pub struct HostJobBranches {
     kernel: Option<RunningJobChild<PlatformHandle>>,
     store: Option<RunningJobChild<PlatformHandle>>,
@@ -317,6 +641,26 @@ pub enum HostBranchDisposition {
 enum BranchLiveness {
     Live,
     Dead,
+}
+
+#[cfg(windows)]
+enum CutoverLaunchOutcome {
+    Candidate,
+    Rollback { candidate_error: String },
+}
+
+#[cfg(windows)]
+impl CutoverLaunchOutcome {
+    fn activation_generation<'a>(
+        &self,
+        candidate: &'a PlatformHandle,
+        prior: &'a PlatformHandle,
+    ) -> &'a PlatformHandle {
+        match self {
+            Self::Candidate => candidate,
+            Self::Rollback { .. } => prior,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -527,10 +871,6 @@ impl HostJobBranches {
                 OsString::from(host.epoch.current.sequence.to_string()),
             ),
             (
-                OsString::from("ELIOT_ACTIVATION_NONCE"),
-                OsString::from(host.nonce.as_str()),
-            ),
-            (
                 OsString::from("ELIOT_JOB_OBJECT_ID"),
                 OsString::from(job_identity.name()),
             ),
@@ -541,14 +881,21 @@ impl HostJobBranches {
     /// Completes the authenticated Host↔Kernel lifecycle before Host
     /// publishes any successful contour observation.
     #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "ordered authenticated control sequencing keeps every authority transition visible"
+        reason = "the explicit durable activation transaction preserves the ordered generation, journal, prior-disposition, and authority bindings"
     )]
-    fn complete_kernel_control(
+    fn complete_kernel_control<B: JournalBackend>(
         &self,
         generation: &PlatformHandle,
         host: &HostInstallationEpoch,
-    ) -> Result<(HostKernelHandshake, KernelReadyReceipt), HostError> {
+        journal: &HostStateJournalService<B>,
+        activation_id: &PlatformHandle,
+        activation_generation: &EpochTransition,
+        prior_kernel_disposition: PriorKernelDisposition,
+        kernel_generation: EpochTransition,
+        kernel_authority_epoch: AuthorityEpoch,
+    ) -> Result<(KernelActivationReceipt, KernelReadyReceipt), HostError> {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
         })?;
@@ -599,12 +946,6 @@ impl HostJobBranches {
             .clone();
         let authority_epoch = AuthorityEpoch::new(host.epoch.current.sequence)
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let activation_id = PlatformHandle::new(format!(
-            "host-kernel:{}:{}",
-            host.epoch.current.lineage.as_str(),
-            host.epoch.current.sequence
-        ))
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         // Kernel authenticates the connected Host peer against this exact
         // value, so it is read from the live current-process handle. A PID
         // alone would not make PID reuse or image substitution observable.
@@ -624,22 +965,22 @@ impl HostJobBranches {
         // Inert projection of the Host-retained Kernel Job. It grants nothing:
         // Kernel must reopen the named Job and re-observe its own root
         // membership before it will author readiness.
+        let recoverable_job = kernel.evidence().recoverable_job_binding();
         let job_binding: HostJobBinding = serde_json::from_value(
-            serde_json::to_value(kernel.evidence().recoverable_job_binding())
+            serde_json::to_value(&recoverable_job)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
         )
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         job_binding
             .validate()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let handshake = HostKernelHandshake {
+        let candidate = HostKernelCandidateBinding {
             installation_id: host.installation.clone(),
             host_epoch: authority_epoch,
-            kernel_epoch: launch.authority_state_fence.authority_epoch,
-            activation_id,
+            kernel_epoch: kernel_authority_epoch,
+            activation_id: activation_id.clone(),
             artifact_hash: kernel_artifact.clone(),
             config_hash: config_digest.clone(),
-            activation_nonce: host.nonce.clone(),
             job_object_id: PlatformHandle::new(kernel.job_identity().name())
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
             pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE)
@@ -650,9 +991,46 @@ impl HostJobBranches {
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
             containment_action: None,
         };
-        handshake
+        candidate
             .validate()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let root = recoverable_job.root();
+        let root_process = root.process();
+        let file_identity = root.executable_file_identity();
+        let durable_job = KernelJobBinding {
+            job_name: PlatformHandle::new(recoverable_job.job_identity().name())
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            owner: PlatformHandle::new("Kernel")
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            root_pid: root_process.process_id,
+            root_start_time_100ns: root_process.start_time_100ns,
+            root_image_path: PlatformHandle::new(root_process.image_path.clone())
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            root_volume_serial_number: file_identity.volume_serial_number,
+            root_file_index: file_identity.file_index,
+        };
+        let process_record = ServiceProcessRecord {
+            process_id: format!(
+                "pid:{}:start:{}",
+                root_process.process_id, root_process.start_time_100ns
+            ),
+            owner: "Kernel".to_owned(),
+            state: ServiceProcessState::Starting,
+            health: HealthVector::healthy(),
+            authority_epoch: candidate.kernel_epoch,
+        };
+        let mut activation = DurableKernelActivationDriver::bind_candidate(
+            journal,
+            host,
+            activation_id,
+            activation_generation,
+            kernel_artifact.clone(),
+            candidate.pipe_identity.clone(),
+            durable_job,
+            prior_kernel_disposition,
+            kernel_generation,
+            process_record,
+        )?;
         // Host deliberately authors no readiness receipt. Readiness is proven
         // by Kernel from its own live process, Job, authority, configuration
         // and Store observations, and arrives on the ProbeReady response.
@@ -670,33 +1048,24 @@ impl HostJobBranches {
             )
             .await
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            let peer = transport.peer_identity().process_binding().ok_or_else(|| {
-                HostError::ProcessContour("Kernel peer identity is unavailable".to_owned())
-            })?;
-            let observed_image = std::fs::canonicalize(peer.image_path())
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            let approved_image = std::fs::canonicalize(&expected_kernel_image)
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            if peer.process_id() != process.process_id || observed_image != approved_image {
-                return Err(HostError::ProcessContour(
-                    "authenticated Kernel peer is not the retained approved process".to_owned(),
-                ));
-            }
+            validate_authenticated_kernel_peer(
+                transport.peer_identity(),
+                process.process_id,
+                process.start_time_100ns,
+                &expected_kernel_image,
+            )?;
             let limits = TransportLimits::default();
             let commands = [
-                KernelControlCommand::Reconcile(handshake.clone()),
+                KernelControlCommand::Reconcile,
                 KernelControlCommand::Shadow,
                 KernelControlCommand::PrepareHandoff,
-                KernelControlCommand::Activate,
-                KernelControlCommand::ProbeReady,
             ];
-            let mut final_receipt = None;
             for (index, command) in commands.into_iter().enumerate() {
                 let sequence = u64::try_from(index + 1)
                     .map_err(|error| HostError::ProcessContour(error.to_string()))?;
                 let message_id = PlatformHandle::new(format!(
                     "{}:{}",
-                    handshake.activation_id.as_str(),
+                    candidate.activation_id.as_str(),
                     sequence
                 ))
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -707,7 +1076,7 @@ impl HostJobBranches {
                     sequence,
                     peer_process_id: std::process::id(),
                     generation: launch.authority_generation,
-                    handshake: handshake.clone(),
+                    candidate: candidate.clone(),
                     command,
                     payload_digest: String::new(),
                 }
@@ -717,7 +1086,7 @@ impl HostJobBranches {
                     format!(
                         "host-control:{}:{}",
                         generation.as_str(),
-                        handshake.activation_id.as_str()
+                        candidate.activation_id.as_str()
                     ),
                     &request,
                 )
@@ -743,25 +1112,204 @@ impl HostJobBranches {
                 if response.message_id != message_id
                     || response.request_digest != request.payload_digest
                     || response.error.is_some()
-                    || (matches!(&request.command, KernelControlCommand::ProbeReady)
-                        && response.state != KernelServiceState::Ready)
                 {
                     return Err(HostError::ProcessContour(
                         "Kernel control response binding failed".to_owned(),
                     ));
                 }
-                if let Some(observed) = response.receipt {
-                    observed
-                        .validate(&handshake)
-                        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-                    final_receipt = Some(observed);
+            }
+            activation.handoff_prepared()?;
+            activation.prior_disposition_committed()?;
+            let permit = activation.issue_nonce(&candidate, launch.authority_generation)?;
+            activation.activating()?;
+            let activate_request = kernel_control_request(
+                &candidate,
+                launch.authority_generation,
+                KernelControlCommand::Activate(permit.clone()),
+                4,
+            )?;
+            let activate_digest = activate_request.payload_digest.clone();
+            let activate_frame = control_request_frame(
+                format!(
+                    "host-control:{}:{}",
+                    generation.as_str(),
+                    candidate.activation_id.as_str()
+                ),
+                &activate_request,
+            )
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let delivered_response = match transport.send_frame(&activate_frame, limits).await {
+                Ok(DeliveryOutcome::Delivered) => Some(
+                    transport
+                        .receive_frame(limits)
+                        .await
+                        .map_err(|error| HostError::RecoveryRequired(error.to_string()))
+                        .and_then(|frame| {
+                            decode_control_response_frame(&frame)
+                                .map_err(|error| HostError::RecoveryRequired(error.to_string()))
+                        }),
+                ),
+                Ok(DeliveryOutcome::UnknownOutcome) | Err(_) => None,
+            };
+            let direct_receipt = delivered_response
+                .map(|response| {
+                    activation_response_or_reconcile(
+                        response,
+                        &activate_request.message_id,
+                        &activate_request.payload_digest,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let (activation_receipt, probe_sequence) = if let Some(receipt) = direct_receipt {
+                (receipt, 5)
+            } else {
+                // Do not resend the permit.  Reconnect and query the exact
+                // operation/request digest without carrying nonce material.
+                // Receive/decode/binding loss after Delivered is also an
+                // unknown outcome and follows this same path.
+                drop(transport);
+                transport = NamedPipeTransport::connect_authenticated(
+                    KERNEL_CONTROL_PIPE,
+                    std::time::Duration::from_secs(5),
+                    &expectation,
+                )
+                .await
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                validate_authenticated_kernel_peer(
+                    transport.peer_identity(),
+                    process.process_id,
+                    process.start_time_100ns,
+                    &expected_kernel_image,
+                )
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                let query = KernelActivationQuery {
+                    operation_id: permit.operation_id.clone(),
+                    activate_request_digest: activate_digest,
+                };
+                let query_request = kernel_control_request(
+                    &candidate,
+                    launch.authority_generation,
+                    KernelControlCommand::ReconcileActivation(query),
+                    1,
+                )?;
+                let query_frame = control_request_frame(
+                    format!(
+                        "host-control:{}:{}",
+                        generation.as_str(),
+                        candidate.activation_id.as_str()
+                    ),
+                    &query_request,
+                )
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                match transport
+                    .send_frame(&query_frame, limits)
+                    .await
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+                {
+                    DeliveryOutcome::Delivered => {}
+                    DeliveryOutcome::UnknownOutcome => {
+                        return Err(HostError::RecoveryRequired(
+                            "Kernel activation reconciliation outcome is unknown".to_owned(),
+                        ));
+                    }
+                }
+                let response = transport
+                    .receive_frame(limits)
+                    .await
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                let response = decode_control_response_frame(&response)
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                if response.message_id != query_request.message_id
+                    || response.request_digest != query_request.payload_digest
+                    || response.error.is_some()
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "Kernel activation reconciliation response was not exact".to_owned(),
+                    ));
+                }
+                let receipt = response.activation_receipt.ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Kernel did not retain the queried activation operation".to_owned(),
+                    )
+                })?;
+                (receipt, 2)
+            };
+            activation_receipt
+                .validate(&permit)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let probe_request = kernel_control_request(
+                &candidate,
+                launch.authority_generation,
+                KernelControlCommand::ProbeReady,
+                probe_sequence,
+            )?;
+            let probe_frame = control_request_frame(
+                format!(
+                    "host-control:{}:{}",
+                    generation.as_str(),
+                    candidate.activation_id.as_str()
+                ),
+                &probe_request,
+            )
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            match transport
+                .send_frame(&probe_frame, limits)
+                .await
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            {
+                DeliveryOutcome::Delivered => {}
+                DeliveryOutcome::UnknownOutcome => {
+                    return Err(HostError::RecoveryRequired(
+                        "Kernel ProbeReady delivery outcome is unknown".to_owned(),
+                    ));
                 }
             }
-            final_receipt.ok_or_else(|| {
+            let response = transport
+                .receive_frame(limits)
+                .await
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let response = decode_control_response_frame(&response)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            if response.message_id != probe_request.message_id
+                || response.request_digest != probe_request.payload_digest
+                || response.error.is_some()
+                || response.state != KernelServiceState::Ready
+            {
+                return Err(HostError::ProcessContour(
+                    "Kernel ProbeReady response binding failed".to_owned(),
+                ));
+            }
+            let ready = response.receipt.ok_or_else(|| {
                 HostError::ProcessContour("Kernel did not return a ready receipt".to_owned())
-            })
-        })?;
-        Ok((handshake, ready))
+            })?;
+            ready
+                .validate_for_probe(&probe_request, &activation_receipt)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            Ok((activation_receipt, ready))
+        });
+        let (activation_receipt, ready) = match ready {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                let failure = activation.fail("kernel-control-activation-failed");
+                return Err(match failure {
+                    Ok(()) => error,
+                    Err(failure) => HostError::RecoveryRequired(format!(
+                        "Kernel activation failed ({error}); durable failure transition failed ({failure})"
+                    )),
+                });
+            }
+        };
+        if let Err(error) = activation.active(&candidate, &activation_receipt, &ready) {
+            let failure = activation.fail("kernel-active-commit-failed");
+            return Err(match failure {
+                Ok(()) => error,
+                Err(failure) => HostError::RecoveryRequired(format!(
+                    "Kernel Active commit failed ({error}); durable revoke failed ({failure})"
+                )),
+            });
+        }
+        Ok((activation_receipt, ready))
     }
 
     #[allow(
@@ -998,7 +1546,7 @@ impl HostJobBranches {
             &launch.store_bootstrap_descriptor_digest,
             store_artifact,
             config_digest,
-            &host.nonce,
+            host.host_process_nonce().as_handle(),
         )?;
         let store_config_path = approved_locator(
             Path::new(launch.store_config_path.as_str()),
@@ -1515,7 +2063,7 @@ impl HostJobBranches {
         clippy::too_many_arguments,
         reason = "candidate and rollback authority sets stay explicit to prevent cross-generation substitution"
     )]
-    pub fn cutover_with_rollback(
+    fn cutover_with_rollback(
         &mut self,
         candidate_kernel: &Path,
         candidate_store: &Path,
@@ -1540,7 +2088,7 @@ impl HostJobBranches {
         candidate_launch: &RuntimeLaunchDescriptor,
         prior_launch: &RuntimeLaunchDescriptor,
         host: &HostInstallationEpoch,
-    ) -> Result<(), HostError> {
+    ) -> Result<CutoverLaunchOutcome, HostError> {
         self.terminate_store_then_kernel()?;
         match self.start_approved(
             candidate_kernel,
@@ -1556,7 +2104,7 @@ impl HostJobBranches {
             host,
             candidate_launch,
         ) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(CutoverLaunchOutcome::Candidate),
             Err(candidate_error) => {
                 let rollback = self
                     .start_approved(
@@ -1578,12 +2126,9 @@ impl HostJobBranches {
                             "candidate failed ({candidate_error}); rollback failed ({error})"
                         ))
                     });
-                match rollback {
-                    Ok(()) => Err(HostError::ProcessContour(format!(
-                        "candidate rejected; prior approved contour restored: {candidate_error}"
-                    ))),
-                    Err(error) => Err(error),
-                }
+                rollback.map(|()| CutoverLaunchOutcome::Rollback {
+                    candidate_error: candidate_error.to_string(),
+                })
             }
         }
     }
@@ -1683,6 +2228,12 @@ fn fresh_identity(prefix: &str) -> Result<PlatformHandle, HostError> {
         .map_err(|error| HostError::Platform(error.to_string()))
 }
 
+fn sha256_json(value: &impl serde::Serialize) -> Result<String, HostError> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 fn root_epoch(lineage: PlatformHandle) -> EpochTransition {
     EpochTransition {
         current: EpochIdentity {
@@ -1731,6 +2282,34 @@ fn record_fence(
         activation_id: activation_id.clone(),
         activation_generation: activation_generation.clone(),
     }
+}
+
+fn terminated_prior_kernel(prior: &KernelRecord) -> Result<PriorKernelDisposition, HostError> {
+    let job = prior.candidate_job_binding.clone().ok_or_else(|| {
+        HostError::OwnerLeaseRecovery("prior Kernel Job binding is absent".to_owned())
+    })?;
+    let mut process = prior.process.clone().ok_or_else(|| {
+        HostError::OwnerLeaseRecovery("prior Kernel process binding is absent".to_owned())
+    })?;
+    process.state = ServiceProcessState::Stopped;
+    process.health = HealthVector {
+        liveness: HealthDimension::Unknown,
+        readiness: HealthDimension::Unknown,
+        freshness: HealthDimension::Unknown,
+        compatibility: HealthDimension::Unknown,
+        integrity: HealthDimension::Unknown,
+        capacity: HealthDimension::Unknown,
+    };
+    Ok(PriorKernelDisposition::Terminated(PriorKernelSource {
+        host: prior.fence.host.clone(),
+        activation_identity: prior.activation_identity.clone(),
+        generation: prior.kernel_generation.clone(),
+        job,
+        process,
+        history_complete: true,
+        job_empty: true,
+        root_reaped: true,
+    }))
 }
 
 fn initial_activation_record(
@@ -2289,6 +2868,101 @@ impl HostComposition {
         }
     }
 
+    #[cfg(windows)]
+    fn next_kernel_activation_context(
+        &self,
+        manifest_authority_epoch: AuthorityEpoch,
+    ) -> Result<(PriorKernelDisposition, EpochTransition, AuthorityEpoch), HostError> {
+        let state = self.journal.snapshot()?;
+        if state.prior_kernel_unknown {
+            return Err(HostError::OwnerLeaseRecovery(
+                "prior Kernel disposition is unknown".to_owned(),
+            ));
+        }
+        let prior = state.kernel.as_ref().or(state.prior_kernel.as_ref());
+        let Some(prior) = prior else {
+            let activation = state.activation.ok_or_else(|| {
+                HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+            })?;
+            return Ok((
+                PriorKernelDisposition::NoPriorKernel,
+                EpochTransition {
+                    current: activation.lineage.kernel_epoch,
+                    parent: None,
+                },
+                manifest_authority_epoch,
+            ));
+        };
+        if state.kernel.is_some()
+            && !matches!(
+                prior.state,
+                KernelActivationState::Failed | KernelActivationState::ManualRecovery
+            )
+        {
+            return Err(HostError::OwnerLeaseRecovery(
+                "current Kernel must be durably failed before direct-child restart".to_owned(),
+            ));
+        }
+        let generation = prior.direct_child_generation()?;
+        let prior_authority = prior
+            .process
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::OwnerLeaseRecovery("prior Kernel process binding is absent".to_owned())
+            })?
+            .authority_epoch
+            .value();
+        let next_authority_value =
+            manifest_authority_epoch
+                .value()
+                .max(prior_authority.checked_add(1).ok_or_else(|| {
+                    HostError::OwnerLeaseRecovery("Kernel authority epoch overflow".to_owned())
+                })?);
+        let authority = AuthorityEpoch::new(next_authority_value)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        Ok((terminated_prior_kernel(prior)?, generation, authority))
+    }
+
+    #[cfg(windows)]
+    fn fail_current_kernel_record(&self, evidence: &str) -> Result<(), HostError> {
+        let current = self.journal.snapshot()?.kernel.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "Kernel failure transition has no durable Kernel record".to_owned(),
+            )
+        })?;
+        DurableKernelActivationDriver::resume(&self.journal, current).fail(evidence)
+    }
+
+    #[cfg(windows)]
+    fn activate_launched_kernel(
+        &mut self,
+        generation: &PlatformHandle,
+        manifest_authority_epoch: AuthorityEpoch,
+    ) -> Result<KernelReadyReceipt, HostError> {
+        let (prior_kernel, kernel_generation, kernel_authority_epoch) =
+            self.next_kernel_activation_context(manifest_authority_epoch)?;
+        let (_, receipt) = self.jobs.complete_kernel_control(
+            generation,
+            &self.host,
+            &self.journal,
+            &self.activation_id,
+            &self.activation_generation,
+            prior_kernel,
+            kernel_generation,
+            kernel_authority_epoch,
+        )?;
+        if let Err(error) = self.accept_kernel_ready(&receipt) {
+            let durable = self.fail_current_kernel_record("kernel-ready-accept-failed");
+            return Err(match durable {
+                Ok(()) => error,
+                Err(durable) => HostError::RecoveryRequired(format!(
+                    "Kernel ready receipt failed ({error}); durable failure transition failed ({durable})"
+                )),
+            });
+        }
+        Ok(receipt)
+    }
+
     /// Starts the currently approved Kernel and store images in their
     /// independent Host-owned Job branches.  The registry is checked before
     /// any process is created, and the launch contour binds generation,
@@ -2319,6 +2993,14 @@ impl HostComposition {
         let (approved_kernel_path, approved_store_path, approved_config_path) =
             active.manifest.runtime_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
+        let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
+            .next_kernel_activation_context(
+                active
+                    .manifest
+                    .runtime_launch
+                    .authority_state_fence
+                    .authority_epoch,
+            )?;
         self.jobs.start_approved(
             kernel_executable.as_ref(),
             store_executable.as_ref(),
@@ -2333,47 +3015,47 @@ impl HostComposition {
             &self.host,
             &active.manifest.runtime_launch,
         )?;
-        let (handshake, receipt) = match self
-            .jobs
-            .complete_kernel_control(&active.manifest.generation, &self.host)
-        {
+        let (_activation_receipt, receipt) = match self.jobs.complete_kernel_control(
+            &active.manifest.generation,
+            &self.host,
+            &self.journal,
+            &self.activation_id,
+            &self.activation_generation,
+            prior_kernel,
+            kernel_generation,
+            kernel_authority_epoch,
+        ) {
             Ok(value) => value,
             Err(error) => return self.cleanup_launched_contour(error),
         };
-        if let Err(error) = self.accept_kernel_ready(&handshake, &receipt) {
-            return self.cleanup_launched_contour(error);
+        if let Err(error) = self.accept_kernel_ready(&receipt) {
+            return self.cleanup_active_kernel_contour(error, "kernel-ready-accept-failed");
         }
         if let Err(error) =
             self.transition_activation(ActivationState::ControlReady, "host-kernel-control-ready")
         {
-            return self.cleanup_launched_contour(error);
+            return self.cleanup_active_kernel_contour(error, "host-control-ready-commit-failed");
         }
         if let Err(error) =
             self.transition_activation(ActivationState::Active, "host-runtime-active")
         {
-            return self.cleanup_launched_contour(error);
+            return self.cleanup_active_kernel_contour(error, "host-active-commit-failed");
         }
         if let Err(error) = self.persist_process_observations(&active.manifest.generation) {
-            self.cleanup_launched_contour(error)
+            self.cleanup_active_kernel_contour(error, "host-process-observation-failed")
         } else {
             Ok(())
         }
     }
 
     #[cfg(windows)]
-    fn accept_kernel_ready(
-        &self,
-        handshake: &HostKernelHandshake,
-        receipt: &KernelReadyReceipt,
-    ) -> Result<(), HostError> {
-        if handshake.installation_id != self.host.installation {
+    fn accept_kernel_ready(&self, receipt: &KernelReadyReceipt) -> Result<(), HostError> {
+        if receipt.activation_id != self.activation_id {
             return Err(HostError::ProcessContour(
-                "Kernel ready receipt installation mismatch".to_owned(),
+                "Kernel ready receipt activation mismatch".to_owned(),
             ));
         }
-        receipt
-            .validate(handshake)
-            .map_err(|error| HostError::ProcessContour(error.to_string()))
+        Ok(())
     }
 
     /// Activates one approved generation only after a bounded process cutover;
@@ -2384,6 +3066,10 @@ impl HostComposition {
     /// Returns an error if admission is fenced, either generation is invalid,
     /// cutover or rollback fails, or the registry cannot be persisted.
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "candidate activation and exact rollback reactivation form one ordered durable cutover transaction"
+    )]
     pub fn cutover_generation(
         &mut self,
         generation: &PlatformHandle,
@@ -2455,36 +3141,125 @@ impl HostComposition {
             &prior.manifest.runtime_launch,
             &self.host,
         );
-        match result {
-            Ok(()) => {
-                if let Err(error) = self.registry_store.save(&self.registry) {
-                    let cleanup_error =
-                        self.cleanup_launched_contour(HostError::Installation(error));
-                    let _ = self.registry.rollback();
-                    let _ = self.registry_store.save(&self.registry);
-                    return cleanup_error;
-                }
-                if let Err(error) =
-                    self.persist_process_observations(&candidate.manifest.generation)
-                {
-                    let cleanup = self.cleanup_launched_contour(error);
-                    // A post-launch observation failure must not leave the
-                    // candidate as the in-memory or durable active
-                    // generation.  The newly launched branches have already
-                    // been consumed by cleanup; restore the prior LKG
-                    // projection before returning the failure.
-                    let _ = self.registry.rollback();
-                    let _ = self.registry_store.save(&self.registry);
-                    cleanup
-                } else {
-                    Ok(())
-                }
-            }
+        let launch = match result {
+            Ok(launch) => launch,
             Err(error) => {
                 let _ = self.registry.rollback();
                 let _ = self.registry_store.save(&self.registry);
-                Err(error)
+                return Err(error);
             }
+        };
+        if let Err(error) = self.fail_current_kernel_record("kernel-cutover-prior-terminated") {
+            let cleanup = self.cleanup_launched_contour(error);
+            let _ = self.registry.rollback();
+            let _ = self.registry_store.save(&self.registry);
+            return cleanup;
+        }
+
+        let launched_generation = launch
+            .activation_generation(&candidate.manifest.generation, &prior.manifest.generation);
+        if launched_generation == &prior.manifest.generation {
+            let CutoverLaunchOutcome::Rollback { candidate_error } = &launch else {
+                return Err(HostError::OwnerLeaseRecovery(
+                    "cutover launch target discriminator was inconsistent".to_owned(),
+                ));
+            };
+            self.registry.rollback().map_err(HostError::Installation)?;
+            if let Err(error) = self.activate_launched_kernel(
+                &prior.manifest.generation,
+                prior
+                    .manifest
+                    .runtime_launch
+                    .authority_state_fence
+                    .authority_epoch,
+            ) {
+                return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
+                    "candidate launch failed ({candidate_error}); rollback activation failed ({error})"
+                )));
+            }
+            if let Err(error) = self.registry_store.save(&self.registry) {
+                return self.cleanup_active_kernel_contour(
+                    HostError::Installation(error),
+                    "rollback-registry-save-failed",
+                );
+            }
+            if let Err(error) = self.persist_process_observations(&prior.manifest.generation) {
+                return self
+                    .cleanup_active_kernel_contour(error, "rollback-process-observation-failed");
+            }
+            return Err(HostError::ProcessContour(format!(
+                "candidate rejected; prior approved contour durably reactivated: {candidate_error}"
+            )));
+        }
+
+        if let Err(candidate_error) = self.activate_launched_kernel(
+            &candidate.manifest.generation,
+            candidate
+                .manifest
+                .runtime_launch
+                .authority_state_fence
+                .authority_epoch,
+        ) {
+            self.jobs.terminate_store_then_kernel()?;
+            self.registry.rollback().map_err(HostError::Installation)?;
+            self.jobs.start_approved(
+                prior_kernel.as_ref(),
+                prior_store.as_ref(),
+                &prior.manifest.generation,
+                &prior.manifest.config_digest,
+                &prior_config_locator,
+                prior_kernel_path,
+                prior_store_path,
+                prior_config_path,
+                prior_kernel_artifact,
+                prior_store_artifact,
+                &self.host,
+                &prior.manifest.runtime_launch,
+            )?;
+            if let Err(rollback_error) = self.activate_launched_kernel(
+                &prior.manifest.generation,
+                prior
+                    .manifest
+                    .runtime_launch
+                    .authority_state_fence
+                    .authority_epoch,
+            ) {
+                return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
+                    "candidate activation failed ({candidate_error}); rollback activation failed ({rollback_error})"
+                )));
+            }
+            if let Err(error) = self.registry_store.save(&self.registry) {
+                return self.cleanup_active_kernel_contour(
+                    HostError::Installation(error),
+                    "rollback-registry-save-failed",
+                );
+            }
+            if let Err(error) = self.persist_process_observations(&prior.manifest.generation) {
+                return self
+                    .cleanup_active_kernel_contour(error, "rollback-process-observation-failed");
+            }
+            return Err(HostError::ProcessContour(format!(
+                "candidate activation failed; prior approved contour durably reactivated: {candidate_error}"
+            )));
+        }
+
+        if let Err(error) = self.registry_store.save(&self.registry) {
+            let cleanup = self.cleanup_active_kernel_contour(
+                HostError::Installation(error),
+                "candidate-registry-save-failed",
+            );
+            let _ = self.registry.rollback();
+            let _ = self.registry_store.save(&self.registry);
+            return cleanup;
+        }
+        if let Err(error) = self.persist_process_observations(&candidate.manifest.generation) {
+            let cleanup =
+                self.cleanup_active_kernel_contour(error, "candidate-process-observation-failed");
+            let _ = self.registry.rollback();
+            let _ = self.registry_store.save(&self.registry);
+            cleanup
+        } else {
+            Ok(())
         }
     }
 
@@ -2508,6 +3283,19 @@ impl HostComposition {
         let (approved_kernel_path, approved_store_path, approved_config_path) =
             active.manifest.runtime_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
+        let kernel_requires_activation = matches!(
+            HostJobBranches::branch_state(self.jobs.kernel.as_ref()),
+            Ok(BranchLiveness::Dead)
+        );
+        if kernel_requires_activation {
+            let current = self.journal.snapshot()?.kernel.ok_or_else(|| {
+                HostError::OwnerLeaseRecovery(
+                    "dead Kernel branch has no durable Kernel record".to_owned(),
+                )
+            })?;
+            DurableKernelActivationDriver::resume(&self.journal, current)
+                .fail("kernel-process-observed-dead")?;
+        }
         let disposition = self.jobs.reconcile(
             &active.manifest.generation,
             &active.manifest.config_digest,
@@ -2519,10 +3307,46 @@ impl HostComposition {
             store_artifact,
             &self.host,
         )?;
+        let mut kernel_reactivated = false;
+        if kernel_requires_activation && self.jobs.kernel.is_some() {
+            let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
+                .next_kernel_activation_context(
+                    active
+                        .manifest
+                        .runtime_launch
+                        .authority_state_fence
+                        .authority_epoch,
+                )?;
+            if let Err(error) = self.jobs.complete_kernel_control(
+                &active.manifest.generation,
+                &self.host,
+                &self.journal,
+                &self.activation_id,
+                &self.activation_generation,
+                prior_kernel,
+                kernel_generation,
+                kernel_authority_epoch,
+            ) {
+                let cleanup = self.jobs.terminate_kernel();
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => HostError::RecoveryRequired(format!(
+                        "Kernel restart activation failed ({error}); Kernel cleanup failed ({cleanup})"
+                    )),
+                });
+            }
+            kernel_reactivated = true;
+        }
         if let Err(error) = self
             .persist_process_observations_with_disposition(&active.manifest.generation, disposition)
         {
-            return self.cleanup_launched_contour(error).map(|()| disposition);
+            return match reconcile_observation_cleanup(kernel_reactivated) {
+                ReconcileObservationCleanup::ActiveKernel => {
+                    self.cleanup_active_kernel_contour(error, "kernel-reconcile-observation-failed")
+                }
+                ReconcileObservationCleanup::GenericContour => self.cleanup_launched_contour(error),
+            }
+            .map(|()| disposition);
         }
         Ok(disposition)
     }
@@ -2601,6 +3425,27 @@ impl HostComposition {
                     ActivationState::Failed | ActivationState::DegradedRecovery
                 )
             }))
+    }
+
+    #[cfg(windows)]
+    fn cleanup_active_kernel_contour(
+        &mut self,
+        error: HostError,
+        evidence: &str,
+    ) -> Result<(), HostError> {
+        let durable = self
+            .journal
+            .snapshot()
+            .map_err(HostError::Journal)
+            .and_then(|state| {
+                let current = state.kernel.ok_or_else(|| {
+                    HostError::OwnerLeaseRecovery(
+                        "active Kernel cleanup has no durable Kernel record".to_owned(),
+                    )
+                })?;
+                DurableKernelActivationDriver::resume(&self.journal, current).fail(evidence)
+            });
+        finish_active_kernel_cleanup(durable, || self.cleanup_launched_contour(error))
     }
 
     #[cfg(windows)]
@@ -3041,6 +3886,187 @@ mod journal_tests {
             Err(JournalError::Torn { .. })
         ));
     }
+
+    #[test]
+    fn activation_failure_nonce_discriminator_revokes_only_pre_active_issuance() {
+        let nonce = || {
+            eliot_platform::KernelActivationNonce::new(
+                PlatformHandle::new("a".repeat(64)).unwrap_or_else(|_| unreachable!()),
+            )
+            .unwrap_or_else(|_| unreachable!())
+        };
+        let unissued = OneTimeNonceState::unissued();
+        assert_eq!(
+            nonce_after_activation_failure(&unissued)
+                .unwrap_or_else(|_| unreachable!())
+                .state(),
+            NonceState::Unissued
+        );
+        let issued = OneTimeNonceState::issued(nonce());
+        assert_eq!(
+            nonce_after_activation_failure(&issued)
+                .unwrap_or_else(|_| unreachable!())
+                .state(),
+            NonceState::Revoked
+        );
+        let consumed = OneTimeNonceState::issued(nonce())
+            .consume()
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            nonce_after_activation_failure(&consumed)
+                .unwrap_or_else(|_| unreachable!())
+                .state(),
+            NonceState::Consumed
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression constructs and drives the complete real durable activation record sequence"
+    )]
+    fn reconciled_active_failure_is_durable_failed_consumed_before_cleanup() {
+        let host = test_host();
+        let activation_generation =
+            root_epoch(fresh_identity("reconcile-activation-lineage").unwrap());
+        let activation_id = fresh_identity("reconcile-activation").unwrap();
+        let journal =
+            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone()).unwrap();
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(
+                initial_activation_record(
+                    &host,
+                    &activation_id,
+                    &activation_generation,
+                    ActivationState::Starting,
+                    "reconcile-starting",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let job_name = PlatformHandle::new("Local\\Eliot-Host-Kernel-reconcile").unwrap();
+        let kernel_image = "C:\\eliot\\eliot-kernel.exe".to_owned();
+        let candidate = HostKernelCandidateBinding {
+            installation_id: host.installation.clone(),
+            host_epoch: AuthorityEpoch::new(host.epoch.current.sequence).unwrap(),
+            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            activation_id: activation_id.clone(),
+            artifact_hash: PlatformHandle::new("reconcile-artifact").unwrap(),
+            config_hash: PlatformHandle::new("reconcile-config").unwrap(),
+            job_object_id: job_name.clone(),
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
+            host_process: HostProcessBinding {
+                process_id: 7,
+                start_time_100ns: 9,
+                image_path: "C:\\eliot\\eliot-host.exe".to_owned(),
+            },
+            job_binding: HostJobBinding {
+                job: eliot_kernel_service::HostJobIdentity {
+                    name: job_name.as_str().to_owned(),
+                },
+                root: eliot_kernel_service::HostJobRoot {
+                    process: HostProcessBinding {
+                        process_id: 42,
+                        start_time_100ns: 10,
+                        image_path: kernel_image.clone(),
+                    },
+                    executable: eliot_kernel_service::HostFileIdentity {
+                        volume_serial_number: 1,
+                        file_index: 2,
+                    },
+                },
+            },
+            restart_budget: RestartBudget::new(1, 1).unwrap(),
+            containment_action: None,
+        };
+        let durable_job = KernelJobBinding {
+            job_name: job_name.clone(),
+            owner: PlatformHandle::new("Kernel").unwrap(),
+            root_pid: 42,
+            root_start_time_100ns: 10,
+            root_image_path: PlatformHandle::new(kernel_image.clone()).unwrap(),
+            root_volume_serial_number: 1,
+            root_file_index: 2,
+        };
+        let kernel_generation = root_epoch(fresh_identity("reconcile-kernel-lineage").unwrap());
+        let mut driver = DurableKernelActivationDriver::bind_candidate(
+            &journal,
+            &host,
+            &activation_id,
+            &activation_generation,
+            candidate.artifact_hash.clone(),
+            candidate.pipe_identity.clone(),
+            durable_job,
+            PriorKernelDisposition::NoPriorKernel,
+            kernel_generation,
+            ServiceProcessRecord {
+                process_id: "pid:42:start:10".to_owned(),
+                owner: "Kernel".to_owned(),
+                state: ServiceProcessState::Starting,
+                health: HealthVector::healthy(),
+                authority_epoch: candidate.kernel_epoch,
+            },
+        )
+        .unwrap();
+        driver.handoff_prepared().unwrap();
+        driver.prior_disposition_committed().unwrap();
+        let permit = driver
+            .issue_nonce(&candidate, ResourceGeneration::genesis())
+            .unwrap();
+        driver.activating().unwrap();
+        let activation_receipt = KernelActivationReceipt::issue(&permit);
+        let ready = KernelReadyReceipt {
+            activation_id: activation_id.clone(),
+            activation_operation_id: activation_receipt.operation_id.clone(),
+            activation_nonce_digest: activation_receipt.activation_nonce_digest.clone(),
+            process: eliot_kernel_service::ProcessObservation {
+                process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
+                job_object_id: job_name,
+                state: ServiceProcessState::Ready,
+                health: HealthVector::healthy(),
+                evidence_refs: vec![PlatformHandle::new("reconcile-process-evidence").unwrap()],
+            },
+            health: HealthVector::healthy(),
+            evidence_refs: vec![PlatformHandle::new("reconcile-ready-evidence").unwrap()],
+        };
+        driver
+            .active(&candidate, &activation_receipt, &ready)
+            .unwrap();
+        drop(driver);
+        let active = journal.snapshot().unwrap().kernel.unwrap();
+        assert_eq!(active.state, KernelActivationState::Active);
+        assert_eq!(active.one_time_nonce.state(), NonceState::Consumed);
+
+        let cleanup_seen = std::cell::Cell::new(false);
+        let result = match reconcile_observation_cleanup(true) {
+            ReconcileObservationCleanup::ActiveKernel => {
+                let current = journal.snapshot().unwrap().kernel.unwrap();
+                let durable = DurableKernelActivationDriver::resume(&journal, current)
+                    .fail("kernel-reconcile-observation-failed");
+                finish_active_kernel_cleanup(durable, || {
+                    let failed = journal.snapshot().unwrap().kernel.unwrap();
+                    assert_eq!(failed.state, KernelActivationState::Failed);
+                    assert_eq!(failed.one_time_nonce.state(), NonceState::Consumed);
+                    cleanup_seen.set(true);
+                    Err(HostError::ProcessContour(
+                        "injected terminate-and-clear".to_owned(),
+                    ))
+                })
+            }
+            ReconcileObservationCleanup::GenericContour => {
+                panic!("reactivated Kernel selected generic cleanup")
+            }
+        };
+        assert!(result.is_err());
+        assert!(cleanup_seen.get());
+        let failed = journal.snapshot().unwrap().kernel.unwrap();
+        assert_eq!(failed.state, KernelActivationState::Failed);
+        assert_eq!(failed.one_time_nonce.state(), NonceState::Consumed);
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -3048,9 +4074,10 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        HostBranchDisposition, HostError, ReconciliationObservation, ReconciliationState,
-        StoreKernelLaunchError, StoreLivenessEvidence, launch_store_then_kernel,
-        reconcile_state_machine,
+        CutoverLaunchOutcome, HostBranchDisposition, HostError, KernelControlResponse,
+        KernelServiceState, PlatformHandle, ReconciliationObservation, ReconciliationState,
+        StoreKernelLaunchError, StoreLivenessEvidence, activation_response_or_reconcile,
+        launch_store_then_kernel, reconcile_state_machine,
     };
 
     #[derive(Debug, Eq, PartialEq)]
@@ -3064,6 +4091,78 @@ mod tests {
             Some(child) if child.live => ReconciliationObservation::Live,
             Some(_) | None => ReconciliationObservation::Dead,
         }
+    }
+
+    #[test]
+    fn cutover_launch_discriminator_selects_only_the_process_that_was_launched() {
+        let candidate = PlatformHandle::new("candidate-generation").expect("candidate");
+        let prior = PlatformHandle::new("prior-generation").expect("prior");
+        assert_eq!(
+            CutoverLaunchOutcome::Candidate.activation_generation(&candidate, &prior),
+            &candidate
+        );
+        assert_eq!(
+            CutoverLaunchOutcome::Rollback {
+                candidate_error: "launch rejected".to_owned(),
+            }
+            .activation_generation(&candidate, &prior),
+            &prior
+        );
+    }
+
+    #[test]
+    fn activate_response_uncertainty_reconciles_but_exact_rejection_does_not() {
+        let message = PlatformHandle::new("activate-message").expect("message");
+        let digest = "a".repeat(64);
+        let response = |message_id: PlatformHandle, error: Option<String>| KernelControlResponse {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id,
+            request_digest: digest.clone(),
+            state: KernelServiceState::Activating,
+            receipt: None,
+            activation_receipt: None,
+            error,
+            payload_digest: String::new(),
+        };
+        assert!(
+            activation_response_or_reconcile(
+                Err(HostError::RecoveryRequired("receive lost".to_owned())),
+                &message,
+                &digest,
+            )
+            .expect("unknown receive outcome")
+            .is_none()
+        );
+        assert!(
+            activation_response_or_reconcile(
+                Ok(response(
+                    PlatformHandle::new("wrong-message").expect("wrong message"),
+                    None,
+                )),
+                &message,
+                &digest,
+            )
+            .expect("binding loss is unknown")
+            .is_none()
+        );
+        assert!(
+            activation_response_or_reconcile(
+                Ok(response(message.clone(), None)),
+                &message,
+                &digest
+            )
+            .expect("missing receipt is unknown")
+            .is_none()
+        );
+        assert!(
+            activation_response_or_reconcile(
+                Ok(response(message.clone(), Some("rejected".to_owned()))),
+                &message,
+                &digest,
+            )
+            .is_err()
+        );
     }
 
     #[test]

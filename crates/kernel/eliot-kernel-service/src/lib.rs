@@ -26,8 +26,9 @@ pub use lifecycle::{
 };
 pub use protocol::{
     ContainmentAction, HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot,
-    HostKernelHandshake, HostProcessBinding, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE,
-    KERNEL_CONTROL_WIRE_ID, KERNEL_CONTROL_WIRE_VERSION, KernelControlCommand,
+    HostKernelCandidateBinding, HostProcessBinding, HostStoreBootstrapRequirement,
+    KERNEL_CONTROL_PIPE, KERNEL_CONTROL_WIRE_ID, KERNEL_CONTROL_WIRE_VERSION,
+    KernelActivationPermit, KernelActivationQuery, KernelActivationReceipt, KernelControlCommand,
     KernelControlRequest, KernelControlResponse, KernelReadyReceipt,
     ProcessAuthorityHandoffDescriptor, ProcessExecutionRejection, ProcessExecutionRequest,
     ProcessExecutionResponse, ProcessObservation, RestartBudget, StoreBootstrapDescriptor,

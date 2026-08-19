@@ -12,7 +12,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::protocol::{HostKernelHandshake, KernelControlCommand, KernelReadyReceipt};
+use crate::protocol::{
+    HostKernelCandidateBinding, KernelActivationPermit, KernelActivationQuery,
+    KernelActivationReceipt, KernelControlCommand, KernelReadyReceipt,
+};
 use crate::validate_text;
 
 /// Recovery may fast-forward to a durable epoch, but an unbounded value is
@@ -200,7 +203,9 @@ pub struct KernelService {
     state: KernelServiceState,
     authority: KernelAuthority,
     front_door: FrontDoor,
-    handshake: Option<HostKernelHandshake>,
+    candidate: Option<HostKernelCandidateBinding>,
+    activation_receipt: Option<KernelActivationReceipt>,
+    activation_request_digest: Option<String>,
     ready: Option<KernelReadyReceipt>,
     failure: Option<ServiceFailure>,
     generation_fenced: bool,
@@ -221,7 +226,9 @@ impl KernelService {
             state: KernelServiceState::Cold,
             front_door: FrontDoor::new(authority.clone(), control_capacity, ledger_capacity)?,
             authority,
-            handshake: None,
+            candidate: None,
+            activation_receipt: None,
+            activation_request_digest: None,
             ready: None,
             failure: None,
             generation_fenced: false,
@@ -248,9 +255,14 @@ impl KernelService {
         self.failure.as_ref()
     }
 
-    /// Returns the accepted Host handshake, if a lineage is present.
-    pub fn handshake(&self) -> Option<&HostKernelHandshake> {
-        self.handshake.as_ref()
+    /// Returns the accepted nonce-free candidate binding, if present.
+    pub fn candidate_binding(&self) -> Option<&HostKernelCandidateBinding> {
+        self.candidate.as_ref()
+    }
+
+    /// Returns the exact consumed activation receipt, if present.
+    pub fn activation_receipt(&self) -> Option<&KernelActivationReceipt> {
+        self.activation_receipt.as_ref()
     }
 
     /// Returns the readiness receipt, if normal admission is open.
@@ -299,14 +311,30 @@ impl KernelService {
             return Err(KernelServiceError::GenerationFenced);
         }
         match command {
-            KernelControlCommand::Reconcile(handshake) => self.reconcile(handshake)?,
+            KernelControlCommand::Reconcile => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "candidate",
+                    reason: "Reconcile requires the request candidate binding",
+                });
+            }
             KernelControlCommand::Shadow => {
                 self.transition(KernelServiceState::ShadowNoAuthority)?;
             }
             KernelControlCommand::PrepareHandoff => {
                 self.transition(KernelServiceState::HandoffPrepared)?;
             }
-            KernelControlCommand::Activate => self.transition(KernelServiceState::Activating)?,
+            KernelControlCommand::Activate(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "activation_permit",
+                    reason: "Activate requires the authenticated request boundary",
+                });
+            }
+            KernelControlCommand::ReconcileActivation(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "activation_query",
+                    reason: "activation reconciliation requires the authenticated request boundary",
+                });
+            }
             KernelControlCommand::ProbeReady => {
                 // A wire command cannot carry a caller-shaped readiness
                 // receipt. The composition root must perform live
@@ -330,12 +358,15 @@ impl KernelService {
     }
 
     /// Reconciles and pins a new Host installation lineage.
-    pub fn reconcile(&mut self, handshake: HostKernelHandshake) -> Result<(), KernelServiceError> {
-        handshake.validate()?;
+    pub fn reconcile(
+        &mut self,
+        candidate: HostKernelCandidateBinding,
+    ) -> Result<(), KernelServiceError> {
+        candidate.validate()?;
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
-        if self.state == KernelServiceState::Failed && handshake.containment_action.is_none() {
+        if self.state == KernelServiceState::Failed && candidate.containment_action.is_none() {
             return Err(KernelServiceError::MissingContainmentEvidence);
         }
         if matches!(
@@ -348,24 +379,90 @@ impl KernelService {
             });
         }
         self.transition(KernelServiceState::Reconciling)?;
-        self.handshake = Some(handshake);
+        self.candidate = Some(candidate);
+        self.activation_receipt = None;
+        self.activation_request_digest = None;
         self.ready = None;
         self.failure = None;
         Ok(())
     }
 
+    /// Consumes one exact permit after its durable Host append is committed.
+    pub fn activate_permit(
+        &mut self,
+        permit: &KernelActivationPermit,
+        generation: ResourceGeneration,
+        request_digest: String,
+    ) -> Result<KernelActivationReceipt, KernelServiceError> {
+        let candidate = self
+            .candidate
+            .as_ref()
+            .ok_or(KernelServiceError::HandshakeMismatch {
+                field: "missing_candidate",
+            })?;
+        permit.validate(candidate, generation)?;
+        if self.activation_receipt.is_some() || self.activation_request_digest.is_some() {
+            return Err(KernelServiceError::InvalidField {
+                field: "activation_permit",
+                reason: "activation permit was already consumed",
+            });
+        }
+        if request_digest.len() != 64
+            || !request_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "activation_request_digest",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        self.transition(KernelServiceState::Activating)?;
+        let receipt = KernelActivationReceipt::issue(permit);
+        self.activation_receipt = Some(receipt.clone());
+        self.activation_request_digest = Some(request_digest);
+        Ok(receipt)
+    }
+
+    /// Reconciles an unknown Activate delivery without accepting the permit again.
+    pub fn reconcile_activation(
+        &self,
+        query: &KernelActivationQuery,
+    ) -> Result<Option<KernelActivationReceipt>, KernelServiceError> {
+        query.validate()?;
+        match (
+            self.activation_receipt.as_ref(),
+            self.activation_request_digest.as_deref(),
+        ) {
+            (Some(receipt), Some(digest))
+                if receipt.operation_id == query.operation_id
+                    && digest == query.activate_request_digest =>
+            {
+                Ok(Some(receipt.clone()))
+            }
+            (None, None) => Ok(None),
+            _ => Err(KernelServiceError::HandshakeMismatch {
+                field: "activation_query",
+            }),
+        }
+    }
+
     /// Publishes an initial, repeated, or recovery readiness receipt after
-    /// exact handshake and health checks.
+    /// exact candidate, activation receipt, and health checks.
     pub fn mark_ready(&mut self, receipt: KernelReadyReceipt) -> Result<(), KernelServiceError> {
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
-        let handshake = self
-            .handshake
+        let candidate = self
+            .candidate
             .as_ref()
             .ok_or(KernelServiceError::HandshakeMismatch {
-                field: "missing_handshake",
+                field: "missing_candidate",
             })?;
+        let activation = self
+            .activation_receipt
+            .as_ref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
         if !matches!(
             self.state,
             KernelServiceState::Activating
@@ -377,7 +474,7 @@ impl KernelService {
                 to: KernelServiceState::Ready,
             });
         }
-        receipt.validate(handshake)?;
+        receipt.validate(candidate, activation)?;
         self.ready = Some(receipt);
         self.failure = None;
         if self.state != KernelServiceState::Ready {
@@ -464,8 +561,8 @@ impl KernelService {
         if self.state != KernelServiceState::Ready {
             return Err(KernelServiceError::AdmissionClosed(self.state));
         }
-        let handshake = self
-            .handshake
+        let candidate = self
+            .candidate
             .as_ref()
             .ok_or(KernelServiceError::AdmissionClosed(self.state))?;
         let permit = self
@@ -477,7 +574,7 @@ impl KernelService {
             })?;
         Ok(AdmissionLease {
             permit,
-            activation_id: handshake.activation_id.as_str().to_owned(),
+            activation_id: candidate.activation_id.as_str().to_owned(),
             authority_epoch: self.front_door.epoch(),
         })
     }
@@ -533,22 +630,21 @@ mod tests {
         HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostProcessBinding,
         ProcessObservation, RestartBudget,
     };
-    use eliot_platform::PlatformHandle;
+    use eliot_platform::{KernelActivationNonce, PlatformHandle};
     use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 
     fn handle(value: &str) -> PlatformHandle {
         PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
     }
 
-    fn handshake() -> HostKernelHandshake {
-        HostKernelHandshake {
+    fn candidate() -> HostKernelCandidateBinding {
+        HostKernelCandidateBinding {
             installation_id: handle("installation-1"),
             host_epoch: AuthorityEpoch::new(1).unwrap_or_else(|_| unreachable!()),
             kernel_epoch: AuthorityEpoch::genesis(),
             activation_id: handle("activation-1"),
             artifact_hash: handle("artifact-1"),
             config_hash: handle("config-1"),
-            activation_nonce: handle("nonce-1"),
             job_object_id: handle("Local\\Eliot-Host-Kernel-test"),
             pipe_identity: handle(crate::protocol::KERNEL_CONTROL_PIPE),
             host_process: HostProcessBinding {
@@ -577,13 +673,34 @@ mod tests {
         }
     }
 
-    fn ready_receipt(handshake: &HostKernelHandshake, evidence: &str) -> KernelReadyReceipt {
+    fn permit(candidate: &HostKernelCandidateBinding) -> KernelActivationPermit {
+        KernelActivationPermit {
+            operation_id: handle("activation-operation-1"),
+            candidate_binding_digest: candidate
+                .compute_digest()
+                .unwrap_or_else(|_| unreachable!()),
+            prior_kernel_disposition_digest: "b".repeat(64),
+            journal_transaction_id: handle("journal-transaction-1"),
+            journal_sequence: 7,
+            generation: ResourceGeneration::genesis(),
+            authority_epoch: candidate.kernel_epoch,
+            activation_nonce: KernelActivationNonce::new(handle(&"a".repeat(64)))
+                .unwrap_or_else(|_| unreachable!()),
+        }
+    }
+
+    fn ready_receipt(
+        candidate: &HostKernelCandidateBinding,
+        activation: &KernelActivationReceipt,
+        evidence: &str,
+    ) -> KernelReadyReceipt {
         KernelReadyReceipt {
-            activation_id: handshake.activation_id.clone(),
-            activation_nonce: handshake.activation_nonce.clone(),
+            activation_id: candidate.activation_id.clone(),
+            activation_operation_id: activation.operation_id.clone(),
+            activation_nonce_digest: activation.activation_nonce_digest.clone(),
             process: ProcessObservation {
                 process_id: handle("pid:42:start:10"),
-                job_object_id: handshake.job_object_id.clone(),
+                job_object_id: candidate.job_object_id.clone(),
                 state: ServiceProcessState::Ready,
                 health: HealthVector::healthy(),
                 evidence_refs: vec![handle("process-evidence")],
@@ -593,9 +710,13 @@ mod tests {
         }
     }
 
-    fn activate(service: &mut KernelService, handshake: HostKernelHandshake) {
+    fn activate(
+        service: &mut KernelService,
+        candidate: HostKernelCandidateBinding,
+    ) -> KernelActivationReceipt {
+        let permit = permit(&candidate);
         service
-            .apply(KernelControlCommand::Reconcile(handshake))
+            .reconcile(candidate)
             .unwrap_or_else(|_| unreachable!());
         service
             .apply(KernelControlCommand::Shadow)
@@ -604,8 +725,48 @@ mod tests {
             .apply(KernelControlCommand::PrepareHandoff)
             .unwrap_or_else(|_| unreachable!());
         service
-            .apply(KernelControlCommand::Activate)
+            .activate_permit(&permit, ResourceGeneration::genesis(), "c".repeat(64))
+            .unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn activation_is_consumed_once_and_unknown_delivery_reconciles_by_operation() {
+        let mut service = KernelService::new([5; 32], 2, 4).unwrap_or_else(|_| unreachable!());
+        let candidate = candidate();
+        let permit = permit(&candidate);
+        service
+            .reconcile(candidate)
             .unwrap_or_else(|_| unreachable!());
+        service
+            .apply(KernelControlCommand::Shadow)
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .apply(KernelControlCommand::PrepareHandoff)
+            .unwrap_or_else(|_| unreachable!());
+        let digest = "d".repeat(64);
+        let receipt = service
+            .activate_permit(&permit, ResourceGeneration::genesis(), digest.clone())
+            .unwrap_or_else(|_| unreachable!());
+        assert!(
+            service
+                .activate_permit(&permit, ResourceGeneration::genesis(), digest.clone())
+                .is_err()
+        );
+        let reconciled = service
+            .reconcile_activation(&KernelActivationQuery {
+                operation_id: permit.operation_id.clone(),
+                activate_request_digest: digest.clone(),
+            })
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(reconciled, Some(receipt));
+        assert!(
+            service
+                .reconcile_activation(&KernelActivationQuery {
+                    operation_id: permit.operation_id,
+                    activate_request_digest: "e".repeat(64),
+                })
+                .is_err()
+        );
     }
 
     #[test]
@@ -656,24 +817,21 @@ mod tests {
     fn ready_probe_replaces_receipt_without_reactivation_or_epoch_change()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut service = KernelService::new([13; 32], 2, 4)?;
-        let handshake = handshake();
-        activate(&mut service, handshake.clone());
-        let initial = ready_receipt(&handshake, "ready-initial");
+        let candidate = candidate();
+        let activation = activate(&mut service, candidate.clone());
+        let initial = ready_receipt(&candidate, &activation, "ready-initial");
         service.publish_ready(initial)?;
         let epoch = service.authority_epoch();
-        let retained_handshake = service.handshake().cloned();
+        let retained_candidate = service.candidate_binding().cloned();
 
-        let repeated = ready_receipt(&handshake, "ready-repeat");
+        let repeated = ready_receipt(&candidate, &activation, "ready-repeat");
         service.publish_ready(repeated.clone())?;
 
         assert_eq!(service.state(), KernelServiceState::Ready);
         assert_eq!(service.ready_receipt(), Some(&repeated));
         assert_eq!(service.authority_epoch(), epoch);
-        assert_eq!(service.handshake(), retained_handshake.as_ref());
-        assert_eq!(
-            service.handshake().map(|value| &value.activation_nonce),
-            Some(&handshake.activation_nonce)
-        );
+        assert_eq!(service.candidate_binding(), retained_candidate.as_ref());
+        assert_eq!(service.activation_receipt(), Some(&activation));
         Ok(())
     }
 
@@ -681,13 +839,13 @@ mod tests {
     fn degraded_probe_recovers_only_after_fresh_full_receipt()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut service = KernelService::new([15; 32], 2, 4)?;
-        let handshake = handshake();
-        activate(&mut service, handshake.clone());
-        service.publish_ready(ready_receipt(&handshake, "ready-initial"))?;
+        let candidate = candidate();
+        let activation = activate(&mut service, candidate.clone());
+        service.publish_ready(ready_receipt(&candidate, &activation, "ready-initial"))?;
         service.apply(KernelControlCommand::Degrade(handle("store-lost")))?;
         assert_eq!(service.state(), KernelServiceState::Degraded);
 
-        let recovery = ready_receipt(&handshake, "ready-recovery");
+        let recovery = ready_receipt(&candidate, &activation, "ready-recovery");
         service.publish_ready(recovery.clone())?;
 
         assert_eq!(service.state(), KernelServiceState::Ready);
@@ -698,7 +856,8 @@ mod tests {
 
     #[test]
     fn probe_publication_rejects_every_forbidden_state() {
-        let handshake = handshake();
+        let candidate = candidate();
+        let activation = KernelActivationReceipt::issue(&permit(&candidate));
         let forbidden = [
             KernelServiceState::Cold,
             KernelServiceState::Reconciling,
@@ -711,10 +870,11 @@ mod tests {
         ];
         for state in forbidden {
             let mut service = KernelService::new([17; 32], 2, 4).unwrap_or_else(|_| unreachable!());
-            service.handshake = Some(handshake.clone());
+            service.candidate = Some(candidate.clone());
+            service.activation_receipt = Some(activation.clone());
             service.state = state;
             assert!(matches!(
-                service.publish_ready(ready_receipt(&handshake, "ready-forbidden")),
+                service.publish_ready(ready_receipt(&candidate, &activation, "ready-forbidden")),
                 Err(KernelServiceError::IllegalTransition {
                     from,
                     to: KernelServiceState::Ready

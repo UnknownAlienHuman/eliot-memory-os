@@ -3,7 +3,7 @@
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
 use eliot_ipc::TransportError;
 use eliot_kernel_core::AuthoritySnapshotBindingWire;
-use eliot_platform::{PlatformHandle, PortError, SecretReference};
+use eliot_platform::{KernelActivationNonce, PlatformHandle, PortError, SecretReference};
 use eliot_process::{
     CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
     ProcessExecutionError, ProcessExecutionView, ProcessStartReceipt,
@@ -25,7 +25,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 1;
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 2;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 const PROBE_BINDING_PREFIXES: [&str; 5] = [
@@ -136,9 +136,10 @@ fn handle_text(value: &str, field: &'static str) -> Result<(), KernelServiceErro
     validate_text(value, field)
 }
 
-/// One authenticated Host lifecycle command.  The command is repeated with
-/// the complete handshake so reconnects cannot silently inherit stale Host
-/// identity, generation, or nonce state.
+/// One authenticated Host lifecycle command.  Every request repeats the exact
+/// nonce-free candidate binding so reconnects cannot silently inherit stale
+/// Host, process, Job, generation, or pipe identity.  Activation authority is
+/// carried only by [`KernelControlCommand::Activate`].
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelControlRequest {
@@ -154,8 +155,8 @@ pub struct KernelControlRequest {
     pub peer_process_id: u32,
     /// Approved generation bound to this control exchange.
     pub generation: ResourceGeneration,
-    /// Complete Host lineage binding.
-    pub handshake: HostKernelHandshake,
+    /// Complete nonce-free Host/candidate lineage binding.
+    pub candidate: HostKernelCandidateBinding,
     /// One closed lifecycle command.
     pub command: KernelControlCommand,
     /// Digest over all fields except this digest.
@@ -173,7 +174,7 @@ impl KernelControlRequest {
             sequence: u64,
             peer_process_id: u32,
             generation: ResourceGeneration,
-            handshake: &'a HostKernelHandshake,
+            candidate: &'a HostKernelCandidateBinding,
             command: &'a KernelControlCommand,
         }
         serde_json::to_vec(&Unsigned {
@@ -183,7 +184,7 @@ impl KernelControlRequest {
             sequence: self.sequence,
             peer_process_id: self.peer_process_id,
             generation: self.generation,
-            handshake: &self.handshake,
+            candidate: &self.candidate,
             command: &self.command,
         })
         .map_err(|_| KernelServiceError::InvalidField {
@@ -226,7 +227,10 @@ impl KernelControlRequest {
                 reason: "must be non-zero",
             });
         }
-        self.handshake.validate()?;
+        self.candidate.validate()?;
+        if let KernelControlCommand::Activate(permit) = &self.command {
+            permit.validate(&self.candidate, self.generation)?;
+        }
         if self.payload_digest.len() != 64
             || !self
                 .payload_digest
@@ -259,6 +263,9 @@ pub struct KernelControlResponse {
     pub state: KernelServiceState,
     /// Receipt returned only after Kernel-owned readiness observation.
     pub receipt: Option<KernelReadyReceipt>,
+    /// Exact receipt returned after one activation permit is consumed, or
+    /// after a nonce-free operation-identity reconciliation finds it.
+    pub activation_receipt: Option<KernelActivationReceipt>,
     /// Stable rejection detail, when the command was not accepted.
     pub error: Option<String>,
     /// Digest over all fields except this digest.
@@ -276,6 +283,7 @@ impl KernelControlResponse {
             request_digest: &'a str,
             state: KernelServiceState,
             receipt: &'a Option<KernelReadyReceipt>,
+            activation_receipt: &'a Option<KernelActivationReceipt>,
             error: &'a Option<String>,
         }
         serde_json::to_vec(&Unsigned {
@@ -285,6 +293,7 @@ impl KernelControlResponse {
             request_digest: &self.request_digest,
             state: self.state,
             receipt: &self.receipt,
+            activation_receipt: &self.activation_receipt,
             error: &self.error,
         })
         .map_err(|_| KernelServiceError::InvalidField {
@@ -1029,10 +1038,14 @@ impl ProcessObservation {
     }
 }
 
-/// The immutable Host lineage and activation binding presented to Kernel.
+/// Immutable Host lineage and candidate binding presented before authority.
+///
+/// This structure is intentionally incapable of carrying activation nonce
+/// material.  It authenticates the candidate session through the named-pipe
+/// peer plus exact Host process and Kernel Job/process observations.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HostKernelHandshake {
+pub struct HostKernelCandidateBinding {
     /// Host installation identity.
     pub installation_id: PlatformHandle,
     /// Host installation epoch that owns this process.
@@ -1045,8 +1058,6 @@ pub struct HostKernelHandshake {
     pub artifact_hash: PlatformHandle,
     /// Immutable configuration hash/reference.
     pub config_hash: PlatformHandle,
-    /// One-time activation nonce. It is consumed exactly once.
-    pub activation_nonce: PlatformHandle,
     /// Host-owned Kernel Job Object identity.
     pub job_object_id: PlatformHandle,
     /// Candidate/active authenticated local IPC identity.
@@ -1061,17 +1072,26 @@ pub struct HostKernelHandshake {
     pub containment_action: Option<ContainmentAction>,
 }
 
-impl HostKernelHandshake {
+impl HostKernelCandidateBinding {
+    /// Returns the canonical digest bound into the later activation permit.
+    pub fn compute_digest(&self) -> Result<String, KernelServiceError> {
+        serde_json::to_vec(self)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "candidate.digest",
+                reason: "cannot canonicalize candidate binding",
+            })
+    }
+
     /// Validates all identity and epoch invariants before a candidate starts.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
         for (value, field) in [
-            (&self.installation_id, "handshake.installation_id"),
-            (&self.activation_id, "handshake.activation_id"),
-            (&self.artifact_hash, "handshake.artifact_hash"),
-            (&self.config_hash, "handshake.config_hash"),
-            (&self.activation_nonce, "handshake.activation_nonce"),
-            (&self.job_object_id, "handshake.job_object_id"),
-            (&self.pipe_identity, "handshake.pipe_identity"),
+            (&self.installation_id, "candidate.installation_id"),
+            (&self.activation_id, "candidate.activation_id"),
+            (&self.artifact_hash, "candidate.artifact_hash"),
+            (&self.config_hash, "candidate.config_hash"),
+            (&self.job_object_id, "candidate.job_object_id"),
+            (&self.pipe_identity, "candidate.pipe_identity"),
         ] {
             handle(value, field)?;
         }
@@ -1091,6 +1111,162 @@ impl HostKernelHandshake {
         }
         if let Some(containment) = &self.containment_action {
             containment.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Durable one-use permit for one exact candidate activation.
+///
+/// The nonce is a canonical typed 256-bit value.  The remaining fields bind
+/// it to the committed Host journal append, the exact prior disposition, and
+/// the candidate/generation/authority contour.  No other command can carry
+/// this type.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelActivationPermit {
+    /// Stable Host-owned activation operation identity.
+    pub operation_id: PlatformHandle,
+    /// Digest of [`HostKernelCandidateBinding`].
+    pub candidate_binding_digest: String,
+    /// Digest of the exact durable prior-Kernel disposition.
+    pub prior_kernel_disposition_digest: String,
+    /// Transaction identity of the committed `NonceIssued` append.
+    pub journal_transaction_id: PlatformHandle,
+    /// Sequence of the committed `NonceIssued` append.
+    pub journal_sequence: u64,
+    /// Approved runtime generation carried by the request.
+    pub generation: ResourceGeneration,
+    /// Strict Kernel authority epoch for this process generation.
+    pub authority_epoch: AuthorityEpoch,
+    /// Fresh one-use OS-generated activation authority.
+    pub activation_nonce: KernelActivationNonce,
+}
+
+impl KernelActivationPermit {
+    /// Validates the permit against the nonce-free candidate and request.
+    pub fn validate(
+        &self,
+        candidate: &HostKernelCandidateBinding,
+        generation: ResourceGeneration,
+    ) -> Result<(), KernelServiceError> {
+        handle(&self.operation_id, "permit.operation_id")?;
+        handle(
+            &self.journal_transaction_id,
+            "permit.journal_transaction_id",
+        )?;
+        for (value, field) in [
+            (
+                self.candidate_binding_digest.as_str(),
+                "permit.candidate_binding_digest",
+            ),
+            (
+                self.prior_kernel_disposition_digest.as_str(),
+                "permit.prior_kernel_disposition_digest",
+            ),
+        ] {
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(KernelServiceError::InvalidField {
+                    field,
+                    reason: "must be a lowercase SHA-256 digest",
+                });
+            }
+        }
+        if self.journal_sequence == 0
+            || self.generation != generation
+            || self.authority_epoch != candidate.kernel_epoch
+            || self.candidate_binding_digest != candidate.compute_digest()?
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "activation_permit",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns a non-secret digest used by receipts and reconciliation.
+    pub fn activation_nonce_digest(&self) -> String {
+        sha256_hex(self.activation_nonce.as_handle().as_str().as_bytes())
+    }
+}
+
+/// Kernel-authored evidence that one exact permit was consumed once.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelActivationReceipt {
+    /// Stable Host-owned activation operation identity.
+    pub operation_id: PlatformHandle,
+    /// Digest of the exact nonce-free candidate binding.
+    pub candidate_binding_digest: String,
+    /// Digest of the exact durable prior-Kernel disposition.
+    pub prior_kernel_disposition_digest: String,
+    /// Transaction identity of the committed `NonceIssued` append.
+    pub journal_transaction_id: PlatformHandle,
+    /// Sequence of the committed `NonceIssued` append.
+    pub journal_sequence: u64,
+    /// Approved runtime generation consumed by the Kernel.
+    pub generation: ResourceGeneration,
+    /// Kernel authority epoch consumed by the Kernel.
+    pub authority_epoch: AuthorityEpoch,
+    /// Non-secret digest of the consumed nonce; raw material is never echoed.
+    pub activation_nonce_digest: String,
+}
+
+impl KernelActivationReceipt {
+    /// Issues the exact receipt after the Kernel accepts one permit.
+    pub fn issue(permit: &KernelActivationPermit) -> Self {
+        Self {
+            operation_id: permit.operation_id.clone(),
+            candidate_binding_digest: permit.candidate_binding_digest.clone(),
+            prior_kernel_disposition_digest: permit.prior_kernel_disposition_digest.clone(),
+            journal_transaction_id: permit.journal_transaction_id.clone(),
+            journal_sequence: permit.journal_sequence,
+            generation: permit.generation,
+            authority_epoch: permit.authority_epoch,
+            activation_nonce_digest: permit.activation_nonce_digest(),
+        }
+    }
+
+    /// Validates a receipt against the exact permit without exposing nonce bytes.
+    pub fn validate(&self, permit: &KernelActivationPermit) -> Result<(), KernelServiceError> {
+        let expected = Self::issue(permit);
+        if self != &expected {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "activation_receipt",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Nonce-free lookup for an Activate request whose transport outcome was unknown.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelActivationQuery {
+    /// Exact operation identity of the possibly consumed permit.
+    pub operation_id: PlatformHandle,
+    /// Digest of the original Activate request; the permit is never repeated.
+    pub activate_request_digest: String,
+}
+
+impl KernelActivationQuery {
+    /// Validates the bounded nonce-free reconciliation identity.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        handle(&self.operation_id, "activation_query.operation_id")?;
+        if self.activate_request_digest.len() != 64
+            || !self
+                .activate_request_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "activation_query.activate_request_digest",
+                reason: "must be a lowercase SHA-256 digest",
+            });
         }
         Ok(())
     }
@@ -1118,11 +1294,12 @@ impl ContainmentAction {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelReadyReceipt {
-    /// Activation identity echoed from the handshake.
+    /// Activation identity echoed from the candidate binding.
     pub activation_id: PlatformHandle,
-    /// Activation nonce echoed from the handshake. Repeat probes retain this
-    /// lineage binding without consuming the nonce again.
-    pub activation_nonce: PlatformHandle,
+    /// Exact consumed activation operation identity.
+    pub activation_operation_id: PlatformHandle,
+    /// Non-secret digest retained from the one-use activation receipt.
+    pub activation_nonce_digest: String,
     /// Process and Job Object observation at readiness time.
     pub process: ProcessObservation,
     /// Kernel health vector at readiness time.
@@ -1153,15 +1330,15 @@ impl KernelReadyReceipt {
             format!("kernel-probe-generation:{}", request.generation.value()),
             format!(
                 "kernel-probe-authority-epoch:{}",
-                request.handshake.kernel_epoch.value()
+                request.candidate.kernel_epoch.value()
             ),
             format!(
                 "kernel-probe-config:{}",
-                request.handshake.config_hash.as_str()
+                request.candidate.config_hash.as_str()
             ),
             format!(
                 "kernel-probe-artifact:{}",
-                request.handshake.artifact_hash.as_str()
+                request.candidate.artifact_hash.as_str()
             ),
         ]
         .into_iter()
@@ -1171,21 +1348,31 @@ impl KernelReadyReceipt {
     }
 
     /// Validates readiness without inferring success from process existence.
-    pub fn validate(&self, handshake: &HostKernelHandshake) -> Result<(), KernelServiceError> {
+    pub fn validate(
+        &self,
+        candidate: &HostKernelCandidateBinding,
+        activation: &KernelActivationReceipt,
+    ) -> Result<(), KernelServiceError> {
         handle(&self.activation_id, "ready.activation_id")?;
-        handle(&self.activation_nonce, "ready.activation_nonce")?;
-        if self.activation_id != handshake.activation_id {
+        handle(
+            &self.activation_operation_id,
+            "ready.activation_operation_id",
+        )?;
+        if self.activation_id != candidate.activation_id {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "activation_id",
             });
         }
-        if self.activation_nonce != handshake.activation_nonce {
+        if self.activation_operation_id != activation.operation_id
+            || self.activation_nonce_digest != activation.activation_nonce_digest
+            || activation.candidate_binding_digest != candidate.compute_digest()?
+        {
             return Err(KernelServiceError::HandshakeMismatch {
-                field: "activation_nonce",
+                field: "activation_receipt",
             });
         }
         self.process.validate()?;
-        if self.process.job_object_id != handshake.job_object_id {
+        if self.process.job_object_id != candidate.job_object_id {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "job_object_id",
             });
@@ -1215,8 +1402,9 @@ impl KernelReadyReceipt {
     pub fn validate_for_probe(
         &self,
         request: &KernelControlRequest,
+        activation: &KernelActivationReceipt,
     ) -> Result<(), KernelServiceError> {
-        self.validate(&request.handshake)?;
+        self.validate(&request.candidate, activation)?;
         let expected = Self::probe_binding_evidence(request)?;
         for (prefix, binding) in PROBE_BINDING_PREFIXES.into_iter().zip(expected) {
             let mut matching = self
@@ -1236,17 +1424,20 @@ impl KernelReadyReceipt {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 #[allow(
     clippy::large_enum_variant,
-    reason = "preserve the established self-describing wire shape for the full Reconcile handshake"
+    reason = "the one-use activation permit remains self-describing on the single control wire"
 )]
 pub enum KernelControlCommand {
-    /// Begin reconciliation of one Host activation lineage.
-    Reconcile(HostKernelHandshake),
+    /// Begin reconciliation of the request's nonce-free candidate binding.
+    Reconcile,
     /// Enter side-by-side candidate mode without authority.
     Shadow,
     /// Record that Host prepared the exclusive handoff.
     PrepareHandoff,
-    /// Begin consuming the one-time activation nonce.
-    Activate,
+    /// Consume the exact durably issued one-time activation permit.
+    Activate(KernelActivationPermit),
+    /// Reconcile an Activate request by operation identity after an unknown
+    /// transport outcome.  This never retries or reissues the permit.
+    ReconcileActivation(KernelActivationQuery),
     /// Ask Kernel to prove readiness from live observations and self-author a
     /// receipt.  No caller-shaped receipt is accepted on this wire.
     ProbeReady,
@@ -1322,15 +1513,14 @@ mod tests {
         assert_eq!(value["operation"], "Inspect");
     }
 
-    fn control_handshake() -> HostKernelHandshake {
-        HostKernelHandshake {
+    fn candidate_binding() -> HostKernelCandidateBinding {
+        HostKernelCandidateBinding {
             installation_id: handle_value("installation-1"),
             host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
             kernel_epoch: AuthorityEpoch::new(1).expect("kernel epoch"),
             activation_id: handle_value("activation-1"),
             artifact_hash: handle_value("artifact-1"),
             config_hash: handle_value("config-1"),
-            activation_nonce: handle_value("nonce-1"),
             job_object_id: handle_value("Local\\Eliot-Host-Kernel-test"),
             pipe_identity: handle_value(KERNEL_CONTROL_PIPE),
             host_process: HostProcessBinding {
@@ -1359,6 +1549,23 @@ mod tests {
         }
     }
 
+    fn activation_permit(
+        candidate: &HostKernelCandidateBinding,
+        generation: ResourceGeneration,
+    ) -> KernelActivationPermit {
+        KernelActivationPermit {
+            operation_id: handle_value("activation-operation-1"),
+            candidate_binding_digest: candidate.compute_digest().expect("candidate digest"),
+            prior_kernel_disposition_digest: "b".repeat(64),
+            journal_transaction_id: handle_value("journal-transaction-1"),
+            journal_sequence: 7,
+            generation,
+            authority_epoch: candidate.kernel_epoch,
+            activation_nonce: KernelActivationNonce::new(handle_value(&"a".repeat(64)))
+                .expect("activation nonce"),
+        }
+    }
+
     #[test]
     fn control_wire_digest_and_unknown_fields_are_fail_closed() {
         let request = KernelControlRequest {
@@ -1368,7 +1575,7 @@ mod tests {
             sequence: 1,
             peer_process_id: 42,
             generation: ResourceGeneration::new(1).expect("generation"),
-            handshake: control_handshake(),
+            candidate: candidate_binding(),
             command: KernelControlCommand::Shadow,
             payload_digest: String::new(),
         }
@@ -1385,13 +1592,17 @@ mod tests {
         assert!(serde_json::from_value::<KernelControlRequest>(json).is_err());
     }
 
-    fn ready_receipt(handshake: &HostKernelHandshake) -> KernelReadyReceipt {
+    fn ready_receipt(
+        candidate: &HostKernelCandidateBinding,
+        activation: &KernelActivationReceipt,
+    ) -> KernelReadyReceipt {
         KernelReadyReceipt {
-            activation_id: handshake.activation_id.clone(),
-            activation_nonce: handshake.activation_nonce.clone(),
+            activation_id: candidate.activation_id.clone(),
+            activation_operation_id: activation.operation_id.clone(),
+            activation_nonce_digest: activation.activation_nonce_digest.clone(),
             process: ProcessObservation {
                 process_id: handle_value("pid:42:start:1"),
-                job_object_id: handshake.job_object_id.clone(),
+                job_object_id: candidate.job_object_id.clone(),
                 state: ServiceProcessState::Ready,
                 health: HealthVector::healthy(),
                 evidence_refs: vec![handle_value("process-evidence-1")],
@@ -1401,7 +1612,7 @@ mod tests {
         }
     }
 
-    fn probe_request(handshake: HostKernelHandshake) -> KernelControlRequest {
+    fn probe_request(candidate: HostKernelCandidateBinding) -> KernelControlRequest {
         KernelControlRequest {
             wire_id: KERNEL_CONTROL_WIRE_ID.to_owned(),
             wire_version: KERNEL_CONTROL_WIRE_VERSION,
@@ -1409,7 +1620,7 @@ mod tests {
             sequence: 5,
             peer_process_id: 7,
             generation: ResourceGeneration::new(3).expect("generation"),
-            handshake,
+            candidate,
             command: KernelControlCommand::ProbeReady,
             payload_digest: String::new(),
         }
@@ -1417,8 +1628,11 @@ mod tests {
         .expect("probe digest")
     }
 
-    fn bound_ready_receipt(request: &KernelControlRequest) -> KernelReadyReceipt {
-        let mut receipt = ready_receipt(&request.handshake);
+    fn bound_ready_receipt(
+        request: &KernelControlRequest,
+        activation: &KernelActivationReceipt,
+    ) -> KernelReadyReceipt {
+        let mut receipt = ready_receipt(&request.candidate, activation);
         receipt
             .evidence_refs
             .extend(KernelReadyReceipt::probe_binding_evidence(request).expect("probe bindings"));
@@ -1426,26 +1640,59 @@ mod tests {
     }
 
     #[test]
-    fn ready_receipt_rejects_nonce_job_health_and_evidence_substitution() {
-        let handshake = control_handshake();
-        let receipt = ready_receipt(&handshake);
-        assert!(receipt.validate(&handshake).is_ok());
+    fn candidate_is_nonce_free_and_old_handshake_authority_shape_is_rejected() {
+        let candidate = candidate_binding();
+        let value = serde_json::to_value(&candidate).expect("candidate json");
+        assert!(value.get("activation_nonce").is_none());
+        let mut old = value;
+        old["activation_nonce"] = serde_json::Value::String("legacy-authority".to_owned());
+        assert!(serde_json::from_value::<HostKernelCandidateBinding>(old).is_err());
+    }
 
-        let mut wrong_nonce = receipt.clone();
-        wrong_nonce.activation_nonce = handle_value("nonce-other");
-        assert!(wrong_nonce.validate(&handshake).is_err());
+    #[test]
+    fn activation_permit_binds_candidate_journal_generation_and_authority() {
+        let candidate = candidate_binding();
+        let generation = ResourceGeneration::new(3).expect("generation");
+        let permit = activation_permit(&candidate, generation);
+        assert!(permit.validate(&candidate, generation).is_ok());
+        let receipt = KernelActivationReceipt::issue(&permit);
+        assert!(receipt.validate(&permit).is_ok());
+        let mut wrong = permit;
+        wrong.journal_sequence += 1;
+        assert!(receipt.validate(&wrong).is_err());
+
+        let mut restarted = candidate;
+        restarted.job_binding.root.process.start_time_100ns += 1;
+        assert_ne!(
+            restarted.compute_digest().expect("restarted digest"),
+            wrong.candidate_binding_digest
+        );
+        assert!(wrong.validate(&restarted, generation).is_err());
+    }
+
+    #[test]
+    fn ready_receipt_rejects_activation_job_health_and_evidence_substitution() {
+        let candidate = candidate_binding();
+        let permit = activation_permit(&candidate, ResourceGeneration::new(3).expect("generation"));
+        let activation = KernelActivationReceipt::issue(&permit);
+        let receipt = ready_receipt(&candidate, &activation);
+        assert!(receipt.validate(&candidate, &activation).is_ok());
+
+        let mut wrong_activation = receipt.clone();
+        wrong_activation.activation_nonce_digest = "c".repeat(64);
+        assert!(wrong_activation.validate(&candidate, &activation).is_err());
 
         let mut wrong_job = receipt.clone();
         wrong_job.process.job_object_id = handle_value("Local\\Eliot-Other-Job");
-        assert!(wrong_job.validate(&handshake).is_err());
+        assert!(wrong_job.validate(&candidate, &activation).is_err());
 
         let mut unhealthy = receipt.clone();
         unhealthy.health.liveness = eliot_runtime_contracts::HealthDimension::Degraded;
-        assert!(unhealthy.validate(&handshake).is_err());
+        assert!(unhealthy.validate(&candidate, &activation).is_err());
 
         let mut missing_evidence = receipt;
         missing_evidence.evidence_refs.clear();
-        assert!(missing_evidence.validate(&handshake).is_err());
+        assert!(missing_evidence.validate(&candidate, &activation).is_err());
     }
 
     #[test]
@@ -1466,56 +1713,89 @@ mod tests {
 
     #[test]
     fn ready_receipt_is_bound_to_exact_probe_generation_and_fence() {
-        let request = probe_request(control_handshake());
-        let receipt = bound_ready_receipt(&request);
-        assert!(receipt.validate_for_probe(&request).is_ok());
+        let candidate = candidate_binding();
+        let permit = activation_permit(&candidate, ResourceGeneration::new(3).expect("generation"));
+        let activation = KernelActivationReceipt::issue(&permit);
+        let request = probe_request(candidate);
+        let receipt = bound_ready_receipt(&request, &activation);
+        assert!(receipt.validate_for_probe(&request, &activation).is_ok());
 
         let mut stale_request = request.clone();
         stale_request.message_id = handle_value("probe-message-2");
         stale_request.sequence = 6;
         stale_request.payload_digest = stale_request.compute_digest().expect("stale digest");
-        assert!(receipt.validate_for_probe(&stale_request).is_err());
-        let repeated = bound_ready_receipt(&stale_request);
-        assert!(repeated.validate_for_probe(&stale_request).is_ok());
+        assert!(
+            receipt
+                .validate_for_probe(&stale_request, &activation)
+                .is_err()
+        );
+        let repeated = bound_ready_receipt(&stale_request, &activation);
+        assert!(
+            repeated
+                .validate_for_probe(&stale_request, &activation)
+                .is_ok()
+        );
         assert_ne!(request.payload_digest, stale_request.payload_digest);
         assert_ne!(receipt.evidence_refs, repeated.evidence_refs);
-        assert_eq!(receipt.activation_nonce, repeated.activation_nonce);
+        assert_eq!(
+            receipt.activation_nonce_digest,
+            repeated.activation_nonce_digest
+        );
         let mut next_repeat_request = stale_request.clone();
         next_repeat_request.message_id = handle_value("probe-message-3");
         next_repeat_request.sequence = 7;
         next_repeat_request.payload_digest = next_repeat_request
             .compute_digest()
             .expect("next repeat digest");
-        let next_repeated = bound_ready_receipt(&next_repeat_request);
+        let next_repeated = bound_ready_receipt(&next_repeat_request, &activation);
         assert!(
             next_repeated
-                .validate_for_probe(&next_repeat_request)
+                .validate_for_probe(&next_repeat_request, &activation)
                 .is_ok()
         );
-        assert!(repeated.validate_for_probe(&next_repeat_request).is_err());
+        assert!(
+            repeated
+                .validate_for_probe(&next_repeat_request, &activation)
+                .is_err()
+        );
         assert_ne!(repeated.evidence_refs, next_repeated.evidence_refs);
-        assert_eq!(repeated.activation_nonce, next_repeated.activation_nonce);
+        assert_eq!(
+            repeated.activation_nonce_digest,
+            next_repeated.activation_nonce_digest
+        );
 
         let mut other_generation = request.clone();
         other_generation.generation = ResourceGeneration::new(4).expect("generation");
         other_generation.payload_digest = other_generation.compute_digest().expect("digest");
-        assert!(receipt.validate_for_probe(&other_generation).is_err());
+        assert!(
+            receipt
+                .validate_for_probe(&other_generation, &activation)
+                .is_err()
+        );
 
         let mut other_fence = request.clone();
-        other_fence.handshake.kernel_epoch = AuthorityEpoch::new(2).expect("epoch");
+        other_fence.candidate.kernel_epoch = AuthorityEpoch::new(2).expect("epoch");
         other_fence.payload_digest = other_fence.compute_digest().expect("digest");
-        assert!(receipt.validate_for_probe(&other_fence).is_err());
+        assert!(
+            receipt
+                .validate_for_probe(&other_fence, &activation)
+                .is_err()
+        );
 
         let mut other_config = request.clone();
-        other_config.handshake.config_hash = handle_value("config-2");
+        other_config.candidate.config_hash = handle_value("config-2");
         other_config.payload_digest = other_config.compute_digest().expect("digest");
-        assert!(receipt.validate_for_probe(&other_config).is_err());
+        assert!(
+            receipt
+                .validate_for_probe(&other_config, &activation)
+                .is_err()
+        );
 
         let mut ambiguous = receipt.clone();
         ambiguous
             .evidence_refs
             .push(handle_value("kernel-probe-authority-epoch:99"));
-        assert!(ambiguous.validate_for_probe(&request).is_err());
+        assert!(ambiguous.validate_for_probe(&request, &activation).is_err());
 
         let mut substituted = receipt;
         substituted.evidence_refs.retain(|evidence| {
@@ -1526,7 +1806,11 @@ mod tests {
         substituted
             .evidence_refs
             .push(handle_value("kernel-probe-authority-epoch:99"));
-        assert!(substituted.validate_for_probe(&request).is_err());
+        assert!(
+            substituted
+                .validate_for_probe(&request, &activation)
+                .is_err()
+        );
 
         let mut non_probe = request;
         non_probe.command = KernelControlCommand::Drain;
@@ -1536,15 +1820,15 @@ mod tests {
 
     #[test]
     fn host_process_and_job_binding_are_required_and_bounded() {
-        let mut missing_process = control_handshake();
+        let mut missing_process = candidate_binding();
         missing_process.host_process.process_id = 0;
         assert!(missing_process.validate().is_err());
 
-        let mut missing_root = control_handshake();
+        let mut missing_root = candidate_binding();
         missing_root.job_binding.root.process.start_time_100ns = 0;
         assert!(missing_root.validate().is_err());
 
-        let mut missing_file = control_handshake();
+        let mut missing_file = candidate_binding();
         missing_file.job_binding.root.executable.file_index = 0;
         assert!(missing_file.validate().is_err());
     }
