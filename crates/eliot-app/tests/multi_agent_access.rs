@@ -254,6 +254,7 @@ fn canonical_profiles_publish_bounded_tool_sets() -> TestResult {
                 "eliot_fetch_l2",
                 "eliot_compile_packet_l3",
                 "eliot_agent_candidate_submit",
+                "eliot.observe",
                 "eliot_memory_influence_trace",
                 "eliot_write_cognitive_observation",
             ];
