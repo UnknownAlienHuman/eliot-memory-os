@@ -9,8 +9,8 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_platform::{
@@ -113,6 +113,15 @@ impl std::error::Error for HostOwnerLeaseError {}
 
 /// Prefix for the installation-wide cross-process Host owner mutex.
 pub const HOST_OWNER_MUTEX_PREFIX: &str = "Global\\Eliot-Host-Owner-";
+
+/// Shared in-process authority gate between a Host owner lease and every
+/// capability derived from it.  The gate is held for the complete mutation,
+/// so release/Drop can revoke the capability before closing the OS mutex.
+#[derive(Debug, Default)]
+struct HostLeaseAuthority {
+    gate: Mutex<()>,
+    revoked: AtomicBool,
+}
 
 /// Failure returned when an explicit owner release cannot classify its
 /// ReleaseMutex/CloseHandle effects.
@@ -1744,6 +1753,7 @@ pub struct HostOwnerLease {
     handle: windows_sys::Win32::Foundation::HANDLE,
     owns: bool,
     name: String,
+    authority: Arc<HostLeaseAuthority>,
 }
 
 /// Compile-time proof that the caller owns the installation Host epoch.
@@ -1753,7 +1763,36 @@ pub struct HostOwnerLease {
 /// across crate boundaries, but cannot forge or deserialize one.
 #[derive(Debug)]
 pub struct HostOwnerEpochCapability {
-    _private: (),
+    authority: Arc<HostLeaseAuthority>,
+}
+
+/// Opaque live guard held for the complete Host-owned registry mutation.
+///
+/// The guard cannot be forged or inspected by consumers; dropping it releases
+/// the same in-process gate used by [`HostOwnerLease::release`] and `Drop`.
+#[must_use]
+pub struct HostOwnerEpochGuard<'a> {
+    _gate: MutexGuard<'a, ()>,
+}
+
+impl HostOwnerEpochCapability {
+    /// Acquires a live guard while this capability is still backed by its
+    /// unreleased owner lease.
+    ///
+    /// # Errors
+    /// Returns [`WindowsAdapterError::IdentityMismatch`] after the lease has
+    /// been released or dropped, or when the authority gate is poisoned.
+    pub fn live_guard(&self) -> Result<HostOwnerEpochGuard<'_>, WindowsAdapterError> {
+        let gate = self
+            .authority
+            .gate
+            .lock()
+            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+        if self.authority.revoked.load(Ordering::Acquire) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(HostOwnerEpochGuard { _gate: gate })
+    }
 }
 
 impl HostOwnerLease {
@@ -1812,6 +1851,7 @@ impl HostOwnerLease {
                     handle,
                     owns: true,
                     name,
+                    authority: Arc::new(HostLeaseAuthority::default()),
                 }),
                 ERROR_ALREADY_EXISTS => {
                     // Never wait on or join an object we did not create.  Its
@@ -1860,16 +1900,20 @@ impl HostOwnerLease {
 
     /// Returns a Host-only activation capability while this owner lease is held.
     #[must_use]
-    pub const fn activation_capability(&self) -> HostOwnerEpochCapability {
-        HostOwnerEpochCapability { _private: () }
+    pub fn activation_capability(&self) -> HostOwnerEpochCapability {
+        HostOwnerEpochCapability {
+            authority: Arc::clone(&self.authority),
+        }
     }
 
     /// Creates the inert capability used by provider-neutral tests on targets
     /// without a Windows owner mutex. Production Windows callers must obtain
     /// this value from [`Self::activation_capability`] instead.
     #[cfg(not(windows))]
-    pub const fn unsupported_platform_test_capability() -> HostOwnerEpochCapability {
-        HostOwnerEpochCapability { _private: () }
+    pub fn unsupported_platform_test_capability() -> HostOwnerEpochCapability {
+        HostOwnerEpochCapability {
+            authority: Arc::new(HostLeaseAuthority::default()),
+        }
     }
 
     /// Releases the owner mutex after the caller has durably recorded a
@@ -1881,6 +1925,15 @@ impl HostOwnerLease {
     /// Returns a typed error when releasing or closing the mutex fails, or
     /// when this operation is unavailable on the current platform.
     pub fn release(&mut self) -> Result<(), HostOwnerLeaseReleaseError> {
+        // Serialize revocation with every derived Host mutation. A poisoned
+        // gate is still recovered here so the capability is revoked before
+        // touching the OS owner mutex.
+        let _gate = self
+            .authority
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.authority.revoked.store(true, Ordering::Release);
         #[cfg(windows)]
         {
             use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
@@ -1917,6 +1970,12 @@ impl Drop for HostOwnerLease {
     fn drop(&mut self) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::ReleaseMutex;
+        let _gate = self
+            .authority
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.authority.revoked.store(true, Ordering::Release);
         if self.handle.is_null() {
             return;
         }
@@ -11315,7 +11374,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("eliot-p02-suspended-{}", unique_suffix()));
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
         let marker = root.join("started");
-        let child = spawn_suspended_child(&marker, &root, false);
+        let child = spawn_suspended_child(&marker, &root, true);
         let pid = child.id();
         assert!(!marker.exists(), "child must not run before ResumeThread");
         let terminal = child.terminate(0xE1_05).unwrap_or_else(|_| unreachable!());
@@ -11574,6 +11633,55 @@ mod tests {
         assert_eq!(identity.process_id, child.id());
         drop(job);
         assert!(wait_for_child_exit(&mut child));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dropping_host_owned_running_job_kills_children_and_removes_reopen_path() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-crash-kill-on-close-{}",
+            unique_suffix()
+        ));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let marker = root.join("started");
+        let child = spawn_suspended_child(&marker, &root, false);
+        let pid = child.id();
+        let running = child
+            .validate::<(), &'static str, _>(|_| Ok(()))
+            .unwrap_or_else(|_| unreachable!())
+            .resume()
+            .unwrap_or_else(|_| unreachable!());
+        wait_for_marker(&marker);
+        let binding = running.evidence().recoverable_job_binding();
+        let mut pids = Vec::new();
+        for _ in 0..100 {
+            if running.active_process_count().is_ok_and(|count| count >= 2) {
+                pids = running
+                    .job_processes()
+                    .unwrap_or_else(|_| unreachable!())
+                    .into_iter()
+                    .map(|process| process.process_id)
+                    .collect::<Vec<_>>();
+                if pids.len() >= 2 {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(pids.len() >= 2, "crash contour must include the descendant");
+
+        // This is the Host crash boundary: dropping the process-owned
+        // RunningJobChild closes its KILL_ON_JOB_CLOSE Job handle.  A restart
+        // must therefore treat the durable binding as historical evidence,
+        // not as a live contour it may commit without a fresh launch proof.
+        drop(running);
+        assert!(pids.into_iter().all(wait_for_process_gone));
+        assert!(wait_for_process_gone(pid));
+        assert!(matches!(
+            RecoverableJobObject::open(binding),
+            Err(WindowsAdapterError::NotFound)
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]
@@ -12180,5 +12288,62 @@ mod tests {
             .terminate(0xE1_36)
             .unwrap_or_else(|_| unreachable!());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn test_owner_lease(authority: Arc<HostLeaseAuthority>) -> HostOwnerLease {
+        HostOwnerLease {
+            handle: std::ptr::null_mut(),
+            owns: true,
+            name: "test-host-owner".to_owned(),
+            authority,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_epoch_capability_is_revoked_by_release_and_drop() {
+        let authority = Arc::new(HostLeaseAuthority::default());
+        let mut lease = test_owner_lease(Arc::clone(&authority));
+        let capability = lease.activation_capability();
+        let guard = capability.live_guard().unwrap_or_else(|_| unreachable!());
+        drop(guard);
+        lease.release().unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            capability.live_guard().err(),
+            Some(WindowsAdapterError::IdentityMismatch)
+        );
+
+        let capability = {
+            let lease = test_owner_lease(Arc::new(HostLeaseAuthority::default()));
+            lease.activation_capability()
+        };
+        assert_eq!(
+            capability.live_guard().err(),
+            Some(WindowsAdapterError::IdentityMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_epoch_release_waits_for_in_flight_mutation_guard() {
+        use std::sync::Barrier;
+
+        let authority = Arc::new(HostLeaseAuthority::default());
+        let mut lease = test_owner_lease(Arc::clone(&authority));
+        let capability = lease.activation_capability();
+        let entered = Arc::new(Barrier::new(2));
+        let entered_worker = Arc::clone(&entered);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _guard = capability.live_guard().unwrap_or_else(|_| unreachable!());
+                entered_worker.wait();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            });
+            entered.wait();
+            let started = std::time::Instant::now();
+            lease.release().unwrap_or_else(|_| unreachable!());
+            assert!(started.elapsed() >= std::time::Duration::from_millis(75));
+        });
     }
 }

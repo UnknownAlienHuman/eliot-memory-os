@@ -2171,6 +2171,26 @@ pub struct ApprovedGeneration {
     pub last_known_good: bool,
 }
 
+/// Durable idempotency receipt for the most recent terminal pending
+/// activation result.  Keeping the exact transaction and plan bindings lets
+/// a retried Host commit/abort return the original terminal result without
+/// accepting a different caller after the pending projection is cleared.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingActivationTerminal {
+    transaction_id: PlatformHandle,
+    plan_digest: PlatformHandle,
+    generation: PlatformHandle,
+    disposition: PendingActivationTerminalDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PendingActivationTerminalDisposition {
+    Committed,
+    Aborted,
+}
+
 impl ApprovedGeneration {
     /// Validates the generation and its approval reference.
     pub fn validate(&self) -> Result<(), InstallationError> {
@@ -2206,6 +2226,11 @@ pub struct ApprovedGenerationRegistry {
     /// serde default).  Registries written before pending activation was
     /// introduced therefore require an explicit migration/re-stage.
     pending_activation: Option<PendingActivation>,
+    /// Exact idempotency receipt for the most recent committed or aborted
+    /// pending activation.  A new stage supersedes this single terminal
+    /// receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_terminal_activation: Option<PendingActivationTerminal>,
 }
 
 /// Durable activation candidate handed from the installer coordinator to the
@@ -2538,6 +2563,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
                     active_generation: previous.active_generation,
                     last_known_good_generation: previous.last_known_good_generation,
                     pending_activation: None,
+                    last_terminal_activation: None,
                 };
                 if previous.validate().is_ok() {
                     Err(InstallationError::MigrationRequired {
@@ -2703,6 +2729,7 @@ impl ApprovedGenerationRegistry {
             active_generation: None,
             last_known_good_generation: None,
             pending_activation: None,
+            last_terminal_activation: None,
         }
     }
 
@@ -2763,7 +2790,9 @@ impl ApprovedGenerationRegistry {
             state: PendingActivationState::Pending,
         };
         if let Some(existing) = &self.pending_activation {
-            if existing == &pending {
+            let mut same_identity = pending.clone();
+            same_identity.state = existing.state.clone();
+            if existing == &same_identity {
                 return Ok(());
             }
             return Err(InstallationError::IdentityConflict);
@@ -2780,6 +2809,7 @@ impl ApprovedGenerationRegistry {
         }
         self.approve(pending.manifest.clone(), pending.approval_ref.clone())?;
         self.pending_activation = Some(pending);
+        self.last_terminal_activation = None;
         self.validate()
     }
 
@@ -2787,6 +2817,23 @@ impl ApprovedGenerationRegistry {
     #[must_use]
     pub const fn pending_activation(&self) -> Option<&PendingActivation> {
         self.pending_activation.as_ref()
+    }
+
+    fn terminal_matches(
+        &self,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        generation: Option<&PlatformHandle>,
+        disposition: PendingActivationTerminalDisposition,
+    ) -> bool {
+        self.last_terminal_activation
+            .as_ref()
+            .is_some_and(|terminal| {
+                terminal.transaction_id == *transaction_id
+                    && terminal.plan_digest == *plan_digest
+                    && generation.is_none_or(|value| terminal.generation == *value)
+                    && terminal.disposition == disposition
+            })
     }
 
     /// Host-only claim/retry transition for one exact pending identity.
@@ -2807,11 +2854,14 @@ impl ApprovedGenerationRegistry {
     /// plan digest; substitutions are rejected before any process launch.
     pub fn claim_pending_activation(
         &mut self,
-        _host: &HostOwnerEpochCapability,
+        host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
     ) -> Result<PendingActivation, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
         self.validate()?;
         let pending = self.pending_activation.as_mut().ok_or_else(|| {
             InstallationError::IncompleteObservation("no pending activation exists".to_owned())
@@ -2850,15 +2900,28 @@ impl ApprovedGenerationRegistry {
     /// The transaction and plan digest are mandatory idempotency bindings.
     pub fn commit_pending_activation(
         &mut self,
-        _host: &HostOwnerEpochCapability,
+        host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
     ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
         self.validate()?;
-        let pending = self.pending_activation.as_ref().ok_or_else(|| {
-            InstallationError::IncompleteObservation("no pending activation exists".to_owned())
-        })?;
+        let Some(pending) = self.pending_activation.as_ref() else {
+            if self.terminal_matches(
+                transaction_id,
+                plan_digest,
+                Some(generation),
+                PendingActivationTerminalDisposition::Committed,
+            ) {
+                return Ok(());
+            }
+            return Err(InstallationError::IncompleteObservation(
+                "no pending activation exists".to_owned(),
+            ));
+        };
         if pending.transaction_id != *transaction_id
             || pending.plan_digest != *plan_digest
             || pending.manifest.generation != *generation
@@ -2870,22 +2933,32 @@ impl ApprovedGenerationRegistry {
                 "pending activation requires recovery before commit".to_owned(),
             ));
         }
+        let pending_record = pending.clone();
         let pending = self.pending_activation.take();
         if let Err(error) = self.activate(generation) {
             self.pending_activation = pending;
             return Err(error);
         }
+        self.last_terminal_activation = Some(PendingActivationTerminal {
+            transaction_id: pending_record.transaction_id,
+            plan_digest: pending_record.plan_digest,
+            generation: pending_record.manifest.generation,
+            disposition: PendingActivationTerminalDisposition::Committed,
+        });
         self.validate()
     }
 
     /// Records an unknown/failed Host attempt without advertising the candidate.
     pub fn mark_pending_recovery(
         &mut self,
-        _host: &HostOwnerEpochCapability,
+        host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         reason: impl Into<String>,
     ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
         self.validate()?;
         let pending = self.pending_activation.as_mut().ok_or_else(|| {
             InstallationError::IncompleteObservation("no pending activation exists".to_owned())
@@ -2902,12 +2975,23 @@ impl ApprovedGenerationRegistry {
     /// Aborts a first-install candidate without creating an active/LKG state.
     pub fn abort_pending_activation(
         &mut self,
-        _host: &HostOwnerEpochCapability,
+        host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
     ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
         self.validate()?;
         let Some(pending) = self.pending_activation.as_ref() else {
+            if self.terminal_matches(
+                transaction_id,
+                plan_digest,
+                None,
+                PendingActivationTerminalDisposition::Aborted,
+            ) {
+                return Ok(());
+            }
             return Err(InstallationError::IncompleteObservation(
                 "no pending activation exists".to_owned(),
             ));
@@ -2921,9 +3005,16 @@ impl ApprovedGenerationRegistry {
             ));
         }
         let generation = pending.manifest.generation.clone();
+        let terminal = PendingActivationTerminal {
+            transaction_id: pending.transaction_id.clone(),
+            plan_digest: pending.plan_digest.clone(),
+            generation: generation.clone(),
+            disposition: PendingActivationTerminalDisposition::Aborted,
+        };
         self.generations
             .retain(|item| item.manifest.generation != generation);
         self.pending_activation = None;
+        self.last_terminal_activation = Some(terminal);
         self.validate()
     }
 
@@ -2975,6 +3066,41 @@ impl ApprovedGenerationRegistry {
                 .iter()
                 .find(|item| &item.manifest.generation == generation && item.active)
         })
+    }
+
+    fn validate_terminal_activation(
+        &self,
+        terminal: &PendingActivationTerminal,
+    ) -> Result<(), InstallationError> {
+        handle(
+            &terminal.transaction_id,
+            "last_terminal_activation.transaction_id",
+        )?;
+        sha256_handle(
+            &terminal.plan_digest,
+            "last_terminal_activation.plan_digest",
+        )?;
+        handle(&terminal.generation, "last_terminal_activation.generation")?;
+        match terminal.disposition {
+            PendingActivationTerminalDisposition::Committed
+                if self.active_generation.as_ref() != Some(&terminal.generation) =>
+            {
+                Err(InstallationError::IncompleteObservation(
+                    "committed terminal activation is not the active generation".to_owned(),
+                ))
+            }
+            PendingActivationTerminalDisposition::Aborted
+                if self
+                    .generations
+                    .iter()
+                    .any(|item| item.manifest.generation == terminal.generation) =>
+            {
+                Err(InstallationError::IncompleteObservation(
+                    "aborted terminal activation remains approved".to_owned(),
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Validates the complete registry projection and all generation entries.
@@ -3043,6 +3169,9 @@ impl ApprovedGenerationRegistry {
             return Err(InstallationError::IncompleteObservation(
                 "last-known-good flag has no registry identity".to_owned(),
             ));
+        }
+        if let Some(terminal) = &self.last_terminal_activation {
+            self.validate_terminal_activation(terminal)?;
         }
         if let Some(pending) = &self.pending_activation {
             pending.validate(self.active_generation.as_ref())?;
@@ -7091,6 +7220,89 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn live_host_capability() -> (HostOwnerLease, HostOwnerEpochCapability) {
+        let installation = test_handle(format!(
+            "test-host-owner-live-{}",
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let lease = HostOwnerLease::acquire(&installation)
+            .unwrap_or_else(|error| panic!("test Host owner lease: {error}"));
+        let capability = lease.activation_capability();
+        (lease, capability)
+    }
+
+    #[cfg(windows)]
+    fn pending_registry_for_owner_gate() -> (ApprovedGenerationRegistry, InstallationTransaction) {
+        let transaction = registering_transaction();
+        let mut registry = ApprovedGenerationRegistry::new();
+        must(registry.stage_pending_activation(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            transaction.candidate_manifest.clone(),
+            test_handle("approval:owner-gate"),
+        ));
+        (registry, transaction)
+    }
+
+    #[cfg(windows)]
+    fn assert_registry_mutations_rejected_after_owner_shutdown(
+        registry: &mut ApprovedGenerationRegistry,
+        transaction: &InstallationTransaction,
+        capability: &HostOwnerEpochCapability,
+    ) {
+        let before = registry.clone();
+        assert!(
+            registry
+                .claim_pending_activation(
+                    capability,
+                    &transaction.transaction_id,
+                    &transaction.installer_plan_digest,
+                    &transaction.candidate_manifest.generation,
+                )
+                .is_err()
+        );
+        assert_eq!(registry, &before);
+
+        let before = registry.clone();
+        assert!(
+            registry
+                .commit_pending_activation(
+                    capability,
+                    &transaction.transaction_id,
+                    &transaction.installer_plan_digest,
+                    &transaction.candidate_manifest.generation,
+                )
+                .is_err()
+        );
+        assert_eq!(registry, &before);
+
+        let before = registry.clone();
+        assert!(
+            registry
+                .mark_pending_recovery(
+                    capability,
+                    &transaction.transaction_id,
+                    &transaction.installer_plan_digest,
+                    "owner lease is no longer live",
+                )
+                .is_err()
+        );
+        assert_eq!(registry, &before);
+
+        let before = registry.clone();
+        assert!(
+            registry
+                .abort_pending_activation(
+                    capability,
+                    &transaction.transaction_id,
+                    &transaction.installer_plan_digest,
+                )
+                .is_err()
+        );
+        assert_eq!(registry, &before);
+    }
+
     #[derive(Clone, Default)]
     struct SharedStore {
         state: Arc<Mutex<Option<InstallationTransaction>>>,
@@ -9363,6 +9575,7 @@ mod tests {
             active_generation: Some(generation),
             last_known_good_generation: None,
             pending_activation: None,
+            last_terminal_activation: None,
         };
         let mut legacy = must(serde_json::to_value(registry));
         let Some(object) = legacy.as_object_mut() else {
@@ -9395,6 +9608,7 @@ mod tests {
             active_generation: Some(generation),
             last_known_good_generation: None,
             pending_activation: None,
+            last_terminal_activation: None,
         };
         let mut value = must(serde_json::to_value(registry));
         let Some(object) = value.as_object_mut() else {
@@ -9446,6 +9660,26 @@ mod tests {
             &transaction.installer_plan_digest,
             "simulated pre-launch crash",
         ));
+        must(registry.stage_pending_activation(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            transaction.candidate_manifest.clone(),
+            test_handle("approval:pending"),
+        ));
+        assert!(matches!(
+            registry.pending_activation().map(|pending| &pending.state),
+            Some(PendingActivationState::RecoveryRequired { .. })
+        ));
+        assert!(matches!(
+            must(registry.claim_pending_activation(
+                &host,
+                &transaction.transaction_id,
+                &transaction.installer_plan_digest,
+                &transaction.candidate_manifest.generation,
+            ))
+            .state,
+            PendingActivationState::Pending
+        ));
         assert!(matches!(
             must(registry.claim_pending_activation(
                 &host,
@@ -9478,6 +9712,45 @@ mod tests {
             Some(&transaction.candidate_manifest.generation)
         );
         assert!(registry.last_known_good_generation().is_none());
+        let bytes = must(serde_json::to_vec(&registry));
+        let mut reloaded = must(decode_registry_bytes(&bytes));
+        must(reloaded.commit_pending_activation(
+            &host,
+            &transaction.transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest.generation,
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_mutations_reject_after_owner_release_without_state_change() {
+        let (mut registry, transaction) = pending_registry_for_owner_gate();
+        let (mut lease, capability) = live_host_capability();
+        lease
+            .release()
+            .unwrap_or_else(|error| panic!("owner release failed: {error}"));
+        assert_registry_mutations_rejected_after_owner_shutdown(
+            &mut registry,
+            &transaction,
+            &capability,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_mutations_reject_after_owner_drop_without_state_change() {
+        let (mut registry, transaction) = pending_registry_for_owner_gate();
+        let capability = {
+            let (lease, capability) = live_host_capability();
+            drop(lease);
+            capability
+        };
+        assert_registry_mutations_rejected_after_owner_shutdown(
+            &mut registry,
+            &transaction,
+            &capability,
+        );
     }
 
     #[test]
@@ -9563,7 +9836,22 @@ mod tests {
             &transaction.transaction_id,
             &transaction.installer_plan_digest,
         ));
-        assert_eq!(registry, ApprovedGenerationRegistry::new());
+        must(registry.abort_pending_activation(
+            &host,
+            &transaction.transaction_id,
+            &transaction.installer_plan_digest,
+        ));
+        let bytes = must(serde_json::to_vec(&registry));
+        let mut reloaded = must(decode_registry_bytes(&bytes));
+        must(reloaded.abort_pending_activation(
+            &host,
+            &transaction.transaction_id,
+            &transaction.installer_plan_digest,
+        ));
+        assert!(registry.generations().is_empty());
+        assert!(registry.active_generation().is_none());
+        assert!(registry.last_known_good_generation().is_none());
+        assert!(registry.pending_activation().is_none());
     }
 
     #[test]
@@ -9641,6 +9929,7 @@ mod tests {
             active_generation: Some(test_handle("generation:missing")),
             last_known_good_generation: None,
             pending_activation: None,
+            last_terminal_activation: None,
         }));
         let Err(error) = decode_registry_bytes(&must(serde_json::to_vec(&current))) else {
             panic!("current corruption must fail closed");
