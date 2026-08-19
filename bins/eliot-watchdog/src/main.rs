@@ -1,14 +1,20 @@
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use eliot_platform_windows::protected_program_data_path;
+use eliot_platform_windows::{ServiceBootstrapArguments, protected_program_data_path};
 use eliot_watchdog::{
-    FileWatchdogAdmission, IndependentKernelSensor, SERVICE_NAME, WatchdogAdmissionSource,
-    WatchdogComposition, WatchdogConfig,
+    FileWatchdogAdmission, IndependentKernelSensor, LiveHostObservationSource, SERVICE_NAME,
+    WatchdogAdmissionSource, WatchdogComposition, WatchdogConfig,
+    inspect_approved_host_registration,
 };
 
+static PROCESS_BOOTSTRAP: OnceLock<Result<Option<ServiceBootstrapArguments>, String>> =
+    OnceLock::new();
+
 fn main() {
+    let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap());
     #[cfg(windows)]
     match run_as_scm_service() {
         Ok(true) => return,
@@ -21,13 +27,19 @@ fn main() {
             std::process::exit(1);
         }
     }
-    if let Err(error) = run_watchdog(Arc::new(AtomicBool::new(false))) {
+    if let Err(error) = run_watchdog(Arc::new(AtomicBool::new(false)), None) {
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {error}");
         std::process::exit(1);
     }
 }
 
-fn run_watchdog(stop_signal: Arc<AtomicBool>) -> Result<(), String> {
+fn run_watchdog(
+    stop_signal: Arc<AtomicBool>,
+    scm_launch: Option<&eliot_watchdog::ValidatedWatchdogScmLaunch>,
+) -> Result<(), String> {
+    let bootstrap = scm_launch
+        .map(|launch| launch.bootstrap().clone())
+        .ok_or_else(|| "SCM bootstrap is required for Runtime contour selection".to_owned())?;
     let lease_path = protected_program_data_path("Eliot/host/supervision-lease.json")
         .map_err(|error| error.to_string())?;
     let admission_config_path = protected_program_data_path("Eliot/host/watchdog-admission.json")
@@ -35,27 +47,41 @@ fn run_watchdog(stop_signal: Arc<AtomicBool>) -> Result<(), String> {
     let registry_path = protected_program_data_path("Eliot/host/installation-registry.redb")
         .map_err(|error| error.to_string())?;
     // The lease is issued by the Host/Kernel contour.  There is deliberately
-    // no genesis/default lease in this process: stale or missing durable bytes
-    // fail closed before the watchdog can advertise readiness.  The source is
-    // retained by the composition and reloaded before every observation.
+    // no genesis/default lease in this process.  A stale or missing lease
+    // starts a gap-only sensor so the Watchdog can remain alive and record a
+    // bounded observation; the sensor gains heartbeat authority only after a
+    // later, freshly verified lease.  The source is retained by the
+    // composition and reloaded before every observation.
     let admission_source = Arc::new(
-        FileWatchdogAdmission::from_registry(lease_path, admission_config_path, registry_path)
-            .map_err(|error| error.to_string())?,
-    );
-    let admission = admission_source
-        .reload()
-        .map_err(|error| error.to_string())?;
-    let sensor = Arc::new(
-        IndependentKernelSensor::open_runtime_binding(
-            admission_source.runtime_binding(),
-            admission.watchdog_epoch().value(),
+        FileWatchdogAdmission::from_registry(
+            lease_path,
+            admission_config_path,
+            registry_path,
+            bootstrap,
         )
         .map_err(|error| error.to_string())?,
     );
-    let composition = WatchdogComposition::start_with_shutdown(
+    let binding = admission_source.runtime_binding();
+    inspect_approved_host_registration(binding.approved_host_image())
+        .map_err(|error| error.to_string())?;
+    let initial_admission = admission_source.reload().ok();
+    let sensor = Arc::new(
+        match initial_admission {
+            Some(admission) => IndependentKernelSensor::open_runtime_binding(
+                binding.clone(),
+                admission.watchdog_epoch().value(),
+            ),
+            None => IndependentKernelSensor::open_runtime_binding_without_epoch(binding.clone()),
+        }
+        .map_err(|error| error.to_string())?,
+    );
+    let composition = WatchdogComposition::start_with_shutdown_and_host(
         WatchdogConfig::default(),
         admission_source,
         sensor,
+        Arc::new(LiveHostObservationSource::try_new(
+            binding.approved_host_image().to_owned(),
+        )),
         stop_signal,
     )
     .map_err(|error| error.to_string())?;
@@ -118,7 +144,10 @@ fn run_as_scm_service() -> Result<bool, u32> {
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn watchdog_service_main(_argc: u32, _argv: *mut *mut u16) {
+unsafe extern "system" fn watchdog_service_main(
+    service_arg_count: u32,
+    service_arg_vector: *mut *mut u16,
+) {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::GetLastError;
@@ -140,12 +169,88 @@ unsafe extern "system" fn watchdog_service_main(_argc: u32, _argv: *mut *mut u16
     }
     SERVICE_STATUS_HANDLE.store(handle as isize, Ordering::Release);
     publish_service_status(handle, SERVICE_START_PENDING, 0, 0, 1, 10_000);
+    let validated_launch =
+        match unsafe { service_launch_options(service_arg_count, service_arg_vector) }
+            .and_then(|()| validate_registered_process_bootstrap())
+        {
+            Ok(launch) => launch,
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "{SERVICE_NAME}: invalid SCM launch argv or registration: {error}"
+                );
+                publish_service_status(handle, SERVICE_STOPPED, 0, 1, 0, 0);
+                return;
+            }
+        };
     let stop_signal = Arc::new(AtomicBool::new(false));
     let _ = SERVICE_STOP_REQUESTED.set(stop_signal.clone());
-    if let Err(error) = run_watchdog(stop_signal) {
+    if let Err(error) = run_watchdog(stop_signal, Some(&validated_launch)) {
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {error}");
         publish_service_status(handle, SERVICE_STOPPED, 0, 1, 0, 0);
     }
+}
+
+fn parse_process_bootstrap() -> Result<Option<ServiceBootstrapArguments>, String> {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        return Ok(None);
+    }
+    eliot_watchdog::parse_watchdog_process_argv(args)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn validate_registered_process_bootstrap()
+-> Result<eliot_watchdog::ValidatedWatchdogScmLaunch, eliot_watchdog::WatchdogScmLaunchError> {
+    match PROCESS_BOOTSTRAP.get() {
+        Some(Ok(Some(bootstrap))) => eliot_watchdog::validate_watchdog_scm_bootstrap(bootstrap),
+        Some(Ok(None)) => Err(eliot_watchdog::WatchdogScmLaunchError::InvalidArgv(
+            "SCM process command line omitted the canonical bootstrap".to_owned(),
+        )),
+        Some(Err(error)) => Err(eliot_watchdog::WatchdogScmLaunchError::InvalidArgv(
+            error.clone(),
+        )),
+        None => Err(eliot_watchdog::WatchdogScmLaunchError::InvalidArgv(
+            "SCM process bootstrap was not captured before dispatch".to_owned(),
+        )),
+    }
+}
+
+#[cfg(windows)]
+unsafe fn service_launch_options(
+    service_arg_count: u32,
+    service_arg_vector: *mut *mut u16,
+) -> Result<(), eliot_watchdog::WatchdogScmLaunchError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    const MAX_SERVICE_ARG_UNITS: usize = 64 * 1024;
+
+    if service_arg_vector.is_null() || service_arg_count != 1 {
+        return Err(eliot_watchdog::WatchdogScmLaunchError::InvalidArgv(
+            "ServiceMain argv must contain only the canonical service name".to_owned(),
+        ));
+    }
+    let raw = unsafe {
+        std::slice::from_raw_parts(service_arg_vector.cast_const(), service_arg_count as usize)
+    };
+    let pointer = raw[0];
+    if pointer.is_null() {
+        return Err(eliot_watchdog::WatchdogScmLaunchError::InvalidArgv(
+            "SCM provided a null service argv value".to_owned(),
+        ));
+    }
+    let mut length = 0usize;
+    while length < MAX_SERVICE_ARG_UNITS && unsafe { *pointer.add(length) } != 0 {
+        length += 1;
+    }
+    if length == MAX_SERVICE_ARG_UNITS {
+        return Err(eliot_watchdog::WatchdogScmLaunchError::InvalidArgv(
+            "SCM argv value is too long".to_owned(),
+        ));
+    }
+    let value = unsafe { std::slice::from_raw_parts(pointer.cast_const(), length) };
+    eliot_watchdog::validate_watchdog_service_main_argv([OsString::from_wide(value)])
 }
 
 #[cfg(windows)]
