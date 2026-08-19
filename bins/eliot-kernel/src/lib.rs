@@ -1260,6 +1260,41 @@ impl ProcessExecutionGateway {
         self.executor.inspect(operation_id).await
     }
 
+    #[cfg(windows)]
+    async fn inspect_exact_running_receipt(
+        &self,
+        receipt: &ProcessStartReceipt,
+    ) -> Result<(), ProcessExecutionError> {
+        receipt.validate()?;
+        let record = self
+            .replay_store
+            .load_process_start(receipt.operation_id())
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
+            .ok_or(ProcessExecutionError::NotFound)?;
+        if record.state != ProcessExecutionReplayState::Completed
+            || record.receipt.as_ref() != Some(receipt)
+        {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        let view = match self
+            .inspect(&record.owner, receipt.operation_id().clone())
+            .await
+        {
+            Ok(view) => view,
+            Err(ProcessExecutionError::NotFound | ProcessExecutionError::UnknownOutcome) => {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            Err(error) => return Err(error),
+        };
+        if view.lifecycle() != ProcessLifecycle::Running
+            || view.binding() != receipt.binding()
+            || view.identity() != Some(receipt.identity())
+        {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        Ok(())
+    }
+
     async fn cancel(
         &self,
         owner: &ProcessOwnerBinding,
@@ -3295,15 +3330,13 @@ impl KernelComposition {
                 {
                     return Err(TransportError::SessionFenced);
                 }
+                #[cfg(windows)]
+                self.validate_authenticated_daemon_ready()
+                    .await
+                    .map_err(|_| TransportError::SessionFenced)?;
                 self.mark_daemon_ready()
                     .map_err(|_| TransportError::SessionFenced)
-                    .map(|()| {
-                        serde_json::json!({
-                            "status": "known",
-                            "value": { "accepted": true },
-                            "recovery": null,
-                        })
-                    })
+                    .map(|()| Self::accepted_daemon_response())
             }
             "health" => self
                 .daemon_health()
@@ -3329,13 +3362,7 @@ impl KernelComposition {
                     .to_owned();
                 self.mark_daemon_degraded(reason)
                     .map_err(|_| TransportError::SessionFenced)
-                    .map(|()| {
-                        serde_json::json!({
-                            "status": "known",
-                            "value": { "accepted": true },
-                            "recovery": null,
-                        })
-                    })
+                    .map(|()| Self::accepted_daemon_response())
             }
             "daemon_fatal" => {
                 let reason = payload
@@ -3350,13 +3377,7 @@ impl KernelComposition {
                     .to_owned();
                 self.mark_daemon_failed(reason)
                     .map_err(|_| TransportError::SessionFenced)
-                    .map(|()| {
-                        serde_json::json!({
-                            "status": "known",
-                            "value": { "accepted": true },
-                            "recovery": null,
-                        })
-                    })
+                    .map(|()| Self::accepted_daemon_response())
             }
             _ => return Err(TransportError::SessionFenced),
         };
@@ -3365,6 +3386,14 @@ impl KernelComposition {
         frame.request_id = Some(request_id);
         frame.validate()?;
         Ok(frame)
+    }
+
+    fn accepted_daemon_response() -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": { "accepted": true },
+            "recovery": null,
+        })
     }
 
     fn daemon_snapshot(&self) -> Result<serde_json::Value, TransportError> {
@@ -3628,6 +3657,88 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    async fn validate_authenticated_daemon_ready(&self) -> Result<(), KernelServiceError> {
+        let Some(launch) = self.daemon_launch.as_ref() else {
+            return Ok(());
+        };
+        let receipt = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?
+            .receipt
+            .clone()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        self.validate_daemon_process_readiness(launch, &receipt)
+            .await
+    }
+
+    #[cfg(windows)]
+    async fn validate_daemon_process_readiness(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        receipt: &ProcessStartReceipt,
+    ) -> Result<(), KernelServiceError> {
+        let Some(gateway) = self.process_gateway.as_ref() else {
+            let _ = self
+                .mark_daemon_failed("eliotd physical process authority is unavailable".to_owned());
+            return Err(KernelServiceError::ReadinessNotProven);
+        };
+        if gateway
+            .inspect_exact_running_receipt(receipt)
+            .await
+            .is_err()
+        {
+            let _ = self
+                .mark_daemon_failed("eliotd physical process is not freshly Running".to_owned());
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+
+        let generation = Generation::new(launch.generation.value()).map_err(|_| {
+            let _ = self.mark_daemon_failed("eliotd launch generation is invalid".to_owned());
+            KernelServiceError::ReadinessNotProven
+        })?;
+        let kernel_process = observe_named_pipe_peer_process(std::process::id()).map_err(|_| {
+            let _ = self.mark_daemon_failed(
+                "Kernel physical identity is unavailable for eliotd readiness".to_owned(),
+            );
+            KernelServiceError::ReadinessNotProven
+        })?;
+        let launch_identity = eliotd_launch_attempt_identity(
+            launch,
+            kernel_process.process_id(),
+            kernel_process.start_time_100ns(),
+            kernel_process.image_path(),
+        )
+        .map_err(|_| {
+            let _ = self.mark_daemon_failed("eliotd launch attempt identity is invalid".to_owned());
+            KernelServiceError::ReadinessNotProven
+        })?;
+        let expected_operation =
+            eliotd_operation_id(generation, &launch_identity).map_err(|_| {
+                let _ = self
+                    .mark_daemon_failed("eliotd launch operation identity is invalid".to_owned());
+                KernelServiceError::ReadinessNotProven
+            })?;
+        let physical = receipt.identity().physical();
+        if receipt.operation_id() != &expected_operation
+            || receipt.accepted_generation().get() != launch.generation.value()
+            || receipt.binding().state_fence().authority_epoch() != launch.authority_epoch.value()
+            || receipt.binding().state_fence().generation() != generation
+            || receipt.identity().executable_sha256() != launch.executable_sha256
+            || !physical
+                .image_path()
+                .eq_ignore_ascii_case(launch.executable.as_str())
+        {
+            let _ = self.mark_daemon_failed(
+                "eliotd physical process binding does not match the approved launch contour"
+                    .to_owned(),
+            );
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
         reason = "ordered live process, Job, authority, configuration, and Store proof remains explicit"
@@ -3728,22 +3839,25 @@ impl KernelComposition {
                 field: "store_state_fence",
             });
         }
-        let daemon_evidence = if self.daemon_launch.is_some() {
-            let daemon_state = self.daemon_runtime.lock().map_err(|_| {
-                KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
-            })?;
-            let daemon_receipt = daemon_state
-                .receipt
-                .as_ref()
-                .filter(|_| daemon_status_proves_ready(&daemon_state.status))
-                .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let daemon_evidence = if let Some(launch) = self.daemon_launch.as_ref() {
+            let daemon_receipt = {
+                let daemon_state = self.daemon_runtime.lock().map_err(|_| {
+                    KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
+                })?;
+                daemon_state
+                    .receipt
+                    .as_ref()
+                    .filter(|_| daemon_status_proves_ready(&daemon_state.status))
+                    .cloned()
+                    .ok_or(KernelServiceError::ReadinessNotProven)?
+            };
+            self.validate_daemon_process_readiness(launch, &daemon_receipt)
+                .await?;
             Some(
                 PlatformHandle::new(format!(
                     "eliotd-ready:{}:{}",
                     daemon_receipt.identity().pid(),
-                    self.daemon_launch
-                        .as_ref()
-                        .map_or("", |launch| launch.descriptor_sha256.as_str()),
+                    launch.descriptor_sha256.as_str(),
                 ))
                 .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
             )
@@ -5939,6 +6053,112 @@ mod tests {
             .expect("shutdown restarted Kernel executor");
         drop(old_gateway);
         drop(restarted_gateway);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn daemon_readiness_requires_fresh_running_executor_receipt() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-daemon-readiness-executor-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        std::fs::create_dir_all(root.join("kernel")).expect("kernel work root");
+        let executable = std::env::current_exe().expect("test executable");
+        let executable_sha256 =
+            sha256_hex(&std::fs::read(&executable).expect("read test executable"));
+        let containment_root = executable.parent().expect("test executable parent");
+        let mut launch = test_daemon_launch(&root);
+        launch.executable =
+            PlatformHandle::new(executable.to_string_lossy()).expect("test executable handle");
+        launch.executable_sha256.clone_from(&executable_sha256);
+        launch.working_directory = PlatformHandle::new(containment_root.to_string_lossy())
+            .expect("working directory handle");
+        launch.arguments[7] =
+            PlatformHandle::new(launch.executable_sha256.clone()).expect("executable digest");
+        launch.descriptor_sha256.clear();
+        launch = launch.with_computed_digest().expect("test launch digest");
+        let mut kernel = KernelComposition::new(
+            KernelConfig::new(root.join("kernel"))
+                .with_daemon_launch(launch.clone())
+                .with_kernel_artifact_sha256("c".repeat(64)),
+        )
+        .expect("kernel composition");
+        let kernel_process =
+            observe_named_pipe_peer_process(std::process::id()).expect("Kernel process identity");
+        let generation = Generation::new(launch.generation.value()).expect("generation");
+        let attempt = eliotd_launch_attempt_identity(
+            &launch,
+            kernel_process.process_id(),
+            kernel_process.start_time_100ns(),
+            kernel_process.image_path(),
+        )
+        .expect("launch attempt identity");
+        let operation = eliotd_operation_id(generation, &attempt).expect("operation identity");
+        let admission = real_executor_admission(
+            &executable,
+            &executable_sha256,
+            operation.as_str(),
+            "tests::real_executor_receipt_child",
+            BTreeMap::from([(REAL_EXECUTOR_CHILD_ENV.to_owned(), "1".to_owned())]),
+        );
+        let (gateway, platform, authority) =
+            real_process_gateway(&root.join("real-executor"), containment_root);
+        let gateway = Arc::new(gateway);
+        let owner = gateway_test_owner();
+        let receipt =
+            start_real_executor_child(&gateway, &platform, &authority, &admission, &owner).await;
+        assert_eq!(receipt.operation_id(), &operation);
+        gateway
+            .persist_completed(
+                receipt.operation_id(),
+                &process_admission_digest(&admission).expect("admission digest"),
+                &owner,
+                receipt.clone(),
+            )
+            .expect("persist live completion");
+        kernel.process_gateway = Some(Arc::clone(&gateway));
+        {
+            let mut state = kernel.daemon_runtime.lock().expect("daemon runtime lock");
+            state.status = DaemonRuntimeStatus::Ready;
+            state.receipt = Some(receipt.clone());
+        }
+
+        let inspection = gateway.inspect_exact_running_receipt(&receipt).await;
+        assert!(
+            inspection.is_ok(),
+            "gateway exact inspection must accept the live receipt: {inspection:?}"
+        );
+        kernel
+            .validate_daemon_process_readiness(&launch, &receipt)
+            .await
+            .expect("live exact process accepted");
+        assert!(kernel.daemon_ready());
+
+        gateway
+            .executor
+            .shutdown()
+            .expect("terminate executor child");
+        assert!(
+            kernel
+                .validate_daemon_process_readiness(&launch, &receipt)
+                .await
+                .is_err(),
+            "terminal executor inspection must reject readiness"
+        );
+        assert!(!kernel.daemon_ready());
+        assert!(matches!(
+            kernel
+                .daemon_runtime
+                .lock()
+                .expect("daemon runtime lock")
+                .status,
+            DaemonRuntimeStatus::Failed(_)
+        ));
+        drop(gateway);
+        drop(kernel);
         let _ = std::fs::remove_dir_all(root);
     }
 
