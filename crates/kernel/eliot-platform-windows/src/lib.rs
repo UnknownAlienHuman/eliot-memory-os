@@ -176,15 +176,114 @@ impl std::error::Error for ProtectedPathError {}
 /// Returns an error when the root is absent, relative, cannot be canonicalized,
 /// or contains a reparse point.
 pub fn protected_program_data_root() -> Result<PathBuf, ProtectedPathError> {
-    let raw = std::env::var_os("ProgramData").ok_or(ProtectedPathError::InvalidRoot)?;
-    let raw = PathBuf::from(raw);
-    if !raw.is_absolute() {
-        return Err(ProtectedPathError::InvalidRoot);
-    }
+    let raw = known_folder_path(KnownFolder::ProgramData)?;
     reject_reparse_chain(&raw, true)?;
-    let canonical = std::fs::canonicalize(&raw).map_err(|_| ProtectedPathError::Io)?;
+    let canonical = canonical_windows_path(&raw)?;
     validate_directory_no_reparse(&canonical)?;
     Ok(canonical)
+}
+
+/// Resolves the current user's canonical LocalAppData root without applying an
+/// ACL or accepting a caller-authored fallback.
+pub fn current_user_local_app_data_root() -> Result<PathBuf, ProtectedPathError> {
+    let raw = known_folder_path(KnownFolder::LocalAppData)?;
+    reject_reparse_chain(&raw, true)?;
+    let canonical = canonical_windows_path(&raw)?;
+    validate_directory_no_reparse(&canonical)?;
+    Ok(canonical)
+}
+
+#[derive(Clone, Copy)]
+enum KnownFolder {
+    ProgramData,
+    LocalAppData,
+}
+
+#[cfg(windows)]
+fn known_folder_path(folder: KnownFolder) -> Result<PathBuf, ProtectedPathError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::S_OK;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_LocalAppData, FOLDERID_ProgramData, SHGetKnownFolderPath,
+    };
+
+    let folder_id = match folder {
+        KnownFolder::ProgramData => &FOLDERID_ProgramData,
+        KnownFolder::LocalAppData => &FOLDERID_LocalAppData,
+    };
+    let mut path = std::ptr::null_mut();
+    let status = unsafe {
+        // SAFETY: the folder id is static, null token selects the process user,
+        // and `path` receives task-allocator memory released below.
+        SHGetKnownFolderPath(folder_id, 0, std::ptr::null_mut(), &raw mut path)
+    };
+    if status != S_OK || path.is_null() {
+        unsafe {
+            // SAFETY: CoTaskMemFree accepts null and any pointer returned by the API.
+            CoTaskMemFree(path.cast());
+        }
+        return Err(ProtectedPathError::InvalidRoot);
+    }
+    let mut length = 0_usize;
+    while length <= 32_767 {
+        let terminated = unsafe {
+            // SAFETY: SHGetKnownFolderPath returned a NUL-terminated Windows path.
+            *path.add(length) == 0
+        };
+        if terminated {
+            break;
+        }
+        length += 1;
+    }
+    if length > 32_767 {
+        unsafe {
+            // SAFETY: `path` is still the task-allocator pointer returned above.
+            CoTaskMemFree(path.cast());
+        }
+        return Err(ProtectedPathError::InvalidRoot);
+    }
+    let value = unsafe {
+        // SAFETY: `length` was bounded by scanning the API-owned NUL-terminated buffer.
+        OsString::from_wide(std::slice::from_raw_parts(path, length))
+    };
+    unsafe {
+        // SAFETY: `path` is released exactly once after its contents are copied.
+        CoTaskMemFree(path.cast());
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(ProtectedPathError::InvalidRoot);
+    }
+    Ok(path)
+}
+
+#[cfg(not(windows))]
+fn known_folder_path(_folder: KnownFolder) -> Result<PathBuf, ProtectedPathError> {
+    Err(ProtectedPathError::UnsupportedPlatform)
+}
+
+/// Canonicalizes one existing path and converts Windows' internal verbatim
+/// result into the DOS/UNC form admitted at provider-neutral contract seams.
+///
+/// This conversion applies only after the OS resolves an existing path. It
+/// does not make a caller-supplied device or verbatim path contract-valid.
+///
+/// # Errors
+///
+/// Returns an error when canonicalization fails or the OS result is not an
+/// absolute DOS/UNC path.
+pub fn canonical_windows_path(path: &Path) -> Result<PathBuf, ProtectedPathError> {
+    let canonical = std::fs::canonicalize(path).map_err(|_| ProtectedPathError::Io)?;
+    #[cfg(windows)]
+    {
+        normalize_final_windows_path_text(&canonical.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(canonical)
+    }
 }
 
 /// Resolves a fixed relative path below the canonical `ProgramData` root.
@@ -255,6 +354,108 @@ pub struct ProtectedPathLease {
     file: std::fs::File,
 }
 
+/// Retained read-only lease for one existing directory below the OS-resolved
+/// ProgramData contour.
+///
+/// Unlike [`ProtectedPathLease`], acquisition never creates a sentinel and
+/// never writes an ACL. Root creation and ACL application remain explicit
+/// installation transaction effects.
+pub struct ProtectedRootLease {
+    path: PathBuf,
+    identity: FileIdentity,
+    #[cfg(windows)]
+    directories: Vec<std::fs::File>,
+}
+
+impl std::fmt::Debug for ProtectedRootLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProtectedRootLease")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProtectedRootLease {
+    /// Opens an existing absolute ProgramData descendant and retains a
+    /// no-follow, no-delete-sharing handle for its complete directory contour.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path escapes ProgramData, contains a reparse
+    /// point, is not an existing directory, or cannot be retained read-only.
+    pub fn open_existing(path: &Path) -> Result<Self, ProtectedPathError> {
+        let root = expected_root()?;
+        ensure_protected_containment(&root, path)?;
+        let canonical = canonical_windows_path(path)?;
+        ensure_protected_containment(&root, &canonical)?;
+        let relative = canonical
+            .strip_prefix(&root)
+            .map_err(|_| ProtectedPathError::InvalidPath)?;
+        #[cfg(windows)]
+        {
+            let directories = pin_protected_directory_contour(&root, relative)?;
+            let retained = directories.last().ok_or(ProtectedPathError::InvalidPath)?;
+            let identity =
+                file_identity_from_handle(retained).map_err(|_| ProtectedPathError::Io)?;
+            Ok(Self {
+                path: canonical,
+                identity,
+                directories,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = relative;
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns the OS-resolved DOS/UNC directory path.
+    pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            final_windows_path_from_handle(
+                self.directories
+                    .last()
+                    .ok_or(ProtectedPathError::InvalidPath)?,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns the retained directory-object identity.
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Re-reads identity from the retained directory handle.
+    pub fn verify_stable_identity(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let retained = self
+                .directories
+                .last()
+                .ok_or(ProtectedPathError::InvalidPath)?;
+            let identity =
+                file_identity_from_handle(retained).map_err(|_| ProtectedPathError::Io)?;
+            if identity != self.identity {
+                return Err(ProtectedPathError::Io);
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+}
+
 impl std::fmt::Debug for ProtectedPathLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -298,7 +499,7 @@ impl ProtectedPathLease {
     pub fn open_existing_absolute(path: &Path) -> Result<Self, ProtectedPathError> {
         let root = expected_root()?;
         ensure_protected_containment(&root, path)?;
-        let canonical = std::fs::canonicalize(path).map_err(|_| ProtectedPathError::Io)?;
+        let canonical = canonical_windows_path(path)?;
         ensure_protected_containment(&root, &canonical)?;
         let relative = canonical
             .strip_prefix(&root)
@@ -316,6 +517,19 @@ impl ProtectedPathLease {
     #[must_use]
     pub const fn identity(&self) -> FileIdentity {
         self.identity
+    }
+
+    /// Returns the DOS/UNC path resolved from the retained handle. Windows
+    /// verbatim prefixes are removed before the path crosses the contract seam.
+    pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            final_windows_path_from_handle(&self.file)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
     }
 
     /// Re-reads the identity from the retained handle and rejects any
@@ -458,6 +672,106 @@ pub struct UserOwnedRootLease {
     handle: std::fs::File,
 }
 
+/// Read-only retained lease for an already-provisioned current-user root.
+///
+/// Acquisition verifies the current process SID as owner and requires the
+/// exact protected user-root DACL, but never requests `WRITE_DAC` or changes
+/// security state. Provisioning remains an explicit installer effect.
+pub struct UserOwnedRootReadLease {
+    path: PathBuf,
+    identity: FileIdentity,
+    sid: String,
+    #[cfg(windows)]
+    handle: std::fs::File,
+}
+
+impl std::fmt::Debug for UserOwnedRootReadLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UserOwnedRootReadLease")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .field("sid", &self.sid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UserOwnedRootReadLease {
+    /// Opens and verifies one existing current-user directory without changing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing/relative/reparse root, a different owner,
+    /// a non-protected or unexpected DACL, or an unavailable retained handle.
+    pub fn open_existing(root: &Path) -> Result<Self, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let declared = validate_user_owned_root(root)?;
+            let path = canonical_windows_path(&declared)?;
+            if !path.is_absolute() {
+                return Err(ProtectedPathError::InvalidRoot);
+            }
+            reject_reparse_chain(&path, true)?;
+            let sid = current_process_sid()?;
+            let handle = open_user_owned_directory_read_only(&path, &sid)?;
+            let identity =
+                file_identity_from_handle(&handle).map_err(|_| ProtectedPathError::Io)?;
+            Ok(Self {
+                path,
+                identity,
+                sid,
+                handle,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = root;
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns the current process SID verified as directory owner.
+    #[must_use]
+    pub fn current_user_sid(&self) -> &str {
+        &self.sid
+    }
+
+    /// Returns the retained directory-object identity.
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Returns the canonical DOS/UNC path from the retained handle.
+    pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            final_windows_path_from_handle(&self.handle)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Re-checks the retained directory identity without reopening by path.
+    pub fn verify_stable_identity(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let identity =
+                file_identity_from_handle(&self.handle).map_err(|_| ProtectedPathError::Io)?;
+            if identity != self.identity {
+                return Err(ProtectedPathError::Io);
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+}
+
 impl std::fmt::Debug for UserOwnedRootLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -518,6 +832,18 @@ impl UserOwnedRootLease {
     #[must_use]
     pub const fn identity(&self) -> FileIdentity {
         self.identity
+    }
+
+    /// Returns the canonical DOS/UNC root path from the retained directory handle.
+    pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            final_windows_path_from_handle(&self.handle)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
     }
 
     /// Re-checks that the retained root handle still names the same object.
@@ -778,6 +1104,30 @@ fn open_user_owned_directory(path: &Path, sid: &str) -> Result<std::fs::File, Pr
 }
 
 #[cfg(windows)]
+fn open_user_owned_directory_read_only(
+    path: &Path,
+    sid: &str,
+) -> Result<std::fs::File, ProtectedPathError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    options.access_mode(FILE_GENERIC_READ);
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProtectedPathError::ReparsePoint);
+    }
+    verify_user_owned_opened_handle_read_only(&file, sid)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
 fn open_user_owned_directory_contour(
     root: &Path,
     relative: &Path,
@@ -967,6 +1317,21 @@ fn open_directory_contour(
             Err(error) => return Err(error),
         };
         directories.push(directory);
+    }
+    Ok(directories)
+}
+
+#[cfg(windows)]
+fn pin_protected_directory_contour(
+    root: &Path,
+    relative: &Path,
+) -> Result<Vec<std::fs::File>, ProtectedPathError> {
+    let components = protected_components(relative)?;
+    let mut current = root.to_path_buf();
+    let mut directories = vec![pin_directory(root).map_err(|_| ProtectedPathError::Io)?];
+    for component in components {
+        current.push(component);
+        directories.push(pin_directory(&current).map_err(|_| ProtectedPathError::Io)?);
     }
     Ok(directories)
 }
@@ -1211,6 +1576,94 @@ fn protect_user_owned_opened_handle(
     };
     unsafe { LocalFree(descriptor.cast()) };
     if !dacl_matches || !protected {
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_user_owned_opened_handle_read_only(
+    file: &std::fs::File,
+    sid: &str,
+) -> Result<(), ProtectedPathError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    };
+
+    if !valid_sid_text(sid) {
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    let expected = OwnedSecurityDescriptor::for_user_owned_storage(sid, true)
+        .map_err(|_| ProtectedPathError::AclMismatch)?;
+    let expected_dacl = expected
+        .dacl()
+        .map_err(|_| ProtectedPathError::AclMismatch)?;
+    let security = OWNER_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | PROTECTED_DACL_SECURITY_INFORMATION;
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        // SAFETY: the retained handle is live and every output points to a valid local.
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            security,
+            &raw mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() || owner.is_null() {
+        if !descriptor.is_null() {
+            unsafe {
+                // SAFETY: descriptor was allocated by GetSecurityInfo.
+                LocalFree(descriptor.cast());
+            }
+        }
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    let owner_matches = sid_to_string(owner).is_ok_and(|observed| observed == sid);
+    let mut present = 0;
+    let mut actual_dacl = std::ptr::null_mut();
+    let mut defaulted = 0;
+    let dacl_matches = unsafe {
+        // SAFETY: descriptor and expected DACL remain live for these bounded reads.
+        windows_sys::Win32::Security::GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut present,
+            &raw mut actual_dacl,
+            &raw mut defaulted,
+        ) != 0
+            && present != 0
+            && !actual_dacl.is_null()
+            && (*actual_dacl).AclSize == (*expected_dacl).AclSize
+            && std::slice::from_raw_parts(
+                actual_dacl.cast::<u8>(),
+                usize::from((*actual_dacl).AclSize),
+            ) == std::slice::from_raw_parts(
+                expected_dacl.cast::<u8>(),
+                usize::from((*expected_dacl).AclSize),
+            )
+    };
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    let protected = unsafe {
+        // SAFETY: descriptor is live and control/revision outputs are valid locals.
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0
+    };
+    unsafe {
+        // SAFETY: descriptor is released exactly once after all reads complete.
+        LocalFree(descriptor.cast());
+    }
+    if !owner_matches || !dacl_matches || !protected {
         return Err(ProtectedPathError::AclMismatch);
     }
     Ok(())
@@ -6325,11 +6778,13 @@ const ACTIVATION_NONCE_PREFIX: &str = "eliot-activation-";
 const ACTIVATION_NONCE_RANDOM_BYTES: usize = 32;
 const ACTIVATION_NONCE_HEX_BYTES: usize = ACTIVATION_NONCE_RANDOM_BYTES * 2;
 
-/// Issues one fresh Host-owned activation nonce from the Windows system RNG.
+/// Issues fresh OS-random material exclusively for Kernel activation.
 ///
 /// The nonce deliberately has no lineage, time, process, or other caller
 /// input.  Any `BCrypt` failure is terminal for this issuance attempt; callers
-/// must not substitute a deterministic or weak fallback.
+/// must not substitute a deterministic or weak fallback. Composition must wrap
+/// the returned handle in the canonical `eliot_platform::KernelActivationNonce`
+/// and must never substitute a Host installation-epoch nonce.
 ///
 /// # Errors
 ///
@@ -6337,7 +6792,7 @@ const ACTIVATION_NONCE_HEX_BYTES: usize = ACTIVATION_NONCE_RANDOM_BYTES * 2;
 /// request, or [`WindowsAdapterError::InvalidInput`] if the resulting handle
 /// cannot satisfy the bounded nonce shape.
 #[cfg(windows)]
-pub fn fresh_activation_nonce() -> Result<PlatformHandle, WindowsAdapterError> {
+pub fn fresh_activation_nonce_material() -> Result<PlatformHandle, WindowsAdapterError> {
     use windows_sys::Win32::Security::Cryptography::{
         BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
     };
@@ -6357,18 +6812,16 @@ pub fn fresh_activation_nonce() -> Result<PlatformHandle, WindowsAdapterError> {
         return Err(WindowsAdapterError::Failed);
     }
 
-    let mut value =
-        String::with_capacity(ACTIVATION_NONCE_PREFIX.len() + ACTIVATION_NONCE_HEX_BYTES);
-    value.push_str(ACTIVATION_NONCE_PREFIX);
+    let mut value = String::with_capacity(ACTIVATION_NONCE_HEX_BYTES);
     for byte in random {
         use std::fmt::Write;
         write!(&mut value, "{byte:02x}").map_err(|_| WindowsAdapterError::Failed)?;
     }
 
     let handle = PlatformHandle::new(value).map_err(|_| WindowsAdapterError::InvalidInput)?;
-    if !handle.as_str().starts_with(ACTIVATION_NONCE_PREFIX)
-        || handle.as_str().len() != ACTIVATION_NONCE_PREFIX.len() + ACTIVATION_NONCE_HEX_BYTES
-        || !handle.as_str()[ACTIVATION_NONCE_PREFIX.len()..]
+    if handle.as_str().len() != ACTIVATION_NONCE_HEX_BYTES
+        || !handle
+            .as_str()
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
@@ -6378,7 +6831,64 @@ pub fn fresh_activation_nonce() -> Result<PlatformHandle, WindowsAdapterError> {
 }
 
 #[cfg(not(windows))]
+pub fn fresh_activation_nonce_material() -> Result<PlatformHandle, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
+/// Compatibility wrapper retaining the historical prefixed handle shape.
+/// New Kernel activation code must wrap [`fresh_activation_nonce_material`]
+/// directly in the canonical provider-neutral nonce type.
 pub fn fresh_activation_nonce() -> Result<PlatformHandle, WindowsAdapterError> {
+    let material = fresh_activation_nonce_material()?;
+    PlatformHandle::new(format!("{ACTIVATION_NONCE_PREFIX}{}", material.as_str()))
+        .map_err(|_| WindowsAdapterError::InvalidInput)
+}
+
+/// Observes bytes available to the caller on the volume containing `path`.
+///
+/// This is an observation only. Policy thresholds remain owned by the
+/// installation contract, and every error must be treated as an unknown
+/// outcome rather than as sufficient free space.
+///
+/// # Errors
+///
+/// Returns [`WindowsAdapterError::InvalidInput`] for a relative path and a
+/// classified adapter error when Windows cannot observe the volume.
+#[cfg(windows)]
+pub fn observe_volume_free_space(path: &Path) -> Result<u64, WindowsAdapterError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    if !path.is_absolute() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut available = 0_u64;
+    let result = unsafe {
+        // SAFETY: `path` is NUL-terminated and `available` is a live writable
+        // `u64`; the unused output pointers are explicitly null.
+        GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &raw mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    Ok(available)
+}
+
+#[cfg(not(windows))]
+pub fn observe_volume_free_space(path: &Path) -> Result<u64, WindowsAdapterError> {
+    if !path.is_absolute() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
     Err(WindowsAdapterError::Unavailable)
 }
 
@@ -6563,6 +7073,57 @@ fn flush_directory(pins: &[std::fs::File]) {
 
 #[cfg(not(windows))]
 fn flush_directory(_pins: &[std::fs::File]) {}
+
+#[cfg(windows)]
+fn final_windows_path_from_handle(file: &std::fs::File) -> Result<PathBuf, ProtectedPathError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    let handle = file.as_raw_handle().cast();
+    let required = unsafe {
+        // SAFETY: query call uses a live retained handle and no output buffer.
+        GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0)
+    };
+    if required == 0 {
+        return Err(ProtectedPathError::Io);
+    }
+    let mut buffer =
+        vec![0_u16; usize::try_from(required).map_err(|_| ProtectedPathError::Io)? + 1];
+    let written = unsafe {
+        // SAFETY: buffer is writable for the declared length and handle remains live.
+        GetFinalPathNameByHandleW(
+            handle,
+            buffer.as_mut_ptr(),
+            u32::try_from(buffer.len()).map_err(|_| ProtectedPathError::Io)?,
+            0,
+        )
+    };
+    if written == 0 || usize::try_from(written).map_err(|_| ProtectedPathError::Io)? >= buffer.len()
+    {
+        return Err(ProtectedPathError::Io);
+    }
+    let path = String::from_utf16(
+        &buffer[..usize::try_from(written).map_err(|_| ProtectedPathError::Io)?],
+    )
+    .map_err(|_| ProtectedPathError::InvalidPath)?;
+    normalize_final_windows_path_text(&path)
+}
+
+#[cfg(windows)]
+fn normalize_final_windows_path_text(path: &str) -> Result<PathBuf, ProtectedPathError> {
+    let normalized = if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(dos) = path.strip_prefix(r"\\?\") {
+        dos.to_owned()
+    } else {
+        path.to_owned()
+    };
+    let normalized = PathBuf::from(normalized);
+    if !normalized.is_absolute() {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    Ok(normalized)
+}
 
 #[cfg(windows)]
 fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
@@ -7874,6 +8435,51 @@ mod tests {
         })
     }
 
+    #[cfg(windows)]
+    fn directory_security_descriptor_bytes(path: &Path) -> Vec<u8> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorLength, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        };
+
+        let handle = pin_directory(path).unwrap_or_else(|error| panic!("directory open: {error}"));
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let status = unsafe {
+            // SAFETY: retained handle is live and descriptor output is a valid local.
+            GetSecurityInfo(
+                handle.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        assert!(!descriptor.is_null());
+        let length = unsafe {
+            // SAFETY: descriptor was returned by GetSecurityInfo and is live.
+            GetSecurityDescriptorLength(descriptor)
+        };
+        let length = usize::try_from(length).unwrap_or_else(|_| unreachable!());
+        let bytes = unsafe {
+            // SAFETY: the reported descriptor length bounds this copied slice.
+            std::slice::from_raw_parts(descriptor.cast::<u8>(), length).to_vec()
+        };
+        unsafe {
+            // SAFETY: descriptor is released exactly once after copying.
+            LocalFree(descriptor.cast());
+        }
+        bytes
+    }
+
     #[test]
     fn rejects_relative_and_reparse_roots() {
         assert!(validate_root(Path::new("relative")).is_err());
@@ -7886,7 +8492,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn activation_nonce_has_bounded_lowercase_hex_shape() {
+    fn activation_nonce_has_256_bit_lowercase_hex_shape() {
         let nonce =
             fresh_activation_nonce().unwrap_or_else(|error| panic!("nonce failed: {error}"));
         let value = nonce.as_str();
@@ -7895,10 +8501,88 @@ mod tests {
             value.len(),
             ACTIVATION_NONCE_PREFIX.len() + ACTIVATION_NONCE_HEX_BYTES
         );
+        assert_eq!(ACTIVATION_NONCE_RANDOM_BYTES * 8, 256);
         assert!(
             value[ACTIVATION_NONCE_PREFIX.len()..]
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn activation_nonce_material_is_exact_canonical_64_hex() {
+        let first = fresh_activation_nonce_material()
+            .unwrap_or_else(|error| panic!("raw nonce failed: {error}"));
+        let second = fresh_activation_nonce_material()
+            .unwrap_or_else(|error| panic!("raw nonce failed: {error}"));
+        assert_eq!(first.as_str().len(), 64);
+        assert!(
+            first
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_ne!(first, second);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_handle_paths_drop_verbatim_prefixes_before_contract_comparison() {
+        assert_eq!(
+            normalize_final_windows_path_text(r"\\?\C:\ProgramData\Eliot")
+                .unwrap_or_else(|error| panic!("DOS path normalization failed: {error}")),
+            PathBuf::from(r"C:\ProgramData\Eliot")
+        );
+        assert_eq!(
+            normalize_final_windows_path_text(r"\\?\UNC\server\share\Eliot")
+                .unwrap_or_else(|error| panic!("UNC path normalization failed: {error}")),
+            PathBuf::from(r"\\server\share\Eliot")
+        );
+
+        let directory = std::env::temp_dir().join("eliot-canonical-contract-path-test");
+        std::fs::create_dir_all(&directory)
+            .unwrap_or_else(|error| panic!("fixture creation failed: {error}"));
+        let canonical = canonical_windows_path(&directory)
+            .unwrap_or_else(|error| panic!("canonicalization failed: {error}"));
+        assert!(canonical.is_absolute());
+        assert!(!canonical.to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn known_folder_anchors_ignore_environment_substitution() {
+        let original_program_data = std::env::var_os("ProgramData");
+        let original_local_app_data = std::env::var_os("LOCALAPPDATA");
+        unsafe {
+            // SAFETY: the values are restored before assertions or panics.
+            std::env::set_var("ProgramData", r"C:\attacker-selected-program-data");
+            std::env::set_var("LOCALAPPDATA", r"C:\attacker-selected-local-app-data");
+        }
+        let observed_program_data = protected_program_data_root();
+        let observed_local_app_data = current_user_local_app_data_root();
+        unsafe {
+            // SAFETY: restore this process's exact pre-test environment state.
+            match original_program_data {
+                Some(value) => std::env::set_var("ProgramData", value),
+                None => std::env::remove_var("ProgramData"),
+            }
+            match original_local_app_data {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+        }
+        let observed_program_data = observed_program_data
+            .unwrap_or_else(|error| panic!("ProgramData known-folder lookup failed: {error}"));
+        let observed_local_app_data = observed_local_app_data
+            .unwrap_or_else(|error| panic!("LocalAppData known-folder lookup failed: {error}"));
+        assert_ne!(
+            observed_program_data,
+            PathBuf::from(r"C:\attacker-selected-program-data")
+        );
+        assert_ne!(
+            observed_local_app_data,
+            PathBuf::from(r"C:\attacker-selected-local-app-data")
         );
     }
 
@@ -7919,6 +8603,23 @@ mod tests {
         assert!(validate_component("state\0.bin").is_err());
         assert!(valid_credential_key("nested/ok-key"));
         assert!(!valid_credential_key("../outside"));
+    }
+
+    #[test]
+    fn free_space_observation_rejects_relative_path_as_unknown_input() {
+        assert_eq!(
+            observe_volume_free_space(Path::new("relative")),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn free_space_observation_reads_real_current_volume() {
+        let current = std::env::current_dir().unwrap_or_else(|_| unreachable!());
+        let available = observe_volume_free_space(&current)
+            .unwrap_or_else(|error| panic!("free-space observation failed: {error}"));
+        assert!(available > 0);
     }
 
     #[test]
@@ -8266,6 +8967,20 @@ mod tests {
             ),
             Err(WindowsAdapterError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn service_registration_plan_accepts_local_service_account() {
+        let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+        let request = ServiceRegistrationRequest::new(
+            "EliotHostCanary",
+            "ELIOT Host Canary",
+            image,
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+        )
+        .unwrap_or_else(|error| panic!("LocalService plan failed: {error}"));
+        assert_eq!(request.account(), ServiceAccount::LocalService);
     }
 
     #[test]
@@ -9023,6 +9738,33 @@ mod tests {
 
         drop(file_lease);
         drop(root_lease);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_user_root_lease_fails_closed_without_rewriting_security() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-user-owned-read-only-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+
+        let invalid_before = directory_security_descriptor_bytes(&root);
+        assert!(UserOwnedRootReadLease::open_existing(&root).is_err());
+        assert_eq!(invalid_before, directory_security_descriptor_bytes(&root));
+
+        drop(
+            UserOwnedRootLease::open_existing(&root)
+                .unwrap_or_else(|error| panic!("fixture ACL provisioning failed: {error}")),
+        );
+        let valid_before = directory_security_descriptor_bytes(&root);
+        let lease = UserOwnedRootReadLease::open_existing(&root)
+            .unwrap_or_else(|error| panic!("read-only lease failed: {error}"));
+        assert_eq!(valid_before, directory_security_descriptor_bytes(&root));
+        lease
+            .verify_stable_identity()
+            .unwrap_or_else(|_| unreachable!());
+
+        drop(lease);
         let _ = std::fs::remove_dir_all(root);
     }
 

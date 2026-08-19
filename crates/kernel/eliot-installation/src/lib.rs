@@ -21,7 +21,9 @@ use eliot_platform::{
     PortOutcome,
 };
 use eliot_platform_windows::{
-    ProtectedPathLease, UserOwnedPathLease, require_protected_program_data_path,
+    ProtectedPathError, ProtectedPathLease, ProtectedRootLease, UserOwnedPathLease,
+    UserOwnedRootReadLease, current_user_local_app_data_root, protected_program_data_root,
+    require_protected_program_data_path,
 };
 use redb::{Database, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
@@ -31,7 +33,7 @@ use thiserror::Error;
 /// Stable wire name for the installation contract.
 pub const CONTRACT_NAME: &str = "eliot.kernel.installation";
 /// Current installation contract revision.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
 
 /// Returns the stable contract identity for handshakes and provenance.
 pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
@@ -47,9 +49,9 @@ pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
         CONTRACT_NAME,
         CONTRACT_VERSION,
         &Shape {
-            surface: "profile_catalogue_managed_change_transaction",
+            surface: "profile_catalogue_runtime_roots_installer_transaction",
             version: CONTRACT_VERSION,
-            transaction_rule: "immutable_plan_observed_stage_transition",
+            transaction_rule: "digest_bound_roots_immutable_plan_observed_stage_transition",
             unknown_rule: "rollback_required_until_reconciled",
         },
     )
@@ -231,6 +233,133 @@ fn lexical_windows_path(value: &str) -> Option<String> {
     let mut normalized = prefix.to_ascii_lowercase();
     normalized.push_str(&components.join("\\"));
     Some(normalized)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct WindowsPathIdentity {
+    prefix: String,
+    components: Vec<String>,
+}
+
+impl WindowsPathIdentity {
+    fn parse_root(value: &str, field: &str) -> Result<Self, InstallationError> {
+        text(value, field)?;
+        let value = value.replace('/', "\\");
+        let lower = value.to_ascii_lowercase();
+        if lower.starts_with("\\\\?\\")
+            || lower.starts_with("\\\\.\\")
+            || lower.starts_with("\\??\\")
+            || lower.starts_with("\\\\??\\")
+            || lower.starts_with("\\device\\")
+            || lower.starts_with("\\\\device\\")
+            || lower.starts_with("\\globalroot\\")
+            || lower.starts_with("\\\\globalroot\\")
+        {
+            return Err(InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason:
+                    "Windows device, NT and verbatim prefixes are not admitted for runtime roots"
+                        .to_owned(),
+            });
+        }
+
+        let (prefix, body) = if let Some(body) = value.strip_prefix("\\\\") {
+            let mut parts = body.split('\\');
+            let server = parts.next().unwrap_or_default();
+            let share = parts.next().unwrap_or_default();
+            if server.is_empty() || share.is_empty() {
+                return Err(InstallationError::InvalidField {
+                    field: field.to_owned(),
+                    reason: "UNC runtime root must include server and share components".to_owned(),
+                });
+            }
+            (
+                format!(
+                    "\\\\{}\\{}",
+                    server.to_ascii_lowercase(),
+                    share.to_ascii_lowercase()
+                ),
+                parts.collect::<Vec<_>>(),
+            )
+        } else if value.len() >= 3
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value.as_bytes()[1] == b':'
+            && value.as_bytes()[2] == b'\\'
+        {
+            (
+                value[..2].to_ascii_lowercase(),
+                value[3..].split('\\').collect::<Vec<_>>(),
+            )
+        } else {
+            return Err(InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason: "runtime root must be an absolute drive or UNC path".to_owned(),
+            });
+        };
+
+        let mut components = Vec::new();
+        for component in body {
+            if component.is_empty() {
+                continue;
+            }
+            if component == "." || component == ".." {
+                return Err(InstallationError::InvalidField {
+                    field: field.to_owned(),
+                    reason: "runtime root must not contain dot or parent traversal components"
+                        .to_owned(),
+                });
+            }
+            if component.ends_with(' ') || component.ends_with('.') || component.contains(':') {
+                return Err(InstallationError::InvalidField {
+                    field: field.to_owned(),
+                    reason: "runtime root contains a Windows lexical alias component".to_owned(),
+                });
+            }
+            components.push(component.to_ascii_lowercase());
+        }
+        if components.is_empty() {
+            return Err(InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason: "volume roots are not admitted as mutable runtime roots".to_owned(),
+            });
+        }
+        Ok(Self { prefix, components })
+    }
+
+    fn contains(&self, candidate: &Self) -> bool {
+        self.prefix == candidate.prefix
+            && self.components.len() <= candidate.components.len()
+            && self
+                .components
+                .iter()
+                .zip(&candidate.components)
+                .all(|(left, right)| left == right)
+    }
+
+    fn aliases_or_overlaps(&self, other: &Self) -> bool {
+        self.contains(other) || other.contains(self)
+    }
+
+    fn ends_with(&self, suffix: &[&str]) -> bool {
+        self.components.len() >= suffix.len()
+            && self.components[self.components.len() - suffix.len()..]
+                .iter()
+                .map(String::as_str)
+                .eq(suffix.iter().copied())
+    }
+}
+
+fn joined_windows_path(root: &str, suffix: &str) -> String {
+    format!(
+        "{}\\{}",
+        root.trim_end_matches(|character| character == '\\' || character == '/'),
+        suffix
+    )
+}
+
+fn same_windows_root(left: &str, right: &str) -> Result<bool, InstallationError> {
+    Ok(WindowsPathIdentity::parse_root(left, "left_root")?
+        == WindowsPathIdentity::parse_root(right, "right_root")?)
 }
 
 fn reject_authority_alias(
@@ -438,7 +567,561 @@ impl InstallationProfile {
     }
 }
 
-/// The three roots whose ownership and mutability are kept separate.
+/// Digest-bound mutable runtime roots for one explicitly selected profile.
+///
+/// `profile_anchor_root` is supplied by the installer after the Windows adapter
+/// proves the corresponding protected ProgramData, LocalAppData, or retained
+/// portable contour. The contract never consults process environment variables
+/// and therefore cannot silently select a different profile root.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeStateRoots {
+    /// Profile for which these roots were derived.
+    pub profile: InstallationProfile,
+    /// Explicit OS-validated profile anchor.
+    pub profile_anchor_root: PlatformHandle,
+    /// Durable root for this exact installation identity.
+    pub installation_root: PlatformHandle,
+    /// Host journal and supervision state.
+    pub host_state_root: PlatformHandle,
+    /// Kernel operational-record state (ORS).
+    pub kernel_ors_root: PlatformHandle,
+    /// Kernel ephemeral work area.
+    pub kernel_work_root: PlatformHandle,
+    /// Canonical Store database files.
+    pub store_data_root: PlatformHandle,
+    /// Canonical Store working directory.
+    pub store_work_root: PlatformHandle,
+    /// Canonical Store temporary files.
+    pub store_temp_root: PlatformHandle,
+    /// Watchdog state and bounded spool.
+    pub watchdog_state_root: PlatformHandle,
+    /// SHA-256 of all preceding fields.
+    pub roots_digest: PlatformHandle,
+}
+
+/// One retained, no-follow root lease exposed by an OS adapter.
+///
+/// Implementations must keep the underlying directory and ancestor handles
+/// alive for the lifetime of the value. Returning path text without a retained
+/// lease violates this contract.
+pub trait RuntimeRootLease {
+    /// Caller-declared path bound to the retained handle.
+    fn declared_path(&self) -> &str;
+    /// Canonical path obtained from the retained no-follow handle.
+    fn canonical_path(&self) -> &str;
+    /// Stable same-file identity (for example volume serial plus file index).
+    fn file_identity(&self) -> &str;
+    /// Whether every retained component was proven non-reparse.
+    fn is_reparse_free(&self) -> bool;
+}
+
+/// Adapter hook that acquires retained no-follow leases for runtime roots.
+pub trait RuntimeRootLeaseProvider {
+    /// Concrete guard kept alive through validation and returned to the caller.
+    type Lease: RuntimeRootLease;
+
+    /// Retains one existing root without following a reparse point.
+    fn retain_root(&mut self, root: &PlatformHandle) -> Result<Self::Lease, InstallationError>;
+}
+
+/// Validated lease guards. Dropping this value releases the retained OS leases.
+pub struct ValidatedRuntimeRootLeases<L> {
+    leases: Vec<L>,
+}
+
+/// Real Windows retained root lease used by production composition.
+pub enum WindowsRuntimeRootLease {
+    /// SystemService lease backed by a protected sentinel file and retained contour.
+    Protected {
+        /// Contract-declared root path.
+        declared_path: String,
+        /// OS-resolved DOS/UNC root path.
+        canonical_path: String,
+        /// Stable retained file-object identity.
+        file_identity: String,
+        /// Retained no-follow protected contour guard.
+        lease: ProtectedRootLease,
+    },
+    /// UserMode/PortableDev retained directory lease.
+    UserOwned {
+        /// Contract-declared root path.
+        declared_path: String,
+        /// OS-resolved DOS/UNC root path.
+        canonical_path: String,
+        /// Stable retained directory-object identity.
+        file_identity: String,
+        /// Retained current-user directory guard.
+        lease: UserOwnedRootReadLease,
+    },
+}
+
+impl RuntimeRootLease for WindowsRuntimeRootLease {
+    fn declared_path(&self) -> &str {
+        match self {
+            Self::Protected { declared_path, .. } | Self::UserOwned { declared_path, .. } => {
+                declared_path
+            }
+        }
+    }
+
+    fn canonical_path(&self) -> &str {
+        match self {
+            Self::Protected { canonical_path, .. } | Self::UserOwned { canonical_path, .. } => {
+                canonical_path
+            }
+        }
+    }
+
+    fn file_identity(&self) -> &str {
+        match self {
+            Self::Protected { file_identity, .. } | Self::UserOwned { file_identity, .. } => {
+                file_identity
+            }
+        }
+    }
+
+    fn is_reparse_free(&self) -> bool {
+        match self {
+            Self::Protected { lease, .. } => lease.verify_stable_identity().is_ok(),
+            Self::UserOwned { lease, .. } => lease.verify_stable_identity().is_ok(),
+        }
+    }
+}
+
+/// Production Windows adapter for the `RuntimeRootLeaseProvider` hook.
+pub struct WindowsRuntimeRootLeaseProvider {
+    profile: InstallationProfile,
+}
+
+impl WindowsRuntimeRootLeaseProvider {
+    /// Validates the OS profile anchor before any runtime root is retained.
+    pub fn for_roots(roots: &RuntimeStateRoots) -> Result<Self, InstallationError> {
+        roots.validate()?;
+        roots.validate_profile_anchor_os()?;
+        Ok(Self {
+            profile: roots.profile,
+        })
+    }
+}
+
+impl RuntimeRootLeaseProvider for WindowsRuntimeRootLeaseProvider {
+    type Lease = WindowsRuntimeRootLease;
+
+    fn retain_root(&mut self, root: &PlatformHandle) -> Result<Self::Lease, InstallationError> {
+        let declared_path = root.as_str().to_owned();
+        let path = Path::new(root.as_str());
+        match self.profile {
+            InstallationProfile::SystemService => {
+                let lease =
+                    ProtectedRootLease::open_existing(path).map_err(protected_path_error)?;
+                let canonical_path = lease
+                    .canonical_path()
+                    .map_err(protected_path_error)?
+                    .to_string_lossy()
+                    .into_owned();
+                let identity = lease.identity();
+                Ok(WindowsRuntimeRootLease::Protected {
+                    declared_path,
+                    canonical_path,
+                    file_identity: format!(
+                        "volume:{}:file:{}",
+                        identity.volume_serial_number, identity.file_index
+                    ),
+                    lease,
+                })
+            }
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                let lease =
+                    UserOwnedRootReadLease::open_existing(path).map_err(protected_path_error)?;
+                let canonical_path = lease
+                    .canonical_path()
+                    .map_err(protected_path_error)?
+                    .to_string_lossy()
+                    .into_owned();
+                let identity = lease.identity();
+                Ok(WindowsRuntimeRootLease::UserOwned {
+                    declared_path,
+                    canonical_path,
+                    file_identity: format!(
+                        "volume:{}:file:{}",
+                        identity.volume_serial_number, identity.file_index
+                    ),
+                    lease,
+                })
+            }
+        }
+    }
+}
+
+fn protected_path_error(error: ProtectedPathError) -> InstallationError {
+    InstallationError::Platform(error.to_string())
+}
+
+impl<L> ValidatedRuntimeRootLeases<L> {
+    /// Borrows every retained root lease in contract field order.
+    #[must_use]
+    pub fn leases(&self) -> &[L] {
+        &self.leases
+    }
+}
+
+impl RuntimeStateRoots {
+    const ROOT_SUFFIXES: [(&'static str, &'static str); 7] = [
+        ("host_state_root", "host"),
+        ("kernel_ors_root", "kernel\\state"),
+        ("kernel_work_root", "kernel\\work"),
+        ("store_data_root", "store\\data"),
+        ("store_work_root", "store\\work"),
+        ("store_temp_root", "store\\tmp"),
+        ("watchdog_state_root", "watchdog"),
+    ];
+
+    /// Derives SystemService or UserMode roots from an explicit OS-validated
+    /// profile anchor and a lowercase SHA-256 installation key.
+    pub fn derive_profiled(
+        profile: InstallationProfile,
+        profile_anchor_root: PlatformHandle,
+        installation_key: &str,
+    ) -> Result<Self, InstallationError> {
+        if profile == InstallationProfile::PortableDev {
+            return Err(InstallationError::ProfileViolation(
+                "portable_dev requires derive_portable with one retained root".to_owned(),
+            ));
+        }
+        Self::validate_profile_anchor_path_os(profile, &profile_anchor_root)?;
+        validate_installation_key(installation_key)?;
+        let installation_root = PlatformHandle::new(joined_windows_path(
+            profile_anchor_root.as_str(),
+            &format!("Eliot\\installations\\{installation_key}"),
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "runtime_state_roots.installation_root".to_owned(),
+            reason: error.to_string(),
+        })?;
+        Self::derived(profile, profile_anchor_root, installation_root)
+    }
+
+    /// Derives PortableDev roots below one explicit retained disposable root.
+    pub fn derive_portable(
+        retained_portable_root: PlatformHandle,
+    ) -> Result<Self, InstallationError> {
+        Self::validate_profile_anchor_path_os(
+            InstallationProfile::PortableDev,
+            &retained_portable_root,
+        )?;
+        Self::derived(
+            InstallationProfile::PortableDev,
+            retained_portable_root.clone(),
+            retained_portable_root,
+        )
+    }
+
+    fn validate_profile_anchor_path_os(
+        profile: InstallationProfile,
+        anchor: &PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        let observed = match profile {
+            InstallationProfile::SystemService => {
+                protected_program_data_root().map_err(protected_path_error)?
+            }
+            InstallationProfile::UserMode => {
+                current_user_local_app_data_root().map_err(protected_path_error)?
+            }
+            InstallationProfile::PortableDev => {
+                let lease = UserOwnedRootReadLease::open_existing(Path::new(anchor.as_str()))
+                    .map_err(protected_path_error)?;
+                lease.canonical_path().map_err(protected_path_error)?
+            }
+        };
+        if !same_windows_root(anchor.as_str(), &observed.to_string_lossy())? {
+            return Err(InstallationError::ProfileViolation(
+                "profile anchor does not match the OS-resolved retained contour".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_profile_anchor_os(&self) -> Result<(), InstallationError> {
+        Self::validate_profile_anchor_path_os(self.profile, &self.profile_anchor_root)
+    }
+
+    fn derived(
+        profile: InstallationProfile,
+        profile_anchor_root: PlatformHandle,
+        installation_root: PlatformHandle,
+    ) -> Result<Self, InstallationError> {
+        let make = |suffix: &str| {
+            PlatformHandle::new(joined_windows_path(installation_root.as_str(), suffix)).map_err(
+                |error| InstallationError::InvalidField {
+                    field: "runtime_state_roots".to_owned(),
+                    reason: error.to_string(),
+                },
+            )
+        };
+        let host_state_root = make("host")?;
+        let kernel_ors_root = make("kernel\\state")?;
+        let kernel_work_root = make("kernel\\work")?;
+        let store_data_root = make("store\\data")?;
+        let store_work_root = make("store\\work")?;
+        let store_temp_root = make("store\\tmp")?;
+        let watchdog_state_root = make("watchdog")?;
+        let mut roots = Self {
+            profile,
+            profile_anchor_root,
+            installation_root,
+            host_state_root,
+            kernel_ors_root,
+            kernel_work_root,
+            store_data_root,
+            store_work_root,
+            store_temp_root,
+            watchdog_state_root,
+            roots_digest: PlatformHandle::new("0".repeat(64)).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "runtime_state_roots.roots_digest".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+        };
+        roots.roots_digest =
+            PlatformHandle::new(sha256_hex(&roots.unsigned_bytes()?)).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "runtime_state_roots.roots_digest".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+        roots.validate()?;
+        Ok(roots)
+    }
+
+    fn root_fields(&self) -> [(&'static str, &PlatformHandle); 7] {
+        [
+            ("host_state_root", &self.host_state_root),
+            ("kernel_ors_root", &self.kernel_ors_root),
+            ("kernel_work_root", &self.kernel_work_root),
+            ("store_data_root", &self.store_data_root),
+            ("store_work_root", &self.store_work_root),
+            ("store_temp_root", &self.store_temp_root),
+            ("watchdog_state_root", &self.watchdog_state_root),
+        ]
+    }
+
+    fn reject_mutable_alias(
+        &self,
+        candidate: &PlatformHandle,
+        candidate_field: &str,
+    ) -> Result<(), InstallationError> {
+        let candidate_path = WindowsPathIdentity::parse_root(candidate.as_str(), candidate_field)?;
+        for (root_field, root) in self.root_fields() {
+            let mutable_path = WindowsPathIdentity::parse_root(
+                root.as_str(),
+                &format!("runtime_state_roots.{root_field}"),
+            )?;
+            if candidate_path.aliases_or_overlaps(&mutable_path) {
+                return Err(InstallationError::ProfileViolation(format!(
+                    "{candidate_field} aliases mutable runtime root {root_field}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn unsigned_bytes(&self) -> Result<Vec<u8>, InstallationError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            profile: InstallationProfile,
+            profile_anchor_root: &'a PlatformHandle,
+            installation_root: &'a PlatformHandle,
+            host_state_root: &'a PlatformHandle,
+            kernel_ors_root: &'a PlatformHandle,
+            kernel_work_root: &'a PlatformHandle,
+            store_data_root: &'a PlatformHandle,
+            store_work_root: &'a PlatformHandle,
+            store_temp_root: &'a PlatformHandle,
+            watchdog_state_root: &'a PlatformHandle,
+        }
+        serde_json::to_vec(&Unsigned {
+            profile: self.profile,
+            profile_anchor_root: &self.profile_anchor_root,
+            installation_root: &self.installation_root,
+            host_state_root: &self.host_state_root,
+            kernel_ors_root: &self.kernel_ors_root,
+            kernel_work_root: &self.kernel_work_root,
+            store_data_root: &self.store_data_root,
+            store_work_root: &self.store_work_root,
+            store_temp_root: &self.store_temp_root,
+            watchdog_state_root: &self.watchdog_state_root,
+        })
+        .map_err(|error| InstallationError::InvalidField {
+            field: "runtime_state_roots".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// Validates profile binding, fixed topology, whole-component separation,
+    /// and the roots digest. OS reparse/file identity proof is performed by
+    /// [`Self::retain_and_validate`].
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        let anchor = WindowsPathIdentity::parse_root(
+            self.profile_anchor_root.as_str(),
+            "runtime_state_roots.profile_anchor_root",
+        )?;
+        let installation = WindowsPathIdentity::parse_root(
+            self.installation_root.as_str(),
+            "runtime_state_roots.installation_root",
+        )?;
+        match self.profile {
+            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+                if !anchor.contains(&installation) || anchor == installation {
+                    return Err(InstallationError::ProfileViolation(
+                        "profiled installation root must be below its explicit profile anchor"
+                            .to_owned(),
+                    ));
+                }
+                let Some(key) = installation.components.last() else {
+                    return Err(InstallationError::ProfileViolation(
+                        "profiled installation root is incomplete".to_owned(),
+                    ));
+                };
+                validate_installation_key(key)?;
+                if installation.components.len() < 3
+                    || !installation.ends_with(&["eliot", "installations", key])
+                {
+                    return Err(InstallationError::ProfileViolation(
+                        "profiled installation root must end in Eliot/installations/<key>"
+                            .to_owned(),
+                    ));
+                }
+            }
+            InstallationProfile::PortableDev => {
+                if anchor != installation {
+                    return Err(InstallationError::ProfileViolation(
+                        "portable_dev installation root must equal its retained portable root"
+                            .to_owned(),
+                    ));
+                }
+                if installation.components.len() >= 3 {
+                    let last = installation
+                        .components
+                        .last()
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    if valid_installation_key(last)
+                        && installation.ends_with(&["eliot", "installations", last])
+                    {
+                        return Err(InstallationError::ProfileViolation(
+                            "portable_dev must not alias a profiled durable installation root"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let fields = self.root_fields();
+        let mut parsed = Vec::with_capacity(fields.len());
+        for ((field, root), (expected_field, suffix)) in
+            fields.iter().zip(Self::ROOT_SUFFIXES.iter())
+        {
+            debug_assert_eq!(field, expected_field);
+            let path = WindowsPathIdentity::parse_root(
+                root.as_str(),
+                &format!("runtime_state_roots.{field}"),
+            )?;
+            if !installation.contains(&path) || installation == path {
+                return Err(InstallationError::ProfileViolation(format!(
+                    "{field} must be below the installation root"
+                )));
+            }
+            let expected = WindowsPathIdentity::parse_root(
+                &joined_windows_path(self.installation_root.as_str(), suffix),
+                &format!("runtime_state_roots.{field}"),
+            )?;
+            if path != expected {
+                return Err(InstallationError::ProfileViolation(format!(
+                    "{field} does not match the fixed runtime root topology"
+                )));
+            }
+            parsed.push((field, path));
+        }
+        for left in 0..parsed.len() {
+            for right in left + 1..parsed.len() {
+                if parsed[left].1.aliases_or_overlaps(&parsed[right].1) {
+                    return Err(InstallationError::ProfileViolation(format!(
+                        "{} and {} alias or overlap by Windows path components",
+                        parsed[left].0, parsed[right].0
+                    )));
+                }
+            }
+        }
+        sha256_handle(&self.roots_digest, "runtime_state_roots.roots_digest")?;
+        if sha256_hex(&self.unsigned_bytes()?) != self.roots_digest.as_str() {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_state_roots.roots_digest".to_owned(),
+                reason: "runtime root digest mismatch".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Acquires and validates retained no-follow OS leases for all mutable roots.
+    /// The returned guards must remain alive across descriptor consumption.
+    pub fn retain_and_validate<P>(
+        &self,
+        provider: &mut P,
+    ) -> Result<ValidatedRuntimeRootLeases<P::Lease>, InstallationError>
+    where
+        P: RuntimeRootLeaseProvider,
+    {
+        self.validate()?;
+        let mut leases = Vec::with_capacity(7);
+        let mut identities = BTreeSet::new();
+        for (field, root) in self.root_fields() {
+            let lease = provider.retain_root(root)?;
+            if !lease.is_reparse_free() {
+                return Err(InstallationError::ProfileViolation(format!(
+                    "{field} retained lease contains a reparse point"
+                )));
+            }
+            if !same_windows_root(lease.declared_path(), root.as_str())?
+                || !same_windows_root(lease.canonical_path(), root.as_str())?
+            {
+                return Err(InstallationError::ProfileViolation(format!(
+                    "{field} retained lease does not bind the declared canonical root"
+                )));
+            }
+            text(lease.file_identity(), "runtime_root_lease.file_identity")?;
+            if !identities.insert(lease.file_identity().to_owned()) {
+                return Err(InstallationError::ProfileViolation(
+                    "two runtime roots alias the same retained file object".to_owned(),
+                ));
+            }
+            leases.push(lease);
+        }
+        Ok(ValidatedRuntimeRootLeases { leases })
+    }
+}
+
+fn valid_installation_key(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_installation_key(value: &str) -> Result<(), InstallationError> {
+    if valid_installation_key(value) {
+        Ok(())
+    } else {
+        Err(InstallationError::InvalidField {
+            field: "installation_key".to_owned(),
+            reason: "must be a lowercase SHA-256-derived path key".to_owned(),
+        })
+    }
+}
+
+/// Installation/package roots plus the typed mutable runtime topology.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallationRoots {
@@ -448,6 +1131,8 @@ pub struct InstallationRoots {
     pub durable_data: String,
     /// User configuration and cache.
     pub user_config_cache: String,
+    /// Explicit digest-bound runtime state topology.
+    pub runtime_state_roots: RuntimeStateRoots,
 }
 
 impl InstallationRoots {
@@ -457,11 +1142,13 @@ impl InstallationRoots {
         immutable_binaries: impl Into<String>,
         durable_data: impl Into<String>,
         user_config_cache: impl Into<String>,
+        runtime_state_roots: RuntimeStateRoots,
     ) -> Result<Self, InstallationError> {
         let roots = Self {
             immutable_binaries: immutable_binaries.into(),
             durable_data: durable_data.into(),
             user_config_cache: user_config_cache.into(),
+            runtime_state_roots,
         };
         roots.validate(profile)?;
         Ok(roots)
@@ -474,27 +1161,22 @@ impl InstallationRoots {
             (&self.durable_data, "durable_data"),
             (&self.user_config_cache, "user_config_cache"),
         ];
-        let mut identities = BTreeSet::new();
+        let mut parsed_roots = Vec::new();
         for (value, field) in values {
             text(value, field)?;
-            let normalized = value
-                .replace('\\', "/")
-                .trim_end_matches('/')
-                .to_ascii_lowercase();
-            if normalized == "."
-                || normalized == ".."
-                || normalized.starts_with("../")
-                || normalized.contains("/../")
-                || normalized.ends_with("/..")
-            {
-                return Err(InstallationError::ProfileViolation(
-                    "installation roots must not contain parent traversal".to_owned(),
-                ));
-            }
-            if !identities.insert(normalized) {
-                return Err(InstallationError::ProfileViolation(
-                    "immutable, durable and user roots must be distinct".to_owned(),
-                ));
+            parsed_roots.push((field, WindowsPathIdentity::parse_root(value, field)?));
+        }
+        for left in 0..parsed_roots.len() {
+            for right in left + 1..parsed_roots.len() {
+                if parsed_roots[left]
+                    .1
+                    .aliases_or_overlaps(&parsed_roots[right].1)
+                {
+                    return Err(InstallationError::ProfileViolation(format!(
+                        "{} and {} alias or overlap by Windows path components",
+                        parsed_roots[left].0, parsed_roots[right].0
+                    )));
+                }
             }
         }
         if !profile.is_disposable()
@@ -504,6 +1186,21 @@ impl InstallationRoots {
         {
             return Err(InstallationError::ProfileViolation(
                 "production binaries may not share the durable data root".to_owned(),
+            ));
+        }
+        self.runtime_state_roots.validate()?;
+        if self.runtime_state_roots.profile != profile {
+            return Err(InstallationError::ProfileViolation(
+                "runtime roots profile must equal the installation profile".to_owned(),
+            ));
+        }
+        if !same_windows_root(
+            &self.durable_data,
+            self.runtime_state_roots.installation_root.as_str(),
+        )? {
+            return Err(InstallationError::ProfileViolation(
+                "durable installation root must equal RuntimeStateRoots.installation_root"
+                    .to_owned(),
             ));
         }
         Ok(())
@@ -772,6 +1469,8 @@ pub struct CandidateManifest {
     pub supervision_key_fingerprint: PlatformHandle,
     /// Signature/approval evidence reference.
     pub signature_ref: PlatformHandle,
+    /// Digest of the exact mutable root topology approved by this manifest.
+    pub runtime_state_roots_digest: PlatformHandle,
     /// Exact Host-owned runtime launch contour bound to this approval.
     pub runtime_launch: RuntimeLaunchDescriptor,
 }
@@ -796,7 +1495,13 @@ pub struct RuntimeLaunchDescriptor {
     pub authority_descriptor_path: PlatformHandle,
     /// Independent lowercase SHA-256 digest of the authority descriptor bytes.
     pub authority_descriptor_digest: PlatformHandle,
+    /// Explicit profile-bound mutable runtime root topology.
+    pub runtime_state_roots: RuntimeStateRoots,
     /// Explicit Kernel working directory.
+    ///
+    /// This v1 compatibility field must exactly equal
+    /// `runtime_state_roots.kernel_work_root` and can be removed only in a
+    /// separately versioned consumer migration.
     pub kernel_work_root: PlatformHandle,
     /// SHA-256 digest of the approved Kernel image.
     pub kernel_artifact_digest: PlatformHandle,
@@ -910,6 +1615,7 @@ impl RuntimeLaunchDescriptor {
             authority_state_fence: &'a StateFence,
             authority_descriptor_path: &'a PlatformHandle,
             authority_descriptor_digest: &'a PlatformHandle,
+            runtime_state_roots: &'a RuntimeStateRoots,
             kernel_work_root: &'a PlatformHandle,
             kernel_artifact_digest: &'a PlatformHandle,
             store_config_path: &'a PlatformHandle,
@@ -933,6 +1639,7 @@ impl RuntimeLaunchDescriptor {
             authority_state_fence: &self.authority_state_fence,
             authority_descriptor_path: &self.authority_descriptor_path,
             authority_descriptor_digest: &self.authority_descriptor_digest,
+            runtime_state_roots: &self.runtime_state_roots,
             kernel_work_root: &self.kernel_work_root,
             kernel_artifact_digest: &self.kernel_artifact_digest,
             store_config_path: &self.store_config_path,
@@ -985,8 +1692,23 @@ impl RuntimeLaunchDescriptor {
             &self.authority_descriptor_digest,
             "runtime_launch.authority_descriptor_digest",
         )?;
+        self.runtime_state_roots.validate()?;
+        if self.runtime_state_roots.profile != self.profile {
+            return Err(InstallationError::ProfileViolation(
+                "runtime launch profile must equal RuntimeStateRoots.profile".to_owned(),
+            ));
+        }
         handle(&self.kernel_work_root, "runtime_launch.kernel_work_root")?;
         approved_path(&self.kernel_work_root, "runtime_launch.kernel_work_root")?;
+        if !same_windows_root(
+            self.kernel_work_root.as_str(),
+            self.runtime_state_roots.kernel_work_root.as_str(),
+        )? {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.kernel_work_root".to_owned(),
+                reason: "legacy field must equal RuntimeStateRoots.kernel_work_root".to_owned(),
+            });
+        }
         sha256_handle(
             &self.kernel_artifact_digest,
             "runtime_launch.kernel_artifact_digest",
@@ -1051,6 +1773,14 @@ impl RuntimeLaunchDescriptor {
         match (self.profile, &self.portable_root) {
             (InstallationProfile::PortableDev, Some(root)) => {
                 approved_path(root, "runtime_launch.portable_root")?;
+                if !same_windows_root(
+                    root.as_str(),
+                    self.runtime_state_roots.installation_root.as_str(),
+                )? {
+                    return Err(InstallationError::ProfileViolation(
+                        "portable root must equal RuntimeStateRoots.installation_root".to_owned(),
+                    ));
+                }
             }
             (InstallationProfile::PortableDev, None) => {
                 return Err(InstallationError::ProfileViolation(
@@ -1092,6 +1822,32 @@ impl RuntimeLaunchDescriptor {
                 portable_root,
                 "runtime_launch.portable_root",
             )?;
+        }
+        for (candidate, candidate_field) in [
+            (
+                &self.authority_descriptor_path,
+                "runtime_launch.authority_descriptor_path",
+            ),
+            (&self.store_config_path, "runtime_launch.store_config_path"),
+            (
+                &self.store_bootstrap_descriptor_path,
+                "runtime_launch.store_bootstrap_descriptor_path",
+            ),
+            (
+                &self.store_bridge_executable_path,
+                "runtime_launch.store_bridge_executable_path",
+            ),
+            (
+                &self.canonical_store_executable_path,
+                "runtime_launch.canonical_store_executable_path",
+            ),
+            (
+                &self.watchdog_executable_path,
+                "runtime_launch.watchdog_executable_path",
+            ),
+        ] {
+            self.runtime_state_roots
+                .reject_mutable_alias(candidate, candidate_field)?;
         }
         for (arguments, field) in [
             (&self.kernel_arguments, "runtime_launch.kernel_arguments"),
@@ -1145,6 +1901,12 @@ impl CandidateManifest {
             "eliot-kernel.exe",
             "manifest.kernel_executable_path",
         )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(
+                &self.kernel_executable_path,
+                "manifest.kernel_executable_path",
+            )?;
         approved_path(
             &self.store_bridge_executable_path,
             "manifest.store_bridge_executable_path",
@@ -1235,6 +1997,16 @@ impl CandidateManifest {
             &self.supervision_key_fingerprint,
             "manifest.supervision_key_fingerprint",
         )?;
+        sha256_handle(
+            &self.runtime_state_roots_digest,
+            "manifest.runtime_state_roots_digest",
+        )?;
+        if self.runtime_state_roots_digest != self.runtime_launch.runtime_state_roots.roots_digest {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.runtime_state_roots_digest".to_owned(),
+                reason: "must exactly bind the launch RuntimeStateRoots digest".to_owned(),
+            });
+        }
         handle(&self.signature_ref, "manifest.signature_ref")
             .and_then(|()| self.runtime_launch.validate_for_config(&self.config_path))
     }
@@ -1377,6 +2149,86 @@ struct LegacyRuntimeLaunchDescriptor {
     descriptor_digest: PlatformHandle,
 }
 
+#[allow(
+    dead_code,
+    reason = "v1 wire mirror is used for strict major-version migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1RegistryWire {
+    generations: Vec<V1ApprovedGenerationWire>,
+    active_generation: Option<PlatformHandle>,
+    last_known_good_generation: Option<PlatformHandle>,
+}
+
+#[allow(
+    dead_code,
+    reason = "v1 wire mirror is used for strict major-version migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1ApprovedGenerationWire {
+    manifest: V1CandidateManifestWire,
+    approval_ref: PlatformHandle,
+    active: bool,
+    last_known_good: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "v1 wire mirror is used for strict major-version migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1CandidateManifestWire {
+    generation: PlatformHandle,
+    components: Vec<PlatformHandle>,
+    kernel_artifact_digest: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    kernel_executable_path: PlatformHandle,
+    store_bridge_executable_path: PlatformHandle,
+    canonical_store_executable_path: PlatformHandle,
+    config_path: PlatformHandle,
+    dependency_closure_refs: Vec<PlatformHandle>,
+    license_refs: Vec<PlatformHandle>,
+    config_digest: PlatformHandle,
+    supervision_key_fingerprint: PlatformHandle,
+    signature_ref: PlatformHandle,
+    runtime_launch: V1RuntimeLaunchDescriptorWire,
+}
+
+#[allow(
+    dead_code,
+    reason = "v1 wire mirror is used for strict major-version migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1RuntimeLaunchDescriptorWire {
+    profile: InstallationProfile,
+    portable_root: Option<PlatformHandle>,
+    installation_epoch: InstallationEpoch,
+    generation: PlatformHandle,
+    authority_generation: ResourceGeneration,
+    authority_state_fence: StateFence,
+    authority_descriptor_path: PlatformHandle,
+    authority_descriptor_digest: PlatformHandle,
+    kernel_work_root: PlatformHandle,
+    kernel_artifact_digest: PlatformHandle,
+    store_config_path: PlatformHandle,
+    store_bridge_executable_path: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    store_bootstrap_descriptor_path: PlatformHandle,
+    store_bootstrap_descriptor_digest: PlatformHandle,
+    canonical_store_executable_path: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    kernel_arguments: Vec<PlatformHandle>,
+    canonical_store_arguments: Vec<PlatformHandle>,
+    watchdog_executable_path: PlatformHandle,
+    watchdog_artifact_digest: PlatformHandle,
+    descriptor_digest: PlatformHandle,
+}
+
 fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, InstallationError> {
     match serde_json::from_slice::<ApprovedGenerationRegistry>(bytes) {
         Ok(registry) => {
@@ -1388,7 +2240,12 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             Ok(registry)
         }
         Err(_) => {
-            if serde_json::from_slice::<LegacyRegistryWire>(bytes).is_ok() {
+            if serde_json::from_slice::<V1RegistryWire>(bytes).is_ok() {
+                Err(InstallationError::MigrationRequired {
+                    reason: "approved-generation registry v1 requires explicit re-stage; runtime roots cannot be synthesized"
+                        .to_owned(),
+                })
+            } else if serde_json::from_slice::<LegacyRegistryWire>(bytes).is_ok() {
                 Err(InstallationError::MigrationRequired {
                     reason: "approved-generation registry requires re-stage; legacy launch fields cannot be synthesized"
                         .to_owned(),
@@ -1694,6 +2551,270 @@ impl PlannedChange {
     }
 }
 
+/// Service role owned by the elevated SystemService installer.
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InstallerServiceRole {
+    /// `eliot-host` service.
+    Host,
+    /// Sibling `eliot-watchdog` service.
+    Watchdog,
+}
+
+/// Password-free account admitted for Runtime Live service plans.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InstallerServiceAccount {
+    /// Built-in least-privileged LocalService identity.
+    LocalService,
+}
+
+/// Principals admitted by one protected runtime-root ACL plan.
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InstallerAclPrincipal {
+    /// Built-in Administrators group.
+    Administrators,
+    /// Built-in LocalService identity used by Host and Watchdog.
+    LocalService,
+    /// Built-in LocalSystem identity retained for installer/OS ownership.
+    LocalSystem,
+    /// Current user, valid only for UserMode or PortableDev.
+    CurrentUser,
+}
+
+/// One immutable installer effect owned by the enclosing
+/// [`InstallationTransaction`]. The elevated adapter reports observations
+/// through the existing transaction coordinator.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum InstallerEffectPlan {
+    /// Create and retain one declared root.
+    CreateRoot {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Exact root to create.
+        root: PlatformHandle,
+    },
+    /// Apply and verify one protected ACL.
+    ApplyAcl {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Exact root receiving the ACL.
+        root: PlatformHandle,
+        /// Complete admitted principal set.
+        principals: Vec<InstallerAclPrincipal>,
+    },
+    /// Register one own-process SCM service.
+    RegisterService {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Host or Watchdog role.
+        role: InstallerServiceRole,
+        /// Stable SCM service name.
+        service_name: PlatformHandle,
+        /// Approved executable path.
+        executable_path: PlatformHandle,
+        /// Password-free service account.
+        account: InstallerServiceAccount,
+        /// Whether SCM starts the service automatically.
+        automatic_start: bool,
+    },
+}
+
+impl InstallerEffectPlan {
+    fn effect_id(&self) -> &PlatformHandle {
+        match self {
+            Self::CreateRoot { effect_id, .. }
+            | Self::ApplyAcl { effect_id, .. }
+            | Self::RegisterService { effect_id, .. } => effect_id,
+        }
+    }
+
+    fn validate(&self) -> Result<(), InstallationError> {
+        handle(self.effect_id(), "installer_effect.effect_id")?;
+        match self {
+            Self::CreateRoot { root, .. } => approved_path(root, "installer_effect.root"),
+            Self::ApplyAcl {
+                root, principals, ..
+            } => {
+                approved_path(root, "installer_effect.root")?;
+                if principals.is_empty() {
+                    return Err(InstallationError::InvalidField {
+                        field: "installer_effect.principals".to_owned(),
+                        reason: "ACL plan must contain explicit principals".to_owned(),
+                    });
+                }
+                let unique = principals.iter().copied().collect::<BTreeSet<_>>();
+                if unique.len() != principals.len() {
+                    return Err(InstallationError::Duplicate {
+                        kind: "installer ACL principal".to_owned(),
+                        identity: self.effect_id().as_str().to_owned(),
+                    });
+                }
+                Ok(())
+            }
+            Self::RegisterService {
+                service_name,
+                executable_path,
+                automatic_start,
+                ..
+            } => {
+                handle(service_name, "installer_effect.service_name")?;
+                approved_path(executable_path, "installer_effect.executable_path")?;
+                if !automatic_start {
+                    return Err(InstallationError::InvalidField {
+                        field: "installer_effect.automatic_start".to_owned(),
+                        reason: "Runtime Live Host and Watchdog must use automatic start"
+                            .to_owned(),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn validate_installer_effects(
+    profile: InstallationProfile,
+    roots: &RuntimeStateRoots,
+    planned_changes: &[PlannedChange],
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    if effects.is_empty() {
+        return Err(InstallationError::InvalidField {
+            field: "installer_effects".to_owned(),
+            reason: "must contain explicit root, ACL and service work".to_owned(),
+        });
+    }
+    let planned_ids = planned_changes
+        .iter()
+        .map(|change| change.change_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if planned_ids.len() != planned_changes.len() {
+        return Err(InstallationError::Duplicate {
+            kind: "planned change".to_owned(),
+            identity: "installer plan contains a repeated change identity".to_owned(),
+        });
+    }
+    let mut effect_ids = BTreeSet::new();
+    let mut created_roots = BTreeSet::new();
+    let mut acl_roots = BTreeSet::new();
+    let mut service_roles = BTreeSet::new();
+    for effect in effects {
+        effect.validate()?;
+        if !effect_ids.insert(effect.effect_id().as_str()) {
+            return Err(InstallationError::Duplicate {
+                kind: "installer effect".to_owned(),
+                identity: effect.effect_id().as_str().to_owned(),
+            });
+        }
+        match effect {
+            InstallerEffectPlan::CreateRoot { root, .. } => {
+                created_roots.insert(WindowsPathIdentity::parse_root(
+                    root.as_str(),
+                    "installer_effect.root",
+                )?);
+            }
+            InstallerEffectPlan::ApplyAcl {
+                root, principals, ..
+            } => {
+                let expected_principals = if profile == InstallationProfile::SystemService {
+                    [
+                        InstallerAclPrincipal::Administrators,
+                        InstallerAclPrincipal::LocalService,
+                        InstallerAclPrincipal::LocalSystem,
+                    ]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+                } else {
+                    [
+                        InstallerAclPrincipal::CurrentUser,
+                        InstallerAclPrincipal::LocalSystem,
+                    ]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+                };
+                if principals.iter().copied().collect::<BTreeSet<_>>() != expected_principals {
+                    return Err(InstallationError::ProfileViolation(
+                        "runtime ACL differs from the exact profile principal set".to_owned(),
+                    ));
+                }
+                acl_roots.insert(WindowsPathIdentity::parse_root(
+                    root.as_str(),
+                    "installer_effect.root",
+                )?);
+            }
+            InstallerEffectPlan::RegisterService { role, account, .. } => {
+                if profile != InstallationProfile::SystemService {
+                    return Err(InstallationError::ProfileViolation(
+                        "SCM effects are admitted only for SystemService".to_owned(),
+                    ));
+                }
+                if *account != InstallerServiceAccount::LocalService {
+                    return Err(InstallationError::ProfileViolation(
+                        "Host and Watchdog must run as LocalService".to_owned(),
+                    ));
+                }
+                if !service_roles.insert(*role) {
+                    return Err(InstallationError::Duplicate {
+                        kind: "installer service role".to_owned(),
+                        identity: format!("{role:?}"),
+                    });
+                }
+            }
+        }
+    }
+    if planned_ids != effect_ids {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let required_roots = std::iter::once(&roots.installation_root)
+        .chain(roots.root_fields().into_iter().map(|(_, root)| root))
+        .map(|root| WindowsPathIdentity::parse_root(root.as_str(), "required_root"))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if created_roots != required_roots || acl_roots != required_roots {
+        return Err(InstallationError::IncompleteObservation(
+            "transaction plan must create and ACL exactly the declared runtime roots".to_owned(),
+        ));
+    }
+    let required_services = [InstallerServiceRole::Host, InstallerServiceRole::Watchdog]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if profile == InstallationProfile::SystemService && service_roles != required_services {
+        return Err(InstallationError::IncompleteObservation(
+            "SystemService transaction requires exactly Host and Watchdog registrations".to_owned(),
+        ));
+    }
+    if profile != InstallationProfile::SystemService && !service_roles.is_empty() {
+        return Err(InstallationError::ProfileViolation(
+            "non-service profiles must not register SCM services".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Store-volume observation used to evaluate the immutable free-space policy.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StoreFreeSpaceObservation {
+    /// Windows observed caller-available bytes.
+    Known {
+        /// Caller-available bytes on the Store data volume.
+        available_bytes: u64,
+        /// Evidence binding the observation to the volume and instant.
+        evidence_refs: Vec<PlatformHandle>,
+    },
+    /// Windows could not classify the current available space.
+    Unknown {
+        /// Evidence or failure capsule references for recovery.
+        evidence_refs: Vec<PlatformHandle>,
+    },
+}
+
 /// Durable installer stage. A partial external effect cannot skip recovery.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1726,7 +2847,7 @@ impl InstallationStage {
     fn can_advance(self, next: Self) -> bool {
         matches!(
             (self, next),
-            (Self::Planned, Self::Staging)
+            (Self::Planned, Self::Staging | Self::RollbackRequired)
                 | (Self::Staging, Self::StaticVerified | Self::RollbackRequired)
                 | (
                     Self::StaticVerified,
@@ -1764,6 +2885,12 @@ pub struct InstallationTransaction {
     pub staging_root: PlatformHandle,
     /// Planned OS/file/plugin/service changes.
     pub planned_changes: Vec<PlannedChange>,
+    /// Typed root/ACL/SCM effects bound one-to-one to `planned_changes`.
+    pub installer_effects: Vec<InstallerEffectPlan>,
+    /// Minimum caller-available bytes required on the Store data volume.
+    pub minimum_store_available_bytes: u64,
+    /// Digest binding the sole transaction identity to its immutable installer plan.
+    pub installer_plan_digest: PlatformHandle,
     /// Precondition observations captured before staging.
     pub precondition_evidence: Vec<PlatformHandle>,
     /// Current durable stage.
@@ -1798,6 +2925,8 @@ impl InstallationTransaction {
         candidate_manifest: CandidateManifest,
         staging_root: PlatformHandle,
         planned_changes: Vec<PlannedChange>,
+        installer_effects: Vec<InstallerEffectPlan>,
+        minimum_store_available_bytes: u64,
         precondition_evidence: Vec<PlatformHandle>,
         recovery_command: PlatformHandle,
     ) -> Result<Self, InstallationError> {
@@ -1838,12 +2967,36 @@ impl InstallationTransaction {
                 reason: "must contain an explicit effect plan".to_owned(),
             });
         }
+        if minimum_store_available_bytes == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "minimum_store_available_bytes".to_owned(),
+                reason: "must be a non-zero explicit policy value".to_owned(),
+            });
+        }
+        validate_installer_effects(
+            profile,
+            &candidate_manifest.runtime_launch.runtime_state_roots,
+            &planned_changes,
+            &installer_effects,
+        )?;
         if profile.is_disposable() && staging_root.as_str().contains("..") {
             return Err(InstallationError::ProfileViolation(
                 "portable staging root must remain repository-local".to_owned(),
             ));
         }
         let rollback_plan = request.rollback_plan.clone();
+        let installer_plan_digest =
+            PlatformHandle::new(sha256_hex(&Self::installer_plan_unsigned_bytes(
+                &transaction_id,
+                &candidate_manifest.runtime_launch.runtime_state_roots,
+                minimum_store_available_bytes,
+                &planned_changes,
+                &installer_effects,
+            )?))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "installer_plan_digest".to_owned(),
+                reason: error.to_string(),
+            })?;
         Ok(Self {
             transaction_id,
             installation_epoch,
@@ -1853,6 +3006,9 @@ impl InstallationTransaction {
             candidate_manifest,
             staging_root,
             planned_changes,
+            installer_effects,
+            minimum_store_available_bytes,
+            installer_plan_digest,
             precondition_evidence,
             stage: InstallationStage::Planned,
             completed_stage_refs: Vec::new(),
@@ -1863,6 +3019,34 @@ impl InstallationTransaction {
             observed_postconditions: Vec::new(),
             recovery_command,
             revision: 1,
+        })
+    }
+
+    fn installer_plan_unsigned_bytes(
+        transaction_id: &PlatformHandle,
+        runtime_state_roots: &RuntimeStateRoots,
+        minimum_store_available_bytes: u64,
+        planned_changes: &[PlannedChange],
+        installer_effects: &[InstallerEffectPlan],
+    ) -> Result<Vec<u8>, InstallationError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            transaction_id: &'a PlatformHandle,
+            runtime_state_roots: &'a RuntimeStateRoots,
+            minimum_store_available_bytes: u64,
+            planned_changes: &'a [PlannedChange],
+            installer_effects: &'a [InstallerEffectPlan],
+        }
+        serde_json::to_vec(&Unsigned {
+            transaction_id,
+            runtime_state_roots,
+            minimum_store_available_bytes,
+            planned_changes,
+            installer_effects,
+        })
+        .map_err(|error| InstallationError::InvalidField {
+            field: "installer_plan".to_owned(),
+            reason: error.to_string(),
         })
     }
 
@@ -1889,6 +3073,35 @@ impl InstallationTransaction {
         handle(&self.staging_root, "staging_root")?;
         handle(&self.rollback_plan, "rollback_plan")?;
         handle(&self.recovery_command, "recovery_command")?;
+        if self.minimum_store_available_bytes == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "minimum_store_available_bytes".to_owned(),
+                reason: "must be a non-zero explicit policy value".to_owned(),
+            });
+        }
+        for change in &self.planned_changes {
+            change.validate()?;
+        }
+        validate_installer_effects(
+            self.profile,
+            &self.candidate_manifest.runtime_launch.runtime_state_roots,
+            &self.planned_changes,
+            &self.installer_effects,
+        )?;
+        sha256_handle(&self.installer_plan_digest, "installer_plan_digest")?;
+        if sha256_hex(&Self::installer_plan_unsigned_bytes(
+            &self.transaction_id,
+            &self.candidate_manifest.runtime_launch.runtime_state_roots,
+            self.minimum_store_available_bytes,
+            &self.planned_changes,
+            &self.installer_effects,
+        )?) != self.installer_plan_digest.as_str()
+        {
+            return Err(InstallationError::InvalidField {
+                field: "installer_plan_digest".to_owned(),
+                reason: "installer plan digest mismatch".to_owned(),
+            });
+        }
         if self.revision == 0 {
             return Err(InstallationError::InvalidField {
                 field: "revision".to_owned(),
@@ -1934,6 +3147,44 @@ impl InstallationTransaction {
             ));
         }
         Ok(())
+    }
+
+    /// Records the real Store-volume observation through this transaction's
+    /// existing fail-closed state machine.
+    pub fn record_store_free_space(
+        &mut self,
+        observation: StoreFreeSpaceObservation,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.validate()?;
+        match observation {
+            StoreFreeSpaceObservation::Known {
+                available_bytes,
+                evidence_refs,
+            } => {
+                handles(&evidence_refs, "free_space.evidence_refs", true)?;
+                if available_bytes < self.minimum_store_available_bytes {
+                    return Ok(InstallationStepOutcome::Rejected);
+                }
+                self.precondition_evidence.extend(evidence_refs.clone());
+                self.revision = self.revision.checked_add(1).ok_or_else(|| {
+                    InstallationError::InvalidField {
+                        field: "revision".to_owned(),
+                        reason: "overflow".to_owned(),
+                    }
+                })?;
+                self.validate()?;
+                Ok(InstallationStepOutcome::Applied {
+                    stage: self.stage,
+                    evidence_refs,
+                })
+            }
+            StoreFreeSpaceObservation::Unknown { evidence_refs } => {
+                self.mark_unknown(evidence_refs.clone())?;
+                Ok(InstallationStepOutcome::RollbackRequired {
+                    pending_refs: evidence_refs,
+                })
+            }
+        }
     }
 
     /// Advances one stage using observed evidence and increments the revision.
@@ -2318,6 +3569,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use eliot_platform_windows::UserOwnedRootLease;
 
     struct KnownEffectPort {
         observation: InstallationEffectObservation,
@@ -2350,11 +3603,146 @@ mod tests {
         test_handle(root.join(name).to_string_lossy().into_owned())
     }
 
+    #[cfg(windows)]
+    fn provision_portable_test_root(path: &Path) {
+        std::fs::create_dir_all(path).unwrap_or_else(|_| unreachable!());
+        drop(must(UserOwnedRootLease::open_existing(path)));
+    }
+
+    fn reseal_roots(roots: &mut RuntimeStateRoots) {
+        roots.roots_digest = test_handle(sha256_hex(&must(roots.unsigned_bytes())));
+    }
+
+    fn installer_plan_parts(
+        roots: &RuntimeStateRoots,
+    ) -> (Vec<PlannedChange>, Vec<InstallerEffectPlan>) {
+        let mut effects = Vec::new();
+        let declared = std::iter::once(&roots.installation_root)
+            .chain(roots.root_fields().into_iter().map(|(_, root)| root))
+            .cloned()
+            .collect::<Vec<_>>();
+        for (index, root) in declared.into_iter().enumerate() {
+            effects.push(InstallerEffectPlan::CreateRoot {
+                effect_id: test_handle(format!("effect:create:{index}")),
+                root: root.clone(),
+            });
+            effects.push(InstallerEffectPlan::ApplyAcl {
+                effect_id: test_handle(format!("effect:acl:{index}")),
+                root,
+                principals: if roots.profile == InstallationProfile::SystemService {
+                    vec![
+                        InstallerAclPrincipal::Administrators,
+                        InstallerAclPrincipal::LocalService,
+                        InstallerAclPrincipal::LocalSystem,
+                    ]
+                } else {
+                    vec![
+                        InstallerAclPrincipal::CurrentUser,
+                        InstallerAclPrincipal::LocalSystem,
+                    ]
+                },
+            });
+        }
+        if roots.profile == InstallationProfile::SystemService {
+            for (role, name, image) in [
+                (
+                    InstallerServiceRole::Host,
+                    "EliotHost",
+                    r"C:\ProgramData\Eliot\packages\canary\eliot-host.exe",
+                ),
+                (
+                    InstallerServiceRole::Watchdog,
+                    "EliotWatchdog",
+                    r"C:\ProgramData\Eliot\packages\canary\eliot-watchdog.exe",
+                ),
+            ] {
+                effects.push(InstallerEffectPlan::RegisterService {
+                    effect_id: test_handle(format!("effect:service:{name}")),
+                    role,
+                    service_name: test_handle(name),
+                    executable_path: test_handle(image),
+                    account: InstallerServiceAccount::LocalService,
+                    automatic_start: true,
+                });
+            }
+        }
+        let changes = effects
+            .iter()
+            .map(|effect| PlannedChange {
+                change_id: effect.effect_id().clone(),
+                target: match effect {
+                    InstallerEffectPlan::CreateRoot { root, .. }
+                    | InstallerEffectPlan::ApplyAcl { root, .. } => root.clone(),
+                    InstallerEffectPlan::RegisterService { service_name, .. } => {
+                        service_name.clone()
+                    }
+                },
+                precondition_refs: vec![test_handle("evidence:installer-precondition")],
+                postcondition_refs: vec![test_handle("evidence:installer-postcondition")],
+            })
+            .collect();
+        (changes, effects)
+    }
+
+    struct FakeRuntimeRootLease {
+        declared_path: String,
+        canonical_path: String,
+        identity: String,
+        reparse_free: bool,
+    }
+
+    impl RuntimeRootLease for FakeRuntimeRootLease {
+        fn declared_path(&self) -> &str {
+            &self.declared_path
+        }
+
+        fn canonical_path(&self) -> &str {
+            &self.canonical_path
+        }
+
+        fn file_identity(&self) -> &str {
+            &self.identity
+        }
+
+        fn is_reparse_free(&self) -> bool {
+            self.reparse_free
+        }
+    }
+
+    struct FakeRuntimeRootLeaseProvider {
+        next: usize,
+        reparse_at: Option<usize>,
+        alias_identity: bool,
+    }
+
+    impl RuntimeRootLeaseProvider for FakeRuntimeRootLeaseProvider {
+        type Lease = FakeRuntimeRootLease;
+
+        fn retain_root(&mut self, root: &PlatformHandle) -> Result<Self::Lease, InstallationError> {
+            let index = self.next;
+            self.next += 1;
+            Ok(FakeRuntimeRootLease {
+                declared_path: root.as_str().to_owned(),
+                canonical_path: root.as_str().to_ascii_uppercase(),
+                identity: if self.alias_identity {
+                    "volume:1:file:shared".to_owned()
+                } else {
+                    format!("volume:1:file:{index}")
+                },
+                reparse_free: self.reparse_at != Some(index),
+            })
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn registering_transaction() -> InstallationTransaction {
         let root = std::env::temp_dir().join("eliot-installation-activate-regression");
+        let portable_directory = root.join("portable");
+        provision_portable_test_root(&portable_directory);
         let candidate_generation = test_handle("generation:candidate");
         let rollback_plan = test_handle("rollback:plan");
+        let portable_root = test_handle(portable_directory.to_string_lossy().into_owned());
+        let runtime_state_roots = must(RuntimeStateRoots::derive_portable(portable_root.clone()));
         let candidate_manifest = CandidateManifest {
             generation: candidate_generation.clone(),
             components: vec![
@@ -2373,10 +3761,11 @@ mod tests {
             config_digest: test_handle("2".repeat(64)),
             supervision_key_fingerprint: test_handle("3".repeat(64)),
             signature_ref: test_handle("evidence:signature"),
+            runtime_state_roots_digest: runtime_state_roots.roots_digest.clone(),
             runtime_launch: {
                 let mut descriptor = RuntimeLaunchDescriptor {
                     profile: InstallationProfile::PortableDev,
-                    portable_root: Some(test_path(&root, "portable")),
+                    portable_root: Some(portable_root.clone()),
                     installation_epoch: InstallationEpoch {
                         installation: test_handle("installation:test"),
                         lineage_id: test_handle("lineage:test"),
@@ -2390,7 +3779,8 @@ mod tests {
                     ),
                     authority_descriptor_path: test_path(&root, "authority.json"),
                     authority_descriptor_digest: test_handle("7".repeat(64)),
-                    kernel_work_root: test_path(&root, "portable"),
+                    runtime_state_roots: runtime_state_roots.clone(),
+                    kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
                     kernel_artifact_digest: test_handle("0".repeat(64)),
                     store_config_path: test_path(&root, "generation.json"),
                     store_bridge_executable_path: test_path(&root, "eliot-store-surreal.exe"),
@@ -2401,7 +3791,7 @@ mod tests {
                     canonical_store_artifact_digest: test_handle("5".repeat(64)),
                     kernel_arguments: vec![
                         test_handle("--work-root"),
-                        test_path(&root, "portable"),
+                        runtime_state_roots.kernel_work_root.clone(),
                         test_handle("--store-bootstrap"),
                         test_path(&root, "store-bootstrap.json"),
                         test_handle("--store-bootstrap-sha256"),
@@ -2413,7 +3803,7 @@ mod tests {
                     ],
                     canonical_store_arguments: vec![
                         test_handle("--portable-dev-root"),
-                        test_path(&root, "portable"),
+                        portable_root,
                         test_handle("--config"),
                         test_path(&root, "generation.json"),
                     ],
@@ -2442,6 +3832,7 @@ mod tests {
             budget: test_handle("budget:test"),
             stop_condition: test_handle("stop:on-failure"),
         };
+        let (planned_changes, installer_effects) = installer_plan_parts(&runtime_state_roots);
         let mut transaction = must(InstallationTransaction::new(
             test_handle("transaction:activate"),
             InstallationEpoch {
@@ -2454,12 +3845,9 @@ mod tests {
             None,
             candidate_manifest,
             test_path(&root, "staging"),
-            vec![PlannedChange {
-                change_id: test_handle("change:activation-pointer"),
-                target: test_handle("target:activation-pointer"),
-                precondition_refs: vec![test_handle("evidence:precondition")],
-                postcondition_refs: vec![test_handle("evidence:postcondition")],
-            }],
+            planned_changes,
+            installer_effects,
+            1,
             vec![test_handle("evidence:plan-precondition")],
             test_handle("recovery:command"),
         ));
@@ -2476,6 +3864,225 @@ mod tests {
             vec![test_handle("evidence:registered")],
         ));
         transaction
+    }
+
+    #[test]
+    fn portable_runtime_roots_accept_distinct_sibling_topology() {
+        let directory = std::env::temp_dir().join("eliot-portable-root-siblings");
+        provision_portable_test_root(&directory);
+        let root = test_handle(directory.to_string_lossy().into_owned());
+        let roots = must(RuntimeStateRoots::derive_portable(root));
+        assert!(roots.validate().is_ok());
+        assert_ne!(roots.kernel_work_root, roots.store_work_root);
+        assert_ne!(roots.store_data_root, roots.store_temp_root);
+    }
+
+    #[test]
+    fn runtime_roots_reject_traversal_and_device_prefixes() {
+        assert!(
+            RuntimeStateRoots::derive_portable(test_handle(r"C:\portable\..\escaped")).is_err()
+        );
+        assert!(RuntimeStateRoots::derive_portable(test_handle(r"\\?\C:\portable\eliot")).is_err());
+    }
+
+    #[test]
+    fn windows_root_overlap_is_case_insensitive_and_component_aware() {
+        let parent = must(WindowsPathIdentity::parse_root(
+            r"C:\Runtime\Store",
+            "parent",
+        ));
+        let child = must(WindowsPathIdentity::parse_root(
+            r"c:/runtime/STORE/data",
+            "child",
+        ));
+        let component_prefix = must(WindowsPathIdentity::parse_root(
+            r"C:\Runtime\Storehouse",
+            "component_prefix",
+        ));
+        assert!(parent.aliases_or_overlaps(&child));
+        assert!(!parent.aliases_or_overlaps(&component_prefix));
+    }
+
+    #[test]
+    fn runtime_roots_reject_system_escape_and_portable_system_alias() {
+        let program_data = must(protected_program_data_root());
+        let unrelated = std::env::temp_dir().join("eliot-wrong-system-anchor");
+        std::fs::create_dir_all(&unrelated).unwrap_or_else(|_| unreachable!());
+        assert!(
+            RuntimeStateRoots::derive_profiled(
+                InstallationProfile::SystemService,
+                test_handle(unrelated.to_string_lossy().into_owned()),
+                &"a".repeat(64),
+            )
+            .is_err(),
+            "SystemService must not silently replace an unproven anchor"
+        );
+        assert!(
+            RuntimeStateRoots::derive_profiled(
+                InstallationProfile::UserMode,
+                test_handle(program_data.to_string_lossy().into_owned()),
+                &"a".repeat(64),
+            )
+            .is_err(),
+            "UserMode must not silently fall back to ProgramData"
+        );
+        let mut system = must(RuntimeStateRoots::derive_profiled(
+            InstallationProfile::SystemService,
+            test_handle(program_data.to_string_lossy().into_owned()),
+            &"b".repeat(64),
+        ));
+        system.store_data_root = test_handle(r"C:\outside\store\data");
+        reseal_roots(&mut system);
+        assert!(system.validate().is_err());
+
+        let profiled = test_handle(format!(
+            r"{}\Eliot\installations\{}",
+            program_data.to_string_lossy(),
+            "c".repeat(64)
+        ));
+        assert!(
+            RuntimeStateRoots::derived(
+                InstallationProfile::PortableDev,
+                profiled.clone(),
+                profiled,
+            )
+            .is_err(),
+            "portable profile must not alias a profiled durable root"
+        );
+    }
+
+    #[test]
+    fn retained_root_hook_rejects_reparse_evidence() {
+        let directory = std::env::temp_dir().join("eliot-retained-root-test");
+        provision_portable_test_root(&directory);
+        let roots = must(RuntimeStateRoots::derive_portable(test_handle(
+            directory.to_string_lossy().into_owned(),
+        )));
+        let mut provider = FakeRuntimeRootLeaseProvider {
+            next: 0,
+            reparse_at: Some(3),
+            alias_identity: false,
+        };
+        assert!(roots.retain_and_validate(&mut provider).is_err());
+
+        let mut provider = FakeRuntimeRootLeaseProvider {
+            next: 0,
+            reparse_at: None,
+            alias_identity: false,
+        };
+        let retained = must(roots.retain_and_validate(&mut provider));
+        assert_eq!(retained.leases().len(), 7);
+
+        let mut provider = FakeRuntimeRootLeaseProvider {
+            next: 0,
+            reparse_at: None,
+            alias_identity: true,
+        };
+        assert!(roots.retain_and_validate(&mut provider).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_provider_retains_portable_roots_by_handle() {
+        let directory = std::env::temp_dir().join("eliot-production-retained-root-test");
+        provision_portable_test_root(&directory);
+        let roots = must(RuntimeStateRoots::derive_portable(test_handle(
+            directory.to_string_lossy().into_owned(),
+        )));
+        for (_, root) in roots.root_fields() {
+            provision_portable_test_root(Path::new(root.as_str()));
+        }
+        let mut provider = must(WindowsRuntimeRootLeaseProvider::for_roots(&roots));
+        let retained = must(roots.retain_and_validate(&mut provider));
+        assert_eq!(retained.leases().len(), 7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_retained_validation_does_not_create_missing_roots_or_sentinel() {
+        let program_data = must(protected_program_data_root());
+        let unique = sha256_hex(
+            format!("{}:{:?}", std::process::id(), std::time::SystemTime::now()).as_bytes(),
+        );
+        let roots = must(RuntimeStateRoots::derive_profiled(
+            InstallationProfile::SystemService,
+            test_handle(program_data.to_string_lossy().into_owned()),
+            &unique,
+        ));
+        assert!(!Path::new(roots.installation_root.as_str()).exists());
+        let mut provider = must(WindowsRuntimeRootLeaseProvider::for_roots(&roots));
+        assert!(roots.retain_and_validate(&mut provider).is_err());
+        assert!(
+            !Path::new(roots.installation_root.as_str()).exists(),
+            "retained validation must not create directories or sentinel files"
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_runtime_root_tampering_after_approval() {
+        let mut manifest = registering_transaction().candidate_manifest;
+        manifest.runtime_launch.runtime_state_roots.store_data_root =
+            test_handle(r"C:\Development\scratch\tampered-store-data");
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn installer_plan_binds_local_service_and_unknown_space_requires_recovery() {
+        let program_data = must(protected_program_data_root());
+        let roots = must(RuntimeStateRoots::derive_profiled(
+            InstallationProfile::SystemService,
+            test_handle(program_data.to_string_lossy().into_owned()),
+            &"d".repeat(64),
+        ));
+        let (changes, effects) = installer_plan_parts(&roots);
+        assert!(
+            validate_installer_effects(
+                InstallationProfile::SystemService,
+                &roots,
+                &changes,
+                &effects,
+            )
+            .is_ok()
+        );
+        assert!(
+            effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    InstallerEffectPlan::RegisterService { account, .. } => Some(account),
+                    _ => None,
+                })
+                .all(|account| *account == InstallerServiceAccount::LocalService)
+        );
+        let mut transaction = registering_transaction();
+        let outcome = must(transaction.record_store_free_space(
+            StoreFreeSpaceObservation::Unknown {
+                evidence_refs: vec![test_handle("failure:free-space-unobserved")],
+            },
+        ));
+        assert!(matches!(
+            outcome,
+            InstallationStepOutcome::RollbackRequired { .. }
+        ));
+        assert_eq!(transaction.stage, InstallationStage::RollbackRequired);
+    }
+
+    #[test]
+    fn installer_effects_have_no_second_transaction_identity() {
+        let mut transaction = registering_transaction();
+        let encoded = must(serde_json::to_value(&transaction));
+        assert!(encoded.get("transaction_id").is_some());
+        let effects = encoded
+            .get("installer_effects")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| unreachable!());
+        assert!(effects.iter().all(|effect| {
+            effect.get("transaction_id").is_none()
+                && effect.get("stage").is_none()
+                && effect.get("disposition").is_none()
+        }));
+
+        transaction.installer_effects[0] = transaction.installer_effects[1].clone();
+        assert!(transaction.validate().is_err());
     }
 
     #[test]
@@ -2618,10 +4225,9 @@ mod tests {
     #[test]
     fn runtime_launch_digest_covers_store_and_authority_inputs() {
         let descriptor = registering_transaction().candidate_manifest.runtime_launch;
-        assert_eq!(
-            descriptor.descriptor_digest.as_str(),
-            "10aece7fcb9a1af26e5c8793d4a0bc5bc913fafc00c45218e95e5bdf2651096f"
-        );
+        assert!(valid_installation_key(
+            descriptor.descriptor_digest.as_str()
+        ));
         let original = descriptor.descriptor_digest.clone();
 
         let mut store_path = descriptor.clone();
@@ -2679,6 +4285,8 @@ mod tests {
             transaction.candidate_manifest.clone(),
             transaction.staging_root.clone(),
             transaction.planned_changes.clone(),
+            transaction.installer_effects.clone(),
+            transaction.minimum_store_available_bytes,
             transaction.precondition_evidence.clone(),
             transaction.recovery_command.clone(),
         );
@@ -2730,7 +4338,11 @@ mod tests {
         assert!(prefix.validate().is_ok());
 
         let valid = registering_transaction().candidate_manifest.runtime_launch;
-        assert_eq!(valid.portable_root.as_ref(), Some(&valid.kernel_work_root));
+        assert_eq!(
+            valid.portable_root.as_ref(),
+            Some(&valid.runtime_state_roots.installation_root)
+        );
+        assert_ne!(valid.portable_root.as_ref(), Some(&valid.kernel_work_root));
         assert!(valid.validate().is_ok());
     }
 
@@ -2764,7 +4376,7 @@ mod tests {
         assert!(approved_path(&test_handle(r"\\?\Volume{abc}\x"), "device_path").is_err());
     }
 
-    fn legacy_registry_value() -> serde_json::Value {
+    fn v1_registry_value() -> serde_json::Value {
         let transaction = registering_transaction();
         let generation = transaction.candidate_manifest.generation.clone();
         let registry = ApprovedGenerationRegistry {
@@ -2782,22 +4394,17 @@ mod tests {
         else {
             panic!("legacy fixture runtime launch");
         };
-        for field in [
-            "installation_epoch",
-            "generation",
-            "authority_generation",
-            "authority_state_fence",
-            "authority_descriptor_path",
-            "authority_descriptor_digest",
-        ] {
-            runtime.remove(field);
-        }
+        runtime.remove("runtime_state_roots");
+        let Some(manifest) = legacy["generations"][0]["manifest"].as_object_mut() else {
+            panic!("v1 fixture manifest");
+        };
+        manifest.remove("runtime_state_roots_digest");
         legacy
     }
 
     #[test]
     fn existing_redb_v1_record_requires_migration_instead_of_becoming_empty() {
-        let legacy_bytes = must(serde_json::to_vec(&legacy_registry_value()));
+        let legacy_bytes = must(serde_json::to_vec(&v1_registry_value()));
 
         let path = std::env::temp_dir().join(format!(
             "eliot-installation-legacy-registry-{}.redb",
@@ -2857,7 +4464,7 @@ mod tests {
         };
         assert!(matches!(error, InstallationError::CorruptRegistry { .. }));
 
-        current = legacy_registry_value();
+        current = v1_registry_value();
         current["unrelated"] = serde_json::json!(true);
         let Err(error) = decode_registry_bytes(&must(serde_json::to_vec(&current))) else {
             panic!("unknown legacy schema must fail closed");
