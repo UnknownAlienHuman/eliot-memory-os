@@ -3,6 +3,9 @@ param(
     [string]$Version = '0.1.0',
     [string]$OutputRoot = (Join-Path $env:LOCALAPPDATA 'Eliot\packages'),
     [string]$OperatorSource,
+    [string]$SurrealExe,
+    [string]$SurrealSha256,
+    [string]$SurrealVersion,
     [switch]$SkipBuild,
     [switch]$PlanOnly,
     [string]$VerifyBundle
@@ -40,6 +43,12 @@ $runtimeArtifactDefinitions = @(
         binary = 'eliot-store-surreal'
         role = 'store_bridge'
         relative_path = 'runtime/eliot-store-surreal.exe'
+    }
+    [pscustomobject]@{
+        package = 'eliotd'
+        binary = 'eliotd'
+        role = 'daemon'
+        relative_path = 'runtime/eliotd.exe'
     }
 )
 
@@ -91,23 +100,121 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
     return @($plan)
 }
 
-function Get-VerifiedRuntimeArtifacts([object[]]$Plan) {
+function Get-VerifiedRuntimeArtifacts([object[]]$Plan, [string]$Version) {
     $artifacts = foreach ($entry in @($Plan)) {
         if (-not (Test-Path -LiteralPath $entry.path -PathType Leaf)) {
             throw "required runtime executable is missing: $($entry.path)"
         }
         $file = Get-Item -LiteralPath $entry.path
         Assert-NoSecretFile $file $entry.relative_path
+        Assert-WindowsX64Pe $file.FullName $entry.relative_path
         [ordered]@{
             package = $entry.package
             binary = $entry.binary
             role = $entry.role
             path = $entry.relative_path
+            source = 'cargo'
+            version = $Version
+            architecture = 'windows-x64'
             sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             bytes = $file.Length
         }
     }
     return @($artifacts)
+}
+
+function Assert-WindowsX64Pe([string]$Path, [string]$RelativePath) {
+    $stream = [System.IO.File]::Open($Path, 'Open', 'Read', 'Read')
+    try {
+        $dos = [byte[]]::new(64)
+        if ($stream.Read($dos, 0, $dos.Length) -ne $dos.Length -or
+            $dos[0] -ne 0x4d -or $dos[1] -ne 0x5a) {
+            throw "release artifact is not a PE executable: $RelativePath"
+        }
+        $peOffset = [System.BitConverter]::ToInt32($dos, 0x3c)
+        if ($peOffset -lt 64 -or $peOffset -gt 16MB -or
+            $stream.Seek($peOffset, [System.IO.SeekOrigin]::Begin) -ne $peOffset) {
+            throw "release artifact has an invalid PE header: $RelativePath"
+        }
+        $header = [byte[]]::new(6)
+        if ($stream.Read($header, 0, $header.Length) -ne $header.Length -or
+            $header[0] -ne 0x50 -or $header[1] -ne 0x45 -or
+            $header[2] -ne 0 -or $header[3] -ne 0) {
+            throw "release artifact has an invalid PE signature: $RelativePath"
+        }
+        $machine = [System.BitConverter]::ToUInt16($header, 4)
+        if ($machine -ne 0x8664) {
+            throw "release artifact is not Windows x64 (machine=0x$('{0:X4}' -f $machine)): $RelativePath"
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Assert-PinnedExternalPath([string]$Path, [string]$Purpose) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [System.IO.Path]::IsPathRooted($Path)) {
+        throw "$Purpose must be an explicit absolute path; PATH and environment lookup are forbidden"
+    }
+    $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
+    $file = Get-Item -LiteralPath $resolved -ErrorAction Stop
+    if (-not ($file -is [System.IO.FileInfo]) -or
+        ($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        -not [string]::IsNullOrWhiteSpace([string]$file.LinkType) -or
+        @($file.Target | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count -ne 0) {
+        throw "$Purpose must be a resident regular non-reparse file: $resolved"
+    }
+    $parent = $file.Directory
+    while ($parent) {
+        if (($parent.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Purpose parent directory is a reparse point: $($parent.FullName)"
+        }
+        $next = $parent.Parent
+        if (-not $next -or $next.FullName -eq $parent.FullName) { break }
+        $parent = $next
+    }
+    return $file
+}
+
+function Get-VerifiedPinnedSurrealArtifact([string]$Path, [string]$ExpectedSha256, [string]$ExpectedVersion) {
+    if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw 'SurrealSha256 must be the caller-supplied 64-character SHA-256 pin'
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedVersion)) {
+        throw 'SurrealVersion must be the caller-supplied exact file version pin'
+    }
+    $file = Assert-PinnedExternalPath $Path 'SurrealExe'
+    if ($file.Name -cne 'surreal.exe') {
+        throw "SurrealExe must name the canonical surreal.exe file: $($file.FullName)"
+    }
+    Assert-NoSecretFile $file 'runtime/surreal.exe'
+    Assert-WindowsX64Pe $file.FullName 'runtime/surreal.exe'
+    $actualSha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $pinnedSha256 = $ExpectedSha256.ToLowerInvariant()
+    if ($actualSha256 -ne $pinnedSha256) {
+        throw "SurrealExe SHA-256 does not match the caller-supplied pin: $($file.FullName)"
+    }
+    $versionOutput = (& $file.FullName version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "SurrealExe version probe failed: $($file.FullName)"
+    }
+    $versionMatch = [regex]::Match($versionOutput, '(?m)^(?<version>[0-9A-Za-z.-]+) for windows on x86_64\s*$')
+    if (-not $versionMatch.Success -or $versionMatch.Groups['version'].Value -cne $ExpectedVersion) {
+        throw "SurrealExe version/architecture does not match the caller-supplied pin: expected '$ExpectedVersion windows x86_64', actual '$versionOutput'"
+    }
+    [ordered]@{
+        package = 'surrealdb'
+        binary = 'surreal'
+        role = 'database'
+        path = 'runtime/surreal.exe'
+        source = 'caller-pinned-absolute-path'
+        version = $ExpectedVersion
+        architecture = 'windows-x64'
+        sha256 = $actualSha256
+        bytes = $file.Length
+        signature_policy = 'pre-release-unsigned'
+        signature_evidence = 'not-issued'
+    }
 }
 
 function Assert-SafeRelativePath([string]$Path, [string]$Purpose) {
@@ -287,6 +394,8 @@ function Test-ReleaseBundle([string]$Path) {
         'runtime/eliot-watchdog.exe',
         'runtime/eliot-kernel.exe',
         'runtime/eliot-store-surreal.exe',
+        'runtime/eliotd.exe',
+        'runtime/surreal.exe',
         'runtime/RUNTIME_ARTIFACTS.json',
         'operator/Eliot.Operator.exe',
         'config',
@@ -331,6 +440,12 @@ function Test-ReleaseBundle([string]$Path) {
     }
 
     $release = Get-Content -LiteralPath (Join-Path $resolved 'RELEASE.json') -Raw | ConvertFrom-Json
+    if ($release.signed -ne $false -or
+        [string]$release.signature_policy -ne 'pre-release-unsigned' -or
+        [string]$release.signature_evidence -ne 'not-issued' -or
+        $release.public_distribution_ready -ne $false) {
+        throw 'RELEASE.json is missing the explicit pre-release signing boundary'
+    }
     $plugin = Get-Content -LiteralPath (Join-Path $codexPluginRoot '.codex-plugin/plugin.json') -Raw | ConvertFrom-Json
     if ([string]$plugin.name -ne 'eliot-governor' -or
         [string]$plugin.version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$' -or
@@ -377,7 +492,9 @@ function Test-ReleaseBundle([string]$Path) {
     if ([string]$runtimeManifest.schema -ne 'eliot-runtime-artifact-set-v1' -or
         [string]$runtimeManifest.source_commit -notmatch '^[0-9a-f]{40}$' -or
         [string]$runtimeManifest.installation_approval -ne 'not-issued' -or
-        $runtimeManifest.signed -ne $false) {
+        $runtimeManifest.signed -ne $false -or
+        [string]$runtimeManifest.signature_policy -ne 'pre-release-unsigned' -or
+        [string]$runtimeManifest.signature_evidence -ne 'not-issued') {
         throw 'runtime artifact manifest is missing its verified-build-only boundary'
     }
     if ([string]$runtimeManifest.source_commit -ne [string]$release.source_commit -or
@@ -387,8 +504,8 @@ function Test-ReleaseBundle([string]$Path) {
     }
     $expectedRuntime = @(Get-RuntimeArtifactDefinitions)
     $declaredRuntime = @($runtimeManifest.artifacts)
-    if ($declaredRuntime.Count -ne $expectedRuntime.Count) {
-        throw "runtime artifact manifest count mismatch: declared=$($declaredRuntime.Count) expected=$($expectedRuntime.Count)"
+    if ($declaredRuntime.Count -ne ($expectedRuntime.Count + 1)) {
+        throw "runtime artifact manifest count mismatch: declared=$($declaredRuntime.Count) expected=$($expectedRuntime.Count + 1)"
     }
     $runtimePaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($expected in $expectedRuntime) {
@@ -400,6 +517,8 @@ function Test-ReleaseBundle([string]$Path) {
         }
         $entry = $entry[0]
         if ([string]$entry.role -ne $expected.role -or [string]$entry.path -ne $expected.relative_path -or
+            [string]$entry.source -ne 'cargo' -or [string]$entry.version -ne [string]$release.version -or
+            [string]$entry.architecture -ne 'windows-x64' -or
             [string]$entry.sha256 -notmatch '^[0-9a-f]{64}$' -or [int64]$entry.bytes -le 0) {
             throw "runtime artifact manifest has invalid metadata for $($expected.package)/$($expected.binary)"
         }
@@ -416,10 +535,58 @@ function Test-ReleaseBundle([string]$Path) {
         if ($actualHash -ne [string]$entry.sha256 -or $file.Length -ne [int64]$entry.bytes) {
             throw "runtime artifact digest mismatch: $relative"
         }
+        Assert-WindowsX64Pe $candidate $relative
+    }
+    $surrealEntries = @($declaredRuntime | Where-Object {
+            [string]$_.package -eq 'surrealdb' -and [string]$_.binary -eq 'surreal'
+        })
+    if ($surrealEntries.Count -ne 1) {
+        throw 'runtime artifact manifest must contain exactly one caller-pinned surrealdb/surreal artifact'
+    }
+    $surrealEntry = $surrealEntries[0]
+    if ([string]$surrealEntry.role -ne 'database' -or
+        [string]$surrealEntry.path -ne 'runtime/surreal.exe' -or
+        [string]$surrealEntry.source -ne 'caller-pinned-absolute-path' -or
+        [string]$surrealEntry.version -ne [string]$runtimeManifest.surreal_version -or
+        [string]$surrealEntry.architecture -ne 'windows-x64' -or
+        [string]$surrealEntry.sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [int64]$surrealEntry.bytes -le 0 -or
+        [string]$surrealEntry.signature_policy -ne 'pre-release-unsigned' -or
+        [string]$surrealEntry.signature_evidence -ne 'not-issued') {
+        throw 'caller-pinned surrealdb artifact metadata is missing or non-canonical'
+    }
+    if (-not $runtimePaths.Add('runtime/surreal.exe')) {
+        throw 'caller-pinned surrealdb artifact path is duplicated'
+    }
+    $surrealPath = Join-Path $resolved 'runtime/surreal.exe'
+    $surrealFile = Get-Item -LiteralPath $surrealPath
+    $surrealVersionOutput = (& $surrealPath version 2>&1 | Out-String).Trim()
+    if ((Get-FileHash -LiteralPath $surrealPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne [string]$surrealEntry.sha256 -or
+        $surrealFile.Length -ne [int64]$surrealEntry.bytes -or
+        [regex]::Match($surrealVersionOutput, '(?m)^(?<version>[0-9A-Za-z.-]+) for windows on x86_64\s*$').Groups['version'].Value -cne [string]$surrealEntry.version) {
+        throw 'caller-pinned surrealdb artifact readback mismatch'
+    }
+    Assert-WindowsX64Pe $surrealPath 'runtime/surreal.exe'
+    $releaseRuntimeEntries = @($release.runtime_artifacts)
+    if ([int]$release.runtime_artifact_count -ne $declaredRuntime.Count -or
+        $releaseRuntimeEntries.Count -ne $declaredRuntime.Count) {
+        throw 'RELEASE.json runtime artifact count does not match RUNTIME_ARTIFACTS.json'
+    }
+    foreach ($entry in $declaredRuntime) {
+        $releaseEntry = @($releaseRuntimeEntries | Where-Object {
+                [string]$_.package -eq [string]$entry.package -and [string]$_.binary -eq [string]$entry.binary
+            })
+        if ($releaseEntry.Count -ne 1 -or
+            [string]$releaseEntry[0].path -ne [string]$entry.path -or
+            [string]$releaseEntry[0].sha256 -ne [string]$entry.sha256 -or
+            [string]$releaseEntry[0].version -ne [string]$entry.version -or
+            [string]$releaseEntry[0].architecture -ne [string]$entry.architecture) {
+            throw 'RELEASE.json runtime artifact binding differs from RUNTIME_ARTIFACTS.json'
+        }
     }
     $actualRuntimeExecutables = @(Get-ChildItem -LiteralPath (Join-Path $resolved 'runtime') -Filter '*.exe' -File |
         ForEach-Object { $_.FullName.Substring($resolved.Length).TrimStart([char]'\').Replace('\', '/') })
-    if ($actualRuntimeExecutables.Count -ne $expectedRuntime.Count -or
+    if ($actualRuntimeExecutables.Count -ne ($expectedRuntime.Count + 1) -or
         @($actualRuntimeExecutables | Where-Object { -not $runtimePaths.Contains($_) }).Count -ne 0) {
         throw 'runtime directory contains an unmanifested executable'
     }
@@ -483,6 +650,7 @@ if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
     throw 'failed to resolve the Cargo target directory'
 }
 $runtimeArtifactPlan = Get-RuntimeArtifactPlan $cargoMetadata
+$verifiedPinnedSurreal = Get-VerifiedPinnedSurrealArtifact $SurrealExe $SurrealSha256 $SurrealVersion
 $governorPath = Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-governor.exe'
 $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
@@ -511,6 +679,13 @@ $plan = [ordered]@{
     codex_plugin_source = $codexPluginSource
     codex_plugin_base_version = $codexPluginBaseVersion
     codex_mcp_profile = 'codex_controller'
+    surreal = [ordered]@{
+        path = $verifiedPinnedSurreal.path
+        sha256 = $verifiedPinnedSurreal.sha256
+        version = $verifiedPinnedSurreal.version
+        architecture = $verifiedPinnedSurreal.architecture
+        source = $verifiedPinnedSurreal.source
+    }
     runtime_artifacts = @($runtimeArtifactPlan | ForEach-Object {
             [ordered]@{
                 package = $_.package
@@ -520,7 +695,7 @@ $plan = [ordered]@{
                 build_path = $_.path
             }
         })
-    includes = @('governor', 'runtime-artifacts', 'operator', 'config', 'integrations', 'codex-marketplace', 'codex-plugin', 'skills', 'migrations', 'operations-runbooks')
+    includes = @('governor', 'runtime-artifacts', 'pinned-surrealdb', 'operator', 'config', 'integrations', 'codex-marketplace', 'codex-plugin', 'skills', 'migrations', 'operations-runbooks')
     signing_required_before_public_distribution = $true
 }
 
@@ -529,7 +704,7 @@ if ($PlanOnly) {
     exit 0
 }
 
-    if (-not $OperatorSource) {
+if (-not $OperatorSource) {
     throw 'OperatorSource is required for every staged release; use -PlanOnly to inspect without artifacts'
 }
 
@@ -545,12 +720,12 @@ try {
     if ($SkipBuild) {
         throw 'SkipBuild is not permitted for staged releases because it cannot prove Governor source provenance'
     }
-    & cargo build --release -p eliot-app --bin eliot-governor
+    & cargo build --locked --offline --release -p eliot-app --bin eliot-governor
     if ($LASTEXITCODE -ne 0) {
         throw "cargo Governor release build failed with exit code $LASTEXITCODE"
     }
     foreach ($artifact in $runtimeArtifactPlan) {
-        & cargo build --release -p $artifact.package --bin $artifact.binary
+        & cargo build --locked --offline --release -p $artifact.package --bin $artifact.binary
         if ($LASTEXITCODE -ne 0) {
             throw "cargo runtime release build failed for $($artifact.package)/$($artifact.binary) with exit code $LASTEXITCODE"
         }
@@ -565,7 +740,7 @@ try {
     if (-not (Test-Path -LiteralPath $governor -PathType Leaf)) {
         throw "release governor executable is missing: $governor"
     }
-    $verifiedRuntimeArtifacts = @(Get-VerifiedRuntimeArtifacts $runtimeArtifactPlan)
+    $verifiedRuntimeArtifacts = @(Get-VerifiedRuntimeArtifacts $runtimeArtifactPlan $Version)
 
     if (Test-Path -LiteralPath $bundle) {
         throw "release bundle already exists; choose another version or output root: $bundle"
@@ -578,6 +753,7 @@ try {
     foreach ($artifact in $runtimeArtifactPlan) {
         Copy-Item -LiteralPath $artifact.path -Destination (Join-Path $bundle $artifact.relative_path)
     }
+    Copy-Item -LiteralPath $SurrealExe -Destination (Join-Path $bundle 'runtime/surreal.exe')
     [ordered]@{
         schema = 'eliot-runtime-artifact-set-v1'
         component = 'eliot_runtime_verified_build_artifacts'
@@ -586,8 +762,11 @@ try {
         architecture = 'windows-x64'
         build_profile = 'release'
         signed = $false
+        signature_policy = 'pre-release-unsigned'
+        signature_evidence = 'not-issued'
         installation_approval = 'not-issued'
-        artifacts = @($verifiedRuntimeArtifacts)
+        surreal_version = $verifiedPinnedSurreal.version
+        artifacts = @($verifiedRuntimeArtifacts + $verifiedPinnedSurreal)
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $runtimeRoot 'RUNTIME_ARTIFACTS.json') -Encoding utf8
     Copy-TrackedTree $repo $sourceCommit 'config' (Join-Path $bundle 'config')
     Copy-TrackedTree $repo $sourceCommit 'integrations' (Join-Path $bundle 'integrations')
@@ -625,9 +804,24 @@ try {
         operator_protocol_hash = $protocolHash
         codex_plugin_base_version = $codexPluginBaseVersion
         runtime_artifacts_manifest = 'runtime/RUNTIME_ARTIFACTS.json'
-        runtime_artifact_count = $runtimeArtifactPlan.Count
+        runtime_artifact_count = $runtimeArtifactPlan.Count + 1
+        runtime_artifacts = @($verifiedRuntimeArtifacts + $verifiedPinnedSurreal | ForEach-Object {
+                [ordered]@{
+                    package = $_.package
+                    binary = $_.binary
+                    role = $_.role
+                    path = $_.path
+                    source = $_.source
+                    version = $_.version
+                    architecture = $_.architecture
+                    sha256 = $_.sha256
+                    bytes = $_.bytes
+                }
+            })
         architecture = 'windows-x64'
         signed = $false
+        signature_policy = 'pre-release-unsigned'
+        signature_evidence = 'not-issued'
         public_distribution_ready = $false
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $bundle 'RELEASE.json') -Encoding utf8
 

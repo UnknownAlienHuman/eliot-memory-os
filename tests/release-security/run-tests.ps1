@@ -16,6 +16,7 @@ $expectedRuntime = @(
     'eliot-watchdog/eliot-watchdog/watchdog/runtime/eliot-watchdog.exe'
     'eliot-kernel/eliot-kernel/kernel/runtime/eliot-kernel.exe'
     'eliot-store-surreal/eliot-store-surreal/store_bridge/runtime/eliot-store-surreal.exe'
+    'eliotd/eliotd/daemon/runtime/eliotd.exe'
 )
 $actualRuntime = @($runtimePlan | ForEach-Object { "$($_.package)/$($_.binary)/$($_.role)/$($_.relative_path)" })
 if ($actualRuntime.Count -ne $expectedRuntime.Count -or
@@ -37,6 +38,28 @@ if (-not $missingRejected) {
     throw 'missing runtime package metadata was not rejected'
 }
 
+$externalPathRejected = $false
+try {
+    Get-VerifiedPinnedSurrealArtifact 'surreal.exe' ('0' * 64) '3.1.4' | Out-Null
+}
+catch {
+    $externalPathRejected = $_.Exception.Message -match 'explicit absolute path'
+}
+if (-not $externalPathRejected) {
+    throw 'implicit PATH/relative surreal.exe resolution was not rejected'
+}
+
+$externalPinRejected = $false
+try {
+    Get-VerifiedPinnedSurrealArtifact (Join-Path $env:SystemRoot 'System32\cmd.exe') ('0' * 64) '3.1.4' | Out-Null
+}
+catch {
+    $externalPinRejected = $_.Exception.Message -match 'resident regular non-reparse|canonical surreal.exe'
+}
+if (-not $externalPinRejected) {
+    throw 'non-canonical surreal executable substitution was not rejected'
+}
+
 $tempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
 $root = Join-Path $tempBase "eliot-release-security-$([guid]::NewGuid().ToString('N'))"
 try {
@@ -44,6 +67,18 @@ try {
     $source = Join-Path $fixtureRepo 'payload'
     $destination = Join-Path $root 'copied'
     New-Item -ItemType Directory -Path $source -Force | Out-Null
+    $notPe = Join-Path $root 'not-pe.exe'
+    Set-Content -LiteralPath $notPe -Value 'not a PE' -Encoding ascii
+    $architectureRejected = $false
+    try {
+        Assert-WindowsX64Pe $notPe 'not-pe.exe'
+    }
+    catch {
+        $architectureRejected = $_.Exception.Message -match 'not a PE executable'
+    }
+    if (-not $architectureRejected) {
+        throw 'non-PE external artifact was not rejected'
+    }
     Set-Content -LiteralPath (Join-Path $source 'tracked.txt') -Value 'tracked release payload' -Encoding utf8
     Set-Content -LiteralPath (Join-Path $source 'untracked.txt') -Value 'must not be staged' -Encoding utf8
     & git -C $fixtureRepo init --quiet
@@ -138,6 +173,9 @@ try {
         utf16_fixture_rejected = $true
         credential_document_name_allowed = $true
         secret_filename_rejected = $true
+        surreal_path_pin_required = $true
+        surreal_filename_pin_rejected = $true
+        non_pe_artifact_rejected = $true
     } | ConvertTo-Json -Depth 3
 }
 finally {
