@@ -167,8 +167,7 @@ cue_bindings:
     cue_value:            # normalized, see 2.2
     match_mode: exact | prefix | signature
     strength: primary | secondary     # primary = author expects direct reuse here
-    expected_reuse_note:  # <= 200 chars, free text: "when will this matter again
-                          # and what will be on screen at that moment"
+    expected_reuse_note:  # optional free text; no architecture-level 200-character cap
 ```
 
 Validation rules (deterministic, in `WriteAdmissionService`):
