@@ -1892,6 +1892,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-blob",
  "eliot-contracts",
+ "eliot-installation",
  "eliot-ipc",
  "eliot-kernel-service",
  "eliot-platform",
@@ -1915,6 +1916,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-platform",
+ "eliot-platform-windows",
  "eliot-protocol",
  "eliot-store-api",
  "futures-util",

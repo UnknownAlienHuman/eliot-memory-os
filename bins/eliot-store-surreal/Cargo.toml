@@ -18,6 +18,7 @@ eliot-blob.workspace = true
 eliot-contracts.workspace = true
 eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true
+eliot-installation.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true

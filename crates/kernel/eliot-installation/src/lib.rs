@@ -1538,7 +1538,9 @@ pub struct RuntimeLaunchDescriptor {
     pub canonical_store_artifact_digest: PlatformHandle,
     /// Exact Kernel child arguments, excluding argv[0].
     pub kernel_arguments: Vec<PlatformHandle>,
-    /// Exact canonical Surreal engine arguments, excluding argv[0].
+    /// Exact Store bridge arguments, excluding argv[0].
+    pub store_bridge_arguments: Vec<PlatformHandle>,
+    /// Exact canonical Surreal provider arguments, excluding argv[0].
     pub canonical_store_arguments: Vec<PlatformHandle>,
     /// Canonical SCM Watchdog image and its approved digest.
     pub watchdog_executable_path: PlatformHandle,
@@ -1549,7 +1551,7 @@ pub struct RuntimeLaunchDescriptor {
 }
 
 impl RuntimeLaunchDescriptor {
-    fn expected_store_arguments(&self, config_path: &PlatformHandle) -> Vec<String> {
+    fn expected_store_bridge_arguments(&self, config_path: &PlatformHandle) -> Vec<String> {
         match self.profile {
             InstallationProfile::PortableDev => vec![
                 "--portable-dev-root".to_owned(),
@@ -1563,6 +1565,60 @@ impl RuntimeLaunchDescriptor {
                 vec!["--config".to_owned(), config_path.as_str().to_owned()]
             }
         }
+    }
+
+    fn validate_canonical_store_arguments(&self) -> Result<(), InstallationError> {
+        let arguments = self
+            .canonical_store_arguments
+            .iter()
+            .map(PlatformHandle::as_str)
+            .collect::<Vec<_>>();
+        let expected_len = 12;
+        if arguments.len() != expected_len
+            || arguments[0] != "start"
+            || arguments[1] != "--no-banner"
+            || arguments[2] != "--bind"
+            || arguments[4] != "--temporary-directory"
+            || !same_windows_root(
+                arguments[5],
+                self.runtime_state_roots.store_temp_root.as_str(),
+            )?
+            || arguments[6] != "--log-file-enabled"
+            || arguments[7] != "--log-file-path"
+            || !same_windows_root(
+                arguments[8],
+                self.runtime_state_roots.store_work_root.as_str(),
+            )?
+            || arguments[9] != "--log-file-name"
+            || arguments[10] != "surrealdb.log"
+            || arguments[11]
+                != format!(
+                    "surrealkv://{}",
+                    self.runtime_state_roots
+                        .store_data_root
+                        .as_str()
+                        .replace('\\', "/")
+                )
+        {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.canonical_store_arguments".to_owned(),
+                reason: "must exactly bind the canonical Surreal provider launch contour"
+                    .to_owned(),
+            });
+        }
+        let bind = arguments[3];
+        let valid_bind = bind
+            .strip_prefix("127.0.0.1:")
+            .or_else(|| bind.strip_prefix("[::1]:"))
+            .and_then(|port| port.parse::<u16>().ok())
+            .is_some_and(|port| port != 0);
+        if !valid_bind {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.canonical_store_arguments".to_owned(),
+                reason: "provider --bind must be an exact nonzero loopback socket".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn expected_kernel_arguments(&self, config_path: &PlatformHandle) -> Vec<String> {
@@ -1594,10 +1650,10 @@ impl RuntimeLaunchDescriptor {
                 reason: "must exactly equal the approved concrete Store config".to_owned(),
             });
         }
-        let expected_store = self.expected_store_arguments(config_path);
+        let expected_store = self.expected_store_bridge_arguments(config_path);
         let expected_kernel = self.expected_kernel_arguments(config_path);
         let actual_store = self
-            .canonical_store_arguments
+            .store_bridge_arguments
             .iter()
             .map(|value| value.as_str().to_owned())
             .collect::<Vec<_>>();
@@ -1608,7 +1664,7 @@ impl RuntimeLaunchDescriptor {
             .collect::<Vec<_>>();
         if actual_store != expected_store {
             return Err(InstallationError::InvalidField {
-                field: "runtime_launch.canonical_store_arguments".to_owned(),
+                field: "runtime_launch.store_bridge_arguments".to_owned(),
                 reason: "must exactly select the approved generation config".to_owned(),
             });
         }
@@ -1618,6 +1674,7 @@ impl RuntimeLaunchDescriptor {
                 reason: "must exactly select the approved generation config".to_owned(),
             });
         }
+        self.validate_canonical_store_arguments()?;
         Ok(())
     }
 
@@ -1643,6 +1700,7 @@ impl RuntimeLaunchDescriptor {
             kernel_arguments: &'a [PlatformHandle],
             store_bridge_executable_path: &'a PlatformHandle,
             store_bridge_artifact_digest: &'a PlatformHandle,
+            store_bridge_arguments: &'a [PlatformHandle],
             canonical_store_arguments: &'a [PlatformHandle],
             watchdog_executable_path: &'a PlatformHandle,
             watchdog_artifact_digest: &'a PlatformHandle,
@@ -1667,6 +1725,7 @@ impl RuntimeLaunchDescriptor {
             kernel_arguments: &self.kernel_arguments,
             store_bridge_executable_path: &self.store_bridge_executable_path,
             store_bridge_artifact_digest: &self.store_bridge_artifact_digest,
+            store_bridge_arguments: &self.store_bridge_arguments,
             canonical_store_arguments: &self.canonical_store_arguments,
             watchdog_executable_path: &self.watchdog_executable_path,
             watchdog_artifact_digest: &self.watchdog_artifact_digest,
@@ -1869,6 +1928,10 @@ impl RuntimeLaunchDescriptor {
         for (arguments, field) in [
             (&self.kernel_arguments, "runtime_launch.kernel_arguments"),
             (
+                &self.store_bridge_arguments,
+                "runtime_launch.store_bridge_arguments",
+            ),
+            (
                 &self.canonical_store_arguments,
                 "runtime_launch.canonical_store_arguments",
             ),
@@ -1877,6 +1940,19 @@ impl RuntimeLaunchDescriptor {
                 handle(argument, field)?;
             }
         }
+        let expected_store_bridge = self.expected_store_bridge_arguments(&self.store_config_path);
+        let actual_store_bridge = self
+            .store_bridge_arguments
+            .iter()
+            .map(|value| value.as_str().to_owned())
+            .collect::<Vec<_>>();
+        if actual_store_bridge != expected_store_bridge {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.store_bridge_arguments".to_owned(),
+                reason: "must exactly select the descriptor-bound Store config".to_owned(),
+            });
+        }
+        self.validate_canonical_store_arguments()?;
         sha256_handle(&self.descriptor_digest, "runtime_launch.descriptor_digest")?;
         if sha256_hex(&self.unsigned_bytes()?) != self.descriptor_digest.as_str() {
             return Err(InstallationError::InvalidField {
@@ -2048,6 +2124,30 @@ impl CandidateManifest {
             &self.config_path,
         )
     }
+
+    /// Returns the two Host-owned child image digests: Kernel and Store
+    /// bridge. The canonical Surreal provider is launched only inside the
+    /// validated Store bridge boundary.
+    pub fn host_child_artifact_digests(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.kernel_artifact_digest,
+            &self.store_bridge_artifact_digest,
+        ))
+    }
+
+    /// Returns the exact Kernel, Store bridge, and Store config paths consumed
+    /// by Host. The canonical Surreal provider path never crosses this launch
+    /// seam as a direct Host child.
+    pub fn host_child_paths(&self) -> (&PlatformHandle, &PlatformHandle, &PlatformHandle) {
+        (
+            &self.kernel_executable_path,
+            &self.store_bridge_executable_path,
+            &self.config_path,
+        )
+    }
 }
 
 /// One artifact generation admitted by installation policy.
@@ -2168,6 +2268,88 @@ struct LegacyRuntimeLaunchDescriptor {
 
 #[allow(
     dead_code,
+    reason = "pre-split wire mirror is used for strict argv migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreSplitRegistryWire {
+    generations: Vec<PreSplitApprovedGenerationWire>,
+    active_generation: Option<PlatformHandle>,
+    last_known_good_generation: Option<PlatformHandle>,
+}
+
+#[allow(
+    dead_code,
+    reason = "pre-split wire mirror is used for strict argv migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreSplitApprovedGenerationWire {
+    manifest: PreSplitCandidateManifestWire,
+    approval_ref: PlatformHandle,
+    active: bool,
+    last_known_good: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "pre-split wire mirror is used for strict argv migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreSplitCandidateManifestWire {
+    generation: PlatformHandle,
+    components: Vec<PlatformHandle>,
+    kernel_artifact_digest: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    kernel_executable_path: PlatformHandle,
+    store_bridge_executable_path: PlatformHandle,
+    canonical_store_executable_path: PlatformHandle,
+    config_path: PlatformHandle,
+    dependency_closure_refs: Vec<PlatformHandle>,
+    license_refs: Vec<PlatformHandle>,
+    config_digest: PlatformHandle,
+    supervision_key_fingerprint: PlatformHandle,
+    signature_ref: PlatformHandle,
+    runtime_state_roots_digest: PlatformHandle,
+    runtime_launch: PreSplitRuntimeLaunchDescriptorWire,
+}
+
+#[allow(
+    dead_code,
+    reason = "pre-split wire mirror is used for strict argv migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreSplitRuntimeLaunchDescriptorWire {
+    profile: InstallationProfile,
+    portable_root: Option<PlatformHandle>,
+    installation_epoch: InstallationEpoch,
+    generation: PlatformHandle,
+    authority_generation: ResourceGeneration,
+    authority_state_fence: StateFence,
+    authority_descriptor_path: PlatformHandle,
+    authority_descriptor_digest: PlatformHandle,
+    runtime_state_roots: RuntimeStateRoots,
+    kernel_work_root: PlatformHandle,
+    kernel_artifact_digest: PlatformHandle,
+    store_config_path: PlatformHandle,
+    store_bridge_executable_path: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    store_bootstrap_descriptor_path: PlatformHandle,
+    store_bootstrap_descriptor_digest: PlatformHandle,
+    canonical_store_executable_path: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    kernel_arguments: Vec<PlatformHandle>,
+    canonical_store_arguments: Vec<PlatformHandle>,
+    watchdog_executable_path: PlatformHandle,
+    watchdog_artifact_digest: PlatformHandle,
+    descriptor_digest: PlatformHandle,
+}
+
+#[allow(
+    dead_code,
     reason = "v1 wire mirror is used for strict major-version migration discrimination"
 )]
 #[derive(Deserialize)]
@@ -2257,7 +2439,12 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             Ok(registry)
         }
         Err(_) => {
-            if serde_json::from_slice::<V1RegistryWire>(bytes).is_ok() {
+            if serde_json::from_slice::<PreSplitRegistryWire>(bytes).is_ok() {
+                Err(InstallationError::MigrationRequired {
+                    reason: "approved-generation registry predates split Store bridge/provider argv and requires explicit re-stage"
+                        .to_owned(),
+                })
+            } else if serde_json::from_slice::<V1RegistryWire>(bytes).is_ok() {
                 Err(InstallationError::MigrationRequired {
                     reason: "approved-generation registry v1 requires explicit re-stage; runtime roots cannot be synthesized"
                         .to_owned(),
@@ -4780,11 +4967,31 @@ mod tests {
                         test_handle("--authority-descriptor-sha256"),
                         test_handle("7".repeat(64)),
                     ],
-                    canonical_store_arguments: vec![
+                    store_bridge_arguments: vec![
                         test_handle("--portable-dev-root"),
                         portable_root,
                         test_handle("--config"),
                         test_path(&root, "generation.json"),
+                    ],
+                    canonical_store_arguments: vec![
+                        test_handle("start"),
+                        test_handle("--no-banner"),
+                        test_handle("--bind"),
+                        test_handle("127.0.0.1:8000"),
+                        test_handle("--temporary-directory"),
+                        runtime_state_roots.store_temp_root.clone(),
+                        test_handle("--log-file-enabled"),
+                        test_handle("--log-file-path"),
+                        runtime_state_roots.store_work_root.clone(),
+                        test_handle("--log-file-name"),
+                        test_handle("surrealdb.log"),
+                        test_handle(format!(
+                            "surrealkv://{}",
+                            runtime_state_roots
+                                .store_data_root
+                                .as_str()
+                                .replace('\\', "/")
+                        )),
                     ],
                     watchdog_executable_path: test_path(&root, "eliot-watchdog.exe"),
                     watchdog_artifact_digest: test_handle("4".repeat(64)),
@@ -5592,27 +5799,27 @@ mod tests {
                 descriptor.authority_descriptor_digest.as_str(),
             ]
         );
-        assert_eq!(descriptor.canonical_store_arguments[2].as_str(), "--config");
+        assert_eq!(descriptor.store_bridge_arguments[2].as_str(), "--config");
         assert!(descriptor.validate().is_ok());
         let config = &transaction.candidate_manifest.config_path;
         assert!(descriptor.validate_for_config(config).is_ok());
 
         let mut tampered = descriptor.clone();
-        tampered.canonical_store_arguments[0] = test_handle("--outside-root");
+        tampered.store_bridge_arguments[0] = test_handle("--outside-root");
         assert!(tampered.validate_for_config(config).is_err());
 
         let mut missing_config = descriptor.clone();
-        missing_config.canonical_store_arguments.truncate(2);
+        missing_config.store_bridge_arguments.truncate(2);
         assert!(missing_config.validate_for_config(config).is_err());
 
         let mut duplicate_config = descriptor.clone();
         duplicate_config
-            .canonical_store_arguments
+            .store_bridge_arguments
             .push(test_handle(config.as_str()));
         assert!(duplicate_config.validate_for_config(config).is_err());
 
         let mut alternate_config = descriptor.clone();
-        alternate_config.canonical_store_arguments[3] = test_path(
+        alternate_config.store_bridge_arguments[3] = test_path(
             &std::env::temp_dir(),
             "eliot-installation-alternate-config.json",
         );
@@ -5674,6 +5881,43 @@ mod tests {
         let mut wrong_authority_order = descriptor.clone();
         wrong_authority_order.kernel_arguments.swap(6, 8);
         assert!(wrong_authority_order.validate_for_config(config).is_err());
+    }
+
+    #[test]
+    fn host_child_materialization_selects_bridge_not_provider() {
+        let transaction = registering_transaction();
+        let manifest = &transaction.candidate_manifest;
+        let (_, host_store_path, _) = manifest.host_child_paths();
+        let (_, host_store_digest) = must(manifest.host_child_artifact_digests());
+        assert_eq!(host_store_path, &manifest.store_bridge_executable_path);
+        assert_eq!(host_store_digest, &manifest.store_bridge_artifact_digest);
+        assert_ne!(host_store_path, &manifest.canonical_store_executable_path);
+    }
+
+    #[test]
+    fn split_store_argv_rejects_resealed_semantic_substitution() {
+        let descriptor = registering_transaction().candidate_manifest.runtime_launch;
+        let mut bridge_tamper = descriptor.clone();
+        bridge_tamper.store_bridge_arguments[0] = test_handle("--outside-root");
+        bridge_tamper.descriptor_digest =
+            test_handle(sha256_hex(&must(bridge_tamper.unsigned_bytes())));
+        assert!(bridge_tamper.validate().is_err());
+
+        let mut provider_bind_change = descriptor.clone();
+        provider_bind_change.canonical_store_arguments[3] = test_handle("127.0.0.1:9000");
+        provider_bind_change.descriptor_digest =
+            test_handle(sha256_hex(&must(provider_bind_change.unsigned_bytes())));
+        assert!(provider_bind_change.validate().is_ok());
+
+        let mut provider_root_substitution = descriptor;
+        provider_root_substitution.canonical_store_arguments[5] = provider_root_substitution
+            .runtime_state_roots
+            .store_work_root
+            .clone();
+        provider_root_substitution.descriptor_digest = test_handle(sha256_hex(&must(
+            provider_root_substitution.unsigned_bytes(),
+        )));
+        assert!(provider_root_substitution.validate().is_err());
     }
 
     #[test]
@@ -5848,12 +6092,47 @@ mod tests {
         else {
             panic!("legacy fixture runtime launch");
         };
+        runtime.remove("store_bridge_arguments");
         runtime.remove("runtime_state_roots");
         let Some(manifest) = legacy["generations"][0]["manifest"].as_object_mut() else {
             panic!("v1 fixture manifest");
         };
         manifest.remove("runtime_state_roots_digest");
         legacy
+    }
+
+    fn pre_split_registry_value() -> serde_json::Value {
+        let transaction = registering_transaction();
+        let generation = transaction.candidate_manifest.generation.clone();
+        let registry = ApprovedGenerationRegistry {
+            generations: vec![ApprovedGeneration {
+                manifest: transaction.candidate_manifest,
+                approval_ref: test_handle("approval:pre-split"),
+                active: true,
+                last_known_good: false,
+            }],
+            active_generation: Some(generation),
+            last_known_good_generation: None,
+        };
+        let mut value = must(serde_json::to_value(registry));
+        let Some(runtime) = value["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
+        else {
+            panic!("pre-split fixture runtime launch");
+        };
+        let bridge_arguments = runtime
+            .remove("store_bridge_arguments")
+            .unwrap_or_else(|| panic!("pre-split bridge arguments"));
+        runtime.insert("canonical_store_arguments".to_owned(), bridge_arguments);
+        value
+    }
+
+    #[test]
+    fn pre_split_argv_registry_requires_explicit_restage() {
+        let bytes = must(serde_json::to_vec(&pre_split_registry_value()));
+        assert!(matches!(
+            decode_registry_bytes(&bytes),
+            Err(InstallationError::MigrationRequired { .. })
+        ));
     }
 
     #[test]

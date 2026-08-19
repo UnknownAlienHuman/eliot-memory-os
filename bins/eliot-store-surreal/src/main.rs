@@ -2,10 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(windows)]
-use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-    SourceId, StateFence,
-};
+use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId};
 #[cfg(windows)]
 use eliot_ipc::NamedPipeServer;
 use eliot_ipc::TransportLimits;
@@ -18,7 +15,8 @@ use eliot_protocol::{
 };
 use eliot_store_surreal::{
     SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch, load_config,
-    load_portable_dev_config, store_bootstrap_descriptor, validate_request_frame,
+    load_portable_dev_config, require_semantic_ready_for_pipe, store_bootstrap_descriptor,
+    validate_request_frame,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -69,6 +67,12 @@ async fn run() -> Result<(), String> {
         return Ok(());
     };
     let composition = StoreComposition::new(&config)?;
+    composition.connect().await?;
+    let readiness = composition
+        .readiness()
+        .await
+        .map_err(|error| format!("semantic Store readiness failed: {error}"))?;
+    require_semantic_ready_for_pipe(&readiness, &config.schema_generation)?;
 
     let limits = TransportLimits::default();
     let expectation = eliot_platform_windows::NamedPipePeerExpectation::new(
@@ -120,7 +124,7 @@ async fn run() -> Result<(), String> {
             .await
             .map_err(|error| format!("EBP frame rejected: {error}"))?;
         let response = match validate_request_frame(&mut session, &frame) {
-            Ok(request) => dispatch(&composition, request).await,
+            Ok(request) => Box::pin(dispatch(&composition, request)).await,
             Err(error) => eliot_store_surreal::Response::Error { error },
         };
         let response_frame = eliot_store_api::response_frame(
@@ -162,6 +166,7 @@ async fn prepare_launch(
             let config = load_portable_dev_config(&root, &config_path)?;
             if initialize_schema_only {
                 let composition = StoreComposition::new(&config)?;
+                composition.connect().await?;
                 let clock = read_portable_dev_clock(&config)?;
                 let receipt = composition
                     .apply_initial_schema_migration(&clock)
@@ -190,10 +195,6 @@ async fn prepare_launch(
 fn read_portable_dev_clock(
     config: &eliot_store_surreal::StoreLaunchConfig,
 ) -> Result<eliot_platform::ClockObservation, String> {
-    let authority_epoch = AuthorityEpoch::new(config.authority_epoch)
-        .map_err(|error| format!("invalid clock authority epoch: {error}"))?;
-    let resource_generation = ResourceGeneration::new(config.store_generation)
-        .map_err(|error| format!("invalid clock resource generation: {error}"))?;
     let request = ClockRequest {
         context: RequestMetadata {
             request_id: RequestId::new(format!(
@@ -207,7 +208,7 @@ fn read_portable_dev_clock(
                 .map_err(|error| format!("invalid clock product id: {error}"))?,
             source_id: SourceId::new(config.instance_id.clone())
                 .map_err(|error| format!("invalid clock source id: {error}"))?,
-            state_fence: StateFence::new(authority_epoch, resource_generation),
+            state_fence: config.runtime_launch.authority_state_fence.clone(),
             clock: ClockReading::default(),
         },
     };

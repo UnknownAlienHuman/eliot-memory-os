@@ -8,6 +8,7 @@ description = "Sole SurrealDB credential and client owner for the ELIOT canonica
 
 [dependencies]
 eliot-platform.workspace = true
+eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
 eliot-store-api.workspace = true
 futures-util.workspace = true

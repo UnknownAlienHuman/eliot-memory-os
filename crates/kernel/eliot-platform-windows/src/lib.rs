@@ -26,6 +26,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod tcp_listener_owner;
+
+pub use tcp_listener_owner::{
+    TcpListenerOwnerError, TcpListenerOwnerObservation, observe_loopback_tcp_listener_owner,
+};
+
 /// Failure returned by a Windows-only primitive before it can be projected
 /// into a provider-neutral P-01 outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6009,6 +6015,50 @@ impl RetainedProcessPathLease {
         #[cfg(not(windows))]
         {
             let _ = (executable, working_directory, expected_sha256);
+            Err(PortError::Provider(provider_failed()))
+        }
+    }
+
+    /// Revalidates the retained executable/work-root/digest proof and observes
+    /// the exact live process identity for one child PID.
+    ///
+    /// The observed image path and file identity must still project to the
+    /// retained executable. Callers must compare the complete returned value
+    /// across security-sensitive observations so PID reuse and image changes
+    /// fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidPath` or a typed provider failure when the retained
+    /// path proof, process query, image path, or image file identity cannot be
+    /// proven.
+    pub fn validate_process_identity(
+        &self,
+        process_id: u32,
+        executable: &Path,
+        working_directory: &Path,
+        expected_sha256: &str,
+    ) -> Result<ProcessIdentity, PortError> {
+        self.validate(executable, working_directory, expected_sha256)?;
+        if process_id == 0 {
+            return Err(PortError::InvalidPath);
+        }
+        #[cfg(windows)]
+        {
+            let identity = inspect_process_identity(process_id)
+                .map_err(|error| PortError::Provider(provider_from_io(&error)))?;
+            if !same_windows_path(&identity.image_path, &executable.to_string_lossy())
+                || file_identity(Path::new(&identity.image_path))
+                    .map_err(|error| PortError::Provider(provider_from_io(&error)))?
+                    != self.executable_identity
+            {
+                return Err(PortError::InvalidPath);
+            }
+            Ok(identity)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = process_id;
             Err(PortError::Provider(provider_failed()))
         }
     }

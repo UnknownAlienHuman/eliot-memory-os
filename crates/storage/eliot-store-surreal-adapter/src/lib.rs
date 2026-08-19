@@ -31,6 +31,7 @@ pub use config::{
     SurrealAdapterConfig,
 };
 use eliot_platform::ClockObservation;
+use eliot_platform_windows::RetainedProcessPathLease;
 use eliot_store_api::{
     CONTRACT_VERSION, CanonicalStoreClient, CanonicalValidationSnapshot, EffectClass,
     NamedOperationManifest, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
@@ -46,7 +47,8 @@ pub use readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 /// store.
 pub struct SurrealStoreAdapter {
     pub(crate) config: SurrealAdapterConfig,
-    pub(crate) client: tokio::sync::OnceCell<client::RpcTransport>,
+    pub(crate) provider_process_lease: RetainedProcessPathLease,
+    pub(crate) client: tokio::sync::OnceCell<Result<client::RpcTransport, AdapterError>>,
     pub(crate) write_lock: tokio::sync::Mutex<()>,
     /// Immutable closed operation manifest admitted by this adapter instance.
     pub(crate) operation_manifest: NamedOperationManifest,
@@ -57,7 +59,8 @@ impl fmt::Debug for SurrealStoreAdapter {
         formatter
             .debug_struct("SurrealStoreAdapter")
             .field("config", &self.config)
-            .field("connected", &self.client.get().is_some())
+            .field("provider_process_lease", &self.provider_process_lease)
+            .field("connected", &self.client.get().is_some_and(Result::is_ok))
             .field("write_lock", &"private")
             .field("operation_manifest", &self.operation_manifest)
             .finish()
@@ -66,13 +69,31 @@ impl fmt::Debug for SurrealStoreAdapter {
 
 impl SurrealStoreAdapter {
     /// Builds an adapter with the given connection and generation settings.
-    pub fn new(config: SurrealAdapterConfig) -> Self {
-        Self {
+    pub fn new(
+        config: SurrealAdapterConfig,
+        provider_process_lease: RetainedProcessPathLease,
+    ) -> Result<Self, AdapterError> {
+        config
+            .validate()
+            .map_err(|error| AdapterError::Config(error.to_string()))?;
+        provider_process_lease
+            .validate(
+                std::path::Path::new(&config.provider_executable_path),
+                std::path::Path::new(&config.store_work_root),
+                &config.provider_artifact_digest,
+            )
+            .map_err(|_| {
+                AdapterError::Config(
+                    "canonical provider process lease failed identity validation".to_owned(),
+                )
+            })?;
+        Ok(Self {
             config,
+            provider_process_lease,
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
             operation_manifest: default_manifest(),
-        }
+        })
     }
 
     /// Builds an adapter with an explicit immutable manifest supplied by the
@@ -80,11 +101,21 @@ impl SurrealStoreAdapter {
     /// replaced while the adapter is live.
     pub fn new_with_manifest(
         config: SurrealAdapterConfig,
+        provider_process_lease: RetainedProcessPathLease,
         manifest: NamedOperationManifest,
     ) -> Result<Self, StoreError> {
+        config.validate().map_err(|_| StoreError::Unavailable)?;
+        provider_process_lease
+            .validate(
+                std::path::Path::new(&config.provider_executable_path),
+                std::path::Path::new(&config.store_work_root),
+                &config.provider_artifact_digest,
+            )
+            .map_err(|_| StoreError::Unavailable)?;
         manifest.validate()?;
         Ok(Self {
             config,
+            provider_process_lease,
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
             operation_manifest: manifest,
@@ -276,8 +307,31 @@ mod tests {
             endpoint: "ws://127.0.0.1:18000/rpc".to_owned(),
             namespace: "eliot".to_owned(),
             database: "eliot".to_owned(),
-            username: "root".to_owned(),
+            username: "provider-user".to_owned(),
             password: SecretString::new("test-secret".into()),
+            provider_bind_address: "127.0.0.1:18000".to_owned(),
+            installation_id: "installation-test".to_owned(),
+            installation_profile: "portable_dev".to_owned(),
+            runtime_state_roots_digest: "a".repeat(64),
+            provider_executable_path: r"C:\eliot\surreal.exe".to_owned(),
+            provider_artifact_digest: "b".repeat(64),
+            provider_arguments: vec![
+                "start".to_owned(),
+                "--no-banner".to_owned(),
+                "--bind".to_owned(),
+                "127.0.0.1:18000".to_owned(),
+                "--temporary-directory".to_owned(),
+                r"C:\eliot\store\tmp".to_owned(),
+                "--log-file-enabled".to_owned(),
+                "--log-file-path".to_owned(),
+                r"C:\eliot\store\work".to_owned(),
+                "--log-file-name".to_owned(),
+                "surrealdb.log".to_owned(),
+                "surrealkv://C:/eliot/store/data".to_owned(),
+            ],
+            store_data_root: r"C:\eliot\store\data".to_owned(),
+            store_work_root: r"C:\eliot\store\work".to_owned(),
+            store_temp_root: r"C:\eliot\store\tmp".to_owned(),
             connect_timeout_ms: 1_000,
             query_timeout_ms: 1_000,
             expected_provider_major: PINNED_SURREALDB_MAJOR,
@@ -287,9 +341,9 @@ mod tests {
 
     #[test]
     fn adapter_debug_redacts_credentials() {
-        let adapter = SurrealStoreAdapter::new(config());
-        let rendered = format!("{adapter:?}");
+        let rendered = format!("{:?}", config());
         assert!(!rendered.contains("test-secret"));
-        assert!(rendered.contains("connected"));
+        assert!(!rendered.contains("provider-user"));
+        assert!(rendered.contains("REDACTED"));
     }
 }

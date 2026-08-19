@@ -12,7 +12,11 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use eliot_blob::BlobRootOwner;
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::StateFence;
+use eliot_installation::{
+    InstallationProfile, RuntimeLaunchDescriptor, ValidatedRuntimeRootLeases,
+    WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
+};
 use eliot_ipc::{ReplayDisposition, ReplayLedger, TransportLimits};
 use eliot_kernel_service::{
     HostStoreBootstrapRequirement, STORE_MODULE_IDENTITY, STORE_ROUTE_IDENTITY,
@@ -32,7 +36,9 @@ use eliot_store_api::{
     PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey,
     StoreError, StoreHealth, WriteReceipt, decode_request_frame,
 };
-pub use eliot_store_api::{ReadinessReceipt, StoreRequest as Request, StoreResponse as Response};
+pub use eliot_store_api::{
+    ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
+};
 use eliot_store_surreal_adapter::{
     AdapterError, MigrationReceipt, PINNED_SURREALDB_MAJOR, SchemaGeneration, SemanticReadiness,
     SurrealAdapterConfig, SurrealStoreAdapter,
@@ -79,12 +85,12 @@ fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
 
 /// Explicit, target-only process launch configuration.
 ///
-/// This is intentionally not the legacy governor configuration.  The process
-/// accepts only the connection coordinates, bounded timeouts, schema
-/// generation, one Blob root, one process identity, and an opaque credential
-/// reference.  Credential bytes are resolved after validation and never cross
-/// this type or the EBP wire surface.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// This is intentionally not the legacy governor configuration. The process
+/// accepts the complete canonical [`RuntimeLaunchDescriptor`] together with
+/// Store-only connection coordinates, bounded timeouts, schema generation,
+/// one Blob root and an opaque credential reference. Credential bytes are
+/// resolved after validation and never cross this type or the EBP wire surface.
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreLaunchConfig {
     pub store_pipe: String,
@@ -95,9 +101,9 @@ pub struct StoreLaunchConfig {
     pub expected_client_session_id: u32,
     pub approved_artifact_hash: String,
     pub approved_config_hash: String,
-    pub store_generation: u64,
-    pub authority_epoch: u64,
     pub endpoint: String,
+    /// Exact loopback bind address owned by this Store instance's provider.
+    pub provider_bind_address: String,
     pub namespace: String,
     pub database: String,
     pub username: String,
@@ -107,6 +113,8 @@ pub struct StoreLaunchConfig {
     pub blob_root: String,
     pub instance_id: String,
     pub credential_ref: String,
+    /// Exact, self-digested Host-owned runtime launch contour.
+    pub runtime_launch: RuntimeLaunchDescriptor,
 }
 
 impl StoreLaunchConfig {
@@ -130,12 +138,35 @@ impl StoreLaunchConfig {
                     .to_owned(),
             );
         }
-        if self.store_generation == 0 || self.authority_epoch == 0 {
-            return Err("store_generation and authority_epoch must be non-zero".to_owned());
+        self.runtime_launch
+            .validate()
+            .map_err(|error| format!("invalid runtime_launch: {error}"))?;
+        if self.approved_artifact_hash != self.runtime_launch.store_bridge_artifact_digest.as_str()
+        {
+            return Err(
+                "approved_artifact_hash must equal runtime_launch.store_bridge_artifact_digest"
+                    .to_owned(),
+            );
         }
         validate_launch_text(&self.endpoint, "endpoint")?;
-        if !self.endpoint.starts_with("ws://") && !self.endpoint.starts_with("wss://") {
-            return Err("endpoint must start with ws:// or wss://".to_owned());
+        validate_provider_bind_address(&self.provider_bind_address)?;
+        if self.endpoint != format!("ws://{}/rpc", self.provider_bind_address) {
+            return Err(
+                "endpoint must exactly match the explicit loopback provider bind address"
+                    .to_owned(),
+            );
+        }
+        let descriptor_provider_arguments = self
+            .runtime_launch
+            .canonical_store_arguments
+            .iter()
+            .map(|argument| argument.as_str().to_owned())
+            .collect::<Vec<_>>();
+        if descriptor_provider_arguments != expected_provider_arguments(self) {
+            return Err(
+                "runtime_launch canonical provider argv does not exactly match Store coordinates"
+                    .to_owned(),
+            );
         }
         validate_launch_text(&self.namespace, "namespace")?;
         validate_launch_text(&self.database, "database")?;
@@ -154,6 +185,52 @@ impl StoreLaunchConfig {
         }
         Ok(())
     }
+
+    /// Validates the exact Host materialization path in addition to the
+    /// descriptor and operational config digests.
+    pub fn validate_materialized_at(&self, config_path: &Path) -> Result<(), String> {
+        self.validate()?;
+        if !config_path.is_absolute() {
+            return Err("materialized Store config path must be absolute".to_owned());
+        }
+        let config_path = PlatformHandle::new(config_path.to_string_lossy().into_owned())
+            .map_err(|error| format!("invalid materialized Store config path: {error}"))?;
+        self.runtime_launch
+            .validate_for_config(&config_path)
+            .map_err(|error| format!("runtime launch/config materialization mismatch: {error}"))
+    }
+
+    const fn authority_epoch(&self) -> u64 {
+        self.runtime_launch
+            .authority_state_fence
+            .authority_epoch
+            .value()
+    }
+
+    const fn store_generation(&self) -> u64 {
+        self.runtime_launch.authority_generation.value()
+    }
+}
+
+fn expected_provider_arguments(config: &StoreLaunchConfig) -> Vec<String> {
+    let roots = &config.runtime_launch.runtime_state_roots;
+    vec![
+        "start".to_owned(),
+        "--no-banner".to_owned(),
+        "--bind".to_owned(),
+        config.provider_bind_address.clone(),
+        "--temporary-directory".to_owned(),
+        roots.store_temp_root.as_str().to_owned(),
+        "--log-file-enabled".to_owned(),
+        "--log-file-path".to_owned(),
+        roots.store_work_root.as_str().to_owned(),
+        "--log-file-name".to_owned(),
+        "surrealdb.log".to_owned(),
+        format!(
+            "surrealkv://{}",
+            roots.store_data_root.as_str().replace('\\', "/")
+        ),
+    ]
 }
 
 /// Constructs the exact store-neutral bootstrap descriptor consumed by
@@ -166,10 +243,7 @@ pub fn store_bootstrap_descriptor(
     config: &StoreLaunchConfig,
 ) -> Result<HostStoreBootstrapRequirement, String> {
     config.validate()?;
-    let authority_epoch = AuthorityEpoch::new(config.authority_epoch)
-        .map_err(|error| format!("invalid Store authority epoch: {error}"))?;
-    let store_generation = ResourceGeneration::new(config.store_generation)
-        .map_err(|error| format!("invalid Store generation: {error}"))?;
+    let store_generation = config.runtime_launch.authority_generation;
     let handle = |value: &str, field: &str| {
         PlatformHandle::new(value).map_err(|error| format!("invalid {field}: {error}"))
     };
@@ -181,7 +255,7 @@ pub fn store_bootstrap_descriptor(
         route_identity: handle(STORE_ROUTE_IDENTITY, "route identity")?,
         canonical_pipe_identity: handle(&config.store_pipe, "canonical pipe identity")?,
         store_generation,
-        state_fence: StateFence::new(authority_epoch, store_generation),
+        state_fence: config.runtime_launch.authority_state_fence.clone(),
         launch_nonce: handle(&config.launch_nonce, "launch nonce")?,
         connection_id: handle(&connection_id, "connection identity")?,
         expected_peer_sid: handle(&config.expected_client_sid, "Store peer SID")?,
@@ -202,9 +276,8 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         expected_client_sid: &'a str,
         expected_client_session_id: u32,
         approved_artifact_hash: &'a str,
-        store_generation: u64,
-        authority_epoch: u64,
         endpoint: &'a str,
+        provider_bind_address: &'a str,
         namespace: &'a str,
         database: &'a str,
         username: &'a str,
@@ -214,6 +287,7 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         blob_root: &'a str,
         instance_id: &'a str,
         credential_ref: &'a str,
+        runtime_launch: &'a RuntimeLaunchDescriptor,
     }
     let input = OperationalConfig {
         store_pipe: &config.store_pipe,
@@ -221,9 +295,8 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         expected_client_sid: &config.expected_client_sid,
         expected_client_session_id: config.expected_client_session_id,
         approved_artifact_hash: &config.approved_artifact_hash,
-        store_generation: config.store_generation,
-        authority_epoch: config.authority_epoch,
         endpoint: &config.endpoint,
+        provider_bind_address: &config.provider_bind_address,
         namespace: &config.namespace,
         database: &config.database,
         username: &config.username,
@@ -233,6 +306,7 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         blob_root: &config.blob_root,
         instance_id: &config.instance_id,
         credential_ref: &config.credential_ref,
+        runtime_launch: &config.runtime_launch,
     };
     let bytes =
         serde_json::to_vec(&input).map_err(|error| format!("serialize launch digest: {error}"))?;
@@ -260,6 +334,20 @@ fn validate_launch_text(value: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_provider_bind_address(value: &str) -> Result<(), String> {
+    let port = value
+        .strip_prefix("127.0.0.1:")
+        .or_else(|| value.strip_prefix("[::1]:"))
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0);
+    if port.is_none() {
+        return Err(
+            "provider_bind_address must be an explicit non-zero loopback socket".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Canonical store composition. All provider authority is held by the one
 /// adapter and one process/root Blob claim; Blob does not become a semantic
 /// store or alternate transition path.
@@ -267,6 +355,7 @@ pub struct StoreComposition {
     store: SurrealStoreAdapter,
     blob: BlobRootOwner,
     state_fence: StateFence,
+    _runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
 }
 
 impl std::fmt::Debug for StoreComposition {
@@ -276,7 +365,7 @@ impl std::fmt::Debug for StoreComposition {
             .field("store", &self.store)
             .field("blob_owner", &self.blob)
             .field("state_fence", &self.state_fence)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -296,20 +385,43 @@ impl StoreComposition {
         let platform = WindowsPlatform::new(config.blob_root.clone())
             .map_err(|error| format!("validate Blob root for credential access: {error}"))?;
         let password = resolve_credential(&platform, &config.credential_ref)?;
-        let state_fence = StateFence::new(
-            AuthorityEpoch::new(config.authority_epoch)
-                .map_err(|error| format!("invalid Store authority epoch: {error}"))?,
-            ResourceGeneration::new(config.store_generation)
-                .map_err(|error| format!("invalid Store generation: {error}"))?,
-        );
+        let roots = &config.runtime_launch.runtime_state_roots;
+        let mut root_lease_provider = WindowsRuntimeRootLeaseProvider::for_roots(roots)
+            .map_err(|error| format!("validate runtime-root provider: {error}"))?;
+        let runtime_root_leases = roots
+            .retain_and_validate(&mut root_lease_provider)
+            .map_err(|error| format!("retain canonical runtime roots: {error}"))?;
+        let provider_platform = WindowsPlatform::new(roots.profile_anchor_root.as_str().to_owned())
+            .map_err(|error| format!("validate provider launch contour: {error}"))?;
+        let provider_process_lease = provider_platform
+            .retain_process_path_lease(
+                Path::new(
+                    config
+                        .runtime_launch
+                        .canonical_store_executable_path
+                        .as_str(),
+                ),
+                Path::new(roots.store_work_root.as_str()),
+                config
+                    .runtime_launch
+                    .canonical_store_artifact_digest
+                    .as_str(),
+            )
+            .map_err(|_| "retain canonical provider process identity failed".to_owned())?;
+        let state_fence = config.runtime_launch.authority_state_fence.clone();
         state_fence
             .validate()
             .map_err(|error| format!("invalid Store state fence: {error}"))?;
-        let store = SurrealStoreAdapter::new(adapter_config(config, password)?);
+        let store = SurrealStoreAdapter::new(
+            materialize_adapter_config(config, password)?,
+            provider_process_lease,
+        )
+        .map_err(|error| format!("compose canonical provider adapter: {error}"))?;
         Ok(Self {
             store,
             blob,
             state_fence,
+            _runtime_root_leases: runtime_root_leases,
         })
     }
 
@@ -328,6 +440,15 @@ impl StoreComposition {
     /// Bounded adapter/provider health observation.
     pub async fn health(&self) -> Result<StoreHealth, StoreError> {
         self.store.health().await
+    }
+
+    /// Starts the one retained canonical provider child and proves authenticated
+    /// version readiness before the Store pipe accepts requests.
+    pub async fn connect(&self) -> Result<(), String> {
+        self.store
+            .connect()
+            .await
+            .map_err(|error| format!("canonical provider startup failed: {error}"))
     }
 
     /// Semantic schema readiness observation.  This is not a write authority
@@ -448,6 +569,31 @@ impl StoreComposition {
     }
 }
 
+/// Requires the complete semantic-ready receipt for the exact configured
+/// schema generation before a Store pipe may be created or advertised.
+///
+/// `StoreComposition::readiness` has already performed the canonical fence
+/// snapshot proof. This final pure gate rejects unavailable, migration,
+/// malformed, partial, or generation-mismatched receipts.
+pub fn require_semantic_ready_for_pipe(
+    receipt: &ReadinessReceipt,
+    expected_generation: &str,
+) -> Result<(), String> {
+    receipt
+        .validate()
+        .map_err(|error| format!("invalid semantic readiness receipt: {error}"))?;
+    if receipt.status != ReadinessStatus::Ready
+        || receipt.expected_generation.as_deref() != Some(expected_generation)
+        || receipt.observed_generation.as_deref() != Some(expected_generation)
+    {
+        return Err(
+            "canonical Store schema/fence is not semantically ready; pipe admission denied"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Immutable identity projected into the S-03 `ServerHello`.  The transport
 /// loop does not get to invent any provider or process authority; it receives
 /// this projection from the one `StoreComposition`.
@@ -538,11 +684,12 @@ pub fn admit_handshake(
     let state_fence = &hello.module_generation.state_fence;
     if hello.artifact_hash.as_str() != config.approved_artifact_hash
         || hello.launch_nonce != config.launch_nonce
-        || hello.module_generation.generation.value() != config.store_generation
+        || hello.module_generation.generation.value() != config.store_generation()
         || state_fence.resource_generation != hello.module_generation.generation
-        || state_fence.resource_generation.value() != config.store_generation
+        || state_fence.resource_generation.value() != config.store_generation()
         || state_fence.authority_epoch != hello.authority_epoch
-        || state_fence.authority_epoch.value() != config.authority_epoch
+        || state_fence.authority_epoch.value() != config.authority_epoch()
+        || state_fence != &config.runtime_launch.authority_state_fence
     {
         return Err(
             "ClientHello is outside the Host-approved store generation/fence lineage".to_owned(),
@@ -720,23 +867,51 @@ impl StoreDispatchBackend for StoreComposition {
     }
 }
 
-fn adapter_config(
+/// Purely materializes the credential-bearing adapter configuration from an
+/// already digest-bound Store launch projection. Provider argv is copied from
+/// the validated runtime descriptor and then revalidated byte-for-byte against
+/// the Store coordinates and roots; it is never reconstructed at spawn time.
+pub fn materialize_adapter_config(
     config: &StoreLaunchConfig,
     password: SecretString,
 ) -> Result<SurrealAdapterConfig, String> {
+    config.validate()?;
     let schema_generation = SchemaGeneration::new(config.schema_generation.as_str())
         .map_err(|error| error.to_string())?;
-    Ok(SurrealAdapterConfig {
+    let launch = &config.runtime_launch;
+    let roots = &launch.runtime_state_roots;
+    let adapter = SurrealAdapterConfig {
         endpoint: config.endpoint.clone(),
+        provider_bind_address: config.provider_bind_address.clone(),
         namespace: config.namespace.clone(),
         database: config.database.clone(),
         username: config.username.clone(),
         password,
+        installation_id: launch.installation_epoch.installation.as_str().to_owned(),
+        installation_profile: match launch.profile {
+            InstallationProfile::SystemService => "system_service",
+            InstallationProfile::UserMode => "user_mode",
+            InstallationProfile::PortableDev => "portable_dev",
+        }
+        .to_owned(),
+        runtime_state_roots_digest: roots.roots_digest.as_str().to_owned(),
+        provider_executable_path: launch.canonical_store_executable_path.as_str().to_owned(),
+        provider_artifact_digest: launch.canonical_store_artifact_digest.as_str().to_owned(),
+        provider_arguments: launch
+            .canonical_store_arguments
+            .iter()
+            .map(|argument| argument.as_str().to_owned())
+            .collect(),
+        store_data_root: roots.store_data_root.as_str().to_owned(),
+        store_work_root: roots.store_work_root.as_str().to_owned(),
+        store_temp_root: roots.store_temp_root.as_str().to_owned(),
         connect_timeout_ms: config.connect_timeout_ms,
         query_timeout_ms: config.query_timeout_ms,
         expected_provider_major: PINNED_SURREALDB_MAJOR,
         expected_schema_generation: schema_generation,
-    })
+    };
+    adapter.validate().map_err(|error| error.to_string())?;
+    Ok(adapter)
 }
 
 fn resolve_credential(
@@ -794,13 +969,13 @@ fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<StoreLaunchConfig, St
         Some("json") => {
             let config: StoreLaunchConfig = serde_json::from_slice(bytes)
                 .map_err(|error| format!("parse JSON config: {error}"))?;
-            config.validate()?;
+            config.validate_materialized_at(path)?;
             Ok(config)
         }
         Some("toml") => {
             let config: StoreLaunchConfig =
                 toml::from_slice(bytes).map_err(|error| format!("parse TOML config: {error}"))?;
-            config.validate()?;
+            config.validate_materialized_at(path)?;
             Ok(config)
         }
         Some(extension) => Err(format!(
@@ -818,9 +993,189 @@ mod tests {
     use eliot_contracts::{
         ArtifactId, AuthorityEpoch, ContractId, ContractVersion, ResourceGeneration,
     };
+    use eliot_installation::{InstallationEpoch, RuntimeStateRoots};
     use eliot_runtime_contracts::{
         HealthVector, ModuleContract, ModuleGeneration, ModuleGenerationState,
     };
+
+    fn handle(value: impl Into<String>) -> PlatformHandle {
+        PlatformHandle::new(value).expect("valid test handle")
+    }
+
+    fn runtime_state_roots() -> RuntimeStateRoots {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            profile: InstallationProfile,
+            profile_anchor_root: &'a PlatformHandle,
+            installation_root: &'a PlatformHandle,
+            host_state_root: &'a PlatformHandle,
+            kernel_ors_root: &'a PlatformHandle,
+            kernel_work_root: &'a PlatformHandle,
+            store_data_root: &'a PlatformHandle,
+            store_work_root: &'a PlatformHandle,
+            store_temp_root: &'a PlatformHandle,
+            watchdog_state_root: &'a PlatformHandle,
+        }
+        let installation_key = "1".repeat(64);
+        let installation_root = format!(r"C:\ProgramData\Eliot\installations\{installation_key}");
+        let mut roots = RuntimeStateRoots {
+            profile: InstallationProfile::SystemService,
+            profile_anchor_root: handle(r"C:\ProgramData"),
+            installation_root: handle(&installation_root),
+            host_state_root: handle(format!(r"{installation_root}\host")),
+            kernel_ors_root: handle(format!(r"{installation_root}\kernel\state")),
+            kernel_work_root: handle(format!(r"{installation_root}\kernel\work")),
+            store_data_root: handle(format!(r"{installation_root}\store\data")),
+            store_work_root: handle(format!(r"{installation_root}\store\work")),
+            store_temp_root: handle(format!(r"{installation_root}\store\tmp")),
+            watchdog_state_root: handle(format!(r"{installation_root}\watchdog")),
+            roots_digest: handle("0".repeat(64)),
+        };
+        let bytes = serde_json::to_vec(&Unsigned {
+            profile: roots.profile,
+            profile_anchor_root: &roots.profile_anchor_root,
+            installation_root: &roots.installation_root,
+            host_state_root: &roots.host_state_root,
+            kernel_ors_root: &roots.kernel_ors_root,
+            kernel_work_root: &roots.kernel_work_root,
+            store_data_root: &roots.store_data_root,
+            store_work_root: &roots.store_work_root,
+            store_temp_root: &roots.store_temp_root,
+            watchdog_state_root: &roots.watchdog_state_root,
+        })
+        .expect("serialize roots digest fixture");
+        roots.roots_digest = handle(format!("{:x}", Sha256::digest(bytes)));
+        roots
+    }
+
+    fn reseal_runtime_launch(descriptor: &mut RuntimeLaunchDescriptor) {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            profile: InstallationProfile,
+            portable_root: &'a Option<PlatformHandle>,
+            installation_epoch: &'a InstallationEpoch,
+            generation: &'a PlatformHandle,
+            authority_generation: ResourceGeneration,
+            authority_state_fence: &'a StateFence,
+            authority_descriptor_path: &'a PlatformHandle,
+            authority_descriptor_digest: &'a PlatformHandle,
+            runtime_state_roots: &'a RuntimeStateRoots,
+            kernel_work_root: &'a PlatformHandle,
+            kernel_artifact_digest: &'a PlatformHandle,
+            store_config_path: &'a PlatformHandle,
+            store_bootstrap_descriptor_path: &'a PlatformHandle,
+            store_bootstrap_descriptor_digest: &'a PlatformHandle,
+            canonical_store_executable_path: &'a PlatformHandle,
+            canonical_store_artifact_digest: &'a PlatformHandle,
+            kernel_arguments: &'a [PlatformHandle],
+            store_bridge_executable_path: &'a PlatformHandle,
+            store_bridge_artifact_digest: &'a PlatformHandle,
+            store_bridge_arguments: &'a [PlatformHandle],
+            canonical_store_arguments: &'a [PlatformHandle],
+            watchdog_executable_path: &'a PlatformHandle,
+            watchdog_artifact_digest: &'a PlatformHandle,
+        }
+        let unsigned = Unsigned {
+            profile: descriptor.profile,
+            portable_root: &descriptor.portable_root,
+            installation_epoch: &descriptor.installation_epoch,
+            generation: &descriptor.generation,
+            authority_generation: descriptor.authority_generation,
+            authority_state_fence: &descriptor.authority_state_fence,
+            authority_descriptor_path: &descriptor.authority_descriptor_path,
+            authority_descriptor_digest: &descriptor.authority_descriptor_digest,
+            runtime_state_roots: &descriptor.runtime_state_roots,
+            kernel_work_root: &descriptor.kernel_work_root,
+            kernel_artifact_digest: &descriptor.kernel_artifact_digest,
+            store_config_path: &descriptor.store_config_path,
+            store_bootstrap_descriptor_path: &descriptor.store_bootstrap_descriptor_path,
+            store_bootstrap_descriptor_digest: &descriptor.store_bootstrap_descriptor_digest,
+            canonical_store_executable_path: &descriptor.canonical_store_executable_path,
+            canonical_store_artifact_digest: &descriptor.canonical_store_artifact_digest,
+            kernel_arguments: &descriptor.kernel_arguments,
+            store_bridge_executable_path: &descriptor.store_bridge_executable_path,
+            store_bridge_artifact_digest: &descriptor.store_bridge_artifact_digest,
+            store_bridge_arguments: &descriptor.store_bridge_arguments,
+            canonical_store_arguments: &descriptor.canonical_store_arguments,
+            watchdog_executable_path: &descriptor.watchdog_executable_path,
+            watchdog_artifact_digest: &descriptor.watchdog_artifact_digest,
+        };
+        descriptor.descriptor_digest = handle(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&unsigned).expect("serialize unsigned runtime launch")
+            )
+        ));
+    }
+
+    fn runtime_launch() -> RuntimeLaunchDescriptor {
+        let roots = runtime_state_roots();
+        let config_path = handle(r"C:\ProgramData\Eliot\generation.json");
+        let authority_generation = ResourceGeneration::genesis();
+        let authority_state_fence =
+            StateFence::new(AuthorityEpoch::genesis(), authority_generation);
+        let mut descriptor = RuntimeLaunchDescriptor {
+            profile: InstallationProfile::SystemService,
+            portable_root: None,
+            installation_epoch: InstallationEpoch {
+                installation: handle("installation-test"),
+                lineage_id: handle("lineage-test"),
+                sequence: 1,
+            },
+            generation: handle("generation-test"),
+            authority_generation,
+            authority_state_fence,
+            authority_descriptor_path: handle(r"C:\ProgramData\Eliot\authority.json"),
+            authority_descriptor_digest: handle("7".repeat(64)),
+            runtime_state_roots: roots.clone(),
+            kernel_work_root: roots.kernel_work_root.clone(),
+            kernel_artifact_digest: handle("0".repeat(64)),
+            store_config_path: config_path.clone(),
+            store_bridge_executable_path: handle(
+                r"C:\ProgramData\Eliot\bin\eliot-store-surreal.exe",
+            ),
+            store_bridge_artifact_digest: handle("a".repeat(64)),
+            store_bootstrap_descriptor_path: handle(r"C:\ProgramData\Eliot\store-bootstrap.json"),
+            store_bootstrap_descriptor_digest: handle("6".repeat(64)),
+            canonical_store_executable_path: handle(r"C:\ProgramData\Eliot\bin\surreal.exe"),
+            canonical_store_artifact_digest: handle("b".repeat(64)),
+            kernel_arguments: vec![
+                handle("--work-root"),
+                roots.kernel_work_root.clone(),
+                handle("--store-bootstrap"),
+                handle(r"C:\ProgramData\Eliot\store-bootstrap.json"),
+                handle("--store-bootstrap-sha256"),
+                handle("6".repeat(64)),
+                handle("--authority-descriptor"),
+                handle(r"C:\ProgramData\Eliot\authority.json"),
+                handle("--authority-descriptor-sha256"),
+                handle("7".repeat(64)),
+            ],
+            store_bridge_arguments: vec![handle("--config"), config_path],
+            canonical_store_arguments: vec![
+                handle("start"),
+                handle("--no-banner"),
+                handle("--bind"),
+                handle("127.0.0.1:8000"),
+                handle("--temporary-directory"),
+                roots.store_temp_root.clone(),
+                handle("--log-file-enabled"),
+                handle("--log-file-path"),
+                roots.store_work_root.clone(),
+                handle("--log-file-name"),
+                handle("surrealdb.log"),
+                handle(format!(
+                    "surrealkv://{}",
+                    roots.store_data_root.as_str().replace('\\', "/")
+                )),
+            ],
+            watchdog_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-watchdog.exe"),
+            watchdog_artifact_digest: handle("4".repeat(64)),
+            descriptor_digest: handle("0".repeat(64)),
+        };
+        reseal_runtime_launch(&mut descriptor);
+        descriptor
+    }
 
     fn config() -> StoreLaunchConfig {
         let mut config = StoreLaunchConfig {
@@ -830,9 +1185,8 @@ mod tests {
             expected_client_session_id: 0,
             approved_artifact_hash: "a".repeat(64),
             approved_config_hash: String::new(),
-            store_generation: 1,
-            authority_epoch: 1,
-            endpoint: "ws://127.0.0.1:8000".to_owned(),
+            endpoint: "ws://127.0.0.1:8000/rpc".to_owned(),
+            provider_bind_address: "127.0.0.1:8000".to_owned(),
             namespace: "eliot".to_owned(),
             database: "eliot".to_owned(),
             username: "store".to_owned(),
@@ -842,6 +1196,7 @@ mod tests {
             blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
             instance_id: "store-test".to_owned(),
             credential_ref: "eliot/store".to_owned(),
+            runtime_launch: runtime_launch(),
         };
         config.approved_config_hash = launch_config_digest(&config).expect("config digest");
         config
@@ -857,6 +1212,39 @@ mod tests {
         let mut endpoint_altered = config;
         endpoint_altered.endpoint = "ws://127.0.0.1:9000".to_owned();
         assert!(endpoint_altered.validate().is_err());
+    }
+
+    #[test]
+    fn canonical_runtime_identity_profile_and_digest_are_required() {
+        let config = config();
+        assert!(config.validate().is_ok());
+
+        let mut profile_mismatch = config.clone();
+        profile_mismatch.runtime_launch.profile = InstallationProfile::UserMode;
+        reseal_runtime_launch(&mut profile_mismatch.runtime_launch);
+        profile_mismatch.approved_config_hash =
+            launch_config_digest(&profile_mismatch).expect("mismatched config digest");
+        assert!(profile_mismatch.validate().is_err());
+
+        let mut digest_mismatch = config.clone();
+        digest_mismatch
+            .runtime_launch
+            .runtime_state_roots
+            .roots_digest = handle("c".repeat(64));
+        reseal_runtime_launch(&mut digest_mismatch.runtime_launch);
+        digest_mismatch.approved_config_hash =
+            launch_config_digest(&digest_mismatch).expect("mismatched config digest");
+        assert!(digest_mismatch.validate().is_err());
+
+        let mut invalid_installation = config;
+        invalid_installation
+            .runtime_launch
+            .installation_epoch
+            .sequence = 0;
+        reseal_runtime_launch(&mut invalid_installation.runtime_launch);
+        invalid_installation.approved_config_hash =
+            launch_config_digest(&invalid_installation).expect("mismatched config digest");
+        assert!(invalid_installation.validate().is_err());
     }
 
     #[test]
@@ -888,11 +1276,107 @@ mod tests {
     fn bounded_config_parser_supports_json_and_rejects_other_extensions() {
         let config = config();
         let json = serde_json::to_vec(&config).expect("JSON config");
-        let parsed =
-            parse_config_bytes(Path::new("store.json"), &json).expect("JSON config parses");
+        let exact_path = Path::new(config.runtime_launch.store_config_path.as_str());
+        let parsed = parse_config_bytes(exact_path, &json).expect("JSON config parses");
         assert_eq!(parsed.store_pipe, config.store_pipe);
         assert_eq!(parsed.approved_config_hash, config.approved_config_hash);
-        assert!(parse_config_bytes(Path::new("store.txt"), &json).is_err());
+        assert!(
+            parse_config_bytes(Path::new(r"C:\ProgramData\Eliot\different.json"), &json).is_err()
+        );
+        assert!(
+            parse_config_bytes(Path::new(r"C:\ProgramData\Eliot\generation.txt"), &json).is_err()
+        );
+    }
+
+    #[test]
+    fn materialized_config_binds_full_runtime_descriptor_and_outer_digest() {
+        let config = config();
+        let exact_path = Path::new(config.runtime_launch.store_config_path.as_str()).to_path_buf();
+        assert!(config.validate_materialized_at(&exact_path).is_ok());
+
+        let mut authority_tampered = config.clone();
+        authority_tampered
+            .runtime_launch
+            .authority_descriptor_digest = handle("8".repeat(64));
+        assert!(
+            authority_tampered
+                .validate_materialized_at(&exact_path)
+                .is_err()
+        );
+
+        let mut resealed_inner = config.clone();
+        resealed_inner.runtime_launch.generation = handle("generation-replaced");
+        reseal_runtime_launch(&mut resealed_inner.runtime_launch);
+        assert!(resealed_inner.runtime_launch.validate().is_ok());
+        assert!(
+            resealed_inner
+                .validate_materialized_at(&exact_path)
+                .is_err()
+        );
+
+        let mut bridge_mismatch = config;
+        bridge_mismatch.approved_artifact_hash = "9".repeat(64);
+        bridge_mismatch.approved_config_hash =
+            launch_config_digest(&bridge_mismatch).expect("outer config digest");
+        assert!(
+            bridge_mismatch
+                .validate_materialized_at(&exact_path)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn descriptor_provider_argv_materializes_exactly_and_rejects_bind_substitution() {
+        let config = config();
+        let adapter =
+            materialize_adapter_config(&config, SecretString::new("materialization-secret".into()))
+                .expect("descriptor materializes adapter config");
+        assert_eq!(
+            adapter.provider_arguments,
+            config
+                .runtime_launch
+                .canonical_store_arguments
+                .iter()
+                .map(|argument| argument.as_str().to_owned())
+                .collect::<Vec<_>>()
+        );
+
+        let mut substituted = config;
+        substituted.provider_bind_address = "127.0.0.1:9000".to_owned();
+        substituted.endpoint = "ws://127.0.0.1:9000/rpc".to_owned();
+        substituted.approved_config_hash =
+            launch_config_digest(&substituted).expect("outer digest");
+        assert!(
+            materialize_adapter_config(
+                &substituted,
+                SecretString::new("materialization-secret".into()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pipe_gate_requires_exact_complete_semantic_ready_receipt() {
+        assert!(
+            require_semantic_ready_for_pipe(&ReadinessReceipt::ready("1.0.0".to_owned()), "1.0.0")
+                .is_ok()
+        );
+        assert!(
+            require_semantic_ready_for_pipe(&ReadinessReceipt::unavailable(), "1.0.0").is_err()
+        );
+        assert!(
+            require_semantic_ready_for_pipe(
+                &ReadinessReceipt::migration_required("1.0.0".to_owned(), None),
+                "1.0.0",
+            )
+            .is_err()
+        );
+        let partial = ReadinessReceipt {
+            status: ReadinessStatus::Ready,
+            expected_generation: Some("1.0.0".to_owned()),
+            observed_generation: Some("0.9.0".to_owned()),
+        };
+        assert!(require_semantic_ready_for_pipe(&partial, "1.0.0").is_err());
     }
 
     #[test]
@@ -911,8 +1395,8 @@ mod tests {
         let module_id = ContractId::new(STORE_MODULE_IDENTITY).expect("module id");
         let artifact_id =
             ArtifactId::new(config.approved_artifact_hash.as_str()).expect("artifact");
-        let authority_epoch = AuthorityEpoch::new(config.authority_epoch).expect("epoch");
-        let generation = ResourceGeneration::new(config.store_generation).expect("generation");
+        let authority_epoch = config.runtime_launch.authority_state_fence.authority_epoch;
+        let generation = config.runtime_launch.authority_generation;
         let hello = ClientHello {
             protocol_range: ProtocolRange {
                 minimum: ProtocolVersion::CURRENT,
@@ -973,8 +1457,8 @@ mod tests {
         };
         let mut hello: ClientHello = serde_json::from_value(payload).expect("client hello");
         hello.module_generation.state_fence = StateFence::new(
-            AuthorityEpoch::new(config.authority_epoch).expect("epoch"),
-            ResourceGeneration::new(config.store_generation + 1).expect("generation"),
+            config.runtime_launch.authority_state_fence.authority_epoch,
+            ResourceGeneration::new(config.store_generation() + 1).expect("generation"),
         );
         let mismatched =
             eliot_ipc::client_hello_frame("connection-test", &hello).expect("mismatched hello");
@@ -982,11 +1466,12 @@ mod tests {
             admit_handshake(mismatched, TransportLimits::default(), &config, &identity,).is_err()
         );
 
-        let mismatched_authority = AuthorityEpoch::new(config.authority_epoch + 1).expect("epoch");
+        let mismatched_authority =
+            AuthorityEpoch::new(config.authority_epoch() + 1).expect("epoch");
         hello.authority_epoch = mismatched_authority;
         hello.module_generation.state_fence = StateFence::new(
             mismatched_authority,
-            ResourceGeneration::new(config.store_generation).expect("generation"),
+            config.runtime_launch.authority_generation,
         );
         let mismatched_epoch = eliot_ipc::client_hello_frame("connection-test", &hello)
             .expect("mismatched epoch hello");

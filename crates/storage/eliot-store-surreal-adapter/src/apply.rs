@@ -180,20 +180,16 @@ where
 pub(crate) async fn client(
     adapter: &SurrealStoreAdapter,
 ) -> Result<&client::RpcTransport, AdapterError> {
-    if let Some(db) = adapter.client.get() {
-        return Ok(db);
-    }
-    let transport = client::RpcTransport::connect(&adapter.config).await?;
-    if adapter.client.set(transport).is_err() {
-        return adapter
-            .client
-            .get()
-            .ok_or(AdapterError::ProviderUnavailable);
-    }
-    adapter
+    match adapter
         .client
-        .get()
-        .ok_or(AdapterError::ProviderUnavailable)
+        .get_or_init(|| async {
+            client::RpcTransport::connect(&adapter.config, &adapter.provider_process_lease).await
+        })
+        .await
+    {
+        Ok(transport) => Ok(transport),
+        Err(error) => Err(error.clone()),
+    }
 }
 
 /// Reads the recorded schema generation, if any.

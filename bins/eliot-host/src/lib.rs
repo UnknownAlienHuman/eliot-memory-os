@@ -702,7 +702,7 @@ pub struct HostJobBranches {
     kernel_identity: JobObjectIdentity,
     store_identity: JobObjectIdentity,
     kernel_executable: Option<PathBuf>,
-    canonical_store_executable: Option<PathBuf>,
+    store_bridge_executable: Option<PathBuf>,
     kernel_lease: Option<LaunchLease>,
     store_lease: Option<LaunchLease>,
     config_path: Option<PathBuf>,
@@ -1013,6 +1013,35 @@ fn classify_liveness_tick(
 }
 
 #[cfg(windows)]
+fn descriptor_bound_liveness_tick(
+    gate: &mut HostReadinessGate,
+    liveness: HostBranchDisposition,
+    active_manifest: Option<&CandidateManifest>,
+    current_contour: impl FnOnce(
+        &PlatformHandle,
+        &PlatformHandle,
+        &PlatformHandle,
+        &PlatformHandle,
+    ) -> Result<ReadinessContourIdentity, HostError>,
+    now: std::time::Instant,
+) -> HostLivenessTick {
+    let contour = (liveness == HostBranchDisposition::LiveAwaitingReadiness).then(|| {
+        let manifest = active_manifest
+            .ok_or_else(|| HostError::ProcessContour("no approved active generation".to_owned()))?;
+        let (kernel_artifact, store_artifact) = manifest
+            .host_child_artifact_digests()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        current_contour(
+            &manifest.generation,
+            kernel_artifact,
+            store_artifact,
+            &manifest.config_digest,
+        )
+    });
+    classify_liveness_tick(gate, liveness, contour, now)
+}
+
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BranchLiveness {
     Live,
@@ -1181,7 +1210,7 @@ impl HostJobBranches {
             kernel_identity,
             store_identity,
             kernel_executable: None,
-            canonical_store_executable: None,
+            store_bridge_executable: None,
             kernel_lease: None,
             store_lease: None,
             config_path: None,
@@ -2009,12 +2038,12 @@ impl HostJobBranches {
     pub fn start_approved(
         &mut self,
         kernel_executable: &Path,
-        canonical_store_executable: &Path,
+        store_bridge_executable: &Path,
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
         config_path: &Path,
         approved_kernel_path: &PlatformHandle,
-        approved_canonical_store_path: &PlatformHandle,
+        approved_store_bridge_path: &PlatformHandle,
         approved_config_path: &PlatformHandle,
         kernel_artifact: &PlatformHandle,
         store_artifact: &PlatformHandle,
@@ -2054,15 +2083,15 @@ impl HostJobBranches {
         let kernel_lease =
             open_launch_lease(launch.profile, portable_root.as_ref(), &kernel_executable)?;
         verify_launch_digest(&kernel_lease, kernel_artifact, "runtime.kernel_artifact")?;
-        let canonical_store_executable = approved_locator(
-            canonical_store_executable,
-            approved_canonical_store_path,
+        let store_bridge_executable = approved_locator(
+            store_bridge_executable,
+            approved_store_bridge_path,
             launch.profile,
         )?;
         let store_lease = open_launch_lease(
             launch.profile,
             portable_root.as_ref(),
-            &canonical_store_executable,
+            &store_bridge_executable,
         )?;
         verify_launch_digest(&store_lease, store_artifact, "runtime.store_artifact")?;
         let config_path = approved_locator(config_path, approved_config_path, launch.profile)?;
@@ -2120,7 +2149,7 @@ impl HostJobBranches {
         let launch_result = launch_store_then_kernel(
             || {
                 Self::launch(
-                    &canonical_store_executable,
+                    &store_bridge_executable,
                     &store_lease,
                     &self.store_identity,
                     generation,
@@ -2128,11 +2157,11 @@ impl HostJobBranches {
                     store_artifact,
                     &config_path,
                     &config_lease,
-                    approved_canonical_store_path,
+                    approved_store_bridge_path,
                     approved_config_path,
                     &config_pin,
                     host,
-                    &launch.canonical_store_arguments,
+                    &launch.store_bridge_arguments,
                     &working_directory,
                 )
             },
@@ -2181,7 +2210,7 @@ impl HostJobBranches {
         match launch_result {
             Ok((store, kernel)) => {
                 self.kernel_executable = Some(kernel_executable);
-                self.canonical_store_executable = Some(canonical_store_executable);
+                self.store_bridge_executable = Some(store_bridge_executable);
                 self.kernel_lease = Some(kernel_lease);
                 self.store_lease = Some(store_lease);
                 self.config_path = Some(config_path);
@@ -2240,7 +2269,7 @@ impl HostJobBranches {
             }
             Err(StoreKernelLaunchError::CleanupRequired { store, reason }) => {
                 self.kernel_executable = Some(kernel_executable);
-                self.canonical_store_executable = Some(canonical_store_executable);
+                self.store_bridge_executable = Some(store_bridge_executable);
                 self.kernel_lease = Some(kernel_lease);
                 self.store_lease = Some(store_lease);
                 self.config_path = Some(config_path);
@@ -2340,7 +2369,7 @@ impl HostJobBranches {
         host: &HostInstallationEpoch,
     ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
         let executable = self
-            .canonical_store_executable
+            .store_bridge_executable
             .clone()
             .ok_or_else(|| HostError::ProcessContour("store image is not recorded".to_owned()))?;
         let executable_lease = self
@@ -2372,7 +2401,7 @@ impl HostJobBranches {
                 .ok_or_else(|| {
                     HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
                 })?
-                .canonical_store_arguments,
+                .store_bridge_arguments,
             Path::new(
                 self.launch
                     .as_ref()
@@ -2478,7 +2507,7 @@ impl HostJobBranches {
         config_digest: &PlatformHandle,
         config_path: &Path,
         approved_kernel_path: &PlatformHandle,
-        approved_canonical_store_path: &PlatformHandle,
+        approved_store_bridge_path: &PlatformHandle,
         approved_config_path: &PlatformHandle,
         kernel_artifact: &PlatformHandle,
         store_artifact: &PlatformHandle,
@@ -2550,8 +2579,8 @@ impl HostJobBranches {
             lease.verify().map_err(HostError::ProcessContour)?;
             verify_launch_digest(lease, kernel_artifact, "runtime.kernel_artifact")?;
         }
-        if let Some(store) = &self.canonical_store_executable {
-            let approved = approved_locator(store, approved_canonical_store_path, profile)?;
+        if let Some(store) = &self.store_bridge_executable {
+            let approved = approved_locator(store, approved_store_bridge_path, profile)?;
             let lease = self.store_lease.as_ref().ok_or_else(|| {
                 HostError::ProcessContour("store image lease is missing".to_owned())
             })?;
@@ -2609,7 +2638,7 @@ impl HostJobBranches {
                     config_digest,
                     config_path,
                     store_artifact,
-                    approved_canonical_store_path,
+                    approved_store_bridge_path,
                     approved_config_path,
                     host,
                 )
@@ -2763,7 +2792,7 @@ impl HostJobBranches {
 
     fn clear_recorded_contour(&mut self) {
         self.kernel_executable = None;
-        self.canonical_store_executable = None;
+        self.store_bridge_executable = None;
         self.kernel_lease = None;
         self.store_lease = None;
         self.config_path = None;
@@ -2810,7 +2839,7 @@ impl HostJobBranches {
         self.kernel.is_some()
             || self.store.is_some()
             || self.kernel_executable.is_some()
-            || self.canonical_store_executable.is_some()
+            || self.store_bridge_executable.is_some()
     }
 }
 
@@ -3729,12 +3758,12 @@ impl HostComposition {
             })?;
         self.transition_activation(ActivationState::Starting, "host-start-approved")?;
         self.request_watchdog(&active.manifest.runtime_launch)?;
-        let (kernel_artifact, store_artifact, _canonical_store_artifact) = active
+        let (kernel_artifact, store_artifact) = active
             .manifest
-            .runtime_artifact_digests()
+            .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let (approved_kernel_path, approved_store_path, approved_config_path) =
-            active.manifest.runtime_paths();
+            active.manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
         let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
             .next_kernel_activation_context(
@@ -3834,22 +3863,18 @@ impl HostComposition {
             .ok_or_else(|| {
                 HostError::ProcessContour("candidate generation is not approved".to_owned())
             })?;
-        let (
-            candidate_kernel_artifact,
-            candidate_store_artifact,
-            _candidate_canonical_store_artifact,
-        ) = candidate
+        let (candidate_kernel_artifact, candidate_store_artifact) = candidate
             .manifest
-            .runtime_artifact_digests()
+            .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let (prior_kernel_artifact, prior_store_artifact, _prior_canonical_store_artifact) = prior
+        let (prior_kernel_artifact, prior_store_artifact) = prior
             .manifest
-            .runtime_artifact_digests()
+            .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let (candidate_kernel_path, candidate_store_path, candidate_config_path) =
-            candidate.manifest.runtime_paths();
+            candidate.manifest.host_child_paths();
         let (prior_kernel_path, prior_store_path, prior_config_path) =
-            prior.manifest.runtime_paths();
+            prior.manifest.host_child_paths();
         let candidate_config_locator = PathBuf::from(candidate_config_path.as_str());
         let prior_config_locator = PathBuf::from(prior_config_path.as_str());
         // Resolve every candidate and rollback locator before mutating the
@@ -4020,23 +4045,19 @@ impl HostComposition {
     pub fn liveness_tick(&mut self) -> Result<HostLivenessTick, HostError> {
         self.ensure_admission_open()?;
         let liveness = self.jobs.liveness_only();
-        let contour = (liveness == HostBranchDisposition::LiveAwaitingReadiness).then(|| {
-            let active = self.registry.active().ok_or_else(|| {
-                HostError::ProcessContour("no approved active generation".to_owned())
-            })?;
-            self.current_readiness_contour(
-                &active.manifest.generation,
-                &active.manifest.kernel_artifact_digest,
-                &active.manifest.canonical_store_artifact_digest,
-                &active.manifest.config_digest,
-            )
-        });
-        Ok(classify_liveness_tick(
-            &mut self.readiness_gate,
+        let active_manifest = self.registry.active().map(|active| &active.manifest);
+        let mut readiness_gate = std::mem::take(&mut self.readiness_gate);
+        let tick = descriptor_bound_liveness_tick(
+            &mut readiness_gate,
             liveness,
-            contour,
+            active_manifest,
+            |generation, kernel, store, config| {
+                self.current_readiness_contour(generation, kernel, store, config)
+            },
             std::time::Instant::now(),
-        ))
+        );
+        self.readiness_gate = readiness_gate;
+        Ok(tick)
     }
 
     /// Reconciles the approved contour and records fresh process observations.
@@ -4054,12 +4075,12 @@ impl HostComposition {
             self.registry.active().cloned().ok_or_else(|| {
                 HostError::ProcessContour("no approved active generation".to_owned())
             })?;
-        let (kernel_artifact, store_artifact, _canonical_store_artifact) = active
+        let (kernel_artifact, store_artifact) = active
             .manifest
-            .runtime_artifact_digests()
+            .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let (approved_kernel_path, approved_store_path, approved_config_path) =
-            active.manifest.runtime_paths();
+            active.manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
         let kernel_requires_activation = matches!(
             HostJobBranches::branch_state(self.jobs.kernel.as_ref()),
@@ -4306,9 +4327,9 @@ impl HostComposition {
                 "readiness probe generation is not the approved active generation".to_owned(),
             ));
         }
-        let (kernel_artifact, store_artifact, _canonical_store_artifact) = active
+        let (kernel_artifact, store_artifact) = active
             .manifest
-            .runtime_artifact_digests()
+            .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let contour = self.current_readiness_contour(
             generation,
@@ -4811,6 +4832,8 @@ mod journal_tests {
         BackendError, BackendReconcileState, DurableImage, FaultPoint, MemoryBackend,
         PreparedAppend,
     };
+    #[cfg(windows)]
+    use eliot_installation::{InstallationEpoch, RuntimeStateRoots};
 
     struct ImageBackend {
         image: DurableImage,
@@ -5183,6 +5206,241 @@ mod journal_tests {
             .unwrap(),
             store_proof_fence,
         }
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture constructs one fully validated split Store launch descriptor for the production liveness boundary"
+    )]
+    fn liveness_manifest_with_distinct_store_digests() -> (CandidateManifest, std::path::PathBuf) {
+        fn handle(value: impl Into<String>) -> PlatformHandle {
+            PlatformHandle::new(value.into()).unwrap_or_else(|_| unreachable!())
+        }
+
+        fn path(root: &Path, name: &str) -> PlatformHandle {
+            handle(root.join(name).to_string_lossy().into_owned())
+        }
+
+        #[derive(serde::Serialize)]
+        struct UnsignedLaunch<'a> {
+            profile: InstallationProfile,
+            portable_root: &'a Option<PlatformHandle>,
+            installation_epoch: &'a InstallationEpoch,
+            generation: &'a PlatformHandle,
+            authority_generation: ResourceGeneration,
+            authority_state_fence: &'a StateFence,
+            authority_descriptor_path: &'a PlatformHandle,
+            authority_descriptor_digest: &'a PlatformHandle,
+            runtime_state_roots: &'a RuntimeStateRoots,
+            kernel_work_root: &'a PlatformHandle,
+            kernel_artifact_digest: &'a PlatformHandle,
+            store_config_path: &'a PlatformHandle,
+            store_bootstrap_descriptor_path: &'a PlatformHandle,
+            store_bootstrap_descriptor_digest: &'a PlatformHandle,
+            canonical_store_executable_path: &'a PlatformHandle,
+            canonical_store_artifact_digest: &'a PlatformHandle,
+            kernel_arguments: &'a [PlatformHandle],
+            store_bridge_executable_path: &'a PlatformHandle,
+            store_bridge_artifact_digest: &'a PlatformHandle,
+            store_bridge_arguments: &'a [PlatformHandle],
+            canonical_store_arguments: &'a [PlatformHandle],
+            watchdog_executable_path: &'a PlatformHandle,
+            watchdog_artifact_digest: &'a PlatformHandle,
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-liveness-store-split-{}",
+            Uuid::new_v4()
+        ));
+        let portable = root.join("portable");
+        std::fs::create_dir_all(&portable).unwrap_or_else(|_| unreachable!());
+        drop(
+            UserOwnedRootLease::open_existing(&portable)
+                .unwrap_or_else(|error| panic!("portable root lease: {error}")),
+        );
+        let portable_handle = handle(portable.to_string_lossy().into_owned());
+        let runtime_state_roots = RuntimeStateRoots::derive_portable(portable_handle.clone())
+            .unwrap_or_else(|error| panic!("portable roots: {error}"));
+        let generation = handle("generation:liveness-store-split");
+        let kernel_digest = handle("a".repeat(64));
+        let bridge_digest = handle("b".repeat(64));
+        let provider_digest = handle("d".repeat(64));
+        let config_digest = handle("c".repeat(64));
+        let config_path = path(&root, "generation.json");
+        let bootstrap_path = path(&root, "store-bootstrap.json");
+        let authority_path = path(&root, "authority.json");
+        let bridge_path = path(&root, "eliot-store-surreal.exe");
+        let provider_path = path(&root, "surreal.exe");
+        let mut runtime_launch = RuntimeLaunchDescriptor {
+            profile: InstallationProfile::PortableDev,
+            portable_root: Some(portable_handle.clone()),
+            installation_epoch: InstallationEpoch {
+                installation: handle("installation:liveness-store-split"),
+                lineage_id: handle("lineage:liveness-store-split"),
+                sequence: 1,
+            },
+            generation: generation.clone(),
+            authority_generation: ResourceGeneration::genesis(),
+            authority_state_fence: StateFence::new(
+                AuthorityEpoch::genesis(),
+                ResourceGeneration::genesis(),
+            ),
+            authority_descriptor_path: authority_path.clone(),
+            authority_descriptor_digest: handle("9".repeat(64)),
+            runtime_state_roots: runtime_state_roots.clone(),
+            kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
+            kernel_artifact_digest: kernel_digest.clone(),
+            store_config_path: config_path.clone(),
+            store_bridge_executable_path: bridge_path.clone(),
+            store_bridge_artifact_digest: bridge_digest.clone(),
+            store_bootstrap_descriptor_path: bootstrap_path.clone(),
+            store_bootstrap_descriptor_digest: handle("8".repeat(64)),
+            canonical_store_executable_path: provider_path.clone(),
+            canonical_store_artifact_digest: provider_digest.clone(),
+            kernel_arguments: vec![
+                handle("--work-root"),
+                runtime_state_roots.kernel_work_root.clone(),
+                handle("--store-bootstrap"),
+                bootstrap_path,
+                handle("--store-bootstrap-sha256"),
+                handle("8".repeat(64)),
+                handle("--authority-descriptor"),
+                authority_path,
+                handle("--authority-descriptor-sha256"),
+                handle("9".repeat(64)),
+            ],
+            store_bridge_arguments: vec![
+                handle("--portable-dev-root"),
+                portable_handle,
+                handle("--config"),
+                config_path.clone(),
+            ],
+            canonical_store_arguments: vec![
+                handle("start"),
+                handle("--no-banner"),
+                handle("--bind"),
+                handle("127.0.0.1:8000"),
+                handle("--temporary-directory"),
+                runtime_state_roots.store_temp_root.clone(),
+                handle("--log-file-enabled"),
+                handle("--log-file-path"),
+                runtime_state_roots.store_work_root.clone(),
+                handle("--log-file-name"),
+                handle("surrealdb.log"),
+                handle(format!(
+                    "surrealkv://{}",
+                    runtime_state_roots
+                        .store_data_root
+                        .as_str()
+                        .replace('\\', "/")
+                )),
+            ],
+            watchdog_executable_path: path(&root, "eliot-watchdog.exe"),
+            watchdog_artifact_digest: handle("7".repeat(64)),
+            descriptor_digest: handle("0".repeat(64)),
+        };
+        let unsigned = UnsignedLaunch {
+            profile: runtime_launch.profile,
+            portable_root: &runtime_launch.portable_root,
+            installation_epoch: &runtime_launch.installation_epoch,
+            generation: &runtime_launch.generation,
+            authority_generation: runtime_launch.authority_generation,
+            authority_state_fence: &runtime_launch.authority_state_fence,
+            authority_descriptor_path: &runtime_launch.authority_descriptor_path,
+            authority_descriptor_digest: &runtime_launch.authority_descriptor_digest,
+            runtime_state_roots: &runtime_launch.runtime_state_roots,
+            kernel_work_root: &runtime_launch.kernel_work_root,
+            kernel_artifact_digest: &runtime_launch.kernel_artifact_digest,
+            store_config_path: &runtime_launch.store_config_path,
+            store_bootstrap_descriptor_path: &runtime_launch.store_bootstrap_descriptor_path,
+            store_bootstrap_descriptor_digest: &runtime_launch.store_bootstrap_descriptor_digest,
+            canonical_store_executable_path: &runtime_launch.canonical_store_executable_path,
+            canonical_store_artifact_digest: &runtime_launch.canonical_store_artifact_digest,
+            kernel_arguments: &runtime_launch.kernel_arguments,
+            store_bridge_executable_path: &runtime_launch.store_bridge_executable_path,
+            store_bridge_artifact_digest: &runtime_launch.store_bridge_artifact_digest,
+            store_bridge_arguments: &runtime_launch.store_bridge_arguments,
+            canonical_store_arguments: &runtime_launch.canonical_store_arguments,
+            watchdog_executable_path: &runtime_launch.watchdog_executable_path,
+            watchdog_artifact_digest: &runtime_launch.watchdog_artifact_digest,
+        };
+        let bytes = serde_json::to_vec(&unsigned).unwrap_or_else(|_| unreachable!());
+        runtime_launch.descriptor_digest = handle(format!("{:x}", Sha256::digest(bytes)));
+        let manifest = CandidateManifest {
+            generation,
+            components: vec![handle("component:kernel"), handle("component:store")],
+            kernel_artifact_digest: kernel_digest,
+            store_bridge_artifact_digest: bridge_digest,
+            canonical_store_artifact_digest: provider_digest,
+            kernel_executable_path: path(&root, "eliot-kernel.exe"),
+            store_bridge_executable_path: bridge_path,
+            canonical_store_executable_path: provider_path,
+            config_path,
+            dependency_closure_refs: vec![handle("evidence:dependency-closure")],
+            license_refs: vec![handle("evidence:licenses")],
+            config_digest,
+            supervision_key_fingerprint: handle("6".repeat(64)),
+            signature_ref: handle("evidence:signature"),
+            runtime_state_roots_digest: runtime_state_roots.roots_digest.clone(),
+            runtime_launch,
+        };
+        manifest
+            .validate()
+            .unwrap_or_else(|error| panic!("liveness manifest: {error}"));
+        (manifest, root)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_controller_liveness_tick_uses_bridge_digest_not_provider_digest() {
+        let (manifest, root) = liveness_manifest_with_distinct_store_digests();
+        assert_ne!(
+            manifest.store_bridge_artifact_digest,
+            manifest.canonical_store_artifact_digest
+        );
+        let now = std::time::Instant::now();
+        let exact = ReadinessContourIdentity {
+            approved_generation: manifest.generation.clone(),
+            approved_kernel_artifact: manifest.kernel_artifact_digest.clone(),
+            approved_store_artifact: manifest.store_bridge_artifact_digest.clone(),
+            approved_config: manifest.config_digest.clone(),
+            active_kernel_record_checksum: PlatformHandle::new("kernel-record")
+                .unwrap_or_else(|_| unreachable!()),
+            candidate_binding_digest: PlatformHandle::new("candidate-binding")
+                .unwrap_or_else(|_| unreachable!()),
+            store_requirement_digest: PlatformHandle::new("store-requirement")
+                .unwrap_or_else(|_| unreachable!()),
+            store_proof_fence: Some(
+                PlatformHandle::new("store-proof").unwrap_or_else(|_| unreachable!()),
+            ),
+        };
+        let mut gate = HostReadinessGate::default();
+        assert!(gate.grant(exact.clone(), now));
+        let mut selected_store = None;
+        let tick = descriptor_bound_liveness_tick(
+            &mut gate,
+            HostBranchDisposition::LiveAwaitingReadiness,
+            Some(&manifest),
+            |generation, kernel, store, config| {
+                assert_eq!(generation, &manifest.generation);
+                assert_eq!(kernel, &manifest.kernel_artifact_digest);
+                assert_eq!(config, &manifest.config_digest);
+                selected_store = Some(store.clone());
+                Ok(exact)
+            },
+            now + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(tick, HostLivenessTick::HealthyLeasePreserved);
+        assert_eq!(
+            selected_store.as_ref(),
+            Some(&manifest.store_bridge_artifact_digest)
+        );
+        assert_ne!(
+            selected_store.as_ref(),
+            Some(&manifest.canonical_store_artifact_digest)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]
