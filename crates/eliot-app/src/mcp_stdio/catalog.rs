@@ -699,7 +699,7 @@ pub(super) fn delegation_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_delegate_review",
             "Eliot Delegate Review",
-            "Route a bounded candidate-only review through Governor policy to Antigravity.",
+            "Route a bounded candidate-only review through Governor policy to Antigravity; Eliot seals or reuses the campaign preregistration internally before reserving the provider call.",
             &json!({
                 "type": "object",
                 "properties": {

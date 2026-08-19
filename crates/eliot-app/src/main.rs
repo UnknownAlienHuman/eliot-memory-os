@@ -2601,7 +2601,7 @@ async fn dispatch_external_review_command(
     }
 }
 
-#[allow(clippy::print_stdout, clippy::too_many_lines)]
+#[allow(clippy::large_futures, clippy::print_stdout, clippy::too_many_lines)]
 async fn dispatch_delegate_command(config: &Path, command: DelegateCommand) -> Result<()> {
     use eliot_types::DelegationProviderPreference;
     let root = delegation_runtime::root_from_config(config);
@@ -2651,8 +2651,6 @@ async fn dispatch_delegate_command(config: &Path, command: DelegateCommand) -> R
                     idempotency_key: None,
                     require_budget_slot: false,
                     explicit_operator_intent: false,
-                    preregistration_id: None,
-                    execution_token: None,
                 },
             )
             .await?
@@ -2695,8 +2693,6 @@ async fn dispatch_delegate_command(config: &Path, command: DelegateCommand) -> R
                     idempotency_key: Some(idempotency_key),
                     require_budget_slot,
                     explicit_operator_intent: confirm_operator_intent,
-                    preregistration_id: None,
-                    execution_token: None,
                 },
             )
             .await?

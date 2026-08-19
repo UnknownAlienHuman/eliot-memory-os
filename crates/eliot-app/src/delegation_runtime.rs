@@ -10,8 +10,9 @@ use eliot_engine::{
     DelegationReportService, ExternalResultCompletenessService, ExternalReviewJobService,
     IncidentService, ProviderCallCampaignRequest, ProviderCallReservationDecision,
     ProviderCallReservationOwner, ProviderCallReservationRequest, ProviderCompletenessInput,
-    ProviderInvocationJournal, WorkState, antigravity_plan_route_policy,
-    antigravity_review_request, external_review_request, work_lease_is_active,
+    ProviderInvocationJournal, ProviderReviewPreRegistrationService, WorkState,
+    antigravity_plan_route_policy, antigravity_review_request, external_review_request,
+    work_lease_is_active,
 };
 use eliot_types::{
     AntigravityBinaryResolutionStatus, AntigravityEnablementScope, AntigravityEnablementState,
@@ -39,6 +40,7 @@ pub fn root_from_config(config_path: &Path) -> PathBuf {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationReviewInput {
     pub project_id: String,
     pub task_id: String,
@@ -62,10 +64,6 @@ pub struct DelegationReviewInput {
     pub require_budget_slot: bool,
     #[serde(default)]
     pub explicit_operator_intent: bool,
-    #[serde(default)]
-    pub preregistration_id: Option<String>,
-    #[serde(default)]
-    pub execution_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -190,27 +188,7 @@ pub async fn review(
     let mut delegation_state = load_state(root)?;
     let mut work_state = load_work_state(root)?;
     let reservation_owner = ProviderCallReservationOwner::new(root);
-    if let (Some(campaign_id), Some(idempotency_key)) =
-        (input.campaign_id.as_ref(), input.idempotency_key.as_ref())
-        && let Some(existing) =
-            reservation_owner
-                .snapshot()?
-                .reservations
-                .into_iter()
-                .find(|reservation| {
-                    reservation.campaign_id == *campaign_id
-                        && reservation.idempotency_key == *idempotency_key
-                })
-    {
-        let review_ref = existing.review_ref.clone();
-        return Ok(json!({
-            "component":"delegation_provider_execution",
-            "idempotent_replay":true,
-            "provider_process_started":false,
-            "reservation":existing,
-            "review_ref":review_ref
-        }));
-    }
+    let provider_ledger_snapshot = reservation_owner.snapshot()?;
     let work_lease_id = WorkLeaseId::from_str(&input.work_lease_id)
         .context("work_lease_id must be a valid WorkLeaseId")?;
     let matching_lease = work_state
@@ -227,6 +205,8 @@ pub async fn review(
         },
         |lease| (lease.project_id, lease.task_id),
     );
+    let execution_input_flags = real_provider_execution_input_flags(&input);
+    let execution_flags = real_provider_execution_flags(&input);
     let request = DelegationRequest {
         delegation_id: new_id("delegation"),
         project_id,
@@ -242,6 +222,22 @@ pub async fn review(
         preferred_provider: input.preferred_provider,
         created_at: OffsetDateTime::now_utc(),
     };
+    let existing_provider_replay = input
+        .campaign_id
+        .as_ref()
+        .zip(input.idempotency_key.as_ref())
+        .and_then(|(campaign_id, idempotency_key)| {
+            provider_ledger_snapshot
+                .reservations
+                .iter()
+                .find(|reservation| {
+                    reservation.campaign_id == *campaign_id
+                        && reservation.idempotency_key == *idempotency_key
+                        && reservation.task_id == request.task_id
+                        && reservation.provider == "antigravity"
+                })
+                .cloned()
+        });
     let health = health(root)?;
     let active_work_lease = matching_lease.as_ref().is_some_and(|lease| {
         lease.project_id == request.project_id
@@ -265,12 +261,13 @@ pub async fn review(
                         i64::try_from(budget.cooldown_seconds).unwrap_or(i64::MAX),
                     )
         });
-    let duplicate_fresh_review = delegation_state.requests.iter().any(|existing| {
-        existing.task_id == request.task_id
-            && existing.review_kind == request.review_kind
-            && existing.question == request.question
-            && OffsetDateTime::now_utc() - existing.created_at < time::Duration::minutes(5)
-    });
+    let duplicate_fresh_review = existing_provider_replay.is_none()
+        && delegation_state.requests.iter().any(|existing| {
+            existing.task_id == request.task_id
+                && existing.review_kind == request.review_kind
+                && existing.question == request.question
+                && OffsetDateTime::now_utc() - existing.created_at < time::Duration::minutes(5)
+        });
     let forbidden_data_exposure = forbidden_data(&request);
     let context = DelegationPolicyContext {
         incident_lockdown: health.incident_lockdown,
@@ -288,35 +285,33 @@ pub async fn review(
     decision.provider_health_ref = Some("reports/delegation-health/latest.json".to_owned());
     decision.budget_id = Some(delegation_state.budgets[budget_index].budget_id.clone());
     let mut execution_evidence = None;
+    let mut idempotent_replay = false;
+    let mut replay_reservation = None;
     if decision.kind == DelegationDecisionKind::Execute {
-        let preregistration_authorized = match (
-            input.campaign_id.as_deref(),
-            input.preregistration_id.as_deref(),
-            input.execution_token.as_deref(),
-        ) {
-            (Some(campaign_id), Some(preregistration_id), Some(token)) => {
-                crate::provider_budget_runtime::validate_execution_authorization(
-                    root,
-                    campaign_id,
-                    preregistration_id,
-                    token,
-                )?;
-                true
+        let seal_allowed =
+            execution_flags || (execution_input_flags && existing_provider_replay.is_some());
+        let sealed_preregistration = if seal_allowed {
+            match (
+                input.campaign_id.as_deref(),
+                input.idempotency_key.as_deref(),
+            ) {
+                (Some(campaign_id), Some(idempotency_key)) => Some(
+                    crate::provider_budget_runtime::seal_or_reuse_preregistration(
+                        root,
+                        campaign_id,
+                        request.project_id,
+                        request.task_id,
+                        &request.question,
+                        &request.evidence_refs,
+                        Some(idempotency_key),
+                    )?,
+                ),
+                _ => None,
             }
-            _ => false,
+        } else {
+            None
         };
-        let execution_authorized = input.require_budget_slot
-            && input.explicit_operator_intent
-            && preregistration_authorized
-            && std::env::var_os("ELIOT_DISABLE_REAL_PROVIDER").is_none()
-            && input
-                .campaign_id
-                .as_ref()
-                .is_some_and(|value| !value.is_empty())
-            && input
-                .idempotency_key
-                .as_ref()
-                .is_some_and(|value| !value.is_empty());
+        let execution_authorized = seal_allowed && sealed_preregistration.is_some();
         if !execution_authorized {
             decision.kind = DelegationDecisionKind::Deny;
             decision.provider_id = None;
@@ -341,23 +336,16 @@ pub async fn review(
                 }];
             } else {
                 let campaign_id = input.campaign_id.as_deref().unwrap_or_default();
-                let idempotency_key = input.idempotency_key.as_deref().unwrap_or_default();
+                let preregistration = sealed_preregistration
+                    .clone()
+                    .context("authorized provider execution lost sealed preregistration")?;
+                let idempotency_key = preregistration.idempotency_key.clone();
                 let calibration = crate::calibration_runtime::load_state(root)?;
                 let campaign = calibration
                     .campaigns
                     .iter()
                     .find(|campaign| campaign.campaign_id == campaign_id)
                     .context("provider execution campaign does not exist")?;
-                let preregistration = calibration
-                    .preregistrations
-                    .iter()
-                    .find(|item| {
-                        item.campaign_id == campaign_id
-                            && input.preregistration_id.as_deref()
-                                == Some(item.preregistration_id.as_str())
-                    })
-                    .cloned()
-                    .context("provider execution preregistration does not exist")?;
                 if !campaign.selected_task_ids.contains(&request.task_id)
                     || campaign.provider_route != "antigravity"
                 {
@@ -380,15 +368,28 @@ pub async fn review(
                             campaign_id: campaign.campaign_id.clone(),
                             task_id: request.task_id,
                             provider: "antigravity".to_owned(),
-                            idempotency_key: idempotency_key.to_owned(),
+                            idempotency_key: idempotency_key.clone(),
                             gate_decision_ref: decision.decision_id.clone(),
                         })?;
                     match reservation_decision {
                         ProviderCallReservationDecision::Reserved(reservation) => {
-                            let preregistration_id = input
-                                .preregistration_id
-                                .as_deref()
-                                .context("authorized provider execution lost preregistration ID")?;
+                            let preregistration_id = preregistration.preregistration_id.as_str();
+                            if let Err(error) =
+                                ProviderReviewPreRegistrationService::validate_before_reservation(
+                                    &preregistration,
+                                    &reservation,
+                                )
+                            {
+                                reservation_owner.release_pre_dispatch(
+                                    &reservation.reservation_id,
+                                    "sealed preregistration did not match provider reservation",
+                                )?;
+                                DelegationBudgetService.release(
+                                    &mut delegation_state.budgets[budget_index],
+                                    request.origin,
+                                );
+                                return Err(anyhow::Error::msg(error));
+                            }
                             crate::provider_budget_runtime::record_reservation(
                                 root,
                                 campaign_id,
@@ -518,14 +519,29 @@ pub async fn review(
                                 }
                             }
                         }
-                        ProviderCallReservationDecision::IdempotentReplay(_) => {
+                        ProviderCallReservationDecision::IdempotentReplay(existing) => {
                             DelegationBudgetService.release(
                                 &mut delegation_state.budgets[budget_index],
                                 request.origin,
                             );
-                            decision.kind = DelegationDecisionKind::Deny;
-                            decision.provider_id = None;
-                            decision.reasons = vec![DelegationReason::FreshEquivalentReview];
+                            if existing.task_id == request.task_id
+                                && existing.provider == "antigravity"
+                            {
+                                idempotent_replay = true;
+                                replay_reservation = Some(existing.clone());
+                                decision.constraints.push(format!(
+                                    "provider_call_reservation_replay:{}",
+                                    existing.reservation_id
+                                ));
+                            } else {
+                                decision.kind = DelegationDecisionKind::Deny;
+                                decision.provider_id = None;
+                                decision.reasons =
+                                    vec![DelegationReason::MissingCampaignReservation];
+                                decision
+                                    .constraints
+                                    .push("provider_reservation_scope_mismatch".to_owned());
+                            }
                         }
                         ProviderCallReservationDecision::BudgetExceeded => {
                             DelegationBudgetService.release(
@@ -578,9 +594,15 @@ pub async fn review(
         .rev()
         .find(|job| job.delegation_id == request.delegation_id);
     let response = DelegationReportService.response(&request, &decision, job);
+    let replay_review_ref = replay_reservation
+        .as_ref()
+        .and_then(|reservation| reservation.review_ref.clone());
     Ok(json!({
         "review": response,
         "execution": execution_evidence,
+        "idempotent_replay": idempotent_replay,
+        "reservation": replay_reservation,
+        "review_ref": replay_review_ref,
         "wait_requested": input.wait
     }))
 }
@@ -1486,4 +1508,22 @@ fn new_id(prefix: &str) -> String {
 
 const fn default_provider() -> DelegationProviderPreference {
     DelegationProviderPreference::Auto
+}
+
+pub(crate) fn real_provider_execution_input_flags(input: &DelegationReviewInput) -> bool {
+    input.require_budget_slot
+        && input.explicit_operator_intent
+        && input
+            .campaign_id
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && input
+            .idempotency_key
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+pub(crate) fn real_provider_execution_flags(input: &DelegationReviewInput) -> bool {
+    real_provider_execution_input_flags(input)
+        && std::env::var_os("ELIOT_DISABLE_REAL_PROVIDER").is_none()
 }

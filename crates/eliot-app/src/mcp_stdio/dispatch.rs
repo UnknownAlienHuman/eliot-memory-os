@@ -725,7 +725,7 @@ pub(super) fn string_array_field(value: &Value, field: &str) -> Vec<String> {
         .collect()
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::large_futures, clippy::too_many_lines)]
 pub(super) async fn dispatch_tool(
     state: &McpState,
     context: AuthenticatedRequestContext,
