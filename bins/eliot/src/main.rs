@@ -51,7 +51,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum InstallationCommand {
-    /// Validate an immutable v5 installation plan JSON without applying it.
+    /// Validate an immutable v6 installation plan JSON without applying it.
     Plan {
         /// Absolute path to an existing serialized `InstallationTransaction`.
         #[arg(long, value_parser = absolute_path)]

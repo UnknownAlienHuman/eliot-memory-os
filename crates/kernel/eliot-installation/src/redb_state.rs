@@ -14,7 +14,7 @@ use eliot_contracts::ContractVersion;
 use eliot_platform::PlatformHandle;
 
 const TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("installation_transactions_v5");
+    TableDefinition::new("installation_transactions_v6");
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,13 +89,13 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
         if !transaction.is_constructor_planned() {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
-                reason: "create_planned accepts only constructor-produced Planned/Pending v5 state"
+                reason: "create_planned accepts only constructor-produced Planned/Pending v6 state"
                     .to_owned(),
             });
         }
         let bytes = encode(transaction)?;
         let database = self.open_for_mutation()?;
-        classify_v5_table(&database)?;
+        classify_v6_table(&database)?;
         let write = database
             .begin_write()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
@@ -134,7 +134,7 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
         let table = match read.open_table(TRANSACTION_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
-                classify_missing_v5_table(&read)?;
+                classify_missing_v6_table(&read)?;
                 return Ok(None);
             }
             Err(error) => return Err(InstallationError::Platform(error.to_string())),
@@ -158,7 +158,7 @@ impl transaction_store_private::Sealed for RedbInstallationTransactionStore {
         transaction.validate()?;
         let bytes = encode(transaction)?;
         let database = self.open_for_mutation()?;
-        if !classify_v5_table(&database)? {
+        if !classify_v6_table(&database)? {
             return Err(InstallationError::TransactionNotFound {
                 transaction_id: transaction.transaction_id.as_str().to_owned(),
             });
@@ -219,21 +219,21 @@ impl transaction_store_private::Sealed for RedbInstallationTransactionStore {
     }
 }
 
-fn classify_v5_table(database: &impl ReadableDatabase) -> Result<bool, InstallationError> {
+fn classify_v6_table(database: &impl ReadableDatabase) -> Result<bool, InstallationError> {
     let read = database
         .begin_read()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
     match read.open_table(TRANSACTION_TABLE) {
         Ok(_) => Ok(true),
         Err(redb::TableError::TableDoesNotExist(_)) => {
-            classify_missing_v5_table(&read)?;
+            classify_missing_v6_table(&read)?;
             Ok(false)
         }
         Err(error) => Err(InstallationError::Platform(error.to_string())),
     }
 }
 
-fn classify_missing_v5_table(read: &redb::ReadTransaction) -> Result<(), InstallationError> {
+fn classify_missing_v6_table(read: &redb::ReadTransaction) -> Result<(), InstallationError> {
     let has_standard_tables = read
         .list_tables()
         .map_err(|error| InstallationError::Platform(error.to_string()))?
@@ -246,7 +246,7 @@ fn classify_missing_v5_table(read: &redb::ReadTransaction) -> Result<(), Install
         .is_some();
     if has_standard_tables || has_multimap_tables {
         return Err(InstallationError::MigrationRequired {
-            reason: "existing nonempty redb store has no installation_transactions_v5 table"
+            reason: "existing nonempty redb store has no installation_transactions_v6 table"
                 .to_owned(),
         });
     }
@@ -299,7 +299,7 @@ fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
         value
             .get("wire_version")
             .ok_or_else(|| InstallationError::MigrationRequired {
-                reason: "transaction envelope predates required v5 wire discriminator".to_owned(),
+                reason: "transaction envelope predates required v6 wire discriminator".to_owned(),
             })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
         InstallationError::MigrationRequired {
@@ -317,7 +317,7 @@ fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
         value
             .get("transaction")
             .ok_or_else(|| InstallationError::MigrationRequired {
-                reason: "transaction envelope predates the required v5 payload".to_owned(),
+                reason: "transaction envelope predates the required v6 payload".to_owned(),
             })?;
     let transaction_bytes = serde_json::to_vec(transaction_value).map_err(|error| {
         InstallationError::CorruptRegistry {
@@ -331,7 +331,7 @@ fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
         })?;
     if envelope.transaction != transaction {
         return Err(InstallationError::MigrationRequired {
-            reason: "transaction payload did not round-trip through the v5 envelope".to_owned(),
+            reason: "transaction payload did not round-trip through the v6 envelope".to_owned(),
         });
     }
     Ok(transaction)
@@ -345,6 +345,8 @@ mod tests {
         TableDefinition::new("installation_transactions_v2");
     const V4_TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
         TableDefinition::new("installation_transactions_v3");
+    const V5_TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
+        TableDefinition::new("installation_transactions_v5");
 
     fn test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -426,6 +428,54 @@ mod tests {
         ));
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v5_transaction_table_requires_migration_before_payload_deserialization() {
+        let path = test_path("legacy-v5");
+        let _ = std::fs::remove_file(&path);
+        let database =
+            Database::create(&path).unwrap_or_else(|error| panic!("create fixture: {error}"));
+        let write = database
+            .begin_write()
+            .unwrap_or_else(|error| panic!("begin fixture write: {error}"));
+        {
+            let mut table = write
+                .open_table(V5_TRANSACTION_TABLE)
+                .unwrap_or_else(|error| panic!("open v5 fixture table: {error}"));
+            table
+                .insert(
+                    "transaction:v5",
+                    br#"{"wire_version":{"major":5,"minor":0,"patch":0},"transaction":{}}"#
+                        .as_slice(),
+                )
+                .unwrap_or_else(|error| panic!("insert v5 fixture: {error}"));
+        }
+        write
+            .commit()
+            .unwrap_or_else(|error| panic!("commit v5 fixture: {error}"));
+        drop(database);
+        let store = RedbInstallationTransactionStore::open_existing_exact_path(&path)
+            .unwrap_or_else(|error| panic!("open v5 fixture: {error}"));
+        let id = PlatformHandle::new("transaction:v5")
+            .unwrap_or_else(|error| panic!("fixture identity: {error}"));
+        assert!(matches!(
+            store.load(&id),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("installation_transactions_v6")
+        ));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v5_transaction_envelope_requires_migration_before_payload_deserialization() {
+        let bytes = br#"{"wire_version":{"major":5,"minor":0,"patch":0},"transaction":{}}"#;
+        assert!(matches!(
+            decode(bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("wire 5.0.0")
+        ));
     }
 
     #[test]

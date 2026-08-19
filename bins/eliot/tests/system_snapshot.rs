@@ -155,7 +155,7 @@ fn run_installation_plan_fixture(name: &str, fixture: &str) -> std::process::Out
 }
 
 #[test]
-fn installation_plan_reports_missing_v5_discriminator_as_migration() {
+fn installation_plan_reports_missing_v6_discriminator_as_migration() {
     let result = run_installation_plan_fixture("missing-discriminator", "{}");
 
     assert!(!result.status.success());
@@ -165,15 +165,15 @@ fn installation_plan_reports_missing_v5_discriminator_as_migration() {
     assert!(
         output["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("required v5 discriminator"))
+            .is_some_and(|detail| detail.contains("required v6 discriminator"))
     );
 }
 
 #[test]
-fn installation_plan_reports_v4_discriminator_as_migration() {
+fn installation_plan_reports_v5_discriminator_as_migration() {
     let result = run_installation_plan_fixture(
-        "v4",
-        r#"{"transaction_wire_version":{"major":4,"minor":0,"patch":0}}"#,
+        "v5",
+        r#"{"transaction_wire_version":{"major":5,"minor":0,"patch":0}}"#,
     );
 
     assert!(!result.status.success());
@@ -183,15 +183,15 @@ fn installation_plan_reports_v4_discriminator_as_migration() {
     assert!(
         output["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("wire 4.0.0"))
+            .is_some_and(|detail| detail.contains("wire 5.0.0"))
     );
 }
 
 #[test]
-fn installation_plan_reports_malformed_v5_as_invalid() {
+fn installation_plan_reports_malformed_v6_as_invalid() {
     let result = run_installation_plan_fixture(
-        "malformed-v5",
-        r#"{"transaction_wire_version":{"major":5,"minor":0,"patch":0},"transaction_id":"malformed"}"#,
+        "malformed-v6",
+        r#"{"transaction_wire_version":{"major":6,"minor":0,"patch":0},"transaction_id":"malformed"}"#,
     );
 
     assert!(!result.status.success());

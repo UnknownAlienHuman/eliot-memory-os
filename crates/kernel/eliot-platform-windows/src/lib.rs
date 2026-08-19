@@ -3614,6 +3614,40 @@ impl WindowsInstallerSecretProvider {
     }
 }
 
+/// Dedicated Windows OS-CSPRNG target factory for the `LocalService` Store
+/// credential namespace.
+///
+/// This semantic factory is intentionally separate from installer ownership
+/// references and Kernel activation nonces. It returns only the non-secret
+/// Credential Manager target; credential bytes are generated and written by
+/// the authenticated Store credential effect.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsStoreCredentialTargetGenerator;
+
+impl WindowsStoreCredentialTargetGenerator {
+    const RANDOM_BYTES: usize = 16;
+
+    /// Constructs a target factory without touching Credential Manager.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Issues one unpredictable `eliot/store/v1/<32 lowercase hex>` target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider error when the Windows OS CSPRNG is
+    /// unavailable or the bounded target cannot be represented.
+    pub fn fresh_target(&self) -> Result<PlatformHandle, WindowsAdapterError> {
+        let mut random = [0_u8; Self::RANDOM_BYTES];
+        fill_system_random(&mut random)?;
+        let target = format!("{STORE_CREDENTIAL_TARGET_PREFIX}{}", hex_lower(&random));
+        random.fill(0);
+        PlatformHandle::new(target).map_err(|_| WindowsAdapterError::InvalidInput)
+    }
+}
+
 /// Raw current-token Credential Manager primitive used by the `LocalService`
 /// Host.  It is deliberately private: callers must obtain the opaque
 /// Host-owned capability from a live [`HostOwnerLease`].
@@ -10384,6 +10418,7 @@ fn valid_credential_key(value: &str) -> bool {
 }
 
 const INSTALLER_CREDENTIAL_TARGET_PREFIX: &str = "eliot/installer-root/v1/";
+const STORE_CREDENTIAL_TARGET_PREFIX: &str = "eliot/store/v1/";
 
 fn installer_credential_target(value: &str) -> bool {
     value.starts_with(INSTALLER_CREDENTIAL_TARGET_PREFIX)
@@ -10780,6 +10815,57 @@ mod tests {
                 .unwrap_or_else(|error| panic!("nonce issuance failed: {error}"));
             assert!(seen.insert(nonce.as_str().to_owned()));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn store_targets_have_exact_shape_and_distinctness() {
+        let generator = WindowsStoreCredentialTargetGenerator::new();
+        let installer = WindowsInstallerSecretProvider::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let target = generator
+                .fresh_target()
+                .unwrap_or_else(|error| panic!("Store target issuance failed: {error}"));
+            assert!(target.as_str().starts_with(STORE_CREDENTIAL_TARGET_PREFIX));
+            let token = target
+                .as_str()
+                .strip_prefix(STORE_CREDENTIAL_TARGET_PREFIX)
+                .unwrap_or_else(|| unreachable!());
+            assert_eq!(token.len(), 32);
+            assert!(
+                token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            assert!(seen.insert(target.as_str().to_owned()));
+        }
+
+        let installer_target = installer
+            .fresh_reference()
+            .unwrap_or_else(|error| panic!("installer target issuance failed: {error}"));
+        assert!(
+            installer_target
+                .as_str()
+                .starts_with(INSTALLER_CREDENTIAL_TARGET_PREFIX)
+        );
+        assert_ne!(
+            installer_target.as_str(),
+            generator
+                .fresh_target()
+                .unwrap_or_else(|error| panic!("Store target issuance failed: {error}"))
+                .as_str()
+        );
+        let activation_target = fresh_activation_nonce()
+            .unwrap_or_else(|error| panic!("activation target issuance failed: {error}"));
+        assert!(activation_target.as_str().starts_with("eliot-activation-"));
+        assert_ne!(
+            activation_target.as_str(),
+            generator
+                .fresh_target()
+                .unwrap_or_else(|error| panic!("Store target issuance failed: {error}"))
+                .as_str()
+        );
     }
 
     #[test]

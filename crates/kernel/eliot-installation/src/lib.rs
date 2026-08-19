@@ -30,9 +30,9 @@ use eliot_platform_windows::{
     ServiceBootstrapArguments, ServiceRegistrationCurrent, ServiceRegistrationInspection,
     ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceStartMode, UserOwnedPathLease,
     UserOwnedRootReadLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
-    WindowsPlatform, current_user_local_app_data_root, fresh_service_registration_nonce,
-    observe_running_eliot_host_process, protected_program_data_root,
-    require_protected_program_data_path,
+    WindowsPlatform, WindowsStoreCredentialTargetGenerator, current_user_local_app_data_root,
+    fresh_service_registration_nonce, observe_running_eliot_host_process,
+    protected_program_data_root, require_protected_program_data_path,
 };
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
@@ -65,7 +65,7 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
 /// This discriminator is intentionally independent from [`CONTRACT_VERSION`]
 /// so the accepted runtime-launch, candidate-manifest and approved-registry
 /// v2 wires remain unchanged.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(6, 0, 0);
 
 /// Returns the stable contract identity for handshakes and provenance.
 pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
@@ -4852,7 +4852,7 @@ impl InstallationTransaction {
     }
 }
 
-/// Decodes the canonical transaction JSON and classifies pre-v5 records as an
+/// Decodes the canonical transaction JSON and classifies pre-v6 records as an
 /// explicit migration requirement rather than synthesizing missing progress.
 pub fn decode_installation_transaction_json(
     bytes: &[u8],
@@ -4863,7 +4863,7 @@ pub fn decode_installation_transaction_json(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v5 discriminator".to_owned(),
+            reason: "installation transaction predates the required v6 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -5396,6 +5396,7 @@ pub trait InstallationEffectPort: Send {
 struct WindowsInstallationEffectPort {
     primitive: WindowsInstallerRootPrimitive,
     secrets: WindowsInstallerSecretProvider,
+    store_target_generator: WindowsStoreCredentialTargetGenerator,
 }
 
 impl WindowsInstallationEffectPort {
@@ -5403,7 +5404,14 @@ impl WindowsInstallationEffectPort {
         Self {
             primitive: WindowsInstallerRootPrimitive::new(),
             secrets: WindowsInstallerSecretProvider::new(),
+            store_target_generator: WindowsStoreCredentialTargetGenerator::new(),
         }
+    }
+
+    fn fresh_store_credential_target(
+        &self,
+    ) -> Result<PlatformHandle, eliot_platform_windows::WindowsAdapterError> {
+        self.store_target_generator.fresh_target()
     }
 
     fn service_context(
@@ -8047,6 +8055,20 @@ where
         }
     }
 
+    /// Issues the non-secret Store credential target for a new installation
+    /// plan.
+    ///
+    /// This is the normal installation-authority factory seam. The planner
+    /// must retain the returned target in both the candidate launch manifest
+    /// and its Store credential effect; it must not generate a replacement
+    /// target through a Kernel activation or installer-root API.
+    pub fn fresh_store_credential_target(&self) -> Result<PlatformHandle, InstallationError> {
+        self.inner
+            .port()
+            .fresh_store_credential_target()
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
     /// Drives exactly one durable root/ACL effect.
     pub fn drive_effect(
         &mut self,
@@ -8428,6 +8450,17 @@ mod tests {
             *state = Some(transaction.clone());
             Ok(())
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installation_authority_is_the_store_target_factory_seam() {
+        let coordinator = WindowsInstallationCoordinator::new(SharedStore::default());
+        let first = must(coordinator.fresh_store_credential_target());
+        let second = must(coordinator.fresh_store_credential_target());
+        assert!(validate_store_credential_target(first.as_str()).is_ok());
+        assert!(validate_store_credential_target(second.as_str()).is_ok());
+        assert_ne!(first, second);
     }
 
     struct FakeEffectPort {
@@ -9984,7 +10017,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_v5_transaction_json_requires_explicit_migration() {
+    fn pre_v6_transaction_json_requires_explicit_migration() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.remove("transaction_wire_version");
@@ -10008,6 +10041,15 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_v6_transaction_json_is_corrupt_registry() {
+        let bytes = br#"{"transaction_wire_version":{"major":6,"minor":0,"patch":0},"transaction_id":"malformed"}"#;
+        assert!(matches!(
+            decode_installation_transaction_json(bytes),
+            Err(InstallationError::CorruptRegistry { .. })
         ));
     }
 
