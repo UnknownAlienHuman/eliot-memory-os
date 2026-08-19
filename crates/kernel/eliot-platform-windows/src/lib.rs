@@ -184,8 +184,13 @@ pub fn protected_program_data_root() -> Result<PathBuf, ProtectedPathError> {
     Ok(canonical)
 }
 
-/// Resolves the current user's canonical LocalAppData root without applying an
+/// Resolves the current user's canonical `LocalAppData` root without applying an
 /// ACL or accepting a caller-authored fallback.
+///
+/// # Errors
+///
+/// Returns an error when the OS known-folder lookup is unavailable, the root
+/// cannot be canonicalized, or its contour contains a reparse point.
 pub fn current_user_local_app_data_root() -> Result<PathBuf, ProtectedPathError> {
     let raw = known_folder_path(KnownFolder::LocalAppData)?;
     reject_reparse_chain(&raw, true)?;
@@ -356,7 +361,7 @@ pub struct ProtectedPathLease {
 }
 
 /// Retained read-only lease for one existing directory below the OS-resolved
-/// ProgramData contour.
+/// `ProgramData` contour.
 ///
 /// Unlike [`ProtectedPathLease`], acquisition never creates a sentinel and
 /// never writes an ACL. Root creation and ACL application remain explicit
@@ -379,12 +384,12 @@ impl std::fmt::Debug for ProtectedRootLease {
 }
 
 impl ProtectedRootLease {
-    /// Opens an existing absolute ProgramData descendant and retains a
+    /// Opens an existing absolute `ProgramData` descendant and retains a
     /// no-follow, no-delete-sharing handle for its complete directory contour.
     ///
     /// # Errors
     ///
-    /// Returns an error when the path escapes ProgramData, contains a reparse
+    /// Returns an error when the path escapes `ProgramData`, contains a reparse
     /// point, is not an existing directory, or cannot be retained read-only.
     pub fn open_existing(path: &Path) -> Result<Self, ProtectedPathError> {
         let root = expected_root()?;
@@ -414,6 +419,11 @@ impl ProtectedRootLease {
     }
 
     /// Returns the OS-resolved DOS/UNC directory path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained directory handle is unavailable,
+    /// cannot be resolved, or the adapter is unsupported on this platform.
     pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
         #[cfg(windows)]
         {
@@ -436,6 +446,11 @@ impl ProtectedRootLease {
     }
 
     /// Re-reads identity from the retained directory handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained handle is unavailable, cannot be
+    /// inspected, changed identity, or is unsupported on this platform.
     pub fn verify_stable_identity(&self) -> Result<(), ProtectedPathError> {
         #[cfg(windows)]
         {
@@ -522,6 +537,11 @@ impl ProtectedPathLease {
 
     /// Returns the DOS/UNC path resolved from the retained handle. Windows
     /// verbatim prefixes are removed before the path crosses the contract seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained handle cannot be resolved or this
+    /// operation is unsupported on the current platform.
     pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
         #[cfg(windows)]
         {
@@ -744,6 +764,11 @@ impl UserOwnedRootReadLease {
     }
 
     /// Returns the canonical DOS/UNC path from the retained handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained handle cannot be resolved or this
+    /// operation is unsupported on the current platform.
     pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
         #[cfg(windows)]
         {
@@ -756,6 +781,11 @@ impl UserOwnedRootReadLease {
     }
 
     /// Re-checks the retained directory identity without reopening by path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained handle cannot be inspected, changed
+    /// identity, or is unsupported on the current platform.
     pub fn verify_stable_identity(&self) -> Result<(), ProtectedPathError> {
         #[cfg(windows)]
         {
@@ -836,6 +866,11 @@ impl UserOwnedRootLease {
     }
 
     /// Returns the canonical DOS/UNC root path from the retained directory handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained handle cannot be resolved or this
+    /// operation is unsupported on the current platform.
     pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
         #[cfg(windows)]
         {
@@ -6852,6 +6887,11 @@ pub fn fresh_kernel_activation_nonce() -> Result<KernelActivationNonce, WindowsA
 
 /// Compatibility wrapper retaining the historical prefixed handle shape.
 /// New Kernel activation code must call [`fresh_kernel_activation_nonce`].
+///
+/// # Errors
+///
+/// Returns the classified OS RNG failure, or [`WindowsAdapterError::InvalidInput`]
+/// if the compatibility handle cannot be constructed from the generated material.
 pub fn fresh_activation_nonce() -> Result<PlatformHandle, WindowsAdapterError> {
     let material = fresh_activation_nonce_material()?;
     PlatformHandle::new(format!("{ACTIVATION_NONCE_PREFIX}{}", material.as_str()))
