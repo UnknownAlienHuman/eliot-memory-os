@@ -6086,6 +6086,11 @@ impl WindowsInstallationEffectPort {
             .registration_nonce
             .as_ref()
             .ok_or(PortError::InvalidRequestMetadata)?;
+        // `effect_request` has already validated the transaction-bound
+        // installation root before this sealed port is reached. Host's
+        // selector is therefore the only admitted fixed child; Watchdog keeps
+        // its original four bootstrap pairs plus nonce.
+        let installation_root = PathBuf::from(request.installation_root.as_str());
         let bootstrap = ServiceBootstrapArguments::new(
             Path::new(bootstrap.descriptor_path.as_str()).to_path_buf(),
             bootstrap.descriptor_digest.as_str(),
@@ -6093,6 +6098,12 @@ impl WindowsInstallationEffectPort {
             bootstrap.plan_generation,
             Vec::<String>::new(),
         )
+        .and_then(|value| match role {
+            InstallerServiceRole::Host => {
+                value.with_host_state_root(installation_root.join("host"))
+            }
+            InstallerServiceRole::Watchdog => Ok(value),
+        })
         .and_then(|value| value.with_registration_nonce(nonce.as_str()))
         .map_err(|_| PortError::InvalidRequestMetadata)?;
         let mut registration = ServiceRegistrationRequest::with_bootstrap(
@@ -6123,7 +6134,6 @@ impl WindowsInstallationEffectPort {
                 )
                 .map_err(|_| PortError::InvalidRequestMetadata)?;
         }
-        let installation_root = PathBuf::from(request.installation_root.as_str());
         let platform = WindowsPlatform::new(installation_root.clone())
             .map_err(|_| PortError::InvalidRequestMetadata)?;
         let profile = match request.profile {
@@ -9758,6 +9768,112 @@ mod tests {
         assert!(!marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"c".repeat(64)));
         request.registration_nonce = Some(test_handle("d".repeat(64)));
         assert!(!marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"b".repeat(64)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_context_binds_host_root_only_for_host_argv() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-service-context-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create service root: {error}"));
+        for executable_name in ["eliot-host.exe", "eliot-watchdog.exe"] {
+            std::fs::write(root.join(executable_name), [])
+                .unwrap_or_else(|error| panic!("create service image: {error}"));
+        }
+        let installation_root = test_handle(root.to_string_lossy().into_owned());
+        let precondition = must(InstallationEffectPrecondition::new(
+            vec![test_handle("evidence:service-precondition")],
+            None,
+            None,
+        ));
+        let make_request = |role, service_name, executable_name| {
+            let effect_id = test_handle(format!("effect:service:{executable_name}"));
+            let request = InstallationEffectRequest {
+                transaction_id: test_handle(format!("transaction:service:{executable_name}")),
+                plan: InstallerEffectPlan::RegisterService {
+                    effect_id: effect_id.clone(),
+                    role,
+                    service_name: test_handle(service_name),
+                    executable_path: test_handle(
+                        root.join(executable_name).to_string_lossy().into_owned(),
+                    ),
+                    account: InstallerServiceAccount::LocalService,
+                    automatic_start: true,
+                },
+                profile: InstallationProfile::SystemService,
+                installation_root: installation_root.clone(),
+                effect_id,
+                attempt: 1,
+                plan_digest: test_handle("a".repeat(64)),
+                precondition: precondition.clone(),
+                ownership_secret: None,
+                store_credential: None,
+                action: InstallationEffectAction::Apply,
+                expected_external_identity: None,
+                service_bootstrap: Some(InstallationServiceBootstrap {
+                    descriptor_path: test_handle(r"C:\ProgramData\Eliot\authority.json"),
+                    descriptor_digest: test_handle("b".repeat(64)),
+                    installation_id: test_handle("installation:service"),
+                    plan_generation: 7,
+                }),
+                registration_nonce: Some(test_handle("c".repeat(64))),
+            };
+            must(request.validate());
+            let (_, registration, _) =
+                must(WindowsInstallationEffectPort::service_context(&request));
+            registration
+                .bootstrap()
+                .unwrap_or_else(|| unreachable!())
+                .argv()
+        };
+
+        let host_argv = make_request(
+            InstallerServiceRole::Host,
+            ELIOT_HOST_SERVICE_NAME,
+            "eliot-host.exe",
+        );
+        let host_root = root.join("host").to_string_lossy().into_owned();
+        assert_eq!(
+            host_argv,
+            vec![
+                "--config-descriptor".to_owned(),
+                r"C:\ProgramData\Eliot\authority.json".to_owned(),
+                "--config-descriptor-sha256".to_owned(),
+                "b".repeat(64),
+                "--installation-id".to_owned(),
+                "installation:service".to_owned(),
+                "--tx-plan-generation".to_owned(),
+                "7".to_owned(),
+                "--host-state-root".to_owned(),
+                host_root,
+                "--registration-nonce".to_owned(),
+                "c".repeat(64),
+            ]
+        );
+
+        let watchdog_argv = make_request(
+            InstallerServiceRole::Watchdog,
+            ELIOT_WATCHDOG_SERVICE_NAME,
+            "eliot-watchdog.exe",
+        );
+        assert_eq!(
+            watchdog_argv,
+            vec![
+                "--config-descriptor".to_owned(),
+                r"C:\ProgramData\Eliot\authority.json".to_owned(),
+                "--config-descriptor-sha256".to_owned(),
+                "b".repeat(64),
+                "--installation-id".to_owned(),
+                "installation:service".to_owned(),
+                "--tx-plan-generation".to_owned(),
+                "7".to_owned(),
+                "--registration-nonce".to_owned(),
+                "c".repeat(64),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
