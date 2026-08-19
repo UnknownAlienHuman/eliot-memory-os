@@ -12193,6 +12193,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn job_assignment_identity_termination_and_kill_on_close_are_real() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let job = JobObject::new_kill_on_close().unwrap_or_else(|_| unreachable!());
         let mut child = spawn_job_child();
         let identity = match job.assign_process(child.id()) {
@@ -12227,6 +12228,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn dropping_host_owned_running_job_kills_children_and_removes_reopen_path() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let root = std::env::temp_dir().join(format!(
             "eliot-host-crash-kill-on-close-{}",
             unique_suffix()
