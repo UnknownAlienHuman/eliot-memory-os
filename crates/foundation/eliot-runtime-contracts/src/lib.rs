@@ -16,7 +16,22 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod installation_activation;
 mod supervision_lease;
+
+pub use installation_activation::{
+    Ed25519InstallationActivationApprovalSigner, INSTALLATION_ACTIVATION_CONTRACT_NAME,
+    INSTALLATION_ACTIVATION_CONTRACT_VERSION, INSTALLATION_ACTIVATION_NONCE_BYTES,
+    INSTALLATION_ACTIVATION_PUBLIC_KEY_BYTES, INSTALLATION_ACTIVATION_SCHEMA,
+    INSTALLATION_ACTIVATION_SIGNATURE_ALGORITHM, INSTALLATION_ACTIVATION_SIGNATURE_BYTES,
+    InstallationActivationApprovalSigner, InstallationActivationApprovalTrustAnchor,
+    InstallationActivationApprovalVerifier, InstallationActivationError,
+    InstallationActivationPayload, InstallationActivationSigner, InstallationActivationTrustAnchor,
+    InstallationActivationVerificationContext, InstallationActivationVerifier,
+    InstallationDigestBinding, InstallationScmReadback, InstallationScmRole,
+    SignedInstallationActivation, SignedInstallationActivationApproval,
+    VerifiedInstallationActivationApproval,
+};
 
 pub use supervision_lease::{
     Ed25519SupervisionLeaseSigner, RegisteredActivityWakePolicy, SUPERVISION_LEASE_CONTRACT_NAME,
@@ -929,6 +944,9 @@ pub fn contract_identity() -> Result<ContractIdentity, RuntimeContractError> {
             "service_process_state": schemars::schema_for!(ServiceProcessState),
             "module_generation_state": schemars::schema_for!(ModuleGenerationState),
             "generation_cutover_state": schemars::schema_for!(GenerationCutoverState),
+            "installation_activation_payload": schemars::schema_for!(InstallationActivationPayload),
+            "signed_installation_activation_approval":
+                schemars::schema_for!(SignedInstallationActivationApproval),
             "recovery_view": schemars::schema_for!(RecoveryView),
         }),
     )
