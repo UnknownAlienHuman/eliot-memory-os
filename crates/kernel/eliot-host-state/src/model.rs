@@ -1517,15 +1517,22 @@ impl StoreRebindRecord {
         handle(&self.operation_id, "store_rebind.operation_id")?;
         digest(&self.request_digest, "store_rebind.request_digest")?;
         handle(&self.requirement, "store_rebind.requirement")?;
-        digest(&self.candidate_binding_digest, "store_rebind.candidate_binding_digest")?;
+        digest(
+            &self.candidate_binding_digest,
+            "store_rebind.candidate_binding_digest",
+        )?;
         digest(&self.store_fence, "store_rebind.store_fence")?;
         if self.process_id == 0 || self.process_start_time_100ns == 0 {
-            return Err(JournalError::Invalid("store_rebind process identity must be non-zero".into()));
+            return Err(JournalError::Invalid(
+                "store_rebind process identity must be non-zero".into(),
+            ));
         }
         handle(&self.process_image_path, "store_rebind.process_image_path")?;
         handle(&self.job_name, "store_rebind.job_name")?;
         if self.generation == 0 || self.authority_epoch == 0 {
-            return Err(JournalError::Invalid("store_rebind generation and epoch must be non-zero".into()));
+            return Err(JournalError::Invalid(
+                "store_rebind generation and epoch must be non-zero".into(),
+            ));
         }
         if let Some(value) = &self.receipt_request_digest {
             digest(value, "store_rebind.receipt_request_digest")?;
@@ -1536,18 +1543,26 @@ impl StoreRebindRecord {
         match self.state {
             StoreRebindState::Pending => {
                 if self.receipt_request_digest.is_some() || self.receipt_store_fence.is_some() {
-                    return Err(JournalError::Invalid("pending store rebind must not carry receipt".into()));
+                    return Err(JournalError::Invalid(
+                        "pending store rebind must not carry receipt".into(),
+                    ));
                 }
             }
             StoreRebindState::Committed => {
                 if self.receipt_request_digest.is_none() || self.receipt_store_fence.is_none() {
-                    return Err(JournalError::Invalid("committed store rebind requires receipt".into()));
+                    return Err(JournalError::Invalid(
+                        "committed store rebind requires receipt".into(),
+                    ));
                 }
                 if self.receipt_request_digest.as_ref() != Some(&self.request_digest) {
-                    return Err(JournalError::Invalid("committed receipt digest must match request".into()));
+                    return Err(JournalError::Invalid(
+                        "committed receipt digest must match request".into(),
+                    ));
                 }
                 if self.receipt_store_fence.as_ref() != Some(&self.store_fence) {
-                    return Err(JournalError::Invalid("committed receipt fence must match handoff fence".into()));
+                    return Err(JournalError::Invalid(
+                        "committed receipt fence must match handoff fence".into(),
+                    ));
                 }
             }
         }

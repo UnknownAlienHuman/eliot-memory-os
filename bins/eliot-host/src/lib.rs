@@ -24,12 +24,12 @@ use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
     EliotActivationRecord, EpochIdentity, EpochTransition, HostInstallationEpoch,
     HostKernelStoreLineage, HostObservationRecord, HostState, HostStateJournalService,
-    HostStateRecord, IdempotencyIdentity, StoreRebindRecord, StoreRebindState, JOURNAL_VERSION,
-    JournalBackend, JournalError, JournalManifest, KernelJobBinding,
-    KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps, NonceState,
-    OneTimeNonceState, PriorKernelDisposition, PriorKernelSource, ProductionHostStateJournal,
-    ReadinessApprovedContour, ReadinessEvidence, ReconcileOutcome, RecordFence,
-    RecoveryLineageEvidence, RedbJournalBackend, WakeDisposition, record_checksum,
+    HostStateRecord, IdempotencyIdentity, JOURNAL_VERSION, JournalBackend, JournalError,
+    JournalManifest, KernelJobBinding, KernelReadinessObservationRecord, KernelRecord,
+    LifecycleTimestamps, NonceState, OneTimeNonceState, PriorKernelDisposition, PriorKernelSource,
+    ProductionHostStateJournal, ReadinessApprovedContour, ReadinessEvidence, ReconcileOutcome,
+    RecordFence, RecoveryLineageEvidence, RedbJournalBackend, StoreRebindRecord, StoreRebindState,
+    WakeDisposition, record_checksum,
 };
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest, InstallationError,
@@ -2475,7 +2475,10 @@ impl HostJobBranches {
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let pending_record = StoreRebindRecord {
                 fence: record_fence(host, activation_id, activation_generation),
-                operation: operation(&format!("store-rebind:{}", handoff_with_digest.operation_id.as_str()))?,
+                operation: operation(&format!(
+                    "store-rebind:{}",
+                    handoff_with_digest.operation_id.as_str()
+                ))?,
                 state: StoreRebindState::Pending,
                 operation_id: handoff_with_digest.operation_id.clone(),
                 request_digest: PlatformHandle::new(canonical.clone())
@@ -2500,7 +2503,11 @@ impl HostJobBranches {
                     .process
                     .start_time_100ns,
                 process_image_path: PlatformHandle::new(
-                    handoff_with_digest.process_binding.process.image_path.clone(),
+                    handoff_with_digest
+                        .process_binding
+                        .process
+                        .image_path
+                        .clone(),
                 )
                 .map_err(|error| HostError::Platform(error.to_string()))?,
                 job_name: handoff_with_digest.process_binding.job.clone(),
@@ -2637,6 +2644,21 @@ impl HostJobBranches {
                     "Store rebind receipt exact fields mismatch".to_owned(),
                 ));
             }
+            final_receipt
+                .validate()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let expected_requirement_digest = format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&handoff.requirement)
+                        .map_err(|error| HostError::Platform(error.to_string()))?
+                )
+            );
+            if final_receipt.requirement_digest != expected_requirement_digest {
+                return Err(HostError::ProcessContour(
+                    "Store rebind receipt requirement digest mismatch".to_owned(),
+                ));
+            }
             let committed_record = StoreRebindRecord {
                 fence: record_fence(host, activation_id, activation_generation),
                 operation: operation(&format!(
@@ -2667,7 +2689,11 @@ impl HostJobBranches {
                     .process
                     .start_time_100ns,
                 process_image_path: PlatformHandle::new(
-                    handoff_with_digest.process_binding.process.image_path.clone(),
+                    handoff_with_digest
+                        .process_binding
+                        .process
+                        .image_path
+                        .clone(),
                 )
                 .map_err(|error| HostError::Platform(error.to_string()))?,
                 job_name: handoff_with_digest.process_binding.job.clone(),

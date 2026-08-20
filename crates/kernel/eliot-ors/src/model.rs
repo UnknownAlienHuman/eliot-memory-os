@@ -2148,7 +2148,10 @@ impl StoreRebindReplayRecord {
     pub fn validate(&self) -> Result<(), OrsError> {
         validate_text(self.operation_id.as_str(), "store_rebind_operation_id")?;
         validate_digest(&self.request_digest, "store_rebind_request_digest")?;
-        validate_digest(&self.candidate_binding_digest, "store_rebind_candidate_digest")?;
+        validate_digest(
+            &self.candidate_binding_digest,
+            "store_rebind_candidate_digest",
+        )?;
         validate_digest(&self.store_fence, "store_rebind_store_fence")?;
         validate_digest(&self.requirement_digest, "store_rebind_requirement_digest")?;
         if self.process_id == 0 || self.process_start_time_100ns == 0 {

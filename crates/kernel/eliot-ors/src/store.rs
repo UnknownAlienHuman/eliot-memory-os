@@ -637,7 +637,11 @@ impl RedbRecoveryStore {
     ) -> Result<Option<crate::StoreRebindReplayRecord>, OrsError> {
         record.validate()?;
         let write = self.database.begin_write().map_err(storage)?;
-        let key = format!("{}::{}", record.operation_id.as_str(), record.request_digest.clone());
+        let key = format!(
+            "{}::{}",
+            record.operation_id.as_str(),
+            record.request_digest.clone()
+        );
         let existing = {
             let mut table = write.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
             if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
@@ -655,7 +659,9 @@ impl RedbRecoveryStore {
                 Some(existing)
             } else {
                 let payload = encode(record)?;
-                table.insert(key.as_str(), payload.as_str()).map_err(storage)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
                 None
             }
         };
@@ -690,7 +696,11 @@ impl RedbRecoveryStore {
         let write = self.database.begin_write().map_err(storage)?;
         {
             let mut table = write.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
-            let key = format!("{}::{}", record.operation_id.as_str(), record.request_digest.clone());
+            let key = format!(
+                "{}::{}",
+                record.operation_id.as_str(),
+                record.request_digest.clone()
+            );
             let existing: Option<crate::StoreRebindReplayRecord> = table
                 .get(key.as_str())
                 .map_err(storage)?
@@ -699,7 +709,9 @@ impl RedbRecoveryStore {
             if let Some(existing) = &existing {
                 existing.validate()?;
                 if existing.request_digest.clone() != record.request_digest.clone()
-                    || existing.candidate_binding_digest.clone() != record.candidate_binding_digest.clone()
+                    || existing.candidate_binding_digest.clone()
+                        != record.candidate_binding_digest.clone()
+                    || existing.store_fence.clone() != record.store_fence.clone()
                 {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "store_rebind_replay",
@@ -707,10 +719,17 @@ impl RedbRecoveryStore {
                     });
                 }
                 let allowed = match (existing.state, record.state) {
-                    (crate::StoreRebindReplayState::Pending, crate::StoreRebindReplayState::Committed)
-                    | (crate::StoreRebindReplayState::Pending, crate::StoreRebindReplayState::Pending)
-                    | (crate::StoreRebindReplayState::Committed, crate::StoreRebindReplayState::Committed) => {
-                        existing == record || existing.state == crate::StoreRebindReplayState::Pending
+                    (
+                        crate::StoreRebindReplayState::Pending
+                        | crate::StoreRebindReplayState::Committed,
+                        crate::StoreRebindReplayState::Committed,
+                    )
+                    | (
+                        crate::StoreRebindReplayState::Pending,
+                        crate::StoreRebindReplayState::Pending,
+                    ) => {
+                        existing == record
+                            || existing.state == crate::StoreRebindReplayState::Pending
                     }
                     _ => false,
                 };
@@ -723,15 +742,15 @@ impl RedbRecoveryStore {
             }
             if existing.as_ref().is_none_or(|current| current != record) {
                 let payload = encode(record)?;
-                table.insert(key.as_str(), payload.as_str()).map_err(storage)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
             }
         }
         write.commit().map_err(storage)
     }
 
-    pub fn load_all_store_rebinds(
-        &self,
-    ) -> Result<Vec<crate::StoreRebindReplayRecord>, OrsError> {
+    pub fn load_all_store_rebinds(&self) -> Result<Vec<crate::StoreRebindReplayRecord>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
         let table = read.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
         let mut records = Vec::new();

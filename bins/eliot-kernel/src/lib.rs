@@ -1391,6 +1391,46 @@ impl Drop for CanonicalStoreAttachment<'_> {
         {
             *retained = None;
         }
+        self.gateway.fence();
+    }
+}
+
+#[cfg(windows)]
+struct CanonicalStoreReplace<'a> {
+    gateway: Arc<KernelStoreGateway>,
+    process_gateway: &'a ProcessExecutionGateway,
+    old: Option<Arc<KernelStoreGateway>>,
+    active: bool,
+}
+
+#[cfg(windows)]
+impl CanonicalStoreReplace<'_> {
+    fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+#[cfg(windows)]
+impl CanonicalStoreAttachmentTransaction for CanonicalStoreReplace<'_> {
+    fn commit(self: Box<Self>) {
+        (*self).commit();
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CanonicalStoreReplace<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut retained) = self.process_gateway.canonical_store.lock()
+            && retained
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.gateway))
+        {
+            retained.clone_from(&self.old);
+        }
+        self.gateway.fence();
     }
 }
 
@@ -1695,6 +1735,25 @@ impl ProcessExecutionGateway {
         Ok(CanonicalStoreAttachment {
             gateway,
             process_gateway: self,
+            active: true,
+        })
+    }
+
+    #[cfg(windows)]
+    fn replace_canonical_store(
+        &self,
+        gateway: Arc<KernelStoreGateway>,
+    ) -> Result<CanonicalStoreReplace<'_>, KernelBuildError> {
+        let mut retained = self
+            .canonical_store
+            .lock()
+            .map_err(|_| KernelBuildError::Service("store gateway lock poisoned".to_owned()))?;
+        let old = retained.clone();
+        *retained = Some(Arc::clone(&gateway));
+        Ok(CanonicalStoreReplace {
+            gateway,
+            process_gateway: self,
+            old,
             active: true,
         })
     }
@@ -3419,42 +3478,31 @@ impl KernelComposition {
             std::sync::Arc::new(client),
             route,
         ));
-        let attachment_result: Result<
-            Box<dyn CanonicalStoreAttachmentTransaction>,
-            KernelBuildError,
-        > = self.process_gateway.as_ref().map_or_else(
-            || {
-                struct NoopAttachment;
-                impl CanonicalStoreAttachmentTransaction for NoopAttachment {
-                    fn commit(self: Box<Self>) {}
-                }
-                Ok(Box::new(NoopAttachment) as Box<dyn CanonicalStoreAttachmentTransaction>)
-            },
-            |pg| {
-                pg.attach_canonical_store(Arc::clone(&gateway))
-                    .map(|a| Box::new(a) as Box<dyn CanonicalStoreAttachmentTransaction>)
-                    .map_err(|e| KernelBuildError::Service(e.to_string()))
-            },
-        );
-        let attachment: Box<dyn CanonicalStoreAttachmentTransaction> = match attachment_result {
-            Ok(attachment) => attachment,
-            Err(error) => {
-                gateway.fence();
-                return Err(error);
-            }
-        };
+        let attachment: Box<dyn CanonicalStoreAttachmentTransaction> = self
+            .process_gateway
+            .as_ref()
+            .map_or_else(
+                || {
+                    struct NoopAttachment;
+                    impl CanonicalStoreAttachmentTransaction for NoopAttachment {
+                        fn commit(self: Box<Self>) {}
+                    }
+                    Ok(Box::new(NoopAttachment) as Box<dyn CanonicalStoreAttachmentTransaction>)
+                },
+                |pg| {
+                    pg.replace_canonical_store(Arc::clone(&gateway))
+                        .map(|a| Box::new(a) as Box<dyn CanonicalStoreAttachmentTransaction>)
+                        .map_err(|e| KernelBuildError::Service(e.to_string()))
+                },
+            )
+            .inspect_err(|_| gateway.fence())?;
         let receipt = {
             let mut svc = self
                 .service
                 .lock()
                 .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
-            match svc.rebind_store(&handoff, request_digest.clone()) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    gateway.fence();
-                    return Err(KernelBuildError::Service(error.to_string()));
-                }
-            }
+            svc.rebind_store(&handoff, request_digest.clone())
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?
         };
         {
             let requirement_digest = {
@@ -3478,21 +3526,17 @@ impl KernelComposition {
                 state: eliot_ors::StoreRebindReplayState::Committed,
                 receipt: Some(receipt.request_digest.clone()),
             };
-            if let Err(error) = self
-                .generation_gateway
+            self.generation_gateway
                 .ors
                 .persist_store_rebind(&committed)
-            {
-                gateway.fence();
-                return Err(KernelBuildError::Service(error.to_string()));
-            }
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         }
         let old_gateway =
             {
                 let mut gw_guard = self.canonical_store_gateway.lock().map_err(|_| {
                     KernelBuildError::Service("store gateway lock poisoned".to_owned())
                 })?;
-                let old = gw_guard.replace(gateway);
+                let old = gw_guard.replace(Arc::clone(&gateway));
                 let mut handoff_guard = self.store_handoff.lock().map_err(|_| {
                     KernelBuildError::Service("Store handoff lock poisoned".to_owned())
                 })?;
@@ -5341,69 +5385,70 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
         }
-        let store_rebind_receipt: Option<eliot_kernel_service::StoreRebindReceipt> =
-            match &request.command {
-                KernelControlCommand::RebindStore(handoff) => {
-                    let receipt = self
-                        .rebind_store(handoff.clone(), request.payload_digest.clone())
-                        .await
+        let store_rebind_receipt: Option<eliot_kernel_service::StoreRebindReceipt> = match &request
+            .command
+        {
+            KernelControlCommand::RebindStore(handoff) => {
+                let receipt = self
+                    .rebind_store(handoff.clone(), request.payload_digest.clone())
+                    .await
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Some(receipt)
+            }
+            KernelControlCommand::ReconcileRebindStore(query) => {
+                let svc_receipt = self
+                    .service
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .reconcile_store_rebind(query)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if svc_receipt.is_some() {
+                    svc_receipt
+                } else {
+                    let op_id = eliot_ors::OperationIdentity::new(query.operation_id.as_str())
                         .map_err(|_| TransportError::SessionFenced)?;
-                    Some(receipt)
-                }
-                KernelControlCommand::ReconcileRebindStore(query) => {
-                    let svc_receipt = self
-                        .service
-                        .lock()
-                        .map_err(|_| TransportError::SessionFenced)?
-                        .reconcile_store_rebind(query)
+                    let record = self
+                        .generation_gateway
+                        .ors
+                        .load_store_rebind(&op_id, &query.request_digest)
                         .map_err(|_| TransportError::SessionFenced)?;
-                    if svc_receipt.is_some() {
-                        svc_receipt
-                    } else {
-                        let op_id = eliot_ors::OperationIdentity::new(query.operation_id.as_str())
-                            .map_err(|_| TransportError::SessionFenced)?;
-                        let record = self
-                            .generation_gateway
-                            .ors
-                            .load_store_rebind(&op_id, &query.request_digest)
-                            .map_err(|_| TransportError::SessionFenced)?;
-                        if let Some(record) =
-                            record.filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
-                        {
-                            let receipt = eliot_kernel_service::StoreRebindReceipt {
-                                operation_id: eliot_platform::PlatformHandle::new(
-                                    record.operation_id.as_str(),
-                                )
-                                .map_err(|_| TransportError::SessionFenced)?,
-                                request_digest: record.request_digest.clone(),
-                                requirement_digest: record.requirement_digest.clone(),
-                                process_binding: eliot_kernel_service::StoreProcessBinding {
-                                    process: eliot_kernel_service::HostProcessBinding {
-                                        process_id: record.process_id,
-                                        start_time_100ns: record.process_start_time_100ns,
-                                        image_path: record.process_image_path.clone(),
-                                    },
-                                    job: eliot_platform::PlatformHandle::new(record.job_name.clone())
-                                        .map_err(|_| TransportError::SessionFenced)?,
+                    if let Some(record) =
+                        record.filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
+                    {
+                        let receipt = eliot_kernel_service::StoreRebindReceipt {
+                            operation_id: eliot_platform::PlatformHandle::new(
+                                record.operation_id.as_str(),
+                            )
+                            .map_err(|_| TransportError::SessionFenced)?,
+                            request_digest: record.request_digest.clone(),
+                            requirement_digest: record.requirement_digest.clone(),
+                            process_binding: eliot_kernel_service::StoreProcessBinding {
+                                process: eliot_kernel_service::HostProcessBinding {
+                                    process_id: record.process_id,
+                                    start_time_100ns: record.process_start_time_100ns,
+                                    image_path: record.process_image_path.clone(),
                                 },
-                                candidate_binding_digest: record.candidate_binding_digest.clone(),
-                                generation: ResourceGeneration::new(record.generation)
+                                job: eliot_platform::PlatformHandle::new(record.job_name.clone())
                                     .map_err(|_| TransportError::SessionFenced)?,
-                                authority_epoch: AuthorityEpoch::new(record.authority_epoch)
-                                    .map_err(|_| TransportError::SessionFenced)?,
-                                store_fence: record.store_fence.clone(),
-                            };
-                            receipt
-                                .validate()
-                                .map_err(|_| TransportError::SessionFenced)?;
-                            Some(receipt)
-                        } else {
-                            None
-                        }
+                            },
+                            candidate_binding_digest: record.candidate_binding_digest.clone(),
+                            generation: ResourceGeneration::new(record.generation)
+                                .map_err(|_| TransportError::SessionFenced)?,
+                            authority_epoch: AuthorityEpoch::new(record.authority_epoch)
+                                .map_err(|_| TransportError::SessionFenced)?,
+                            store_fence: record.store_fence.clone(),
+                        };
+                        receipt
+                            .validate()
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Some(receipt)
+                    } else {
+                        None
                     }
                 }
-                _ => None,
-            };
+            }
+            _ => None,
+        };
         let is_probe = matches!(&request.command, KernelControlCommand::ProbeReady);
         let receipt = if is_probe {
             #[cfg(windows)]
