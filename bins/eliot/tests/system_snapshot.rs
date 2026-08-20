@@ -809,7 +809,7 @@ fn installation_plan_reports_missing_v7_discriminator_as_migration() {
     assert!(
         output["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("required v7 discriminator"))
+            .is_some_and(|detail| detail.contains("required v8 discriminator"))
     );
 }
 
@@ -831,7 +831,7 @@ fn installation_plan_reports_v5_discriminator_as_migration() {
 }
 
 #[test]
-fn installation_plan_reports_malformed_v7_as_invalid() {
+fn installation_plan_reports_malformed_v7_as_migration() {
     let result = run_installation_plan_fixture(
         "malformed-v7",
         r#"{"transaction_wire_version":{"major":7,"minor":0,"patch":0},"transaction_id":"malformed"}"#,
@@ -839,10 +839,10 @@ fn installation_plan_reports_malformed_v7_as_invalid() {
 
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("plan JSON error");
-    assert_installation_error(&output, "INSTALLATION_PLAN_INVALID");
+    assert_installation_error(&output, "INSTALLATION_PLAN_MIGRATION_REQUIRED");
     assert!(
         output["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("installation registry is corrupt"))
+            .is_some_and(|detail| detail.contains("wire 7.0.0"))
     );
 }
