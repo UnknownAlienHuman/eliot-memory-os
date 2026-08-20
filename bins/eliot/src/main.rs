@@ -7,14 +7,12 @@ use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
 use eliot_installation::{
-    decode_installation_transaction_json, parse_installation_transaction_id, InstallationError,
-    InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
-    InstallationTransactionStore, RedbInstallationRegistry, RedbInstallationTransactionStore,
-    WindowsInstallationCoordinator,
+    InstallationError, InstallationProfile, InstallationStage, InstallationStepOutcome,
+    InstallationTransaction, InstallationTransactionStore, RedbInstallationRegistry,
+    RedbInstallationTransactionStore, WindowsInstallationCoordinator,
+    decode_installation_transaction_json, parse_installation_transaction_id,
 };
-use eliot_platform_windows::{
-    canonical_windows_path, protected_program_data_root, ProtectedRootLease,
-};
+use eliot_platform_windows::{ProtectedRootLease, canonical_windows_path};
 use serde_json::json;
 use std::path::PathBuf;
 use std::{fs, io::Read, path::Path};
@@ -311,10 +309,6 @@ fn run_installation_registry_status(registry: &Path) -> Result<i32> {
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
-    let legacy_registry = is_exact_legacy_registry_path(registry);
-    if legacy_registry && !registry.exists() {
-        return Ok(run_legacy_registry_status(registry));
-    }
     match std::fs::symlink_metadata(registry) {
         Ok(metadata) if metadata.is_file() => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -331,9 +325,6 @@ fn run_installation_registry_status(registry: &Path) -> Result<i32> {
             );
             return Ok(INVALID_REQUEST_EXIT);
         }
-    }
-    if legacy_registry {
-        return Ok(run_legacy_registry_status(registry));
     }
     let Some(host_state_root) = registry.parent() else {
         write_installation_error(
@@ -380,7 +371,7 @@ fn run_installation_registry_status(registry: &Path) -> Result<i32> {
             return Ok(INVALID_REQUEST_EXIT);
         }
         Err(error) => {
-            write_installation_error("INSTALLATION_STATUS_INVALID", &error.to_string());
+            write_installation_error(installation_status_error_code(&error), &error.to_string());
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
@@ -438,63 +429,10 @@ fn run_installation_transaction_status(store_path: &Path, raw_transaction_id: &s
     Ok(0)
 }
 
-fn is_exact_legacy_registry_path(registry: &Path) -> bool {
-    let Ok(program_data_root) = protected_program_data_root() else {
-        return false;
-    };
-    let legacy_registry = program_data_root
-        .join("Eliot")
-        .join("host")
-        .join("installation-registry.redb");
-    let normalize = |path: &Path| {
-        path.to_string_lossy()
-            .replace('/', "\\")
-            .trim_start_matches("\\\\?\\")
-            .to_ascii_lowercase()
-    };
-    if normalize(registry) == normalize(&legacy_registry) {
-        return true;
-    }
-    let Ok(observed_registry) = canonical_windows_path(registry) else {
-        return false;
-    };
-    normalize(&observed_registry) == normalize(&legacy_registry)
-}
-
-fn run_legacy_registry_status(registry: &Path) -> i32 {
-    // This read-only call exists only to retain the legacy schema diagnostic;
-    // no value from the retired path is ever returned as installation authority.
-    match RedbInstallationRegistry::inspect_existing(registry) {
-        Ok(Some(_)) => write_installation_error(
-            "INSTALLATION_STATUS_INVALID",
-            "the legacy ProgramData registry path is retired; current-schema contents are not accepted as installation authority",
-        ),
-        Ok(None) => write_installation_error(
-            "INSTALLATION_STATUS_UNAVAILABLE",
-            "the legacy ProgramData registry path does not exist; status never creates it",
-        ),
-        Err(error) => write_installation_error(
-            legacy_registry_status_code(&error),
-            &format!("legacy ProgramData registry inspection failed: {error}"),
-        ),
-    }
-    INVALID_REQUEST_EXIT
-}
-
-fn legacy_registry_status_code(error: &InstallationError) -> &'static str {
+fn installation_status_error_code(error: &InstallationError) -> &'static str {
     match error {
         InstallationError::MigrationRequired { .. } => "INSTALLATION_STATUS_MIGRATION_REQUIRED",
-        InstallationError::Platform(_) => "INSTALLATION_STATUS_UNAVAILABLE",
-        InstallationError::InvalidField { .. }
-        | InstallationError::Duplicate { .. }
-        | InstallationError::IllegalTransition { .. }
-        | InstallationError::IdentityConflict
-        | InstallationError::UnknownOutcome { .. }
-        | InstallationError::IncompleteObservation(_)
-        | InstallationError::ProfileViolation(_)
-        | InstallationError::CorruptRegistry { .. }
-        | InstallationError::CompareAndSaveConflict { .. }
-        | InstallationError::TransactionNotFound { .. } => "INSTALLATION_STATUS_INVALID",
+        _ => "INSTALLATION_STATUS_INVALID",
     }
 }
 
@@ -1115,10 +1053,12 @@ mod tests {
             INVALID_REQUEST_EXIT
         );
         assert!(staging.registry.is_none());
-        assert!(staging
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("no registry write")));
+        assert!(
+            staging
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no registry write"))
+        );
     }
 
     #[test]
@@ -1246,29 +1186,31 @@ mod tests {
     }
 
     #[test]
-    fn legacy_status_only_migration_error_is_migration_required() {
+    fn installation_status_preserves_migration_and_corruption_classification() {
         assert_eq!(
-            legacy_registry_status_code(&InstallationError::MigrationRequired {
+            installation_status_error_code(&InstallationError::MigrationRequired {
                 reason: "old table".to_owned(),
             }),
             "INSTALLATION_STATUS_MIGRATION_REQUIRED"
         );
         assert_eq!(
-            legacy_registry_status_code(&InstallationError::CorruptRegistry {
+            installation_status_error_code(&InstallationError::CorruptRegistry {
                 reason: "bad bytes".to_owned(),
             }),
             "INSTALLATION_STATUS_INVALID"
         );
         assert_eq!(
-            legacy_registry_status_code(&InstallationError::InvalidField {
+            installation_status_error_code(&InstallationError::InvalidField {
                 field: "path".to_owned(),
                 reason: "reparse".to_owned(),
             }),
             "INSTALLATION_STATUS_INVALID"
         );
         assert_eq!(
-            legacy_registry_status_code(&InstallationError::Platform("access denied".to_owned())),
-            "INSTALLATION_STATUS_UNAVAILABLE"
+            installation_status_error_code(&InstallationError::Platform(
+                "access denied".to_owned()
+            )),
+            "INSTALLATION_STATUS_INVALID"
         );
     }
 }

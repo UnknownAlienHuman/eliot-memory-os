@@ -8,11 +8,11 @@ use std::{
 };
 
 use eliot_installation::{
-    parse_installation_transaction_id, AuthorityEpoch, CandidateManifest, InstallationEpoch,
-    InstallationProfile, InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan,
-    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PlannedChange,
-    RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
-    RuntimeStateRoots, StateFence, UserOwnedRootLease,
+    AuthorityEpoch, CandidateManifest, InstallationEpoch, InstallationProfile,
+    InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, ManagedEnvironmentAction,
+    ManagedEnvironmentChangeRequest, PlannedChange, RedbInstallationTransactionStore,
+    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, UserOwnedRootLease,
+    parse_installation_transaction_id,
 };
 #[cfg(windows)]
 use eliot_platform_windows::protected_program_data_root;
@@ -581,9 +581,11 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
         .as_array()
         .expect("all effect progress entries");
     assert_eq!(progress.len(), 16);
-    assert!(progress
-        .iter()
-        .all(|entry| entry["state"]["state"] == "APPLIED"));
+    assert!(
+        progress
+            .iter()
+            .all(|entry| entry["state"]["state"] == "APPLIED")
+    );
     assert_eq!(
         applied["transaction"]["effect_progress"][0]["state"]["state"],
         "APPLIED"
@@ -804,9 +806,11 @@ fn installation_plan_reports_missing_v7_discriminator_as_migration() {
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("plan JSON error");
     assert_installation_error(&output, "INSTALLATION_PLAN_MIGRATION_REQUIRED");
-    assert!(output["detail"]
-        .as_str()
-        .is_some_and(|detail| detail.contains("required v7 discriminator")));
+    assert!(
+        output["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("required v7 discriminator"))
+    );
 }
 
 #[test]
@@ -819,9 +823,11 @@ fn installation_plan_reports_v5_discriminator_as_migration() {
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("plan JSON error");
     assert_installation_error(&output, "INSTALLATION_PLAN_MIGRATION_REQUIRED");
-    assert!(output["detail"]
-        .as_str()
-        .is_some_and(|detail| detail.contains("wire 5.0.0")));
+    assert!(
+        output["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("wire 5.0.0"))
+    );
 }
 
 #[test]
@@ -834,7 +840,9 @@ fn installation_plan_reports_malformed_v7_as_invalid() {
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("plan JSON error");
     assert_installation_error(&output, "INSTALLATION_PLAN_INVALID");
-    assert!(output["detail"]
-        .as_str()
-        .is_some_and(|detail| detail.contains("installation registry is corrupt")));
+    assert!(
+        output["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("installation registry is corrupt"))
+    );
 }
