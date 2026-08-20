@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use eliot_platform::{PlatformHandle, UnknownReason};
 use eliot_platform_windows::{
     ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    require_protected_program_data_path,
+    require_protected_program_data_path, windows_paths_equal,
 };
 use redb::{
     Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
@@ -99,7 +99,7 @@ fn retain_runtime_parent(path: &Path) -> Result<ProtectedRootLease, BackendError
     let canonical = lease
         .canonical_path()
         .map_err(|_| BackendError::Unavailable)?;
-    if canonical != parent {
+    if !windows_paths_equal(&canonical, parent) {
         return Err(BackendError::Unavailable);
     }
     Ok(lease)
@@ -321,7 +321,7 @@ impl RedbJournalBackend {
     }
 
     #[cfg(test)]
-    fn inspect_unprotected_for_test(
+    pub(crate) fn inspect_unprotected_for_test(
         path: impl AsRef<Path>,
     ) -> Result<Option<RedbJournalInspection>, BackendError> {
         let path = path.as_ref();

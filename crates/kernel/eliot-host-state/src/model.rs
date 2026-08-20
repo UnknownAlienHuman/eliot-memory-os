@@ -1387,7 +1387,7 @@ impl KernelReadinessObservationRecord {
         )
     }
 
-    pub(crate) fn validate_against(
+    pub fn validate_against(
         &self,
         active: &KernelRecord,
         active_checksum: &str,
@@ -1413,7 +1413,7 @@ impl KernelReadinessObservationRecord {
         Ok(())
     }
 
-    pub(crate) fn validate_approved_contour(
+    pub fn validate_approved_contour(
         &self,
         expected: &ReadinessApprovedContour,
     ) -> Result<(), JournalError> {

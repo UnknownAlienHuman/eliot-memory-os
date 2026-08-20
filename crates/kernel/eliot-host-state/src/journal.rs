@@ -1033,6 +1033,45 @@ impl<B: JournalBackend> HostStateJournal<B> {
     }
 }
 
+pub fn readonly_project_host_state(image: &DurableImage) -> Result<HostState, JournalError> {
+    if image.epochs.is_empty() {
+        return Err(JournalError::Invalid(
+            "journal has no durable epochs".into(),
+        ));
+    }
+    let mut successes = Vec::new();
+    let mut first_torn: Option<JournalError> = None;
+    for epoch in &image.epochs {
+        match state_for_host(image, &epoch.host) {
+            Ok(state) => successes.push(state),
+            Err(error) => match &error {
+                JournalError::Torn { .. }
+                | JournalError::Checksum { .. }
+                | JournalError::Sequence
+                | JournalError::UnknownVersion { .. }
+                    if first_torn.is_none() =>
+                {
+                    first_torn = Some(error);
+                }
+                _ => {}
+            },
+        }
+    }
+    if let Some(error) = first_torn {
+        return Err(error);
+    }
+    if successes.is_empty() {
+        let _ = load_epochs(image, false)?;
+        return Err(JournalError::Invalid(
+            "no valid HostState projection".into(),
+        ));
+    }
+    successes
+        .into_iter()
+        .max_by_key(|state| state.sequence)
+        .ok_or_else(|| JournalError::Invalid("no projection".into()))
+}
+
 fn persist_error(error: crate::BackendError, transaction_id: &PlatformHandle) -> JournalError {
     match error {
         crate::BackendError::PlanGap { dependency } => JournalError::PlanGap { dependency },

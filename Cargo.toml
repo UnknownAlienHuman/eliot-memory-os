@@ -94,6 +94,7 @@ members = [
   "crates/instrument/eliot-verifier",
   "crates/meta/eliot-doctor-core",
   "crates/meta/eliot-improvement",
+  "crates/meta/eliot-runtime-status",
   "crates/security/eliot-erasure",
   "crates/security/eliot-influence",
   "crates/smart/eliot-context",
@@ -239,6 +240,7 @@ eliot-testd-core = { path = "crates/instrument/eliot-testd-core", version = "0.1
 eliot-verifier = { path = "crates/instrument/eliot-verifier", version = "0.1.0" }
 eliot-doctor-core = { path = "crates/meta/eliot-doctor-core", version = "0.1.0" }
 eliot-improvement = { path = "crates/meta/eliot-improvement", version = "0.1.0" }
+eliot-runtime-status = { path = "crates/meta/eliot-runtime-status", version = "0.1.0" }
 eliot-erasure = { path = "crates/security/eliot-erasure", version = "0.1.0" }
 eliot-influence = { path = "crates/security/eliot-influence", version = "0.1.0" }
 eliot-context = { path = "crates/smart/eliot-context", version = "0.1.0" }

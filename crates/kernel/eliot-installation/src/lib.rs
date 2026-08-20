@@ -2567,6 +2567,18 @@ pub struct InstallationActivationApproval {
 }
 
 impl InstallationActivationApproval {
+    /// Returns the sole installation transaction identity bound by this approval.
+    #[must_use]
+    pub const fn transaction_id(&self) -> &PlatformHandle {
+        &self.transaction_id
+    }
+
+    /// Returns the immutable installer-plan digest bound by this approval.
+    #[must_use]
+    pub const fn installer_plan_digest(&self) -> &PlatformHandle {
+        &self.installer_plan_digest
+    }
+
     /// Validates the approval's self-contained typed binding.
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.approval_ref, "activation_approval.approval_ref")?;
@@ -16936,6 +16948,23 @@ mod tests {
             &transaction.candidate_manifest.generation,
             &test_commit_fence(&transaction.candidate_manifest),
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_activation_exposes_exact_transaction_and_plan_bindings() {
+        let (registry, transaction) = pending_registry_for_owner_gate();
+        let pending = registry
+            .pending_activation()
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            pending.approval.transaction_id(),
+            &transaction.transaction_id
+        );
+        assert_eq!(
+            pending.approval.installer_plan_digest(),
+            &transaction.installer_plan_digest
+        );
     }
 
     #[cfg(windows)]

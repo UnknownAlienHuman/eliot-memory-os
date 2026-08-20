@@ -258,6 +258,95 @@ fn installation_status_requires_existing_host_state_root() {
 
 #[cfg(windows)]
 #[test]
+fn runtime_status_json_is_a_production_subprocess_and_never_creates_state() {
+    let host_state_root = protected_program_data_root()
+        .expect("ProgramData root")
+        .join(format!(
+            "eliot-runtime-status-cli-proof-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+    fs::create_dir_all(&host_state_root).expect("create existing Host root fixture");
+    let observed_files = [
+        "installation-registry.redb",
+        "watchdog-admission.json",
+        "supervision-lease.json",
+        "host-state-journal.redb",
+    ];
+    let before: Vec<_> = observed_files
+        .iter()
+        .map(|name| host_state_root.join(name).exists())
+        .collect();
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .args([
+            "runtime",
+            "status",
+            "--json",
+            "--host-state-root",
+            host_state_root.to_str().expect("Host root is utf8"),
+        ])
+        .output()
+        .expect("run production runtime status subprocess");
+
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "missing evidence must not be live"
+    );
+    let output: Value = serde_json::from_slice(&result.stdout).expect("runtime status JSON");
+    assert_eq!(output["contract"], "eliot.runtime.live");
+    assert_eq!(output["status"], "NOT_HEALTHY");
+    assert_eq!(output["deadline_exceeded"], false);
+    assert_eq!(output["completed"], false);
+    assert_eq!(
+        output["recovery_command"],
+        "eliot installation recover --help"
+    );
+    assert!(output["ors"]["state"].is_object());
+    let after: Vec<_> = observed_files
+        .iter()
+        .map(|name| host_state_root.join(name).exists())
+        .collect();
+    assert_eq!(
+        before, after,
+        "runtime status created or changed Host state"
+    );
+    let _ = fs::remove_dir_all(&host_state_root);
+}
+
+#[test]
+fn runtime_status_json_reports_deadline_exceeded() {
+    let host_state_root = std::env::temp_dir().join(format!(
+        "eliot-runtime-status-timeout-{}",
+        std::process::id()
+    ));
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .args([
+            "runtime",
+            "status",
+            "--json",
+            "--host-state-root",
+            host_state_root.to_str().expect("Host root is utf8"),
+            "--deadline-ms",
+            "0",
+        ])
+        .output()
+        .expect("run deadline-bounded runtime status subprocess");
+
+    assert_eq!(result.status.code(), Some(2));
+    let output: Value = serde_json::from_slice(&result.stdout).expect("timeout JSON");
+    assert_eq!(output["status"], "ERROR");
+    assert_eq!(output["code"], "RUNTIME_STATUS_TIMEOUT");
+    assert_eq!(output["deadline_exceeded"], true);
+    assert_eq!(output["completed"], false);
+    assert!(!host_state_root.exists(), "timeout created the Host root");
+}
+
+#[cfg(windows)]
+#[test]
 fn installation_status_reports_missing_registry_under_retained_root() {
     let temp_root = std::env::temp_dir().join(format!(
         "eliot-installation-status-cwd-{}",
@@ -822,8 +911,13 @@ fn installation_transaction_status_reads_existing_store_without_inventing_transa
         .expect("run transaction status command");
 
     assert!(!result.status.success());
-    let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
-    assert_installation_error(&output, "INSTALLATION_TRANSACTION_NOT_FOUND");
+    assert!(result.stdout.is_empty(), "removed selector emitted JSON");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("unexpected argument"),
+        "removed transaction-store selector was unexpectedly accepted: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(store_path.exists(), "status removed the transaction store");
     let _ = fs::remove_dir_all(temp_root);
 }
 

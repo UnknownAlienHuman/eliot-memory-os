@@ -560,9 +560,12 @@ dependencies = [
  "clap",
  "eliot-bootstrap",
  "eliot-cli",
+ "eliot-host-state",
  "eliot-installation",
+ "eliot-ors",
  "eliot-platform-windows",
  "eliot-protocol",
+ "eliot-runtime-status",
  "serde",
  "serde_json",
  "tracing",
@@ -1782,6 +1785,25 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-runtime-status"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-host-state",
+ "eliot-installation",
+ "eliot-ors",
+ "eliot-platform",
+ "eliot-platform-windows",
+ "eliot-runtime-contracts",
+ "redb",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "windows-service",
 ]
 
 [[package]]

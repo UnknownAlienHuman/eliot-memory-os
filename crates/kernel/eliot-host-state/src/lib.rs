@@ -24,7 +24,7 @@ pub use backend::{
 pub use error::{BackendError, JournalError, ReconcileOutcome};
 pub use journal::{
     AppendDisposition, AppendReceipt, HostStateJournal, JOURNAL_MAGIC, JOURNAL_VERSION,
-    record_checksum,
+    readonly_project_host_state, record_checksum,
 };
 pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
 pub use model::{

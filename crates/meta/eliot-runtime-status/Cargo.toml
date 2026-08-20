@@ -1,0 +1,24 @@
+[package]
+name = "eliot-runtime-status"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-host-state.workspace = true
+eliot-installation.workspace = true
+eliot-ors.workspace = true
+eliot-platform.workspace = true
+eliot-platform-windows.workspace = true
+eliot-runtime-contracts.workspace = true
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+windows-service.workspace = true
+
+[lints]
+workspace = true

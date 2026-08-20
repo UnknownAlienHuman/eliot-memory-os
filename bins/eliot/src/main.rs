@@ -7,13 +7,12 @@ use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
 use eliot_installation::{
-    ApprovedGenerationRegistry, GenerationPackagePlanInput, GenerationPackagePlanner,
-    InstallationEpoch, InstallationError, InstallationProfile, InstallationStage,
-    InstallationStepOutcome, InstallationTransaction, InstallationTransactionStore, PlatformHandle,
-    RedbInstallationRegistry, RedbInstallationTransactionStore, WindowsInstallationCoordinator,
-    decode_installation_transaction_json, parse_installation_transaction_id,
+    GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
+    InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
+    InstallationTransactionStore, PlatformHandle, RedbInstallationTransactionStore,
+    WindowsInstallationCoordinator, decode_installation_transaction_json,
+    parse_installation_transaction_id,
 };
-use eliot_platform_windows::{ProtectedRootLease, windows_paths_equal};
 use serde_json::json;
 use std::path::PathBuf;
 use std::{
@@ -55,6 +54,11 @@ enum Command {
     Installation {
         #[command(subcommand)]
         command: InstallationCommand,
+    },
+    /// Read the manifest-bound Runtime Live status contour.
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -153,13 +157,10 @@ enum InstallationCommand {
     Status {
         /// Absolute path to the retained per-installation Host state root.
         #[arg(long, value_parser = absolute_path)]
-        host_state_root: Option<PathBuf>,
-        /// Absolute path to an existing durable transaction redb file.
-        #[arg(long, value_parser = absolute_path)]
-        store: Option<PathBuf>,
-        /// Stable transaction identity retained in the durable store.
-        #[arg(long)]
-        transaction_id: Option<String>,
+        host_state_root: PathBuf,
+        /// Bounded deadline in milliseconds from now (default 2000).
+        #[arg(long, default_value = "2000")]
+        deadline_ms: u64,
     },
     /// Report the unsupported canary-removal seam without mutating the machine.
     RemoveCanary {
@@ -169,6 +170,22 @@ enum InstallationCommand {
         /// Optional transaction identity, accepted only to make the refusal scope explicit.
         #[arg(long)]
         transaction_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommand {
+    /// Emit the production Runtime Live status contract as JSON.
+    Status {
+        /// The machine-readable output contract is mandatory for this command.
+        #[arg(long)]
+        json: bool,
+        /// Absolute path to the retained per-installation Host state root.
+        #[arg(long, value_parser = absolute_path)]
+        host_state_root: PathBuf,
+        /// Bounded deadline in milliseconds from now (default 2000).
+        #[arg(long, default_value = "2000")]
+        deadline_ms: u64,
     },
 }
 
@@ -220,8 +237,28 @@ fn run() -> Result<i32> {
         }
         Command::System { command } => run_system(command),
         Command::Installation { command } => run_installation(command),
+        Command::Runtime { command } => run_runtime(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
+    }
+}
+
+fn run_runtime(command: RuntimeCommand) -> Result<i32> {
+    match command {
+        RuntimeCommand::Status {
+            json,
+            host_state_root,
+            deadline_ms,
+        } => {
+            if !json {
+                write_installation_error(
+                    "RUNTIME_STATUS_JSON_REQUIRED",
+                    "runtime status requires --json; no inspection or filesystem mutation was attempted",
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+            run_installation_runtime_status(&host_state_root, deadline_ms)
+        }
     }
 }
 
@@ -295,23 +332,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
         } => run_installation_effect(&store, &transaction_id, true),
         InstallationCommand::Status {
             host_state_root,
-            store,
-            transaction_id,
-        } => match (host_state_root, store, transaction_id) {
-            (Some(host_state_root), None, None) => {
-                run_installation_registry_status(&host_state_root)
-            }
-            (None, Some(store), Some(transaction_id)) => {
-                run_installation_transaction_status(&store, &transaction_id)
-            }
-            _ => {
-                write_installation_error(
-                    "INSTALLATION_STATUS_INVALID",
-                    "status requires either --host-state-root or both --store and --transaction-id",
-                );
-                Ok(INVALID_REQUEST_EXIT)
-            }
-        },
+            deadline_ms,
+        } => run_installation_runtime_status(&host_state_root, deadline_ms),
         InstallationCommand::RemoveCanary {
             store,
             transaction_id,
@@ -422,102 +444,97 @@ fn run_installation_create(_input: &Path, _store_path: &Path) -> i32 {
     INVALID_REQUEST_EXIT
 }
 
-fn run_installation_registry_status(host_state_root: &Path) -> Result<i32> {
-    if !host_state_root.is_absolute() {
-        write_installation_error(
-            "INSTALLATION_STATUS_INVALID",
-            "Host state root must be absolute",
+fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> Result<i32> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
+    if std::time::Instant::now() >= deadline {
+        write_runtime_status_error(
+            "RUNTIME_STATUS_TIMEOUT",
+            "deadline exceeded before inspection",
+            true,
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
-    match std::fs::symlink_metadata(host_state_root) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            write_installation_error(
-                "INSTALLATION_STATUS_UNAVAILABLE",
-                "Host state root does not exist; status never creates it",
+    match eliot_runtime_status::collect_status(host_state_root, deadline) {
+        Ok(report) => {
+            let status_code = if report.status == "RUNTIME_LIVE" {
+                "RUNTIME_LIVE"
+            } else {
+                "NOT_HEALTHY"
+            };
+            let completed = status_code == "RUNTIME_LIVE";
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "contract": report.contract,
+                    "contract_version": report.contract_version,
+                    "status": status_code,
+                    "host_state_root": report.host_state_root,
+                    "active_generation": report.active_generation,
+                    "last_known_good_generation": report.last_known_good_generation,
+                    "generations": report.generations,
+                    "host_journal": {
+                        "state": report.host_journal.state,
+                        "clean": report.host_journal.clean,
+                        "sequence": report.host_journal.sequence,
+                        "last_checksum": report.host_journal.last_checksum,
+                        "prior_kernel_unknown": report.host_journal.prior_kernel_unknown,
+                        "gap": report.host_journal.gap,
+                    },
+                    "ors": {
+                        "state": report.ors.state,
+                        "gap": report.ors.gap,
+                    },
+                    "transaction_stage": report.transaction_stage,
+                    "services": {
+                        "kernel": report.services.kernel,
+                        "store": report.services.store,
+                        "eliotd": report.services.eliotd,
+                        "watchdog": report.services.watchdog,
+                        "host_service_registration": report.services.host_service_registration,
+                        "watchdog_service_registration": report.services.watchdog_service_registration,
+                    },
+                    "readiness": {
+                        "proof_status": report.readiness.proof_status,
+                        "gap": report.readiness.age_gap,
+                    },
+                    "recovery_command": report.recovery_command,
+                    "gaps": report.gaps,
+                    "components": report.components,
+                    "deadline_exceeded": report.deadline_exceeded,
+                    "completed": completed,
+                    "scope": INSTALLATION_SCOPE,
+                }))?
             );
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-        Ok(_) | Err(_) => {
-            write_installation_error(
-                "INSTALLATION_STATUS_INVALID",
-                "Host state root is not an existing directory",
-            );
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    }
-    let retained_root = match ProtectedRootLease::open_existing(host_state_root) {
-        Ok(root) => root,
-        Err(error) => {
-            write_installation_error("INSTALLATION_STATUS_INVALID", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    let canonical_host_state_root = match retained_root.canonical_path() {
-        Ok(root) => root,
-        Err(error) => {
-            write_installation_error("INSTALLATION_STATUS_INVALID", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    if !windows_paths_equal(&canonical_host_state_root, host_state_root) {
-        write_installation_error(
-            "INSTALLATION_STATUS_INVALID",
-            "Host state root is not the exact retained installation root",
-        );
-        return Ok(INVALID_REQUEST_EXIT);
-    }
-    let read_root = match ProtectedRootLease::open_existing(&canonical_host_state_root) {
-        Ok(root) => root,
-        Err(error) => {
-            write_installation_error(
-                "INSTALLATION_STATUS_INVALID",
-                &format!("Host state root reopen failed: {error}"),
-            );
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    let registry_value = match RedbInstallationRegistry::inspect_existing_at(read_root) {
-        Ok(Some(registry_value)) => registry_value,
-        Ok(None) => {
-            write_installation_error(
-                "INSTALLATION_STATUS_UNAVAILABLE",
-                "registry does not exist; status never creates it",
-            );
-            return Ok(INVALID_REQUEST_EXIT);
+            Ok(if completed { 0 } else { INVALID_REQUEST_EXIT })
         }
         Err(error) => {
-            write_installation_error(installation_status_error_code(&error), &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
+            let deadline_exceeded =
+                matches!(&error, eliot_runtime_status::StatusError::DeadlineExceeded);
+            let (code, detail) = match error {
+                eliot_runtime_status::StatusError::DeadlineExceeded => (
+                    "RUNTIME_STATUS_TIMEOUT",
+                    "deadline exceeded during inspection".to_owned(),
+                ),
+                eliot_runtime_status::StatusError::Invalid(msg) => {
+                    if msg.contains("does not exist") || msg.contains("absent") {
+                        ("INSTALLATION_STATUS_UNAVAILABLE", msg)
+                    } else {
+                        ("INSTALLATION_STATUS_INVALID", msg)
+                    }
+                }
+                eliot_runtime_status::StatusError::Unavailable(msg) => {
+                    ("INSTALLATION_STATUS_UNAVAILABLE", msg)
+                }
+            };
+            write_runtime_status_error(code, &detail, deadline_exceeded);
+            Ok(INVALID_REQUEST_EXIT)
         }
-    };
-    if let Err(error) = retained_root.verify_stable_identity() {
-        write_installation_error("INSTALLATION_STATUS_INVALID", &error.to_string());
-        return Ok(INVALID_REQUEST_EXIT);
     }
-    if let Err(error) =
-        validate_registry_host_state_root(&registry_value, &canonical_host_state_root)
-    {
-        write_installation_error(installation_status_error_code(&error), &error.to_string());
-        return Ok(INVALID_REQUEST_EXIT);
-    }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "contract": "eliot.kernel.installation",
-            "contract_version": INSTALLATION_CONTRACT_VERSION,
-            "status": if registry_value.active().is_some() { "ACTIVE_GENERATION" } else { "NO_ACTIVE_GENERATION" },
-            "active_generation": registry_value.active_generation(),
-            "last_known_good_generation": registry_value.last_known_good_generation(),
-            "generations": registry_value.generations(),
-        }))?
-    );
-    Ok(0)
 }
 
+#[allow(dead_code)]
 fn validate_registry_host_state_root(
-    registry: &ApprovedGenerationRegistry,
+    registry: &eliot_installation::ApprovedGenerationRegistry,
     canonical_host_state_root: &Path,
 ) -> std::result::Result<(), InstallationError> {
     for generation in registry.generations() {
@@ -545,12 +562,13 @@ fn validate_registry_host_state_root(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn validate_manifest_host_state_root(
     declared_host_state_root: &eliot_installation::PlatformHandle,
     canonical_host_state_root: &Path,
     field_prefix: &str,
 ) -> std::result::Result<(), InstallationError> {
-    if windows_paths_equal(
+    if eliot_platform_windows::windows_paths_equal(
         canonical_host_state_root,
         Path::new(declared_host_state_root.as_str()),
     ) {
@@ -562,46 +580,7 @@ fn validate_manifest_host_state_root(
     })
 }
 
-fn run_installation_transaction_status(store_path: &Path, raw_transaction_id: &str) -> Result<i32> {
-    let transaction_id = match parse_installation_transaction_id(raw_transaction_id) {
-        Ok(transaction_id) => transaction_id,
-        Err(error) => {
-            write_installation_error("INSTALLATION_STATUS_INVALID", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    let store = match RedbInstallationTransactionStore::open_existing_exact_path(store_path) {
-        Ok(store) => store,
-        Err(error) => {
-            write_installation_error("INSTALLATION_STATUS_UNAVAILABLE", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    let transaction = match store.load(&transaction_id) {
-        Ok(Some(transaction)) => transaction,
-        Ok(None) => {
-            write_installation_error(
-                "INSTALLATION_TRANSACTION_NOT_FOUND",
-                &format!("transaction is not present in {}", store_path.display()),
-            );
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-        Err(error) => {
-            write_installation_error("INSTALLATION_STATUS_INVALID", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    print_transaction_projection(
-        "TRANSACTION_STATUS",
-        store_path,
-        &transaction,
-        None,
-        None,
-        None,
-    )?;
-    Ok(0)
-}
-
+#[allow(dead_code)]
 fn installation_status_error_code(error: &InstallationError) -> &'static str {
     match error {
         InstallationError::MigrationRequired { .. } => "INSTALLATION_STATUS_MIGRATION_REQUIRED",
@@ -1145,6 +1124,20 @@ fn write_installation_error(code: &str, detail: &str) {
     );
 }
 
+fn write_runtime_status_error(code: &str, detail: &str, deadline_exceeded: bool) {
+    println!(
+        "{}",
+        json!({
+            "status": "ERROR",
+            "code": code,
+            "detail": detail,
+            "deadline_exceeded": deadline_exceeded,
+            "completed": false,
+            "scope": INSTALLATION_SCOPE,
+        })
+    );
+}
+
 fn installation_projection_completed(stage: InstallationStage) -> bool {
     stage == InstallationStage::Completed
 }
@@ -1451,5 +1444,171 @@ mod tests {
             InstallationError::InvalidField { field, .. }
                 if field == "active.runtime_state_roots.host_state_root"
         ));
+    }
+
+    #[test]
+    fn runtime_status_cli_requires_absolute_host_state_root() {
+        let result = Cli::try_parse_from([
+            "eliot",
+            "installation",
+            "status",
+            "--host-state-root",
+            "relative/path",
+        ]);
+        assert!(
+            result.is_err(),
+            "relative host-state-root must be rejected by value_parser"
+        );
+    }
+
+    #[test]
+    fn runtime_status_cli_accepts_production_json_surface() {
+        let root = std::env::temp_dir().join("eliot-runtime-status-production");
+        let root_arg = root.to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "eliot",
+            "runtime",
+            "status",
+            "--json",
+            "--host-state-root",
+            root_arg.as_str(),
+        ])
+        .expect("production runtime status surface must parse");
+        match cli.command {
+            Command::Runtime { command } => match command {
+                RuntimeCommand::Status {
+                    json,
+                    host_state_root,
+                    deadline_ms,
+                } => {
+                    assert!(json);
+                    assert_eq!(host_state_root, root);
+                    assert_eq!(deadline_ms, 2000);
+                }
+            },
+            _ => panic!("expected runtime command"),
+        }
+    }
+
+    #[test]
+    fn runtime_status_cli_accepts_absolute_host_state_root() {
+        let temp = std::env::temp_dir().join(format!("eliot-cli-abs-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp);
+        let arg = temp.to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "eliot",
+            "installation",
+            "status",
+            "--host-state-root",
+            arg.as_str(),
+        ])
+        .expect("absolute root must parse");
+        match cli.command {
+            Command::Installation { command } => match command {
+                InstallationCommand::Status {
+                    host_state_root,
+                    deadline_ms,
+                } => {
+                    assert!(host_state_root.is_absolute());
+                    assert_eq!(deadline_ms, 2000);
+                }
+                _ => panic!("expected status command"),
+            },
+            _ => panic!("expected installation command"),
+        }
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    fn honest_cli_temp_root(prefix: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let base = eliot_platform_windows::protected_program_data_root()
+                .unwrap_or_else(|_| std::env::temp_dir());
+            base.join(format!(
+                "eliot-test-cli-{}-{}-{}",
+                prefix,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = prefix;
+            std::env::temp_dir().join(format!(
+                "eliot-cli-collect-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ))
+        }
+    }
+
+    #[test]
+    fn runtime_status_collect_via_cli_construction_is_not_healthy_with_explicit_gaps_and_no_synthesis()
+     {
+        let root = honest_cli_temp_root("collect");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let report = eliot_runtime_status::collect_status(&root, deadline)
+            .expect("honest collect must succeed");
+        assert_eq!(report.status, "NOT_HEALTHY");
+        assert_eq!(report.contract, "eliot.runtime.live");
+        assert!(
+            report
+                .gaps
+                .iter()
+                .any(|g| g.contains("freshness cannot be proven"))
+        );
+        assert!(report.gaps.iter().any(|g| g.contains("trust anchor")));
+        assert!(report.gaps.iter().any(|g| g.contains("transaction stage")));
+        assert!(report.gaps.iter().any(|g| g.contains("Kernel")));
+        assert!(report.gaps.iter().any(|g| g.contains("Store")));
+        let json = serde_json::to_value(json!({
+            "status": report.status,
+            "host_state_root": report.host_state_root,
+            "ors": report.ors,
+            "transaction_stage": report.transaction_stage,
+            "gaps": report.gaps,
+            "components": report.components,
+        }))
+        .expect("serialize");
+        let text = serde_json::to_string(&json)
+            .expect("stringify")
+            .to_ascii_lowercase();
+        assert!(!text.contains("\"pid\""));
+        assert!(!text.contains("\"fence\""));
+        assert!(!text.contains("\"nonce\""));
+        assert!(matches!(
+            report.transaction_stage.state,
+            eliot_runtime_status::ComponentState::Unknown { .. }
+        ));
+        assert_eq!(
+            report.transaction_stage.gap,
+            eliot_runtime_status::transaction_stage_gap_for()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_status_cli_never_synthesizes_pid_key_nonce_fence_via_collect() {
+        let root = honest_cli_temp_root("no-synth");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let report = eliot_runtime_status::collect_status(&root, deadline).expect("collect");
+        let serialized = serde_json::to_string(&report)
+            .expect("serialize report")
+            .to_ascii_lowercase();
+        assert!(!serialized.contains("\"pid\""));
+        assert!(!serialized.contains("\"fence\""));
+        assert!(!serialized.contains("\"nonce\""));
+        assert!(!serialized.contains("\"public_key\""));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
