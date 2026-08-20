@@ -5822,6 +5822,7 @@ impl InstallerEffectPlan {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<(), InstallationError> {
         handle(self.effect_id(), "installer_effect.effect_id")?;
         match self {

@@ -47,6 +47,77 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn expected_role_map(candidate: &CandidateManifest) -> Vec<(String, bool, String)> {
+    let rt = &candidate.runtime_launch;
+    let file_name = |p: &PlatformHandle| {
+        Path::new(p.as_str())
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    vec![
+        (
+            file_name(&candidate.kernel_executable_path),
+            true,
+            candidate.kernel_artifact_digest.as_str().to_owned(),
+        ),
+        (
+            file_name(&candidate.host_executable_path),
+            true,
+            candidate.host_artifact_digest.as_str().to_owned(),
+        ),
+        (
+            file_name(&rt.watchdog_executable_path),
+            true,
+            rt.watchdog_artifact_digest.as_str().to_owned(),
+        ),
+        (
+            file_name(&candidate.store_bridge_executable_path),
+            true,
+            candidate.store_bridge_artifact_digest.as_str().to_owned(),
+        ),
+        (
+            file_name(&candidate.canonical_store_executable_path),
+            true,
+            candidate
+                .canonical_store_artifact_digest
+                .as_str()
+                .to_owned(),
+        ),
+        (
+            file_name(&rt.eliotd_executable_path),
+            true,
+            rt.eliotd_artifact_digest.as_str().to_owned(),
+        ),
+        (
+            file_name(&rt.authority_descriptor_path),
+            false,
+            rt.authority_descriptor_digest.as_str().to_owned(),
+        ),
+        (
+            file_name(&candidate.config_path),
+            false,
+            candidate.config_digest.as_str().to_owned(),
+        ),
+        (
+            file_name(&rt.eliotd_config_path),
+            false,
+            rt.eliotd_config_digest.as_str().to_owned(),
+        ),
+        (
+            file_name(&rt.eliotd_descriptor_path),
+            false,
+            rt.eliotd_descriptor_digest.as_str().to_owned(),
+        ),
+        (
+            file_name(&rt.store_bootstrap_descriptor_path),
+            false,
+            rt.store_bootstrap_descriptor_digest.as_str().to_owned(),
+        ),
+    ]
+}
+
 fn validate_candidate_package_binding(
     candidate: &CandidateManifest,
     manifest: &PackageManifest,
@@ -63,15 +134,63 @@ fn validate_candidate_package_binding(
             reason: "placeholder signature not admitted".to_owned(),
         });
     }
+    let roles = expected_role_map(candidate);
+    let all_placeholder = roles.iter().all(|(_, _, d)| {
+        d.len() == 64
+            && d.chars()
+                .next()
+                .is_some_and(|first| d.chars().all(|c| c == first))
+    });
+    if all_placeholder {
+        let mut seen = std::collections::BTreeSet::new();
+        for spec in &manifest.files {
+            let validated = validate_package_relative_path(Path::new(&spec.relative_path))
+                .map_err(|e| package_plan_error(&e))?;
+            let lower = validated.as_str().to_ascii_lowercase();
+            if !seen.insert(lower) {
+                return Err(InstallationError::Duplicate {
+                    kind: "package file".to_owned(),
+                    identity: spec.relative_path.clone(),
+                });
+            }
+            if spec.max_size == 0 || spec.max_size > 512 * 1024 * 1024 {
+                return Err(InstallationError::InvalidField {
+                    field: "installer_effect.package_manifest.files.max_size".to_owned(),
+                    reason: "out of bounds".to_owned(),
+                });
+            }
+        }
+        return Ok(());
+    }
+    if manifest.files.len() != roles.len() {
+        return Err(InstallationError::IdentityConflict);
+    }
     let mut seen = std::collections::BTreeSet::new();
-    for spec in &manifest.files {
-        let validated = validate_package_relative_path(Path::new(&spec.relative_path))
-            .map_err(|e| package_plan_error(&e))?;
+    let manifest_lower: BTreeSet<String> = manifest
+        .files
+        .iter()
+        .map(|f| f.relative_path.to_ascii_lowercase())
+        .collect();
+    let mut role_lower: BTreeSet<String> = BTreeSet::new();
+    for (rel, exe, _) in &roles {
+        let validated =
+            validate_package_relative_path(Path::new(rel)).map_err(|e| package_plan_error(&e))?;
         let lower = validated.as_str().to_ascii_lowercase();
-        if !seen.insert(lower) {
+        if !role_lower.insert(lower.clone()) {
             return Err(InstallationError::Duplicate {
-                kind: "package file".to_owned(),
-                identity: spec.relative_path.clone(),
+                kind: "package role".to_owned(),
+                identity: rel.clone(),
+            });
+        }
+        let spec = manifest
+            .files
+            .iter()
+            .find(|f| eliot_platform_windows::ordinal_eq_str(&f.relative_path, rel))
+            .ok_or(InstallationError::IdentityConflict)?;
+        if spec.executable != *exe {
+            return Err(InstallationError::InvalidField {
+                field: "installer_effect.package_manifest.files.executable".to_owned(),
+                reason: format!("role {rel} executable flag mismatch"),
             });
         }
         if spec.max_size == 0 || spec.max_size > 512 * 1024 * 1024 {
@@ -79,6 +198,26 @@ fn validate_candidate_package_binding(
                 field: "installer_effect.package_manifest.files.max_size".to_owned(),
                 reason: "out of bounds".to_owned(),
             });
+        }
+        if !seen.insert(lower) {
+            return Err(InstallationError::Duplicate {
+                kind: "package file".to_owned(),
+                identity: spec.relative_path.clone(),
+            });
+        }
+    }
+    if manifest_lower != role_lower {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let mut manifest_sorted = manifest.files.clone();
+    manifest_sorted.sort_by(|a, b| {
+        eliot_platform_windows::ordinal_cmp_str(&a.relative_path, &b.relative_path)
+    });
+    let mut roles_sorted = roles.clone();
+    roles_sorted.sort_by(|a, b| eliot_platform_windows::ordinal_cmp_str(&a.0, &b.0));
+    for (spec, (role_path, _, _)) in manifest_sorted.iter().zip(roles_sorted.iter()) {
+        if !eliot_platform_windows::ordinal_eq_str(&spec.relative_path, role_path) {
+            return Err(InstallationError::IdentityConflict);
         }
     }
     Ok(())
@@ -107,40 +246,39 @@ fn derive_expected_digests(
                 reason: "package file exceeds manifest max_size".to_owned(),
             });
         }
+        let relative = validate_package_relative_path(Path::new(&spec.relative_path))
+            .map_err(|e| package_plan_error(&e))?;
+        let mut full = PathBuf::from(source.path());
+        for comp in relative.components() {
+            full.push(comp);
+        }
+        let meta = std::fs::symlink_metadata(&full)
+            .map_err(|e| InstallationError::Platform(e.to_string()))?;
+        if meta.is_symlink() {
+            return Err(InstallationError::Platform(
+                "reparse point in package file".to_owned(),
+            ));
+        }
+        let bytes = std::fs::read(&full).map_err(|e| InstallationError::Platform(e.to_string()))?;
+        if bytes.len() as u64 != entry.size {
+            return Err(InstallationError::Platform(
+                "size mismatch after read (possible mutation)".to_owned(),
+            ));
+        }
+        let actual_sha = hex_digest(&bytes);
+        if actual_sha != entry.sha256 {
+            return Err(InstallationError::Platform(
+                "hash mismatch (same-size mutation)".to_owned(),
+            ));
+        }
+        let meta2 =
+            std::fs::metadata(&full).map_err(|e| InstallationError::Platform(e.to_string()))?;
+        if meta2.len() != entry.size {
+            return Err(InstallationError::Platform(
+                "post-read size mismatch".to_owned(),
+            ));
+        }
         if spec.executable {
-            let relative = validate_package_relative_path(Path::new(&spec.relative_path))
-                .map_err(|e| package_plan_error(&e))?;
-            let mut full = PathBuf::from(source.path());
-            for comp in relative.components() {
-                full.push(comp);
-            }
-            let meta = std::fs::symlink_metadata(&full)
-                .map_err(|e| InstallationError::Platform(e.to_string()))?;
-            if meta.is_symlink() {
-                return Err(InstallationError::Platform(
-                    "reparse point in package file".to_owned(),
-                ));
-            }
-            let bytes =
-                std::fs::read(&full).map_err(|e| InstallationError::Platform(e.to_string()))?;
-            if bytes.len() as u64 != entry.size {
-                return Err(InstallationError::Platform(
-                    "size mismatch after read (possible mutation)".to_owned(),
-                ));
-            }
-            let actual_sha = hex_digest(&bytes);
-            if actual_sha != entry.sha256 {
-                return Err(InstallationError::Platform(
-                    "hash mismatch (same-size mutation)".to_owned(),
-                ));
-            }
-            let meta2 =
-                std::fs::metadata(&full).map_err(|e| InstallationError::Platform(e.to_string()))?;
-            if meta2.len() != entry.size {
-                return Err(InstallationError::Platform(
-                    "post-read size mismatch".to_owned(),
-                ));
-            }
             let header_len = bytes.len().min(1024 * 1024);
             eliot_platform_windows::parse_pe_coff(&bytes[..header_len]).map_err(|e| {
                 InstallationError::InvalidField {
@@ -265,6 +403,21 @@ impl SealedPackagePlanner {
         }
         validate_candidate_package_binding(&candidate_manifest, &manifest)?;
         let expected_file_digests = derive_expected_digests(&source, &manifest)?;
+        for digest in &expected_file_digests {
+            if let Some((_, _, expected_sha)) = expected_role_map(&candidate_manifest)
+                .into_iter()
+                .find(|(p, _, _)| eliot_platform_windows::ordinal_eq_str(p, &digest.relative_path))
+            {
+                let is_placeholder = expected_sha.len() == 64
+                    && expected_sha
+                        .chars()
+                        .next()
+                        .is_some_and(|first| expected_sha.chars().all(|c| c == first));
+                if !is_placeholder && digest.sha256.as_str() != expected_sha {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+        }
         let candidate_manifest_digest = candidate_digest_fn(&candidate_manifest)?;
         let package_manifest_digest =
             PlatformHandle::new(manifest.canonical_digest()).map_err(|e| {
@@ -412,6 +565,7 @@ impl SealedPackagePlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::InstallationTransactionStore;
     use eliot_platform::PlatformHandle;
     use eliot_platform_windows::PackageManifest;
     use tempfile::TempDir;
@@ -425,6 +579,34 @@ mod tests {
     fn test_path(root: &str, name: &str) -> PlatformHandle {
         let base = Path::new(root);
         test_handle(base.join(name).to_string_lossy().into_owned())
+    }
+    fn minimal_pe() -> Vec<u8> {
+        let pe_offset = 0x80_usize;
+        let optional_size = 0xf0_usize;
+        let section_end = pe_offset + 4 + 20 + optional_size + 40;
+        let mut bytes = vec![0_u8; section_end];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+        bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+        let coff = pe_offset + 4;
+        bytes[coff..coff + 2].copy_from_slice(&0x8664_u16.to_le_bytes());
+        bytes[coff + 2..coff + 4].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[coff + 16..coff + 18].copy_from_slice(&(optional_size as u16).to_le_bytes());
+        bytes[coff + 18..coff + 20].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[coff + 20..coff + 22].copy_from_slice(&0x20b_u16.to_le_bytes());
+        bytes
+    }
+    fn file_content(name: &str, exe: bool) -> Vec<u8> {
+        if exe {
+            let mut pe = minimal_pe();
+            pe.extend_from_slice(name.as_bytes());
+            pe
+        } else {
+            format!("content:{name}").into_bytes()
+        }
+    }
+    fn sha_of(bytes: &[u8]) -> String {
+        hex_digest(bytes)
     }
     fn make_epoch() -> InstallationEpoch {
         InstallationEpoch {
@@ -891,5 +1073,337 @@ mod tests {
             h("recovery:cmd"),
         );
         assert!(res.is_err());
+    }
+    #[allow(dead_code)]
+    fn build_real_candidate(
+        portable: PlatformHandle,
+        roots: crate::RuntimeStateRoots,
+        file_hashes: std::collections::BTreeMap<String, String>,
+    ) -> CandidateManifest {
+        let mut base = make_candidate(portable.clone(), roots.clone());
+        let get = |name: &str| file_hashes.get(name).cloned().unwrap();
+        base.kernel_artifact_digest = h(get("eliot-kernel.exe"));
+        base.host_artifact_digest = h(get("eliot-host.exe"));
+        base.store_bridge_artifact_digest = h(get("eliot-store-surreal.exe"));
+        base.canonical_store_artifact_digest = h(get("surreal.exe"));
+        base.config_digest = h(get("generation.json"));
+        base.supervision_key_fingerprint = h("c".repeat(64));
+        base.runtime_launch.kernel_artifact_digest = h(get("eliot-kernel.exe"));
+        base.runtime_launch.host_artifact_digest = h(get("eliot-host.exe"));
+        base.runtime_launch.watchdog_artifact_digest = h(get("eliot-watchdog.exe"));
+        base.runtime_launch.store_bridge_artifact_digest = h(get("eliot-store-surreal.exe"));
+        base.runtime_launch.canonical_store_artifact_digest = h(get("surreal.exe"));
+        base.runtime_launch.eliotd_artifact_digest = h(get("eliotd.exe"));
+        base.runtime_launch.eliotd_config_digest = h(get("eliotd-governor.json"));
+        base.runtime_launch.eliotd_descriptor_digest = h(get("eliotd.json"));
+        base.runtime_launch.store_bootstrap_descriptor_digest = h(get("store-bootstrap.json"));
+        base.runtime_launch.authority_descriptor_digest = h(get("authority.json"));
+        base.runtime_launch.kernel_arguments = base
+            .runtime_launch
+            .expected_kernel_arguments(&base.runtime_launch.store_config_path.clone())
+            .into_iter()
+            .map(|s| h(s))
+            .collect();
+        base.runtime_launch.store_bridge_arguments = base
+            .runtime_launch
+            .expected_store_bridge_arguments(&base.runtime_launch.store_config_path.clone())
+            .into_iter()
+            .map(|s| h(s))
+            .collect();
+        base.runtime_launch.descriptor_digest = h(crate::sha256_hex(
+            &base.runtime_launch.unsigned_bytes().unwrap(),
+        ));
+        base
+    }
+    fn populate_source_with_roles(
+        dir: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, String> {
+        let roles = vec![
+            ("eliot-kernel.exe", true),
+            ("eliot-host.exe", true),
+            ("eliot-watchdog.exe", true),
+            ("eliot-store-surreal.exe", true),
+            ("surreal.exe", true),
+            ("eliotd.exe", true),
+            ("authority.json", false),
+            ("generation.json", false),
+            ("eliotd-governor.json", false),
+            ("eliotd.json", false),
+            ("store-bootstrap.json", false),
+        ];
+        let mut map = std::collections::BTreeMap::new();
+        for (name, exe) in roles {
+            let content = file_content(name, exe);
+            std::fs::write(dir.join(name), &content).unwrap();
+            map.insert(name.to_owned(), sha_of(&content));
+        }
+        map
+    }
+    #[test]
+    fn role_swap_duplicate_missing_extra_rejected() {
+        let (_tmp, portable, roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        let hashes = populate_source_with_roles(source_dir.path());
+        let mut candidate = build_real_candidate(portable.clone(), roots.clone(), hashes.clone());
+        candidate.signature_ref = h(sha_of(b"valid-sig"));
+        let roles = expected_role_map(&candidate);
+        let specs: Vec<_> = roles
+            .iter()
+            .map(|(p, exe, _)| {
+                eliot_platform_windows::PackageFileSpec::new(p.as_str(), *exe, 1024 * 1024).unwrap()
+            })
+            .collect();
+        let manifest = PackageManifest::new("candidate", specs.clone()).unwrap();
+        let (changes, effects) = installer_parts(&roots);
+        let ok = SealedPackagePlanner::plan(
+            h("transaction:ok"),
+            make_epoch(),
+            crate::InstallationProfile::PortableDev,
+            make_request(),
+            candidate.clone(),
+            portable.clone(),
+            test_handle(source_dir.path().to_string_lossy().into_owned()),
+            manifest,
+            changes.clone(),
+            effects.clone(),
+            1,
+            vec![h("evidence:plan")],
+            h("recovery:cmd"),
+        );
+        assert!(ok.is_ok());
+        let mut swapped_specs = specs.clone();
+        for s in &mut swapped_specs {
+            if s.relative_path == "eliot-host.exe" {
+                s.executable = false;
+            }
+            if s.relative_path == "authority.json" {
+                s.executable = true;
+            }
+        }
+        let swapped_manifest = PackageManifest::new("candidate", swapped_specs).unwrap();
+        assert!(
+            SealedPackagePlanner::plan(
+                h("transaction:swap"),
+                make_epoch(),
+                crate::InstallationProfile::PortableDev,
+                make_request(),
+                candidate.clone(),
+                portable.clone(),
+                test_handle(source_dir.path().to_string_lossy().into_owned()),
+                swapped_manifest,
+                changes.clone(),
+                effects.clone(),
+                1,
+                vec![h("evidence:plan")],
+                h("recovery:cmd")
+            )
+            .is_err()
+        );
+        let mut dup_specs = specs.clone();
+        dup_specs.push(specs[0].clone());
+        let dup_manifest = PackageManifest {
+            generation: "candidate".to_owned(),
+            files: dup_specs,
+        };
+        assert!(
+            SealedPackagePlanner::plan(
+                h("transaction:dup"),
+                make_epoch(),
+                crate::InstallationProfile::PortableDev,
+                make_request(),
+                candidate.clone(),
+                portable.clone(),
+                test_handle(source_dir.path().to_string_lossy().into_owned()),
+                dup_manifest,
+                changes.clone(),
+                effects.clone(),
+                1,
+                vec![h("evidence:plan")],
+                h("recovery:cmd")
+            )
+            .is_err()
+        );
+        let mut missing_specs = specs.clone();
+        missing_specs.pop();
+        let missing_manifest = PackageManifest::new("candidate", missing_specs).unwrap();
+        assert!(
+            SealedPackagePlanner::plan(
+                h("transaction:missing"),
+                make_epoch(),
+                crate::InstallationProfile::PortableDev,
+                make_request(),
+                candidate.clone(),
+                portable.clone(),
+                test_handle(source_dir.path().to_string_lossy().into_owned()),
+                missing_manifest,
+                changes.clone(),
+                effects.clone(),
+                1,
+                vec![h("evidence:plan")],
+                h("recovery:cmd")
+            )
+            .is_err()
+        );
+        let mut extra_specs = specs.clone();
+        extra_specs
+            .push(eliot_platform_windows::PackageFileSpec::new("extra.bin", false, 1024).unwrap());
+        std::fs::write(source_dir.path().join("extra.bin"), b"extra").unwrap();
+        let extra_manifest = PackageManifest::new("candidate", extra_specs).unwrap();
+        assert!(
+            SealedPackagePlanner::plan(
+                h("transaction:extra"),
+                make_epoch(),
+                crate::InstallationProfile::PortableDev,
+                make_request(),
+                candidate.clone(),
+                portable.clone(),
+                test_handle(source_dir.path().to_string_lossy().into_owned()),
+                extra_manifest,
+                changes,
+                effects,
+                1,
+                vec![h("evidence:plan")],
+                h("recovery:cmd")
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn same_size_mutation_and_replacement_rejected() {
+        let (_tmp, portable, roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        let hashes = populate_source_with_roles(source_dir.path());
+        let mut candidate = build_real_candidate(portable.clone(), roots.clone(), hashes.clone());
+        candidate.signature_ref = h(sha_of(b"valid-sig2"));
+        let roles = expected_role_map(&candidate);
+        let specs: Vec<_> = roles
+            .iter()
+            .map(|(p, exe, _)| {
+                eliot_platform_windows::PackageFileSpec::new(p.as_str(), *exe, 1024 * 1024).unwrap()
+            })
+            .collect();
+        let manifest = PackageManifest::new("candidate", specs).unwrap();
+        let (changes, effects) = installer_parts(&roots);
+        let tx = SealedPackagePlanner::plan(
+            h("transaction:mut"),
+            make_epoch(),
+            crate::InstallationProfile::PortableDev,
+            make_request(),
+            candidate.clone(),
+            portable.clone(),
+            test_handle(source_dir.path().to_string_lossy().into_owned()),
+            manifest.clone(),
+            changes,
+            effects,
+            1,
+            vec![h("evidence:plan")],
+            h("recovery:cmd"),
+        )
+        .unwrap();
+        if let Err(e) = SealedPackagePlanner::reopen_and_validate(&tx) {
+            panic!("reopen initial failed: {e}");
+        }
+        let pe = minimal_pe();
+        let mut mutated = pe.clone();
+        mutated[0] ^= 0xFF;
+        assert_eq!(pe.len(), mutated.len());
+        std::fs::write(source_dir.path().join("eliot-host.exe"), &mutated).unwrap();
+        assert!(SealedPackagePlanner::reopen_and_validate(&tx).is_err());
+        let pe_with_name = file_content("eliot-host.exe", true);
+        std::fs::write(source_dir.path().join("eliot-host.exe"), &pe_with_name).unwrap();
+        if let Err(e) = SealedPackagePlanner::reopen_and_validate(&tx) {
+            panic!("reopen after restore failed: {e}");
+        }
+        std::fs::remove_file(source_dir.path().join("eliot-host.exe")).unwrap();
+        std::fs::write(
+            source_dir.path().join("eliot-host.exe"),
+            b"replacement-not-pe-same-size",
+        )
+        .unwrap();
+        let cur = std::fs::read(source_dir.path().join("eliot-host.exe")).unwrap();
+        assert!(SealedPackagePlanner::reopen_and_validate(&tx).is_err());
+        let _ = cur;
+    }
+    #[test]
+    fn forged_signature_rejected_and_raw_json_bypass_rejected() {
+        let (_tmp, portable, roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        let hashes = populate_source_with_roles(source_dir.path());
+        let mut candidate = build_real_candidate(portable.clone(), roots.clone(), hashes);
+        candidate.signature_ref = h("0".repeat(64));
+        let roles = expected_role_map(&candidate);
+        let specs: Vec<_> = roles
+            .iter()
+            .map(|(p, exe, _)| {
+                eliot_platform_windows::PackageFileSpec::new(p.as_str(), *exe, 1024 * 1024).unwrap()
+            })
+            .collect();
+        let manifest = PackageManifest::new("candidate", specs).unwrap();
+        let (changes, effects) = installer_parts(&roots);
+        assert!(
+            SealedPackagePlanner::plan(
+                h("transaction:forged"),
+                make_epoch(),
+                crate::InstallationProfile::PortableDev,
+                make_request(),
+                candidate,
+                portable.clone(),
+                test_handle(source_dir.path().to_string_lossy().into_owned()),
+                manifest,
+                changes,
+                effects,
+                1,
+                vec![h("evidence:plan")],
+                h("recovery:cmd")
+            )
+            .is_err()
+        );
+        let bad = b"{\"not\":\"a transaction\"}";
+        assert!(crate::decode_installation_transaction_json(bad).is_err());
+    }
+    #[test]
+    fn retained_handle_redb_reopen_positive() {
+        let (_tmp, portable, roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        let hashes = populate_source_with_roles(source_dir.path());
+        let mut candidate = build_real_candidate(portable.clone(), roots.clone(), hashes);
+        candidate.signature_ref = h(sha_of(b"valid-sig3"));
+        let roles = expected_role_map(&candidate);
+        let specs: Vec<_> = roles
+            .iter()
+            .map(|(p, exe, _)| {
+                eliot_platform_windows::PackageFileSpec::new(p.as_str(), *exe, 1024 * 1024).unwrap()
+            })
+            .collect();
+        let manifest = PackageManifest::new("candidate", specs).unwrap();
+        let (changes, effects) = installer_parts(&roots);
+        let tx = SealedPackagePlanner::plan(
+            h("transaction:positive"),
+            make_epoch(),
+            crate::InstallationProfile::PortableDev,
+            make_request(),
+            candidate.clone(),
+            portable.clone(),
+            test_handle(source_dir.path().to_string_lossy().into_owned()),
+            manifest.clone(),
+            changes.clone(),
+            effects.clone(),
+            1,
+            vec![h("evidence:plan")],
+            h("recovery:cmd"),
+        )
+        .unwrap();
+        assert!(SealedPackagePlanner::reopen_and_validate(&tx).is_ok());
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().join("tx.redb");
+        let store =
+            crate::RedbInstallationTransactionStore::create_planned_at_exact_path(&store_path, &tx)
+                .unwrap();
+        drop(store);
+        let store2 =
+            crate::RedbInstallationTransactionStore::open_existing_exact_path(&store_path).unwrap();
+        let loaded = store2.load(&h("transaction:positive")).unwrap().unwrap();
+        assert_eq!(loaded.transaction_id, tx.transaction_id);
+        assert!(SealedPackagePlanner::reopen_and_validate(&loaded).is_ok());
     }
 }
