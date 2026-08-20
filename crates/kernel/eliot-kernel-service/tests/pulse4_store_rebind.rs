@@ -824,6 +824,18 @@ fn production_discriminator_rebind_drives_kernel_composition_path() {
         src_kernel.contains("rebind_store"),
         "Kernel composition must contain rebind_store"
     );
+    assert!(
+        src_host.contains("snapshot_pending"),
+        "Host must resume pending Store rebind via snapshot reuse"
+    );
+    assert!(
+        src_kernel.contains("recover_store_rebind_state"),
+        "Kernel must recover Store rebind from ORS on restart"
+    );
+    assert!(
+        src_kernel.contains("rollback_store_rebind_for_recovery_failure"),
+        "Kernel must atomically rollback Store rebind on durability failure"
+    );
     let host_calls = src_host.matches("rebind_store_control").count();
     let kernel_calls = src_kernel.matches("rebind_store").count();
     assert!(
@@ -834,6 +846,108 @@ fn production_discriminator_rebind_drives_kernel_composition_path() {
         kernel_calls >= 3,
         "Kernel must define, validate and dispatch rebind_store"
     );
+}
+
+#[test]
+fn rebind_recovery_restores_degraded_from_ors_commit() {
+    let (mut svc, cand) = ready_service();
+    let cand_digest = cand.compute_digest().unwrap();
+    let req = requirement();
+    let mut handoff = StoreRebindHandoff {
+        operation_id: handle("rebind-op-recover"),
+        request_digest: "d".repeat(64),
+        requirement: req,
+        process_binding: StoreProcessBinding {
+            process: HostProcessBinding {
+                process_id: 99,
+                start_time_100ns: 100,
+                image_path: r"C:\Eliot\eliot-store-surreal.exe".to_owned(),
+            },
+            job: handle(r"Local\Eliot-Host-Store-test"),
+        },
+        candidate_binding_digest: cand_digest.clone(),
+        generation: ResourceGeneration::genesis(),
+        authority_epoch: AuthorityEpoch::genesis(),
+        store_fence: String::new(),
+    };
+    handoff.store_fence = store_fence_for(&handoff);
+    let receipt = svc.rebind_store(&handoff, "e".repeat(64)).unwrap();
+    let mut restarted = {
+        let (s, _) = ready_service();
+        s
+    };
+    assert!(
+        restarted
+            .reconcile_store_rebind(&StoreRebindQuery {
+                operation_id: handle("rebind-op-recover"),
+                request_digest: "e".repeat(64)
+            })
+            .unwrap()
+            .is_none()
+    );
+    restarted
+        .restore_store_rebind_for_recovery(receipt.clone(), "e".repeat(64))
+        .unwrap();
+    assert_eq!(
+        restarted.state(),
+        eliot_kernel_service::KernelServiceState::Degraded
+    );
+    assert_eq!(restarted.store_rebind_receipt().unwrap(), &receipt);
+    assert!(restarted.acquire_admission().is_err());
+    let ready = {
+        let cand2 = candidate_binding();
+        let activation = restarted.activation_receipt().unwrap().clone();
+        eliot_kernel_service::KernelReadyReceipt {
+            activation_id: cand2.activation_id.clone(),
+            activation_operation_id: activation.operation_id.clone(),
+            activation_nonce_digest: activation.activation_nonce_digest.clone(),
+            process: eliot_kernel_service::ProcessObservation {
+                process_id: handle("pid:42:start:10"),
+                job_object_id: cand2.job_object_id.clone(),
+                state: eliot_runtime_contracts::ServiceProcessState::Ready,
+                health: eliot_runtime_contracts::HealthVector::healthy(),
+                evidence_refs: vec![handle("ev1")],
+            },
+            health: eliot_runtime_contracts::HealthVector::healthy(),
+            evidence_refs: vec![handle("ev1")],
+        }
+    };
+    restarted.publish_ready(ready).unwrap();
+    assert_eq!(
+        restarted.state(),
+        eliot_kernel_service::KernelServiceState::Ready
+    );
+    assert!(restarted.acquire_admission().is_ok());
+}
+
+#[test]
+fn rebind_fence_recheck_blocks_stale_second_rebind_without_probe() {
+    let (mut svc, cand) = ready_service();
+    let cand_digest = cand.compute_digest().unwrap();
+    let req = requirement();
+    let mut handoff = StoreRebindHandoff {
+        operation_id: handle("rebind-op-fence-recheck"),
+        request_digest: "d".repeat(64),
+        requirement: req.clone(),
+        process_binding: StoreProcessBinding {
+            process: HostProcessBinding {
+                process_id: 99,
+                start_time_100ns: 100,
+                image_path: r"C:\Eliot\eliot-store-surreal.exe".to_owned(),
+            },
+            job: handle(r"Local\Eliot-Host-Store-test"),
+        },
+        candidate_binding_digest: cand_digest.clone(),
+        generation: ResourceGeneration::genesis(),
+        authority_epoch: AuthorityEpoch::genesis(),
+        store_fence: String::new(),
+    };
+    handoff.store_fence = store_fence_for(&handoff);
+    svc.rebind_store(&handoff, "e".repeat(64)).unwrap();
+    let mut stale = handoff.clone();
+    stale.operation_id = handle("rebind-op-fence-recheck-2");
+    assert!(svc.rebind_store(&stale, "f".repeat(64)).is_err());
+    assert!(svc.acquire_admission().is_err());
 }
 
 #[test]

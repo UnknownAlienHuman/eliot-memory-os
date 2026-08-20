@@ -2398,6 +2398,16 @@ impl HostJobBranches {
         );
         hasher.update(candidate_digest.as_bytes());
         let store_fence = format!("{:x}", hasher.finalize());
+        let snapshot_pending = journal.snapshot().ok().and_then(|state| {
+            state.store_rebinds.into_iter().find(|record| {
+                record.state == StoreRebindState::Pending
+                    && record.store_fence.as_str() == store_fence
+                    && record.process_id == store_process.process_id
+                    && record.process_start_time_100ns == store_process.start_time_100ns
+                    && record.generation == launch.authority_generation.value()
+                    && record.authority_epoch == candidate.kernel_epoch.value()
+            })
+        });
         let operation_id = fresh_identity("store-rebind")?;
         let handoff = StoreRebindHandoff {
             operation_id: operation_id.clone(),
@@ -2451,6 +2461,96 @@ impl HostJobBranches {
                 kprocess.start_time_100ns,
                 &expected_kernel_image,
             )?;
+            if let Some(pending) = snapshot_pending.clone() {
+                let pending_query = StoreRebindQuery {
+                    operation_id: pending.operation_id.clone(),
+                    request_digest: pending.request_digest.as_str().to_owned(),
+                };
+                let pending_query_request = KernelControlRequest {
+                    wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+                    wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+                    message_id: fresh_identity("store-rebind-query-pending")?,
+                    sequence: 1,
+                    peer_process_id: std::process::id(),
+                    generation: launch.authority_generation,
+                    candidate: candidate.clone(),
+                    command: KernelControlCommand::ReconcileRebindStore(pending_query.clone()),
+                    payload_digest: String::new(),
+                }
+                .with_computed_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                let pending_frame = control_request_frame(
+                    format!(
+                        "host-rebind-query-pending:{}:{}",
+                        generation.as_str(),
+                        candidate.activation_id.as_str()
+                    ),
+                    &pending_query_request,
+                )
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                let mut query_transport = NamedPipeTransport::connect_authenticated(
+                    KERNEL_CONTROL_PIPE,
+                    std::time::Duration::from_secs(5),
+                    &expectation,
+                )
+                .await
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                validate_authenticated_kernel_peer(
+                    query_transport.peer_identity(),
+                    kprocess.process_id,
+                    kprocess.start_time_100ns,
+                    &expected_kernel_image,
+                )
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                if query_transport
+                    .send_frame(&pending_frame, TransportLimits::default())
+                    .await
+                    .is_ok()
+                    && let Ok(frame) = query_transport
+                        .receive_frame(TransportLimits::default())
+                        .await
+                    && let Ok(response) = decode_control_response_frame(&frame)
+                    && response.message_id == pending_query_request.message_id
+                    && response.request_digest == pending_query_request.payload_digest
+                    && response.error.is_none()
+                    && let Some(receipt) = response.store_rebind_receipt
+                    && receipt.operation_id == pending.operation_id
+                    && receipt.request_digest == pending.request_digest.as_str()
+                {
+                    receipt
+                        .validate()
+                        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                    let committed_record = StoreRebindRecord {
+                        fence: record_fence(host, activation_id, activation_generation),
+                        operation: operation(&format!(
+                            "store-rebind:{}:committed",
+                            pending.operation_id.as_str()
+                        ))?,
+                        state: StoreRebindState::Committed,
+                        operation_id: pending.operation_id.clone(),
+                        request_digest: pending.request_digest.clone(),
+                        requirement: pending.requirement.clone(),
+                        candidate_binding_digest: pending.candidate_binding_digest.clone(),
+                        store_fence: pending.store_fence.clone(),
+                        process_id: pending.process_id,
+                        process_start_time_100ns: pending.process_start_time_100ns,
+                        process_image_path: pending.process_image_path.clone(),
+                        job_name: pending.job_name.clone(),
+                        generation: pending.generation,
+                        authority_epoch: pending.authority_epoch,
+                        receipt_request_digest: Some(
+                            PlatformHandle::new(receipt.request_digest.clone())
+                                .map_err(|error| HostError::Platform(error.to_string()))?,
+                        ),
+                        receipt_store_fence: Some(
+                            PlatformHandle::new(receipt.store_fence.clone())
+                                .map_err(|error| HostError::Platform(error.to_string()))?,
+                        ),
+                    };
+                    append_reconciled(journal, HostStateRecord::StoreRebind(committed_record))?;
+                    return Ok(receipt);
+                }
+            }
             let mut handoff_with_digest = handoff.clone();
             let canonical = handoff_with_digest
                 .canonical_request_digest()

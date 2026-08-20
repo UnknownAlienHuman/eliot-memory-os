@@ -2421,6 +2421,9 @@ impl KernelStoreGateway {
             if service.generation_fenced() {
                 return Err("Kernel generation is fenced".to_owned());
             }
+            if self.is_fenced() {
+                return Err("canonical-store gateway is fenced for rebind".to_owned());
+            }
             if self.route.authority_epoch() != service.authority_epoch()
                 || self.route.active_generation() != transition.state_fence.resource_generation
             {
@@ -2436,6 +2439,9 @@ impl KernelStoreGateway {
             }
             lease
         };
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
 
         let result = self
             .store
@@ -2453,6 +2459,9 @@ impl KernelStoreGateway {
 
     /// Reads one Host-bound canonical validation snapshot.
     pub async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, String> {
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
         self.store
             .validation_snapshot()
             .await
@@ -2598,6 +2607,66 @@ fn update_handshake_policy(
         });
     }
     Ok(())
+}
+
+#[cfg(windows)]
+impl KernelComposition {
+    fn recover_store_rebind_state(
+        ors: &RedbRecoveryStore,
+        service: &mut eliot_kernel_service::KernelService,
+        store_bootstrap: Option<&HostStoreBootstrapRequirement>,
+    ) -> Result<Option<eliot_kernel_service::StoreBootstrapHandoff>, String> {
+        let records = ors.load_all_store_rebinds().map_err(|e| e.to_string())?;
+        let committed = records
+            .into_iter()
+            .filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
+            .max_by_key(|r| (r.authority_epoch, r.generation));
+        let Some(record) = committed else {
+            return Ok(None);
+        };
+        let Some(requirement) = store_bootstrap else {
+            return Ok(None);
+        };
+        let requirement_digest = {
+            let bytes = serde_json::to_vec(requirement).map_err(|e| e.to_string())?;
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        if requirement_digest != record.requirement_digest {
+            return Ok(None);
+        }
+        if requirement.state_fence.resource_generation.value() != record.generation
+            || requirement.state_fence.authority_epoch.value() != record.authority_epoch
+        {
+            return Ok(None);
+        }
+        let receipt = eliot_kernel_service::StoreRebindReceipt {
+            operation_id: PlatformHandle::new(record.operation_id.as_str())
+                .map_err(|e| e.to_string())?,
+            request_digest: record.request_digest.clone(),
+            requirement_digest: record.requirement_digest.clone(),
+            process_binding: eliot_kernel_service::StoreProcessBinding {
+                process: eliot_kernel_service::HostProcessBinding {
+                    process_id: record.process_id,
+                    start_time_100ns: record.process_start_time_100ns,
+                    image_path: record.process_image_path.clone(),
+                },
+                job: PlatformHandle::new(record.job_name.clone()).map_err(|e| e.to_string())?,
+            },
+            candidate_binding_digest: record.candidate_binding_digest.clone(),
+            generation: ResourceGeneration::new(record.generation).map_err(|e| e.to_string())?,
+            authority_epoch: AuthorityEpoch::new(record.authority_epoch)
+                .map_err(|e| e.to_string())?,
+            store_fence: record.store_fence.clone(),
+        };
+        receipt.validate().map_err(|e| e.to_string())?;
+        service
+            .restore_store_rebind_for_recovery(receipt.clone(), record.request_digest.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(Some(eliot_kernel_service::StoreBootstrapHandoff {
+            requirement: requirement.clone(),
+            process_binding: receipt.process_binding.clone(),
+        }))
+    }
 }
 
 impl KernelComposition {
@@ -3015,6 +3084,7 @@ impl KernelComposition {
     /// Keeps ordered generation, authority, and handoff construction in one
     /// composition path so no intermediate partially wired authority escapes.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::needless_pass_by_value)]
     fn assemble(
         config: KernelConfig,
         ors: Arc<RedbRecoveryStore>,
@@ -3176,7 +3246,7 @@ impl KernelComposition {
             None,
         )
         .map_err(KernelBuildError::Runtime)?;
-        let generation_gateway = OrsGenerationCoordinator::new(ors);
+        let generation_gateway = OrsGenerationCoordinator::new(ors.clone());
         let mut service = service;
         service
             .synchronize_authority_epoch(authority_epoch)
@@ -3185,6 +3255,18 @@ impl KernelComposition {
         generation_gateway
             .recover(&mut generations, &mut service, &mut policy)
             .map_err(KernelBuildError::Ors)?;
+        #[cfg(windows)]
+        let store_handoff_init = {
+            let store_bootstrap_for_recovery = store_bootstrap.clone();
+            Self::recover_store_rebind_state(
+                &ors,
+                &mut service,
+                store_bootstrap_for_recovery.as_ref(),
+            )
+            .map_err(KernelBuildError::Ors)?
+        };
+        #[cfg(not(windows))]
+        let store_handoff_init = None;
         Ok(Self {
             work_root,
             runtime,
@@ -3211,7 +3293,7 @@ impl KernelComposition {
             #[cfg(windows)]
             daemon_recovery_attempts: AtomicU64::new(0),
             #[cfg(windows)]
-            store_handoff: Mutex::new(None),
+            store_handoff: Mutex::new(store_handoff_init),
             approved_config_hash,
             canonical_store_claimed: AtomicBool::new(false),
             #[cfg(windows)]
@@ -3307,33 +3389,6 @@ impl KernelComposition {
             return Err(KernelBuildError::Service(
                 "Store rebind outer digest invalid".to_owned(),
             ));
-        }
-        {
-            let requirement_digest = {
-                let bytes = serde_json::to_vec(&handoff.requirement)
-                    .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-                format!("{:x}", Sha256::digest(&bytes))
-            };
-            let pending = eliot_ors::StoreRebindReplayRecord {
-                operation_id: eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
-                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
-                request_digest: request_digest.clone(),
-                candidate_binding_digest: handoff.candidate_binding_digest.clone(),
-                store_fence: handoff.store_fence.clone(),
-                requirement_digest: requirement_digest.clone(),
-                process_id: handoff.process_binding.process.process_id,
-                process_start_time_100ns: handoff.process_binding.process.start_time_100ns,
-                process_image_path: handoff.process_binding.process.image_path.clone(),
-                job_name: handoff.process_binding.job.as_str().to_owned(),
-                generation: handoff.generation.value(),
-                authority_epoch: handoff.authority_epoch.value(),
-                state: eliot_ors::StoreRebindReplayState::Pending,
-                receipt: None,
-            };
-            self.generation_gateway
-                .ors
-                .begin_store_rebind(&pending)
-                .map_err(|e| KernelBuildError::Service(e.to_string()))?;
         }
         {
             let service = self
@@ -3473,6 +3528,69 @@ impl KernelComposition {
                 "store rebind does not match active Kernel store route".to_owned(),
             ));
         }
+        if let Some(existing) = self
+            .generation_gateway
+            .ors
+            .load_store_rebind(
+                &eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
+                &request_digest,
+            )
+            .map_err(|e| KernelBuildError::Service(e.to_string()))?
+        {
+            if existing.state == eliot_ors::StoreRebindReplayState::Committed
+                && let Some(receipt) = existing.receipt.clone()
+            {
+                let restored = eliot_kernel_service::StoreRebindReceipt {
+                    operation_id: handoff.operation_id.clone(),
+                    request_digest: request_digest.clone(),
+                    requirement_digest: existing.requirement_digest.clone(),
+                    process_binding: handoff.process_binding.clone(),
+                    candidate_binding_digest: handoff.candidate_binding_digest.clone(),
+                    generation: handoff.generation,
+                    authority_epoch: handoff.authority_epoch,
+                    store_fence: handoff.store_fence.clone(),
+                };
+                if receipt == request_digest {
+                    return Ok(restored);
+                }
+            }
+            if existing.request_digest != request_digest
+                || existing.candidate_binding_digest != handoff.candidate_binding_digest
+                || existing.store_fence != handoff.store_fence
+            {
+                return Err(KernelBuildError::Service(
+                    "existing store rebind conflicts".to_owned(),
+                ));
+            }
+        }
+        {
+            let requirement_digest = {
+                let bytes = serde_json::to_vec(&handoff.requirement)
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+                format!("{:x}", Sha256::digest(&bytes))
+            };
+            let pending = eliot_ors::StoreRebindReplayRecord {
+                operation_id: eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
+                request_digest: request_digest.clone(),
+                candidate_binding_digest: handoff.candidate_binding_digest.clone(),
+                store_fence: handoff.store_fence.clone(),
+                requirement_digest: requirement_digest.clone(),
+                process_id: handoff.process_binding.process.process_id,
+                process_start_time_100ns: handoff.process_binding.process.start_time_100ns,
+                process_image_path: handoff.process_binding.process.image_path.clone(),
+                job_name: handoff.process_binding.job.as_str().to_owned(),
+                generation: handoff.generation.value(),
+                authority_epoch: handoff.authority_epoch.value(),
+                state: eliot_ors::StoreRebindReplayState::Pending,
+                receipt: None,
+            };
+            self.generation_gateway
+                .ors
+                .begin_store_rebind(&pending)
+                .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+        }
         let gateway = std::sync::Arc::new(KernelStoreGateway::new(
             self.service.clone(),
             std::sync::Arc::new(client),
@@ -3501,10 +3619,23 @@ impl KernelComposition {
                 .service
                 .lock()
                 .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
+            if svc.state() != eliot_kernel_service::KernelServiceState::Ready {
+                return Err(KernelBuildError::Service(
+                    "Store rebind requires Ready Kernel (fence recheck)".to_owned(),
+                ));
+            }
+            if svc.candidate_binding().is_some_and(|c| {
+                c.compute_digest()
+                    .is_ok_and(|d| d != handoff.candidate_binding_digest)
+            }) {
+                return Err(KernelBuildError::Service(
+                    "Store rebind candidate binding mismatch (fence recheck)".to_owned(),
+                ));
+            }
             svc.rebind_store(&handoff, request_digest.clone())
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?
         };
-        {
+        let committed_result = {
             let requirement_digest = {
                 let bytes = serde_json::to_vec(&handoff.requirement)
                     .map_err(|e| KernelBuildError::Service(e.to_string()))?;
@@ -3529,23 +3660,45 @@ impl KernelComposition {
             self.generation_gateway
                 .ors
                 .persist_store_rebind(&committed)
-                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-        }
-        let old_gateway =
+                .map_err(|error| KernelBuildError::Service(error.to_string()))
+        };
+        if let Err(error) = committed_result {
             {
-                let mut gw_guard = self.canonical_store_gateway.lock().map_err(|_| {
-                    KernelBuildError::Service("store gateway lock poisoned".to_owned())
-                })?;
-                let mut handoff_guard = self.store_handoff.lock().map_err(|_| {
-                    KernelBuildError::Service("Store handoff lock poisoned".to_owned())
-                })?;
-                let old = gw_guard.replace(Arc::clone(&gateway));
-                *handoff_guard = Some(eliot_kernel_service::StoreBootstrapHandoff {
-                    requirement: handoff.requirement.clone(),
-                    process_binding: handoff.process_binding.clone(),
-                });
-                old
-            };
+                let mut svc = self
+                    .service
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                svc.rollback_store_rebind_for_recovery_failure();
+            }
+            return Err(error);
+        }
+        let old_gateway = match (|| {
+            let mut gw_guard = self
+                .canonical_store_gateway
+                .lock()
+                .map_err(|_| KernelBuildError::Service("store gateway lock poisoned".to_owned()))?;
+            let mut handoff_guard = self
+                .store_handoff
+                .lock()
+                .map_err(|_| KernelBuildError::Service("Store handoff lock poisoned".to_owned()))?;
+            let old = gw_guard.replace(Arc::clone(&gateway));
+            *handoff_guard = Some(eliot_kernel_service::StoreBootstrapHandoff {
+                requirement: handoff.requirement.clone(),
+                process_binding: handoff.process_binding.clone(),
+            });
+            Ok::<Option<Arc<KernelStoreGateway>>, KernelBuildError>(old)
+        })() {
+            Ok(old) => old,
+            Err(error) => {
+                let mut svc = self
+                    .service
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = svc.fence_generation(format!("store rebind composition fenced: {error}"));
+                gateway.fence();
+                return Err(error);
+            }
+        };
         attachment.commit();
         if let Some(old) = old_gateway {
             old.fence();

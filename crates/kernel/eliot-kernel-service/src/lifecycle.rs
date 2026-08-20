@@ -592,6 +592,11 @@ impl KernelService {
             });
         }
         if self.store_rebind_receipt.is_some() || self.store_rebind_request_digest.is_some() {
+            if self.store_rebind_receipt.as_ref() == Some(&receipt)
+                && self.store_rebind_request_digest.as_deref() == Some(request_digest.as_str())
+            {
+                return Ok(());
+            }
             return Err(KernelServiceError::InvalidField {
                 field: "store_rebind.operation_id",
                 reason: "Store rebind already consumed for this lineage",
@@ -607,6 +612,22 @@ impl KernelService {
             ));
         }
         Ok(())
+    }
+
+    /// Rolls back an uncommitted Store rebind after a durability failure.
+    pub fn rollback_store_rebind_for_recovery_failure(&mut self) {
+        if self.store_rebind_receipt.is_some() || self.store_rebind_request_digest.is_some() {
+            self.store_rebind_receipt = None;
+            self.store_rebind_request_digest = None;
+            if self.state == KernelServiceState::Degraded
+                && self.failure.as_ref().is_some_and(|f| {
+                    matches!(f, ServiceFailure::Contract(s) if s == "store-rebind:degraded-for-fence")
+                })
+            {
+                let _ = self.transition(KernelServiceState::Ready);
+                self.failure = None;
+            }
+        }
     }
 
     /// Publishes an initial, repeated, or recovery readiness receipt after
