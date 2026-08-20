@@ -50,13 +50,13 @@ use eliot_platform_windows::{
     RetainedProcessPathLease, UserOwnedPathLease, UserOwnedRootLease, WindowsPlatform,
 };
 use eliot_process::{
-    ActionLeaseRef, DispatchAuthorityId, DispatchValidationContext, EnvironmentInheritance,
-    EnvironmentProjection, FencingToken, Generation, ImageId, JobId, KernelDispatchKey,
-    PermitIssuance, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest,
-    ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessLaunchAdmission,
-    ProcessLifecycle, ProcessOwnerBinding, ProcessRequest, ProcessSessionBinding,
-    ProcessStartReceipt, ProcessTreeId, ResourceLimits, SessionId, SuspendedLaunchEvidence,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    ActionLeaseRef, CancellationStatus, DispatchAuthorityId, DispatchValidationContext,
+    EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
+    KernelDispatchKey, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
+    ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor, ProcessIntent,
+    ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
+    ProcessSessionBinding, ProcessStartReceipt, ProcessTreeId, ResourceLimits, SessionId,
+    SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
@@ -89,6 +89,8 @@ const STORE_BRIDGE_ROUTE: &str = "store_bridge";
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 const ELIOTD_RECEIPT_PENDING_DEPENDENCY: &str = "eliotd-process-receipt";
 const ELIOTD_RECEIPT_PENDING_REASON: &str = "exact launched process receipt publication is pending";
+#[cfg(windows)]
+const ELIOTD_MAX_RECOVERY_ATTEMPTS: u64 = 1;
 
 #[cfg(windows)]
 fn observed_session_principal_binding() -> Result<String, KernelBuildError> {
@@ -139,6 +141,36 @@ fn eliotd_operation_id(
         KernelBuildError::Service("eliotd launch attempt identity is malformed".to_owned())
     })?;
     eliot_process::OperationId::new(format!("eliotd-launch-{}-{short}", generation.get()))
+        .map_err(|error| KernelBuildError::Service(error.to_string()))
+}
+
+#[cfg(windows)]
+fn fresh_eliotd_launch_descriptor(
+    previous: &EliotdLaunchDescriptor,
+    recovery_attempt: u64,
+) -> Result<EliotdLaunchDescriptor, KernelBuildError> {
+    previous
+        .validate()
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+    let nonce_material = format!(
+        "{}:{}:{}:{}",
+        previous.descriptor_sha256,
+        previous.launch_nonce.as_str(),
+        recovery_attempt,
+        unix_ms(),
+    );
+    let launch_nonce =
+        PlatformHandle::new(format!("eliotd:{}", sha256_hex(nonce_material.as_bytes())))
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+    let mut next = previous.clone();
+    next.launch_nonce = launch_nonce.clone();
+    if next.arguments.len() != 8 {
+        return Err(KernelBuildError::Service(
+            "eliotd launch descriptor has a non-canonical argv contour".to_owned(),
+        ));
+    }
+    next.arguments[5] = launch_nonce;
+    next.with_computed_digest()
         .map_err(|error| KernelBuildError::Service(error.to_string()))
 }
 
@@ -363,9 +395,17 @@ pub struct KernelComposition {
     process_gateway: Option<Arc<ProcessExecutionGateway>>,
     store_bootstrap: Option<HostStoreBootstrapRequirement>,
     daemon_launch: Option<EliotdLaunchDescriptor>,
+    /// The current immutable launch binding. Recovery replaces this only
+    /// after the previous process effect is known terminal; the original
+    /// Host-approved descriptor remains retained in `daemon_launch`.
+    daemon_active_launch: Mutex<Option<EliotdLaunchDescriptor>>,
     kernel_artifact_sha256: Option<String>,
     daemon_runtime: Mutex<DaemonRuntimeState>,
     daemon_status_changed: tokio::sync::Notify,
+    #[cfg(windows)]
+    daemon_recovery_gate: tokio::sync::Mutex<()>,
+    #[cfg(windows)]
+    daemon_recovery_attempts: AtomicU64,
     #[cfg(windows)]
     store_handoff: Mutex<Option<StoreBootstrapHandoff>>,
     approved_config_hash: Option<String>,
@@ -391,6 +431,7 @@ const fn daemon_status_proves_ready(status: &DaemonRuntimeStatus) -> bool {
 struct DaemonRuntimeState {
     status: DaemonRuntimeStatus,
     receipt: Option<ProcessStartReceipt>,
+    recovery_fenced: bool,
 }
 
 /// Result of the closed Kernel semantic gateway for one authenticated frame.
@@ -2619,13 +2660,19 @@ impl KernelComposition {
             front_door_policy: Mutex::new(policy),
             process_gateway,
             store_bootstrap,
+            daemon_active_launch: Mutex::new(daemon_launch.clone()),
             daemon_launch,
             kernel_artifact_sha256,
             daemon_runtime: Mutex::new(DaemonRuntimeState {
                 status: DaemonRuntimeStatus::NotLaunched,
                 receipt: None,
+                recovery_fenced: false,
             }),
             daemon_status_changed: tokio::sync::Notify::new(),
+            #[cfg(windows)]
+            daemon_recovery_gate: tokio::sync::Mutex::new(()),
+            #[cfg(windows)]
+            daemon_recovery_attempts: AtomicU64::new(0),
             #[cfg(windows)]
             store_handoff: Mutex::new(None),
             approved_config_hash,
@@ -2702,6 +2749,13 @@ impl KernelComposition {
         self.daemon_launch.as_ref()
     }
 
+    fn active_daemon_launch(&self) -> Result<Option<EliotdLaunchDescriptor>, KernelServiceError> {
+        self.daemon_active_launch
+            .lock()
+            .map(|launch| launch.clone())
+            .map_err(|_| KernelServiceError::Platform("daemon launch lock poisoned".to_owned()))
+    }
+
     /// Launches the approved `eliotd` through the existing Kernel process
     /// authority.  Store bootstrap must already be connected; the child is
     /// never spawned from a raw command or an ambient environment.
@@ -2711,9 +2765,12 @@ impl KernelComposition {
         reason = "the launch admission sequence is intentionally contiguous so every authority check precedes the single process start"
     )]
     pub async fn launch_eliotd(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
-        let launch = self.daemon_launch.as_ref().ok_or_else(|| {
-            KernelBuildError::Service("eliotd launch descriptor is required".to_owned())
-        })?;
+        let launch = self
+            .active_daemon_launch()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?
+            .ok_or_else(|| {
+                KernelBuildError::Service("eliotd launch descriptor is required".to_owned())
+            })?;
         launch
             .validate()
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
@@ -2737,7 +2794,7 @@ impl KernelComposition {
         let kernel_process = observe_named_pipe_peer_process(std::process::id())
             .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
         let launch_identity = eliotd_launch_attempt_identity(
-            launch,
+            &launch,
             kernel_process.process_id(),
             kernel_process.start_time_100ns(),
             kernel_process.image_path(),
@@ -2802,7 +2859,7 @@ impl KernelComposition {
             generation,
         )
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-        let proof = Self::retain_eliotd_path_proof(launch, &admission)?;
+        let proof = Self::retain_eliotd_path_proof(&launch, &admission)?;
         {
             let mut state = self.daemon_runtime.lock().map_err(|_| {
                 KernelBuildError::Service("daemon runtime lock poisoned".to_owned())
@@ -2818,13 +2875,8 @@ impl KernelComposition {
             Ok(receipt) => receipt,
             Err(error) => {
                 let reason = format!("eliotd process start failed: {error}");
-                if let Ok(mut state) = self.daemon_runtime.lock() {
-                    state.status = DaemonRuntimeStatus::Failed(reason.clone());
-                }
-                self.daemon_status_changed.notify_one();
-                if let Ok(mut service) = self.service.lock() {
-                    let _ = service.fence_generation(reason);
-                }
+                let unknown_outcome = matches!(&error, ProcessExecutionError::UnknownOutcome);
+                let _ = self.record_daemon_failed(&reason, unknown_outcome);
                 return Err(KernelBuildError::Service(error.to_string()));
             }
         };
@@ -2918,6 +2970,286 @@ impl KernelComposition {
         }
     }
 
+    #[cfg(windows)]
+    async fn close_previous_daemon_process(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        receipt: &ProcessStartReceipt,
+    ) -> Result<(), KernelBuildError> {
+        let gateway = self.process_gateway.as_ref().ok_or_else(|| {
+            KernelBuildError::Service(
+                "process authority is required for eliotd recovery".to_owned(),
+            )
+        })?;
+        receipt
+            .validate()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let generation = Generation::new(launch.generation.value())
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let kernel_process = observe_named_pipe_peer_process(std::process::id())
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+        let launch_identity = eliotd_launch_attempt_identity(
+            launch,
+            kernel_process.process_id(),
+            kernel_process.start_time_100ns(),
+            kernel_process.image_path(),
+        )?;
+        let expected_operation = eliotd_operation_id(generation, &launch_identity)?;
+        if receipt.operation_id() != &expected_operation
+            || receipt.accepted_generation().get() != launch.generation.value()
+            || receipt.binding().state_fence().authority_epoch() != launch.authority_epoch.value()
+            || receipt.binding().state_fence().generation() != generation
+            || receipt.identity().executable_sha256() != launch.executable_sha256
+            || !receipt
+                .identity()
+                .physical()
+                .image_path()
+                .eq_ignore_ascii_case(launch.executable.as_str())
+        {
+            return Err(KernelBuildError::Service(
+                "eliotd recovery refused a stale or substituted process receipt".to_owned(),
+            ));
+        }
+        let kernel_expectation = current_process_named_pipe_expectation()
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+        let owner = ProcessOwnerBinding::new(
+            ACTIVE_DAEMON_CALLER,
+            stable_owner_principal_digest(
+                kernel_expectation.expected_sid(),
+                ACTIVE_DAEMON_CALLER,
+                launch.authority_epoch.value(),
+                generation,
+            ),
+            launch.authority_epoch.value(),
+            generation,
+        )
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let view = match gateway
+            .inspect(&owner, receipt.operation_id().clone())
+            .await
+        {
+            Ok(view) => view,
+            Err(ProcessExecutionError::NotFound | ProcessExecutionError::UnknownOutcome) => {
+                return Err(KernelBuildError::Service(
+                    "eliotd previous process outcome is unknown; recovery is fenced".to_owned(),
+                ));
+            }
+            Err(error) => return Err(KernelBuildError::Service(error.to_string())),
+        };
+        if view.binding() != receipt.binding() || view.identity() != Some(receipt.identity()) {
+            return Err(KernelBuildError::Service(
+                "eliotd previous process inspection does not match its receipt".to_owned(),
+            ));
+        }
+        match view.lifecycle() {
+            ProcessLifecycle::Exited | ProcessLifecycle::Failed | ProcessLifecycle::Reconciled => {
+                Ok(())
+            }
+            ProcessLifecycle::Running => {
+                let cancellation = gateway
+                    .cancel(&owner, receipt.operation_id().clone())
+                    .await
+                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+                if cancellation.binding() != receipt.binding()
+                    || cancellation.status() != CancellationStatus::Completed
+                    || cancellation.lifecycle() != ProcessLifecycle::Exited
+                    || !cancellation.descendants().is_some_and(|descendants| {
+                        descendants.complete() && descendants.tree_terminated()
+                    })
+                {
+                    return Err(KernelBuildError::Service(
+                        "eliotd previous process tree closure was not proven".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            ProcessLifecycle::Created
+            | ProcessLifecycle::Starting
+            | ProcessLifecycle::Cancelling
+            | ProcessLifecycle::UnknownOutcome
+            | ProcessLifecycle::Quarantined => Err(KernelBuildError::Service(
+                "eliotd previous process is not in a known terminal state".to_owned(),
+            )),
+        }
+    }
+
+    /// Performs one Kernel-owned bounded recovery of a failed daemon
+    /// attempt. The old process effect must be known terminal before the
+    /// active descriptor, nonce, and operation identity are replaced.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bounded recovery keeps disposition, fresh binding, and readiness rendezvous ordered"
+    )]
+    pub async fn recover_eliotd(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
+        let _recovery_gate = self.daemon_recovery_gate.lock().await;
+        let service_state = self
+            .service_state()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        if !probe_ready_state_admitted(service_state) {
+            return Err(KernelBuildError::Service(
+                "eliotd recovery requires an admitted Activating, Ready, or Degraded Kernel state"
+                    .to_owned(),
+            ));
+        }
+        let launch = self
+            .active_daemon_launch()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?
+            .ok_or_else(|| {
+                KernelBuildError::Service("eliotd launch descriptor is required".to_owned())
+            })?;
+        let (status, previous_receipt, recovery_fenced) = {
+            let state = self.daemon_runtime.lock().map_err(|_| {
+                KernelBuildError::Service("daemon runtime lock poisoned".to_owned())
+            })?;
+            (
+                state.status.clone(),
+                state.receipt.clone(),
+                state.recovery_fenced,
+            )
+        };
+        if recovery_fenced {
+            return Err(KernelBuildError::Service(
+                "eliotd previous process start has an unknown outcome; recovery is fenced"
+                    .to_owned(),
+            ));
+        }
+        if matches!(status, DaemonRuntimeStatus::Ready) {
+            if let Some(receipt) = previous_receipt {
+                self.validate_daemon_process_readiness(&launch, &receipt)
+                    .await
+                    .map_err(|_| {
+                        KernelBuildError::Service(
+                            "eliotd Ready receipt is no longer physically proven".to_owned(),
+                        )
+                    })?;
+                return Ok(receipt);
+            }
+            return Err(KernelBuildError::Service(
+                "eliotd Ready state has no exact process receipt".to_owned(),
+            ));
+        }
+        if matches!(status, DaemonRuntimeStatus::Launching) && previous_receipt.is_none() {
+            return Err(KernelBuildError::Service(
+                "eliotd launch is still awaiting its process receipt".to_owned(),
+            ));
+        }
+        let attempt = self.daemon_recovery_attempts.fetch_add(1, Ordering::AcqRel);
+        if attempt >= ELIOTD_MAX_RECOVERY_ATTEMPTS {
+            let reason = "eliotd bounded recovery budget is exhausted".to_owned();
+            let _ = self.mark_daemon_failed(reason.clone());
+            return Err(KernelBuildError::Service(reason));
+        }
+        if let Some(receipt) = previous_receipt.as_ref() {
+            if let Err(error) = self.close_previous_daemon_process(&launch, receipt).await {
+                let reason = error.to_string();
+                let _ = self.mark_daemon_failed(reason.clone());
+                return Err(KernelBuildError::Service(reason));
+            }
+        } else if !matches!(
+            status,
+            DaemonRuntimeStatus::NotLaunched | DaemonRuntimeStatus::Failed(_)
+        ) {
+            let reason = "eliotd recovery has no exact prior process disposition".to_owned();
+            let _ = self.mark_daemon_failed(reason.clone());
+            return Err(KernelBuildError::Service(reason));
+        }
+        let next_launch = fresh_eliotd_launch_descriptor(&launch, attempt + 1)?;
+        {
+            let mut policy = self.front_door_policy.lock().map_err(|_| {
+                KernelBuildError::Service("front-door policy lock poisoned".to_owned())
+            })?;
+            if policy.module_generation.generation != next_launch.generation
+                || policy.module_generation.state_fence.authority_epoch
+                    != next_launch.authority_epoch
+            {
+                return Err(KernelBuildError::Service(
+                    "eliotd recovery descriptor has the wrong generation or authority".to_owned(),
+                ));
+            }
+            next_launch
+                .launch_nonce
+                .as_str()
+                .clone_into(&mut policy.launch_nonce);
+        }
+        *self
+            .daemon_active_launch
+            .lock()
+            .map_err(|_| KernelBuildError::Service("daemon launch lock poisoned".to_owned()))? =
+            Some(next_launch);
+        {
+            let mut state = self.daemon_runtime.lock().map_err(|_| {
+                KernelBuildError::Service("daemon runtime lock poisoned".to_owned())
+            })?;
+            state.status = DaemonRuntimeStatus::NotLaunched;
+            state.receipt = None;
+            state.recovery_fenced = false;
+        }
+        self.daemon_status_changed.notify_one();
+        let launched = match self.launch_eliotd().await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let reason = error.to_string();
+                let _ = self.mark_daemon_failed(reason.clone());
+                return Err(KernelBuildError::Service(reason));
+            }
+        };
+        if let Err(error) = self
+            .await_daemon_ready(&launched, self.ipc_limits().operation_timeout)
+            .await
+        {
+            let reason = error.to_string();
+            let _ = self.mark_daemon_failed(reason.clone());
+            return Err(KernelBuildError::Service(reason));
+        }
+        Ok(launched)
+    }
+
+    #[cfg(windows)]
+    async fn ensure_daemon_ready_for_probe(
+        &self,
+    ) -> Result<ProcessStartReceipt, KernelServiceError> {
+        let launch = self
+            .active_daemon_launch()?
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let (status, receipt) = {
+            let state = self.daemon_runtime.lock().map_err(|_| {
+                KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
+            })?;
+            (state.status.clone(), state.receipt.clone())
+        };
+        if let Some(receipt) = receipt.as_ref() {
+            if status == DaemonRuntimeStatus::Ready {
+                if self
+                    .validate_daemon_process_readiness(&launch, receipt)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(receipt.clone());
+                }
+            } else if status == DaemonRuntimeStatus::Running
+                && self
+                    .await_daemon_ready(receipt, self.ipc_limits().operation_timeout)
+                    .await
+                    .is_ok()
+            {
+                self.validate_daemon_process_readiness(&launch, receipt)
+                    .await?;
+                return Ok(receipt.clone());
+            }
+        }
+        let recovered = self
+            .recover_eliotd()
+            .await
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let current_launch = self
+            .active_daemon_launch()?
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        self.validate_daemon_process_readiness(&current_launch, &recovered)
+            .await?;
+        Ok(recovered)
+    }
+
     /// Records an authenticated daemon-ready report after generation checks
     /// have been performed by the front-door dispatcher.
     pub fn mark_daemon_ready(&self) -> Result<(), KernelServiceError> {
@@ -2949,23 +3281,43 @@ impl KernelComposition {
         Ok(())
     }
 
-    /// Records a bounded authenticated daemon fatal disposition and fences
-    /// Kernel normal admission.  Kernel remains the sole lifecycle owner.
-    pub fn mark_daemon_failed(&self, reason: String) -> Result<(), KernelServiceError> {
+    /// Records a bounded authenticated daemon fatal disposition and closes
+    /// normal admission without fencing the generation. Kernel remains the
+    /// sole lifecycle owner and may consume its one fresh recovery attempt.
+    pub fn mark_daemon_failed(&self, reason: impl Into<String>) -> Result<(), KernelServiceError> {
+        let reason = reason.into();
+        self.record_daemon_failed(&reason, false)
+    }
+
+    fn record_daemon_failed(
+        &self,
+        reason: &str,
+        recovery_fenced: bool,
+    ) -> Result<(), KernelServiceError> {
         let mut state = self
             .daemon_runtime
             .lock()
             .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?;
-        if state.receipt.is_none() {
-            return Err(KernelServiceError::ReadinessNotProven);
-        }
-        state.status = DaemonRuntimeStatus::Failed(reason.clone());
+        state.status = DaemonRuntimeStatus::Failed(reason.to_owned());
+        state.recovery_fenced |= recovery_fenced;
         drop(state);
         self.daemon_status_changed.notify_one();
-        self.service
+        let mut service = self
+            .service
             .lock()
-            .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?
-            .fence_generation(reason)
+            .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?;
+        if matches!(
+            service.state(),
+            KernelServiceState::Activating
+                | KernelServiceState::Ready
+                | KernelServiceState::Degraded
+        ) {
+            let reason_handle =
+                PlatformHandle::new(format!("eliotd-failed:{}", sha256_hex(reason.as_bytes())))
+                    .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+            service.apply(KernelControlCommand::Degrade(reason_handle))?;
+        }
+        Ok(())
     }
 
     /// Connects and retains the one Host-approved canonical-store client and
@@ -3133,14 +3485,14 @@ impl KernelComposition {
         client: &eliot_protocol::ClientHello,
     ) -> Result<(), TransportError> {
         let launch = self
-            .daemon_launch
-            .as_ref()
+            .active_daemon_launch()
+            .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::SessionFenced)?;
         let policy = self
             .front_door_policy
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        Self::validate_eliotd_client_binding(launch, &policy, client)?;
+        Self::validate_eliotd_client_binding(&launch, &policy, client)?;
         drop(policy);
         let peer_binding = peer
             .process_binding()
@@ -3206,6 +3558,28 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    fn require_current_daemon_session(&self, session: &Session) -> Result<(), TransportError> {
+        if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER {
+            return Ok(());
+        }
+        let Some(launch) = self
+            .active_daemon_launch()
+            .map_err(|_| TransportError::SessionFenced)?
+        else {
+            return Ok(());
+        };
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if session.accepts_bound(&policy.module_generation, launch.launch_nonce.as_str()) {
+            Ok(())
+        } else {
+            Err(TransportError::SessionFenced)
+        }
+    }
+
+    #[cfg(windows)]
     fn published_daemon_receipt(
         state: &DaemonRuntimeState,
     ) -> Result<ProcessStartReceipt, TransportError> {
@@ -3260,6 +3634,8 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        #[cfg(windows)]
+        self.require_current_daemon_session(session)?;
         if let Some(identity) = &frame.request_identity
             && !session
                 .module_generation
@@ -3477,6 +3853,8 @@ impl KernelComposition {
         if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER {
             return Err(TransportError::SessionFenced);
         }
+        #[cfg(windows)]
+        self.require_current_daemon_session(session)?;
         let result = match operation {
             "snapshot" => self.daemon_snapshot().map(|value| {
                 serde_json::json!({
@@ -3827,7 +4205,7 @@ impl KernelComposition {
 
     #[cfg(windows)]
     async fn validate_authenticated_daemon_ready(&self) -> Result<(), KernelServiceError> {
-        let Some(launch) = self.daemon_launch.as_ref() else {
+        let Some(launch) = self.active_daemon_launch()? else {
             return Ok(());
         };
         let receipt = self
@@ -3837,7 +4215,7 @@ impl KernelComposition {
             .receipt
             .clone()
             .ok_or(KernelServiceError::ReadinessNotProven)?;
-        self.validate_daemon_process_readiness(launch, &receipt)
+        self.validate_daemon_process_readiness(&launch, &receipt)
             .await
     }
 
@@ -4008,19 +4386,12 @@ impl KernelComposition {
                 field: "store_state_fence",
             });
         }
-        let daemon_evidence = if let Some(launch) = self.daemon_launch.as_ref() {
-            let daemon_receipt = {
-                let daemon_state = self.daemon_runtime.lock().map_err(|_| {
-                    KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
-                })?;
-                daemon_state
-                    .receipt
-                    .as_ref()
-                    .filter(|_| daemon_status_proves_ready(&daemon_state.status))
-                    .cloned()
-                    .ok_or(KernelServiceError::ReadinessNotProven)?
-            };
-            self.validate_daemon_process_readiness(launch, &daemon_receipt)
+        let daemon_evidence = if self.active_daemon_launch()?.is_some() {
+            let daemon_receipt = self.ensure_daemon_ready_for_probe().await?;
+            let launch = self
+                .active_daemon_launch()?
+                .ok_or(KernelServiceError::ReadinessNotProven)?;
+            self.validate_daemon_process_readiness(&launch, &daemon_receipt)
                 .await?;
             Some(
                 PlatformHandle::new(format!(
@@ -4208,7 +4579,10 @@ impl KernelComposition {
         };
         #[cfg(windows)]
         if matches!(&request.command, KernelControlCommand::Activate(_))
-            && self.daemon_launch.is_some()
+            && self
+                .active_daemon_launch()
+                .map_err(|_| TransportError::SessionFenced)?
+                .is_some()
         {
             let launched = self
                 .launch_eliotd()
@@ -4634,6 +5008,98 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn recovery_attempt_uses_fresh_nonce_descriptor_and_operation_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-daemon-recovery-attempt-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let original = test_daemon_launch(&root);
+        let first = fresh_eliotd_launch_descriptor(&original, 1).expect("first recovery launch");
+        let second = fresh_eliotd_launch_descriptor(&first, 2).expect("second recovery launch");
+        first.validate().expect("first descriptor remains exact");
+        second.validate().expect("second descriptor remains exact");
+        assert_ne!(original.launch_nonce, first.launch_nonce);
+        assert_ne!(first.launch_nonce, second.launch_nonce);
+        assert_eq!(first.arguments[5], first.launch_nonce);
+        assert_eq!(second.arguments[5], second.launch_nonce);
+        let first_identity = eliotd_launch_attempt_identity(&first, 41_001, 9_001, "kernel.exe")
+            .expect("first launch identity");
+        let second_identity = eliotd_launch_attempt_identity(&second, 41_001, 9_001, "kernel.exe")
+            .expect("second launch identity");
+        let first_operation = eliotd_operation_id(
+            Generation::new(first.generation.value()).expect("generation"),
+            &first_identity,
+        )
+        .expect("first operation");
+        let second_operation = eliotd_operation_id(
+            Generation::new(second.generation.value()).expect("generation"),
+            &second_identity,
+        )
+        .expect("second operation");
+        assert_ne!(first_operation, second_operation);
+        assert_eq!(first.authority_epoch, original.authority_epoch);
+        assert_eq!(first.generation, original.generation);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_nonce_rotation_fences_stale_daemon_sessions() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-daemon-recovery-session-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let original = test_daemon_launch(&root);
+        let kernel = KernelComposition::new(
+            KernelConfig::new(&root)
+                .with_daemon_launch(original.clone())
+                .with_kernel_artifact_sha256("c".repeat(64)),
+        )
+        .expect("kernel composition");
+        let policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy")
+            .clone();
+        let stale = Session {
+            connection_id: "stale-eliotd-session".to_owned(),
+            protocol_version: policy.protocol_range.maximum,
+            peer: PeerIdentity::Unavailable {
+                reason: eliot_ipc::PeerIdentityUnavailable::ProviderProofNotComposed,
+            },
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.value(),
+            module_generation: policy.module_generation.clone(),
+            launch_nonce: policy.launch_nonce.clone(),
+            capabilities: policy.allowed_capabilities.clone(),
+            privacy_classes: policy.allowed_privacy_classes.clone(),
+            effects: policy.allowed_effects.clone(),
+            session_epoch: 1,
+            state: eliot_ipc::SessionState::Open,
+        };
+        kernel
+            .require_current_daemon_session(&stale)
+            .expect("original session binding is current");
+        let next = fresh_eliotd_launch_descriptor(&original, 1).expect("fresh recovery launch");
+        *kernel
+            .daemon_active_launch
+            .lock()
+            .expect("active launch lock") = Some(next.clone());
+        kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy")
+            .launch_nonce = next.launch_nonce.as_str().to_owned();
+        assert!(matches!(
+            kernel.require_current_daemon_session(&stale),
+            Err(TransportError::SessionFenced)
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn production_handshake_policy_binds_observed_current_process_principal() {
         let root = std::env::temp_dir().join(format!(
             "eliot-kernel-observed-principal-{}",
@@ -4989,6 +5455,7 @@ mod tests {
         let mut state = DaemonRuntimeState {
             status: DaemonRuntimeStatus::Launching,
             receipt: None,
+            recovery_fenced: false,
         };
         assert!(matches!(
             KernelComposition::published_daemon_receipt(&state),

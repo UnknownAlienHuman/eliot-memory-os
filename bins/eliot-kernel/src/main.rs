@@ -279,6 +279,10 @@ async fn main() {
 }
 
 #[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "authenticated front-door receive, handshake, and control dispatch stay ordered"
+)]
 async fn serve_connection(
     kernel: Arc<KernelComposition>,
     mut front_door: NamedPipeServer,
@@ -293,7 +297,14 @@ async fn serve_connection(
     let connection_id = client_frame.connection_id.clone();
     let peer = front_door.peer_identity().clone();
     if decode_control_request_frame(&client_frame).is_ok() {
-        return serve_control_connection(kernel, front_door, shutdown, client_frame, peer).await;
+        return Box::pin(serve_control_connection(
+            kernel,
+            front_door,
+            shutdown,
+            client_frame,
+            peer,
+        ))
+        .await;
     }
     let client = match decode_client_hello_frame_unbound(&client_frame) {
         Ok(client) => client,
