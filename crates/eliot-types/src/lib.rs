@@ -332,7 +332,11 @@ pub use runtime::{
     RuntimeModulesConfig, RuntimeStatusReport, SchemaRef, ServiceHealthState, ServiceRuntimeStatus,
 };
 pub use runtime_supervision::{
-    AdapterCircuitState, OPERATION_RESTART_WINDOW_SCHEMA_VERSION,
+    AdapterCircuitState, DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION, DescendantFileIdentity,
+    DescendantProcessSnapshot, DescendantsAtRootExit, DescendantsAtRootExitCaptured,
+    DescendantsAtRootExitFailed, DescendantsCaptureErrorKind, MAX_DESCENDANT_DETAIL_CHARS,
+    MAX_DESCENDANT_IMAGE_PATH_CHARS, MAX_DESCENDANT_IMAGE_SHA256_CHARS,
+    MAX_DESCENDANTS_AT_ROOT_EXIT, OPERATION_RESTART_WINDOW_SCHEMA_VERSION,
     OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION, OperationCancellationState, OperationPhase,
     OperationReconciliationState, OperationRestartWindow, OperationRuntimeCheckpoint,
     ProcessReapReceipt, ProviderDispatchState, RUNTIME_INTEGRITY_REPORT_SCHEMA_VERSION,

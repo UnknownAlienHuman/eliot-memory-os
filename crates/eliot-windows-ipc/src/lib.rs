@@ -97,6 +97,19 @@ pub struct FileIdentity {
     pub file_index: u64,
 }
 
+/// Verified current Job Object member bound to a retained process handle.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CurrentJobProcessSnapshot {
+    /// Windows process identifier observed while member of the Job.
+    pub pid: u32,
+    /// Creation FILETIME ticks queried through the retained handle.
+    pub start_ticks: u64,
+    /// Canonical image path returned by the retained handle at open time.
+    pub image: PathBuf,
+    /// Stable file identity of the executable bound to the retained image handle.
+    pub file_identity: FileIdentity,
+}
+
 /// A read-only file authority held open without write or delete sharing.
 ///
 /// The handle prevents replacement or mutation of the named file while trusted
@@ -1389,6 +1402,78 @@ impl SuspendedJobChild {
         processes.sort();
         processes.dedup();
         Ok(processes)
+    }
+
+    /// Enumerates the exact current members of the Job Object through the retained Job handle.
+    ///
+    /// Each entry is verified through a retained process handle that captures PID, start
+    /// ticks, canonical image path and stable file identity. No historical observer
+    /// snapshot is used. PID 0 is rejected, duplicates are treated as errors, and any
+    /// access-denied or enumeration failure is returned as an explicit error so the
+    /// caller cannot report an authoritative empty snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Windows cannot query the Job, open a member process, or
+    /// verify its image identity. Callers must surface this error as explicit typed
+    /// capture failure rather than an empty snapshot.
+    pub fn current_job_processes(&self) -> io::Result<Vec<CurrentJobProcessSnapshot>> {
+        let pids = job_process_ids(self.job.0)?;
+        if pids.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Job Object returned PID 0",
+            ));
+        }
+        let mut snapshots = Vec::with_capacity(pids.len());
+        for pid in pids {
+            let snapshot = Self::open_current_process_snapshot(pid)?;
+            if snapshots
+                .iter()
+                .any(|existing: &CurrentJobProcessSnapshot| existing.pid == snapshot.pid)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("duplicate PID {pid} in Job Object enumeration"),
+                ));
+            }
+            snapshots.push(snapshot);
+        }
+        snapshots.sort_by_key(|entry| entry.pid);
+        let current_ids = job_process_ids(self.job.0)?;
+        if current_ids.len() != snapshots.len()
+            || !current_ids
+                .iter()
+                .all(|pid| snapshots.iter().any(|entry| &entry.pid == pid))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Job Object membership changed between enumeration and identity capture",
+            ));
+        }
+        Ok(snapshots)
+    }
+
+    fn open_current_process_snapshot(pid: u32) -> io::Result<CurrentJobProcessSnapshot> {
+        if pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PID must be non-zero",
+            ));
+        }
+        // SAFETY: numeric PID is used only to resolve a process handle.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        let process = OwnedHandle::new(process)?;
+        let image = query_process_image(process.0)?;
+        let start_ticks = process_start_ticks(process.0)?;
+        let image_file = PinnedFile::open(&image)?;
+        let file_identity = image_file.identity();
+        Ok(CurrentJobProcessSnapshot {
+            pid,
+            start_ticks,
+            image,
+            file_identity,
+        })
     }
 
     /// Returns the number of processes currently assigned to the Job Object.

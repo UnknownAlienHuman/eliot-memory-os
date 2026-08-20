@@ -4,6 +4,8 @@ use eliot_engine::{
     runtime_supervision::{AdapterExecutionContext, CancellationToken},
 };
 use eliot_types::{
+    DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION, DescendantFileIdentity, DescendantProcessSnapshot,
+    DescendantsAtRootExit, DescendantsAtRootExitFailed, DescendantsCaptureErrorKind,
     OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION, OperationCancellationState, OperationPhase,
     OperationReconciliationState, OperationRuntimeCheckpoint, ProcessReapReceipt,
     ProviderDispatchState, ProviderTimeoutClass, ProviderTimeoutProfile,
@@ -609,6 +611,22 @@ pub async fn recover_stale_job_objects(
                 forced_termination,
                 empty,
             } => {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let descendants_at_root_exit = DescendantsAtRootExit::failed(
+                    checkpoint.root_pid,
+                    None,
+                    elapsed_ms,
+                    DescendantsCaptureErrorKind::EnumerationFailed,
+                    "startup recovery: no live root-exit descendant capture",
+                )
+                .unwrap_or(DescendantsAtRootExit::Failed(DescendantsAtRootExitFailed {
+                    schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
+                    root_pid: checkpoint.root_pid,
+                    root_exit_code: None,
+                    capture_elapsed_ms: elapsed_ms,
+                    error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
+                    detail: "startup recovery".to_owned(),
+                }));
                 let receipt = ProcessReapReceipt {
                     operation_id: checkpoint.operation_id.clone(),
                     generation: checkpoint.generation,
@@ -621,8 +639,9 @@ pub async fn recover_stale_job_objects(
                     stdout_closed: empty,
                     stderr_closed: empty,
                     all_tasks_joined: empty,
-                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    elapsed_ms,
                     terminal_error_codes: Vec::new(),
+                    descendants_at_root_exit,
                 };
                 checkpoint.active_process_count = process_count_after;
                 checkpoint.cancellation_state = if receipt.proves_complete_reap() {
@@ -654,6 +673,22 @@ pub async fn recover_stale_job_objects(
                 receipts.push(receipt);
             }
             StartupProcessRecovery::VerifiedRootReaped { job_name, root_pid } => {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let descendants_at_root_exit = DescendantsAtRootExit::failed(
+                    Some(root_pid),
+                    None,
+                    elapsed_ms,
+                    DescendantsCaptureErrorKind::EnumerationFailed,
+                    "startup recovery: verified root without live descendant capture",
+                )
+                .unwrap_or(DescendantsAtRootExit::Failed(DescendantsAtRootExitFailed {
+                    schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
+                    root_pid: Some(root_pid),
+                    root_exit_code: None,
+                    capture_elapsed_ms: elapsed_ms,
+                    error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
+                    detail: "startup recovery".to_owned(),
+                }));
                 let receipt = ProcessReapReceipt {
                     operation_id: checkpoint.operation_id.clone(),
                     generation: checkpoint.generation,
@@ -666,8 +701,9 @@ pub async fn recover_stale_job_objects(
                     stdout_closed: true,
                     stderr_closed: true,
                     all_tasks_joined: true,
-                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    elapsed_ms,
                     terminal_error_codes: Vec::new(),
+                    descendants_at_root_exit,
                 };
                 checkpoint.active_process_count = 0;
                 checkpoint.cancellation_state = eliot_types::OperationCancellationState::Reaped;
@@ -1149,8 +1185,59 @@ fn run_worker(
     let mut cancellation_seen_at = None;
     let mut exit_code = None;
     let mut process_exit_at = None;
+    let mut descendants_at_root_exit: Option<DescendantsAtRootExit> = None;
 
     loop {
+        if descendants_at_root_exit.is_none() {
+            match child.try_wait() {
+                Ok(Some(code)) => {
+                    let elapsed_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let snapshot =
+                        capture_descendants_at_root_exit(&child, root_pid, Some(code), elapsed_ms);
+                    descendants_at_root_exit = Some(snapshot);
+                    if process_exit_at.is_none() {
+                        process_exit_at = Some(OffsetDateTime::now_utc());
+                    }
+                    if exit_code.is_none() {
+                        exit_code = Some(code);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let elapsed_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let detail = format!("root wait failed: {error}");
+                    let truncated = if detail.chars().count() > 512 {
+                        detail.chars().take(512).collect::<String>()
+                    } else {
+                        detail
+                    };
+                    let snapshot = DescendantsAtRootExit::failed(
+                        Some(root_pid),
+                        None,
+                        elapsed_ms,
+                        DescendantsCaptureErrorKind::EnumerationFailed,
+                        truncated,
+                    )
+                    .unwrap_or(DescendantsAtRootExit::Failed(
+                        DescendantsAtRootExitFailed {
+                            schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
+                            root_pid: Some(root_pid),
+                            root_exit_code: None,
+                            capture_elapsed_ms: elapsed_ms,
+                            error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
+                            detail: "root wait failed".to_owned(),
+                        },
+                    ));
+                    descendants_at_root_exit = Some(snapshot);
+                    record_worker_error(
+                        &mut worker_error,
+                        format!("query supervised root process exit: {error}"),
+                    );
+                }
+            }
+        }
         match child.active_process_count() {
             Ok(count) => {
                 max_process_count = max_process_count.max(count);
@@ -1248,6 +1335,28 @@ fn run_worker(
         }
     }
     let exit_waiter_terminal = exit_code.is_some();
+    if descendants_at_root_exit.is_none() {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let snapshot = capture_descendants_at_root_exit(&child, root_pid, exit_code, elapsed_ms);
+        descendants_at_root_exit = Some(snapshot);
+    }
+    let descendants_at_root_exit = descendants_at_root_exit.unwrap_or_else(|| {
+        DescendantsAtRootExit::failed(
+            Some(root_pid),
+            exit_code,
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            DescendantsCaptureErrorKind::EnumerationFailed,
+            "descendant capture unavailable",
+        )
+        .unwrap_or(DescendantsAtRootExit::Failed(DescendantsAtRootExitFailed {
+            schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
+            root_pid: Some(root_pid),
+            root_exit_code: exit_code,
+            capture_elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
+            detail: "descendant capture unavailable".to_owned(),
+        }))
+    });
     let observed_processes = child.observed_processes();
     max_process_count =
         max_process_count.max(u32::try_from(observed_processes.len()).unwrap_or(u32::MAX));
@@ -1284,6 +1393,7 @@ fn run_worker(
             && exit_waiter_terminal,
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         terminal_error_codes,
+        descendants_at_root_exit,
     };
     if receipt.proves_complete_reap() {
         cancellation.mark_reaped();
@@ -1352,6 +1462,116 @@ fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[allow(clippy::too_many_lines)]
+fn capture_descendants_at_root_exit(
+    child: &SuspendedJobChild,
+    root_pid: u32,
+    root_exit_code: Option<i32>,
+    capture_elapsed_ms: u64,
+) -> DescendantsAtRootExit {
+    match child.current_job_processes() {
+        Ok(snapshots) => {
+            let mut descendants = Vec::new();
+            for snapshot in snapshots {
+                if snapshot.pid == root_pid {
+                    continue;
+                }
+                let image_path = snapshot.image.to_string_lossy().to_string();
+                let image_sha256 = sha256_file(&snapshot.image)
+                    .ok()
+                    .filter(|hash| hash.chars().count() <= 128 && !hash.is_empty());
+                descendants.push(DescendantProcessSnapshot {
+                    pid: snapshot.pid,
+                    start_ticks: snapshot.start_ticks,
+                    image_path,
+                    file_identity: DescendantFileIdentity {
+                        volume_serial_number: snapshot.file_identity.volume_serial_number,
+                        file_index: snapshot.file_identity.file_index,
+                    },
+                    image_sha256,
+                });
+            }
+            match DescendantsAtRootExit::captured(
+                root_pid,
+                root_exit_code,
+                capture_elapsed_ms,
+                descendants,
+            ) {
+                Ok(captured) => captured,
+                Err(detail) => {
+                    let kind = if detail.contains("overflow") {
+                        DescendantsCaptureErrorKind::Overflow
+                    } else if detail.contains("duplicate") {
+                        DescendantsCaptureErrorKind::Duplicate
+                    } else if detail.contains("pid must be non-zero") || detail.contains("PID 0") {
+                        DescendantsCaptureErrorKind::InvalidPid
+                    } else if detail.contains("equals root") {
+                        DescendantsCaptureErrorKind::Duplicate
+                    } else {
+                        DescendantsCaptureErrorKind::EnumerationFailed
+                    };
+                    let truncated = if detail.chars().count() > 512 {
+                        detail.chars().take(512).collect::<String>()
+                    } else {
+                        detail
+                    };
+                    DescendantsAtRootExit::failed(
+                        Some(root_pid),
+                        root_exit_code,
+                        capture_elapsed_ms,
+                        kind,
+                        truncated.clone(),
+                    )
+                    .unwrap_or(DescendantsAtRootExit::Failed(
+                        DescendantsAtRootExitFailed {
+                            schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
+                            root_pid: Some(root_pid),
+                            root_exit_code,
+                            capture_elapsed_ms,
+                            error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
+                            detail: truncated,
+                        },
+                    ))
+                }
+            }
+        }
+        Err(error) => {
+            let kind = match error.kind() {
+                std::io::ErrorKind::PermissionDenied => DescendantsCaptureErrorKind::AccessDenied,
+                std::io::ErrorKind::WouldBlock => DescendantsCaptureErrorKind::Ambiguous,
+                std::io::ErrorKind::InvalidData if error.to_string().contains("duplicate") => {
+                    DescendantsCaptureErrorKind::Duplicate
+                }
+                std::io::ErrorKind::InvalidData if error.to_string().contains("PID 0") => {
+                    DescendantsCaptureErrorKind::InvalidPid
+                }
+                _ => DescendantsCaptureErrorKind::EnumerationFailed,
+            };
+            let detail = error.to_string();
+            let detail = if detail.chars().count() > 512 {
+                detail.chars().take(512).collect::<String>()
+            } else {
+                detail
+            };
+            DescendantsAtRootExit::failed(
+                Some(root_pid),
+                root_exit_code,
+                capture_elapsed_ms,
+                kind,
+                detail.clone(),
+            )
+            .unwrap_or(DescendantsAtRootExit::Failed(DescendantsAtRootExitFailed {
+                schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
+                root_pid: Some(root_pid),
+                root_exit_code,
+                capture_elapsed_ms,
+                error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
+                detail,
+            }))
+        }
+    }
 }
 
 fn job_object_name(operation_id: &str, generation: u64) -> String {
@@ -1552,6 +1772,7 @@ fn send_progress(sender: &mpsc::UnboundedSender<ProcessProgress>, progress: Proc
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::{
         ChildCriticality, ProcessRestartPolicy, RestartStrategy, ScriptedProviderProcessRunner,
         SupervisedChildKind, SupervisedProcessSpec, SupervisedWindowsProcessRunner,
@@ -1846,6 +2067,13 @@ mod tests {
                 all_tasks_joined: true,
                 elapsed_ms: 1,
                 terminal_error_codes: Vec::new(),
+                descendants_at_root_exit: eliot_types::DescendantsAtRootExit::captured(
+                    41,
+                    Some(0),
+                    1,
+                    Vec::new(),
+                )
+                .unwrap(),
             },
         }]);
         let spec = ProviderProcessSpec {
@@ -1990,6 +2218,101 @@ mod tests {
                 .any(|window| window == b"{\"status\":\"complete\"}")
         );
         assert!(output.reap_receipt.proves_complete_reap());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn descendant_snapshot_at_root_exit_is_authoritative() -> Result<()> {
+        let mut spec = fixture_spec("descendant-handles", 5_000)?;
+        spec.operation_id = format!(
+            "{}-snap-{}-{:?}",
+            spec.operation_id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::thread::current().id()
+        );
+        spec.stdin_payload = Some(Vec::new());
+        spec.timeout_profile = eliot_types::ProviderRoutePolicy::for_route(
+            eliot_types::AgentHostId::Codex,
+            "descendant-snapshot-fixture",
+            eliot_types::ProviderDeclaredBudget::new(5_000, 32 * 1024)
+                .with_spawn_deadline_ms(Some(1_000))
+                .with_first_output_deadline_ms(None)
+                .with_cancellation_grace_ms(20)
+                .with_cleanup_grace_ms(2_000)
+                .with_reconciliation_window_ms(0),
+        )
+        .timeout_profile()
+        .clone();
+        let output = run_supervised_process(spec, context(5_000)).await?;
+        assert!(output.reap_receipt.proves_complete_reap());
+        assert_eq!(output.reap_receipt.process_count_after, 0);
+        match &output.reap_receipt.descendants_at_root_exit {
+            eliot_types::DescendantsAtRootExit::Captured(captured) => {
+                let root_pid = output.reap_receipt.root_pid.expect("root pid");
+                assert_eq!(captured.root_pid, root_pid);
+                assert!(!captured.descendants.is_empty());
+                assert!(
+                    captured
+                        .descendants
+                        .iter()
+                        .all(|entry| entry.pid != root_pid)
+                );
+                assert!(captured.descendants.iter().all(|entry| entry.pid != 0));
+                for entry in &captured.descendants {
+                    assert!(!entry.image_path.is_empty());
+                    assert!(entry.start_ticks != 0);
+                    assert!(
+                        entry.file_identity.file_index != 0
+                            || entry.file_identity.volume_serial_number != 0
+                    );
+                    if let Some(sha) = &entry.image_sha256 {
+                        assert_eq!(sha.len(), 64);
+                    }
+                }
+                let mut sorted = captured.descendants.clone();
+                sorted.sort_by_key(|entry| entry.pid);
+                assert_eq!(sorted, captured.descendants);
+            }
+            eliot_types::DescendantsAtRootExit::Failed(failed) => {
+                panic!("expected captured descendants, got failed {failed:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn no_descendant_snapshot_is_authoritative_empty() -> Result<()> {
+        let mut spec = fixture_spec("antigravity-executor", 5_000)?;
+        spec.operation_id = format!(
+            "{}-empty-{}-{:?}",
+            spec.operation_id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::thread::current().id()
+        );
+        spec.stdin_payload = Some(Vec::new());
+        let output = run_supervised_process(spec, context(5_000)).await?;
+        assert!(output.reap_receipt.proves_complete_reap());
+        assert_eq!(output.reap_receipt.process_count_after, 0);
+        match &output.reap_receipt.descendants_at_root_exit {
+            eliot_types::DescendantsAtRootExit::Captured(captured) => {
+                assert!(captured.descendants.is_empty());
+                assert_eq!(
+                    captured.root_pid,
+                    output.reap_receipt.root_pid.expect("root pid")
+                );
+            }
+            eliot_types::DescendantsAtRootExit::Failed(failed) => {
+                panic!("expected empty captured, got failed {failed:?}");
+            }
+        }
         Ok(())
     }
 }

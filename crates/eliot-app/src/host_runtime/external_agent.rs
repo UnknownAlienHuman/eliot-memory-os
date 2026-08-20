@@ -1553,6 +1553,7 @@ struct McpSmokePreparation {
 }
 
 #[allow(
+    clippy::large_futures,
     clippy::too_many_lines,
     reason = "the bounded preparation keeps phase attribution and canonical identity setup together"
 )]
@@ -1669,6 +1670,7 @@ async fn prepare_mcp_smoke(
     result
 }
 
+#[allow(clippy::large_futures)]
 async fn run_mcp_preflight(config_path: &Path, host: AgentHostId, model: &str) -> Result<Value> {
     let preparation = prepare_mcp_smoke(config_path, host, model).await?;
     let report_path = runtime_root(config_path)
@@ -1778,7 +1780,7 @@ fn memory_revision_within_execution_window(
     observed_revision >= preflight_revision && observed_revision <= postflight_revision
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::large_futures, clippy::too_many_lines)]
 async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Result<Value> {
     let McpSmokePreparation {
         smoke_id,
@@ -4382,11 +4384,13 @@ mod mcp_smoke_tests {
 
 #[cfg(test)]
 mod provider_runtime_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::host_runtime::supervised_process::ScriptedProviderProcessRunner;
     use eliot_types::{
-        AdapterContext, AgentSessionId, HostLaunchContract, ProcessReapReceipt,
-        ProviderDeclaredBudget, ProviderRoutePolicy, ReceiptId, WorkItemId, WorkLeaseId, WriteId,
+        AdapterContext, AgentSessionId, DescendantsAtRootExit, HostLaunchContract,
+        ProcessReapReceipt, ProviderDeclaredBudget, ProviderRoutePolicy, ReceiptId, WorkItemId,
+        WorkLeaseId, WriteId,
     };
 
     #[derive(Default)]
@@ -4572,6 +4576,13 @@ mod provider_runtime_tests {
                 all_tasks_joined: true,
                 elapsed_ms: 20,
                 terminal_error_codes: Vec::new(),
+                descendants_at_root_exit: DescendantsAtRootExit::captured(
+                    42_424,
+                    Some(0),
+                    20,
+                    Vec::new(),
+                )
+                .unwrap(),
             },
         }
     }

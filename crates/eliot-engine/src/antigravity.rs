@@ -4897,10 +4897,12 @@ mod security_tests {
         assert!(protocol.candidate_final_line_exact);
     }
 
+    #[allow(clippy::unwrap_used)]
     struct RecordedRedactionRunner {
         malformed_output: bool,
     }
 
+    #[allow(clippy::unwrap_used)]
     impl ProviderProcessRunner for RecordedRedactionRunner {
         fn run<'a>(
             &'a self,
@@ -4983,6 +4985,13 @@ mod security_tests {
                         all_tasks_joined: true,
                         elapsed_ms: 1,
                         terminal_error_codes: Vec::new(),
+                        descendants_at_root_exit: eliot_types::DescendantsAtRootExit::captured(
+                            42,
+                            Some(0),
+                            1,
+                            Vec::new(),
+                        )
+                        .unwrap(),
                     },
                 })
             })

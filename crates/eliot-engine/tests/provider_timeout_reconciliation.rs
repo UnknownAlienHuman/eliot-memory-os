@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -10,10 +11,10 @@ use eliot_engine::{
     ProviderRouteReadinessService,
 };
 use eliot_types::{
-    ExternalResultCompletenessReceipt, ProcessReapReceipt, ProviderIdentityCheck,
-    ProviderInvocationAttempt, ProviderInvocationOutcomeClass, ProviderInvocationState,
-    ProviderReconciliationMethod, ProviderResultCompleteness, ProviderRouteReadinessVerdict,
-    ProviderTimeoutClass,
+    DescendantsAtRootExit, ExternalResultCompletenessReceipt, ProcessReapReceipt,
+    ProviderIdentityCheck, ProviderInvocationAttempt, ProviderInvocationOutcomeClass,
+    ProviderInvocationState, ProviderReconciliationMethod, ProviderResultCompleteness,
+    ProviderRouteReadinessVerdict, ProviderTimeoutClass,
 };
 use time::OffsetDateTime;
 
@@ -757,6 +758,8 @@ fn complete_reap_receipt() -> ProcessReapReceipt {
         all_tasks_joined: true,
         elapsed_ms: 45,
         terminal_error_codes: Vec::new(),
+        descendants_at_root_exit: DescendantsAtRootExit::captured(42, Some(0), 45, Vec::new())
+            .unwrap(),
     }
 }
 
