@@ -10,6 +10,7 @@ use eliot_runtime_contracts::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::model::store_rebind_transition;
 use crate::*;
 
 fn h(value: &str) -> PlatformHandle {
@@ -75,6 +76,30 @@ fn operation(id: &str) -> IdempotencyIdentity {
     IdempotencyIdentity {
         operation_id: h(id),
         idempotency_key: h(&format!("key-{id}")),
+    }
+}
+
+fn store_rebind_record(state: StoreRebindState) -> StoreRebindRecord {
+    let host = host(1);
+    let activation_generation = step("activation-lineage", 1);
+    let request_digest = digest_handle('a');
+    StoreRebindRecord {
+        fence: fence(&host, &activation_generation),
+        operation: operation("store-rebind-operation"),
+        state,
+        operation_id: h("store-rebind-operation-id"),
+        request_digest: request_digest.clone(),
+        requirement: digest_handle('b'),
+        candidate_binding_digest: digest_handle('c'),
+        store_fence: digest_handle('d'),
+        process_id: 42,
+        process_start_time_100ns: 100,
+        process_image_path: h(r"C:Eliotstore.exe"),
+        job_name: h(r"Local\Eliot-Store"),
+        generation: 1,
+        authority_epoch: 1,
+        receipt_request_digest: (state == StoreRebindState::Committed).then_some(request_digest),
+        receipt_store_fence: (state == StoreRebindState::Committed).then_some(digest_handle('d')),
     }
 }
 
@@ -2839,4 +2864,25 @@ fn journal_service_facade_delegates_to_the_single_journal_owner() {
         ))
         .unwrap_or_else(|error| panic!("service append failed: {error}"));
     assert_eq!(service.snapshot().unwrap().sequence, 1);
+}
+
+#[test]
+fn store_rebind_pending_has_durable_terminal_dispositions_and_exact_commit_recovery() {
+    let pending = store_rebind_record(StoreRebindState::Pending);
+    let unknown = StoreRebindRecord {
+        state: StoreRebindState::Unknown,
+        ..pending.clone()
+    };
+    let aborted = StoreRebindRecord {
+        state: StoreRebindState::Aborted,
+        ..unknown.clone()
+    };
+    let committed = store_rebind_record(StoreRebindState::Committed);
+
+    assert!(store_rebind_transition(None, &pending).is_ok());
+    assert!(store_rebind_transition(Some(&pending), &unknown).is_ok());
+    assert!(store_rebind_transition(Some(&unknown), &aborted).is_ok());
+    assert!(store_rebind_transition(Some(&unknown), &committed).is_ok());
+    assert!(store_rebind_transition(Some(&committed), &unknown).is_err());
+    assert!(store_rebind_transition(None, &aborted).is_err());
 }

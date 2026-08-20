@@ -1487,6 +1487,14 @@ impl EpochRetirementRecord {
 pub enum StoreRebindState {
     Pending,
     Committed,
+    /// The exact operation was reconciled as not committed.  This is a
+    /// terminal disposition and permits a fresh operation with a new
+    /// identity while retaining the old request for audit/retry binding.
+    Aborted,
+    /// The operation outcome could not be proven either way.  This is a
+    /// durable recovery disposition; callers must retry the exact operation
+    /// identity/query before starting a fresh rebind.
+    Unknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1565,6 +1573,13 @@ impl StoreRebindRecord {
                     ));
                 }
             }
+            StoreRebindState::Aborted | StoreRebindState::Unknown => {
+                if self.receipt_request_digest.is_some() || self.receipt_store_fence.is_some() {
+                    return Err(JournalError::Invalid(
+                        "terminal store rebind disposition must not carry receipt".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1583,8 +1598,16 @@ pub(crate) fn store_rebind_transition(
         }
         let legal = matches!(
             (current.state, next.state),
-            (StoreRebindState::Pending, StoreRebindState::Committed)
-        );
+            (
+                StoreRebindState::Pending,
+                StoreRebindState::Committed | StoreRebindState::Aborted | StoreRebindState::Unknown
+            ) | (
+                StoreRebindState::Unknown,
+                StoreRebindState::Committed | StoreRebindState::Aborted
+            )
+        ) || (current.state == StoreRebindState::Unknown
+            && next.state == StoreRebindState::Unknown
+            && current.operation == next.operation);
         if !legal {
             return Err(illegal("store_rebind", current.state, next.state));
         }

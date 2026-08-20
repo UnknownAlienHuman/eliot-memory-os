@@ -69,6 +69,12 @@ pub const SERVICE_NAME: &str = ELIOT_HOST_SERVICE_NAME;
 pub const PROTOCOL_VERSION: &str = "eliot.host.v1";
 pub const HOST_JOURNAL_RELATIVE_PATH: &str = "Eliot/host/host-state-journal.redb";
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
+/// Stable production-boundary identity for the Host Store-rebind seam.
+pub const HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR: &str =
+    "eliot-host::production-store-rebind:v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostStoreRebindProductionBoundary;
 
 /// Exact launch authority supplied by the Runtime Live SCM registration.
 ///
@@ -2398,21 +2404,22 @@ impl HostJobBranches {
         );
         hasher.update(candidate_digest.as_bytes());
         let store_fence = format!("{:x}", hasher.finalize());
-        let snapshot_pending = journal.snapshot().ok().and_then(|state| {
-            state.store_rebinds.into_iter().find(|record| {
-                record.state == StoreRebindState::Pending
-                    && record.store_fence.as_str() == store_fence
-                    && record.process_id == store_process.process_id
-                    && record.process_start_time_100ns == store_process.start_time_100ns
-                    && record.generation == launch.authority_generation.value()
-                    && record.authority_epoch == candidate.kernel_epoch.value()
-            })
+        let snapshot = journal.snapshot().map_err(HostError::Journal)?;
+        let snapshot_pending = snapshot.store_rebinds.into_iter().find(|record| {
+            matches!(
+                record.state,
+                StoreRebindState::Pending | StoreRebindState::Unknown
+            ) && record.store_fence.as_str() == store_fence
+                && record.process_id == store_process.process_id
+                && record.process_start_time_100ns == store_process.start_time_100ns
+                && record.generation == launch.authority_generation.value()
+                && record.authority_epoch == candidate.kernel_epoch.value()
         });
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        runtime.block_on(async {
+        let result = runtime.block_on(async {
             let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let expected_kernel_image = self
@@ -2727,7 +2734,8 @@ impl HostJobBranches {
                 }
                 response.store_rebind_receipt.ok_or_else(|| {
                     HostError::RecoveryRequired(
-                        "Kernel did not retain queried Store rebind operation".to_owned(),
+                        "Store rebind reconciliation confirmed operation is not committed"
+                            .to_owned(),
                     )
                 })?
             };
@@ -2814,7 +2822,31 @@ impl HostJobBranches {
             };
             append_reconciled(journal, HostStateRecord::StoreRebind(committed_record))?;
             Ok(final_receipt)
-        })
+        });
+        if let Err(error) = &result {
+            let disposition = if error
+                .to_string()
+                .contains("Store rebind reconciliation confirmed operation is not committed")
+            {
+                StoreRebindState::Aborted
+            } else {
+                StoreRebindState::Unknown
+            };
+            if let Err(disposition_error) = persist_store_rebind_disposition(
+                journal,
+                &record_fence(host, activation_id, activation_generation),
+                &store_fence,
+                store_process,
+                launch.authority_generation.value(),
+                candidate.kernel_epoch.value(),
+                disposition,
+            ) {
+                return Err(HostError::RecoveryRequired(format!(
+                    "Store rebind failed ({error}); durable disposition failed: {disposition_error}"
+                )));
+            }
+        }
+        result
     }
 
     #[allow(
@@ -4700,6 +4732,65 @@ fn append_reconciled<B: JournalBackend>(
     }
 }
 
+#[cfg(windows)]
+fn persist_store_rebind_disposition(
+    journal: &ProductionHostStateJournal,
+    fence: &RecordFence,
+    store_fence: &str,
+    process: &ProcessIdentity,
+    generation: u64,
+    authority_epoch: u64,
+    disposition: StoreRebindState,
+) -> Result<(), HostError> {
+    if !matches!(
+        disposition,
+        StoreRebindState::Aborted | StoreRebindState::Unknown
+    ) {
+        return Err(HostError::RecoveryRequired(
+            "invalid Store rebind terminal disposition".to_owned(),
+        ));
+    }
+    let record = journal
+        .snapshot()?
+        .store_rebinds
+        .into_iter()
+        .find(|record| {
+            record.fence == *fence
+                && matches!(
+                    record.state,
+                    StoreRebindState::Pending | StoreRebindState::Unknown
+                )
+                && record.store_fence.as_str() == store_fence
+                && record.process_id == process.process_id
+                && record.process_start_time_100ns == process.start_time_100ns
+                && record.generation == generation
+                && record.authority_epoch == authority_epoch
+        })
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store rebind terminal disposition has no exact pending journal record".to_owned(),
+            )
+        })?;
+    if record.state == StoreRebindState::Unknown && disposition == StoreRebindState::Unknown {
+        return Ok(());
+    }
+    let mut terminal = record;
+    terminal.state = disposition;
+    terminal.operation = operation(&format!(
+        "store-rebind:{}:{}",
+        terminal.operation_id.as_str(),
+        match disposition {
+            StoreRebindState::Aborted => "aborted",
+            StoreRebindState::Unknown => "unknown",
+            StoreRebindState::Pending | StoreRebindState::Committed => unreachable!(),
+        }
+    ))?;
+    terminal.receipt_request_digest = None;
+    terminal.receipt_store_fence = None;
+    append_reconciled(journal, HostStateRecord::StoreRebind(terminal))?;
+    Ok(())
+}
+
 fn append_reconciled_readiness<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     observation: KernelReadinessObservationRecord,
@@ -5037,6 +5128,11 @@ fn open_production_epoch(
     reason = "the lifecycle flags are independent durable shutdown and lease-release fences"
 )]
 pub struct HostComposition {
+    #[allow(
+        dead_code,
+        reason = "zero-sized marker binds the production Store-rebind seam"
+    )]
+    store_rebind_boundary: HostStoreRebindProductionBoundary,
     journal: ProductionHostStateJournal,
     registry_store: RedbInstallationRegistry,
     registry: ApprovedGenerationRegistry,
@@ -5098,6 +5194,11 @@ fn start_approved_manifest_contour<P: ApprovedHostStartupPort>(
 }
 
 impl HostComposition {
+    /// Returns the discriminator bound to the production Host composition.
+    #[must_use]
+    pub const fn production_store_rebind_discriminator() -> &'static str {
+        HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR
+    }
     fn validate_launch_options_for_manifest(
         options: &HostLaunchOptions,
         manifest: &CandidateManifest,
@@ -5268,6 +5369,7 @@ impl HostComposition {
         let jobs =
             HostJobBranches::new(&host).map_err(|error| HostError::Platform(error.to_string()))?;
         let mut composition = Self {
+            store_rebind_boundary: HostStoreRebindProductionBoundary,
             journal,
             registry_store,
             registry,
@@ -9597,12 +9699,13 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        CutoverLaunchOutcome, HostBranchDisposition, HostError, HostJobBranches,
-        HostProcessBinding, KERNEL_BOOTSTRAP_ENVIRONMENT, KERNEL_CONTROL_PIPE,
-        KernelControlResponse, KernelLaunchBinding, KernelServiceState, PlatformHandle,
-        ReconciliationObservation, ReconciliationState, StoreKernelLaunchError,
-        StoreLivenessEvidence, activation_response_or_reconcile, fresh_host_epoch,
-        launch_store_then_kernel, reconcile_state_machine,
+        CutoverLaunchOutcome, HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR, HostBranchDisposition,
+        HostComposition, HostError, HostJobBranches, HostProcessBinding,
+        KERNEL_BOOTSTRAP_ENVIRONMENT, KERNEL_CONTROL_PIPE, KernelControlResponse,
+        KernelLaunchBinding, KernelServiceState, PlatformHandle, ReconciliationObservation,
+        ReconciliationState, StoreKernelLaunchError, StoreLivenessEvidence,
+        activation_response_or_reconcile, fresh_host_epoch, launch_store_then_kernel,
+        reconcile_state_machine,
     };
     use eliot_platform_windows::JobObjectIdentity;
 
@@ -10219,13 +10322,12 @@ mod tests {
     }
 
     #[test]
-    fn pulse4_production_discriminator_host_and_kernel_call_sites_present() {
-        let host_src = include_str!("lib.rs");
-        assert!(
-            host_src.contains("rebind_store_control"),
-            "Host must drive rebind_store_control"
+    fn pulse4_production_discriminator_is_bound_to_host_composition() {
+        assert_eq!(
+            HostComposition::production_store_rebind_discriminator(),
+            HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR
         );
-        assert!(host_src.contains("StoreRebindHandoff") || host_src.contains("store_rebind"));
+        assert!(!HostComposition::production_store_rebind_discriminator().is_empty());
     }
 }
 

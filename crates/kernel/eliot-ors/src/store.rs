@@ -1775,6 +1775,7 @@ impl RedbRecoveryStore {
                     .open_table(SUPERVISION_LEASE_RESULTS)
                     .map_err(storage)?,
             );
+            drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
         }
         write.commit().map_err(storage)
     }

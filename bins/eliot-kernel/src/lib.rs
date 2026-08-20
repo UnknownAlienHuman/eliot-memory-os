@@ -92,12 +92,18 @@ use eliot_platform_windows::{
 pub const SERVICE_NAME: &str = "eliot-kernel";
 pub const PROTOCOL_VERSION: &str = "eliot.kernel.v1";
 pub const DEFAULT_PIPE_NAME: &str = KERNEL_CONTROL_PIPE;
+/// Stable production-boundary identity for the Kernel Store-rebind seam.
+pub const KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR: &str =
+    "eliot-kernel::production-store-rebind:v1";
 const STORE_BRIDGE_ROUTE: &str = "store_bridge";
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 const ELIOTD_RECEIPT_PENDING_DEPENDENCY: &str = "eliotd-process-receipt";
 const ELIOTD_RECEIPT_PENDING_REASON: &str = "exact launched process receipt publication is pending";
 #[cfg(windows)]
 const ELIOTD_MAX_RECOVERY_ATTEMPTS: u64 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KernelStoreRebindProductionBoundary;
 
 #[cfg(windows)]
 fn observed_session_principal_binding() -> Result<String, KernelBuildError> {
@@ -439,6 +445,11 @@ impl std::error::Error for KernelBuildError {}
 
 /// The complete, production Kernel composition.
 pub struct KernelComposition {
+    #[allow(
+        dead_code,
+        reason = "zero-sized marker binds the production Store-rebind seam"
+    )]
+    store_rebind_boundary: KernelStoreRebindProductionBoundary,
     work_root: PathBuf,
     runtime: Runtime,
     platform: Arc<WindowsPlatform>,
@@ -2352,11 +2363,102 @@ fn stable_owner_principal_digest(
 /// construction path and supplies the Host-approved client, fixed
 /// `store_bridge` route, and fixed active daemon caller.
 #[cfg(windows)]
+struct GatewayFlight {
+    state: Mutex<GatewayFlightState>,
+    drained: tokio::sync::Notify,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct GatewayFlightState {
+    fenced: bool,
+    in_flight: usize,
+}
+
+#[cfg(windows)]
+struct GatewayFlightGuard<'a> {
+    flight: &'a GatewayFlight,
+}
+
+#[cfg(windows)]
+impl GatewayFlight {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GatewayFlightState::default()),
+            drained: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn enter(&self) -> Result<GatewayFlightGuard<'_>, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "canonical-store gateway flight lock poisoned".to_owned())?;
+        if state.fenced {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        state.in_flight = state
+            .in_flight
+            .checked_add(1)
+            .ok_or_else(|| "canonical-store gateway flight count overflowed".to_owned())?;
+        Ok(GatewayFlightGuard { flight: self })
+    }
+
+    fn fence(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.fenced = true;
+            if state.in_flight == 0 {
+                self.drained.notify_waiters();
+            }
+        }
+    }
+
+    fn is_fenced(&self) -> bool {
+        self.state.lock().map_or(true, |state| state.fenced)
+    }
+
+    fn is_drained(&self) -> Result<bool, String> {
+        self.state
+            .lock()
+            .map(|state| state.in_flight == 0)
+            .map_err(|_| "canonical-store gateway flight lock poisoned".to_owned())
+    }
+
+    async fn fence_and_drain(&self, timeout: Duration) -> Result<(), String> {
+        self.fence();
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.drained.notified();
+                if self.is_drained()? {
+                    return Ok::<(), String>(());
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| "canonical-store gateway in-flight drain timed out".to_owned())??;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for GatewayFlightGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.flight.state.lock() {
+            state.in_flight = state.in_flight.saturating_sub(1);
+            if state.in_flight == 0 {
+                self.flight.drained.notify_waiters();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 pub struct KernelStoreGateway {
     service: Arc<Mutex<KernelService>>,
     store: Arc<EbpCanonicalStoreClient<NamedPipeTransport>>,
     route: GenerationRoute,
-    fenced: AtomicBool,
+    flight: GatewayFlight,
 }
 
 #[cfg(windows)]
@@ -2381,16 +2483,20 @@ impl KernelStoreGateway {
             service,
             store,
             route,
-            fenced: AtomicBool::new(false),
+            flight: GatewayFlight::new(),
         }
     }
 
     fn fence(&self) {
-        self.fenced.store(true, Ordering::Release);
+        self.flight.fence();
     }
 
     fn is_fenced(&self) -> bool {
-        self.fenced.load(Ordering::Acquire)
+        self.flight.is_fenced()
+    }
+
+    async fn fence_and_drain(&self, timeout: Duration) -> Result<(), String> {
+        self.flight.fence_and_drain(timeout).await
     }
 
     /// Applies one already prepared transition after fixed Kernel admission.
@@ -2401,6 +2507,7 @@ impl KernelStoreGateway {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, String> {
+        let _flight = self.flight.enter()?;
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
@@ -2459,6 +2566,7 @@ impl KernelStoreGateway {
 
     /// Reads one Host-bound canonical validation snapshot.
     pub async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, String> {
+        let _flight = self.flight.enter()?;
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
@@ -2470,6 +2578,7 @@ impl KernelStoreGateway {
 
     /// Reads and validates the retained canonical Store health observation.
     pub async fn health(&self) -> Result<StoreHealth, String> {
+        let _flight = self.flight.enter()?;
         let health = self
             .store
             .health()
@@ -2478,6 +2587,50 @@ impl KernelStoreGateway {
         health.validate().map_err(|error| error.to_string())?;
         Ok(health)
     }
+}
+
+#[cfg(windows)]
+fn store_rebind_record_matches(
+    record: &eliot_ors::StoreRebindReplayRecord,
+    handoff: &eliot_kernel_service::StoreRebindHandoff,
+    request_digest: &str,
+    requirement_digest: &str,
+) -> bool {
+    record.operation_id.as_str() == handoff.operation_id.as_str()
+        && record.request_digest == request_digest
+        && record.candidate_binding_digest == handoff.candidate_binding_digest
+        && record.store_fence == handoff.store_fence
+        && record.requirement_digest == requirement_digest
+        && record.process_id == handoff.process_binding.process.process_id
+        && record.process_start_time_100ns == handoff.process_binding.process.start_time_100ns
+        && record.process_image_path == handoff.process_binding.process.image_path
+        && record.job_name == handoff.process_binding.job.as_str()
+        && record.generation == handoff.generation.value()
+        && record.authority_epoch == handoff.authority_epoch.value()
+}
+
+#[cfg(windows)]
+fn store_rebind_record_is_committed(
+    record: &eliot_ors::StoreRebindReplayRecord,
+    handoff: &eliot_kernel_service::StoreRebindHandoff,
+    request_digest: &str,
+    requirement_digest: &str,
+) -> bool {
+    store_rebind_record_matches(record, handoff, request_digest, requirement_digest)
+        && record.state == eliot_ors::StoreRebindReplayState::Committed
+        && record.receipt.as_deref() == Some(request_digest)
+}
+
+#[cfg(windows)]
+fn store_rebind_record_is_pending(
+    record: &eliot_ors::StoreRebindReplayRecord,
+    handoff: &eliot_kernel_service::StoreRebindHandoff,
+    request_digest: &str,
+    requirement_digest: &str,
+) -> bool {
+    store_rebind_record_matches(record, handoff, request_digest, requirement_digest)
+        && record.state == eliot_ors::StoreRebindReplayState::Pending
+        && record.receipt.is_none()
 }
 
 /// The sole semantic bridge between ORS cutover evidence and the in-memory
@@ -2611,18 +2764,58 @@ fn update_handshake_policy(
 
 #[cfg(windows)]
 impl KernelComposition {
+    /// Returns the discriminator bound to the production Kernel composition.
+    #[must_use]
+    pub const fn production_store_rebind_discriminator() -> &'static str {
+        KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR
+    }
+
     fn recover_store_rebind_state(
         ors: &RedbRecoveryStore,
         service: &mut eliot_kernel_service::KernelService,
         store_bootstrap: Option<&HostStoreBootstrapRequirement>,
     ) -> Result<Option<eliot_kernel_service::StoreBootstrapHandoff>, String> {
-        let records = ors.load_all_store_rebinds().map_err(|e| e.to_string())?;
+        let mut records = ors.load_all_store_rebinds().map_err(|e| e.to_string())?;
+        let mut reconciled_committed = Vec::new();
         for pending in records
             .iter()
             .filter(|r| r.state == eliot_ors::StoreRebindReplayState::Pending)
         {
-            let _ = ors.abort_store_rebind(&pending.operation_id, &pending.request_digest);
+            let aborted = ors
+                .abort_store_rebind(&pending.operation_id, &pending.request_digest)
+                .map_err(|error| {
+                    format!(
+                        "startup Store rebind abort/reconciliation failed for {}: {error}",
+                        pending.operation_id.as_str()
+                    )
+                })?;
+            if !aborted {
+                let after = ors
+                    .load_store_rebind(&pending.operation_id, &pending.request_digest)
+                    .map_err(|error| {
+                        format!(
+                            "startup Store rebind abort readback failed for {}: {error}",
+                            pending.operation_id.as_str()
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        format!(
+                            "startup Store rebind abort returned false without exact readback for {}",
+                            pending.operation_id.as_str()
+                        )
+                    })?;
+                if after.state != eliot_ors::StoreRebindReplayState::Committed
+                    || after.receipt.as_deref() != Some(after.request_digest.as_str())
+                {
+                    return Err(format!(
+                        "startup Store rebind abort did not reach a terminal disposition for {}",
+                        pending.operation_id.as_str()
+                    ));
+                }
+                reconciled_committed.push(after);
+            }
         }
+        records.extend(reconciled_committed);
         let committed = records
             .into_iter()
             .filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
@@ -3274,6 +3467,7 @@ impl KernelComposition {
         #[cfg(not(windows))]
         let store_handoff_init = None;
         Ok(Self {
+            store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,
             runtime,
             platform,
@@ -3359,6 +3553,29 @@ impl KernelComposition {
         }
         *retained = Some(handoff);
         Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn fence_store_rebind_runtime(
+        &self,
+        gateway: &Arc<KernelStoreGateway>,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        if let Ok(mut service) = self.service.lock() {
+            let _ = service.fence_generation(reason);
+        }
+        gateway.fence();
+        let old = self
+            .canonical_store_gateway
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(old) = old
+            && !Arc::ptr_eq(&old, gateway)
+        {
+            let _ = old.fence_and_drain(Duration::from_secs(5)).await;
+        }
     }
 
     #[cfg(windows)]
@@ -3534,37 +3751,43 @@ impl KernelComposition {
                 "store rebind does not match active Kernel store route".to_owned(),
             ));
         }
+        let requirement_digest = {
+            let bytes = serde_json::to_vec(&handoff.requirement)
+                .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        let operation = eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
+            .map_err(|e| KernelBuildError::Service(e.to_string()))?;
         if let Some(existing) = self
             .generation_gateway
             .ors
-            .load_store_rebind(
-                &eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
-                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
-                &request_digest,
-            )
+            .load_store_rebind(&operation, &request_digest)
             .map_err(|e| KernelBuildError::Service(e.to_string()))?
         {
-            if existing.state == eliot_ors::StoreRebindReplayState::Committed
-                && let Some(receipt) = existing.receipt.clone()
-            {
+            if store_rebind_record_is_committed(
+                &existing,
+                &handoff,
+                &request_digest,
+                &requirement_digest,
+            ) {
                 let restored = eliot_kernel_service::StoreRebindReceipt {
                     operation_id: handoff.operation_id.clone(),
                     request_digest: request_digest.clone(),
-                    requirement_digest: existing.requirement_digest.clone(),
+                    requirement_digest: requirement_digest.clone(),
                     process_binding: handoff.process_binding.clone(),
                     candidate_binding_digest: handoff.candidate_binding_digest.clone(),
                     generation: handoff.generation,
                     authority_epoch: handoff.authority_epoch,
                     store_fence: handoff.store_fence.clone(),
                 };
-                if receipt == request_digest {
-                    return Ok(restored);
-                }
+                return Ok(restored);
             }
-            if existing.request_digest != request_digest
-                || existing.candidate_binding_digest != handoff.candidate_binding_digest
-                || existing.store_fence != handoff.store_fence
-            {
+            if !store_rebind_record_matches(
+                &existing,
+                &handoff,
+                &request_digest,
+                &requirement_digest,
+            ) {
                 return Err(KernelBuildError::Service(
                     "existing store rebind conflicts".to_owned(),
                 ));
@@ -3575,24 +3798,6 @@ impl KernelComposition {
             std::sync::Arc::new(client),
             route.clone(),
         ));
-        let attachment: Box<dyn CanonicalStoreAttachmentTransaction> = self
-            .process_gateway
-            .as_ref()
-            .map_or_else(
-                || {
-                    struct NoopAttachment;
-                    impl CanonicalStoreAttachmentTransaction for NoopAttachment {
-                        fn commit(self: Box<Self>) {}
-                    }
-                    Ok(Box::new(NoopAttachment) as Box<dyn CanonicalStoreAttachmentTransaction>)
-                },
-                |pg| {
-                    pg.replace_canonical_store(Arc::clone(&gateway))
-                        .map(|a| Box::new(a) as Box<dyn CanonicalStoreAttachmentTransaction>)
-                        .map_err(|e| KernelBuildError::Service(e.to_string()))
-                },
-            )
-            .inspect_err(|_| gateway.fence())?;
         let receipt = {
             let mut svc = self
                 .service
@@ -3612,17 +3817,47 @@ impl KernelComposition {
                 ));
             }
             svc.rebind_store(&handoff, request_digest.clone())
-                .map_err(|error| KernelBuildError::Service(error.to_string()))?
+                .map_err(|error| KernelBuildError::Service(error.to_string()))
+                .inspect_err(|_| gateway.fence())?
+        };
+        // Close service admission before exposing the replacement gateway.
+        // This ordering is the no-dual-writer fence: the old gateway remains
+        // retained but cannot admit new work while ORS is being finalized.
+        let attachment_result: Result<
+            Box<dyn CanonicalStoreAttachmentTransaction>,
+            KernelBuildError,
+        > = self
+            .process_gateway
+            .as_ref()
+            .map_or_else(
+                || {
+                    struct NoopAttachment;
+                    impl CanonicalStoreAttachmentTransaction for NoopAttachment {
+                        fn commit(self: Box<Self>) {}
+                    }
+                    Ok(Box::new(NoopAttachment) as Box<dyn CanonicalStoreAttachmentTransaction>)
+                },
+                |pg| {
+                    pg.replace_canonical_store(Arc::clone(&gateway))
+                        .map(|a| Box::new(a) as Box<dyn CanonicalStoreAttachmentTransaction>)
+                        .map_err(|e| KernelBuildError::Service(e.to_string()))
+                },
+            )
+            .inspect_err(|_| gateway.fence());
+        let attachment = match attachment_result {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                let mut service = self
+                    .service
+                    .lock()
+                    .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
+                service.rollback_store_rebind_for_recovery_failure();
+                return Err(error);
+            }
         };
         {
-            let requirement_digest = {
-                let bytes = serde_json::to_vec(&handoff.requirement)
-                    .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-                format!("{:x}", Sha256::digest(&bytes))
-            };
             let pending = eliot_ors::StoreRebindReplayRecord {
-                operation_id: eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
-                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
+                operation_id: operation.clone(),
                 request_digest: request_digest.clone(),
                 candidate_binding_digest: handoff.candidate_binding_digest.clone(),
                 store_fence: handoff.store_fence.clone(),
@@ -3636,24 +3871,132 @@ impl KernelComposition {
                 state: eliot_ors::StoreRebindReplayState::Pending,
                 receipt: None,
             };
-            self.generation_gateway
-                .ors
-                .begin_store_rebind(&pending)
-                .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+            let begin_result = self.generation_gateway.ors.begin_store_rebind(&pending);
+            if let Err(begin_error) = begin_result {
+                let reconciled = self
+                    .generation_gateway
+                    .ors
+                    .load_store_rebind(&operation, &request_digest);
+                match reconciled {
+                    Ok(Some(record))
+                        if store_rebind_record_is_committed(
+                            &record,
+                            &handoff,
+                            &request_digest,
+                            &requirement_digest,
+                        ) => {}
+                    Ok(Some(record))
+                        if store_rebind_record_is_pending(
+                            &record,
+                            &handoff,
+                            &request_digest,
+                            &requirement_digest,
+                        ) =>
+                    {
+                        match self
+                            .generation_gateway
+                            .ors
+                            .abort_store_rebind(&operation, &request_digest)
+                        {
+                            Ok(_) => {
+                                let after_abort = self
+                                    .generation_gateway
+                                    .ors
+                                    .load_store_rebind(&operation, &request_digest)
+                                    .map_err(|error| {
+                                        KernelBuildError::Service(format!(
+                                            "Store rebind abort readback failed: {error}"
+                                        ))
+                                    })?;
+                                match after_abort {
+                                    None => {
+                                        let mut service = self.service.lock().map_err(|_| {
+                                            KernelBuildError::Service(
+                                                "service lock poisoned".to_owned(),
+                                            )
+                                        })?;
+                                        service.rollback_store_rebind_for_recovery_failure();
+                                        return Err(KernelBuildError::Service(
+                                            begin_error.to_string(),
+                                        ));
+                                    }
+                                    Some(record)
+                                        if store_rebind_record_is_committed(
+                                            &record,
+                                            &handoff,
+                                            &request_digest,
+                                            &requirement_digest,
+                                        ) => {}
+                                    Some(_) => {
+                                        self.fence_store_rebind_runtime(
+                                        &gateway,
+                                        format!(
+                                            "Store rebind begin abort remained durable: {begin_error}"
+                                        ),
+                                    )
+                                    .await;
+                                        return Err(KernelBuildError::Service(format!(
+                                            "Store rebind begin outcome is uncertain after abort: {begin_error}"
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(abort_error) => {
+                                self.fence_store_rebind_runtime(
+                                &gateway,
+                                format!(
+                                    "Store rebind begin abort failed ({begin_error}): {abort_error}"
+                                ),
+                            )
+                            .await;
+                                return Err(KernelBuildError::Service(format!(
+                                    "Store rebind begin outcome is uncertain: {begin_error}; abort: {abort_error}"
+                                )));
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        let mut service = self.service.lock().map_err(|_| {
+                            KernelBuildError::Service("service lock poisoned".to_owned())
+                        })?;
+                        service.rollback_store_rebind_for_recovery_failure();
+                        return Err(KernelBuildError::Service(begin_error.to_string()));
+                    }
+                    Ok(Some(record)) => {
+                        self.fence_store_rebind_runtime(
+                            &gateway,
+                            format!(
+                                "Store rebind begin readback conflicted for {}",
+                                record.operation_id.as_str()
+                            ),
+                        )
+                        .await;
+                        return Err(KernelBuildError::Service(
+                            "Store rebind begin readback conflicted".to_owned(),
+                        ));
+                    }
+                    Err(readback_error) => {
+                        self.fence_store_rebind_runtime(
+                            &gateway,
+                            format!(
+                                "Store rebind begin readback failed ({begin_error}): {readback_error}"
+                            ),
+                        )
+                        .await;
+                        return Err(KernelBuildError::Service(format!(
+                            "Store rebind begin outcome is uncertain: {begin_error}; readback: {readback_error}"
+                        )));
+                    }
+                }
+            }
         }
         let committed_result = {
-            let requirement_digest = {
-                let bytes = serde_json::to_vec(&handoff.requirement)
-                    .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-                format!("{:x}", Sha256::digest(&bytes))
-            };
             let committed = eliot_ors::StoreRebindReplayRecord {
-                operation_id: eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
-                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
+                operation_id: operation.clone(),
                 request_digest: request_digest.clone(),
                 candidate_binding_digest: handoff.candidate_binding_digest.clone(),
                 store_fence: handoff.store_fence.clone(),
-                requirement_digest,
+                requirement_digest: requirement_digest.clone(),
                 process_id: handoff.process_binding.process.process_id,
                 process_start_time_100ns: handoff.process_binding.process.start_time_100ns,
                 process_image_path: handoff.process_binding.process.image_path.clone(),
@@ -3669,32 +4012,159 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Service(error.to_string()))
         };
         if let Err(error) = committed_result {
-            {
-                let mut svc = self
-                    .service
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                svc.rollback_store_rebind_for_recovery_failure();
+            let readback = self
+                .generation_gateway
+                .ors
+                .load_store_rebind(&operation, &request_digest);
+            match readback {
+                Ok(Some(record))
+                    if store_rebind_record_is_committed(
+                        &record,
+                        &handoff,
+                        &request_digest,
+                        &requirement_digest,
+                    ) => {}
+                Ok(Some(record))
+                    if store_rebind_record_is_pending(
+                        &record,
+                        &handoff,
+                        &request_digest,
+                        &requirement_digest,
+                    ) =>
+                {
+                    match self
+                        .generation_gateway
+                        .ors
+                        .abort_store_rebind(&operation, &request_digest)
+                    {
+                        Ok(_) => {
+                            let after_abort = self
+                                .generation_gateway
+                                .ors
+                                .load_store_rebind(&operation, &request_digest);
+                            match after_abort {
+                                Ok(None) => {
+                                    let mut service = self.service.lock().map_err(|_| {
+                                        KernelBuildError::Service(
+                                            "service lock poisoned".to_owned(),
+                                        )
+                                    })?;
+                                    service.rollback_store_rebind_for_recovery_failure();
+                                    return Err(error);
+                                }
+                                Ok(Some(after))
+                                    if store_rebind_record_is_committed(
+                                        &after,
+                                        &handoff,
+                                        &request_digest,
+                                        &requirement_digest,
+                                    ) => {}
+                                Ok(Some(_)) => {
+                                    self.fence_store_rebind_runtime(
+                                        &gateway,
+                                        "Store rebind commit abort readback remained non-terminal",
+                                    )
+                                    .await;
+                                    return Err(KernelBuildError::Service(
+                                        "Store rebind commit outcome is uncertain after abort"
+                                            .to_owned(),
+                                    ));
+                                }
+                                Err(readback_error) => {
+                                    self.fence_store_rebind_runtime(
+                                    &gateway,
+                                    format!(
+                                        "Store rebind commit abort readback failed: {readback_error}"
+                                    ),
+                                )
+                                .await;
+                                    return Err(KernelBuildError::Service(format!(
+                                        "Store rebind commit outcome is uncertain: {error}; abort readback: {readback_error}"
+                                    )));
+                                }
+                            }
+                        }
+                        Err(abort_error) => {
+                            self.fence_store_rebind_runtime(
+                                &gateway,
+                                format!(
+                                    "Store rebind commit abort failed ({error}): {abort_error}"
+                                ),
+                            )
+                            .await;
+                            return Err(KernelBuildError::Service(format!(
+                                "Store rebind commit outcome is uncertain: {error}; abort: {abort_error}"
+                            )));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let mut service = self.service.lock().map_err(|_| {
+                        KernelBuildError::Service("service lock poisoned".to_owned())
+                    })?;
+                    service.rollback_store_rebind_for_recovery_failure();
+                    return Err(error);
+                }
+                Ok(Some(record)) => {
+                    self.fence_store_rebind_runtime(
+                        &gateway,
+                        format!(
+                            "Store rebind commit readback conflicted for {}",
+                            record.operation_id.as_str()
+                        ),
+                    )
+                    .await;
+                    return Err(KernelBuildError::Service(
+                        "Store rebind commit readback conflicted".to_owned(),
+                    ));
+                }
+                Err(readback_error) => {
+                    self.fence_store_rebind_runtime(
+                        &gateway,
+                        format!("Store rebind commit readback failed ({error}): {readback_error}"),
+                    )
+                    .await;
+                    return Err(KernelBuildError::Service(format!(
+                        "Store rebind commit outcome is uncertain: {error}; readback: {readback_error}"
+                    )));
+                }
             }
-            if let Ok(op) = eliot_ors::OperationIdentity::new(handoff.operation_id.as_str()) {
-                let _ = self
-                    .generation_gateway
-                    .ors
-                    .abort_store_rebind(&op, &request_digest);
-            }
-            return Err(error);
         }
-        if let Some(pg) = self.process_gateway.as_ref()
-            && let Ok(guard) = pg.canonical_store.lock()
-            && let Some(old) = guard.as_ref()
-            && !Arc::ptr_eq(old, &gateway)
-        {
-            old.fence();
+        let service_commit_error = {
+            let mut service = self
+                .service
+                .lock()
+                .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
+            service
+                .commit_store_rebind()
+                .err()
+                .map(|error| error.to_string())
+        };
+        if let Some(error) = service_commit_error {
+            self.fence_store_rebind_runtime(
+                &gateway,
+                format!("Store rebind service commit publication failed: {error}"),
+            )
+            .await;
+            return Err(KernelBuildError::Service(error));
         }
-        if let Ok(guard) = self.canonical_store_gateway.lock()
-            && let Some(old) = guard.as_ref()
+        let old_gateway_for_drain = self
+            .canonical_store_gateway
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(old) = old_gateway_for_drain
+            && !Arc::ptr_eq(&old, &gateway)
+            && let Err(error) = old.fence_and_drain(Duration::from_secs(5)).await
         {
-            old.fence();
+            self.fence_store_rebind_runtime(
+                &gateway,
+                format!("Store rebind old gateway drain failed: {error}"),
+            )
+            .await;
+            return Err(KernelBuildError::Service(format!(
+                "Store rebind old gateway drain failed: {error}"
+            )));
         }
         let old_gateway = match (|| {
             let mut gw_guard = self
@@ -9334,6 +9804,37 @@ mod tests {
                     .expect("owner");
             assert!(authorize_process_owner(&first, &candidate).is_err());
         }
+    }
+
+    #[test]
+    fn pulse4_production_discriminator_is_bound_to_kernel_composition() {
+        assert_eq!(
+            KernelComposition::production_store_rebind_discriminator(),
+            KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR
+        );
+        assert!(!KernelComposition::production_store_rebind_discriminator().is_empty());
+    }
+
+    #[test]
+    fn store_gateway_fence_waits_for_in_flight_work_before_replacement() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|_| unreachable!());
+        runtime.block_on(async {
+            let flight = Arc::new(GatewayFlight::new());
+            let guard = flight.enter().unwrap_or_else(|_| unreachable!());
+            let draining = {
+                let flight = Arc::clone(&flight);
+                tokio::spawn(async move { flight.fence_and_drain(Duration::from_secs(1)).await })
+            };
+            tokio::task::yield_now().await;
+            assert!(!draining.is_finished());
+            drop(guard);
+            assert!(draining.await.unwrap_or_else(|_| unreachable!()).is_ok());
+            assert!(flight.is_fenced());
+            assert!(flight.enter().is_err());
+        });
     }
 }
 

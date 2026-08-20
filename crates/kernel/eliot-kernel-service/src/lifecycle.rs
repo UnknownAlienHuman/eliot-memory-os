@@ -211,6 +211,14 @@ pub struct KernelService {
     generation_fenced: bool,
     store_rebind_receipt: Option<crate::protocol::StoreRebindReceipt>,
     store_rebind_request_digest: Option<String>,
+    /// Receipts from completed Store-only rebinds in this Kernel lineage.
+    /// They remain queryable by exact operation/request identity without
+    /// reopening the old gateway.
+    store_rebind_history: Vec<crate::protocol::StoreRebindReceipt>,
+    /// The prior committed receipt retained while a replacement is degraded
+    /// but not yet durably committed.  Recovery restores it instead of
+    /// pretending that a maybe-durable replacement was rolled back.
+    store_rebind_previous: Option<(crate::protocol::StoreRebindReceipt, String)>,
 }
 
 impl KernelService {
@@ -236,6 +244,8 @@ impl KernelService {
             generation_fenced: false,
             store_rebind_receipt: None,
             store_rebind_request_digest: None,
+            store_rebind_history: Vec::new(),
+            store_rebind_previous: None,
         })
     }
 
@@ -525,10 +535,30 @@ impl KernelService {
             {
                 return Ok(receipt);
             }
-            return Err(KernelServiceError::InvalidField {
-                field: "store_rebind.operation_id",
-                reason: "Store rebind already consumed for this lineage",
-            });
+            if self.state != KernelServiceState::Ready {
+                return Err(KernelServiceError::InvalidField {
+                    field: "store_rebind.operation_id",
+                    reason: "Store rebind already consumed for this lineage",
+                });
+            }
+            let previous_receipt =
+                self.store_rebind_receipt
+                    .take()
+                    .ok_or(KernelServiceError::HandshakeMismatch {
+                        field: "store_rebind.receipt",
+                    })?;
+            let previous_digest = self.store_rebind_request_digest.take().ok_or(
+                KernelServiceError::HandshakeMismatch {
+                    field: "store_rebind.request_digest",
+                },
+            )?;
+            if self.store_rebind_previous.is_some() {
+                return Err(KernelServiceError::InvalidField {
+                    field: "store_rebind.operation_id",
+                    reason: "another Store rebind is already in recovery",
+                });
+            }
+            self.store_rebind_previous = Some((previous_receipt, previous_digest));
         }
         self.transition(KernelServiceState::Degraded)?;
         self.ready = None;
@@ -558,20 +588,60 @@ impl KernelService {
         query: &crate::protocol::StoreRebindQuery,
     ) -> Result<Option<crate::protocol::StoreRebindReceipt>, KernelServiceError> {
         query.validate()?;
-        match (
+        let mut known_operation = false;
+        if let (Some(receipt), Some(digest)) = (
             self.store_rebind_receipt.as_ref(),
             self.store_rebind_request_digest.as_deref(),
-        ) {
-            (Some(receipt), Some(digest))
-                if receipt.operation_id == query.operation_id && digest == query.request_digest =>
-            {
-                Ok(Some(receipt.clone()))
+        ) && receipt.operation_id == query.operation_id
+        {
+            known_operation = true;
+            if digest == query.request_digest {
+                return Ok(Some(receipt.clone()));
             }
-            (None, None) => Ok(None),
-            _ => Err(KernelServiceError::HandshakeMismatch {
-                field: "store_rebind_query",
-            }),
         }
+        if let Some((receipt, digest)) = &self.store_rebind_previous
+            && receipt.operation_id == query.operation_id
+        {
+            known_operation = true;
+            if digest == &query.request_digest {
+                return Ok(Some(receipt.clone()));
+            }
+        }
+        if let Some(receipt) = self
+            .store_rebind_history
+            .iter()
+            .find(|receipt| receipt.operation_id == query.operation_id)
+        {
+            known_operation = true;
+            if receipt.request_digest == query.request_digest {
+                return Ok(Some(receipt.clone()));
+            }
+        }
+        if !known_operation
+            && self.store_rebind_receipt.is_none()
+            && self.store_rebind_request_digest.is_none()
+            && self.store_rebind_previous.is_none()
+            && self.store_rebind_history.is_empty()
+        {
+            return Ok(None);
+        }
+        Err(KernelServiceError::HandshakeMismatch {
+            field: "store_rebind_query",
+        })
+    }
+
+    /// Marks the current Store rebind durable and retires the previous
+    /// gateway receipt into exact-identity history.
+    pub fn commit_store_rebind(&mut self) -> Result<(), KernelServiceError> {
+        if let Some((previous, _digest)) = self.store_rebind_previous.take()
+            && !self
+                .store_rebind_history
+                .iter()
+                .any(|receipt| receipt.operation_id == previous.operation_id)
+        {
+            self.store_rebind_history.push(previous);
+        }
+        Ok(())
     }
 
     /// Returns the last Store rebind receipt, if any.
@@ -616,17 +686,25 @@ impl KernelService {
 
     /// Rolls back an uncommitted Store rebind after a durability failure.
     pub fn rollback_store_rebind_for_recovery_failure(&mut self) {
-        if self.store_rebind_receipt.is_some() || self.store_rebind_request_digest.is_some() {
+        let had_rebind = self.store_rebind_previous.is_some()
+            || self.store_rebind_receipt.is_some()
+            || self.store_rebind_request_digest.is_some();
+        if let Some((previous, previous_digest)) = self.store_rebind_previous.take() {
+            self.store_rebind_receipt = Some(previous);
+            self.store_rebind_request_digest = Some(previous_digest);
+        } else if self.store_rebind_receipt.is_some() || self.store_rebind_request_digest.is_some()
+        {
             self.store_rebind_receipt = None;
             self.store_rebind_request_digest = None;
-            if self.state == KernelServiceState::Degraded
-                && self.failure.as_ref().is_some_and(|f| {
-                    matches!(f, ServiceFailure::Contract(s) if s == "store-rebind:degraded-for-fence")
-                })
-            {
-                let _ = self.transition(KernelServiceState::Ready);
-                self.failure = None;
-            }
+        }
+        if had_rebind
+            && self.state == KernelServiceState::Degraded
+            && self.failure.as_ref().is_some_and(|f| {
+                matches!(f, ServiceFailure::Contract(s) if s == "store-rebind:degraded-for-fence")
+            })
+        {
+            let _ = self.transition(KernelServiceState::Ready);
+            self.failure = None;
         }
     }
 
@@ -811,8 +889,10 @@ mod tests {
     use super::*;
     use crate::protocol::{
         HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostProcessBinding,
-        ProcessObservation, RestartBudget,
+        ProcessObservation, RestartBudget, StoreProcessBinding, StoreRebindHandoff,
+        StoreRebindQuery,
     };
+    use eliot_contracts::StateFence;
     use eliot_platform::{KernelActivationNonce, PlatformHandle};
     use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 
@@ -891,6 +971,51 @@ mod tests {
             health: HealthVector::healthy(),
             evidence_refs: vec![handle(evidence)],
         }
+    }
+
+    fn rebind_handoff(
+        candidate: &HostKernelCandidateBinding,
+        operation: &str,
+        process_id: u32,
+    ) -> StoreRebindHandoff {
+        let generation = ResourceGeneration::new(1).unwrap_or_else(|_| unreachable!());
+        let authority_epoch = AuthorityEpoch::new(1).unwrap_or_else(|_| unreachable!());
+        let requirement = crate::protocol::HostStoreBootstrapRequirement {
+            route_identity: handle(crate::STORE_ROUTE_IDENTITY),
+            canonical_pipe_identity: handle(r"\\.\pipe\eliot\store"),
+            store_generation: generation,
+            state_fence: StateFence::new(authority_epoch, generation),
+            launch_nonce: handle("store-launch-nonce"),
+            connection_id: handle("store-connection"),
+            expected_peer_sid: handle("S-1-5-18"),
+            expected_peer_session_id: 0,
+            approved_artifact_hash: handle(&"a".repeat(64)),
+            approved_config_hash: handle(&"b".repeat(64)),
+            timeout_ms: 5_000,
+        };
+        let mut handoff = StoreRebindHandoff {
+            operation_id: handle(operation),
+            request_digest: "0".repeat(64),
+            requirement,
+            process_binding: StoreProcessBinding {
+                process: HostProcessBinding {
+                    process_id,
+                    start_time_100ns: u64::from(process_id) + 100,
+                    image_path: format!(r"C:\Eliot\store-{process_id}.exe"),
+                },
+                job: handle("Local\\Eliot-Store-test"),
+            },
+            candidate_binding_digest: candidate
+                .compute_digest()
+                .unwrap_or_else(|_| unreachable!()),
+            generation,
+            authority_epoch,
+            store_fence: format!("{process_id:0>64}"),
+        };
+        handoff.request_digest = handoff
+            .canonical_request_digest()
+            .unwrap_or_else(|_| unreachable!());
+        handoff
     }
 
     fn activate(
@@ -1034,6 +1159,63 @@ mod tests {
         assert_eq!(service.state(), KernelServiceState::Ready);
         assert_eq!(service.ready_receipt(), Some(&recovery));
         assert!(service.failure().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn store_rebind_repeat_preserves_exact_history_and_rolls_back_uncommitted_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut service = KernelService::new([19; 32], 2, 4)?;
+        let mut candidate = candidate();
+        candidate.kernel_epoch = AuthorityEpoch::new(1)?;
+        let activation = activate(&mut service, candidate.clone());
+        service.publish_ready(ready_receipt(&candidate, &activation, "ready-initial"))?;
+
+        let first = rebind_handoff(&candidate, "store-rebind-first", 101);
+        let first_receipt = service.rebind_store(&first, first.request_digest.clone())?;
+        service.commit_store_rebind()?;
+        service.publish_ready(ready_receipt(&candidate, &activation, "ready-after-first"))?;
+
+        let second = rebind_handoff(&candidate, "store-rebind-second", 102);
+        let second_receipt = service.rebind_store(&second, second.request_digest.clone())?;
+        assert_eq!(service.state(), KernelServiceState::Degraded);
+        assert_eq!(
+            service.reconcile_store_rebind(&StoreRebindQuery {
+                operation_id: second.operation_id.clone(),
+                request_digest: second.request_digest.clone(),
+            })?,
+            Some(second_receipt.clone())
+        );
+
+        service.rollback_store_rebind_for_recovery_failure();
+        assert_eq!(service.state(), KernelServiceState::Ready);
+        assert_eq!(service.store_rebind_receipt(), Some(&first_receipt));
+        assert_eq!(
+            service.reconcile_store_rebind(&StoreRebindQuery {
+                operation_id: first.operation_id.clone(),
+                request_digest: first.request_digest.clone(),
+            })?,
+            Some(first_receipt.clone())
+        );
+        assert!(
+            service
+                .reconcile_store_rebind(&StoreRebindQuery {
+                    operation_id: second.operation_id.clone(),
+                    request_digest: second.request_digest.clone(),
+                })
+                .is_err()
+        );
+
+        let second_retry = service.rebind_store(&second, second.request_digest.clone())?;
+        service.commit_store_rebind()?;
+        assert_eq!(second_retry, second_receipt);
+        assert_eq!(
+            service.reconcile_store_rebind(&StoreRebindQuery {
+                operation_id: first.operation_id,
+                request_digest: first.request_digest,
+            })?,
+            Some(first_receipt)
+        );
         Ok(())
     }
 
