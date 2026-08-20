@@ -169,6 +169,12 @@ fn store_rebind_commit_order_is_durable_and_idempotent() -> TestResult {
         StoreRebindReplayState::Pending,
     )?;
     assert!(store.begin_store_rebind(&first_pending)?.is_none());
+    let mut substituted_pending = first_pending.clone();
+    substituted_pending.process_id += 1;
+    assert!(store.begin_store_rebind(&substituted_pending).is_err());
+    substituted_pending.process_id = first_pending.process_id;
+    substituted_pending.requirement_digest = "f".repeat(64);
+    assert!(store.persist_store_rebind(&substituted_pending).is_err());
     let mut first_committed = make_record(
         first_pending.operation_id.as_str(),
         &first_pending.request_digest,

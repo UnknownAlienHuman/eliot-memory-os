@@ -398,6 +398,23 @@ pub struct RedbRecoveryStore {
         std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
 }
 
+fn same_store_rebind_binding(
+    left: &crate::StoreRebindReplayRecord,
+    right: &crate::StoreRebindReplayRecord,
+) -> bool {
+    left.operation_id == right.operation_id
+        && left.request_digest == right.request_digest
+        && left.candidate_binding_digest == right.candidate_binding_digest
+        && left.store_fence == right.store_fence
+        && left.requirement_digest == right.requirement_digest
+        && left.process_id == right.process_id
+        && left.process_start_time_100ns == right.process_start_time_100ns
+        && left.process_image_path == right.process_image_path
+        && left.job_name == right.job_name
+        && left.generation == right.generation
+        && left.authority_epoch == right.authority_epoch
+}
+
 impl RedbRecoveryStore {
     #[cfg(test)]
     pub(crate) fn write_process_start_raw_for_test(
@@ -647,13 +664,10 @@ impl RedbRecoveryStore {
             if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
                 let existing: crate::StoreRebindReplayRecord = decode(existing.value())?;
                 existing.validate()?;
-                if existing.request_digest != record.request_digest
-                    || existing.candidate_binding_digest != record.candidate_binding_digest
-                    || existing.store_fence != record.store_fence
-                {
+                if !same_store_rebind_binding(&existing, record) {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "store_rebind_replay",
-                        reason: "existing store rebind conflicts".to_owned(),
+                        reason: "existing Store rebind binding conflicts".to_owned(),
                     });
                 }
                 Some(existing)
@@ -709,14 +723,10 @@ impl RedbRecoveryStore {
             let mut next = record.clone();
             if let Some(existing) = &existing {
                 existing.validate()?;
-                if existing.request_digest.clone() != record.request_digest.clone()
-                    || existing.candidate_binding_digest.clone()
-                        != record.candidate_binding_digest.clone()
-                    || existing.store_fence.clone() != record.store_fence.clone()
-                {
+                if !same_store_rebind_binding(existing, record) {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "store_rebind_replay",
-                        reason: "store rebind replacement rejected".to_owned(),
+                        reason: "Store rebind replacement binding rejected".to_owned(),
                     });
                 }
                 match (existing.state, record.state) {

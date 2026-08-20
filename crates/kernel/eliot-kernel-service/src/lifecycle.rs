@@ -644,6 +644,65 @@ impl KernelService {
         Ok(())
     }
 
+    /// Rehydrates an exact ORS commit after volatile publication was lost.
+    ///
+    /// The durable receipt is already the authority for this operation, so a
+    /// replay must not call [`Self::rebind_store`] (which would require a
+    /// fresh Ready transition and could manufacture a second operation).  It
+    /// may restore the current slot from Ready/Degraded, but it never accepts
+    /// a different operation over a live slot.
+    pub fn restore_store_rebind_for_replay(
+        &mut self,
+        receipt: crate::protocol::StoreRebindReceipt,
+        request_digest: String,
+    ) -> Result<(), KernelServiceError> {
+        receipt.validate()?;
+        if request_digest != receipt.request_digest {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "store_rebind.request_digest",
+            });
+        }
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        if let (Some(current), Some(current_digest)) = (
+            self.store_rebind_receipt.as_ref(),
+            self.store_rebind_request_digest.as_deref(),
+        ) {
+            if current == &receipt && current_digest == request_digest {
+                return Ok(());
+            }
+            return Err(KernelServiceError::InvalidField {
+                field: "store_rebind.operation_id",
+                reason: "Store rebind replay conflicts with the current lineage slot",
+            });
+        }
+        if self.store_rebind_receipt.is_some() || self.store_rebind_request_digest.is_some() {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "store_rebind.receipt",
+            });
+        }
+        if !matches!(
+            self.state,
+            KernelServiceState::Ready | KernelServiceState::Degraded
+        ) {
+            return Err(KernelServiceError::IllegalTransition {
+                from: self.state,
+                to: KernelServiceState::Degraded,
+            });
+        }
+        if self.state == KernelServiceState::Ready {
+            self.transition(KernelServiceState::Degraded)?;
+            self.ready = None;
+        }
+        self.failure = Some(ServiceFailure::Contract(
+            "store-rebind:replayed-durable-commit".to_owned(),
+        ));
+        self.store_rebind_receipt = Some(receipt);
+        self.store_rebind_request_digest = Some(request_digest);
+        Ok(())
+    }
+
     /// Returns the last Store rebind receipt, if any.
     pub fn store_rebind_receipt(&self) -> Option<&crate::protocol::StoreRebindReceipt> {
         self.store_rebind_receipt.as_ref()
@@ -1216,6 +1275,42 @@ mod tests {
             })?,
             Some(first_receipt)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_durable_replay_restores_lost_slot_and_retires_previous_operation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut service = KernelService::new([21; 32], 2, 4)?;
+        let mut candidate = candidate();
+        candidate.kernel_epoch = AuthorityEpoch::new(1)?;
+        let activation = activate(&mut service, candidate.clone());
+        service.publish_ready(ready_receipt(&candidate, &activation, "ready-initial"))?;
+
+        let first = rebind_handoff(&candidate, "store-rebind-replay-first", 201);
+        let first_receipt = service.rebind_store(&first, first.request_digest.clone())?;
+        service.commit_store_rebind()?;
+        service.publish_ready(ready_receipt(&candidate, &activation, "ready-after-first"))?;
+
+        let second = rebind_handoff(&candidate, "store-rebind-replay-second", 202);
+        let second_receipt = service.rebind_store(&second, second.request_digest.clone())?;
+        let second_digest = second.request_digest.clone();
+
+        // Model publication loss after ORS has committed: the previous slot
+        // remains recoverable, but the current volatile receipt is absent.
+        service.store_rebind_receipt = None;
+        service.store_rebind_request_digest = None;
+        service.restore_store_rebind_for_replay(second_receipt.clone(), second_digest)?;
+        service.commit_store_rebind()?;
+
+        assert_eq!(service.store_rebind_receipt(), Some(&second_receipt));
+        assert!(
+            service
+                .store_rebind_history
+                .iter()
+                .any(|receipt| receipt == &first_receipt)
+        );
+        assert!(service.store_rebind_previous.is_none());
         Ok(())
     }
 

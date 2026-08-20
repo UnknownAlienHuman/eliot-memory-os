@@ -3782,7 +3782,7 @@ impl KernelComposition {
         };
         let operation = eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
             .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-        if let Some(existing) = self
+        let durable_replay = if let Some(existing) = self
             .generation_gateway
             .ors
             .load_store_rebind(&operation, &request_digest)
@@ -3794,29 +3794,23 @@ impl KernelComposition {
                 &request_digest,
                 &requirement_digest,
             ) {
-                let restored = eliot_kernel_service::StoreRebindReceipt {
-                    operation_id: handoff.operation_id.clone(),
-                    request_digest: request_digest.clone(),
-                    requirement_digest: requirement_digest.clone(),
-                    process_binding: handoff.process_binding.clone(),
-                    candidate_binding_digest: handoff.candidate_binding_digest.clone(),
-                    generation: handoff.generation,
-                    authority_epoch: handoff.authority_epoch,
-                    store_fence: handoff.store_fence.clone(),
-                };
-                return Ok(restored);
+                Some(store_rebind_receipt_from_ors_record(&existing)?)
+            } else {
+                if !store_rebind_record_matches(
+                    &existing,
+                    &handoff,
+                    &request_digest,
+                    &requirement_digest,
+                ) {
+                    return Err(KernelBuildError::Service(
+                        "existing store rebind conflicts".to_owned(),
+                    ));
+                }
+                None
             }
-            if !store_rebind_record_matches(
-                &existing,
-                &handoff,
-                &request_digest,
-                &requirement_digest,
-            ) {
-                return Err(KernelBuildError::Service(
-                    "existing store rebind conflicts".to_owned(),
-                ));
-            }
-        }
+        } else {
+            None
+        };
         // A durable exact commit is the idempotence source of truth.  Check
         // it before requiring the volatile service to be Ready so a replay
         // after Kernel publication loss can recover from ORS rather than
@@ -3826,7 +3820,10 @@ impl KernelComposition {
                 .service
                 .lock()
                 .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
-            if service.state() != eliot_kernel_service::KernelServiceState::Ready {
+            if service.state() != eliot_kernel_service::KernelServiceState::Ready
+                && !(durable_replay.is_some()
+                    && service.state() == eliot_kernel_service::KernelServiceState::Degraded)
+            {
                 return Err(KernelBuildError::Service(
                     "Store rebind requires Ready Kernel".to_owned(),
                 ));
@@ -3855,7 +3852,9 @@ impl KernelComposition {
                 .service
                 .lock()
                 .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
-            if svc.state() != eliot_kernel_service::KernelServiceState::Ready {
+            if durable_replay.is_none()
+                && svc.state() != eliot_kernel_service::KernelServiceState::Ready
+            {
                 return Err(KernelBuildError::Service(
                     "Store rebind requires Ready Kernel (fence recheck)".to_owned(),
                 ));
@@ -3868,9 +3867,15 @@ impl KernelComposition {
                     "Store rebind candidate binding mismatch (fence recheck)".to_owned(),
                 ));
             }
-            svc.rebind_store(&handoff, request_digest.clone())
-                .map_err(|error| KernelBuildError::Service(error.to_string()))
-                .inspect_err(|_| gateway.fence())?
+            if let Some(restored) = durable_replay.clone() {
+                svc.restore_store_rebind_for_replay(restored.clone(), request_digest.clone())
+                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+                restored
+            } else {
+                svc.rebind_store(&handoff, request_digest.clone())
+                    .map_err(|error| KernelBuildError::Service(error.to_string()))
+                    .inspect_err(|_| gateway.fence())?
+            }
         };
         // Close service admission before exposing the replacement gateway.
         // This ordering is the no-dual-writer fence: the old gateway remains
@@ -3907,7 +3912,7 @@ impl KernelComposition {
                 return Err(error);
             }
         });
-        {
+        if durable_replay.is_none() {
             let pending = eliot_ors::StoreRebindReplayRecord {
                 operation_id: operation.clone(),
                 request_digest: request_digest.clone(),
@@ -6087,6 +6092,126 @@ impl KernelComposition {
         }
     }
 
+    #[cfg(windows)]
+    fn validate_store_rebind_admission(
+        &self,
+        request: &KernelControlRequest,
+    ) -> Result<(), TransportError> {
+        if matches!(
+            &request.command,
+            KernelControlCommand::Reconcile | KernelControlCommand::ReconcileRebindStore(_)
+        ) {
+            // Generic recovery and exact ORS queries must remain admissible
+            // while a just-committed replacement is between its durable ORS
+            // linearization point and volatile handoff publication.  Their
+            // command-specific paths validate the candidate/ORS binding below
+            // instead of comparing against the previous live handoff.
+            return Ok(());
+        }
+        let receipt = self
+            .service
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .store_rebind_receipt()
+            .cloned();
+        let Some(receipt) = receipt else {
+            return Ok(());
+        };
+        self.validate_store_rebind_receipt_admission(request, &receipt)
+    }
+
+    #[cfg(windows)]
+    fn validate_store_rebind_receipt_admission(
+        &self,
+        request: &KernelControlRequest,
+        receipt: &eliot_kernel_service::StoreRebindReceipt,
+    ) -> Result<(), TransportError> {
+        let candidate_digest = request
+            .candidate
+            .compute_digest()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if receipt.candidate_binding_digest != candidate_digest
+            || receipt.generation != request.generation
+            || receipt.authority_epoch != request.candidate.kernel_epoch
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let handoff = self
+            .store_handoff
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        if receipt.process_binding != handoff.process_binding {
+            return Err(TransportError::SessionFenced);
+        }
+        let expected_requirement_digest = serde_json::to_vec(&handoff.requirement)
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+            .map_err(|_| TransportError::SessionFenced)?;
+        if receipt.requirement_digest != expected_requirement_digest {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(
+            serde_json::to_vec(&handoff.requirement.state_fence)
+                .map_err(|_| TransportError::SessionFenced)?,
+        );
+        hasher.update(receipt.generation.value().to_le_bytes());
+        hasher.update(receipt.authority_epoch.value().to_le_bytes());
+        hasher.update(
+            handoff
+                .requirement
+                .approved_artifact_hash
+                .as_str()
+                .as_bytes(),
+        );
+        hasher.update(handoff.requirement.approved_config_hash.as_str().as_bytes());
+        hasher.update(receipt.process_binding.process.process_id.to_le_bytes());
+        hasher.update(
+            receipt
+                .process_binding
+                .process
+                .start_time_100ns
+                .to_le_bytes(),
+        );
+        hasher.update(receipt.process_binding.process.image_path.as_bytes());
+        hasher.update(receipt.process_binding.job.as_str().as_bytes());
+        hasher.update(candidate_digest.as_bytes());
+        if receipt.store_fence != format!("{:x}", hasher.finalize()) {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn validate_store_rebind_ors_record_admission(
+        request: &KernelControlRequest,
+        query: &eliot_kernel_service::StoreRebindQuery,
+        record: &eliot_ors::StoreRebindReplayRecord,
+    ) -> Result<(), TransportError> {
+        let receipt = store_rebind_receipt_from_ors_record(record)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let candidate_digest = request
+            .candidate
+            .compute_digest()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if receipt.operation_id.as_str() != query.operation_id.as_str()
+            || receipt.request_digest != query.request_digest
+            || receipt.candidate_binding_digest != candidate_digest
+            || receipt.generation != request.generation
+            || receipt.authority_epoch != request.candidate.kernel_epoch
+            || receipt.requirement_digest != record.requirement_digest
+            || receipt.store_fence != record.store_fence
+            || receipt.process_binding.process.process_id != record.process_id
+            || receipt.process_binding.process.start_time_100ns != record.process_start_time_100ns
+            || receipt.process_binding.process.image_path != record.process_image_path
+            || receipt.process_binding.job.as_str() != record.job_name
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
     /// Applies one authenticated Host control request after binding the
     /// transport's handle-proven peer and the approved generation contour.
     #[allow(
@@ -6159,11 +6284,14 @@ impl KernelComposition {
             KernelControlCommand::BootstrapStore(_)
                 | KernelControlCommand::RebindStore(_)
                 | KernelControlCommand::ReconcileRebindStore(_)
+                | KernelControlCommand::Reconcile
         ) {
             Some(self.store_rebind_gate.lock().await)
         } else {
             None
         };
+        #[cfg(windows)]
+        self.validate_store_rebind_admission(&request)?;
         if let Some(handoff) = bootstrap {
             self.install_store_bootstrap(handoff.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -6200,10 +6328,10 @@ impl KernelComposition {
                             && record.request_digest == query.request_digest
                             && record.receipt.as_deref() == Some(query.request_digest.as_str()) =>
                     {
-                        Some(
-                            store_rebind_receipt_from_ors_record(&record)
-                                .map_err(|_| TransportError::SessionFenced)?,
-                        )
+                        Self::validate_store_rebind_ors_record_admission(&request, query, &record)?;
+                        let receipt = store_rebind_receipt_from_ors_record(&record)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Some(receipt)
                     }
                     Some(record)
                         if record.state == eliot_ors::StoreRebindReplayState::Pending
@@ -6237,10 +6365,12 @@ impl KernelComposition {
                                     && after.receipt.as_deref()
                                         == Some(query.request_digest.as_str()) =>
                             {
-                                Some(
-                                    store_rebind_receipt_from_ors_record(&after)
-                                        .map_err(|_| TransportError::SessionFenced)?,
-                                )
+                                Self::validate_store_rebind_ors_record_admission(
+                                    &request, query, &after,
+                                )?;
+                                let receipt = store_rebind_receipt_from_ors_record(&after)
+                                    .map_err(|_| TransportError::SessionFenced)?;
+                                Some(receipt)
                             }
                             _ => return Err(TransportError::SessionFenced),
                         }

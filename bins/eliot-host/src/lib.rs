@@ -2339,7 +2339,13 @@ impl HostJobBranches {
         }
         self.kernel_candidate = Some(candidate);
         self.kernel_activation_receipt = Some(activation_receipt.clone());
-        self.reconcile_store_rebind_records(generation, journal)?;
+        self.reconcile_store_rebind_records(
+            generation,
+            journal,
+            host,
+            activation_id,
+            activation_generation,
+        )?;
         Ok((activation_receipt, ready))
     }
 
@@ -2438,14 +2444,32 @@ impl HostJobBranches {
         receipt
             .validate()
             .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        if receipt.candidate_binding_digest != candidate_digest
+            || receipt.generation != authority_generation
+            || receipt.authority_epoch != candidate.kernel_epoch
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store rebind exact query receipt candidate lineage mismatch".to_owned(),
+            ));
+        }
         Ok(Some(receipt))
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exact Store recovery keeps Host journal, candidate, peer and terminal disposition checks in one boundary"
+    )]
     fn reconcile_store_rebind_records<B: JournalBackend>(
         &self,
         generation: &PlatformHandle,
         journal: &HostStateJournalService<B>,
+        host: &HostInstallationEpoch,
+        activation_id: &PlatformHandle,
+        activation_generation: &EpochTransition,
     ) -> Result<(), HostError> {
         let records = journal
             .snapshot()?
@@ -2471,6 +2495,10 @@ impl HostJobBranches {
                 "Store rebind startup recovery has no Kernel candidate".to_owned(),
             )
         })?;
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let active_fence = record_fence(host, activation_id, activation_generation);
         let kernel = self.kernel.as_ref().ok_or_else(|| {
             HostError::RecoveryRequired(
                 "Store rebind startup recovery has no live Kernel".to_owned(),
@@ -2489,6 +2517,24 @@ impl HostJobBranches {
         let mut unknown = Vec::new();
         runtime.block_on(async {
             for record in records {
+                if record.fence != active_fence
+                    || record.candidate_binding_digest.as_str() != candidate_digest
+                {
+                    let operation_id = record.operation_id.clone();
+                    let request_digest = record.request_digest.as_str().to_owned();
+                    persist_store_rebind_disposition(
+                        journal,
+                        &operation_id,
+                        &request_digest,
+                        StoreRebindState::Unknown,
+                    )?;
+                    unknown.push(format!(
+                        "{}:{}: Store rebind journal lineage is not the active Host candidate",
+                        operation_id.as_str(),
+                        request_digest
+                    ));
+                    continue;
+                }
                 let result = Self::query_store_rebind_exact(
                     &record.operation_id,
                     record.request_digest.as_str(),
@@ -2587,7 +2633,13 @@ impl HostJobBranches {
                 "Store Job observation does not contain exact relaunched Store process".to_owned(),
             ));
         }
-        self.reconcile_store_rebind_records(generation, journal)?;
+        self.reconcile_store_rebind_records(
+            generation,
+            journal,
+            host,
+            activation_id,
+            activation_generation,
+        )?;
         let candidate_digest = candidate
             .compute_digest()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -2932,6 +2984,11 @@ impl HostJobBranches {
                 || final_receipt.generation != launch.authority_generation
                 || final_receipt.authority_epoch != candidate.kernel_epoch
                 || final_receipt.store_fence != store_fence
+                || final_receipt.process_binding.process.process_id != store_process.process_id
+                || final_receipt.process_binding.process.start_time_100ns
+                    != store_process.start_time_100ns
+                || final_receipt.process_binding.process.image_path != store_process.image_path
+                || final_receipt.process_binding.job.as_str() != store.job_identity().name()
             {
                 return Err(HostError::ProcessContour(
                     "Store rebind receipt binding mismatch".to_owned(),
@@ -4953,6 +5010,11 @@ fn append_store_rebind_terminal<B: JournalBackend>(
                 || receipt.requirement_digest != record.requirement.as_str()
                 || receipt.candidate_binding_digest != record.candidate_binding_digest.as_str()
                 || receipt.store_fence != record.store_fence.as_str()
+                || receipt.process_binding.process.process_id != record.process_id
+                || receipt.process_binding.process.start_time_100ns
+                    != record.process_start_time_100ns
+                || receipt.process_binding.process.image_path != record.process_image_path.as_str()
+                || receipt.process_binding.job != record.job_name
                 || receipt.generation.value() != record.generation
                 || receipt.authority_epoch.value() != record.authority_epoch
             {
@@ -10018,6 +10080,36 @@ mod journal_tests {
                 .unwrap()
                 .state,
             StoreRebindState::Pending
+        );
+
+        let third = make_pending("store-rebind-third", &"f".repeat(64));
+        append_reconciled(&journal, HostStateRecord::StoreRebind(third.clone())).unwrap();
+        let mut substituted_receipt = StoreRebindReceipt {
+            operation_id: third.operation_id.clone(),
+            request_digest: third.request_digest.as_str().to_owned(),
+            requirement_digest: third.requirement.as_str().to_owned(),
+            process_binding: StoreProcessBinding {
+                process: HostProcessBinding {
+                    process_id: third.process_id,
+                    start_time_100ns: third.process_start_time_100ns,
+                    image_path: third.process_image_path.as_str().to_owned(),
+                },
+                job: third.job_name.clone(),
+            },
+            candidate_binding_digest: third.candidate_binding_digest.as_str().to_owned(),
+            generation: ResourceGeneration::new(third.generation).unwrap(),
+            authority_epoch: AuthorityEpoch::new(third.authority_epoch).unwrap(),
+            store_fence: third.store_fence.as_str().to_owned(),
+        };
+        substituted_receipt.process_binding.process.process_id += 1;
+        assert!(
+            append_store_rebind_terminal(
+                &journal,
+                third,
+                StoreRebindState::Committed,
+                Some(&substituted_receipt),
+            )
+            .is_err()
         );
     }
 }
