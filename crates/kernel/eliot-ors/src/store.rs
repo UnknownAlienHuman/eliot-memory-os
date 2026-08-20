@@ -756,13 +756,7 @@ impl RedbRecoveryStore {
                                 reason: "committed receipt replacement rejected".to_owned(),
                             });
                         }
-                        // The first durable commit order is authoritative;
-                        // retries cannot overwrite it with a caller-local
-                        // zero or a different order.
                         next = existing.clone();
-                        if next.commit_order == 0 {
-                            next.commit_order = Self::next_operational_order(&write)?;
-                        }
                     }
                     _ => {
                         return Err(OrsError::IntegrityProblem {
@@ -828,6 +822,33 @@ impl RedbRecoveryStore {
             records.push(record);
         }
         Ok(records)
+    }
+
+    pub fn insert_store_rebind_legacy_for_test(
+        &self,
+        record: &crate::StoreRebindReplayRecord,
+    ) -> Result<(), OrsError> {
+        record.validate()?;
+        if record.state != crate::StoreRebindReplayState::Committed {
+            return Err(OrsError::InvalidField {
+                field: "store_rebind_state",
+                reason: "legacy insert requires committed",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut table = write.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
+            let key = format!(
+                "{}::{}",
+                record.operation_id.as_str(),
+                record.request_digest.clone()
+            );
+            let payload = encode(record)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)
     }
 
     /// Test-only admission hook without a freshness check.

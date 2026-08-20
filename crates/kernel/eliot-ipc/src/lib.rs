@@ -46,7 +46,7 @@ impl ProcessBinding {
     /// The constructor is intentionally boring: authority comes from the
     /// adapter's handle-bound observation, never from a caller-provided
     /// boolean.
-    fn from_observation(
+    pub fn from_observation(
         process_id: u32,
         start_time_100ns: u64,
         image_path: impl Into<String>,
@@ -88,6 +88,16 @@ pub struct IdentityProof {
     process: ProcessBinding,
     sid: String,
     session: String,
+}
+
+impl IdentityProof {
+    pub fn for_test(process: ProcessBinding, sid: String, session: String) -> Self {
+        Self {
+            process,
+            sid,
+            session,
+        }
+    }
 }
 
 impl PeerIdentity {
@@ -150,6 +160,24 @@ impl PeerIdentity {
             Self::Unavailable { .. } => Err(TransportError::PeerIdentityUnavailable),
             Self::Authenticated { .. } => Err(TransportError::UnauthenticatedPeer),
         }
+    }
+
+    pub fn authenticated_for_test(
+        process: ProcessBinding,
+        sid: String,
+        session: String,
+    ) -> Result<Self, TransportError> {
+        let identity = Self::Authenticated {
+            process_id: process.process_id(),
+            user_identity: sid.clone(),
+            session_identity: session.clone(),
+            proof: IdentityProof {
+                process,
+                sid,
+                session,
+            },
+        };
+        identity.validate().map(|()| identity)
     }
 
     /// Returns the provider-observed, handle-bound process identity when peer

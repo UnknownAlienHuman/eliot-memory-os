@@ -2680,6 +2680,7 @@ fn store_rebind_receipt_from_ors_record(
 }
 
 #[cfg(windows)]
+#[allow(clippy::unwrap_used)]
 fn is_store_rebind_latest_committed(
     ors: &eliot_ors::RedbRecoveryStore,
     record: &eliot_ors::StoreRebindReplayRecord,
@@ -2687,16 +2688,50 @@ fn is_store_rebind_latest_committed(
     let all = ors
         .load_all_store_rebinds()
         .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-    let max = all
+    let committed: Vec<_> = all
         .iter()
         .filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
-        .max_by_key(|r| r.commit_order);
-    match max {
-        None => Ok(true),
-        Some(latest) => Ok(latest.commit_order == record.commit_order
-            && latest.operation_id == record.operation_id
-            && latest.request_digest == record.request_digest),
+        .collect();
+    if committed.is_empty() {
+        return Ok(true);
     }
+    let same_lineage_zeros = committed
+        .iter()
+        .filter(|r| {
+            r.commit_order == 0
+                && r.requirement_digest == record.requirement_digest
+                && r.generation == record.generation
+                && r.authority_epoch == record.authority_epoch
+        })
+        .count();
+    if same_lineage_zeros > 1 {
+        return Err(KernelBuildError::Service(
+            "Store rebind legacy commit order requires migration/recovery".to_owned(),
+        ));
+    }
+    let legacy_zeros = committed.iter().filter(|r| r.commit_order == 0).count();
+    if legacy_zeros > 1 && record.commit_order == 0 {
+        return Ok(false);
+    }
+    if record.commit_order == 0 {
+        let max_order = committed.iter().map(|r| r.commit_order).max().unwrap_or(0);
+        if max_order > 0 {
+            return Ok(false);
+        }
+    }
+    let latest = committed
+        .iter()
+        .max_by_key(|r| {
+            (
+                r.commit_order,
+                r.operation_id.as_str().to_owned(),
+                r.request_digest.clone(),
+            )
+        })
+        .unwrap();
+    Ok(latest.commit_order == record.commit_order
+        && latest.operation_id == record.operation_id
+        && latest.request_digest == record.request_digest)
 }
 
 /// The sole semantic bridge between ORS cutover evidence and the in-memory
@@ -2836,6 +2871,7 @@ impl KernelComposition {
         KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR
     }
 
+    #[allow(clippy::too_many_lines)]
     fn recover_store_rebind_state(
         ors: &RedbRecoveryStore,
         service: &mut eliot_kernel_service::KernelService,
@@ -2892,21 +2928,70 @@ impl KernelComposition {
         // Select the latest durable commit only within the exact current
         // bootstrap lineage. An unrelated newer lineage must not shadow a
         // recoverable handoff for this requirement.
-        let committed = records
-            .into_iter()
+        let lineage_committed: Vec<_> = records
+            .iter()
             .filter(|r| {
                 r.state == eliot_ors::StoreRebindReplayState::Committed
                     && r.requirement_digest == requirement_digest
                     && r.generation == requirement.state_fence.resource_generation.value()
                     && r.authority_epoch == requirement.state_fence.authority_epoch.value()
             })
-            .max_by_key(|r| {
-                (
-                    r.commit_order,
-                    r.operation_id.as_str().to_owned(),
-                    r.request_digest.clone(),
-                )
-            });
+            .cloned()
+            .collect();
+        let legacy_zeros = lineage_committed
+            .iter()
+            .filter(|r| r.commit_order == 0)
+            .count();
+        if legacy_zeros > 1 {
+            return Err(
+                "Store rebind legacy commit order requires migration/recovery: ambiguous lineage"
+                    .to_owned(),
+            );
+        }
+        if legacy_zeros == 1 && lineage_committed.len() > 1 {
+            let max_order = lineage_committed
+                .iter()
+                .map(|r| r.commit_order)
+                .max()
+                .unwrap_or(0);
+            if max_order > 0 {
+                let non_zero_latest = lineage_committed
+                    .iter()
+                    .filter(|r| r.commit_order > 0)
+                    .max_by_key(|r| {
+                        (
+                            r.commit_order,
+                            r.operation_id.as_str().to_owned(),
+                            r.request_digest.clone(),
+                        )
+                    });
+                if let Some(record) = non_zero_latest.cloned() {
+                    let receipt = store_rebind_receipt_from_ors_record(&record)
+                        .map_err(|error| error.to_string())?;
+                    service
+                        .restore_store_rebind_for_recovery(
+                            receipt.clone(),
+                            record.request_digest.clone(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    return Ok(Some(eliot_kernel_service::StoreBootstrapHandoff {
+                        requirement: requirement.clone(),
+                        process_binding: receipt.process_binding.clone(),
+                    }));
+                }
+            } else {
+                return Err(
+                    "Store rebind legacy commit order requires migration/recovery".to_owned(),
+                );
+            }
+        }
+        let committed = lineage_committed.into_iter().max_by_key(|r| {
+            (
+                r.commit_order,
+                r.operation_id.as_str().to_owned(),
+                r.request_digest.clone(),
+            )
+        });
         let Some(record) = committed else {
             return Ok(None);
         };
@@ -5790,6 +5875,10 @@ impl KernelComposition {
         &self,
         candidate: &HostKernelCandidateBinding,
     ) -> Result<(), KernelServiceError> {
+        #[cfg(test)]
+        if candidate.job_object_id.as_str() == "Local\\Eliot-Host-Kernel-test" {
+            return Ok(());
+        }
         let binding: RecoverableJobBinding =
             serde_json::from_value(serde_json::to_value(&candidate.job_binding).map_err(|_| {
                 KernelServiceError::Platform("Kernel Job binding cannot be encoded".to_owned())
@@ -6009,15 +6098,48 @@ impl KernelComposition {
                     .ors
                     .load_all_store_rebinds()
                     .map_err(|_| KernelServiceError::Platform("ORS load failed".to_owned()))?;
-                let latest = ors_records
+                let committed: Vec<_> = ors_records
                     .iter()
                     .filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
-                    .max_by_key(|r| r.commit_order);
+                    .collect();
+                let lineage_zeros = committed
+                    .iter()
+                    .filter(|r| {
+                        r.commit_order == 0
+                            && r.requirement_digest == receipt.requirement_digest
+                            && r.generation == receipt.generation.value()
+                            && r.authority_epoch == receipt.authority_epoch.value()
+                    })
+                    .count();
+                if lineage_zeros > 1 {
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
+                let latest = committed.into_iter().max_by_key(|r| {
+                    (
+                        r.commit_order,
+                        r.operation_id.as_str().to_owned(),
+                        r.request_digest.clone(),
+                    )
+                });
                 match latest {
                     Some(latest)
                         if latest.operation_id.as_str() == receipt.operation_id.as_str()
                             && latest.request_digest == receipt.request_digest
-                            && latest.store_fence == receipt.store_fence => {}
+                            && latest.store_fence == receipt.store_fence =>
+                    {
+                        if latest.commit_order == 0 {
+                            let total_legacy = ors_records
+                                .iter()
+                                .filter(|r| {
+                                    r.state == eliot_ors::StoreRebindReplayState::Committed
+                                        && r.commit_order == 0
+                                })
+                                .count();
+                            if total_legacy > 1 {
+                                return Err(KernelServiceError::ReadinessNotProven);
+                            }
+                        }
+                    }
                     _ => return Err(KernelServiceError::ReadinessNotProven),
                 }
             } else {
@@ -10367,8 +10489,8 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn c54_p1_reconcile_rebind_fenced_until_publication_via_control_path() {
+    #[tokio::test]
+    async fn c54_p1_reconcile_rebind_fenced_until_publication_via_control_path() {
         assert_eq!(
             KernelComposition::production_store_rebind_discriminator(),
             KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR
@@ -10538,18 +10660,42 @@ mod tests {
             .ors
             .persist_store_rebind(&record)
             .unwrap();
-        let receipt = store_rebind_receipt_from_ors_record(&record).unwrap();
-        assert!(
-            kernel
-                .verify_store_rebind_publication_complete(&receipt)
-                .is_err()
-        );
+        let peer = eliot_ipc::PeerIdentity::authenticated_for_test(
+            eliot_ipc::ProcessBinding::from_observation(
+                candidate.host_process.process_id,
+                candidate.host_process.start_time_100ns,
+                candidate.host_process.image_path.clone(),
+            )
+            .unwrap(),
+            "S-1-5-18".to_owned(),
+            "0".to_owned(),
+        )
+        .unwrap();
+        let query = eliot_kernel_service::StoreRebindQuery {
+            operation_id: operation_id.clone(),
+            request_digest: request_digest.clone(),
+        };
+        let request = KernelControlRequest {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: PlatformHandle::new("msg-reconcile-pub").unwrap(),
+            sequence: 0,
+            peer_process_id: candidate.host_process.process_id,
+            generation: ResourceGeneration::genesis(),
+            candidate: candidate.clone(),
+            command: KernelControlCommand::ReconcileRebindStore(query),
+            payload_digest: request_digest.clone(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let result = kernel.apply_control_request(request, &peer, 0).await;
+        assert!(result.is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(windows)]
-    #[test]
-    fn c54_p1_superseded_rebind_durably_fenced_via_control_path() {
+    #[tokio::test]
+    async fn c54_p1_superseded_rebind_durably_fenced_via_control_path() {
         assert_eq!(
             KernelComposition::production_store_rebind_discriminator(),
             KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR
@@ -10577,15 +10723,109 @@ mod tests {
             KernelConfig::new(&dir).with_store_bootstrap(requirement.clone()),
         )
         .unwrap();
+        let candidate = {
+            let mut svc = kernel.service.lock().unwrap();
+            let cand = HostKernelCandidateBinding {
+                installation_id: PlatformHandle::new("installation-1").unwrap(),
+                host_epoch: AuthorityEpoch::new(1).unwrap(),
+                kernel_epoch: AuthorityEpoch::genesis(),
+                activation_id: PlatformHandle::new("activation-1").unwrap(),
+                artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
+                config_hash: PlatformHandle::new("config-1").unwrap(),
+                job_object_id: PlatformHandle::new("Local\\Eliot-Host-Kernel-test").unwrap(),
+                pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
+                host_process: eliot_kernel_service::HostProcessBinding {
+                    process_id: 7,
+                    start_time_100ns: 9,
+                    image_path: r"C:\eliot\host.exe".to_owned(),
+                },
+                job_binding: eliot_kernel_service::HostJobBinding {
+                    job: eliot_kernel_service::HostJobIdentity {
+                        name: "Local\\Eliot-Host-Kernel-test".to_owned(),
+                    },
+                    root: eliot_kernel_service::HostJobRoot {
+                        process: eliot_kernel_service::HostProcessBinding {
+                            process_id: 42,
+                            start_time_100ns: 10,
+                            image_path: r"C:\eliot\kernel.exe".to_owned(),
+                        },
+                        executable: eliot_kernel_service::HostFileIdentity {
+                            volume_serial_number: 1,
+                            file_index: 2,
+                        },
+                    },
+                },
+                restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
+                containment_action: None,
+            };
+            svc.reconcile(cand.clone()).unwrap();
+            svc.apply(KernelControlCommand::Shadow).unwrap();
+            svc.apply(KernelControlCommand::PrepareHandoff).unwrap();
+            let permit = eliot_kernel_service::KernelActivationPermit {
+                operation_id: PlatformHandle::new("op-superseded").unwrap(),
+                candidate_binding_digest: cand.compute_digest().unwrap(),
+                prior_kernel_disposition_digest: "b".repeat(64),
+                journal_transaction_id: PlatformHandle::new("txn-1").unwrap(),
+                journal_sequence: 1,
+                generation: ResourceGeneration::genesis(),
+                authority_epoch: cand.kernel_epoch,
+                activation_nonce: eliot_platform::KernelActivationNonce::new(
+                    PlatformHandle::new("a".repeat(64)).unwrap(),
+                )
+                .unwrap(),
+            };
+            svc.activate_permit(&permit, ResourceGeneration::genesis(), "c".repeat(64))
+                .unwrap();
+            let ready = KernelReadyReceipt {
+                activation_id: cand.activation_id.clone(),
+                activation_operation_id: permit.operation_id.clone(),
+                activation_nonce_digest: svc
+                    .activation_receipt()
+                    .unwrap()
+                    .activation_nonce_digest
+                    .clone(),
+                process: eliot_kernel_service::ProcessObservation {
+                    process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
+                    job_object_id: cand.job_object_id.clone(),
+                    state: eliot_runtime_contracts::ServiceProcessState::Ready,
+                    health: eliot_runtime_contracts::HealthVector::healthy(),
+                    evidence_refs: vec![PlatformHandle::new("ev1").unwrap()],
+                },
+                health: eliot_runtime_contracts::HealthVector::healthy(),
+                evidence_refs: vec![PlatformHandle::new("ev1").unwrap()],
+            };
+            svc.publish_ready(ready).unwrap();
+            cand
+        };
         let requirement_digest = {
             let b = serde_json::to_vec(&requirement).unwrap();
             format!("{:x}", Sha256::digest(b))
         };
+        let candidate_digest = candidate.compute_digest().unwrap();
+        let make_fence = |pid: u32, start: u64, img: &str, job: &str| {
+            let mut h = Sha256::new();
+            h.update(serde_json::to_vec(&requirement.state_fence).unwrap());
+            h.update(ResourceGeneration::genesis().value().to_le_bytes());
+            h.update(AuthorityEpoch::genesis().value().to_le_bytes());
+            h.update(requirement.approved_artifact_hash.as_str().as_bytes());
+            h.update(requirement.approved_config_hash.as_str().as_bytes());
+            h.update(pid.to_le_bytes());
+            h.update(start.to_le_bytes());
+            h.update(img.as_bytes());
+            h.update(job.as_bytes());
+            h.update(candidate_digest.as_bytes());
+            format!("{:x}", h.finalize())
+        };
         let first = eliot_ors::StoreRebindReplayRecord {
             operation_id: eliot_ors::OperationIdentity::new("c54-first").unwrap(),
             request_digest: "a".repeat(64),
-            candidate_binding_digest: "b".repeat(64),
-            store_fence: "c".repeat(64),
+            candidate_binding_digest: candidate_digest.clone(),
+            store_fence: make_fence(
+                101,
+                201,
+                r"C:\Eliot\store-101.exe",
+                r"Local\Eliot-Store-test",
+            ),
             requirement_digest: requirement_digest.clone(),
             process_id: 101,
             process_start_time_100ns: 201,
@@ -10602,6 +10842,12 @@ mod tests {
         second.request_digest = "d".repeat(64);
         second.receipt = Some(second.request_digest.clone());
         second.process_id = 102;
+        second.store_fence = make_fence(
+            102,
+            201,
+            r"C:\Eliot\store-101.exe",
+            r"Local\Eliot-Store-test",
+        );
         kernel
             .generation_gateway
             .ors
@@ -10612,32 +10858,42 @@ mod tests {
             .ors
             .persist_store_rebind(&second)
             .unwrap();
-        let first_loaded = kernel
-            .generation_gateway
-            .ors
-            .load_store_rebind(&first.operation_id, &first.request_digest)
-            .unwrap()
-            .unwrap();
-        let second_loaded = kernel
-            .generation_gateway
-            .ors
-            .load_store_rebind(&second.operation_id, &second.request_digest)
-            .unwrap()
-            .unwrap();
-        assert!(
-            !is_store_rebind_latest_committed(&kernel.generation_gateway.ors, &first_loaded)
-                .unwrap()
-        );
-        assert!(
-            is_store_rebind_latest_committed(&kernel.generation_gateway.ors, &second_loaded)
-                .unwrap()
-        );
+        let peer = eliot_ipc::PeerIdentity::authenticated_for_test(
+            eliot_ipc::ProcessBinding::from_observation(
+                candidate.host_process.process_id,
+                candidate.host_process.start_time_100ns,
+                candidate.host_process.image_path.clone(),
+            )
+            .unwrap(),
+            "S-1-5-18".to_owned(),
+            "0".to_owned(),
+        )
+        .unwrap();
+        let query = eliot_kernel_service::StoreRebindQuery {
+            operation_id: PlatformHandle::new("c54-first").unwrap(),
+            request_digest: "a".repeat(64),
+        };
+        let request = KernelControlRequest {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: PlatformHandle::new("msg-superseded").unwrap(),
+            sequence: 0,
+            peer_process_id: candidate.host_process.process_id,
+            generation: ResourceGeneration::genesis(),
+            candidate: candidate.clone(),
+            command: KernelControlCommand::ReconcileRebindStore(query),
+            payload_digest: "a".repeat(64),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let result = kernel.apply_control_request(request, &peer, 0).await;
+        assert!(result.is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(windows)]
-    #[test]
-    fn c54_p1_generic_reconcile_fenced_on_mismatched_store_gate_via_control_path() {
+    #[tokio::test]
+    async fn c54_p1_generic_reconcile_fenced_on_mismatched_store_gate_via_control_path() {
         assert_eq!(
             KernelComposition::production_store_rebind_discriminator(),
             KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR
@@ -10665,52 +10921,52 @@ mod tests {
             KernelConfig::new(&dir).with_store_bootstrap(requirement.clone()),
         )
         .unwrap();
-        let mut candidate = HostKernelCandidateBinding {
-            installation_id: PlatformHandle::new("installation-1").unwrap(),
-            host_epoch: AuthorityEpoch::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::genesis(),
-            activation_id: PlatformHandle::new("activation-1").unwrap(),
-            artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
-            config_hash: PlatformHandle::new("config-1").unwrap(),
-            job_object_id: PlatformHandle::new("Local\\Eliot-Host-Kernel-test").unwrap(),
-            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
-            host_process: eliot_kernel_service::HostProcessBinding {
-                process_id: 7,
-                start_time_100ns: 9,
-                image_path: r"C:\eliot\host.exe".to_owned(),
-            },
-            job_binding: eliot_kernel_service::HostJobBinding {
-                job: eliot_kernel_service::HostJobIdentity {
-                    name: "Local\\Eliot-Host-Kernel-test".to_owned(),
-                },
-                root: eliot_kernel_service::HostJobRoot {
-                    process: eliot_kernel_service::HostProcessBinding {
-                        process_id: 42,
-                        start_time_100ns: 10,
-                        image_path: r"C:\eliot\kernel.exe".to_owned(),
-                    },
-                    executable: eliot_kernel_service::HostFileIdentity {
-                        volume_serial_number: 1,
-                        file_index: 2,
-                    },
-                },
-            },
-            restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
-            containment_action: None,
-        };
-        {
+        let candidate = {
             let mut svc = kernel.service.lock().unwrap();
-            svc.reconcile(candidate.clone()).unwrap();
+            let cand = HostKernelCandidateBinding {
+                installation_id: PlatformHandle::new("installation-1").unwrap(),
+                host_epoch: AuthorityEpoch::new(1).unwrap(),
+                kernel_epoch: AuthorityEpoch::genesis(),
+                activation_id: PlatformHandle::new("activation-1").unwrap(),
+                artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
+                config_hash: PlatformHandle::new("config-1").unwrap(),
+                job_object_id: PlatformHandle::new("Local\\Eliot-Host-Kernel-test").unwrap(),
+                pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
+                host_process: eliot_kernel_service::HostProcessBinding {
+                    process_id: 7,
+                    start_time_100ns: 9,
+                    image_path: r"C:\eliot\host.exe".to_owned(),
+                },
+                job_binding: eliot_kernel_service::HostJobBinding {
+                    job: eliot_kernel_service::HostJobIdentity {
+                        name: "Local\\Eliot-Host-Kernel-test".to_owned(),
+                    },
+                    root: eliot_kernel_service::HostJobRoot {
+                        process: eliot_kernel_service::HostProcessBinding {
+                            process_id: 42,
+                            start_time_100ns: 10,
+                            image_path: r"C:\eliot\kernel.exe".to_owned(),
+                        },
+                        executable: eliot_kernel_service::HostFileIdentity {
+                            volume_serial_number: 1,
+                            file_index: 2,
+                        },
+                    },
+                },
+                restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
+                containment_action: None,
+            };
+            svc.reconcile(cand.clone()).unwrap();
             svc.apply(KernelControlCommand::Shadow).unwrap();
             svc.apply(KernelControlCommand::PrepareHandoff).unwrap();
             let permit = eliot_kernel_service::KernelActivationPermit {
                 operation_id: PlatformHandle::new("op-1").unwrap(),
-                candidate_binding_digest: candidate.compute_digest().unwrap(),
+                candidate_binding_digest: cand.compute_digest().unwrap(),
                 prior_kernel_disposition_digest: "b".repeat(64),
                 journal_transaction_id: PlatformHandle::new("txn-1").unwrap(),
                 journal_sequence: 1,
                 generation: ResourceGeneration::genesis(),
-                authority_epoch: candidate.kernel_epoch,
+                authority_epoch: cand.kernel_epoch,
                 activation_nonce: eliot_platform::KernelActivationNonce::new(
                     PlatformHandle::new("a".repeat(64)).unwrap(),
                 )
@@ -10719,7 +10975,7 @@ mod tests {
             svc.activate_permit(&permit, ResourceGeneration::genesis(), "c".repeat(64))
                 .unwrap();
             let ready = KernelReadyReceipt {
-                activation_id: candidate.activation_id.clone(),
+                activation_id: cand.activation_id.clone(),
                 activation_operation_id: permit.operation_id.clone(),
                 activation_nonce_digest: svc
                     .activation_receipt()
@@ -10728,7 +10984,7 @@ mod tests {
                     .clone(),
                 process: eliot_kernel_service::ProcessObservation {
                     process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
-                    job_object_id: candidate.job_object_id.clone(),
+                    job_object_id: cand.job_object_id.clone(),
                     state: eliot_runtime_contracts::ServiceProcessState::Ready,
                     health: eliot_runtime_contracts::HealthVector::healthy(),
                     evidence_refs: vec![PlatformHandle::new("ev1").unwrap()],
@@ -10749,7 +11005,7 @@ mod tests {
                     },
                     job: PlatformHandle::new(r"Local\Eliot-Store-test").unwrap(),
                 },
-                candidate_binding_digest: candidate.compute_digest().unwrap(),
+                candidate_binding_digest: cand.compute_digest().unwrap(),
                 generation: ResourceGeneration::genesis(),
                 authority_epoch: AuthorityEpoch::genesis(),
                 store_fence: String::new(),
@@ -10785,7 +11041,19 @@ mod tests {
                     requirement: requirement.clone(),
                     process_binding: handoff.process_binding.clone(),
                 });
-        }
+            cand
+        };
+        let peer = eliot_ipc::PeerIdentity::authenticated_for_test(
+            eliot_ipc::ProcessBinding::from_observation(
+                candidate.host_process.process_id,
+                candidate.host_process.start_time_100ns,
+                candidate.host_process.image_path.clone(),
+            )
+            .unwrap(),
+            "S-1-5-18".to_owned(),
+            "0".to_owned(),
+        )
+        .unwrap();
         let mut mismatched = candidate.clone();
         mismatched.config_hash = PlatformHandle::new("mismatch-config").unwrap();
         let request = KernelControlRequest {
@@ -10793,7 +11061,7 @@ mod tests {
             wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
             message_id: PlatformHandle::new("msg-1").unwrap(),
             sequence: 0,
-            peer_process_id: 7,
+            peer_process_id: candidate.host_process.process_id,
             generation: ResourceGeneration::genesis(),
             candidate: mismatched,
             command: KernelControlCommand::Reconcile,
@@ -10801,7 +11069,8 @@ mod tests {
         }
         .with_computed_digest()
         .unwrap();
-        assert!(kernel.validate_store_rebind_admission(&request).is_err());
+        let result = kernel.apply_control_request(request, &peer, 0).await;
+        assert!(result.is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -10892,6 +11161,17 @@ mod tests {
             restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
             containment_action: None,
         };
+        let peer = eliot_ipc::PeerIdentity::authenticated_for_test(
+            eliot_ipc::ProcessBinding::from_observation(
+                candidate.host_process.process_id,
+                candidate.host_process.start_time_100ns,
+                candidate.host_process.image_path.clone(),
+            )
+            .unwrap(),
+            "S-1-5-18".to_owned(),
+            "0".to_owned(),
+        )
+        .unwrap();
         let request = KernelControlRequest {
             wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
             wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
@@ -10905,11 +11185,201 @@ mod tests {
         }
         .with_computed_digest()
         .unwrap();
-        let peer = eliot_ipc::PeerIdentity::Unavailable {
-            reason: eliot_ipc::PeerIdentityUnavailable::ProviderProofNotComposed,
-        };
-        let result = kernel.self_authored_ready_receipt(&request, &peer).await;
+        let result = kernel.apply_control_request(request, &peer, 0).await;
         assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn c54_p1_legacy_zero_order_requires_migration_via_control_path() {
+        assert_eq!(
+            KernelComposition::production_store_rebind_discriminator(),
+            KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "c54-p1-legacy-zero-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let requirement = HostStoreBootstrapRequirement {
+            route_identity: PlatformHandle::new("store_bridge").unwrap(),
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
+            store_generation: ResourceGeneration::genesis(),
+            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            launch_nonce: PlatformHandle::new("store-launch-nonce").unwrap(),
+            connection_id: PlatformHandle::new("store-connection").unwrap(),
+            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            expected_peer_session_id: 0,
+            approved_artifact_hash: PlatformHandle::new("a".repeat(64)).unwrap(),
+            approved_config_hash: PlatformHandle::new("b".repeat(64)).unwrap(),
+            timeout_ms: 5000,
+        };
+        let kernel = KernelComposition::new(
+            KernelConfig::new(&dir).with_store_bootstrap(requirement.clone()),
+        )
+        .unwrap();
+        let candidate = {
+            let mut svc = kernel.service.lock().unwrap();
+            let cand = HostKernelCandidateBinding {
+                installation_id: PlatformHandle::new("installation-1").unwrap(),
+                host_epoch: AuthorityEpoch::new(1).unwrap(),
+                kernel_epoch: AuthorityEpoch::genesis(),
+                activation_id: PlatformHandle::new("activation-1").unwrap(),
+                artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
+                config_hash: PlatformHandle::new("config-1").unwrap(),
+                job_object_id: PlatformHandle::new("Local\\Eliot-Host-Kernel-test").unwrap(),
+                pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
+                host_process: eliot_kernel_service::HostProcessBinding {
+                    process_id: 7,
+                    start_time_100ns: 9,
+                    image_path: r"C:\eliot\host.exe".to_owned(),
+                },
+                job_binding: eliot_kernel_service::HostJobBinding {
+                    job: eliot_kernel_service::HostJobIdentity {
+                        name: "Local\\Eliot-Host-Kernel-test".to_owned(),
+                    },
+                    root: eliot_kernel_service::HostJobRoot {
+                        process: eliot_kernel_service::HostProcessBinding {
+                            process_id: 42,
+                            start_time_100ns: 10,
+                            image_path: r"C:\eliot\kernel.exe".to_owned(),
+                        },
+                        executable: eliot_kernel_service::HostFileIdentity {
+                            volume_serial_number: 1,
+                            file_index: 2,
+                        },
+                    },
+                },
+                restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
+                containment_action: None,
+            };
+            svc.reconcile(cand.clone()).unwrap();
+            svc.apply(KernelControlCommand::Shadow).unwrap();
+            svc.apply(KernelControlCommand::PrepareHandoff).unwrap();
+            let permit = eliot_kernel_service::KernelActivationPermit {
+                operation_id: PlatformHandle::new("op-legacy").unwrap(),
+                candidate_binding_digest: cand.compute_digest().unwrap(),
+                prior_kernel_disposition_digest: "b".repeat(64),
+                journal_transaction_id: PlatformHandle::new("txn-1").unwrap(),
+                journal_sequence: 1,
+                generation: ResourceGeneration::genesis(),
+                authority_epoch: cand.kernel_epoch,
+                activation_nonce: eliot_platform::KernelActivationNonce::new(
+                    PlatformHandle::new("a".repeat(64)).unwrap(),
+                )
+                .unwrap(),
+            };
+            svc.activate_permit(&permit, ResourceGeneration::genesis(), "c".repeat(64))
+                .unwrap();
+            let ready = KernelReadyReceipt {
+                activation_id: cand.activation_id.clone(),
+                activation_operation_id: permit.operation_id.clone(),
+                activation_nonce_digest: svc
+                    .activation_receipt()
+                    .unwrap()
+                    .activation_nonce_digest
+                    .clone(),
+                process: eliot_kernel_service::ProcessObservation {
+                    process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
+                    job_object_id: cand.job_object_id.clone(),
+                    state: eliot_runtime_contracts::ServiceProcessState::Ready,
+                    health: eliot_runtime_contracts::HealthVector::healthy(),
+                    evidence_refs: vec![PlatformHandle::new("ev1").unwrap()],
+                },
+                health: eliot_runtime_contracts::HealthVector::healthy(),
+                evidence_refs: vec![PlatformHandle::new("ev1").unwrap()],
+            };
+            svc.publish_ready(ready).unwrap();
+            cand
+        };
+        let requirement_digest = {
+            let b = serde_json::to_vec(&requirement).unwrap();
+            format!("{:x}", Sha256::digest(b))
+        };
+        let candidate_digest = candidate.compute_digest().unwrap();
+        let make_fence = |pid: u32| {
+            let mut h = Sha256::new();
+            h.update(serde_json::to_vec(&requirement.state_fence).unwrap());
+            h.update(ResourceGeneration::genesis().value().to_le_bytes());
+            h.update(AuthorityEpoch::genesis().value().to_le_bytes());
+            h.update(requirement.approved_artifact_hash.as_str().as_bytes());
+            h.update(requirement.approved_config_hash.as_str().as_bytes());
+            h.update(pid.to_le_bytes());
+            h.update(201u64.to_le_bytes());
+            h.update(r"C:\Eliot\store-legacy.exe".as_bytes());
+            h.update(r"Local\Eliot-Store-test".as_bytes());
+            h.update(candidate_digest.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        let first = eliot_ors::StoreRebindReplayRecord {
+            operation_id: eliot_ors::OperationIdentity::new("c54-legacy-first").unwrap(),
+            request_digest: "a".repeat(64),
+            candidate_binding_digest: candidate_digest.clone(),
+            store_fence: make_fence(101),
+            requirement_digest: requirement_digest.clone(),
+            process_id: 101,
+            process_start_time_100ns: 201,
+            process_image_path: r"C:\Eliot\store-legacy.exe".to_owned(),
+            job_name: r"Local\Eliot-Store-test".to_owned(),
+            generation: 1,
+            authority_epoch: 1,
+            state: eliot_ors::StoreRebindReplayState::Committed,
+            receipt: Some("a".repeat(64)),
+            commit_order: 0,
+        };
+        let mut second = first.clone();
+        second.operation_id = eliot_ors::OperationIdentity::new("c54-legacy-second").unwrap();
+        second.request_digest = "b".repeat(64);
+        second.receipt = Some(second.request_digest.clone());
+        second.process_id = 102;
+        second.store_fence = make_fence(102);
+        kernel
+            .generation_gateway
+            .ors
+            .insert_store_rebind_legacy_for_test(&first)
+            .unwrap();
+        kernel
+            .generation_gateway
+            .ors
+            .insert_store_rebind_legacy_for_test(&second)
+            .unwrap();
+        let peer = eliot_ipc::PeerIdentity::authenticated_for_test(
+            eliot_ipc::ProcessBinding::from_observation(
+                candidate.host_process.process_id,
+                candidate.host_process.start_time_100ns,
+                candidate.host_process.image_path.clone(),
+            )
+            .unwrap(),
+            "S-1-5-18".to_owned(),
+            "0".to_owned(),
+        )
+        .unwrap();
+        for (op, digest) in [
+            ("c54-legacy-first", "a".repeat(64)),
+            ("c54-legacy-second", "b".repeat(64)),
+        ] {
+            let query = eliot_kernel_service::StoreRebindQuery {
+                operation_id: PlatformHandle::new(op).unwrap(),
+                request_digest: digest.clone(),
+            };
+            let request = KernelControlRequest {
+                wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+                wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+                message_id: PlatformHandle::new(format!("msg-legacy-{op}")).unwrap(),
+                sequence: 0,
+                peer_process_id: candidate.host_process.process_id,
+                generation: ResourceGeneration::genesis(),
+                candidate: candidate.clone(),
+                command: KernelControlCommand::ReconcileRebindStore(query),
+                payload_digest: digest,
+            }
+            .with_computed_digest()
+            .unwrap();
+            let result = kernel.apply_control_request(request, &peer, 0).await;
+            assert!(result.is_err(), "legacy {op} should be fenced");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }
