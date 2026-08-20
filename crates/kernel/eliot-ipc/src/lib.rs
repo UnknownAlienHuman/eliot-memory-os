@@ -41,17 +41,11 @@ pub struct ProcessBinding {
 }
 
 impl ProcessBinding {
-    /// Creates the value observed by a trusted platform adapter.
-    ///
-    /// The constructor is intentionally boring: authority comes from the
-    /// adapter's handle-bound observation, never from a caller-provided
-    /// boolean.
-    pub fn from_observation(
+    fn from_observation_inner(
         process_id: u32,
         start_time_100ns: u64,
-        image_path: impl Into<String>,
+        image_path: String,
     ) -> Result<Self, TransportError> {
-        let image_path = image_path.into();
         if process_id == 0 || start_time_100ns == 0 || image_path.trim().is_empty() {
             return Err(TransportError::UnauthenticatedPeer);
         }
@@ -63,6 +57,28 @@ impl ProcessBinding {
             start_time_100ns,
             image_path,
         })
+    }
+
+    /// Creates the value observed by a trusted platform adapter.
+    ///
+    /// The constructor is intentionally boring: authority comes from the
+    /// adapter's handle-bound observation, never from a caller-provided
+    /// boolean.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_observation(
+        process_id: u32,
+        start_time_100ns: u64,
+        image_path: impl Into<String>,
+    ) -> Result<Self, TransportError> {
+        Self::from_observation_inner(process_id, start_time_100ns, image_path.into())
+    }
+
+    pub(crate) fn from_observation_for_platform(
+        process_id: u32,
+        start_time_100ns: u64,
+        image_path: String,
+    ) -> Result<Self, TransportError> {
+        Self::from_observation_inner(process_id, start_time_100ns, image_path)
     }
 
     #[must_use]
@@ -91,6 +107,7 @@ pub struct IdentityProof {
 }
 
 impl IdentityProof {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(process: ProcessBinding, sid: String, session: String) -> Self {
         Self {
             process,
@@ -106,7 +123,7 @@ impl PeerIdentity {
         evidence: &eliot_platform_windows::NamedPipePeerEvidence,
     ) -> Result<Self, TransportError> {
         let observed = evidence.process();
-        let process = ProcessBinding::from_observation(
+        let process = ProcessBinding::from_observation_for_platform(
             observed.process_id,
             observed.start_time_100ns,
             observed.image_path.clone(),
@@ -162,6 +179,7 @@ impl PeerIdentity {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn authenticated_for_test(
         process: ProcessBinding,
         sid: String,

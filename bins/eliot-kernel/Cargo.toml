@@ -33,6 +33,7 @@ sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+eliot-ipc = { workspace = true, features = ["test-support"] }
 eliot-ors = { workspace = true, features = ["test-support"] }
 
 [lints]

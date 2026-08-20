@@ -824,6 +824,7 @@ impl RedbRecoveryStore {
         Ok(records)
     }
 
+    #[cfg(feature = "test-support")]
     pub fn insert_store_rebind_legacy_for_test(
         &self,
         record: &crate::StoreRebindReplayRecord,
