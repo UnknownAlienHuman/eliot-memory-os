@@ -1652,6 +1652,7 @@ mod tests {
         roots: crate::RuntimeStateRoots,
     ) -> CandidateManifest {
         let epoch = make_epoch();
+        let kernel_artifact_digest = h("6".repeat(64));
         let mut desc = crate::RuntimeLaunchDescriptor {
             profile: crate::InstallationProfile::PortableDev,
             portable_root: Some(portable_root.clone()),
@@ -1666,7 +1667,7 @@ mod tests {
             authority_descriptor_digest: h("7".repeat(64)),
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
-            kernel_artifact_digest: h("0".repeat(64)),
+            kernel_artifact_digest: kernel_artifact_digest.clone(),
             eliotd_executable_path: test_path(portable_root.as_str(), "eliotd.exe"),
             eliotd_artifact_digest: h("8".repeat(64)),
             eliotd_config_path: test_path(portable_root.as_str(), "eliotd-governor.json"),
@@ -1727,7 +1728,7 @@ mod tests {
         CandidateManifest {
             generation: h("candidate"),
             components: vec![h("component:test")],
-            kernel_artifact_digest: h("0".repeat(64)),
+            kernel_artifact_digest,
             store_bridge_artifact_digest: h("1".repeat(64)),
             canonical_store_artifact_digest: h("5".repeat(64)),
             host_artifact_digest: h("8".repeat(64)),

@@ -33,6 +33,13 @@ pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.eliotd-launch";
 /// Version of the exact `eliotd` child launch contract.
 pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION: u16 = 1;
+/// Adapter-only hashed selector for a Phase-A pending runtime authority.
+/// Runtime artifact/config/descriptor/bootstrap fields must never admit it.
+const PHASE_B_PENDING_SCM_DIGEST: &str =
+    "287ddc2779dd75cc92d2dadd6f06b4dba2eefa5d63538db7be11523687f7ba8c";
+/// Legacy all-zero runtime digest, retained only as a rejection sentinel.
+const LEGACY_PHASE_B_ZERO_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 const PROBE_BINDING_PREFIXES: [&str; 5] = [
     "kernel-probe-request:",
     "kernel-probe-generation:",
@@ -131,12 +138,12 @@ impl EliotdLaunchDescriptor {
             }
         }
         validate_launch_nonce(&self.launch_nonce)?;
-        validate_digest(&self.executable_sha256, "eliotd.executable_sha256")?;
-        validate_digest(
+        validate_runtime_digest(&self.executable_sha256, "eliotd.executable_sha256")?;
+        validate_runtime_digest(
             &self.config_descriptor_sha256,
             "eliotd.config_descriptor_sha256",
         )?;
-        validate_digest(&self.descriptor_sha256, "eliotd.descriptor_sha256")?;
+        validate_runtime_digest(&self.descriptor_sha256, "eliotd.descriptor_sha256")?;
         let expected_arguments = [
             "--config-descriptor",
             self.config_descriptor.as_str(),
@@ -196,6 +203,22 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), KernelService
         });
     }
     Ok(())
+}
+
+fn validate_runtime_digest(value: &str, field: &'static str) -> Result<(), KernelServiceError> {
+    if value == PHASE_B_PENDING_SCM_DIGEST {
+        return Err(KernelServiceError::InvalidField {
+            field,
+            reason: "the SCM pending selector is adapter-only and cannot be a runtime digest",
+        });
+    }
+    if value == LEGACY_PHASE_B_ZERO_DIGEST {
+        return Err(KernelServiceError::InvalidField {
+            field,
+            reason: "legacy zero digest cannot be a runtime artifact or publication proof",
+        });
+    }
+    validate_digest(value, field)
 }
 
 fn validate_launch_nonce(value: &PlatformHandle) -> Result<(), KernelServiceError> {
@@ -1780,17 +1803,7 @@ impl HostStoreBootstrapRequirement {
                 "store_bootstrap.approved_config_hash",
             ),
         ] {
-            if value.as_str().len() != 64
-                || !value
-                    .as_str()
-                    .bytes()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-            {
-                return Err(KernelServiceError::InvalidField {
-                    field,
-                    reason: "must be a lowercase SHA-256 digest",
-                });
-            }
+            validate_runtime_digest(value.as_str(), field)?;
         }
         self.state_fence
             .validate()
@@ -2403,6 +2416,27 @@ mod tests {
         duplicated.arguments[7] = duplicated.launch_nonce.clone();
         duplicated.descriptor_sha256 = duplicated.compute_digest().expect("duplicate digest");
         assert!(duplicated.validate().is_err());
+    }
+
+    #[test]
+    fn runtime_digest_domains_reject_scm_selector_and_legacy_zero() {
+        for reserved in [PHASE_B_PENDING_SCM_DIGEST, LEGACY_PHASE_B_ZERO_DIGEST] {
+            assert!(validate_runtime_digest(reserved, "test.runtime").is_err());
+
+            let mut descriptor = eliotd_launch_descriptor();
+            descriptor.executable_sha256 = reserved.to_owned();
+            descriptor.arguments[7] = handle_value(reserved);
+            descriptor.descriptor_sha256 = descriptor.compute_digest().expect("descriptor digest");
+            assert!(descriptor.validate().is_err());
+
+            let mut bootstrap = requirement();
+            bootstrap.approved_artifact_hash = handle_value(reserved);
+            assert!(bootstrap.validate().is_err());
+
+            let mut config_bootstrap = requirement();
+            config_bootstrap.approved_config_hash = handle_value(reserved);
+            assert!(config_bootstrap.validate().is_err());
+        }
     }
 
     fn requirement() -> HostStoreBootstrapRequirement {

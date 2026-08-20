@@ -7279,6 +7279,7 @@ impl HostComposition {
     #[cfg(windows)]
     fn start_watchdog(
         phase_b: &HostPhaseBMaterialization,
+        scm_launch: &RuntimeLaunchDescriptor,
         approval: &InstallerServiceRegistrationApproval,
         context: RequestMetadata,
     ) -> Result<(), HostError> {
@@ -7294,6 +7295,14 @@ impl HostComposition {
             ));
         }
         let launch = &phase_b.launch;
+        if scm_launch.generation != launch.generation
+            || scm_launch.authority_descriptor_path != launch.authority_descriptor_path
+            || scm_launch.watchdog_executable_path != launch.watchdog_executable_path
+        {
+            return Err(HostError::RecoveryRequired(
+                "Watchdog SCM selector source is not the immutable manifest launch".to_owned(),
+            ));
+        }
         if approval.role() != InstallerServiceRole::Watchdog
             || approval.generation() != &launch.generation
         {
@@ -7327,7 +7336,7 @@ impl HostComposition {
         let mut platform = WindowsPlatform::new(PathBuf::from(launch.kernel_work_root.as_str()))
             .map_err(|error| HostError::Platform(error.to_string()))?;
         let registration = approved_service_registration_request(
-            launch,
+            scm_launch,
             approval,
             InstallerServiceRole::Watchdog,
             &launch.watchdog_executable_path,
@@ -7551,6 +7560,7 @@ impl HostComposition {
         if let Some(watchdog_approval) = watchdog_approval.as_ref() {
             Self::start_watchdog(
                 &phase_b,
+                &manifest.runtime_launch,
                 watchdog_approval,
                 lifecycle_context(&self.host, "watchdog-start")?,
             )?;
@@ -9183,7 +9193,9 @@ mod watchdog_service_tests {
         };
         let bootstrap = ServiceBootstrapArguments::new(
             PathBuf::from(launch.authority_descriptor_path.as_str()),
-            launch.authority_descriptor_digest.as_str(),
+            phase_b_scm_selector(&launch.authority_descriptor_digest)
+                .unwrap_or_else(|_| unreachable!())
+                .as_str(),
             launch.installation_epoch.installation.as_str(),
             launch.authority_generation.value(),
             Vec::<String>::new(),
@@ -9218,7 +9230,8 @@ mod watchdog_service_tests {
             "automatic_start": true,
             "service_bootstrap": {
                 "descriptor_path": launch.authority_descriptor_path,
-                "descriptor_digest": launch.authority_descriptor_digest,
+                "descriptor_digest": phase_b_scm_selector(&launch.authority_descriptor_digest)
+                    .unwrap_or_else(|_| unreachable!()),
                 "installation_id": launch.installation_epoch.installation,
                 "plan_generation": launch.authority_generation.value(),
                 "host_state_root": launch.runtime_state_roots.host_state_root,
@@ -9576,6 +9589,72 @@ mod watchdog_service_tests {
                 .bootstrap()
                 .and_then(|value| value.registration_nonce())
         );
+
+        let pending_marker =
+            PlatformHandle::new(PHASE_B_PENDING_MARKER).unwrap_or_else(|_| unreachable!());
+        let mut pending_scm_launch = launch.clone();
+        pending_scm_launch.authority_descriptor_digest = pending_marker.clone();
+        pending_scm_launch.store_bootstrap_descriptor_digest = pending_marker.clone();
+        pending_scm_launch.kernel_arguments[5] = pending_marker.clone();
+        pending_scm_launch.kernel_arguments[9] = pending_marker;
+        pending_scm_launch = pending_scm_launch
+            .with_computed_digest()
+            .unwrap_or_else(|_| unreachable!());
+        let (pending_watchdog, pending_watchdog_root) = approved_registration_fixture(
+            &pending_scm_launch,
+            InstallerServiceRole::Watchdog,
+            &"c".repeat(64),
+        );
+        let pending_watchdog_image = PlatformHandle::new(
+            pending_watchdog
+                .service_registration_request()
+                .unwrap_or_else(|_| unreachable!())
+                .binary_path()
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        pending_scm_launch.watchdog_executable_path = pending_watchdog_image.clone();
+        pending_scm_launch = pending_scm_launch
+            .with_computed_digest()
+            .unwrap_or_else(|_| unreachable!());
+        let intermediate = pending_scm_launch
+            .with_phase_b_pending_bootstrap_overlay(
+                pending_scm_launch.authority_generation,
+                pending_scm_launch.authority_state_fence.clone(),
+                launch.authority_descriptor_digest.clone(),
+                launch.eliotd_descriptor_digest.clone(),
+            )
+            .unwrap_or_else(|_| unreachable!());
+        let live_overlay = intermediate
+            .with_phase_b_materialization(
+                intermediate.authority_generation,
+                intermediate.authority_state_fence.clone(),
+                launch.authority_descriptor_digest.clone(),
+                launch.store_bootstrap_descriptor_digest.clone(),
+                launch.eliotd_descriptor_digest.clone(),
+            )
+            .unwrap_or_else(|_| unreachable!());
+        let pending_watchdog_request = approved_service_registration_request(
+            &pending_scm_launch,
+            &pending_watchdog,
+            InstallerServiceRole::Watchdog,
+            &pending_watchdog_image,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            pending_watchdog_request
+                .bootstrap()
+                .map(ServiceBootstrapArguments::config_descriptor_digest),
+            Some(eliot_installation::PHASE_B_PENDING_SCM_DIGEST)
+        );
+        assert_ne!(
+            pending_watchdog_request
+                .bootstrap()
+                .map(ServiceBootstrapArguments::config_descriptor_digest),
+            Some(live_overlay.authority_descriptor_digest.as_str())
+        );
+
         assert!(
             approved_service_registration_request(
                 &launch,
@@ -9614,6 +9693,7 @@ mod watchdog_service_tests {
         );
         let _ = std::fs::remove_dir_all(host_root);
         let _ = std::fs::remove_dir_all(watchdog_root);
+        let _ = std::fs::remove_dir_all(pending_watchdog_root);
         let _ = std::fs::remove_dir_all(manifest_root);
     }
 

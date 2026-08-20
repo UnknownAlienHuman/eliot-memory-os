@@ -14,8 +14,9 @@ use std::path::Path;
 use eliot_blob::BlobRootOwner;
 use eliot_contracts::StateFence;
 use eliot_installation::{
-    InstallationProfile, RuntimeLaunchDescriptor, ValidatedRuntimeRootLeases,
-    WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider, validate_store_credential_target,
+    InstallationProfile, PHASE_B_PENDING_SCM_DIGEST, RuntimeLaunchDescriptor,
+    ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
+    validate_store_credential_target,
 };
 use eliot_ipc::{ReplayDisposition, ReplayLedger, TransportLimits};
 use eliot_kernel_service::{
@@ -51,6 +52,8 @@ use thiserror::Error;
 pub const SERVICE_NAME: &str = "eliot-store-surreal";
 pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
 const MAX_LAUNCH_CONFIG_BYTES: u64 = 256 * 1024;
+const LEGACY_PHASE_B_ZERO_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Error returned by the neutral Store root while preserving an ambiguous
 /// provider write identity for the EBP response boundary.
@@ -576,6 +579,14 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
 }
 
 fn validate_digest(value: &str, field: &str) -> Result<(), String> {
+    if value == PHASE_B_PENDING_SCM_DIGEST {
+        return Err(format!(
+            "{field} cannot use the adapter-only SCM pending selector"
+        ));
+    }
+    if value == LEGACY_PHASE_B_ZERO_DIGEST {
+        return Err(format!("{field} cannot use the legacy zero runtime digest"));
+    }
     if value.len() != 64
         || !value
             .bytes()
@@ -1390,7 +1401,7 @@ mod tests {
             authority_descriptor_digest: handle("7".repeat(64)),
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
-            kernel_artifact_digest: handle("0".repeat(64)),
+            kernel_artifact_digest: handle("1".repeat(64)),
             eliotd_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliotd.exe"),
             eliotd_artifact_digest: handle("c".repeat(64)),
             eliotd_config_path: handle(r"C:\ProgramData\Eliot\governor\eliotd.json"),
@@ -1420,7 +1431,7 @@ mod tests {
                 handle("--authority-descriptor-sha256"),
                 handle("7".repeat(64)),
                 handle("--kernel-artifact-sha256"),
-                handle("0".repeat(64)),
+                handle("1".repeat(64)),
                 handle("--eliotd-descriptor"),
                 handle(r"C:\ProgramData\Eliot\eliotd.json"),
                 handle("--eliotd-descriptor-sha256"),
@@ -1477,6 +1488,21 @@ mod tests {
         };
         config.approved_config_hash = launch_config_digest(&config).expect("config digest");
         config
+    }
+
+    #[test]
+    fn runtime_digest_domains_reject_scm_selector_and_legacy_zero() {
+        for reserved in [PHASE_B_PENDING_SCM_DIGEST, LEGACY_PHASE_B_ZERO_DIGEST] {
+            assert!(validate_digest(reserved, "test.runtime").is_err());
+
+            let mut artifact = config();
+            artifact.approved_artifact_hash = reserved.to_owned();
+            assert!(artifact.validate().is_err());
+
+            let mut approved_config = config();
+            approved_config.approved_config_hash = reserved.to_owned();
+            assert!(approved_config.validate().is_err());
+        }
     }
 
     fn schema_bootstrap_command(config: &StoreLaunchConfig) -> StoreSchemaBootstrapCommand {

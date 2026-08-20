@@ -241,6 +241,27 @@ fn sha256_handle(value: &PlatformHandle, field: &str) -> Result<(), Installation
     Ok(())
 }
 
+/// Validates a digest that belongs to a runtime artifact/config/descriptor
+/// domain.  The hashed pending selector is reserved for the SCM adapter and
+/// the legacy all-zero value is never a runtime publication proof.
+fn runtime_sha256_handle(value: &PlatformHandle, field: &str) -> Result<(), InstallationError> {
+    if value.as_str() == PHASE_B_PENDING_SCM_DIGEST {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "the SCM pending selector is adapter-only and cannot be a runtime digest"
+                .to_owned(),
+        });
+    }
+    if value.as_str() == LEGACY_PHASE_B_ZERO_DIGEST {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "legacy zero digest cannot be a runtime artifact or publication proof"
+                .to_owned(),
+        });
+    }
+    sha256_handle(value, field)
+}
+
 /// Wire-level state of a Host-owned Phase-B physical digest.
 ///
 /// The durable candidate uses [`PhaseBDigestState::Pending`] until Host has
@@ -1253,7 +1274,7 @@ impl RuntimeStateRoots {
                 }
             }
         }
-        sha256_handle(&self.roots_digest, "runtime_state_roots.roots_digest")?;
+        runtime_sha256_handle(&self.roots_digest, "runtime_state_roots.roots_digest")?;
         if sha256_hex(&self.unsigned_bytes()?) != self.roots_digest.as_str() {
             return Err(InstallationError::InvalidField {
                 field: "runtime_state_roots.roots_digest".to_owned(),
@@ -2251,7 +2272,7 @@ impl RuntimeLaunchDescriptor {
                 reason: "legacy field must equal RuntimeStateRoots.kernel_work_root".to_owned(),
             });
         }
-        sha256_handle(
+        runtime_sha256_handle(
             &self.kernel_artifact_digest,
             "runtime_launch.kernel_artifact_digest",
         )?;
@@ -2264,7 +2285,7 @@ impl RuntimeLaunchDescriptor {
             "eliotd.exe",
             "runtime_launch.eliotd_executable_path",
         )?;
-        sha256_handle(
+        runtime_sha256_handle(
             &self.eliotd_artifact_digest,
             "runtime_launch.eliotd_artifact_digest",
         )?;
@@ -2272,7 +2293,7 @@ impl RuntimeLaunchDescriptor {
             &self.eliotd_config_path,
             "runtime_launch.eliotd_config_path",
         )?;
-        sha256_handle(
+        runtime_sha256_handle(
             &self.eliotd_config_digest,
             "runtime_launch.eliotd_config_digest",
         )?;
@@ -2280,7 +2301,7 @@ impl RuntimeLaunchDescriptor {
             &self.eliotd_descriptor_path,
             "runtime_launch.eliotd_descriptor_path",
         )?;
-        sha256_handle(
+        runtime_sha256_handle(
             &self.eliotd_descriptor_digest,
             "runtime_launch.eliotd_descriptor_digest",
         )?;
@@ -2326,7 +2347,7 @@ impl RuntimeLaunchDescriptor {
             "surreal.exe",
             "runtime_launch.canonical_store_executable_path",
         )?;
-        sha256_handle(
+        runtime_sha256_handle(
             &self.canonical_store_artifact_digest,
             "runtime_launch.canonical_store_artifact_digest",
         )?;
@@ -2339,7 +2360,7 @@ impl RuntimeLaunchDescriptor {
             "eliot-host.exe",
             "runtime_launch.host_executable_path",
         )?;
-        sha256_handle(
+        runtime_sha256_handle(
             &self.host_artifact_digest,
             "runtime_launch.host_artifact_digest",
         )?;
@@ -2352,7 +2373,7 @@ impl RuntimeLaunchDescriptor {
             "eliot-store-surreal.exe",
             "runtime_launch.store_bridge_executable_path",
         )?;
-        sha256_handle(
+        runtime_sha256_handle(
             &self.store_bridge_artifact_digest,
             "runtime_launch.store_bridge_artifact_digest",
         )?;
@@ -2365,7 +2386,7 @@ impl RuntimeLaunchDescriptor {
             "eliot-watchdog.exe",
             "runtime_launch.watchdog_executable_path",
         )?;
-        sha256_handle(
+        runtime_sha256_handle(
             &self.watchdog_artifact_digest,
             "runtime_launch.watchdog_artifact_digest",
         )?;
@@ -2508,7 +2529,7 @@ impl RuntimeLaunchDescriptor {
             });
         }
         self.validate_canonical_store_arguments()?;
-        sha256_handle(&self.descriptor_digest, "runtime_launch.descriptor_digest")?;
+        runtime_sha256_handle(&self.descriptor_digest, "runtime_launch.descriptor_digest")?;
         if self.compute_digest()? != self.descriptor_digest.as_str() {
             return Err(InstallationError::InvalidField {
                 field: "runtime_launch.descriptor_digest".to_owned(),
@@ -13352,7 +13373,7 @@ mod tests {
                 test_handle("component:kernel"),
                 test_handle("component:store"),
             ],
-            kernel_artifact_digest: test_handle("0".repeat(64)),
+            kernel_artifact_digest: test_handle("4".repeat(64)),
             store_bridge_artifact_digest: test_handle("1".repeat(64)),
             canonical_store_artifact_digest: test_handle("5".repeat(64)),
             host_artifact_digest: test_handle("8".repeat(64)),
@@ -13387,7 +13408,7 @@ mod tests {
                     authority_descriptor_digest: test_handle("7".repeat(64)),
                     runtime_state_roots: runtime_state_roots.clone(),
                     kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
-                    kernel_artifact_digest: test_handle("0".repeat(64)),
+                    kernel_artifact_digest: test_handle("4".repeat(64)),
                     eliotd_executable_path: test_path(&root, "eliotd.exe"),
                     eliotd_artifact_digest: test_handle("8".repeat(64)),
                     eliotd_config_path: test_path(&root, "eliotd-governor.json"),
@@ -13417,7 +13438,7 @@ mod tests {
                         test_handle("--authority-descriptor-sha256"),
                         test_handle("7".repeat(64)),
                         test_handle("--kernel-artifact-sha256"),
-                        test_handle("0".repeat(64)),
+                        test_handle("4".repeat(64)),
                         test_handle("--eliotd-descriptor"),
                         test_path(&root, "eliotd.json"),
                         test_handle("--eliotd-descriptor-sha256"),
@@ -17708,6 +17729,32 @@ mod tests {
         let selector = test_handle(PHASE_B_PENDING_SCM_DIGEST);
         assert!(phase_b_digest_state(&selector, "test.phase_b_selector").is_err());
         assert!(phase_b_scm_selector(&selector).is_err());
+    }
+
+    #[test]
+    fn runtime_digest_domains_reject_reserved_selector_and_legacy_zero() {
+        let base = registering_transaction().candidate_manifest.runtime_launch;
+        for reserved in [PHASE_B_PENDING_SCM_DIGEST, LEGACY_PHASE_B_ZERO_DIGEST] {
+            assert!(runtime_sha256_handle(&test_handle(reserved), "test.runtime").is_err());
+
+            let mut artifact = base.clone();
+            artifact.kernel_artifact_digest = test_handle(reserved);
+            artifact.descriptor_digest = test_handle(sha256_hex(&must(artifact.unsigned_bytes())));
+            assert!(artifact.validate().is_err());
+
+            let mut config = base.clone();
+            config.eliotd_config_digest = test_handle(reserved);
+            config.descriptor_digest = test_handle(sha256_hex(&must(config.unsigned_bytes())));
+            assert!(config.validate().is_err());
+
+            let mut descriptor = base.clone();
+            descriptor.descriptor_digest = test_handle(reserved);
+            assert!(descriptor.validate().is_err());
+
+            let mut bootstrap = base.clone();
+            bootstrap.store_bootstrap_descriptor_digest = test_handle(reserved);
+            assert!(bootstrap.validate().is_err());
+        }
     }
 
     #[test]
