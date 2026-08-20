@@ -4266,7 +4266,11 @@ mod tests {
         let source = include_str!("main.rs");
         let library = include_str!("lib.rs");
         assert!(source.contains("host_state_root"));
+        assert!(source.contains("FileWatchdogAdmission::from_registry"));
         assert!(!source.contains("protected_program_data_path"));
+        assert!(!source.contains("std::env::var"));
+        assert!(!source.contains("std::env::current_dir"));
+        assert!(!source.contains(r"C:\ProgramData\Eliot\host\installation-registry.redb"));
         assert!(library.contains("ProtectedRootLease::open_existing"));
         assert!(library.contains("RedbInstallationRegistry::inspect_existing_at"));
         assert!(library.contains("ProtectedRuntimePathLease::open_existing_absolute"));
