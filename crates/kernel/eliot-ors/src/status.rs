@@ -288,7 +288,24 @@ fn load_staged(
     Ok(Some(stage))
 }
 
+fn encode_key_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            ':' => out.push_str("%3A"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn canonical_history_key(lease_id: &str, revision: u64) -> String {
+    format!("{}::{revision:020}", encode_key_component(lease_id))
+}
+
+#[allow(dead_code)]
+fn raw_canonical_history_key(lease_id: &str, revision: u64) -> String {
     format!("{lease_id}::{revision:020}")
 }
 
@@ -304,14 +321,18 @@ fn load_history(
     let table = read
         .open_table(SUPERVISION_LEASE_HISTORY)
         .map_err(map_table_error)?;
-    let start = format!("{lease_id}::");
-    let end = format!("{start}\u{10ffff}");
+    let prefix = format!("{}::", encode_key_component(lease_id));
+    let raw_prefix = format!("{lease_id}::");
+    let has_legacy_chars = lease_id.contains(':') || lease_id.contains('%');
     let mut out = Vec::new();
     for item in table
-        .range(start.as_str()..end.as_str())
+        .range(prefix.as_str()..)
         .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?
     {
         let (k, v) = item.map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?;
+        if !k.value().starts_with(prefix.as_str()) {
+            break;
+        }
         bounded_charge(used, k.value().len(), v.value().len())?;
         let snap: SupervisionLeaseSnapshot = decode_named(v.value(), "supervision_lease_history")?;
         snap.validate()
@@ -349,6 +370,22 @@ fn load_history(
             ));
         }
         out.push(snap);
+    }
+    #[allow(clippy::collapsible_if)]
+    if out.is_empty() && has_legacy_chars {
+        if let Some(item) = table
+            .range(raw_prefix.as_str()..)
+            .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?
+            .next()
+        {
+            let (k, _) = item.map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?;
+            if k.value().starts_with(raw_prefix.as_str()) {
+                return Err(OrsSupervisionStatusError::MigrationRequired(
+                    "legacy lease_id encoding requires migration: history key uses unescaped colon"
+                        .to_owned(),
+                ));
+            }
+        }
     }
     if out.len() > usize::from(MAX_HISTORY) {
         return Err(OrsSupervisionStatusError::Unknown(
@@ -514,6 +551,18 @@ fn verify_health(
     Ok(())
 }
 
+#[allow(clippy::needless_pass_by_value)]
+fn map_panic(err: Box<dyn std::any::Any + Send>) -> OrsSupervisionStatusError {
+    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic during redb inspection".to_owned()
+    };
+    OrsSupervisionStatusError::Corrupt(msg)
+}
+
 pub fn observe_supervision_status(
     path: impl AsRef<Path>,
     anchor: &SupervisionTrustAnchor,
@@ -521,84 +570,90 @@ pub fn observe_supervision_status(
 ) -> Result<SupervisionStatusProjection, OrsSupervisionStatusError> {
     let path = path.as_ref();
     validate_path(path)?;
-    let db = ReadOnlyDatabase::open(path).map_err(map_db_error)?;
-    let read = db.begin_read().map_err(map_tx_error)?;
-    let schema_res = check_schema(&read);
-    if let Err(e) = schema_res {
-        match e {
-            OrsSupervisionStatusError::Missing(msg) if msg.contains("empty database") => {
-                return Ok(SupervisionStatusProjection {
-                    lease_id: context.lease_id.clone(),
-                    health: HealthDimension::Failed,
-                    heartbeat: HealthDimension::Unknown,
-                    reason: SupervisionStatusReason::MissingCurrent,
-                    current: None,
-                    staged: None,
-                    history: Vec::new(),
-                });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let db = ReadOnlyDatabase::open(path).map_err(map_db_error)?;
+        let read = db.begin_read().map_err(map_tx_error)?;
+        let schema_res = check_schema(&read);
+        if let Err(e) = schema_res {
+            match e {
+                OrsSupervisionStatusError::Missing(msg) if msg.contains("empty database") => {
+                    return Ok(SupervisionStatusProjection {
+                        lease_id: context.lease_id.clone(),
+                        health: HealthDimension::Failed,
+                        heartbeat: HealthDimension::Unknown,
+                        reason: SupervisionStatusReason::MissingCurrent,
+                        current: None,
+                        staged: None,
+                        history: Vec::new(),
+                    });
+                }
+                other => return Err(other),
             }
-            other => return Err(other),
         }
-    }
-    let mut used = 0usize;
-    let lease_id = context.lease_id.as_str();
-    let staged = load_staged(&read, lease_id, &mut used)?;
-    let current = load_current(&read, lease_id, &mut used)?;
-    let history = load_history(&read, lease_id, &mut used)?;
-    validate_history_provenance(current.as_ref(), &history)?;
-    if let Some(cur) = &current {
-        validate_replay_authority(&read, cur, &mut used)?;
-    }
-    let (health, reason) = if staged.is_some() && current.is_none() {
-        (HealthDimension::Failed, SupervisionStatusReason::StagedOnly)
-    } else if let Some(cur) = &current {
-        if cur.record.projection != crate::SupervisionLeaseProjection::Active {
-            (
-                HealthDimension::Failed,
-                SupervisionStatusReason::BindingMismatch("terminal projection".to_owned()),
-            )
-        } else if context.now_ms >= cur.record.artifact.payload.expires_at_ms {
-            (HealthDimension::Failed, SupervisionStatusReason::Expired)
-        } else {
-            match verify_health(anchor, context, cur) {
-                Ok(()) => {
-                    if staged.is_some() {
-                        (HealthDimension::Failed, SupervisionStatusReason::StagedOnly)
-                    } else {
-                        (HealthDimension::Healthy, SupervisionStatusReason::Healthy)
+        let mut used = 0usize;
+        let lease_id = context.lease_id.as_str();
+        let staged = load_staged(&read, lease_id, &mut used)?;
+        let current = load_current(&read, lease_id, &mut used)?;
+        let history = load_history(&read, lease_id, &mut used)?;
+        validate_history_provenance(current.as_ref(), &history)?;
+        if let Some(cur) = &current {
+            validate_replay_authority(&read, cur, &mut used)?;
+        }
+        let (health, reason) = if staged.is_some() && current.is_none() {
+            (HealthDimension::Failed, SupervisionStatusReason::StagedOnly)
+        } else if let Some(cur) = &current {
+            if cur.record.projection != crate::SupervisionLeaseProjection::Active {
+                (
+                    HealthDimension::Failed,
+                    SupervisionStatusReason::BindingMismatch("terminal projection".to_owned()),
+                )
+            } else if context.now_ms >= cur.record.artifact.payload.expires_at_ms {
+                (HealthDimension::Failed, SupervisionStatusReason::Expired)
+            } else {
+                match verify_health(anchor, context, cur) {
+                    Ok(()) => {
+                        if staged.is_some() {
+                            (HealthDimension::Failed, SupervisionStatusReason::StagedOnly)
+                        } else {
+                            (HealthDimension::Healthy, SupervisionStatusReason::Healthy)
+                        }
+                    }
+                    Err(msg) => {
+                        let reason = if msg.contains("SignatureInvalid")
+                            || msg.contains("signature")
+                            || msg.contains("TrustAnchorMismatch")
+                            || msg.contains("public_key")
+                        {
+                            SupervisionStatusReason::SignatureInvalid(msg)
+                        } else if msg.contains("Expired") {
+                            SupervisionStatusReason::Expired
+                        } else {
+                            SupervisionStatusReason::BindingMismatch(msg)
+                        };
+                        (HealthDimension::Failed, reason)
                     }
                 }
-                Err(msg) => {
-                    let reason = if msg.contains("SignatureInvalid")
-                        || msg.contains("signature")
-                        || msg.contains("TrustAnchorMismatch")
-                        || msg.contains("public_key")
-                    {
-                        SupervisionStatusReason::SignatureInvalid(msg)
-                    } else if msg.contains("Expired") {
-                        SupervisionStatusReason::Expired
-                    } else {
-                        SupervisionStatusReason::BindingMismatch(msg)
-                    };
-                    (HealthDimension::Failed, reason)
-                }
             }
-        }
-    } else {
-        (
-            HealthDimension::Failed,
-            SupervisionStatusReason::MissingCurrent,
-        )
-    };
-    Ok(SupervisionStatusProjection {
-        lease_id: context.lease_id.clone(),
-        health,
-        heartbeat: HealthDimension::Unknown,
-        reason,
-        current,
-        staged,
-        history,
-    })
+        } else {
+            (
+                HealthDimension::Failed,
+                SupervisionStatusReason::MissingCurrent,
+            )
+        };
+        Ok(SupervisionStatusProjection {
+            lease_id: context.lease_id.clone(),
+            health,
+            heartbeat: HealthDimension::Unknown,
+            reason,
+            current,
+            staged,
+            history,
+        })
+    }));
+    match outcome {
+        Ok(res) => res,
+        Err(err) => Err(map_panic(err)),
+    }
 }
 
 pub fn open_existing_read_only(
@@ -606,7 +661,13 @@ pub fn open_existing_read_only(
 ) -> Result<ReadOnlyDatabase, OrsSupervisionStatusError> {
     let path = path.as_ref();
     validate_path(path)?;
-    ReadOnlyDatabase::open(path).map_err(map_db_error)
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ReadOnlyDatabase::open(path).map_err(map_db_error)
+    }));
+    match outcome {
+        Ok(res) => res,
+        Err(err) => Err(map_panic(err)),
+    }
 }
 
 #[cfg(test)]
@@ -758,6 +819,75 @@ mod tests {
         let bytes = fs::read(p).unwrap();
         let mtime = fs::metadata(p).unwrap().modified().unwrap();
         (bytes, mtime)
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = Sha256::digest(bytes);
+        let mut out = String::with_capacity(64);
+        for b in digest {
+            out.push(char::from(HEX[usize::from(b >> 4)]));
+            out.push(char::from(HEX[usize::from(b & 0x0f)]));
+        }
+        out
+    }
+
+    fn canonicalize(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(canonicalize).collect())
+            }
+            serde_json::Value::Object(obj) => {
+                let mut sorted = serde_json::Map::new();
+                let mut entries: Vec<_> = obj.into_iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                for (k, v) in entries {
+                    sorted.insert(k, canonicalize(v));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            v => v,
+        }
+    }
+
+    fn recompute_snapshot_receipt(v: &mut serde_json::Value) {
+        let receipt_hash = {
+            let receipt = v.get("receipt").unwrap().as_object().unwrap();
+            let core = serde_json::json!({
+                "ticket_id": receipt.get("ticket_id").unwrap().clone(),
+                "operation_id": receipt.get("operation_id").unwrap().clone(),
+                "record_id": receipt.get("record_id").unwrap().clone(),
+                "lease_id": receipt.get("lease_id").unwrap().clone(),
+                "revision": receipt.get("revision").unwrap().clone(),
+                "operation": receipt.get("operation").unwrap().clone(),
+                "state": receipt.get("state").unwrap().clone(),
+                "projection": receipt.get("projection").unwrap().clone(),
+                "operation_order": receipt.get("operation_order").unwrap().clone(),
+                "ticket_sha256": receipt.get("ticket_sha256").unwrap().clone(),
+                "artifact_sha256": receipt.get("artifact_sha256").unwrap().clone(),
+                "previous_receipt_sha256": receipt.get("previous_receipt_sha256").unwrap().clone()
+            });
+            let canonical = canonicalize(core);
+            let bytes = serde_json::to_vec(&canonical).unwrap();
+            sha256_hex(&bytes)
+        };
+        v.get_mut("receipt")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "receipt_sha256".to_owned(),
+                serde_json::Value::String(receipt_hash.clone()),
+            );
+        v.get_mut("record")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "receipt_sha256".to_owned(),
+                serde_json::Value::String(receipt_hash),
+            );
     }
 
     #[test]
@@ -1914,14 +2044,16 @@ mod tests {
             let write = db.begin_write().unwrap();
             {
                 let mut table = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
-                let key = "lease-1::00000000000000000002";
-                let val = table.get(key).unwrap().unwrap().value().to_owned();
-                let mut v: serde_json::Value = serde_json::from_str(&val).unwrap();
-                v["receipt"]["previous_receipt_sha256"] =
-                    serde_json::Value::String("ff".repeat(32));
-                v["record"]["previous_receipt_sha256"] = serde_json::Value::String("ff".repeat(32));
-                let encoded = serde_json::to_string(&v).unwrap();
-                table.insert(key, encoded.as_str()).unwrap();
+                let key1 = "lease-1::00000000000000000001";
+                let val1 = table.get(key1).unwrap().unwrap().value().to_owned();
+                let mut v1: serde_json::Value = serde_json::from_str(&val1).unwrap();
+                v1["receipt"]["operation_order"] = serde_json::Value::Number(999.into());
+                v1["record"]["operation_order"] = serde_json::Value::Number(999.into());
+                recompute_snapshot_receipt(&mut v1);
+                let encoded1 = serde_json::to_string(&v1).unwrap();
+                let snap1: SupervisionLeaseSnapshot = serde_json::from_str(&encoded1).unwrap();
+                snap1.validate().unwrap();
+                table.insert(key1, encoded1.as_str()).unwrap();
             }
             write.commit().unwrap();
         }
@@ -2032,9 +2164,13 @@ mod tests {
                     .value()
                     .to_owned();
                 let mut v: serde_json::Value = serde_json::from_str(&val).unwrap();
-                v["snapshot"]["receipt"]["receipt_sha256"] =
-                    serde_json::Value::String("00".repeat(32));
+                v["ticket"]["ticket_id"] =
+                    serde_json::Value::String("t-evil-substitution".to_owned());
                 let encoded = serde_json::to_string(&v).unwrap();
+                let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                let snap: SupervisionLeaseSnapshot =
+                    serde_json::from_value(decoded.get("snapshot").unwrap().clone()).unwrap();
+                snap.validate().unwrap();
                 table
                     .insert(current_ticket.as_str(), encoded.as_str())
                     .unwrap();
@@ -2066,20 +2202,17 @@ mod tests {
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             observe_supervision_status(&p, &anchor, &ctx)
         }));
-        let is_torn = match res {
-            Ok(Ok(_)) => false,
-            Ok(Err(e)) => matches!(
-                e,
-                OrsSupervisionStatusError::Corrupt(_)
+        assert!(res.is_ok(), "torn inspection must not panic");
+        let inner = res.unwrap();
+        assert!(
+            matches!(
+                inner,
+                Err(OrsSupervisionStatusError::Corrupt(_)
                     | OrsSupervisionStatusError::Unknown(_)
                     | OrsSupervisionStatusError::Missing(_)
-                    | OrsSupervisionStatusError::AccessDenied(_)
+                    | OrsSupervisionStatusError::AccessDenied(_))
             ),
-            Err(_) => true,
-        };
-        assert!(
-            is_torn,
-            "torn database must be reported as corrupt/unknown or panic"
+            "torn database must be reported as corrupt/unknown/missing/access-denied, got {inner:?}"
         );
         let after_corrupt = file_bytes_and_mtime(&p);
         assert_eq!(before_corrupt.0, after_corrupt.0);
@@ -2104,5 +2237,340 @@ mod tests {
         assert_eq!(before.0, after.0);
         assert_eq!(before.1, after.1);
         cleanup(&p);
+    }
+
+    #[test]
+    fn max_scalar_history_key_is_not_excluded_and_is_corrupt() {
+        let p = path("max-scalar");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 1);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
+                let max_key = format!("lease-1::{}\u{10ffff}", "0".repeat(19));
+                table.insert(max_key.as_str(), "not-json").unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observe_supervision_status(&p, &anchor, &ctx)
+        }));
+        assert!(res.is_ok(), "max-scalar scan must not panic");
+        let inner = res.unwrap();
+        assert!(
+            matches!(
+                inner,
+                Err(OrsSupervisionStatusError::Corrupt(_) | OrsSupervisionStatusError::Unknown(_))
+            ),
+            "max-scalar corruption must be detected, got {inner:?}"
+        );
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn colon_lease_is_isolated_from_sibling_prefix() {
+        let p = path("colon-sibling");
+        cleanup(&p);
+        let store = RedbRecoveryStore::open(&p).unwrap();
+        let signer =
+            Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])
+                .unwrap();
+        for lease in ["lease-a", "lease-a::b"] {
+            let stage = store
+                .prepare_supervision_lease(request(
+                    &format!("t-{lease}"),
+                    &format!("o-{lease}"),
+                    lease,
+                    None,
+                    SupervisionLeaseOperation::Commit,
+                    binding(LeaseState::Active, 100),
+                ))
+                .unwrap();
+            let envelope = stage
+                .ticket
+                .expected_payload()
+                .unwrap()
+                .sign(&signer)
+                .unwrap();
+            let anchor = SupervisionTrustAnchor::new(
+                "installation-1",
+                signer.signer_id(),
+                signer.key_id(),
+                signer.public_key().to_vec(),
+            )
+            .unwrap();
+            let payload = &envelope.payload;
+            let generation = &payload.generation_binding;
+            let ctx = SupervisionLeaseVerificationContext {
+                now_ms: 101,
+                lease_id: payload.lease_id.clone(),
+                host_epoch: payload.host_epoch,
+                activation_id: payload.activation_id.clone(),
+                activation_generation: payload.activation_generation,
+                kernel_epoch: payload.kernel_epoch,
+                watchdog_epoch: payload.watchdog_epoch,
+                state_fence: payload.state_fence.clone(),
+                scope_ref: payload.scope_ref.clone(),
+                observation_scope: payload.observation_scope.clone(),
+                target_id: generation.target_id.clone(),
+                module_id: generation.module_id.clone(),
+                process_id: generation.process_id.clone(),
+                target_generation: generation.target_generation,
+                module_generation: generation.module_generation,
+                process_generation: generation.process_generation,
+                public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+                ors_mirror: payload.ors_mirror.clone(),
+                active_state: SupervisionLeaseActiveStateBinding {
+                    state: payload.state,
+                    revocation_id: None,
+                    revocation_epoch: None,
+                },
+            };
+            let verified = anchor.verify(&envelope, &ctx).unwrap();
+            store
+                .commit_supervision_lease(&stage.ticket, &verified)
+                .unwrap();
+        }
+        drop(store);
+        let signer2 =
+            Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])
+                .unwrap();
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            signer2.signer_id(),
+            signer2.key_id(),
+            signer2.public_key().to_vec(),
+        )
+        .unwrap();
+        for lease in ["lease-a", "lease-a::b"] {
+            let snap: SupervisionLeaseSnapshot = {
+                let db = redb::Database::create(&p).unwrap();
+                let read = db.begin_read().unwrap();
+                let table = read.open_table(SUPERVISION_LEASE_CURRENT).unwrap();
+                let v = table.get(lease).unwrap().unwrap().value().to_owned();
+                serde_json::from_str(&v).unwrap()
+            };
+            let payload = &snap.record.artifact.payload;
+            let generation = &payload.generation_binding;
+            let ctx2 = SupervisionLeaseVerificationContext {
+                now_ms: 101,
+                lease_id: payload.lease_id.clone(),
+                host_epoch: payload.host_epoch,
+                activation_id: payload.activation_id.clone(),
+                activation_generation: payload.activation_generation,
+                kernel_epoch: payload.kernel_epoch,
+                watchdog_epoch: payload.watchdog_epoch,
+                state_fence: payload.state_fence.clone(),
+                scope_ref: payload.scope_ref.clone(),
+                observation_scope: payload.observation_scope.clone(),
+                target_id: generation.target_id.clone(),
+                module_id: generation.module_id.clone(),
+                process_id: generation.process_id.clone(),
+                target_generation: generation.target_generation,
+                module_generation: generation.module_generation,
+                process_generation: generation.process_generation,
+                public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+                ors_mirror: payload.ors_mirror.clone(),
+                active_state: SupervisionLeaseActiveStateBinding {
+                    state: payload.state,
+                    revocation_id: None,
+                    revocation_epoch: None,
+                },
+            };
+            let proj = observe_supervision_status(&p, &anchor, &ctx2).unwrap();
+            assert_eq!(proj.health, HealthDimension::Healthy);
+            assert_eq!(proj.history.len(), 1);
+            assert_eq!(
+                proj.current.as_ref().unwrap().record.lease_id.as_str(),
+                lease
+            );
+        }
+        cleanup(&p);
+    }
+
+    #[test]
+    fn legacy_colon_key_without_encoding_is_migration_required() {
+        let p = path("legacy-colon-migration");
+        cleanup(&p);
+        let store = RedbRecoveryStore::open(&p).unwrap();
+        let signer =
+            Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])
+                .unwrap();
+        let lease = "lease:colon";
+        let stage = store
+            .prepare_supervision_lease(request(
+                "t1",
+                "o1",
+                lease,
+                None,
+                SupervisionLeaseOperation::Commit,
+                binding(LeaseState::Active, 100),
+            ))
+            .unwrap();
+        let envelope = stage
+            .ticket
+            .expected_payload()
+            .unwrap()
+            .sign(&signer)
+            .unwrap();
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .unwrap();
+        let payload = &envelope.payload;
+        let generation = &payload.generation_binding;
+        let ctx = SupervisionLeaseVerificationContext {
+            now_ms: 101,
+            lease_id: payload.lease_id.clone(),
+            host_epoch: payload.host_epoch,
+            activation_id: payload.activation_id.clone(),
+            activation_generation: payload.activation_generation,
+            kernel_epoch: payload.kernel_epoch,
+            watchdog_epoch: payload.watchdog_epoch,
+            state_fence: payload.state_fence.clone(),
+            scope_ref: payload.scope_ref.clone(),
+            observation_scope: payload.observation_scope.clone(),
+            target_id: generation.target_id.clone(),
+            module_id: generation.module_id.clone(),
+            process_id: generation.process_id.clone(),
+            target_generation: generation.target_generation,
+            module_generation: generation.module_generation,
+            process_generation: generation.process_generation,
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: payload.ors_mirror.clone(),
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: payload.state,
+                revocation_id: None,
+                revocation_epoch: None,
+            },
+        };
+        let verified = anchor.verify(&envelope, &ctx).unwrap();
+        store
+            .commit_supervision_lease(&stage.ticket, &verified)
+            .unwrap();
+        drop(store);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut hist = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
+                let encoded_key = format!("{}::{:020}", "lease%3Acolon", 1);
+                let raw_key = format!("{lease}::{:020}", 1);
+                if hist.get(encoded_key.as_str()).unwrap().is_some() {
+                    let val = hist
+                        .get(encoded_key.as_str())
+                        .unwrap()
+                        .unwrap()
+                        .value()
+                        .to_owned();
+                    hist.remove(encoded_key.as_str()).unwrap();
+                    hist.insert(raw_key.as_str(), val.as_str()).unwrap();
+                }
+            }
+            write.commit().unwrap();
+        }
+        let proj = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(
+            matches!(proj, Err(OrsSupervisionStatusError::MigrationRequired(_))),
+            "legacy raw colon key must be migration-required, got {proj:?}"
+        );
+        cleanup(&p);
+    }
+
+    #[test]
+    fn open_existing_read_only_missing_is_missing_and_no_create() {
+        let p = path("open-missing");
+        cleanup(&p);
+        let res = open_existing_read_only(&p);
+        assert!(matches!(res, Err(OrsSupervisionStatusError::Missing(_))));
+        assert!(!p.exists(), "open_existing_read_only must not create file");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn open_existing_read_only_preserves_bytes_and_mtime() {
+        let p = path("open-preserve");
+        cleanup(&p);
+        {
+            let _store = RedbRecoveryStore::open(&p).unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let db = open_existing_read_only(&p).unwrap();
+        drop(db);
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        let db2 = open_existing_read_only(&p).unwrap();
+        let read = db2.begin_read().unwrap();
+        let _ = read.list_tables().unwrap().next();
+        drop(read);
+        drop(db2);
+        let after2 = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after2.0);
+        assert_eq!(before.1, after2.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn open_existing_read_only_torn_is_non_panic_and_typed() {
+        let p = path("open-torn");
+        cleanup(&p);
+        {
+            let _store = RedbRecoveryStore::open(&p).unwrap();
+        }
+        let before = fs::read(&p).unwrap();
+        {
+            let mut truncated = before.clone();
+            truncated.truncate(before.len() / 2);
+            fs::write(&p, &truncated).unwrap();
+        }
+        let res =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open_existing_read_only(&p)));
+        assert!(
+            res.is_ok(),
+            "open_existing_read_only must not panic on torn file"
+        );
+        let inner = res.unwrap();
+        assert!(
+            matches!(
+                inner,
+                Err(OrsSupervisionStatusError::Corrupt(_)
+                    | OrsSupervisionStatusError::Unknown(_)
+                    | OrsSupervisionStatusError::Missing(_)
+                    | OrsSupervisionStatusError::AccessDenied(_))
+            ),
+            "torn open must be typed error"
+        );
+        fs::write(&p, &before).unwrap();
+        cleanup(&p);
+    }
+
+    #[test]
+    fn open_existing_read_only_directory_is_typed_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "eliot-ors-status-dir-{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let res = open_existing_read_only(&dir);
+        assert!(
+            matches!(
+                res,
+                Err(OrsSupervisionStatusError::Corrupt(_)
+                    | OrsSupervisionStatusError::Unknown(_)
+                    | OrsSupervisionStatusError::AccessDenied(_))
+            ),
+            "directory path must be typed error"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -854,12 +854,14 @@ impl RedbRecoveryStore {
     ) -> Result<Vec<ProcessEvidenceRecord>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
         let table = read.open_table(PROCESS_EVIDENCE).map_err(storage)?;
-        let start = format!("{}::", operation_id.as_str());
-        let end = format!("{start}\u{10ffff}");
+        let prefix = format!("{}::", Self::encode_key_component(operation_id.as_str()));
         let mut records = Vec::new();
-        for entry in table.range(start.as_str()..end.as_str()).map_err(storage)? {
+        for entry in table.range(prefix.as_str()..).map_err(storage)? {
             let (key, value) = entry.map_err(storage)?;
             let key = key.value();
+            if !key.starts_with(prefix.as_str()) {
+                break;
+            }
             let record: ProcessEvidenceRecord = decode(value.value())?;
             record.validate()?;
             let canonical_key = record.record_key()?;
@@ -1398,14 +1400,13 @@ impl RedbRecoveryStore {
         let history = read
             .open_table(SUPERVISION_LEASE_HISTORY)
             .map_err(storage)?;
-        let start = format!("{}::", lease_id.as_str());
-        let end = format!("{start}\u{10ffff}");
+        let prefix = format!("{}::", Self::encode_key_component(lease_id.as_str()));
         let mut snapshots = Vec::new();
-        for row in history
-            .range(start.as_str()..end.as_str())
-            .map_err(storage)?
-        {
+        for row in history.range(prefix.as_str()..).map_err(storage)? {
             let (key, value) = row.map_err(storage)?;
+            if !key.value().starts_with(prefix.as_str()) {
+                break;
+            }
             let snapshot: SupervisionLeaseSnapshot =
                 decode_named(value.value(), "supervision_lease_history")?;
             snapshot.validate()?;
@@ -1424,8 +1425,24 @@ impl RedbRecoveryStore {
         Ok(snapshots)
     }
 
+    fn encode_key_component(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for ch in value.chars() {
+            match ch {
+                '%' => out.push_str("%25"),
+                ':' => out.push_str("%3A"),
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
     fn supervision_history_key(lease_id: &crate::OperationIdentity, revision: u64) -> String {
-        format!("{}::{:020}", lease_id.as_str(), revision)
+        format!(
+            "{}::{:020}",
+            Self::encode_key_component(lease_id.as_str()),
+            revision
+        )
     }
 
     fn persist_supervision_snapshot(
