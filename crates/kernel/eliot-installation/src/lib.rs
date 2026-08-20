@@ -69,17 +69,17 @@ pub use redb_state::RedbInstallationTransactionStore;
 
 /// Stable wire name for the installation contract.
 pub const CONTRACT_NAME: &str = "eliot.kernel.installation";
-/// Explicit Phase-A marker for Host-owned Phase-B physical digests.
-///
-/// The wire value is a reserved SHA-256-shaped label solely because the
-/// existing SCM bootstrap constructor and the read-only Watchdog selector
-/// require a digest-shaped string. Runtime validation classifies this exact
-/// value as [`PhaseBDigestState::Pending`], never as a live physical digest;
-/// Host must replace it with exact Phase-B readback before child admission.
+/// Explicit, non-digest Phase-A marker for Host-owned Phase-B physical
+/// digests. It is intentionally not SHA-256-shaped: runtime state must never
+/// confuse the pending marker with a physical authority or bootstrap digest.
+pub const PHASE_B_PENDING_MARKER: &str = "phase-b-pending:v1";
+/// Compatibility name for the reserved Phase-A pending state. Despite the
+/// historical name, this value is a typed marker and is not a digest.
+pub const PHASE_B_PENDING_DIGEST: &str = PHASE_B_PENDING_MARKER;
+/// Adapter-only hashed selector emitted in SCM bootstrap argv. This value is
+/// never valid in a [`RuntimeLaunchDescriptor`] Phase-B digest field.
 pub const PHASE_B_PENDING_SCM_DIGEST: &str =
     "287ddc2779dd75cc92d2dadd6f06b4dba2eefa5d63538db7be11523687f7ba8c";
-/// Compatibility name for the reserved Phase-A pending state.
-pub const PHASE_B_PENDING_DIGEST: &str = PHASE_B_PENDING_SCM_DIGEST;
 const LEGACY_PHASE_B_ZERO_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 /// Current installation contract revision.
@@ -261,9 +261,16 @@ pub fn phase_b_digest_state(
     value: &PlatformHandle,
     field: &str,
 ) -> Result<PhaseBDigestState, InstallationError> {
-    if value.as_str() == PHASE_B_PENDING_DIGEST {
+    if value.as_str() == PHASE_B_PENDING_MARKER {
         handle(value, field)?;
         return Ok(PhaseBDigestState::Pending);
+    }
+    if value.as_str() == PHASE_B_PENDING_SCM_DIGEST {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "the SCM pending selector is adapter-only and cannot be runtime authority"
+                .to_owned(),
+        });
     }
     if value.as_str() == LEGACY_PHASE_B_ZERO_DIGEST {
         return Err(InstallationError::InvalidField {
@@ -276,12 +283,44 @@ pub fn phase_b_digest_state(
     Ok(PhaseBDigestState::Live)
 }
 
-fn phase_b_scm_digest(value: &PlatformHandle) -> PlatformHandle {
-    if value.as_str() == PHASE_B_PENDING_DIGEST {
-        PlatformHandle::new(PHASE_B_PENDING_SCM_DIGEST).unwrap_or_else(|_| unreachable!())
-    } else {
-        value.clone()
+/// Converts the typed runtime Phase-B state to the hashed selector required by
+/// the SCM adapter. The hashed pending selector never crosses back into the
+/// runtime authority fields.
+pub fn phase_b_scm_selector(value: &PlatformHandle) -> Result<PlatformHandle, InstallationError> {
+    match phase_b_digest_state(value, "phase_b.scm_selector")? {
+        PhaseBDigestState::Pending => {
+            PlatformHandle::new(PHASE_B_PENDING_SCM_DIGEST).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "phase_b.scm_selector".to_owned(),
+                    reason: error.to_string(),
+                }
+            })
+        }
+        PhaseBDigestState::Live => Ok(value.clone()),
     }
+}
+
+fn phase_b_scm_digest(value: &PlatformHandle) -> Result<PlatformHandle, InstallationError> {
+    phase_b_scm_selector(value)
+}
+
+fn validate_phase_b_scm_digest(
+    value: &PlatformHandle,
+    field: &str,
+) -> Result<(), InstallationError> {
+    if value.as_str() == LEGACY_PHASE_B_ZERO_DIGEST {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "legacy zero digest cannot be used as an SCM selector".to_owned(),
+        });
+    }
+    if value.as_str() == PHASE_B_PENDING_MARKER {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "runtime pending marker must be mapped to the adapter SCM selector".to_owned(),
+        });
+    }
+    sha256_handle(value, field)
 }
 
 fn validate_eliotd_launch_nonce(
@@ -1664,7 +1703,7 @@ pub struct RuntimeLaunchDescriptor {
     pub authority_descriptor_path: PlatformHandle,
     /// Independent lowercase SHA-256 digest of the authority descriptor bytes.
     ///
-    /// A Phase-A candidate carries [`PHASE_B_PENDING_DIGEST`] here. Host
+    /// A Phase-A candidate carries [`PHASE_B_PENDING_MARKER`] here. Host
     /// replaces that typed pending state only with the digest of exact
     /// published authority bytes before child admission.
     pub authority_descriptor_digest: PlatformHandle,
@@ -1714,7 +1753,7 @@ pub struct RuntimeLaunchDescriptor {
     pub store_bootstrap_descriptor_path: PlatformHandle,
     /// SHA-256 digest of the neutral Store bootstrap descriptor.
     ///
-    /// A Phase-A candidate carries [`PHASE_B_PENDING_DIGEST`] here. Host
+    /// A Phase-A candidate carries [`PHASE_B_PENDING_MARKER`] here. Host
     /// replaces that typed pending state only with the digest of exact
     /// published Store bootstrap bytes before child admission.
     pub store_bootstrap_descriptor_digest: PlatformHandle,
@@ -1819,7 +1858,7 @@ impl RuntimeLaunchDescriptor {
                     .to_owned(),
             });
         }
-        let pending_bootstrap = PlatformHandle::new(PHASE_B_PENDING_DIGEST).map_err(|error| {
+        let pending_bootstrap = PlatformHandle::new(PHASE_B_PENDING_MARKER).map_err(|error| {
             InstallationError::InvalidField {
                 field: "runtime_launch.store_bootstrap_descriptor_digest".to_owned(),
                 reason: error.to_string(),
@@ -7257,7 +7296,7 @@ impl InstallationTransaction {
                             .candidate_manifest
                             .runtime_launch
                             .authority_descriptor_digest,
-                    ),
+                    )?,
                     installation_id: self
                         .candidate_manifest
                         .runtime_launch
@@ -8470,7 +8509,9 @@ impl InstallationEffectPrecondition {
 pub struct InstallationServiceBootstrap {
     /// Exact authority descriptor path consumed by Host and Watchdog.
     pub descriptor_path: PlatformHandle,
-    /// SHA-256 digest of the descriptor bytes.
+    /// SHA-256-shaped SCM selector for the descriptor. For a Phase-A pending
+    /// runtime marker this is [`PHASE_B_PENDING_SCM_DIGEST`], not a physical
+    /// authority readback and never a Phase-B live proof.
     pub descriptor_digest: PlatformHandle,
     /// Installation identity bound to the descriptor.
     pub installation_id: PlatformHandle,
@@ -8486,11 +8527,10 @@ pub struct InstallationServiceBootstrap {
 impl InstallationServiceBootstrap {
     fn validate(&self) -> Result<(), InstallationError> {
         approved_path(&self.descriptor_path, "service_bootstrap.descriptor_path")?;
-        // SCM carries this value only as a stable generation selector. A
-        // Phase-A selector is explicitly `Pending`; it is never a live
-        // authority readback and Host must bind the actual Phase-B digest
-        // before starting either child.
-        phase_b_digest_state(
+        // SCM carries only the adapter selector here. A Phase-A runtime
+        // pending marker must already have been converted to the distinct
+        // hashed selector before this bootstrap crosses the adapter boundary.
+        validate_phase_b_scm_digest(
             &self.descriptor_digest,
             "service_bootstrap.descriptor_digest",
         )?;
@@ -12548,36 +12588,42 @@ fn effect_request(
         staging_receipt: progress.staging_receipt.clone(),
         action,
         expected_external_identity,
-        service_bootstrap: is_service.then(|| InstallationServiceBootstrap {
-            descriptor_path: transaction
-                .candidate_manifest
-                .runtime_launch
-                .authority_descriptor_path
-                .clone(),
-            descriptor_digest: phase_b_scm_digest(
-                &transaction
-                    .candidate_manifest
-                    .runtime_launch
-                    .authority_descriptor_digest,
-            ),
-            installation_id: transaction
-                .candidate_manifest
-                .runtime_launch
-                .installation_epoch
-                .installation
-                .clone(),
-            plan_generation: transaction
-                .candidate_manifest
-                .runtime_launch
-                .authority_generation
-                .value(),
-            host_state_root: transaction
-                .candidate_manifest
-                .runtime_launch
-                .runtime_state_roots
-                .host_state_root
-                .clone(),
-        }),
+        service_bootstrap: is_service
+            .then(
+                || -> Result<InstallationServiceBootstrap, InstallationError> {
+                    Ok(InstallationServiceBootstrap {
+                        descriptor_path: transaction
+                            .candidate_manifest
+                            .runtime_launch
+                            .authority_descriptor_path
+                            .clone(),
+                        descriptor_digest: phase_b_scm_digest(
+                            &transaction
+                                .candidate_manifest
+                                .runtime_launch
+                                .authority_descriptor_digest,
+                        )?,
+                        installation_id: transaction
+                            .candidate_manifest
+                            .runtime_launch
+                            .installation_epoch
+                            .installation
+                            .clone(),
+                        plan_generation: transaction
+                            .candidate_manifest
+                            .runtime_launch
+                            .authority_generation
+                            .value(),
+                        host_state_root: transaction
+                            .candidate_manifest
+                            .runtime_launch
+                            .runtime_state_roots
+                            .host_state_root
+                            .clone(),
+                    })
+                },
+            )
+            .transpose()?,
         registration_nonce: progress.registration_nonce.clone(),
     };
     request.validate()?;
@@ -17261,7 +17307,39 @@ mod tests {
             .phase_b_live_binding
             .as_mut()
             .unwrap_or_else(|| unreachable!());
-        binding.authority_descriptor_digest = test_handle(PHASE_B_PENDING_DIGEST);
+        binding.authority_descriptor_digest = test_handle(PHASE_B_PENDING_MARKER);
+        assert!(
+            registry
+                .commit_pending_activation(
+                    &host,
+                    &transaction.transaction_id,
+                    &transaction.installer_plan_digest,
+                    &transaction.candidate_manifest.generation,
+                    &fence,
+                )
+                .is_err()
+        );
+        assert!(registry.active().is_none());
+        assert!(registry.pending_activation().is_some());
+    }
+
+    #[test]
+    fn registry_commit_rejects_scm_pending_selector_as_phase_b_live_proof() {
+        let transaction = registering_transaction();
+        let host = host_capability();
+        let mut registry = ApprovedGenerationRegistry::new();
+        must(registry.stage_pending_activation(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            transaction.candidate_manifest.clone(),
+            test_handle("approval:phase-b-scm-selector"),
+        ));
+        let mut fence = test_commit_fence(&transaction.candidate_manifest);
+        fence
+            .phase_b_live_binding
+            .as_mut()
+            .unwrap_or_else(|| unreachable!())
+            .authority_descriptor_digest = test_handle(PHASE_B_PENDING_SCM_DIGEST);
         assert!(
             registry
                 .commit_pending_activation(
@@ -17542,7 +17620,7 @@ mod tests {
     fn phase_b_digest_state_transitions_are_ordered_and_non_admissible_until_live() {
         let transaction = registering_transaction();
         let mut phase_a = transaction.candidate_manifest.runtime_launch.clone();
-        let pending = test_handle(PHASE_B_PENDING_DIGEST);
+        let pending = test_handle(PHASE_B_PENDING_MARKER);
         phase_a.authority_descriptor_digest = pending.clone();
         phase_a.store_bootstrap_descriptor_digest = pending.clone();
         phase_a.kernel_arguments[5] = pending.clone();
@@ -17592,10 +17670,71 @@ mod tests {
             (PhaseBDigestState::Live, PhaseBDigestState::Live)
         );
         assert!(live.require_phase_b_live().is_ok());
+        assert!(
+            live.with_phase_b_materialization(
+                live.authority_generation,
+                live.authority_state_fence.clone(),
+                test_handle("a".repeat(64)),
+                test_handle("c".repeat(64)),
+                test_handle("b".repeat(64)),
+            )
+            .is_err()
+        );
 
-        let mut legacy_zero = phase_a;
+        let mut legacy_zero = phase_a.clone();
         legacy_zero.authority_descriptor_digest = test_handle("0".repeat(64));
         assert!(legacy_zero.phase_b_digest_state().is_err());
+        let mut legacy_zero_bootstrap = phase_a;
+        legacy_zero_bootstrap.store_bootstrap_descriptor_digest = test_handle("0".repeat(64));
+        assert!(legacy_zero_bootstrap.phase_b_digest_state().is_err());
+    }
+
+    #[test]
+    fn phase_b_pending_marker_and_scm_selector_stay_in_distinct_domains() {
+        assert_ne!(PHASE_B_PENDING_MARKER, PHASE_B_PENDING_SCM_DIGEST);
+        assert!(!is_lower_sha256(PHASE_B_PENDING_MARKER));
+        assert!(is_lower_sha256(PHASE_B_PENDING_SCM_DIGEST));
+
+        let marker = test_handle(PHASE_B_PENDING_MARKER);
+        assert_eq!(
+            phase_b_digest_state(&marker, "test.phase_b_marker"),
+            Ok(PhaseBDigestState::Pending)
+        );
+        assert_eq!(
+            phase_b_scm_selector(&marker),
+            Ok(test_handle(PHASE_B_PENDING_SCM_DIGEST))
+        );
+
+        let selector = test_handle(PHASE_B_PENDING_SCM_DIGEST);
+        assert!(phase_b_digest_state(&selector, "test.phase_b_selector").is_err());
+        assert!(phase_b_scm_selector(&selector).is_err());
+    }
+
+    #[test]
+    fn service_bootstrap_requires_adapter_selector_for_pending_runtime_state() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-installation-phase-b-bootstrap-{}",
+            std::process::id()
+        ));
+        let make_bootstrap = |descriptor_digest: &str| InstallationServiceBootstrap {
+            descriptor_path: test_handle(root.join("authority.json").to_string_lossy()),
+            descriptor_digest: test_handle(descriptor_digest),
+            installation_id: test_handle("installation:phase-b-bootstrap"),
+            plan_generation: 1,
+            host_state_root: test_handle(root.join("host").to_string_lossy()),
+        };
+
+        assert!(make_bootstrap(PHASE_B_PENDING_MARKER).validate().is_err());
+        assert!(
+            make_bootstrap(PHASE_B_PENDING_SCM_DIGEST)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            make_bootstrap(LEGACY_PHASE_B_ZERO_DIGEST)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

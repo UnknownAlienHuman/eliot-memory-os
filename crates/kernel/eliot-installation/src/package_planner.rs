@@ -13,7 +13,7 @@ use crate::{
     AuthorityEpoch, CandidateManifest, InstallationEpoch, InstallationError, InstallationProfile,
     InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, InstallerServiceAccount,
     InstallerServiceRole, LOCAL_SERVICE_SID, ManagedEnvironmentAction,
-    ManagedEnvironmentChangeRequest, PHASE_B_PENDING_DIGEST, PackageArtifactDigest, PlannedChange,
+    ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange,
     ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
     StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
     candidate_manifest_digest as candidate_digest_fn, handle,
@@ -842,7 +842,7 @@ impl GenerationPackagePlanner {
         );
         // This is a typed pending marker, never a physical digest. Host must
         // replace it after exact Phase-B publication/readback.
-        let phase_b_digest = PlatformHandle::new(PHASE_B_PENDING_DIGEST).map_err(|error| {
+        let phase_b_marker = PlatformHandle::new(PHASE_B_PENDING_MARKER).map_err(|error| {
             InstallationError::InvalidField {
                 field: "generation.phase_b_digest".to_owned(),
                 reason: error.to_string(),
@@ -872,11 +872,11 @@ impl GenerationPackagePlanner {
             "--store-bootstrap".to_owned(),
             store_bootstrap_path.as_str().to_owned(),
             "--store-bootstrap-sha256".to_owned(),
-            phase_b_digest.as_str().to_owned(),
+            phase_b_marker.as_str().to_owned(),
             "--authority-descriptor".to_owned(),
             authority_path.as_str().to_owned(),
             "--authority-descriptor-sha256".to_owned(),
-            phase_b_digest.as_str().to_owned(),
+            phase_b_marker.as_str().to_owned(),
             "--kernel-artifact-sha256".to_owned(),
             kernel_digest.as_str().to_owned(),
             "--eliotd-descriptor".to_owned(),
@@ -921,7 +921,7 @@ impl GenerationPackagePlanner {
             authority_generation,
             authority_state_fence,
             authority_descriptor_path: authority_path,
-            authority_descriptor_digest: phase_b_digest.clone(),
+            authority_descriptor_digest: phase_b_marker.clone(),
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
             kernel_artifact_digest: kernel_digest.clone(),
@@ -937,7 +937,7 @@ impl GenerationPackagePlanner {
             store_bridge_executable_path: store_bridge_path.clone(),
             store_bridge_artifact_digest: store_bridge_digest.clone(),
             store_bootstrap_descriptor_path: store_bootstrap_path,
-            store_bootstrap_descriptor_digest: phase_b_digest,
+            store_bootstrap_descriptor_digest: phase_b_marker,
             canonical_store_executable_path: canonical_store_path.clone(),
             canonical_store_artifact_digest: canonical_store_digest.clone(),
             kernel_arguments,
@@ -2249,7 +2249,7 @@ mod tests {
                 .runtime_launch
                 .authority_descriptor_digest
                 .as_str(),
-            PHASE_B_PENDING_DIGEST
+            PHASE_B_PENDING_MARKER
         );
         assert_eq!(
             transaction
@@ -2257,7 +2257,7 @@ mod tests {
                 .runtime_launch
                 .store_bootstrap_descriptor_digest
                 .as_str(),
-            PHASE_B_PENDING_DIGEST
+            PHASE_B_PENDING_MARKER
         );
         assert_eq!(
             transaction
@@ -2265,7 +2265,7 @@ mod tests {
                 .runtime_launch
                 .kernel_arguments[5]
                 .as_str(),
-            PHASE_B_PENDING_DIGEST
+            PHASE_B_PENDING_MARKER
         );
         assert_eq!(
             transaction
@@ -2273,7 +2273,7 @@ mod tests {
                 .runtime_launch
                 .kernel_arguments[9]
                 .as_str(),
-            PHASE_B_PENDING_DIGEST
+            PHASE_B_PENDING_MARKER
         );
         assert_eq!(
             transaction

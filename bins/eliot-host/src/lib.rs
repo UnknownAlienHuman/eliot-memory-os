@@ -34,9 +34,9 @@ use eliot_host_state::{
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest, InstallationEpoch,
     InstallationError, InstallationProfile, InstallerServiceRegistrationApproval,
-    InstallerServiceRole, PHASE_B_PENDING_DIGEST, PHASE_B_PENDING_SCM_DIGEST,
-    PendingActivationState, PhaseBLiveBinding, RedbInstallationRegistry, RuntimeLaunchDescriptor,
-    verify_approved_path, verify_file_digest_with_lease, verify_file_digest_with_user_lease,
+    InstallerServiceRole, PHASE_B_PENDING_MARKER, PendingActivationState, PhaseBLiveBinding,
+    RedbInstallationRegistry, RuntimeLaunchDescriptor, phase_b_scm_selector, verify_approved_path,
+    verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
 use eliot_kernel_service::{
     EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
@@ -82,7 +82,7 @@ pub const HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR: &str =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostStoreRebindProductionBoundary;
-const STORE_SEMANTIC_CONFIG_HASH_PENDING: &str = PHASE_B_PENDING_DIGEST;
+const STORE_SEMANTIC_CONFIG_HASH_PENDING: &str = PHASE_B_PENDING_MARKER;
 
 /// Exact launch authority supplied by the Runtime Live SCM registration.
 ///
@@ -5233,17 +5233,10 @@ fn approved_service_registration_request(
             "SCM registration approval did not reconstruct a typed bootstrap".to_owned(),
         )
     })?;
-    let expected_descriptor_digest =
-        if launch.authority_descriptor_digest.as_str() == PHASE_B_PENDING_DIGEST {
-            PHASE_B_PENDING_SCM_DIGEST
-        } else {
-            launch.authority_descriptor_digest.as_str()
-        };
-    let descriptor_digest_matches_selector = bootstrap.config_descriptor_digest()
-        == expected_descriptor_digest
-        || bootstrap.config_descriptor_digest() == PHASE_B_PENDING_SCM_DIGEST;
+    let expected_descriptor_digest = phase_b_scm_selector(&launch.authority_descriptor_digest)
+        .map_err(HostError::Installation)?;
     if bootstrap.config_descriptor_path() != Path::new(launch.authority_descriptor_path.as_str())
-        || !descriptor_digest_matches_selector
+        || bootstrap.config_descriptor_digest() != expected_descriptor_digest.as_str()
         || bootstrap.installation_id() != launch.installation_epoch.installation.as_str()
         || bootstrap.host_state_root()
             != Some(Path::new(
@@ -6518,14 +6511,10 @@ impl HostComposition {
         // be substituted by it.
         let manifest_descriptor_path = PathBuf::from(launch.authority_descriptor_path.as_str());
         let manifest_host_root = PathBuf::from(launch.runtime_state_roots.host_state_root.as_str());
-        let expected_descriptor_digest =
-            if launch.authority_descriptor_digest.as_str() == PHASE_B_PENDING_DIGEST {
-                PHASE_B_PENDING_SCM_DIGEST
-            } else {
-                launch.authority_descriptor_digest.as_str()
-            };
+        let expected_descriptor_digest = phase_b_scm_selector(&launch.authority_descriptor_digest)
+            .map_err(HostError::Installation)?;
         if manifest_descriptor_path != options.config_descriptor_path
-            || expected_descriptor_digest != options.config_descriptor_digest().as_str()
+            || expected_descriptor_digest.as_str() != options.config_descriptor_digest().as_str()
             || launch.installation_epoch.installation != *options.installation()
             || launch.authority_generation.value() != options.transaction_plan_generation()
             || manifest_host_root != options.host_state_root
@@ -7297,7 +7286,7 @@ impl HostComposition {
             .launch
             .require_phase_b_live()
             .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-        if phase_b.authority_descriptor_digest.as_str() == PHASE_B_PENDING_DIGEST
+        if phase_b.authority_descriptor_digest.as_str() == PHASE_B_PENDING_MARKER
             || phase_b.authority_descriptor_digest != phase_b.launch.authority_descriptor_digest
         {
             return Err(HostError::RecoveryRequired(
@@ -10556,10 +10545,10 @@ mod journal_tests {
         // pending bootstrap marker to avoid a self-referential semantic hash.
         // Host's in-memory live launch overlays the exact published bootstrap
         // digest before process admission.
-        let pending_digest =
-            PlatformHandle::new(PHASE_B_PENDING_DIGEST).expect("Phase-B pending digest");
-        launch.store_bootstrap_descriptor_digest = pending_digest.clone();
-        launch.kernel_arguments[5] = pending_digest;
+        let pending_marker =
+            PlatformHandle::new(PHASE_B_PENDING_MARKER).expect("Phase-B pending marker");
+        launch.store_bootstrap_descriptor_digest = pending_marker.clone();
+        launch.kernel_arguments[5] = pending_marker;
 
         let nonce = host.host_process_nonce().as_handle().clone();
         let config_without_hash = serde_json::json!({
@@ -10784,6 +10773,34 @@ mod journal_tests {
             registration_nonce: Some(PlatformHandle::new("e".repeat(64)).unwrap()),
         };
         assert!(HostComposition::validate_launch_options_for_manifest(&options, &manifest).is_ok());
+
+        let mut pending_manifest = manifest.clone();
+        pending_manifest.runtime_launch.authority_descriptor_digest =
+            PlatformHandle::new(PHASE_B_PENDING_MARKER).unwrap_or_else(|_| unreachable!());
+        let mut pending_options = options.clone();
+        pending_options.config_descriptor_digest =
+            PlatformHandle::new(eliot_installation::PHASE_B_PENDING_SCM_DIGEST)
+                .unwrap_or_else(|_| unreachable!());
+        assert!(
+            HostComposition::validate_launch_options_for_manifest(
+                &pending_options,
+                &pending_manifest,
+            )
+            .is_ok()
+        );
+        let mut runtime_selector_manifest = pending_manifest.clone();
+        runtime_selector_manifest
+            .runtime_launch
+            .authority_descriptor_digest =
+            PlatformHandle::new(eliot_installation::PHASE_B_PENDING_SCM_DIGEST)
+                .unwrap_or_else(|_| unreachable!());
+        assert!(
+            HostComposition::validate_launch_options_for_manifest(
+                &pending_options,
+                &runtime_selector_manifest,
+            )
+            .is_err()
+        );
 
         let mut substituted = options.clone();
         substituted.config_descriptor_digest =
