@@ -8,12 +8,17 @@
 #![forbid(unsafe_code)]
 
 mod model;
+mod status;
 mod store;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
 pub use model::*;
+pub use status::{
+    OrsSupervisionStatusError, SupervisionStatusProjection, SupervisionStatusReason,
+    observe_supervision_status, open_existing_read_only,
+};
 pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
 };
