@@ -2573,4 +2573,238 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn history_empty_but_current_exists_is_corrupt_and_read_only() {
+        let p = path("history-empty-current");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 1);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
+                table.remove("lease-1::00000000000000000001").unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(
+            matches!(res, Err(OrsSupervisionStatusError::Corrupt(_))),
+            "history empty but current exists must be corrupt, got {res:?}"
+        );
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn history_exists_without_current_is_corrupt_and_read_only() {
+        let p = path("history-no-current");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 1);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(SUPERVISION_LEASE_CURRENT).unwrap();
+                table.remove("lease-1").unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(
+            matches!(res, Err(OrsSupervisionStatusError::Corrupt(_))),
+            "history without current must be corrupt, got {res:?}"
+        );
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn current_is_not_newest_is_corrupt_and_read_only() {
+        let p = path("current-not-newest");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 2);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut cur = write.open_table(SUPERVISION_LEASE_CURRENT).unwrap();
+                let hist = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
+                let old_val = hist
+                    .get("lease-1::00000000000000000001")
+                    .unwrap()
+                    .unwrap()
+                    .value()
+                    .to_owned();
+                let snap: SupervisionLeaseSnapshot = serde_json::from_str(&old_val).unwrap();
+                snap.validate().unwrap();
+                cur.insert("lease-1", old_val.as_str()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(
+            matches!(res, Err(OrsSupervisionStatusError::Corrupt(_))),
+            "current not newest must be corrupt, got {res:?}"
+        );
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn genesis_revision_not_one_is_unknown_and_read_only() {
+        let p = path("genesis-not-one");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 3);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut hist = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
+                hist.remove("lease-1::00000000000000000001").unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(
+            matches!(res, Err(OrsSupervisionStatusError::Unknown(_))),
+            "genesis not one must be unknown, got {res:?}"
+        );
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn percent_lease_is_isolated_from_sibling_prefix() {
+        let p = path("percent-sibling");
+        cleanup(&p);
+        let store = RedbRecoveryStore::open(&p).unwrap();
+        let signer =
+            Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])
+                .unwrap();
+        for lease in ["lease%1", "lease%2"] {
+            let stage = store
+                .prepare_supervision_lease(request(
+                    &format!("t-{lease}"),
+                    &format!("o-{lease}"),
+                    lease,
+                    None,
+                    SupervisionLeaseOperation::Commit,
+                    binding(LeaseState::Active, 100),
+                ))
+                .unwrap();
+            let envelope = stage
+                .ticket
+                .expected_payload()
+                .unwrap()
+                .sign(&signer)
+                .unwrap();
+            let anchor = SupervisionTrustAnchor::new(
+                "installation-1",
+                signer.signer_id(),
+                signer.key_id(),
+                signer.public_key().to_vec(),
+            )
+            .unwrap();
+            let payload = &envelope.payload;
+            let generation = &payload.generation_binding;
+            let ctx = SupervisionLeaseVerificationContext {
+                now_ms: 101,
+                lease_id: payload.lease_id.clone(),
+                host_epoch: payload.host_epoch,
+                activation_id: payload.activation_id.clone(),
+                activation_generation: payload.activation_generation,
+                kernel_epoch: payload.kernel_epoch,
+                watchdog_epoch: payload.watchdog_epoch,
+                state_fence: payload.state_fence.clone(),
+                scope_ref: payload.scope_ref.clone(),
+                observation_scope: payload.observation_scope.clone(),
+                target_id: generation.target_id.clone(),
+                module_id: generation.module_id.clone(),
+                process_id: generation.process_id.clone(),
+                target_generation: generation.target_generation,
+                module_generation: generation.module_generation,
+                process_generation: generation.process_generation,
+                public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+                ors_mirror: payload.ors_mirror.clone(),
+                active_state: SupervisionLeaseActiveStateBinding {
+                    state: payload.state,
+                    revocation_id: None,
+                    revocation_epoch: None,
+                },
+            };
+            let verified = anchor.verify(&envelope, &ctx).unwrap();
+            store
+                .commit_supervision_lease(&stage.ticket, &verified)
+                .unwrap();
+        }
+        drop(store);
+        let signer2 =
+            Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])
+                .unwrap();
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            signer2.signer_id(),
+            signer2.key_id(),
+            signer2.public_key().to_vec(),
+        )
+        .unwrap();
+        for lease in ["lease%1", "lease%2"] {
+            let snap: SupervisionLeaseSnapshot = {
+                let db = redb::Database::create(&p).unwrap();
+                let read = db.begin_read().unwrap();
+                let table = read.open_table(SUPERVISION_LEASE_CURRENT).unwrap();
+                let v = table.get(lease).unwrap().unwrap().value().to_owned();
+                serde_json::from_str(&v).unwrap()
+            };
+            let payload = &snap.record.artifact.payload;
+            let generation = &payload.generation_binding;
+            let ctx2 = SupervisionLeaseVerificationContext {
+                now_ms: 101,
+                lease_id: payload.lease_id.clone(),
+                host_epoch: payload.host_epoch,
+                activation_id: payload.activation_id.clone(),
+                activation_generation: payload.activation_generation,
+                kernel_epoch: payload.kernel_epoch,
+                watchdog_epoch: payload.watchdog_epoch,
+                state_fence: payload.state_fence.clone(),
+                scope_ref: payload.scope_ref.clone(),
+                observation_scope: payload.observation_scope.clone(),
+                target_id: generation.target_id.clone(),
+                module_id: generation.module_id.clone(),
+                process_id: generation.process_id.clone(),
+                target_generation: generation.target_generation,
+                module_generation: generation.module_generation,
+                process_generation: generation.process_generation,
+                public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+                ors_mirror: payload.ors_mirror.clone(),
+                active_state: SupervisionLeaseActiveStateBinding {
+                    state: payload.state,
+                    revocation_id: None,
+                    revocation_epoch: None,
+                },
+            };
+            let proj = observe_supervision_status(&p, &anchor, &ctx2).unwrap();
+            assert_eq!(proj.health, HealthDimension::Healthy);
+            assert_eq!(proj.history.len(), 1);
+            assert_eq!(
+                proj.current.as_ref().unwrap().record.lease_id.as_str(),
+                lease
+            );
+        }
+        cleanup(&p);
+    }
 }
