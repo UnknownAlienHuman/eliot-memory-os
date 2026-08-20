@@ -57,7 +57,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum InstallationCommand {
-    /// Validate an immutable v7 installation plan JSON without applying it.
+    /// Validate an immutable v8 installation plan JSON without applying it.
     Plan {
         /// Absolute path to an existing serialized `InstallationTransaction`.
         #[arg(long, value_parser = absolute_path)]
@@ -746,8 +746,6 @@ fn print_transaction_projection(
             "transaction": transaction_value,
             "scope": INSTALLATION_SCOPE,
             "deferred_scope": [
-                "package_staging",
-                "static_verification",
                 "generation_activation",
                 "service_start",
                 "runtime_health",
