@@ -63,8 +63,7 @@ fn run_watchdog(
         .map_err(|error| error.to_string())?,
     );
     let binding = admission_source.runtime_binding();
-    inspect_approved_host_registration(binding.approved_host_image())
-        .map_err(|error| error.to_string())?;
+    inspect_approved_host_registration(&binding).map_err(|error| error.to_string())?;
     let initial_admission = admission_source.reload().ok();
     let sensor = Arc::new(
         match initial_admission {
@@ -80,9 +79,7 @@ fn run_watchdog(
         WatchdogConfig::default(),
         admission_source,
         sensor,
-        Arc::new(LiveHostObservationSource::try_new(
-            binding.approved_host_image().to_owned(),
-        )),
+        Arc::new(LiveHostObservationSource::from_binding(&binding)),
         stop_signal,
     )
     .map_err(|error| error.to_string())?;

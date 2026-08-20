@@ -24,18 +24,18 @@ use eliot_platform::{
 };
 pub use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{
-    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerEpochCapability,
-    InstallerRootAbsentSnapshot, InstallerRootCreateDisposition, InstallerRootError,
-    InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
-    InstallerRootProfile, InstallerSecretCreateDisposition, InstallerSecretObservation,
-    ProtectedPathError, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
-    ServiceRegistrationInspection, ServiceRegistrationOutcome, ServiceRegistrationRequest,
-    ServiceStartMode, UserOwnedPathLease, UserOwnedRootReadLease, WindowsInstallerRootPrimitive,
-    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
-    current_user_local_app_data_root, fresh_service_registration_nonce,
-    observe_running_eliot_host_process, protected_program_data_root,
-    require_protected_program_data_path,
+    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
+    ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerEpochCapability, InstallerRootAbsentSnapshot,
+    InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
+    InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
+    InstallerSecretCreateDisposition, InstallerSecretObservation, ProtectedPathError,
+    ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease, ServiceAccount,
+    ServiceBootstrapArguments, ServiceRegistrationCurrent, ServiceRegistrationInspection,
+    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceStartMode, UserOwnedPathLease,
+    UserOwnedRootReadLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
+    WindowsPlatform, WindowsStoreCredentialTargetGenerator, current_user_local_app_data_root,
+    fresh_service_registration_nonce, observe_running_eliot_host_process,
+    protected_program_data_root, require_protected_program_data_path,
 };
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
@@ -2529,6 +2529,10 @@ impl ApprovedGeneration {
 pub struct ApprovedGenerationRegistry {
     /// Approved generations keyed by their exact generation identity.
     generations: Vec<ApprovedGeneration>,
+    /// Installer-owned Host and Watchdog SCM approvals keyed by generation and
+    /// role.  This projection is populated only from applied transaction
+    /// service effects.
+    service_registration_approvals: Vec<InstallerServiceRegistrationApproval>,
     /// Currently active generation identity, when one is active.
     active_generation: Option<PlatformHandle>,
     /// Last-known-good generation identity, when one is available.
@@ -2601,6 +2605,8 @@ pub enum PendingActivationState {
 }
 
 const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("eliot_approved_generations_v2");
+const LEGACY_REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eliot_approved_generations_v1");
 const REGISTRY_RELATIVE_PATH: &str = "Eliot/host/installation-registry.redb";
 const INSTALLATION_REGISTRY_FILE_NAME: &str = "installation-registry.redb";
@@ -3032,6 +3038,18 @@ struct PrePendingRegistryWire {
     last_known_good_generation: Option<PlatformHandle>,
 }
 
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreServiceRegistrationApprovalRegistryWire {
+    generations: Vec<ApprovedGeneration>,
+    active_generation: Option<PlatformHandle>,
+    last_known_good_generation: Option<PlatformHandle>,
+    pending_activation: Option<PendingActivation>,
+    #[serde(default)]
+    last_terminal_activation: Option<serde_json::Value>,
+}
+
 fn is_pre_eliotd_config_registry(bytes: &[u8]) -> bool {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return false;
@@ -3069,6 +3087,7 @@ fn is_pre_eliotd_config_registry(bytes: &[u8]) -> bool {
             serde_json::Value::String("0".repeat(64)),
         );
     }
+    value["service_registration_approvals"] = serde_json::json!([]);
     let Ok(mut registry) = serde_json::from_value::<ApprovedGenerationRegistry>(value) else {
         return false;
     };
@@ -3125,9 +3144,17 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
                     reason: "approved-generation registry requires re-stage; legacy launch fields cannot be synthesized"
                         .to_owned(),
                 })
+            } else if serde_json::from_slice::<PreServiceRegistrationApprovalRegistryWire>(bytes)
+                .is_ok()
+            {
+                Err(InstallationError::MigrationRequired {
+                    reason: "approved-generation registry predates installer-owned SCM registration approvals and requires explicit re-stage"
+                        .to_owned(),
+                })
             } else if let Ok(previous) = serde_json::from_slice::<PrePendingRegistryWire>(bytes) {
                 let previous = ApprovedGenerationRegistry {
                     generations: previous.generations,
+                    service_registration_approvals: Vec::new(),
                     active_generation: previous.active_generation,
                     last_known_good_generation: previous.last_known_good_generation,
                     pending_activation: None,
@@ -3168,9 +3195,19 @@ enum RegistryPathLease {
         _root: ProtectedRootLease,
         _file: ProtectedRuntimePathLease,
     },
+    #[cfg(test)]
+    Test,
 }
 
 impl RedbInstallationRegistry {
+    #[cfg(test)]
+    fn from_database_for_test(database: Database) -> Self {
+        Self {
+            database,
+            _path_lease: RegistryPathLease::Test,
+        }
+    }
+
     /// Opens or creates the registry database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
         let path = path.as_ref();
@@ -3311,9 +3348,11 @@ impl RedbInstallationRegistry {
         let read = database
             .begin_read()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        reject_legacy_registry_table(&read)?;
         let table = match read.open_table(REGISTRY_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
+                classify_missing_registry_table(&read)?;
                 return Ok(Some(ApprovedGenerationRegistry::new()));
             }
             Err(error) => return Err(InstallationError::Platform(error.to_string())),
@@ -3374,9 +3413,11 @@ impl RedbInstallationRegistry {
             .database
             .begin_read()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        reject_legacy_registry_table(&read)?;
         let table = match read.open_table(REGISTRY_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
+                classify_missing_registry_table(&read)?;
                 return Ok(ApprovedGenerationRegistry::new());
             }
             Err(error) => return Err(InstallationError::Platform(error.to_string())),
@@ -3398,6 +3439,7 @@ impl RedbInstallationRegistry {
     /// Durably stores one complete validated registry projection.
     pub fn save(&self, registry: &ApprovedGenerationRegistry) -> Result<(), InstallationError> {
         registry.validate()?;
+        classify_registry_table(&self.database)?;
         let bytes = serde_json::to_vec(registry)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         let write = self
@@ -3415,6 +3457,27 @@ impl RedbInstallationRegistry {
         write
             .commit()
             .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Loads the sealed transaction, projects its exact pending activation and
+    /// SCM approvals, and commits the complete registry in one durable save.
+    ///
+    /// A successful return means the registry write committed.  If the process
+    /// stops between the transaction-store read and this commit, retrying the
+    /// same transaction identity is idempotent.
+    pub fn stage_pending_activation_from_transaction_store<S: InstallationTransactionStore>(
+        &self,
+        transaction_store: &S,
+        transaction_id: &PlatformHandle,
+        approval_ref: PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        let mut registry = self.load()?;
+        registry.stage_pending_activation_from_store(
+            transaction_store,
+            transaction_id,
+            approval_ref,
+        )?;
+        self.save(&registry)
     }
 }
 
@@ -3461,9 +3524,13 @@ fn read_existing_registry(
     let read = database
         .begin_read()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    reject_legacy_registry_table(&read)?;
     let table = match read.open_table(REGISTRY_TABLE) {
         Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(ApprovedGenerationRegistry::new()),
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            classify_missing_registry_table(&read)?;
+            return Ok(ApprovedGenerationRegistry::new());
+        }
         Err(error) => return Err(InstallationError::Platform(error.to_string())),
     };
     let Some(value) = table
@@ -3477,12 +3544,60 @@ fn read_existing_registry(
     Ok(registry)
 }
 
+fn reject_legacy_registry_table(read: &redb::ReadTransaction) -> Result<(), InstallationError> {
+    match read.open_table(LEGACY_REGISTRY_TABLE) {
+        Ok(_) => Err(InstallationError::MigrationRequired {
+            reason: "approved-generation registry uses the retired v1 table and requires explicit re-stage"
+                .to_owned(),
+        }),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(()),
+        Err(error) => Err(InstallationError::Platform(error.to_string())),
+    }
+}
+
+fn classify_missing_registry_table(read: &redb::ReadTransaction) -> Result<(), InstallationError> {
+    reject_legacy_registry_table(read)?;
+    let has_standard_tables = read
+        .list_tables()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?
+        .next()
+        .is_some();
+    let has_multimap_tables = read
+        .list_multimap_tables()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?
+        .next()
+        .is_some();
+    if has_standard_tables || has_multimap_tables {
+        return Err(InstallationError::MigrationRequired {
+            reason: "existing nonempty registry store has no installation-registry v2 table"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn classify_registry_table(database: &impl ReadableDatabase) -> Result<bool, InstallationError> {
+    let read = database
+        .begin_read()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    reject_legacy_registry_table(&read)?;
+    match read.open_table(REGISTRY_TABLE) {
+        Ok(_) => Ok(true),
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            classify_missing_registry_table(&read)?;
+            Ok(false)
+        }
+        Err(error) => Err(InstallationError::Platform(error.to_string())),
+    }
+}
+
 impl ApprovedGenerationRegistry {
     /// Creates an empty registry.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             generations: Vec::new(),
+            service_registration_approvals: Vec::new(),
             active_generation: None,
             last_known_good_generation: None,
             pending_activation: None,
@@ -3490,32 +3605,17 @@ impl ApprovedGenerationRegistry {
         }
     }
 
-    /// Approves one exact candidate generation.
-    fn approve(
-        &mut self,
-        manifest: CandidateManifest,
-        approval_ref: PlatformHandle,
-    ) -> Result<(), InstallationError> {
-        manifest.validate()?;
-        handle(&approval_ref, "approved_generation.approval_ref")?;
-        if self
-            .generations
+    /// Looks up one exact role approval for a generation without exposing a
+    /// mutation seam.
+    #[must_use]
+    pub fn service_registration_approval(
+        &self,
+        generation: &PlatformHandle,
+        role: InstallerServiceRole,
+    ) -> Option<&InstallerServiceRegistrationApproval> {
+        self.service_registration_approvals
             .iter()
-            .any(|generation| generation.manifest.generation == manifest.generation)
-        {
-            return Err(InstallationError::Duplicate {
-                kind: "approved generation".to_owned(),
-                identity: manifest.generation.as_str().to_owned(),
-            });
-        }
-        self.generations.push(ApprovedGeneration {
-            manifest,
-            approval_ref,
-            active: false,
-            last_known_good: false,
-        });
-        self.validate()?;
-        Ok(())
+            .find(|approval| approval.generation == *generation && approval.role == role)
     }
 
     /// Persists an installer-approved candidate as pending.  This is the only
@@ -3526,6 +3626,28 @@ impl ApprovedGenerationRegistry {
         plan_digest: PlatformHandle,
         manifest: CandidateManifest,
         approval_ref: PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        if manifest.runtime_launch.profile == InstallationProfile::SystemService {
+            return Err(InstallationError::ProfileViolation(
+                "SystemService activation requires transaction-bound SCM approvals".to_owned(),
+            ));
+        }
+        self.stage_pending_activation_unchecked(
+            transaction_id,
+            plan_digest,
+            manifest,
+            approval_ref,
+            &[],
+        )
+    }
+
+    fn stage_pending_activation_unchecked(
+        &mut self,
+        transaction_id: PlatformHandle,
+        plan_digest: PlatformHandle,
+        manifest: CandidateManifest,
+        approval_ref: PlatformHandle,
+        service_registration_approvals: &[InstallerServiceRegistrationApproval],
     ) -> Result<(), InstallationError> {
         handle(&transaction_id, "pending_activation.transaction_id")?;
         sha256_handle(&plan_digest, "pending_activation.plan_digest")?;
@@ -3566,10 +3688,86 @@ impl ApprovedGenerationRegistry {
                 identity: pending.manifest.generation.as_str().to_owned(),
             });
         }
-        self.approve(pending.manifest.clone(), pending.approval_ref.clone())?;
+        self.generations.push(ApprovedGeneration {
+            manifest: pending.manifest.clone(),
+            approval_ref: pending.approval_ref.clone(),
+            active: false,
+            last_known_good: false,
+        });
         self.pending_activation = Some(pending);
+        self.service_registration_approvals
+            .extend(service_registration_approvals.iter().cloned());
         self.last_terminal_activation = None;
         self.validate()
+    }
+
+    /// Stages one complete installer transaction, including its exact
+    /// Host/Watchdog SCM approval pair, as one in-memory registry projection.
+    ///
+    /// The caller can persist the returned registry with one `save` call.  No
+    /// nonce, manifest or digest is accepted from the caller; all service
+    /// bindings are projected from the transaction's applied effect progress.
+    fn stage_pending_activation_from_transaction(
+        &mut self,
+        transaction: &InstallationTransaction,
+        approval_ref: PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        transaction.validate()?;
+        let approvals = transaction.service_registration_approvals()?;
+        if transaction.profile == InstallationProfile::SystemService && approvals.len() != 2 {
+            return Err(InstallationError::IncompleteObservation(
+                "SystemService transaction requires exactly Host and Watchdog SCM approvals"
+                    .to_owned(),
+            ));
+        }
+        if let Some(existing) = self.pending_activation.as_ref()
+            && existing.transaction_id == transaction.transaction_id
+            && existing.plan_digest == transaction.installer_plan_digest
+            && existing.manifest == transaction.candidate_manifest
+            && existing.approval_ref == approval_ref
+        {
+            for approval in &approvals {
+                if self.service_registration_approval(&approval.generation, approval.role)
+                    != Some(approval)
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            return self.validate();
+        }
+        self.stage_pending_activation_unchecked(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            transaction.candidate_manifest.clone(),
+            approval_ref,
+            &approvals,
+        )?;
+        Ok(())
+    }
+
+    /// Loads one exact durable transaction and stages its complete pending
+    /// activation plus installer-owned SCM approval pair.
+    ///
+    /// The transaction is read through the sealed transaction-store boundary;
+    /// callers cannot supply a forged in-memory manifest or effect-progress
+    /// projection.  The caller should persist this registry once with
+    /// [`RedbInstallationRegistry::save`].
+    fn stage_pending_activation_from_store<S: InstallationTransactionStore>(
+        &mut self,
+        store: &S,
+        transaction_id: &PlatformHandle,
+        approval_ref: PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        let transaction =
+            store
+                .load(transaction_id)?
+                .ok_or_else(|| InstallationError::TransactionNotFound {
+                    transaction_id: transaction_id.as_str().to_owned(),
+                })?;
+        if transaction.transaction_id != *transaction_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.stage_pending_activation_from_transaction(&transaction, approval_ref)
     }
 
     /// Returns the pending candidate, if one exists.
@@ -3772,6 +3970,8 @@ impl ApprovedGenerationRegistry {
         };
         self.generations
             .retain(|item| item.manifest.generation != generation);
+        self.service_registration_approvals
+            .retain(|approval| approval.generation != generation);
         self.pending_activation = None;
         self.last_terminal_activation = Some(terminal);
         self.validate()
@@ -3863,8 +4063,13 @@ impl ApprovedGenerationRegistry {
     }
 
     /// Validates the complete registry projection and all generation entries.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "registry validation keeps the complete activation authority in one boundary"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
         let mut identities = BTreeSet::new();
+        let mut service_identities = BTreeSet::new();
         let mut active_count = 0_usize;
         let mut lkg_count = 0_usize;
         for generation in &self.generations {
@@ -3880,6 +4085,40 @@ impl ApprovedGenerationRegistry {
             }
             if generation.last_known_good {
                 lkg_count += 1;
+            }
+        }
+        for approval in &self.service_registration_approvals {
+            approval.validate()?;
+            let generation = self
+                .generations
+                .iter()
+                .find(|item| item.manifest.generation == approval.generation)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if generation.manifest.runtime_launch.profile != InstallationProfile::SystemService {
+                return Err(InstallationError::ProfileViolation(
+                    "SCM registration approvals require the SystemService profile".to_owned(),
+                ));
+            }
+            if !service_identities.insert((&approval.generation, approval.role)) {
+                return Err(InstallationError::Duplicate {
+                    kind: "service registration approval".to_owned(),
+                    identity: format!("{}:{:?}", approval.generation.as_str(), approval.role),
+                });
+            }
+        }
+        for generation in &self.generations {
+            if generation.manifest.runtime_launch.profile == InstallationProfile::SystemService {
+                let count = self
+                    .service_registration_approvals
+                    .iter()
+                    .filter(|approval| approval.generation == generation.manifest.generation)
+                    .count();
+                if count != 2 {
+                    return Err(InstallationError::IncompleteObservation(
+                        "SystemService generation requires exactly Host and Watchdog SCM approvals"
+                            .to_owned(),
+                    ));
+                }
             }
         }
         if active_count > 1 {
@@ -4059,6 +4298,150 @@ pub enum InstallerServiceRole {
     Host,
     /// Sibling `eliot-watchdog` service.
     Watchdog,
+}
+
+/// Installer-owned approval for one exact Host or Watchdog SCM registration.
+///
+/// The approval is a projection of an [`InstallationTransaction`]'s durable
+/// service-effect progress.  It is deliberately separate from
+/// [`CandidateManifest`] and [`RuntimeLaunchDescriptor`]: the registration
+/// nonce is minted only while the installer drives the effect and is retained
+/// here only after authoritative SCM readback has produced an `Applied`
+/// progress entry.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallerServiceRegistrationApproval {
+    /// Sole transaction which authorized this registration.
+    transaction_id: PlatformHandle,
+    /// Candidate generation bound to the transaction.
+    generation: PlatformHandle,
+    /// Immutable installer effect identity.
+    effect_id: PlatformHandle,
+    /// Host or Watchdog role.
+    role: InstallerServiceRole,
+    /// Canonical SCM service name.
+    service_name: PlatformHandle,
+    /// Exact approved service image path.
+    executable_path: PlatformHandle,
+    /// Exact service account admitted by the effect plan.
+    account: InstallerServiceAccount,
+    /// Exact service start policy admitted by the effect plan.
+    automatic_start: bool,
+    /// Immutable descriptor/installation binding rendered to service argv.
+    service_bootstrap: InstallationServiceBootstrap,
+    /// Unpredictable nonce rendered only for this role's registration.
+    registration_nonce: PlatformHandle,
+    /// Authoritative SCM configuration digest returned by readback.
+    configuration_digest: PlatformHandle,
+}
+
+impl InstallerServiceRegistrationApproval {
+    /// Returns the generation bound to this approval.
+    #[must_use]
+    pub fn generation(&self) -> &PlatformHandle {
+        &self.generation
+    }
+
+    /// Returns the role bound to this approval.
+    #[must_use]
+    pub const fn role(&self) -> InstallerServiceRole {
+        self.role
+    }
+
+    /// Returns the authoritative SCM configuration digest.
+    #[must_use]
+    pub fn configuration_digest(&self) -> &PlatformHandle {
+        &self.configuration_digest
+    }
+
+    /// Validates the durable approval without touching the filesystem or SCM.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        handle(&self.transaction_id, "service_registration.transaction_id")?;
+        handle(&self.generation, "service_registration.generation")?;
+        handle(&self.effect_id, "service_registration.effect_id")?;
+        handle(&self.service_name, "service_registration.service_name")?;
+        approved_path(
+            &self.executable_path,
+            "service_registration.executable_path",
+        )?;
+        self.service_bootstrap.validate()?;
+        sha256_handle(
+            &self.registration_nonce,
+            "service_registration.registration_nonce",
+        )?;
+        sha256_handle(
+            &self.configuration_digest,
+            "service_registration.configuration_digest",
+        )?;
+        let (expected_name, expected_image) = match self.role {
+            InstallerServiceRole::Host => (ELIOT_HOST_SERVICE_NAME, "eliot-host.exe"),
+            InstallerServiceRole::Watchdog => (ELIOT_WATCHDOG_SERVICE_NAME, "eliot-watchdog.exe"),
+        };
+        let observed_image = self
+            .executable_path
+            .as_str()
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or_default();
+        if self.service_name.as_str() != expected_name
+            || !observed_image.eq_ignore_ascii_case(expected_image)
+            || self.account != InstallerServiceAccount::LocalService
+            || !self.automatic_start
+        {
+            return Err(InstallationError::ProfileViolation(
+                "service registration approval differs from the canonical Runtime Live service shape"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reconstructs the exact platform request approved by the installer.
+    ///
+    /// The returned request is still inert; this helper performs no SCM
+    /// mutation.  The platform constructor supplies the final canonical
+    /// command line and its configuration digest is checked against the
+    /// installer readback before the request is returned.
+    pub fn service_registration_request(
+        &self,
+    ) -> Result<ServiceRegistrationRequest, InstallationError> {
+        self.validate()?;
+        let bootstrap = ServiceBootstrapArguments::new(
+            Path::new(self.service_bootstrap.descriptor_path.as_str()).to_path_buf(),
+            self.service_bootstrap.descriptor_digest.as_str(),
+            self.service_bootstrap.installation_id.as_str(),
+            self.service_bootstrap.plan_generation,
+            Vec::<String>::new(),
+        )
+        .and_then(|value| {
+            value.with_host_state_root(Path::new(self.service_bootstrap.host_state_root.as_str()))
+        })
+        .and_then(|value| value.with_registration_nonce(self.registration_nonce.as_str()))
+        .map_err(|_| InstallationError::InvalidField {
+            field: "service_registration.service_bootstrap".to_owned(),
+            reason: "approved SCM bootstrap could not be reconstructed".to_owned(),
+        })?;
+        let display_name = match self.role {
+            InstallerServiceRole::Host => ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            InstallerServiceRole::Watchdog => ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
+        };
+        let request = ServiceRegistrationRequest::with_bootstrap(
+            self.service_name.as_str(),
+            display_name,
+            Path::new(self.executable_path.as_str()).to_path_buf(),
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+            bootstrap,
+        )
+        .map_err(|_| InstallationError::InvalidField {
+            field: "service_registration.request".to_owned(),
+            reason: "approved SCM request could not be reconstructed".to_owned(),
+        })?;
+        if request.expected_configuration_digest() != self.configuration_digest.as_str() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(request)
+    }
 }
 
 /// Password-free account admitted for Runtime Live service plans.
@@ -4939,6 +5322,109 @@ impl InstallationTransaction {
     #[must_use]
     pub fn effect_progress(&self) -> &[InstallationEffectProgress] {
         &self.effect_progress
+    }
+
+    /// Projects the two installer-owned SCM approvals from authoritative
+    /// durable service-effect progress.
+    ///
+    /// Only `Applied` service effects can produce an approval.  A missing
+    /// nonce, pending intent, or unknown effect is returned as a stable
+    /// fail-closed classification; no nonce is copied into the error.
+    pub(crate) fn service_registration_approvals(
+        &self,
+    ) -> Result<Vec<InstallerServiceRegistrationApproval>, InstallationError> {
+        self.validate()?;
+        let mut approvals = Vec::new();
+        let mut roles = BTreeSet::new();
+        let mut nonces = BTreeSet::<PlatformHandle>::new();
+        for (effect, progress) in self.installer_effects.iter().zip(&self.effect_progress) {
+            let InstallerEffectPlan::RegisterService {
+                effect_id,
+                role,
+                service_name,
+                executable_path,
+                account,
+                automatic_start,
+            } = effect
+            else {
+                continue;
+            };
+            let registration_nonce = progress.registration_nonce.clone().ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "service registration approval is missing its durable nonce".to_owned(),
+                )
+            })?;
+            let configuration_digest = match &progress.state {
+                InstallationEffectProgressState::Applied {
+                    external_identity, ..
+                } => external_identity.clone(),
+                InstallationEffectProgressState::Pending
+                | InstallationEffectProgressState::IntentCommitted { .. } => {
+                    return Err(InstallationError::IncompleteObservation(
+                        "service registration effect is pending authoritative readback".to_owned(),
+                    ));
+                }
+                InstallationEffectProgressState::Unknown { .. } => {
+                    return Err(InstallationError::IncompleteObservation(
+                        "service registration effect requires reconciliation".to_owned(),
+                    ));
+                }
+            };
+            if !roles.insert(*role) {
+                return Err(InstallationError::Duplicate {
+                    kind: "service registration role".to_owned(),
+                    identity: format!("{role:?}"),
+                });
+            }
+            if !nonces.insert(registration_nonce.clone()) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let approval = InstallerServiceRegistrationApproval {
+                transaction_id: self.transaction_id.clone(),
+                generation: self.candidate_manifest.generation.clone(),
+                effect_id: effect_id.clone(),
+                role: *role,
+                service_name: service_name.clone(),
+                executable_path: executable_path.clone(),
+                account: *account,
+                automatic_start: *automatic_start,
+                service_bootstrap: InstallationServiceBootstrap {
+                    descriptor_path: self
+                        .candidate_manifest
+                        .runtime_launch
+                        .authority_descriptor_path
+                        .clone(),
+                    descriptor_digest: self
+                        .candidate_manifest
+                        .runtime_launch
+                        .authority_descriptor_digest
+                        .clone(),
+                    installation_id: self
+                        .candidate_manifest
+                        .runtime_launch
+                        .installation_epoch
+                        .installation
+                        .clone(),
+                    plan_generation: self
+                        .candidate_manifest
+                        .runtime_launch
+                        .authority_generation
+                        .value(),
+                    host_state_root: self
+                        .candidate_manifest
+                        .runtime_launch
+                        .runtime_state_roots
+                        .host_state_root
+                        .clone(),
+                },
+                registration_nonce,
+                configuration_digest,
+            };
+            approval.validate()?;
+            approvals.push(approval);
+        }
+        approvals.sort_by_key(|approval| approval.role);
+        Ok(approvals)
     }
 
     /// Returns the monotonic durable revision.
@@ -9586,6 +10072,194 @@ mod tests {
         transaction
     }
 
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the production-bound fixture exercises the complete SystemService projection"
+    )]
+    fn system_registration_transaction() -> InstallationTransaction {
+        let portable = registering_transaction();
+        let program_data = must(protected_program_data_root());
+        let roots = must(RuntimeStateRoots::derive_profiled(
+            InstallationProfile::SystemService,
+            test_handle(program_data.to_string_lossy().into_owned()),
+            &"b".repeat(64),
+        ));
+        let system_path =
+            |name: &str| test_handle(format!(r"{}\{name}", roots.installation_root.as_str()));
+
+        let mut descriptor = portable.candidate_manifest.runtime_launch.clone();
+        descriptor.profile = InstallationProfile::SystemService;
+        descriptor.portable_root = None;
+        descriptor.runtime_state_roots = roots.clone();
+        descriptor.kernel_work_root = roots.kernel_work_root.clone();
+        descriptor.authority_descriptor_path = system_path("authority.json");
+        descriptor.eliotd_executable_path = system_path("eliotd.exe");
+        descriptor.eliotd_config_path = system_path("eliotd-governor.json");
+        descriptor.eliotd_descriptor_path = system_path("eliotd.json");
+        descriptor.store_config_path = system_path("generation.json");
+        descriptor.store_bridge_executable_path = system_path("eliot-store-surreal.exe");
+        descriptor.store_bootstrap_descriptor_path = system_path("store-bootstrap.json");
+        descriptor.canonical_store_executable_path = system_path("surreal.exe");
+        descriptor.host_executable_path = portable.candidate_manifest.host_executable_path.clone();
+        descriptor.watchdog_executable_path = portable
+            .candidate_manifest
+            .runtime_launch
+            .watchdog_executable_path
+            .clone();
+        for image in [
+            &descriptor.host_executable_path,
+            &descriptor.watchdog_executable_path,
+        ] {
+            std::fs::write(image.as_str(), b"test service image")
+                .unwrap_or_else(|_| panic!("test service image must be materialized"));
+        }
+        descriptor.kernel_arguments = descriptor
+            .expected_kernel_arguments(&descriptor.store_config_path)
+            .into_iter()
+            .map(test_handle)
+            .collect();
+        descriptor.store_bridge_arguments = descriptor
+            .expected_store_bridge_arguments(&descriptor.store_config_path)
+            .into_iter()
+            .map(test_handle)
+            .collect();
+        descriptor.canonical_store_arguments[5] = roots.store_temp_root.clone();
+        descriptor.canonical_store_arguments[8] = roots.store_work_root.clone();
+        descriptor.canonical_store_arguments[11] = test_handle(format!(
+            "surrealkv://{}",
+            roots.store_data_root.as_str().replace('\\', "/")
+        ));
+        descriptor = must(descriptor.with_computed_digest());
+
+        let mut manifest = portable.candidate_manifest.clone();
+        manifest.runtime_state_roots_digest = roots.roots_digest.clone();
+        manifest.kernel_executable_path = system_path("eliot-kernel.exe");
+        manifest.store_bridge_executable_path = descriptor.store_bridge_executable_path.clone();
+        manifest.canonical_store_executable_path =
+            descriptor.canonical_store_executable_path.clone();
+        manifest.host_executable_path = descriptor.host_executable_path.clone();
+        manifest.config_path = descriptor.store_config_path.clone();
+        manifest.runtime_launch = descriptor;
+
+        let (planned_changes, mut installer_effects) = installer_plan_parts(&roots);
+        for effect in &mut installer_effects {
+            match effect {
+                InstallerEffectPlan::RegisterService {
+                    role,
+                    executable_path,
+                    ..
+                } => {
+                    *executable_path = match role {
+                        InstallerServiceRole::Host => manifest.host_executable_path.clone(),
+                        InstallerServiceRole::Watchdog => {
+                            manifest.runtime_launch.watchdog_executable_path.clone()
+                        }
+                    };
+                }
+                InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
+                    provision.expected_host_executable = manifest.host_executable_path.clone();
+                }
+                InstallerEffectPlan::CreateRoot { .. } | InstallerEffectPlan::ApplyAcl { .. } => {}
+            }
+        }
+        let mut ordered_effects = installer_effects
+            .iter()
+            .filter(|effect| matches!(effect, InstallerEffectPlan::RegisterService { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        ordered_effects.extend(
+            installer_effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, InstallerEffectPlan::RegisterService { .. })),
+        );
+
+        let mut transaction = must(InstallationTransaction::new(
+            portable.transaction_id,
+            portable.installation_epoch,
+            InstallationProfile::SystemService,
+            portable.request,
+            portable.current_active_manifest,
+            manifest,
+            system_path("staging"),
+            planned_changes,
+            ordered_effects,
+            portable.minimum_store_available_bytes,
+            portable.precondition_evidence,
+            portable.recovery_command,
+        ));
+
+        must(transaction.advance(
+            InstallationStage::Staging,
+            vec![test_handle("evidence:staged")],
+        ));
+        must(transaction.advance(
+            InstallationStage::StaticVerified,
+            vec![test_handle("evidence:static-verified")],
+        ));
+        must(transaction.advance(
+            InstallationStage::Registering,
+            vec![test_handle("evidence:registered")],
+        ));
+
+        let bootstrap = transaction.candidate_manifest.runtime_launch.clone();
+        for (effect, progress) in transaction
+            .installer_effects
+            .iter()
+            .zip(transaction.effect_progress.iter_mut())
+        {
+            let InstallerEffectPlan::RegisterService {
+                role,
+                service_name,
+                executable_path,
+                ..
+            } = effect
+            else {
+                continue;
+            };
+            let nonce = test_handle(match role {
+                InstallerServiceRole::Host => "a".repeat(64),
+                InstallerServiceRole::Watchdog => "b".repeat(64),
+            });
+            let arguments = must(
+                ServiceBootstrapArguments::new(
+                    Path::new(bootstrap.authority_descriptor_path.as_str()).to_path_buf(),
+                    bootstrap.authority_descriptor_digest.as_str(),
+                    bootstrap.installation_epoch.installation.as_str(),
+                    bootstrap.authority_generation.value(),
+                    Vec::<String>::new(),
+                )
+                .and_then(|value| {
+                    value.with_host_state_root(Path::new(
+                        bootstrap.runtime_state_roots.host_state_root.as_str(),
+                    ))
+                })
+                .and_then(|value| value.with_registration_nonce(nonce.as_str())),
+            );
+            let request = must(ServiceRegistrationRequest::with_bootstrap(
+                service_name.as_str(),
+                match role {
+                    InstallerServiceRole::Host => ELIOT_HOST_SERVICE_DISPLAY_NAME,
+                    InstallerServiceRole::Watchdog => ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
+                },
+                Path::new(executable_path.as_str()).to_path_buf(),
+                ServiceStartMode::Automatic,
+                ServiceAccount::LocalService,
+                arguments,
+            ));
+            let configuration_digest = test_handle(request.expected_configuration_digest());
+            progress.registration_nonce = Some(nonce);
+            progress.state = InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                external_identity: configuration_digest,
+                evidence: vec![test_handle(format!("evidence:service:{role:?}"))],
+                postcondition_digest: test_handle("c".repeat(64)),
+            };
+        }
+        must(transaction.validate());
+        transaction
+    }
+
     fn planned_transaction() -> InstallationTransaction {
         let transaction = registering_transaction();
         must(InstallationTransaction::new(
@@ -11226,6 +11900,252 @@ mod tests {
         assert_eq!(transaction.stage, InstallationStage::RollbackRequired);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn service_registration_projection_is_durable_and_exact() {
+        let transaction = system_registration_transaction();
+        let approvals = must(transaction.service_registration_approvals());
+        assert_eq!(approvals.len(), 2);
+        assert_eq!(approvals[0].role, InstallerServiceRole::Host);
+        assert_eq!(approvals[1].role, InstallerServiceRole::Watchdog);
+        assert_ne!(
+            approvals[0].registration_nonce,
+            approvals[1].registration_nonce
+        );
+        assert_ne!(
+            approvals[0].configuration_digest,
+            approvals[1].configuration_digest
+        );
+
+        let transaction_store = SharedStore::default();
+        *transaction_store
+            .state
+            .lock()
+            .unwrap_or_else(|_| unreachable!()) = Some(transaction.clone());
+        let path = std::env::temp_dir().join(format!(
+            "eliot-installation-scm-projection-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let database = must(Database::create(&path));
+        let registry = RedbInstallationRegistry::from_database_for_test(database);
+        let approval_ref = test_handle("approval:system-service");
+        must(registry.stage_pending_activation_from_transaction_store(
+            &transaction_store,
+            &transaction.transaction_id,
+            approval_ref.clone(),
+        ));
+
+        let loaded = must(registry.load());
+        let pending = loaded
+            .pending_activation()
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(pending.transaction_id, transaction.transaction_id);
+        assert_eq!(pending.plan_digest, transaction.installer_plan_digest);
+        assert_eq!(pending.approval_ref, approval_ref);
+        for role in [InstallerServiceRole::Host, InstallerServiceRole::Watchdog] {
+            let approval = loaded
+                .service_registration_approval(&transaction.candidate_manifest.generation, role)
+                .unwrap_or_else(|| unreachable!());
+            let request = must(approval.service_registration_request());
+            assert_eq!(
+                approval.configuration_digest.as_str(),
+                request.expected_configuration_digest()
+            );
+        }
+
+        let before_retry = loaded.clone();
+        must(registry.stage_pending_activation_from_transaction_store(
+            &transaction_store,
+            &transaction.transaction_id,
+            approval_ref.clone(),
+        ));
+        assert_eq!(must(registry.load()), before_retry);
+
+        assert!(matches!(
+            registry.stage_pending_activation_from_transaction_store(
+                &transaction_store,
+                &transaction.transaction_id,
+                test_handle("approval:substituted"),
+            ),
+            Err(InstallationError::IdentityConflict)
+        ));
+        assert_eq!(must(registry.load()), before_retry);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one test covers each fail-closed service observation class"
+    )]
+    fn service_registration_projection_rejects_incomplete_or_reused_observations() {
+        let mut missing_nonce = system_registration_transaction();
+        let host_progress = missing_nonce
+            .effect_progress
+            .iter_mut()
+            .find(|progress| {
+                missing_nonce
+                    .installer_effects
+                    .iter()
+                    .find(|effect| effect.effect_id() == &progress.effect_id)
+                    .is_some_and(|effect| {
+                        matches!(
+                            effect,
+                            InstallerEffectPlan::RegisterService {
+                                role: InstallerServiceRole::Host,
+                                ..
+                            }
+                        )
+                    })
+            })
+            .unwrap_or_else(|| unreachable!());
+        host_progress.registration_nonce = None;
+        assert!(matches!(
+            missing_nonce.service_registration_approvals(),
+            Err(InstallationError::InvalidField { field, .. })
+                if field == "effect_progress.registration_nonce"
+        ));
+
+        let mut pending = system_registration_transaction();
+        for (effect, progress) in pending
+            .installer_effects
+            .iter()
+            .zip(pending.effect_progress.iter_mut())
+        {
+            if matches!(effect, InstallerEffectPlan::RegisterService { .. }) {
+                progress.registration_nonce = Some(test_handle("d".repeat(64)));
+                progress.state = InstallationEffectProgressState::Pending;
+            }
+        }
+        assert!(matches!(
+            pending.service_registration_approvals(),
+            Err(InstallationError::IncompleteObservation(reason))
+                if reason.contains("pending authoritative readback")
+        ));
+
+        let mut unknown = system_registration_transaction();
+        for (effect, progress) in unknown
+            .installer_effects
+            .iter()
+            .zip(unknown.effect_progress.iter_mut())
+        {
+            if let InstallerEffectPlan::RegisterService { role, .. } = effect {
+                progress.registration_nonce = Some(test_handle("e".repeat(64)));
+                progress.state = if *role == InstallerServiceRole::Host {
+                    InstallationEffectProgressState::Unknown {
+                        pending_ref: test_handle("reconcile:service"),
+                    }
+                } else {
+                    InstallationEffectProgressState::Pending
+                };
+            }
+        }
+        assert!(matches!(
+            unknown.service_registration_approvals(),
+            Err(InstallationError::IncompleteObservation(reason))
+                if reason.contains("requires reconciliation")
+        ));
+
+        let mut duplicate_nonce = system_registration_transaction();
+        let host_nonce = duplicate_nonce
+            .effect_progress
+            .iter()
+            .find_map(|progress| {
+                duplicate_nonce
+                    .installer_effects
+                    .iter()
+                    .find(|effect| effect.effect_id() == &progress.effect_id)
+                    .is_some_and(|effect| {
+                        matches!(
+                            effect,
+                            InstallerEffectPlan::RegisterService {
+                                role: InstallerServiceRole::Host,
+                                ..
+                            }
+                        )
+                    })
+                    .then(|| progress.registration_nonce.clone())
+                    .flatten()
+            })
+            .unwrap_or_else(|| unreachable!());
+        let watchdog_progress = duplicate_nonce
+            .effect_progress
+            .iter_mut()
+            .find(|progress| {
+                duplicate_nonce
+                    .installer_effects
+                    .iter()
+                    .find(|effect| effect.effect_id() == &progress.effect_id)
+                    .is_some_and(|effect| {
+                        matches!(
+                            effect,
+                            InstallerEffectPlan::RegisterService {
+                                role: InstallerServiceRole::Watchdog,
+                                ..
+                            }
+                        )
+                    })
+            })
+            .unwrap_or_else(|| unreachable!());
+        watchdog_progress.registration_nonce = Some(host_nonce);
+        assert!(matches!(
+            duplicate_nonce.service_registration_approvals(),
+            Err(InstallationError::IdentityConflict)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_service_registry_wire_rejects_zero_and_partial_approval_pairs() {
+        let transaction = system_registration_transaction();
+        let approvals = must(transaction.service_registration_approvals());
+        for service_registration_approvals in [Vec::new(), vec![approvals[0].clone()]] {
+            let registry = ApprovedGenerationRegistry {
+                generations: vec![ApprovedGeneration {
+                    manifest: transaction.candidate_manifest.clone(),
+                    approval_ref: test_handle("approval:wire"),
+                    active: false,
+                    last_known_good: false,
+                }],
+                service_registration_approvals,
+                active_generation: None,
+                last_known_good_generation: None,
+                pending_activation: None,
+                last_terminal_activation: None,
+            };
+            let bytes = must(serde_json::to_vec(&registry));
+            assert!(matches!(
+                decode_registry_bytes(&bytes),
+                Err(InstallationError::CorruptRegistry { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_registry_table_requires_explicit_migration() {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-installation-legacy-table-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let database = must(Database::create(&path));
+        let write = must(database.begin_write());
+        {
+            let mut table = must(write.open_table(LEGACY_REGISTRY_TABLE));
+            must(table.insert("registry", b"legacy".as_slice()));
+        }
+        must(write.commit());
+        assert!(matches!(
+            classify_registry_table(&database),
+            Err(InstallationError::MigrationRequired { .. })
+        ));
+        drop(database);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn installer_plan_rejects_credential_target_not_bound_to_candidate_launch() {
         let program_data = must(protected_program_data_root());
@@ -11672,6 +12592,7 @@ mod tests {
                 active: true,
                 last_known_good: false,
             }],
+            service_registration_approvals: Vec::new(),
             active_generation: Some(generation),
             last_known_good_generation: None,
             pending_activation: None,
@@ -11681,6 +12602,7 @@ mod tests {
         let Some(object) = legacy.as_object_mut() else {
             panic!("legacy registry object");
         };
+        object.remove("service_registration_approvals");
         object.remove("pending_activation");
         let Some(runtime) = legacy["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
         else {
@@ -11722,6 +12644,7 @@ mod tests {
                 active: true,
                 last_known_good: false,
             }],
+            service_registration_approvals: Vec::new(),
             active_generation: Some(generation),
             last_known_good_generation: None,
             pending_activation: None,
@@ -11731,6 +12654,7 @@ mod tests {
         let Some(object) = value.as_object_mut() else {
             panic!("pre-split registry object");
         };
+        object.remove("service_registration_approvals");
         object.remove("pending_activation");
         let Some(manifest) = value["generations"][0]["manifest"].as_object_mut() else {
             panic!("pre-split fixture manifest");
@@ -11773,12 +12697,17 @@ mod tests {
                 active: true,
                 last_known_good: false,
             }],
+            service_registration_approvals: Vec::new(),
             active_generation: Some(generation),
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
         };
         let mut value = must(serde_json::to_value(registry));
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-credential-binding registry object"))
+            .remove("service_registration_approvals");
         let Some(manifest) = value["generations"][0]["manifest"].as_object_mut() else {
             panic!("pre-credential-binding fixture manifest");
         };
@@ -11816,12 +12745,17 @@ mod tests {
                 active: true,
                 last_known_good: false,
             }],
+            service_registration_approvals: Vec::new(),
             active_generation: Some(generation),
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
         };
         let mut value = must(serde_json::to_value(registry));
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-eliotd-config registry object"))
+            .remove("service_registration_approvals");
         let Some(runtime) = value["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
         else {
             panic!("pre-eliotd-config fixture runtime launch");
@@ -11841,12 +12775,17 @@ mod tests {
                 active: true,
                 last_known_good: false,
             }],
+            service_registration_approvals: Vec::new(),
             active_generation: Some(generation),
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
         };
         let mut value = must(serde_json::to_value(registry));
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-host-artifact-binding registry object"))
+            .remove("service_registration_approvals");
         let Some(manifest) = value["generations"][0]["manifest"].as_object_mut() else {
             panic!("pre-host-artifact-binding fixture manifest");
         };
@@ -11867,6 +12806,32 @@ mod tests {
         assert!(matches!(
             decode_registry_bytes(&bytes),
             Err(InstallationError::MigrationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_service_registration_approval_registry_requires_explicit_restage() {
+        let transaction = registering_transaction();
+        let mut registry = ApprovedGenerationRegistry::new();
+        must(registry.stage_pending_activation(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            transaction.candidate_manifest,
+            test_handle("approval:pre-service-registration"),
+        ));
+        let mut value = must(serde_json::to_value(registry));
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-service-registration registry object"))
+            .remove("service_registration_approvals");
+        let bytes = must(serde_json::to_vec(&value));
+        let Err(error) = decode_registry_bytes(&bytes) else {
+            panic!("pre-service-registration registry must require migration");
+        };
+        assert!(matches!(
+            error,
+            InstallationError::MigrationRequired { reason }
+                if reason.contains("installer-owned SCM registration approvals")
         ));
     }
 
@@ -12227,6 +13192,7 @@ mod tests {
                 active: true,
                 last_known_good: false,
             }],
+            service_registration_approvals: Vec::new(),
             active_generation: Some(test_handle("generation:missing")),
             last_known_good_generation: None,
             pending_activation: None,

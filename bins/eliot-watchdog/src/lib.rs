@@ -17,18 +17,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{AuthorityEpoch, sha256_hex};
 use eliot_installation::{
-    ApprovedGenerationRegistry, CandidateManifest, InstallationProfile, PendingActivationState,
+    ApprovedGenerationRegistry, CandidateManifest, InstallationProfile,
+    InstallerServiceRegistrationApproval, InstallerServiceRole, PendingActivationState,
     RedbInstallationRegistry, RuntimeStateRoots, ValidatedRuntimeRootLeases,
     WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider, verify_file_digest,
     verify_file_digest_with_lease,
 };
 use eliot_platform_windows::{
-    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
     NamedPipePeerProcessBinding, ProcessIdentity, ProtectedPathLease, ProtectedRootLease,
-    ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
-    ServiceRegistrationInspection, ServiceRegistrationRequest, ServiceStartMode,
-    WindowsAdapterError, WindowsPlatform, observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path, windows_paths_equal,
+    ProtectedRuntimePathLease, ServiceBootstrapArguments, ServiceRegistrationInspection,
+    ServiceRegistrationRequest, WindowsAdapterError, WindowsPlatform,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path, windows_paths_equal,
 };
 use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
@@ -68,6 +68,10 @@ pub enum WatchdogScmLaunchError {
     PlatformRoot(String),
     #[error("Watchdog SCM registration is not an exact read-only match: {0:?}")]
     Registration(ServiceRegistrationInspection),
+    #[error("Watchdog SCM installer approval is unavailable or invalid")]
+    ApprovalUnavailable,
+    #[error("Watchdog SCM bootstrap does not match the installer-approved registration")]
+    ApprovalMismatch,
 }
 
 /// Exact, read-only launch evidence accepted from the Windows Service Control
@@ -94,6 +98,36 @@ impl ValidatedWatchdogScmLaunch {
     #[must_use]
     pub fn inspection(&self) -> &ServiceRegistrationInspection {
         &self.inspection
+    }
+}
+
+/// Opaque Host registration proof retained by the Watchdog observer.
+///
+/// The contained request is reconstructed from the installer projection and
+/// has no public field or nonce accessor. It can therefore cross the library
+/// to the binary composition root only as an inspection capability, never as
+/// a caller-supplied SCM authority.
+#[derive(Clone, Debug)]
+pub struct ApprovedHostRegistration {
+    request: ServiceRegistrationRequest,
+}
+
+impl ApprovedHostRegistration {
+    fn from_approval(approval: &InstallerServiceRegistrationApproval) -> Result<Self, SpoolError> {
+        if approval.role() != InstallerServiceRole::Host {
+            return Err(SpoolError::InvalidLease(
+                "installer SCM approval is not a Host registration".to_owned(),
+            ));
+        }
+        let request = approval.service_registration_request().map_err(|_| {
+            SpoolError::InvalidLease("installer Host SCM approval is invalid".to_owned())
+        })?;
+        if request.service_name() != eliot_platform_windows::ELIOT_HOST_SERVICE_NAME {
+            return Err(SpoolError::InvalidLease(
+                "installer Host SCM approval has the wrong service name".to_owned(),
+            ));
+        }
+        Ok(Self { request })
     }
 }
 
@@ -280,17 +314,16 @@ where
 pub fn validate_watchdog_scm_bootstrap(
     bootstrap: &ServiceBootstrapArguments,
 ) -> Result<ValidatedWatchdogScmLaunch, WatchdogScmLaunchError> {
+    let (_, _, registration) =
+        read_approved_service_registration(bootstrap, InstallerServiceRole::Watchdog)
+            .map_err(|_| WatchdogScmLaunchError::ApprovalUnavailable)?;
     let executable = std::env::current_exe().map_err(WatchdogScmLaunchError::Executable)?;
-    let display_name = ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME;
-    let registration = ServiceRegistrationRequest::with_bootstrap(
-        SERVICE_NAME,
-        display_name,
-        executable.clone(),
-        ServiceStartMode::Automatic,
-        ServiceAccount::LocalService,
-        bootstrap.clone(),
-    )
-    .map_err(WatchdogScmLaunchError::Platform)?;
+    if registration.service_name() != SERVICE_NAME
+        || registration.bootstrap() != Some(bootstrap)
+        || !windows_paths_equal(registration.binary_path(), &executable)
+    {
+        return Err(WatchdogScmLaunchError::ApprovalMismatch);
+    }
     let root = executable.parent().ok_or_else(|| {
         WatchdogScmLaunchError::InvalidArgv("current executable has no parent".to_owned())
     })?;
@@ -387,6 +420,13 @@ pub trait WatchdogAdmissionSource: Send + Sync + 'static {
     fn approved_host_image(&self) -> Option<PathBuf> {
         None
     }
+
+    /// Returns the immutable installer approval used to reconstruct the exact
+    /// Host SCM request, when this admission source has one.
+    #[must_use]
+    fn approved_host_registration(&self) -> Option<ApprovedHostRegistration> {
+        None
+    }
 }
 
 /// File-backed admission source for the Host/Kernel lease and its independent
@@ -414,6 +454,8 @@ pub struct WatchdogRuntimeBinding {
     roots: RuntimeStateRoots,
     selected_manifest: Arc<CandidateManifest>,
     approved_host_image: PathBuf,
+    approved_host_registration: ApprovedHostRegistration,
+    approved_watchdog_registration: ServiceRegistrationRequest,
     /// Retained for the complete lifetime of the admission and sensor. This
     /// is the no-follow proof that the Host-state contour cannot be replaced
     /// underneath path-based redb/file consumers.
@@ -502,6 +544,10 @@ impl WatchdogAdmissionSource for FileWatchdogAdmission {
 
     fn approved_host_image(&self) -> Option<PathBuf> {
         Some(self.binding.approved_host_image().to_owned())
+    }
+
+    fn approved_host_registration(&self) -> Option<ApprovedHostRegistration> {
+        Some(self.binding.approved_host_registration.clone())
     }
 }
 
@@ -1183,6 +1229,7 @@ pub enum HostObservationState {
 pub struct HostIdentityMonitor {
     canonical: Option<ProcessIdentity>,
     expected_image: Option<PathBuf>,
+    expected_registration: Option<ApprovedHostRegistration>,
     expected_image_lease: Option<ProtectedPathLease>,
     require_image_lease: bool,
     require_registration_readback: bool,
@@ -1194,26 +1241,36 @@ impl HostIdentityMonitor {
         Self {
             canonical: None,
             expected_image,
+            expected_registration: None,
             expected_image_lease: None,
             require_image_lease: false,
             require_registration_readback: false,
         }
     }
 
-    fn with_approved_image_lease(expected_image: PathBuf, lease: ProtectedPathLease) -> Self {
+    fn with_approved_image_lease(
+        expected_image: PathBuf,
+        lease: ProtectedPathLease,
+        expected_registration: ApprovedHostRegistration,
+    ) -> Self {
         Self {
             canonical: None,
             expected_image: Some(expected_image),
+            expected_registration: Some(expected_registration),
             expected_image_lease: Some(lease),
             require_image_lease: true,
             require_registration_readback: true,
         }
     }
 
-    fn with_unavailable_image_lease(expected_image: PathBuf) -> Self {
+    fn with_unavailable_image_lease(
+        expected_image: PathBuf,
+        expected_registration: ApprovedHostRegistration,
+    ) -> Self {
         Self {
             canonical: None,
             expected_image: Some(expected_image),
+            expected_registration: Some(expected_registration),
             expected_image_lease: None,
             require_image_lease: true,
             require_registration_readback: true,
@@ -1238,9 +1295,9 @@ impl HostIdentityMonitor {
     pub fn observe(&mut self) -> HostObservation {
         if self.require_registration_readback {
             let registration_ok = self
-                .expected_image
-                .as_deref()
-                .is_some_and(|image| inspect_approved_host_registration(image).is_ok());
+                .expected_registration
+                .as_ref()
+                .is_some_and(|registration| inspect_host_registration(registration).is_ok());
             if !registration_ok {
                 return HostObservation {
                     state: HostObservationState::Unknown,
@@ -1358,16 +1415,36 @@ impl LiveHostObservationSource {
         }
     }
 
+    /// Creates the production observer from a registry-bound runtime
+    /// binding. The caller cannot provide or replace the SCM request.
+    #[must_use]
+    pub fn from_binding(binding: &WatchdogRuntimeBinding) -> Self {
+        Self::try_new(
+            binding.approved_host_image.clone(),
+            binding.approved_host_registration.clone(),
+        )
+    }
+
     /// Opens the approved Host image through the protected no-follow adapter
     /// so a same-path replacement is an identity gap, not a fresh baseline.
     /// If the image cannot be retained, the source stays alive but emits only
     /// fail-closed `Unknown` observations until the approved image can be
     /// retained again.
     #[must_use]
-    pub fn try_new(expected_image: PathBuf) -> Self {
+    pub fn try_new(
+        expected_image: PathBuf,
+        expected_registration: ApprovedHostRegistration,
+    ) -> Self {
         let monitor = match ProtectedPathLease::open_existing_absolute(&expected_image) {
-            Ok(lease) => HostIdentityMonitor::with_approved_image_lease(expected_image, lease),
-            Err(_) => HostIdentityMonitor::with_unavailable_image_lease(expected_image),
+            Ok(lease) => HostIdentityMonitor::with_approved_image_lease(
+                expected_image,
+                lease,
+                expected_registration,
+            ),
+            Err(_) => HostIdentityMonitor::with_unavailable_image_lease(
+                expected_image,
+                expected_registration,
+            ),
         };
         Self {
             monitor: Mutex::new(monitor),
@@ -1764,7 +1841,17 @@ impl WatchdogComposition {
                 "approved Host image is required for the production observer".to_owned(),
             )
         })?;
-        let host = Arc::new(LiveHostObservationSource::try_new(expected_host_image));
+        let expected_host_registration =
+            admission.approved_host_registration().ok_or_else(|| {
+                CompositionError::InvalidConfiguration(
+                    "installer-approved Host registration is required for the production observer"
+                        .to_owned(),
+                )
+            })?;
+        let host = Arc::new(LiveHostObservationSource::try_new(
+            expected_host_image,
+            expected_host_registration,
+        ));
         Self::start_with_shutdown_and_host(config, admission, kernel, host, shutdown_requested)
     }
 
@@ -2011,6 +2098,8 @@ fn load_runtime_binding(
     .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
     .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
     let selected_manifest = select_runtime_manifest(&registry, bootstrap)?;
+    let (approved_host_registration, watchdog_request) =
+        load_approved_service_registrations(&registry, &selected_manifest, bootstrap)?;
     let roots = selected_manifest.runtime_launch.runtime_state_roots.clone();
     let watchdog_image = PathBuf::from(
         selected_manifest
@@ -2064,6 +2153,8 @@ fn load_runtime_binding(
             roots,
             selected_manifest: Arc::new(selected_manifest),
             approved_host_image,
+            approved_host_registration,
+            approved_watchdog_registration: watchdog_request,
             host_state_root_lease: Arc::new(host_state_root_lease),
             _approved_host_image_lease: Arc::new(approved_host_image_lease),
             _root_leases: Arc::new(leases),
@@ -2215,31 +2306,171 @@ fn approved_host_artifact_path(manifest: &CandidateManifest) -> Result<PathBuf, 
     Ok(PathBuf::from(path.as_str()))
 }
 
+fn read_registry_for_bootstrap(
+    bootstrap: &ServiceBootstrapArguments,
+) -> Result<(ApprovedGenerationRegistry, CandidateManifest), SpoolError> {
+    let host_state_root = bootstrap.host_state_root().ok_or_else(|| {
+        SpoolError::InvalidLease(
+            "Watchdog SCM bootstrap omitted the installer-approved Host state root".to_owned(),
+        )
+    })?;
+    let registry = RedbInstallationRegistry::inspect_existing_at(
+        ProtectedRootLease::open_existing(host_state_root).map_err(|error| {
+            SpoolError::InvalidLease(format!("Host state root open failed: {error}"))
+        })?,
+    )
+    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+    .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
+    let manifest = select_runtime_manifest(&registry, bootstrap)?;
+    Ok((registry, manifest))
+}
+
+fn service_approval_matches_manifest(
+    approval: &InstallerServiceRegistrationApproval,
+    request: &ServiceRegistrationRequest,
+    manifest: &CandidateManifest,
+    role: InstallerServiceRole,
+) -> bool {
+    let launch = &manifest.runtime_launch;
+    let Some(bootstrap) = request.bootstrap() else {
+        return false;
+    };
+    let Some(host_state_root) = bootstrap.host_state_root() else {
+        return false;
+    };
+    let expected_image = match role {
+        InstallerServiceRole::Host => launch.host_executable_path.as_str(),
+        InstallerServiceRole::Watchdog => launch.watchdog_executable_path.as_str(),
+    };
+    approval.generation() == &manifest.generation
+        && approval.role() == role
+        && request.service_name()
+            == match role {
+                InstallerServiceRole::Host => eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+                InstallerServiceRole::Watchdog => SERVICE_NAME,
+            }
+        && windows_paths_equal(
+            bootstrap.config_descriptor_path(),
+            Path::new(launch.authority_descriptor_path.as_str()),
+        )
+        && bootstrap.config_descriptor_digest() == launch.authority_descriptor_digest.as_str()
+        && bootstrap.installation_id() == launch.installation_epoch.installation.as_str()
+        && bootstrap.transaction_plan_generation() == launch.authority_generation.value()
+        && windows_paths_equal(
+            host_state_root,
+            Path::new(launch.runtime_state_roots.host_state_root.as_str()),
+        )
+        && windows_paths_equal(request.binary_path(), Path::new(expected_image))
+}
+
+fn approved_service_registration(
+    registry: &ApprovedGenerationRegistry,
+    manifest: &CandidateManifest,
+    role: InstallerServiceRole,
+) -> Result<
+    (
+        InstallerServiceRegistrationApproval,
+        ServiceRegistrationRequest,
+    ),
+    SpoolError,
+> {
+    let approval = registry
+        .service_registration_approval(&manifest.generation, role)
+        .ok_or_else(|| {
+            SpoolError::InvalidLease("installer SCM registration approval is missing".to_owned())
+        })?;
+    let request = approval.service_registration_request().map_err(|_| {
+        SpoolError::InvalidLease("installer SCM registration approval is invalid".to_owned())
+    })?;
+    if !service_approval_matches_manifest(approval, &request, manifest, role) {
+        return Err(SpoolError::InvalidLease(
+            "installer SCM registration approval does not bind the selected generation".to_owned(),
+        ));
+    }
+    Ok((approval.clone(), request))
+}
+
+fn load_approved_service_registrations(
+    registry: &ApprovedGenerationRegistry,
+    manifest: &CandidateManifest,
+    bootstrap: &ServiceBootstrapArguments,
+) -> Result<(ApprovedHostRegistration, ServiceRegistrationRequest), SpoolError> {
+    let (host_approval, _) =
+        approved_service_registration(registry, manifest, InstallerServiceRole::Host)?;
+    let (_, watchdog_request) =
+        approved_service_registration(registry, manifest, InstallerServiceRole::Watchdog)?;
+    if watchdog_request.bootstrap() != Some(bootstrap) {
+        return Err(SpoolError::InvalidLease(
+            "Watchdog SCM bootstrap does not match the installer approval".to_owned(),
+        ));
+    }
+    let approved_host_registration = ApprovedHostRegistration::from_approval(&host_approval)?;
+    Ok((approved_host_registration, watchdog_request))
+}
+
+fn read_approved_service_registration(
+    bootstrap: &ServiceBootstrapArguments,
+    role: InstallerServiceRole,
+) -> Result<
+    (
+        CandidateManifest,
+        InstallerServiceRegistrationApproval,
+        ServiceRegistrationRequest,
+    ),
+    SpoolError,
+> {
+    let (registry, manifest) = read_registry_for_bootstrap(bootstrap)?;
+    let (approval, request) = approved_service_registration(&registry, &manifest, role)?;
+    Ok((manifest, approval, request))
+}
+
+fn validate_bound_service_registrations(
+    registry: &ApprovedGenerationRegistry,
+    manifest: &CandidateManifest,
+    expected_host_request: &ServiceRegistrationRequest,
+    expected_watchdog_request: &ServiceRegistrationRequest,
+    bootstrap: &ServiceBootstrapArguments,
+) -> Result<(), SpoolError> {
+    let (_, host_request) =
+        approved_service_registration(registry, manifest, InstallerServiceRole::Host)?;
+    let (_, watchdog_request) =
+        approved_service_registration(registry, manifest, InstallerServiceRole::Watchdog)?;
+    if host_request != *expected_host_request
+        || watchdog_request != *expected_watchdog_request
+        || watchdog_request.bootstrap() != Some(bootstrap)
+    {
+        return Err(SpoolError::InvalidLease(
+            "installer SCM registration approval changed after watchdog binding".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Performs a read-only SCM readback for the exact Host sibling selected by
-/// the immutable runtime contour. This binds the observation path to the
-/// installed service command and fails closed on absent, mismatched, or
-/// unknown registration; it never creates or changes a service.
+/// the immutable runtime contour. The binding is constructed only after the
+/// installer-owned registry approval has been selected and validated, so this
+/// function cannot accept an arbitrary deserialized approval as authority.
+/// It fails closed on absent, mismatched, or unknown registration and never
+/// creates or changes a service.
 ///
 /// # Errors
 ///
 /// Returns an error when the canonical Host service registration is absent,
 /// mismatched, or cannot be observed authoritatively.
-pub fn inspect_approved_host_registration(host_image: &Path) -> Result<(), SpoolError> {
-    let display_name = ELIOT_HOST_SERVICE_DISPLAY_NAME;
-    let registration = ServiceRegistrationRequest::new(
-        ELIOT_HOST_SERVICE_NAME,
-        display_name,
-        host_image,
-        ServiceStartMode::Automatic,
-        ServiceAccount::LocalService,
-    )
-    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    let root = host_image.parent().ok_or_else(|| {
+pub fn inspect_approved_host_registration(
+    binding: &WatchdogRuntimeBinding,
+) -> Result<(), SpoolError> {
+    inspect_host_registration(&binding.approved_host_registration)
+}
+
+fn inspect_host_registration(approved: &ApprovedHostRegistration) -> Result<(), SpoolError> {
+    let registration = &approved.request;
+    let root = registration.binary_path().parent().ok_or_else(|| {
         SpoolError::InvalidLease("approved Host image has no generation root".to_owned())
     })?;
     let platform = WindowsPlatform::new(root.to_path_buf())
         .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    let inspection = platform.inspect_service_registration(&registration);
+    let inspection = platform.inspect_service_registration(registration);
     if matches!(inspection, ServiceRegistrationInspection::Matching { .. }) {
         Ok(())
     } else {
@@ -2302,6 +2533,13 @@ fn load_supervision_lease_bound(
             "selected runtime contour changed after watchdog binding".to_owned(),
         ));
     }
+    validate_bound_service_registrations(
+        &registry,
+        &selected_manifest,
+        &binding.approved_host_registration.request,
+        &binding.approved_watchdog_registration,
+        bootstrap,
+    )?;
     if config.installation_id != expected_installation_id
         || config.trust_anchor.installation_id != expected_installation_id
     {
@@ -2415,6 +2653,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    static FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
+
     fn valid_scm_args() -> Vec<OsString> {
         let bootstrap = ServiceBootstrapArguments::new(
             PathBuf::from(r"C:\ProgramData\Eliot\config\watchdog.json"),
@@ -2433,6 +2673,131 @@ mod tests {
         let mut args = vec![OsString::from(SERVICE_NAME)];
         args.extend(bootstrap.argv().into_iter().map(OsString::from));
         args
+    }
+
+    fn valid_registry_bootstrap() -> ServiceBootstrapArguments {
+        let installation = "a".repeat(64);
+        ServiceBootstrapArguments::new(
+            PathBuf::from(r"C:\ProgramData\Eliot\config\watchdog.json"),
+            "b".repeat(64),
+            installation.clone(),
+            7,
+            std::iter::empty::<String>(),
+        )
+        .and_then(|value| {
+            value.with_host_state_root(PathBuf::from(format!(
+                r"C:\ProgramData\Eliot\installations\{installation}\host"
+            )))
+        })
+        .and_then(|value| value.with_registration_nonce("b".repeat(64)))
+        .unwrap_or_else(|error| panic!("registry bootstrap fixture: {error}"))
+    }
+
+    fn installer_approval_fixture(
+        role: InstallerServiceRole,
+        registration_nonce: &str,
+    ) -> (
+        InstallerServiceRegistrationApproval,
+        ServiceRegistrationRequest,
+    ) {
+        let descriptor =
+            std::env::current_exe().unwrap_or_else(|error| panic!("current exe: {error}"));
+        let host_state_root = std::env::temp_dir().join(format!(
+            "eliot-watchdog-scm-host-state-{}",
+            std::process::id()
+        ));
+        let bootstrap = ServiceBootstrapArguments::new(
+            descriptor,
+            "a".repeat(64),
+            "installation-fixture",
+            7,
+            std::iter::empty::<String>(),
+        )
+        .and_then(|value| value.with_host_state_root(host_state_root))
+        .unwrap_or_else(|error| panic!("bootstrap fixture: {error}"));
+        installer_approval_fixture_for_bootstrap(role, registration_nonce, &bootstrap)
+    }
+
+    fn installer_approval_fixture_for_bootstrap(
+        role: InstallerServiceRole,
+        registration_nonce: &str,
+        template: &ServiceBootstrapArguments,
+    ) -> (
+        InstallerServiceRegistrationApproval,
+        ServiceRegistrationRequest,
+    ) {
+        let source_image =
+            std::env::current_exe().unwrap_or_else(|error| panic!("current exe: {error}"));
+        let fixture_id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let fixture_directory = std::env::temp_dir().join(format!(
+            "eliot-watchdog-scm-fixture-{}-{fixture_id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fixture_directory)
+            .unwrap_or_else(|error| panic!("create fixture directory: {error}"));
+        let image = fixture_directory.join(match role {
+            InstallerServiceRole::Host => "eliot-host.exe",
+            InstallerServiceRole::Watchdog => "eliot-watchdog.exe",
+        });
+        std::fs::copy(&source_image, &image)
+            .unwrap_or_else(|error| panic!("copy fixture image: {error}"));
+        let bootstrap = template
+            .clone()
+            .with_registration_nonce(registration_nonce)
+            .unwrap_or_else(|error| panic!("bootstrap fixture: {error}"));
+        let descriptor = bootstrap.config_descriptor_path().to_path_buf();
+        let host_state_root = bootstrap
+            .host_state_root()
+            .unwrap_or_else(|| panic!("bootstrap fixture has no Host state root"))
+            .to_path_buf();
+        let generation = format!("generation-{}", bootstrap.transaction_plan_generation());
+        let descriptor_digest = bootstrap.config_descriptor_digest().to_owned();
+        let installation_id = bootstrap.installation_id().to_owned();
+        let plan_generation = bootstrap.transaction_plan_generation();
+        let (service_name, display_name) = match role {
+            InstallerServiceRole::Host => (
+                eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+                eliot_platform_windows::ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            ),
+            InstallerServiceRole::Watchdog => (
+                SERVICE_NAME,
+                eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
+            ),
+        };
+        let request = ServiceRegistrationRequest::with_bootstrap(
+            service_name,
+            display_name,
+            image.clone(),
+            eliot_platform_windows::ServiceStartMode::Automatic,
+            eliot_platform_windows::ServiceAccount::LocalService,
+            bootstrap.clone(),
+        )
+        .unwrap_or_else(|error| panic!("request fixture: {error}"));
+        let wire = serde_json::json!({
+            "transaction_id": "transaction-fixture",
+            "generation": generation,
+            "effect_id": format!("effect-{service_name}"),
+            "role": match role {
+                InstallerServiceRole::Host => "HOST",
+                InstallerServiceRole::Watchdog => "WATCHDOG",
+            },
+            "service_name": service_name,
+            "executable_path": image.to_string_lossy(),
+            "account": "LOCAL_SERVICE",
+            "automatic_start": true,
+            "service_bootstrap": {
+                "descriptor_path": descriptor.to_string_lossy(),
+                "descriptor_digest": descriptor_digest,
+                "installation_id": installation_id,
+                "plan_generation": plan_generation,
+                "host_state_root": host_state_root.to_string_lossy(),
+            },
+            "registration_nonce": registration_nonce,
+            "configuration_digest": request.expected_configuration_digest(),
+        });
+        let approval = serde_json::from_value(wire)
+            .unwrap_or_else(|error| panic!("approval fixture: {error}"));
+        (approval, request)
     }
 
     #[allow(
@@ -2554,6 +2919,7 @@ mod tests {
             .collect::<Vec<_>>();
         serde_json::from_value(serde_json::json!({
             "generations": generations,
+            "service_registration_approvals": [],
             "active_generation": null,
             "last_known_good_generation": null,
             "pending_activation": {
@@ -2575,6 +2941,83 @@ mod tests {
             "last_terminal_activation": null
         }))
         .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn patch_manifest_service_paths(
+        manifest: &mut serde_json::Value,
+        host_request: &ServiceRegistrationRequest,
+        watchdog_request: &ServiceRegistrationRequest,
+    ) {
+        let host_path = host_request.binary_path().to_string_lossy().into_owned();
+        let watchdog_path = watchdog_request
+            .binary_path()
+            .to_string_lossy()
+            .into_owned();
+        manifest["host_executable_path"] = serde_json::Value::String(host_path.clone());
+        if let Some(runtime) = manifest
+            .get_mut("runtime_launch")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            runtime.insert(
+                "host_executable_path".to_owned(),
+                serde_json::Value::String(host_path),
+            );
+            runtime.insert(
+                "watchdog_executable_path".to_owned(),
+                serde_json::Value::String(watchdog_path),
+            );
+        }
+    }
+
+    fn registry_wire_with_service_approvals(
+        bootstrap: &ServiceBootstrapArguments,
+    ) -> (
+        serde_json::Value,
+        ServiceRegistrationRequest,
+        ServiceRegistrationRequest,
+    ) {
+        let (host_approval, host_request) = installer_approval_fixture_for_bootstrap(
+            InstallerServiceRole::Host,
+            &"a".repeat(64),
+            bootstrap,
+        );
+        let (watchdog_approval, watchdog_request) = installer_approval_fixture_for_bootstrap(
+            InstallerServiceRole::Watchdog,
+            &"b".repeat(64),
+            bootstrap,
+        );
+        let mut wire = serde_json::to_value(pending_registry_fixture(bootstrap, 1))
+            .unwrap_or_else(|error| panic!("serialize registry fixture: {error}"));
+        wire["pending_activation"] = serde_json::Value::Null;
+        wire["active_generation"] = serde_json::Value::String("generation-7".to_owned());
+        if let Some(generations) = wire
+            .get_mut("generations")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for generation in generations {
+                generation["active"] = serde_json::Value::Bool(true);
+                if let Some(manifest) = generation.get_mut("manifest") {
+                    patch_manifest_service_paths(manifest, &host_request, &watchdog_request);
+                    manifest["config_path"] = serde_json::Value::String(
+                        r"C:\ProgramData\Eliot\packages\generation-7\store.json".to_owned(),
+                    );
+                    if let Some(runtime) = manifest
+                        .get_mut("runtime_launch")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        runtime.insert(
+                            "store_config_path".to_owned(),
+                            serde_json::Value::String(
+                                r"C:\ProgramData\Eliot\packages\generation-7\store.json".to_owned(),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        wire["service_registration_approvals"] =
+            serde_json::json!([host_approval, watchdog_approval,]);
+        (wire, host_request, watchdog_request)
     }
 
     #[test]
@@ -2613,6 +3056,214 @@ mod tests {
         let mut wrong_service = valid_scm_args();
         wrong_service[0] = OsString::from("EliotHost");
         assert!(parse_watchdog_scm_argv(wrong_service).is_err());
+    }
+
+    #[test]
+    fn installer_role_approvals_reconstruct_exact_sibling_requests() {
+        let (host_approval, host_expected) =
+            installer_approval_fixture(InstallerServiceRole::Host, &"a".repeat(64));
+        let (watchdog_approval, watchdog_expected) =
+            installer_approval_fixture(InstallerServiceRole::Watchdog, &"b".repeat(64));
+        let host_request = host_approval
+            .service_registration_request()
+            .unwrap_or_else(|error| panic!("Host approval reconstruction: {error}"));
+        let watchdog_request = watchdog_approval
+            .service_registration_request()
+            .unwrap_or_else(|error| panic!("Watchdog approval reconstruction: {error}"));
+
+        assert_eq!(host_request, host_expected);
+        assert_eq!(watchdog_request, watchdog_expected);
+        assert_eq!(
+            host_request.service_name(),
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME
+        );
+        assert_eq!(watchdog_request.service_name(), SERVICE_NAME);
+        assert_eq!(
+            host_request
+                .bootstrap()
+                .and_then(ServiceBootstrapArguments::registration_nonce),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            watchdog_request
+                .bootstrap()
+                .and_then(ServiceBootstrapArguments::registration_nonce),
+            Some("b".repeat(64).as_str())
+        );
+        assert_ne!(
+            host_request
+                .bootstrap()
+                .and_then(ServiceBootstrapArguments::registration_nonce),
+            watchdog_request
+                .bootstrap()
+                .and_then(ServiceBootstrapArguments::registration_nonce)
+        );
+        assert_eq!(
+            watchdog_request
+                .bootstrap()
+                .and_then(ServiceBootstrapArguments::host_state_root),
+            host_request
+                .bootstrap()
+                .and_then(ServiceBootstrapArguments::host_state_root)
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the single matrix proves registry lookup, role bindings, substitutions, and reload drift against one immutable approval contour"
+    )]
+    fn protected_registry_approval_projection_fences_substitutions_and_reload() {
+        let bootstrap = valid_registry_bootstrap();
+        let (wire, host_expected, watchdog_expected) =
+            registry_wire_with_service_approvals(&bootstrap);
+        let registry: ApprovedGenerationRegistry = serde_json::from_value(wire.clone())
+            .unwrap_or_else(|error| panic!("registry fixture: {error}"));
+        let manifest = select_runtime_manifest(&registry, &bootstrap)
+            .unwrap_or_else(|error| panic!("manifest fixture: {error}"));
+        let (_, host_request) =
+            approved_service_registration(&registry, &manifest, InstallerServiceRole::Host)
+                .unwrap_or_else(|error| panic!("Host approval lookup: {error}"));
+        let (_, watchdog_request) =
+            approved_service_registration(&registry, &manifest, InstallerServiceRole::Watchdog)
+                .unwrap_or_else(|error| panic!("Watchdog approval lookup: {error}"));
+        assert_eq!(host_request, host_expected);
+        assert_eq!(watchdog_request, watchdog_expected);
+        assert!(
+            validate_bound_service_registrations(
+                &registry,
+                &manifest,
+                &host_expected,
+                &watchdog_expected,
+                &bootstrap,
+            )
+            .is_ok()
+        );
+        assert!(read_registry_for_bootstrap(&bootstrap).is_err());
+
+        let mut missing = wire.clone();
+        missing["service_registration_approvals"] = serde_json::json!([]);
+        let missing_registry: ApprovedGenerationRegistry = serde_json::from_value(missing)
+            .unwrap_or_else(|error| panic!("missing approval fixture: {error}"));
+        assert!(approved_service_registration(
+            &missing_registry,
+            &manifest,
+            InstallerServiceRole::Host,
+        )
+        .is_err());
+
+        let mut swapped_role = wire.clone();
+        swapped_role["service_registration_approvals"][0]["role"] =
+            serde_json::Value::String("WATCHDOG".to_owned());
+        let swapped_role_registry: ApprovedGenerationRegistry =
+            serde_json::from_value(swapped_role)
+                .unwrap_or_else(|error| panic!("swapped role fixture: {error}"));
+        assert!(
+            approved_service_registration(
+                &swapped_role_registry,
+                &manifest,
+                InstallerServiceRole::Host,
+            )
+            .is_err()
+        );
+
+        let mut substituted_generation = wire.clone();
+        substituted_generation["service_registration_approvals"][0]["generation"] =
+            serde_json::Value::String("generation-8".to_owned());
+        let substituted_generation_registry: ApprovedGenerationRegistry =
+            serde_json::from_value(substituted_generation)
+                .unwrap_or_else(|error| panic!("generation fixture: {error}"));
+        assert!(
+            approved_service_registration(
+                &substituted_generation_registry,
+                &manifest,
+                InstallerServiceRole::Host,
+            )
+            .is_err()
+        );
+
+        let mut substituted_nonce = wire.clone();
+        substituted_nonce["service_registration_approvals"][0]["registration_nonce"] =
+            serde_json::Value::String("c".repeat(64));
+        let substituted_nonce_registry: ApprovedGenerationRegistry =
+            serde_json::from_value(substituted_nonce)
+                .unwrap_or_else(|error| panic!("nonce fixture: {error}"));
+        assert!(
+            approved_service_registration(
+                &substituted_nonce_registry,
+                &manifest,
+                InstallerServiceRole::Host,
+            )
+            .is_err()
+        );
+
+        let mut substituted_bootstrap = wire.clone();
+        substituted_bootstrap["service_registration_approvals"][0]["service_bootstrap"]["descriptor_digest"] =
+            serde_json::Value::String("c".repeat(64));
+        let substituted_bootstrap_registry: ApprovedGenerationRegistry =
+            serde_json::from_value(substituted_bootstrap)
+                .unwrap_or_else(|error| panic!("bootstrap fixture: {error}"));
+        assert!(
+            approved_service_registration(
+                &substituted_bootstrap_registry,
+                &manifest,
+                InstallerServiceRole::Host,
+            )
+            .is_err()
+        );
+
+        let changed_bootstrap = host_expected
+            .bootstrap()
+            .unwrap_or_else(|| panic!("Host request has no bootstrap"))
+            .clone()
+            .with_registration_nonce("c".repeat(64))
+            .unwrap_or_else(|error| panic!("changed nonce bootstrap: {error}"));
+        let changed_host_request = ServiceRegistrationRequest::with_bootstrap(
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+            eliot_platform_windows::ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            host_expected.binary_path().to_path_buf(),
+            eliot_platform_windows::ServiceStartMode::Automatic,
+            eliot_platform_windows::ServiceAccount::LocalService,
+            changed_bootstrap,
+        )
+        .unwrap_or_else(|error| panic!("changed Host request: {error}"));
+        let mut changed_reload = wire;
+        changed_reload["service_registration_approvals"][0]["registration_nonce"] =
+            serde_json::Value::String("c".repeat(64));
+        changed_reload["service_registration_approvals"][0]["configuration_digest"] =
+            serde_json::Value::String(changed_host_request.expected_configuration_digest());
+        let changed_reload_registry: ApprovedGenerationRegistry =
+            serde_json::from_value(changed_reload)
+                .unwrap_or_else(|error| panic!("reload fixture: {error}"));
+        let changed_manifest = select_runtime_manifest(&changed_reload_registry, &bootstrap)
+            .unwrap_or_else(|error| panic!("changed manifest fixture: {error}"));
+        assert!(
+            validate_bound_service_registrations(
+                &changed_reload_registry,
+                &changed_manifest,
+                &host_expected,
+                &watchdog_expected,
+                &bootstrap,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_or_substituted_role_approval_fails_closed() {
+        let bootstrap = parse_watchdog_scm_argv(valid_scm_args())
+            .unwrap_or_else(|error| panic!("bootstrap fixture: {error}"));
+        let registry = pending_registry_fixture(&bootstrap, 1);
+        let manifest = select_runtime_manifest(&registry, &bootstrap)
+            .unwrap_or_else(|error| panic!("manifest fixture: {error}"));
+        assert!(
+            approved_service_registration(&registry, &manifest, InstallerServiceRole::Watchdog,)
+                .is_err()
+        );
+
+        let (watchdog_approval, _) =
+            installer_approval_fixture(InstallerServiceRole::Watchdog, &"c".repeat(64));
+        assert!(ApprovedHostRegistration::from_approval(&watchdog_approval).is_err());
     }
 
     #[test]
