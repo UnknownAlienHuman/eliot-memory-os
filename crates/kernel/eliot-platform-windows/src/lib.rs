@@ -47,7 +47,8 @@ pub use installer_root::{
 };
 pub use package_staging::{
     AuthenticodeError, AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier,
-    PackageFileSpec, PackageManifest, PackageRelativePath, PackageStager, PackageStagingError,
+    MAX_ENUMERATED_ENTRIES, PackageFileSpec, PackageManifest, PackageRelativePath,
+    PackageSourceFileObservation, PackageSourceObservation, PackageStager, PackageStagingError,
     PackageStagingObservation, PeCoffError, PeCoffEvidence, StagedDirectoryReceipt,
     StagedFileReceipt, StagingReceipt, TrustedSourceBundle, WindowsAuthenticodeVerifier,
     parse_pe_coff, validate_package_relative_path,

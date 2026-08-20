@@ -7,6 +7,8 @@
 //! authority, activation, rollback policy, or durable state.
 
 use std::cmp::Ordering;
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -28,7 +30,8 @@ pub const MAX_PACKAGE_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Maximum PE header prefix inspected by the pure parser.
 pub const MAX_PE_HEADER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
-const MAX_ENUMERATED_ENTRIES: usize = MAX_PACKAGE_FILES * 2 + MAX_PACKAGE_PATH_DEPTH;
+/// Maximum number of files plus directories walked from one source root.
+pub const MAX_ENUMERATED_ENTRIES: usize = MAX_PACKAGE_FILES * 2 + MAX_PACKAGE_PATH_DEPTH;
 
 /// A validated relative package path using `/` as its canonical separator.
 ///
@@ -113,6 +116,7 @@ fn validate_relative_text(raw: &str) -> Result<PackageRelativePath, PackageStagi
             || component.chars().any(char::is_control)
             || component.ends_with('.')
             || component.ends_with(' ')
+            || is_windows_device_name(component)
         {
             return Err(PackageStagingError::InvalidRelativePath);
         }
@@ -129,6 +133,32 @@ fn validate_relative_text(raw: &str) -> Result<PackageRelativePath, PackageStagi
         canonical: components.join("/"),
         components,
     })
+}
+
+/// Return whether a path component names a DOS device rather than a regular
+/// filesystem entry.  Windows applies these names even when an extension is
+/// present (for example, `NUL.txt`), so the comparison uses the text before
+/// the first dot.
+fn is_windows_device_name(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component);
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CLOCK$"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    ) || (upper.len() == 4
+        && (upper.starts_with("COM") || upper.starts_with("LPT"))
+        && upper.as_bytes()[3].is_ascii_digit()
+        && upper.as_bytes()[3] != b'0')
 }
 
 fn ordinal_component_cmp(left: &str, right: &str) -> Ordering {
@@ -991,9 +1021,7 @@ impl TrustedSourceBundle {
     /// Returns a typed error when the source contour cannot be retained or is
     /// substituted by a reparse point.
     pub fn open(path: &Path) -> Result<Self, PackageStagingError> {
-        if !path.is_absolute() {
-            return Err(PackageStagingError::RootUnavailable);
-        }
+        validate_source_root_input(path)?;
         retain_source_directory(path)
     }
 
@@ -1018,6 +1046,17 @@ impl TrustedSourceBundle {
             if identity != self.identity {
                 return Err(PackageStagingError::IdentityMismatch);
             }
+            let mut expected = self.path.ancestors().collect::<Vec<_>>();
+            expected.reverse();
+            if expected.len() != self.contour.len() {
+                return Err(PackageStagingError::IdentityMismatch);
+            }
+            for (handle, expected_path) in self.contour.iter().zip(expected) {
+                let observed = final_path_from_handle(handle)?;
+                if !super::windows_paths_equal(&observed, expected_path) {
+                    return Err(PackageStagingError::IdentityMismatch);
+                }
+            }
             Ok(())
         }
         #[cfg(not(windows))]
@@ -1025,6 +1064,98 @@ impl TrustedSourceBundle {
             Err(PackageStagingError::UnsupportedPlatform)
         }
     }
+
+    /// Observe every regular file below the retained source root.
+    ///
+    /// The walk is read-only and independent of any manifest, signature or
+    /// approval claim.  Every returned item is measured from a no-follow file
+    /// handle and contains only its canonical relative path, SHA-256, stable
+    /// object identity and byte size.  The retained root contour is checked
+    /// before and after the walk; directories and files are checked against
+    /// their final handle paths while the handles are live.
+    ///
+    /// Empty child directories are rejected because they have no file fact to
+    /// carry into the file-defined package plan.  An entirely empty source
+    /// root is represented by an empty observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the source tree is substituted, contains a
+    /// link/reparse/device/path collision, exceeds a bound, or changes while
+    /// being read.
+    pub fn observe(&self) -> Result<PackageSourceObservation, PackageStagingError> {
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            return Err(PackageStagingError::UnsupportedPlatform);
+        }
+        #[cfg(windows)]
+        {
+            self.verify_stable()?;
+            let mut identities = HashSet::new();
+            let mut total_bytes = 0_u64;
+            let mut files = Vec::new();
+            let _tree = walk_tree(self.path(), |relative, path, file, identity| {
+                if !identities.insert(identity) {
+                    return Err(PackageStagingError::IdentityMismatch);
+                }
+                if files.len() >= MAX_PACKAGE_FILES {
+                    return Err(PackageStagingError::BoundExceeded);
+                }
+                let observed = observe_source_handle(file, path, MAX_PACKAGE_FILE_BYTES)?;
+                total_bytes = total_bytes
+                    .checked_add(observed.size)
+                    .ok_or(PackageStagingError::BoundExceeded)?;
+                if total_bytes > MAX_PACKAGE_TOTAL_BYTES {
+                    return Err(PackageStagingError::BoundExceeded);
+                }
+                files.push(PackageSourceFileObservation {
+                    relative_path: relative.canonical.clone(),
+                    sha256: observed.sha256,
+                    identity,
+                    size: observed.size,
+                });
+                Ok(())
+            })?;
+            self.verify_stable()?;
+            files.sort_by(|left, right| {
+                let left = validate_relative_text(&left.relative_path).ok();
+                let right = validate_relative_text(&right.relative_path).ok();
+                match (left, right) {
+                    (Some(left), Some(right)) => ordinal_path_cmp(&left, &right),
+                    _ => Ordering::Equal,
+                }
+            });
+            Ok(PackageSourceObservation { files, total_bytes })
+        }
+    }
+}
+
+fn validate_source_root_input(path: &Path) -> Result<(), PackageStagingError> {
+    if !path.is_absolute() {
+        return Err(PackageStagingError::RootUnavailable);
+    }
+    let raw = path.to_str().ok_or(PackageStagingError::RootUnavailable)?;
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("\\\\?\\")
+        || lower.starts_with("\\\\.\\")
+        || lower.starts_with("\\??\\")
+        || path.components().any(|component| {
+            matches!(component, std::path::Component::ParentDir)
+                || match component {
+                    std::path::Component::Normal(value) => value.to_str().is_none_or(|value| {
+                        value.contains(':')
+                            || value.ends_with('.')
+                            || value.ends_with(' ')
+                            || is_windows_device_name(value)
+                    }),
+                    _ => false,
+                }
+        })
+    {
+        return Err(PackageStagingError::RootUnavailable);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1060,6 +1191,33 @@ fn map_protected_path_error(error: ProtectedPathError) -> PackageStagingError {
         ProtectedPathError::AclMismatch => PackageStagingError::SecurityMismatch,
         ProtectedPathError::Io | ProtectedPathError::SizeExceeded => PackageStagingError::Io,
     }
+}
+
+/// One independently measured regular source file.
+///
+/// This is intentionally narrower than [`StagedFileReceipt`]: it contains no
+/// destination, security, PE, Authenticode, manifest or approval fields.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageSourceFileObservation {
+    /// Canonical slash-separated path below the retained source root.
+    pub relative_path: String,
+    /// Lowercase SHA-256 of the bytes read from the retained file handle.
+    pub sha256: String,
+    /// Windows volume/file-object identity observed from the same handle.
+    pub identity: FileIdentity,
+    /// Number of bytes read from the same handle.
+    pub size: u64,
+}
+
+/// Complete bounded read-only observation of a trusted source bundle.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageSourceObservation {
+    /// File facts sorted by Windows ordinal whole-component path order.
+    pub files: Vec<PackageSourceFileObservation>,
+    /// Aggregate bytes read from all observed files.
+    pub total_bytes: u64,
 }
 
 /// Receipt for one copied package file.
@@ -1925,18 +2083,44 @@ fn enumerate_tree(
     root: &Path,
     manifest: &PackageManifest,
 ) -> Result<Vec<TreeEntry>, PackageStagingError> {
+    let entries = walk_tree(root, |_relative, _path, _file, _identity| Ok(()))?;
+    let _ = manifest;
+    Ok(entries)
+}
+
+/// Walk one retained regular tree once, holding every opened directory until
+/// its descendants have been processed.  The callback runs while each file
+/// handle is open, which lets source observation read the same no-follow
+/// object that was enumerated rather than reopening a mutable path later.
+#[cfg(windows)]
+fn walk_tree<F>(root: &Path, mut on_file: F) -> Result<Vec<TreeEntry>, PackageStagingError>
+where
+    F: FnMut(
+        &PackageRelativePath,
+        &Path,
+        &std::fs::File,
+        FileIdentity,
+    ) -> Result<(), PackageStagingError>,
+{
+    let root_handle = open_existing_directory(root)?;
+    let root_final = final_path_from_handle(&root_handle)?;
+    if !super::windows_paths_equal(&root_final, root) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
     let mut entries = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), Vec::<String>::new(), 0_usize)];
-    while let Some((directory, prefix, depth)) = stack.pop() {
+    let mut stack = vec![(
+        root.to_path_buf(),
+        Vec::<String>::new(),
+        0_usize,
+        root_handle,
+    )];
+    while let Some((directory, prefix, depth, directory_handle)) = stack.pop() {
         if depth > MAX_PACKAGE_PATH_DEPTH {
             return Err(PackageStagingError::BoundExceeded);
         }
-        let directory_handle = open_existing_directory(&directory)?;
+        let mut pending = Vec::new();
         let read_dir = std::fs::read_dir(&directory).map_err(|_| PackageStagingError::Io)?;
         for entry in read_dir {
-            if entries.len() >= MAX_ENUMERATED_ENTRIES {
-                return Err(PackageStagingError::BoundExceeded);
-            }
             let entry = entry.map_err(|_| PackageStagingError::Io)?;
             let name = entry
                 .file_name()
@@ -1944,25 +2128,47 @@ fn enumerate_tree(
                 .ok_or(PackageStagingError::InvalidRelativePath)?
                 .to_owned();
             let relative_text = if prefix.is_empty() {
-                name.clone()
+                name
             } else {
                 format!("{}/{}", prefix.join("/"), name)
             };
             let relative = validate_relative_text(&relative_text)?;
-            let path = entry.path();
+            pending.push((relative, entry.path()));
+        }
+        pending.sort_by(|left, right| ordinal_path_cmp(&left.0, &right.0));
+        for pair in pending.windows(2) {
+            if ordinal_path_eq(&pair[0].0, &pair[1].0) {
+                return Err(PackageStagingError::ManifestCollision);
+            }
+        }
+        if pending.is_empty() && !prefix.is_empty() {
+            return Err(PackageStagingError::TreeMismatch);
+        }
+        let mut child_directories = Vec::new();
+        for (relative, path) in pending {
+            if entries.len() >= MAX_ENUMERATED_ENTRIES {
+                return Err(PackageStagingError::BoundExceeded);
+            }
             let metadata = std::fs::symlink_metadata(&path).map_err(|_| PackageStagingError::Io)?;
             if is_reparse_metadata(&metadata) {
                 return Err(PackageStagingError::ReparsePoint);
             }
             if metadata.is_dir() {
-                let _ = directory_handle;
                 let child = open_existing_directory(&path)?;
-                drop(child);
+                let final_path = final_path_from_handle(&child)?;
+                if !super::windows_paths_equal(&final_path, &path) {
+                    return Err(PackageStagingError::IdentityMismatch);
+                }
                 entries.push(TreeEntry {
                     relative: relative.clone(),
                     kind: TreeEntryKind::Directory,
                 });
-                stack.push((path, relative.components, depth + 1));
+                child_directories.push((
+                    path,
+                    relative.components.clone(),
+                    depth.saturating_add(1),
+                    child,
+                ));
             } else if metadata.is_file() {
                 let file = open_existing_file(&path)?;
                 let identity = file_identity_from_open_handle(&file)?;
@@ -1970,19 +2176,18 @@ fn enumerate_tree(
                 if !super::windows_paths_equal(&final_path, &path) {
                     return Err(PackageStagingError::IdentityMismatch);
                 }
-                drop(file);
+                on_file(&relative, &path, &file, identity)?;
                 entries.push(TreeEntry {
                     relative,
                     kind: TreeEntryKind::File,
                 });
-                let _ = identity;
             } else {
                 return Err(PackageStagingError::WrongEntryKind);
             }
         }
         drop(directory_handle);
+        stack.extend(child_directories.into_iter().rev());
     }
-    let _ = manifest;
     Ok(entries)
 }
 
@@ -2608,6 +2813,83 @@ fn snapshot_source_file(path: &Path, max_size: u64) -> Result<SourceSnapshot, Pa
     })
 }
 
+#[cfg(windows)]
+fn observe_source_handle(
+    file: &std::fs::File,
+    expected_path: &Path,
+    max_size: u64,
+) -> Result<ObservedSourceRead, PackageStagingError> {
+    observe_source_handle_with_post_read_hook(file, expected_path, max_size, || {})
+}
+
+#[cfg(windows)]
+fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
+    file: &std::fs::File,
+    expected_path: &Path,
+    max_size: u64,
+    post_read_hook: H,
+) -> Result<ObservedSourceRead, PackageStagingError> {
+    let identity = file_identity_from_open_handle(file)?;
+    let before_path = final_path_from_handle(file)?;
+    if !super::windows_paths_equal(&before_path, expected_path) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let before_size = file.metadata().map_err(|_| PackageStagingError::Io)?.len();
+    if before_size > max_size || before_size > MAX_PACKAGE_FILE_BYTES {
+        return Err(PackageStagingError::BoundExceeded);
+    }
+    let mut reader = file.try_clone().map_err(|_| PackageStagingError::Io)?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| PackageStagingError::Io)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+    let mut size = 0_u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|_| PackageStagingError::Io)?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or(PackageStagingError::BoundExceeded)?;
+        if size > max_size || size > MAX_PACKAGE_FILE_BYTES {
+            return Err(PackageStagingError::BoundExceeded);
+        }
+        digest.update(&buffer[..read]);
+    }
+    if size != before_size {
+        return Err(PackageStagingError::SizeMismatch);
+    }
+    post_read_hook();
+    ensure_single_link(file)?;
+    let after_identity = file_identity_from_open_handle(file)?;
+    let after_path = final_path_from_handle(file)?;
+    let after_size = file.metadata().map_err(|_| PackageStagingError::Io)?.len();
+    if after_identity != identity {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    if !super::windows_paths_equal(&after_path, expected_path) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    if after_size != before_size {
+        return Err(PackageStagingError::SizeMismatch);
+    }
+    Ok(ObservedSourceRead {
+        size,
+        sha256: format!("{:x}", digest.finalize()),
+    })
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct ObservedSourceRead {
+    size: u64,
+    sha256: String,
+}
+
 #[cfg(not(windows))]
 fn snapshot_source_file(
     _path: &Path,
@@ -2911,6 +3193,10 @@ mod tests {
             "\\\\?\\C:\\verbatim",
             "\\\\.\\pipe\\x",
             "\\??\\C:\\nt",
+            "CON",
+            "NUL.txt",
+            "COM1",
+            "LPT9.log",
             "a.",
             "a ",
             "a//b",
@@ -2919,6 +3205,25 @@ mod tests {
             assert!(
                 validate_relative_text(path).is_err(),
                 "path unexpectedly accepted: {path:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_source_root_rejects_verbatim_device_and_traversal_inputs() {
+        for path in [
+            r"\\?\C:\Windows",
+            r"\\.\pipe\eliot",
+            r"\\??\C:\Windows",
+            r"C:\Windows\..\Temp",
+        ] {
+            assert!(
+                matches!(
+                    TrustedSourceBundle::open(Path::new(path)),
+                    Err(PackageStagingError::RootUnavailable)
+                ),
+                "source root unexpectedly accepted: {path}"
             );
         }
     }
@@ -2939,6 +3244,44 @@ mod tests {
         assert_eq!(
             validate_relative_text("bin/A.exe").expect("path").as_str(),
             "bin/A.exe"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unicode_ordinal_component_order_and_collision_are_explicit() {
+        let manifest = PackageManifest::new(
+            "g1",
+            vec![
+                file("épsilon.txt", false),
+                file("zeta.txt", false),
+                file("alpha.txt", false),
+            ],
+        )
+        .expect("unicode manifest");
+        let mut expected = manifest
+            .files
+            .iter()
+            .map(|file| validate_relative_text(&file.relative_path).expect("path"))
+            .collect::<Vec<_>>();
+        expected.sort_by(ordinal_path_cmp);
+        assert_eq!(
+            manifest
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(PackageRelativePath::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            PackageManifest::new(
+                "g1",
+                vec![file("unicode/É.txt", false), file("unicode/é.txt", false)],
+            ),
+            Err(PackageStagingError::ManifestCollision)
         );
     }
 
@@ -3149,11 +3492,25 @@ mod tests {
             .arg(&outside)
             .output()
             .expect("mklink");
-        assert!(
-            output.status.success(),
-            "mklink /J failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+            let privilege_specific = output.status.code() == Some(5)
+                || stderr.contains("privilege")
+                || stderr.contains("access is denied");
+            if privilege_specific {
+                eprintln!(
+                    "SKIP junction source observation: privilege-specific mklink failure: {}",
+                    stderr.trim()
+                );
+                std::fs::remove_dir(&root).expect("root cleanup");
+                std::fs::remove_dir(&outside).expect("outside cleanup");
+                return;
+            }
+            panic!(
+                "mklink /J failed for a non-privilege reason: {}",
+                stderr.trim()
+            );
+        }
         assert!(matches!(
             open_existing_directory(&junction),
             Err(PackageStagingError::ReparsePoint)
@@ -3163,6 +3520,9 @@ mod tests {
             enumerate_tree(&root, &manifest),
             Err(PackageStagingError::ReparsePoint)
         );
+        let source = TrustedSourceBundle::open(&root).expect("retained source");
+        assert_eq!(source.observe(), Err(PackageStagingError::ReparsePoint));
+        drop(source);
         std::fs::remove_dir(&junction).expect("junction cleanup");
         std::fs::remove_dir(&root).expect("root cleanup");
         std::fs::remove_dir(&outside).expect("outside cleanup");
@@ -3188,8 +3548,129 @@ mod tests {
             open_existing_file(&link),
             Err(PackageStagingError::IdentityMismatch)
         ));
+        let source = TrustedSourceBundle::open(&root).expect("source root");
+        assert_eq!(source.observe(), Err(PackageStagingError::IdentityMismatch));
+        drop(source);
         std::fs::remove_file(&link).expect("link cleanup");
         std::fs::remove_file(&original).expect("original cleanup");
+        std::fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_source_observation_is_bounded_sorted_and_read_only() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-package-source-observe-{}-{}",
+            std::process::id(),
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(root.join("bin")).expect("bin");
+        std::fs::write(root.join("bin/z.txt"), b"z").expect("z");
+        std::fs::write(root.join("a.txt"), b"a").expect("a");
+        let source = TrustedSourceBundle::open(&root).expect("retained source");
+        let moved = root.with_file_name(format!(
+            "eliot-package-source-observe-moved-{}",
+            super::super::unique_suffix()
+        ));
+        assert!(
+            std::fs::rename(&root, &moved).is_err(),
+            "retained ancestor contour must block substitution"
+        );
+        let observed = source.observe().expect("source observation");
+        assert_eq!(observed.total_bytes, 2);
+        assert_eq!(
+            observed
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.txt", "bin/z.txt"]
+        );
+        assert_eq!(observed.files[0].size, 1);
+        assert_eq!(observed.files[0].sha256, hex_digest(b"a"));
+        assert!(root.join("a.txt").is_file());
+        drop(source);
+        std::fs::remove_file(root.join("bin/z.txt")).expect("z cleanup");
+        std::fs::remove_dir(root.join("bin")).expect("bin cleanup");
+        std::fs::remove_file(root.join("a.txt")).expect("a cleanup");
+        std::fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_source_observation_rejects_empty_child_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-package-source-empty-{}-{}",
+            std::process::id(),
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(root.join("empty")).expect("empty");
+        let source = TrustedSourceBundle::open(&root).expect("retained source");
+        assert_eq!(source.observe(), Err(PackageStagingError::TreeMismatch));
+        drop(source);
+        std::fs::remove_dir(root.join("empty")).expect("empty cleanup");
+        std::fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_source_observation_rejects_file_and_depth_bounds() {
+        let file_root = std::env::temp_dir().join(format!(
+            "eliot-package-source-file-bound-{}-{}",
+            std::process::id(),
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&file_root).expect("file root");
+        for index in 0..=MAX_PACKAGE_FILES {
+            std::fs::write(file_root.join(format!("file-{index}.bin")), []).expect("file");
+        }
+        let source = TrustedSourceBundle::open(&file_root).expect("retained source");
+        assert_eq!(source.observe(), Err(PackageStagingError::BoundExceeded));
+        drop(source);
+        for index in 0..=MAX_PACKAGE_FILES {
+            std::fs::remove_file(file_root.join(format!("file-{index}.bin")))
+                .expect("file cleanup");
+        }
+        std::fs::remove_dir(&file_root).expect("file root cleanup");
+
+        let depth_root = std::env::temp_dir().join(format!(
+            "eliot-package-source-depth-bound-{}-{}",
+            std::process::id(),
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&depth_root).expect("depth root");
+        let mut deep = depth_root.clone();
+        for index in 0..=MAX_PACKAGE_PATH_DEPTH {
+            deep.push(format!("d{index}"));
+        }
+        std::fs::create_dir_all(&deep).expect("deep dirs");
+        std::fs::write(deep.join("file.bin"), b"deep").expect("deep file");
+        let source = TrustedSourceBundle::open(&depth_root).expect("retained depth source");
+        assert_eq!(source.observe(), Err(PackageStagingError::BoundExceeded));
+        drop(source);
+        std::fs::remove_dir_all(&depth_root).expect("depth cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_source_observation_post_read_identity_seam_rejects_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-package-source-toctou-{}-{}",
+            std::process::id(),
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("mutable.bin");
+        std::fs::write(&path, b"before").expect("before");
+        let file = open_existing_file(&path).expect("open");
+        let result = observe_source_handle_with_post_read_hook(&file, &path, 64, || {
+            std::fs::write(&path, b"replacement-with-a-different-size").expect("replace");
+        });
+        assert!(matches!(result, Err(PackageStagingError::SizeMismatch)));
+        drop(file);
+        std::fs::remove_file(&path).expect("file cleanup");
         std::fs::remove_dir(&root).expect("root cleanup");
     }
 
