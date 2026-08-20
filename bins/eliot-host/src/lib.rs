@@ -33,9 +33,9 @@ use eliot_host_state::{
 };
 use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, InstallationProfile,
-    InstallerServiceRegistrationApproval, InstallerServiceRole, RedbInstallationRegistry,
-    RuntimeLaunchDescriptor, verify_approved_path, verify_file_digest_with_lease,
-    verify_file_digest_with_user_lease,
+    InstallerServiceRegistrationApproval, InstallerServiceRole, PendingActivationState,
+    RedbInstallationRegistry, RuntimeLaunchDescriptor, verify_approved_path,
+    verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
 use eliot_kernel_service::{
     EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
@@ -4398,21 +4398,56 @@ fn persist_pending_recovery(
     pending: &eliot_installation::PendingActivation,
     reason: &str,
 ) -> Result<(), HostError> {
-    if let Err(mark_error) = registry.mark_pending_recovery(
+    let expected_revision = registry.revision();
+    let expected_post_revision = if registry.pending_activation().is_some_and(|current| {
+        current.approval == pending.approval
+            && matches!(
+                &current.state,
+                PendingActivationState::RecoveryRequired { reason: current_reason }
+                    if current_reason == reason
+            )
+    }) {
+        expected_revision
+    } else {
+        expected_revision.checked_add(1).ok_or_else(|| {
+            HostError::RecoveryRequired(format!(
+                "{reason}; durable recovery disposition revision overflow"
+            ))
+        })?
+    };
+    let outcome = registry_store.mark_pending_recovery(
         host_capability,
-        &pending.transaction_id,
-        &pending.plan_digest,
+        expected_revision,
+        &pending.approval,
         reason,
-    ) {
-        return Err(HostError::RecoveryRequired(format!(
-            "{reason}; durable recovery disposition failed: {mark_error}"
-        )));
-    }
-    registry_store.save(registry).map_err(|save_error| {
+    );
+    let durable = registry_store.load().map_err(|readback_error| {
         HostError::RecoveryRequired(format!(
-            "{reason}; durable recovery disposition save failed: {save_error}"
+            "{reason}; recovery disposition outcome is unknown and registry readback failed: {readback_error}"
         ))
-    })
+    })?;
+    let exact_readback = durable.revision() == expected_post_revision
+        && durable.pending_activation().is_some_and(|current| {
+            current.transaction_id == pending.transaction_id
+                && current.plan_digest == pending.plan_digest
+                && current.approval == pending.approval
+                && matches!(
+                    &current.state,
+                    PendingActivationState::RecoveryRequired { reason: current_reason }
+                        if current_reason == reason
+                )
+        });
+    *registry = durable;
+    match outcome {
+        Ok(()) if exact_readback => Ok(()),
+        Ok(()) => Err(HostError::RecoveryRequired(format!(
+            "{reason}; recovery disposition succeeded but exact registry readback failed"
+        ))),
+        Err(_error) if exact_readback => Ok(()),
+        Err(error) => Err(HostError::RecoveryRequired(format!(
+            "{reason}; durable recovery disposition failed and exact readback did not confirm it: {error}"
+        ))),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5051,13 +5086,7 @@ impl HostComposition {
     ) -> Result<(), HostError> {
         self.ensure_admission_open()?;
         let host_capability = self.owner_lease.activation_capability();
-        let pending = self.registry.claim_pending_activation(
-            &host_capability,
-            &pending.transaction_id,
-            &pending.plan_digest,
-            &pending.manifest.generation,
-        )?;
-        self.registry_store.save(&self.registry)?;
+        let pending = self.claim_pending_durable(pending, &host_capability)?;
         if pending
             .manifest
             .runtime_launch
@@ -5081,11 +5110,7 @@ impl HostComposition {
             self.start_manifest_contour(&pending.manifest, &kernel, &store, Some(&pending))
         {
             if pending.prior_active_generation.is_none() {
-                self.registry.abort_pending_activation(
-                    &host_capability,
-                    &pending.transaction_id,
-                    &pending.plan_digest,
-                )?;
+                self.abort_pending_durable(&pending, &host_capability)?;
             } else {
                 let reason = error.to_string();
                 persist_pending_recovery(
@@ -5096,13 +5121,115 @@ impl HostComposition {
                     &reason,
                 )?;
             }
-            if pending.prior_active_generation.is_none() {
-                self.registry_store.save(&self.registry)?;
-            }
             return Err(error);
         }
         self.commit_pending_durable(&pending, &host_capability)?;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn claim_pending_durable(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<eliot_installation::PendingActivation, HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
+            current.approval == pending.approval
+                && matches!(&current.state, PendingActivationState::Pending)
+        }) {
+            expected_revision
+        } else {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "pending activation claim registry revision overflow".to_owned(),
+                )
+            })?
+        };
+        let outcome = self.registry_store.claim_pending_activation(
+            host_capability,
+            expected_revision,
+            &pending.approval,
+        );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "pending activation claim outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_pending = durable.pending_activation().filter(|current| {
+            current.transaction_id == pending.transaction_id
+                && current.plan_digest == pending.plan_digest
+                && current.approval == pending.approval
+                && matches!(&current.state, PendingActivationState::Pending)
+        });
+        let exact_readback =
+            durable.revision() == expected_post_revision && exact_pending.is_some();
+        let recovered = exact_pending.cloned();
+        self.registry = durable;
+        match outcome {
+            Ok(returned) if exact_readback && Some(&returned) == recovered.as_ref() => Ok(returned),
+            Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
+                "pending activation claim returned a value different from exact registry readback"
+                    .to_owned(),
+            )),
+            Ok(_) => Err(HostError::RecoveryRequired(
+                "pending activation claim succeeded but exact registry readback failed".to_owned(),
+            )),
+            Err(_error) if exact_readback => recovered.ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "pending activation claim readback lost the exact pending record".to_owned(),
+                )
+            }),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "pending activation claim failed and exact readback did not confirm it: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(windows)]
+    fn abort_pending_durable(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self.registry.pending_activation().is_some() {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "pending activation abort registry revision overflow".to_owned(),
+                )
+            })?
+        } else {
+            expected_revision
+        };
+        let outcome = self.registry_store.abort_pending_activation(
+            host_capability,
+            expected_revision,
+            &pending.approval,
+        );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "pending activation abort outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable.pending_activation().is_none()
+            && durable.active().is_none()
+            && !durable
+                .generations()
+                .iter()
+                .any(|generation| generation.manifest.generation == pending.manifest.generation);
+        self.registry = durable;
+        match outcome {
+            Ok(()) if exact_readback => Ok(()),
+            Ok(()) => Err(HostError::RecoveryRequired(
+                "pending activation abort succeeded but exact registry readback failed".to_owned(),
+            )),
+            Err(_error) if exact_readback => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "pending activation abort failed and exact readback did not confirm it: {error}"
+            ))),
+        }
     }
 
     #[cfg(windows)]
@@ -5111,31 +5238,62 @@ impl HostComposition {
         pending: &eliot_installation::PendingActivation,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
-        let before = self.registry.clone();
-        self.registry.commit_pending_activation(
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self.registry.pending_activation().is_some() {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "pending activation commit registry revision overflow".to_owned(),
+                )
+            })?
+        } else {
+            expected_revision
+        };
+        let outcome = self.registry_store.commit_pending_activation(
             host_capability,
-            &pending.transaction_id,
-            &pending.plan_digest,
-            &pending.manifest.generation,
-        )?;
-        if let Err(error) = self.registry_store.save(&self.registry) {
-            self.registry = before;
-            let recovery_result = self.registry.mark_pending_recovery(
+            expected_revision,
+            &pending.approval,
+        );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "activation commit outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable.pending_activation().is_none()
+            && durable.active().is_some_and(|active| {
+                active.manifest.generation == pending.manifest.generation
+                    && active.approval == pending.approval
+            });
+        self.registry = durable;
+        let result = match outcome {
+            Ok(()) if exact_readback => return Ok(()),
+            Ok(()) => HostError::RecoveryRequired(
+                "activation commit succeeded but exact registry readback failed".to_owned(),
+            ),
+            Err(_error) if exact_readback => return Ok(()),
+            Err(error) => HostError::RecoveryRequired(format!(
+                "activation commit failed and exact readback did not confirm it: {error}"
+            )),
+        };
+        if self.registry.pending_activation().is_some_and(|current| {
+            current.transaction_id == pending.transaction_id
+                && current.plan_digest == pending.plan_digest
+                && current.approval == pending.approval
+        }) {
+            persist_pending_recovery(
+                &self.registry_store,
+                &mut self.registry,
                 host_capability,
-                &pending.transaction_id,
-                &pending.plan_digest,
+                pending,
                 "activation commit outcome is unknown",
-            );
-            let durable_recovery =
-                recovery_result.and_then(|()| self.registry_store.save(&self.registry));
-            return match durable_recovery {
-                Ok(()) => Err(error.into()),
-                Err(recovery_error) => Err(HostError::RecoveryRequired(format!(
-                    "activation commit outcome is unknown and recovery disposition could not be durably recorded: {recovery_error}"
-                ))),
-            };
+            )
+            .map_err(|recovery_error| {
+                HostError::RecoveryRequired(format!(
+                    "{result}; durable recovery disposition failed: {recovery_error}"
+                ))
+            })?;
         }
-        Ok(())
+        Err(result)
     }
 
     #[cfg(windows)]
@@ -7931,32 +8089,12 @@ mod journal_tests {
 
     #[cfg(windows)]
     #[test]
-    fn pending_activation_reopen_starts_a_fresh_child_after_historical_active() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression spells out HostComposition::stop journal transitions before replay"
+    )]
+    fn activation_reopen_starts_a_fresh_child_after_historical_active() {
         let fixture = active_readiness_fixture();
-        let (mut manifest, _root) = liveness_manifest_with_distinct_store_digests();
-        manifest.runtime_launch.installation_epoch.installation = fixture
-            .journal
-            .snapshot()
-            .unwrap()
-            .host
-            .installation
-            .clone();
-        let pending = eliot_installation::PendingActivation {
-            transaction_id: PlatformHandle::new("transaction:reopen").unwrap(),
-            plan_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
-            config_digest: manifest.config_digest.clone(),
-            kernel_artifact_digest: manifest.kernel_artifact_digest.clone(),
-            store_bridge_artifact_digest: manifest.store_bridge_artifact_digest.clone(),
-            canonical_store_artifact_digest: manifest.canonical_store_artifact_digest.clone(),
-            host_executable_path: manifest.host_executable_path.clone(),
-            host_artifact_digest: manifest.host_artifact_digest.clone(),
-            runtime_state_roots_digest: manifest.runtime_state_roots_digest.clone(),
-            manifest_digest: PlatformHandle::new(sha256_json(&manifest).unwrap()).unwrap(),
-            prior_active_generation: None,
-            approval_ref: PlatformHandle::new("approval:reopen").unwrap(),
-            manifest,
-            state: eliot_installation::PendingActivationState::Pending,
-        };
         let proof = authenticated_proof(&fixture, 17);
         append_authenticated_kernel_readiness(
             &fixture.journal,
@@ -7966,15 +8104,12 @@ mod journal_tests {
         )
         .unwrap();
         let snapshot = fixture.journal.snapshot().unwrap();
-        let mut control_ready = transition_activation_record(
+        let control_ready = transition_activation_record(
             snapshot.activation.as_ref().unwrap(),
             ActivationState::ControlReady,
             "pending-reopen-control-ready",
         )
         .unwrap();
-        control_ready
-            .trigger_evidence
-            .push(pending_activation_binding(&pending).unwrap());
         append_reconciled(&fixture.journal, HostStateRecord::Activation(control_ready)).unwrap();
         let ready_snapshot = fixture.journal.snapshot().unwrap();
         let active = transition_activation_record(
@@ -7985,6 +8120,82 @@ mod journal_tests {
         .unwrap();
         append_reconciled(&fixture.journal, HostStateRecord::Activation(active)).unwrap();
 
+        // Exercise the same durable reducer sequence as HostComposition::stop
+        // before writing the clean marker.  The process termination itself is
+        // a Windows Job Object effect and is intentionally not fabricated in
+        // this in-memory journal fixture; all journal-owned fences remain
+        // production-shaped and are validated by the reducer.
+        let historical = fixture.journal.snapshot().unwrap();
+        let historical_activation = historical.activation.as_ref().unwrap().clone();
+        let drain_generation = historical_activation.fence.activation_generation.clone();
+        append_reconciled(
+            &fixture.journal,
+            HostStateRecord::Drain(DrainRecord {
+                fence: historical_activation.fence.clone(),
+                operation: operation("host-drain-request-test").unwrap(),
+                drain_generation: drain_generation.clone(),
+                state: DrainState::Requested,
+                evidence_refs: vec![PlatformHandle::new("scm-stop-request-test").unwrap()],
+            }),
+        )
+        .unwrap();
+        append_reconciled(
+            &fixture.journal,
+            HostStateRecord::Drain(DrainRecord {
+                fence: historical_activation.fence.clone(),
+                operation: operation("host-drain-start-test").unwrap(),
+                drain_generation: drain_generation.clone(),
+                state: DrainState::Draining,
+                evidence_refs: vec![PlatformHandle::new("host-admission-closed-test").unwrap()],
+            }),
+        )
+        .unwrap();
+        let draining = transition_activation_record(
+            &fixture.journal.snapshot().unwrap().activation.unwrap(),
+            ActivationState::Draining,
+            "host-draining-test",
+        )
+        .unwrap();
+        append_reconciled(&fixture.journal, HostStateRecord::Activation(draining)).unwrap();
+        append_reconciled(
+            &fixture.journal,
+            HostStateRecord::DrainCommit(DrainCommitRecord {
+                fence: historical_activation.fence.clone(),
+                operation: operation("host-drain-commit-test").unwrap(),
+                drain_generation,
+                last_admission_closed_at: PlatformHandle::new("host-admission-closed-at-test")
+                    .unwrap(),
+                lease_and_pending_operation_snapshot: Vec::new(),
+                authority_epochs_fenced: vec![historical_activation.lineage.kernel_epoch.clone()],
+                processes_modules_and_store_branches_to_stop: vec![
+                    PlatformHandle::new("canonical-store-branch-test").unwrap(),
+                    PlatformHandle::new("kernel-branch-test").unwrap(),
+                ],
+                wake_during_drain_disposition: WakeDisposition::QueueNextGeneration,
+                irreversible_stage: PlatformHandle::new("authority-fenced-test").unwrap(),
+                recovery_owner: PlatformHandle::new("host-composition-test").unwrap(),
+                committed_at: PlatformHandle::new("host-drain-committed-at-test").unwrap(),
+            }),
+        )
+        .unwrap();
+        let stopped_clean = transition_activation_record(
+            &fixture.journal.snapshot().unwrap().activation.unwrap(),
+            ActivationState::StoppedClean,
+            "host-stopped-clean-test",
+        )
+        .unwrap();
+        append_reconciled(&fixture.journal, HostStateRecord::Activation(stopped_clean)).unwrap();
+
+        let historical = fixture.journal.snapshot().unwrap();
+        let historical_activation = historical.activation.as_ref().unwrap();
+        append_clean_marker(
+            &fixture.journal,
+            &historical.host,
+            &historical_activation.activation_id,
+            &historical_activation.fence.activation_generation,
+        )
+        .unwrap();
+
         // Drive the same persisted replay/reopen path used by production Host
         // (with an in-memory durable backend so the test never touches the
         // machine-wide protected ProgramData journal).  The historical Active
@@ -7993,12 +8204,7 @@ mod journal_tests {
         // new Host process reaches this path.
         let durable = fixture.journal.snapshot().unwrap();
         let last_host = durable.host;
-        let installation = pending
-            .manifest
-            .runtime_launch
-            .installation_epoch
-            .installation
-            .clone();
+        let installation = last_host.installation.clone();
         let prior_generation = durable
             .activation
             .as_ref()
@@ -8007,8 +8213,7 @@ mod journal_tests {
             .activation_generation
             .clone();
         let (reopened, reopened_host, reopened_generation) =
-            reopen_existing_epoch(fixture.journal, &last_host, &installation, Some(&pending))
-                .unwrap();
+            reopen_existing_epoch(fixture.journal, &last_host, &installation, None).unwrap();
         assert_ne!(reopened_host, last_host);
         assert_eq!(
             reopened_host.epoch.parent,

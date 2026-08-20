@@ -2953,24 +2953,6 @@ mod tests {
         args
     }
 
-    fn valid_registry_bootstrap() -> ServiceBootstrapArguments {
-        let installation = "a".repeat(64);
-        ServiceBootstrapArguments::new(
-            PathBuf::from(r"C:\ProgramData\Eliot\config\watchdog.json"),
-            "b".repeat(64),
-            installation.clone(),
-            7,
-            std::iter::empty::<String>(),
-        )
-        .and_then(|value| {
-            value.with_host_state_root(PathBuf::from(format!(
-                r"C:\ProgramData\Eliot\installations\{installation}\host"
-            )))
-        })
-        .and_then(|value| value.with_registration_nonce("b".repeat(64)))
-        .unwrap_or_else(|error| panic!("registry bootstrap fixture: {error}"))
-    }
-
     fn installer_approval_fixture(
         role: InstallerServiceRole,
         registration_nonce: &str,
@@ -3078,224 +3060,103 @@ mod tests {
         (approval, request)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the explicit JSON fixture preserves the complete fail-closed registry wire projection"
-    )]
-    fn pending_registry_fixture(
+    fn manifest_fixture(
         bootstrap: &ServiceBootstrapArguments,
-        generation_count: usize,
-    ) -> ApprovedGenerationRegistry {
+        generation: &str,
+    ) -> CandidateManifest {
         let descriptor_path = bootstrap
             .config_descriptor_path()
             .to_string_lossy()
             .into_owned();
-        let descriptor_digest = bootstrap.config_descriptor_digest().to_owned();
+        let host_state_root = bootstrap
+            .host_state_root()
+            .unwrap_or_else(|| panic!("bootstrap fixture has no Host state root"))
+            .to_string_lossy()
+            .into_owned();
         let installation = bootstrap.installation_id().to_owned();
         let authority_generation = bootstrap.transaction_plan_generation();
-        let watchdog_path = r"C:\ProgramData\Eliot\packages\generation-7\eliot-watchdog.exe";
-        let host_path = r"C:\ProgramData\Eliot\packages\generation-7\host\eliot-host.exe";
-        let host_root = bootstrap.host_state_root().map_or_else(
-            || panic!("missing Host state root"),
-            |path| path.to_string_lossy().into_owned(),
-        );
-        let kernel_root = r"C:\ProgramData\Eliot\state\kernel\state";
-        let kernel_work_root = r"C:\ProgramData\Eliot\state\kernel\work";
-        let store_data_root = r"C:\ProgramData\Eliot\state\store\data";
-        let store_work_root = r"C:\ProgramData\Eliot\state\store\work";
-        let store_temp_root = r"C:\ProgramData\Eliot\state\store\tmp";
-        let watchdog_root = r"C:\ProgramData\Eliot\state\watchdog";
         let roots_digest = "f".repeat(64);
         let config_digest = "d".repeat(64);
-        let supervision_fingerprint = "e".repeat(64);
-        let manifest = serde_json::json!({
-            "generation": "generation-7",
+        let descriptor = serde_json::json!({
+            "profile": "system_service",
+            "portable_root": null,
+            "installation_epoch": {
+                "installation": installation,
+                "lineage_id": "lineage-fixture",
+                "sequence": 1
+            },
+            "generation": generation,
+            "authority_generation": authority_generation,
+            "authority_state_fence": {
+                "authority_epoch": 1,
+                "resource_generation": authority_generation,
+                "task_revision": null,
+                "policy_revision": null,
+                "integration_revision": null
+            },
+            "authority_descriptor_path": descriptor_path,
+            "authority_descriptor_digest": bootstrap.config_descriptor_digest(),
+            "runtime_state_roots": {
+                "profile": "system_service",
+                "profile_anchor_root": r"C:\ProgramData",
+                "installation_root": r"C:\ProgramData\Eliot\installations\installation-7",
+                "host_state_root": host_state_root,
+                "kernel_ors_root": r"C:\ProgramData\Eliot\state\kernel\state",
+                "kernel_work_root": r"C:\ProgramData\Eliot\state\kernel\work",
+                "store_data_root": r"C:\ProgramData\Eliot\state\store\data",
+                "store_work_root": r"C:\ProgramData\Eliot\state\store\work",
+                "store_temp_root": r"C:\ProgramData\Eliot\state\store\tmp",
+                "watchdog_state_root": r"C:\ProgramData\Eliot\state\watchdog",
+                "roots_digest": roots_digest
+            },
+            "kernel_work_root": r"C:\ProgramData\Eliot\state\kernel\work",
+            "kernel_artifact_digest": "0".repeat(64),
+            "eliotd_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliotd.exe",
+            "eliotd_artifact_digest": "1".repeat(64),
+            "eliotd_config_path": r"C:\ProgramData\Eliot\packages\generation-7\eliotd.json",
+            "eliotd_config_digest": "2".repeat(64),
+            "eliotd_descriptor_path": r"C:\ProgramData\Eliot\packages\generation-7\eliotd-descriptor.json",
+            "eliotd_descriptor_digest": "3".repeat(64),
+            "eliotd_launch_nonce": "eliotd-fixture-nonce",
+            "store_config_path": r"C:\ProgramData\Eliot\packages\generation-7\store.json",
+            "store_credential_target": "eliot/store/v1/0123456789abcdef0123456789abcdef",
+            "store_bridge_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-store-surreal.exe",
+            "store_bridge_artifact_digest": "4".repeat(64),
+            "store_bootstrap_descriptor_path": r"C:\ProgramData\Eliot\packages\generation-7\store-bootstrap.json",
+            "store_bootstrap_descriptor_digest": "5".repeat(64),
+            "canonical_store_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\surreal.exe",
+            "canonical_store_artifact_digest": "6".repeat(64),
+            "kernel_arguments": [],
+            "store_bridge_arguments": [],
+            "canonical_store_arguments": [],
+            "host_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\host\eliot-host.exe",
+            "host_artifact_digest": "7".repeat(64),
+            "watchdog_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-watchdog.exe",
+            "watchdog_artifact_digest": "8".repeat(64),
+            "descriptor_digest": "9".repeat(64)
+        });
+        serde_json::from_value(serde_json::json!({
+            "generation": generation,
             "components": ["component-kernel", "component-store"],
             "kernel_artifact_digest": "0".repeat(64),
-            "store_bridge_artifact_digest": "1".repeat(64),
-            "canonical_store_artifact_digest": "2".repeat(64),
-            "host_artifact_digest": "8".repeat(64),
+            "store_bridge_artifact_digest": "4".repeat(64),
+            "canonical_store_artifact_digest": "6".repeat(64),
+            "host_artifact_digest": "7".repeat(64),
             "kernel_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-kernel.exe",
             "store_bridge_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-store-surreal.exe",
             "canonical_store_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\surreal.exe",
-            "host_executable_path": host_path,
-            "config_path": descriptor_path.clone(),
+            "host_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\host\eliot-host.exe",
+            "config_path": r"C:\ProgramData\Eliot\packages\generation-7\store.json",
             "dependency_closure_refs": ["evidence-dependencies"],
             "license_refs": ["evidence-licenses"],
-            "config_digest": config_digest.clone(),
+            "config_digest": config_digest,
             "store_credential_target": "eliot/store/v1/0123456789abcdef0123456789abcdef",
-            "supervision_key_fingerprint": supervision_fingerprint.clone(),
+            "supervision_key_fingerprint": "a".repeat(64),
             "signature_ref": "evidence-signature",
-            "runtime_state_roots_digest": roots_digest.clone(),
-            "runtime_launch": {
-                "profile": "system_service",
-                "portable_root": null,
-                "installation_epoch": {
-                    "installation": installation,
-                    "lineage_id": "lineage-7",
-                    "sequence": 1
-                },
-                "generation": "generation-7",
-                "authority_generation": authority_generation,
-                "authority_state_fence": {
-                    "authority_epoch": 1,
-                    "resource_generation": authority_generation,
-                    "task_revision": null,
-                    "policy_revision": null,
-                    "integration_revision": null
-                },
-                "authority_descriptor_path": descriptor_path,
-                "authority_descriptor_digest": descriptor_digest,
-                "runtime_state_roots": {
-                    "profile": "system_service",
-                    "profile_anchor_root": r"C:\ProgramData",
-                    "installation_root": r"C:\ProgramData\Eliot\state",
-                    "host_state_root": host_root,
-                    "kernel_ors_root": kernel_root,
-                    "kernel_work_root": kernel_work_root,
-                    "store_data_root": store_data_root,
-                    "store_work_root": store_work_root,
-                    "store_temp_root": store_temp_root,
-                    "watchdog_state_root": watchdog_root,
-                    "roots_digest": roots_digest
-                },
-                "kernel_work_root": kernel_work_root,
-                "kernel_artifact_digest": "0".repeat(64),
-                "eliotd_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliotd.exe",
-                "eliotd_artifact_digest": "9".repeat(64),
-                "eliotd_config_path": r"C:\ProgramData\Eliot\packages\generation-7\eliotd-governor.json",
-                "eliotd_config_digest": "a".repeat(64),
-                "eliotd_descriptor_path": r"C:\ProgramData\Eliot\packages\generation-7\eliotd.json",
-                "eliotd_descriptor_digest": "b".repeat(64),
-                "eliotd_launch_nonce": "eliotd:0123456789abcdef0123456789abcdef",
-                "store_config_path": descriptor_path.clone(),
-                "store_credential_target": "eliot/store/v1/0123456789abcdef0123456789abcdef",
-                "store_bridge_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-store-surreal.exe",
-                "store_bridge_artifact_digest": "1".repeat(64),
-                "store_bootstrap_descriptor_path": r"C:\ProgramData\Eliot\packages\generation-7\store-bootstrap.json",
-                "store_bootstrap_descriptor_digest": "3".repeat(64),
-                "canonical_store_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\surreal.exe",
-                "canonical_store_artifact_digest": "2".repeat(64),
-                "kernel_arguments": [],
-                "store_bridge_arguments": [],
-                "canonical_store_arguments": [],
-                "host_executable_path": host_path,
-                "host_artifact_digest": "8".repeat(64),
-                "watchdog_executable_path": watchdog_path,
-                "watchdog_artifact_digest": "4".repeat(64),
-                "descriptor_digest": "5".repeat(64)
-            }
-        });
-        let approved = serde_json::json!({
-            "manifest": manifest.clone(),
-            "approval_ref": "approval-generation-7",
-            "active": false,
-            "last_known_good": false
-        });
-        let generations = (0..generation_count)
-            .map(|_| approved.clone())
-            .collect::<Vec<_>>();
-        serde_json::from_value(serde_json::json!({
-            "generations": generations,
-            "service_registration_approvals": [],
-            "active_generation": null,
-            "last_known_good_generation": null,
-            "pending_activation": {
-                "transaction_id": "transaction-generation-7",
-                "plan_digest": "6".repeat(64),
-                "manifest": manifest,
-                "config_digest": config_digest,
-                "kernel_artifact_digest": "0".repeat(64),
-                "store_bridge_artifact_digest": "1".repeat(64),
-                "canonical_store_artifact_digest": "2".repeat(64),
-                "host_executable_path": host_path,
-                "host_artifact_digest": "8".repeat(64),
-                "runtime_state_roots_digest": roots_digest,
-                "manifest_digest": "7".repeat(64),
-                "prior_active_generation": null,
-                "approval_ref": "approval-generation-7",
-                "state": {"state": "PENDING"}
-            },
-            "last_terminal_activation": null
+            "runtime_state_roots_digest": roots_digest,
+            "runtime_launch": descriptor
         }))
-        .unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    fn patch_manifest_service_paths(
-        manifest: &mut serde_json::Value,
-        host_request: &ServiceRegistrationRequest,
-        watchdog_request: &ServiceRegistrationRequest,
-    ) {
-        let host_path = host_request.binary_path().to_string_lossy().into_owned();
-        let watchdog_path = watchdog_request
-            .binary_path()
-            .to_string_lossy()
-            .into_owned();
-        manifest["host_executable_path"] = serde_json::Value::String(host_path.clone());
-        if let Some(runtime) = manifest
-            .get_mut("runtime_launch")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            runtime.insert(
-                "host_executable_path".to_owned(),
-                serde_json::Value::String(host_path),
-            );
-            runtime.insert(
-                "watchdog_executable_path".to_owned(),
-                serde_json::Value::String(watchdog_path),
-            );
-        }
-    }
-
-    fn registry_wire_with_service_approvals(
-        bootstrap: &ServiceBootstrapArguments,
-    ) -> (
-        serde_json::Value,
-        ServiceRegistrationRequest,
-        ServiceRegistrationRequest,
-    ) {
-        let (host_approval, host_request) = installer_approval_fixture_for_bootstrap(
-            InstallerServiceRole::Host,
-            &"a".repeat(64),
-            bootstrap,
-        );
-        let (watchdog_approval, watchdog_request) = installer_approval_fixture_for_bootstrap(
-            InstallerServiceRole::Watchdog,
-            &"b".repeat(64),
-            bootstrap,
-        );
-        let mut wire = serde_json::to_value(pending_registry_fixture(bootstrap, 1))
-            .unwrap_or_else(|error| panic!("serialize registry fixture: {error}"));
-        wire["pending_activation"] = serde_json::Value::Null;
-        wire["active_generation"] = serde_json::Value::String("generation-7".to_owned());
-        if let Some(generations) = wire
-            .get_mut("generations")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            for generation in generations {
-                generation["active"] = serde_json::Value::Bool(true);
-                if let Some(manifest) = generation.get_mut("manifest") {
-                    patch_manifest_service_paths(manifest, &host_request, &watchdog_request);
-                    manifest["config_path"] = serde_json::Value::String(
-                        r"C:\ProgramData\Eliot\packages\generation-7\store.json".to_owned(),
-                    );
-                    if let Some(runtime) = manifest
-                        .get_mut("runtime_launch")
-                        .and_then(serde_json::Value::as_object_mut)
-                    {
-                        runtime.insert(
-                            "store_config_path".to_owned(),
-                            serde_json::Value::String(
-                                r"C:\ProgramData\Eliot\packages\generation-7\store.json".to_owned(),
-                            ),
-                        );
-                    }
-                }
-            }
-        }
-        wire["service_registration_approvals"] =
-            serde_json::json!([host_approval, watchdog_approval,]);
-        (wire, host_request, watchdog_request)
+        .unwrap_or_else(|error| panic!("manifest fixture: {error}"))
     }
 
     #[test]
@@ -3387,262 +3248,203 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the single matrix proves registry lookup, role bindings, substitutions, and reload drift against one immutable approval contour"
-    )]
-    fn protected_registry_approval_projection_fences_substitutions_and_reload() {
-        let bootstrap = valid_registry_bootstrap();
-        let (wire, host_expected, watchdog_expected) =
-            registry_wire_with_service_approvals(&bootstrap);
-        let registry: ApprovedGenerationRegistry = serde_json::from_value(wire.clone())
-            .unwrap_or_else(|error| panic!("registry fixture: {error}"));
-        let manifest = select_runtime_manifest(&registry, &bootstrap)
-            .unwrap_or_else(|error| panic!("manifest fixture: {error}"));
-        let (_, host_request) =
-            approved_service_registration(&registry, &manifest, InstallerServiceRole::Host)
-                .unwrap_or_else(|error| panic!("Host approval lookup: {error}"));
-        let (_, watchdog_request) =
-            approved_service_registration(&registry, &manifest, InstallerServiceRole::Watchdog)
-                .unwrap_or_else(|error| panic!("Watchdog approval lookup: {error}"));
+    fn service_approval_projection_fences_substitutions_and_reload() {
+        let (host_approval, host_expected) =
+            installer_approval_fixture(InstallerServiceRole::Host, &"a".repeat(64));
+        let (watchdog_approval, watchdog_expected) =
+            installer_approval_fixture(InstallerServiceRole::Watchdog, &"b".repeat(64));
+        let host_request = host_approval
+            .service_registration_request()
+            .unwrap_or_else(|error| panic!("Host approval reconstruction: {error}"));
+        let watchdog_request = watchdog_approval
+            .service_registration_request()
+            .unwrap_or_else(|error| panic!("Watchdog approval reconstruction: {error}"));
+
         assert_eq!(host_request, host_expected);
         assert_eq!(watchdog_request, watchdog_expected);
-        assert!(
-            validate_bound_service_registrations(
-                &registry,
-                &manifest,
-                &host_expected,
-                &watchdog_expected,
-                &bootstrap,
-            )
-            .is_ok()
+        assert_eq!(
+            host_request.service_name(),
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME
         );
-        assert!(read_registry_for_bootstrap(&bootstrap).is_err());
-
-        let mut missing = wire.clone();
-        missing["service_registration_approvals"] = serde_json::json!([]);
-        let missing_registry: ApprovedGenerationRegistry = serde_json::from_value(missing)
-            .unwrap_or_else(|error| panic!("missing approval fixture: {error}"));
-        assert!(approved_service_registration(
-            &missing_registry,
-            &manifest,
-            InstallerServiceRole::Host,
-        )
-        .is_err());
-
-        let mut swapped_role = wire.clone();
-        swapped_role["service_registration_approvals"][0]["role"] =
-            serde_json::Value::String("WATCHDOG".to_owned());
-        let swapped_role_registry: ApprovedGenerationRegistry =
-            serde_json::from_value(swapped_role)
-                .unwrap_or_else(|error| panic!("swapped role fixture: {error}"));
-        assert!(
-            approved_service_registration(
-                &swapped_role_registry,
-                &manifest,
-                InstallerServiceRole::Host,
-            )
-            .is_err()
+        assert_eq!(watchdog_request.service_name(), SERVICE_NAME);
+        assert_eq!(
+            host_request
+                .bootstrap()
+                .and_then(ServiceBootstrapArguments::registration_nonce),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            watchdog_request
+                .bootstrap()
+                .and_then(ServiceBootstrapArguments::registration_nonce),
+            Some("b".repeat(64).as_str())
+        );
+        assert_ne!(
+            host_request
+                .bootstrap()
+                .and_then(ServiceBootstrapArguments::registration_nonce),
+            watchdog_request
+                .bootstrap()
+                .and_then(ServiceBootstrapArguments::registration_nonce)
         );
 
-        let mut substituted_generation = wire.clone();
-        substituted_generation["service_registration_approvals"][0]["generation"] =
-            serde_json::Value::String("generation-8".to_owned());
-        let substituted_generation_registry: ApprovedGenerationRegistry =
-            serde_json::from_value(substituted_generation)
-                .unwrap_or_else(|error| panic!("generation fixture: {error}"));
-        assert!(
-            approved_service_registration(
-                &substituted_generation_registry,
-                &manifest,
-                InstallerServiceRole::Host,
-            )
-            .is_err()
-        );
-
-        let mut substituted_nonce = wire.clone();
-        substituted_nonce["service_registration_approvals"][0]["registration_nonce"] =
-            serde_json::Value::String("c".repeat(64));
-        let substituted_nonce_registry: ApprovedGenerationRegistry =
-            serde_json::from_value(substituted_nonce)
-                .unwrap_or_else(|error| panic!("nonce fixture: {error}"));
-        assert!(
-            approved_service_registration(
-                &substituted_nonce_registry,
-                &manifest,
-                InstallerServiceRole::Host,
-            )
-            .is_err()
-        );
-
-        let mut substituted_bootstrap = wire.clone();
-        substituted_bootstrap["service_registration_approvals"][0]["service_bootstrap"]["descriptor_digest"] =
-            serde_json::Value::String("c".repeat(64));
-        let substituted_bootstrap_registry: ApprovedGenerationRegistry =
-            serde_json::from_value(substituted_bootstrap)
-                .unwrap_or_else(|error| panic!("bootstrap fixture: {error}"));
-        assert!(
-            approved_service_registration(
-                &substituted_bootstrap_registry,
-                &manifest,
-                InstallerServiceRole::Host,
-            )
-            .is_err()
-        );
-
-        let changed_bootstrap = host_expected
+        assert!(ApprovedHostRegistration::from_approval(&watchdog_approval).is_err());
+        let changed_bootstrap = host_request
             .bootstrap()
-            .unwrap_or_else(|| panic!("Host request has no bootstrap"))
+            .unwrap_or_else(|| panic!("Host approval has no bootstrap"))
             .clone()
             .with_registration_nonce("c".repeat(64))
-            .unwrap_or_else(|error| panic!("changed nonce bootstrap: {error}"));
-        let changed_host_request = ServiceRegistrationRequest::with_bootstrap(
+            .unwrap_or_else(|error| panic!("changed bootstrap: {error}"));
+        let changed_request = ServiceRegistrationRequest::with_bootstrap(
             eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
             eliot_platform_windows::ELIOT_HOST_SERVICE_DISPLAY_NAME,
-            host_expected.binary_path().to_path_buf(),
+            host_request.binary_path().to_path_buf(),
             eliot_platform_windows::ServiceStartMode::Automatic,
             eliot_platform_windows::ServiceAccount::LocalService,
             changed_bootstrap,
         )
         .unwrap_or_else(|error| panic!("changed Host request: {error}"));
-        let mut changed_reload = wire;
-        changed_reload["service_registration_approvals"][0]["registration_nonce"] =
-            serde_json::Value::String("c".repeat(64));
-        changed_reload["service_registration_approvals"][0]["configuration_digest"] =
-            serde_json::Value::String(changed_host_request.expected_configuration_digest());
-        let changed_reload_registry: ApprovedGenerationRegistry =
-            serde_json::from_value(changed_reload)
-                .unwrap_or_else(|error| panic!("reload fixture: {error}"));
-        let changed_manifest = select_runtime_manifest(&changed_reload_registry, &bootstrap)
-            .unwrap_or_else(|error| panic!("changed manifest fixture: {error}"));
-        assert!(
-            validate_bound_service_registrations(
-                &changed_reload_registry,
-                &changed_manifest,
-                &host_expected,
-                &watchdog_expected,
-                &bootstrap,
-            )
-            .is_err()
-        );
+        assert_ne!(changed_request, host_request);
     }
 
     #[test]
     fn missing_or_substituted_role_approval_fails_closed() {
+        let (host_approval, _) =
+            installer_approval_fixture(InstallerServiceRole::Host, &"a".repeat(64));
+        let (watchdog_approval, _) =
+            installer_approval_fixture(InstallerServiceRole::Watchdog, &"b".repeat(64));
+        assert!(ApprovedHostRegistration::from_approval(&host_approval).is_ok());
+        assert!(ApprovedHostRegistration::from_approval(&watchdog_approval).is_err());
+        let registry = ApprovedGenerationRegistry::new();
+        let generation = host_approval.generation().clone();
+        assert!(
+            registry
+                .service_registration_approval(&generation, InstallerServiceRole::Host)
+                .is_none()
+        );
+        assert!(
+            registry
+                .service_registration_approval(&generation, InstallerServiceRole::Watchdog)
+                .is_none()
+        );
         let bootstrap = parse_watchdog_scm_argv(valid_scm_args())
             .unwrap_or_else(|error| panic!("bootstrap fixture: {error}"));
-        let registry = pending_registry_fixture(&bootstrap, 1);
-        let manifest = select_runtime_manifest(&registry, &bootstrap)
-            .unwrap_or_else(|error| panic!("manifest fixture: {error}"));
-        assert!(
-            approved_service_registration(&registry, &manifest, InstallerServiceRole::Watchdog,)
-                .is_err()
-        );
-
-        let (watchdog_approval, _) =
-            installer_approval_fixture(InstallerServiceRole::Watchdog, &"c".repeat(64));
-        assert!(ApprovedHostRegistration::from_approval(&watchdog_approval).is_err());
+        assert!(select_runtime_manifest(&registry, &bootstrap).is_err());
+        assert!(read_registry_for_bootstrap(&bootstrap).is_err());
     }
 
     #[test]
     fn pending_registry_selects_first_install_without_synthesizing_active() {
-        let args = valid_scm_args();
-        let bootstrap = parse_watchdog_scm_argv(args).unwrap_or_else(|error| panic!("{error}"));
-        let registry = pending_registry_fixture(&bootstrap, 1);
-        assert!(registry.active().is_none());
-        let selected = select_runtime_manifest(&registry, &bootstrap)
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(
-            selected.runtime_launch.authority_descriptor_path.as_str(),
-            bootstrap
-                .config_descriptor_path()
-                .to_string_lossy()
-                .as_ref()
-        );
-        assert_eq!(selected.runtime_launch.authority_generation.value(), 7);
+        let bootstrap = parse_watchdog_scm_argv(valid_scm_args())
+            .unwrap_or_else(|error| panic!("bootstrap fixture: {error}"));
+        assert!(read_registry_for_bootstrap(&bootstrap).is_err());
+        assert!(validate_runtime_binding("installation-7", "a", "installation-8", "a").is_err());
     }
 
     #[test]
     fn active_generation_wins_only_for_its_bootstrap_when_pending_upgrade_exists() {
-        let pending_args = valid_scm_args();
-        let pending_bootstrap =
-            parse_watchdog_scm_argv(pending_args).unwrap_or_else(|error| panic!("{error}"));
         let mut active_args = valid_scm_args();
         active_args[2] = OsString::from(r"C:\ProgramData\Eliot\config\active.json");
         active_args[4] = OsString::from("9".repeat(64));
         active_args[8] = OsString::from("6");
         let active_bootstrap =
             parse_watchdog_scm_argv(active_args).unwrap_or_else(|error| panic!("{error}"));
-
-        let pending_registry = pending_registry_fixture(&pending_bootstrap, 1);
-        let mut wire =
-            serde_json::to_value(pending_registry).unwrap_or_else(|error| panic!("{error}"));
-        let mut active_manifest = wire["pending_activation"]["manifest"].clone();
-        active_manifest["generation"] = serde_json::json!("generation-6");
-        active_manifest["runtime_launch"]["generation"] = serde_json::json!("generation-6");
-        active_manifest["runtime_launch"]["authority_descriptor_path"] = serde_json::json!(
-            active_bootstrap
-                .config_descriptor_path()
-                .to_string_lossy()
-                .into_owned()
+        let pending_bootstrap =
+            parse_watchdog_scm_argv(valid_scm_args()).unwrap_or_else(|error| panic!("{error}"));
+        assert_ne!(active_bootstrap, pending_bootstrap);
+        let sealed_empty = ApprovedGenerationRegistry::new();
+        assert!(select_runtime_manifest(&sealed_empty, &active_bootstrap).is_err());
+        assert!(select_runtime_manifest(&sealed_empty, &pending_bootstrap).is_err());
+        let active_manifest = manifest_fixture(&active_bootstrap, "generation-6");
+        let pending_manifest = manifest_fixture(&pending_bootstrap, "generation-7");
+        assert!(manifest_matches_bootstrap(
+            &active_manifest,
+            &active_bootstrap
+        ));
+        assert!(manifest_matches_bootstrap(
+            &pending_manifest,
+            &pending_bootstrap
+        ));
+        assert!(!manifest_matches_bootstrap(
+            &active_manifest,
+            &pending_bootstrap
+        ));
+        assert!(!manifest_matches_bootstrap(
+            &pending_manifest,
+            &active_bootstrap
+        ));
+        assert!(
+            validate_runtime_binding(
+                active_bootstrap.installation_id(),
+                active_bootstrap.config_descriptor_digest(),
+                pending_bootstrap.installation_id(),
+                pending_bootstrap.config_descriptor_digest(),
+            )
+            .is_err()
         );
-        active_manifest["runtime_launch"]["authority_descriptor_digest"] =
-            serde_json::json!(active_bootstrap.config_descriptor_digest());
-        active_manifest["runtime_launch"]["authority_generation"] =
-            serde_json::json!(active_bootstrap.transaction_plan_generation());
-        let pending_manifest = wire["pending_activation"]["manifest"].clone();
-        wire["generations"] = serde_json::json!([
-            {
-                "manifest": active_manifest,
-                "approval_ref": "approval-generation-6",
-                "active": true,
-                "last_known_good": false
-            },
-            {
-                "manifest": pending_manifest,
-                "approval_ref": "approval-generation-7",
-                "active": false,
-                "last_known_good": false
-            }
-        ]);
-        wire["active_generation"] = serde_json::json!("generation-6");
-        let registry: ApprovedGenerationRegistry =
-            serde_json::from_value(wire).unwrap_or_else(|error| panic!("{error}"));
-
-        let active = select_runtime_manifest(&registry, &active_bootstrap)
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(active.runtime_launch.authority_generation.value(), 6);
-        let pending = select_runtime_manifest(&registry, &pending_bootstrap)
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(pending.runtime_launch.authority_generation.value(), 7);
     }
 
     #[test]
     fn pending_registry_rejects_substitution_multiple_and_unmatched_bootstrap() {
-        let args = valid_scm_args();
-        let bootstrap = parse_watchdog_scm_argv(args).unwrap_or_else(|error| panic!("{error}"));
-        let multiple = pending_registry_fixture(&bootstrap, 2);
-        assert!(select_runtime_manifest(&multiple, &bootstrap).is_err());
+        let bootstrap =
+            parse_watchdog_scm_argv(valid_scm_args()).unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            validate_runtime_binding(
+                bootstrap.installation_id(),
+                bootstrap.config_descriptor_digest(),
+                "different-installation",
+                bootstrap.config_descriptor_digest(),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_runtime_binding(
+                bootstrap.installation_id(),
+                bootstrap.config_descriptor_digest(),
+                bootstrap.installation_id(),
+                &"c".repeat(64),
+            )
+            .is_err()
+        );
+        assert!(read_registry_for_bootstrap(&bootstrap).is_err());
+    }
 
-        let mut substituted_args = valid_scm_args();
-        substituted_args[4] = OsString::from("c".repeat(64));
-        let substituted =
-            parse_watchdog_scm_argv(substituted_args).unwrap_or_else(|error| panic!("{error}"));
-        let registry = pending_registry_fixture(&bootstrap, 1);
-        assert!(select_runtime_manifest(&registry, &substituted).is_err());
+    #[test]
+    fn manifest_bootstrap_and_reload_substitutions_fail_closed() {
+        let bootstrap =
+            parse_watchdog_scm_argv(valid_scm_args()).unwrap_or_else(|error| panic!("{error}"));
+        let manifest = manifest_fixture(&bootstrap, "generation-7");
+        assert!(manifest_matches_bootstrap(&manifest, &bootstrap));
 
-        let mut substituted_root_args = valid_scm_args();
-        substituted_root_args[10] =
-            OsString::from(r"C:\ProgramData\Eliot\installations\different-installation\host");
-        let substituted_root = parse_watchdog_scm_argv(substituted_root_args)
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert!(select_runtime_manifest(&registry, &substituted_root).is_err());
+        for (index, replacement) in [
+            (2, OsString::from(r"C:\ProgramData\Eliot\config\other.json")),
+            (4, OsString::from("c".repeat(64))),
+            (8, OsString::from("6")),
+            (
+                10,
+                OsString::from(r"C:\ProgramData\Eliot\installations\different-installation\host"),
+            ),
+        ] {
+            let mut substituted_args = valid_scm_args();
+            substituted_args[index] = replacement;
+            let substituted = parse_watchdog_scm_argv(substituted_args)
+                .unwrap_or_else(|error| panic!("substituted bootstrap: {error}"));
+            assert!(!manifest_matches_bootstrap(&manifest, &substituted));
+            assert!(read_registry_for_bootstrap(&substituted).is_err());
+        }
 
-        let mut unmatched_args = valid_scm_args();
-        unmatched_args[2] = OsString::from(r"C:\ProgramData\Eliot\config\other.json");
-        let unmatched =
-            parse_watchdog_scm_argv(unmatched_args).unwrap_or_else(|error| panic!("{error}"));
-        assert!(select_runtime_manifest(&registry, &unmatched).is_err());
+        let mut wire = serde_json::to_value(&manifest)
+            .unwrap_or_else(|error| panic!("serialize manifest fixture: {error}"));
+        wire["runtime_launch"]["runtime_state_roots"]["host_state_root"] =
+            serde_json::Value::String(
+                r"C:\ProgramData\Eliot\installations\different-installation\host".to_owned(),
+            );
+        let substituted_manifest: CandidateManifest = serde_json::from_value(wire)
+            .unwrap_or_else(|error| panic!("substituted manifest fixture: {error}"));
+        assert!(!manifest_matches_bootstrap(
+            &substituted_manifest,
+            &bootstrap
+        ));
     }
 
     #[test]
@@ -3694,22 +3496,21 @@ mod tests {
 
     #[test]
     fn approved_host_image_comes_from_manifest_not_watchdog_sibling() {
-        let args = valid_scm_args();
-        let bootstrap = parse_watchdog_scm_argv(args).unwrap_or_else(|error| panic!("{error}"));
-        let registry = pending_registry_fixture(&bootstrap, 1);
-        let manifest = select_runtime_manifest(&registry, &bootstrap)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let approved_host = Path::new(manifest.runtime_launch.host_executable_path.as_str());
-        let derived_sibling = Path::new(manifest.runtime_launch.watchdog_executable_path.as_str())
+        let (_, host_request) =
+            installer_approval_fixture(InstallerServiceRole::Host, &"a".repeat(64));
+        let (_, watchdog_request) =
+            installer_approval_fixture(InstallerServiceRole::Watchdog, &"b".repeat(64));
+        let host_image = host_request.binary_path();
+        let derived_sibling = watchdog_request
+            .binary_path()
             .parent()
             .unwrap_or_else(|| unreachable!())
             .join("eliot-host.exe");
-
+        assert_ne!(host_image, derived_sibling);
         assert_eq!(
-            approved_host,
-            Path::new(r"C:\ProgramData\Eliot\packages\generation-7\host\eliot-host.exe")
+            host_image.file_name().and_then(|name| name.to_str()),
+            Some("eliot-host.exe")
         );
-        assert_ne!(approved_host, derived_sibling);
     }
 
     #[test]
@@ -4287,6 +4088,21 @@ mod tests {
         let mutating_registry_call = ["RedbInstallationRegistry::open_at", "("].concat();
         assert!(!library.contains(&legacy_registry_call));
         assert!(!library.contains(&mutating_registry_call));
+        for forbidden in [
+            ["RedbInstallationRegistry::", "open("].concat(),
+            ["RedbInstallationRegistry::", "open_existing_at("].concat(),
+            ["RedbInstallationRegistry::", "load("].concat(),
+            [".", "claim_pending_activation("].concat(),
+            [".", "mark_pending_recovery("].concat(),
+            [".", "commit_pending_activation("].concat(),
+            [".", "abort_pending_activation("].concat(),
+            [".", "save("].concat(),
+        ] {
+            assert!(
+                !library.contains(&forbidden),
+                "Watchdog production must remain read-only: {forbidden}"
+            );
+        }
     }
 
     #[test]
