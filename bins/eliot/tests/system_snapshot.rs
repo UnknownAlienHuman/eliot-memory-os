@@ -115,10 +115,132 @@ fn snapshot_binds_explicit_root_when_process_starts_in_non_git_directory() {
 }
 
 #[test]
-fn installation_status_requires_existing_explicit_registry() {
+fn installation_status_requires_existing_host_state_root() {
     let temp_root =
         std::env::temp_dir().join(format!("eliot-installation-status-{}", std::process::id()));
     fs::create_dir_all(&temp_root).expect("create status fixture");
+    let host_state_root = temp_root.join("missing-host");
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "status",
+            "--host-state-root",
+            host_state_root.to_str().expect("Host state root is utf8"),
+        ])
+        .output()
+        .expect("run status command");
+
+    assert!(!result.status.success());
+    assert!(!host_state_root.exists(), "status created a missing root");
+    let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
+    assert_installation_error(&output, "INSTALLATION_STATUS_UNAVAILABLE");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(windows)]
+#[test]
+fn installation_status_reports_missing_registry_under_retained_root() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-status-cwd-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_root).expect("create status cwd fixture");
+    let host_state_root = protected_program_data_root()
+        .expect("ProgramData root")
+        .join("Eliot");
+    let registry = host_state_root.join("installation-registry.redb");
+    let expected_code = match fs::symlink_metadata(&host_state_root) {
+        Ok(metadata) if metadata.is_dir() => "INSTALLATION_STATUS_INVALID",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "INSTALLATION_STATUS_UNAVAILABLE"
+        }
+        Ok(_) | Err(_) => "INSTALLATION_STATUS_INVALID",
+    };
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "status",
+            "--host-state-root",
+            host_state_root.to_str().expect("Host state root is utf8"),
+        ])
+        .output()
+        .expect("run missing registry status command");
+
+    assert!(!result.status.success());
+    assert!(!registry.exists(), "status created a missing registry");
+    let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
+    assert_installation_error(&output, expected_code);
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(windows)]
+#[test]
+fn installation_status_rejects_a_wrong_installation_root_without_creation() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-status-wrong-root-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_root).expect("create wrong-root cwd fixture");
+    let wrong_host_root = protected_program_data_root()
+        .expect("ProgramData root")
+        .join("Eliot");
+    let registry = wrong_host_root.join("installation-registry.redb");
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "status",
+            "--host-state-root",
+            wrong_host_root.to_str().expect("wrong root is utf8"),
+        ])
+        .output()
+        .expect("run wrong-root status command");
+
+    assert!(!result.status.success());
+    assert!(!registry.exists(), "status created a wrong-root registry");
+    let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
+    assert_installation_error(&output, "INSTALLATION_STATUS_INVALID");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(windows)]
+#[test]
+fn installation_status_rejects_legacy_host_root_without_reading_it() {
+    let host_state_root = protected_program_data_root()
+        .expect("ProgramData root")
+        .join("Eliot")
+        .join("host");
+    let expected_code = match fs::symlink_metadata(&host_state_root) {
+        Ok(metadata) if metadata.is_dir() => "INSTALLATION_STATUS_INVALID",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "INSTALLATION_STATUS_UNAVAILABLE"
+        }
+        Ok(_) | Err(_) => "INSTALLATION_STATUS_INVALID",
+    };
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .args([
+            "installation",
+            "status",
+            "--host-state-root",
+            host_state_root.to_str().expect("legacy Host root is utf8"),
+        ])
+        .output()
+        .expect("run legacy Host root status command");
+
+    assert!(!result.status.success());
+    let output: Value = serde_json::from_slice(&result.stdout).expect("legacy status JSON error");
+    assert_installation_error(&output, expected_code);
+}
+
+#[test]
+fn installation_status_rejects_removed_registry_selector() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-status-registry-selector-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_root).expect("create removed-selector fixture");
     let registry = temp_root.join("installation-registry.redb");
     let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
         .current_dir(&temp_root)
@@ -129,67 +251,13 @@ fn installation_status_requires_existing_explicit_registry() {
             registry.to_str().expect("registry is utf8"),
         ])
         .output()
-        .expect("run status command");
+        .expect("run removed-selector status command");
 
     assert!(!result.status.success());
-    assert!(!registry.exists(), "status created a missing registry");
-    let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
-    assert_installation_error(&output, "INSTALLATION_STATUS_UNAVAILABLE");
+    assert!(!registry.exists(), "removed selector created a registry");
+    assert!(result.stdout.is_empty(), "removed selector emitted JSON");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unexpected argument"));
     let _ = fs::remove_dir_all(temp_root);
-}
-
-#[test]
-fn installation_status_rejects_a_noncanonical_registry_child_without_creation() {
-    let temp_root = std::env::temp_dir().join(format!(
-        "eliot-installation-status-substitution-{}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&temp_root).expect("create status substitution fixture");
-    let registry = temp_root.join("other.redb");
-    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
-        .current_dir(&temp_root)
-        .args([
-            "installation",
-            "status",
-            "--registry",
-            registry.to_str().expect("registry is utf8"),
-        ])
-        .output()
-        .expect("run substituted status command");
-
-    assert!(!result.status.success());
-    assert!(!registry.exists(), "status created a substituted registry");
-    let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
-    assert_installation_error(&output, "INSTALLATION_STATUS_INVALID");
-    let _ = fs::remove_dir_all(temp_root);
-}
-
-#[cfg(windows)]
-#[test]
-fn installation_status_reports_missing_legacy_registry_as_unavailable() {
-    let registry = protected_program_data_root()
-        .expect("ProgramData root")
-        .join("Eliot")
-        .join("host")
-        .join("installation-registry.redb");
-    if registry.exists() {
-        // A pre-existing machine registry is outside this test's ownership;
-        // the pure CLI classifier covers its migration/corruption branches.
-        return;
-    }
-    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
-        .args([
-            "installation",
-            "status",
-            "--registry",
-            registry.to_str().expect("legacy registry is utf8"),
-        ])
-        .output()
-        .expect("run legacy status command");
-
-    assert!(!result.status.success());
-    let output: Value = serde_json::from_slice(&result.stdout).expect("legacy status JSON error");
-    assert_installation_error(&output, "INSTALLATION_STATUS_UNAVAILABLE");
 }
 
 #[test]
@@ -492,7 +560,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     let planned: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
     assert_eq!(
         planned["transaction_wire_version"],
-        serde_json::json!({"major": 8, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 9, "minor": 0, "patch": 0})
     );
 
     let create = Command::new(env!("CARGO_BIN_EXE_eliot"))
@@ -517,7 +585,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     assert_eq!(created["contract_version"], "3.0.0");
     assert_eq!(
         created["transaction_wire_version"],
-        serde_json::json!({"major": 8, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 9, "minor": 0, "patch": 0})
     );
     assert_eq!(created["transaction_id"], "transaction:cli-positive");
     assert_eq!(created["revision"], 1);
@@ -546,7 +614,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     assert_eq!(status_value["stage"], "PLANNED");
     assert_eq!(
         status_value["transaction"]["transaction_wire_version"],
-        serde_json::json!({"major": 8, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 9, "minor": 0, "patch": 0})
     );
 
     let apply = Command::new(env!("CARGO_BIN_EXE_eliot"))
@@ -596,7 +664,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     );
     assert_eq!(
         applied["transaction"]["transaction_wire_version"],
-        serde_json::json!({"major": 8, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 9, "minor": 0, "patch": 0})
     );
 
     let status_after_apply = Command::new(env!("CARGO_BIN_EXE_eliot"))
@@ -800,7 +868,7 @@ fn run_installation_plan_fixture(name: &str, fixture: &str) -> std::process::Out
 }
 
 #[test]
-fn installation_plan_reports_missing_v7_discriminator_as_migration() {
+fn installation_plan_reports_missing_v9_discriminator_as_migration() {
     let result = run_installation_plan_fixture("missing-discriminator", "{}");
 
     assert!(!result.status.success());
@@ -809,7 +877,7 @@ fn installation_plan_reports_missing_v7_discriminator_as_migration() {
     assert!(
         output["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("required v8 discriminator"))
+            .is_some_and(|detail| detail.contains("required v9 discriminator"))
     );
 }
 

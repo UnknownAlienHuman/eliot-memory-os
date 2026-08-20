@@ -7,12 +7,12 @@ use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
 use eliot_installation::{
-    InstallationError, InstallationProfile, InstallationStage, InstallationStepOutcome,
-    InstallationTransaction, InstallationTransactionStore, RedbInstallationRegistry,
-    RedbInstallationTransactionStore, WindowsInstallationCoordinator,
+    ApprovedGenerationRegistry, InstallationError, InstallationProfile, InstallationStage,
+    InstallationStepOutcome, InstallationTransaction, InstallationTransactionStore,
+    RedbInstallationRegistry, RedbInstallationTransactionStore, WindowsInstallationCoordinator,
     decode_installation_transaction_json, parse_installation_transaction_id,
 };
-use eliot_platform_windows::{ProtectedRootLease, canonical_windows_path};
+use eliot_platform_windows::{ProtectedRootLease, windows_paths_equal};
 use serde_json::json;
 use std::path::PathBuf;
 use std::{fs, io::Read, path::Path};
@@ -94,9 +94,9 @@ enum InstallationCommand {
     /// Read the existing approved-generation registry without changing it.
     #[command(alias = "open")]
     Status {
-        /// Absolute path to an existing approved-generation registry redb file.
+        /// Absolute path to the retained per-installation Host state root.
         #[arg(long, value_parser = absolute_path)]
-        registry: Option<PathBuf>,
+        host_state_root: Option<PathBuf>,
         /// Absolute path to an existing durable transaction redb file.
         #[arg(long, value_parser = absolute_path)]
         store: Option<PathBuf>,
@@ -205,18 +205,20 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             transaction_id,
         } => run_installation_effect(&store, &transaction_id, true),
         InstallationCommand::Status {
-            registry,
+            host_state_root,
             store,
             transaction_id,
-        } => match (registry, store, transaction_id) {
-            (Some(registry), None, None) => run_installation_registry_status(&registry),
+        } => match (host_state_root, store, transaction_id) {
+            (Some(host_state_root), None, None) => {
+                run_installation_registry_status(&host_state_root)
+            }
             (None, Some(store), Some(transaction_id)) => {
                 run_installation_transaction_status(&store, &transaction_id)
             }
             _ => {
                 write_installation_error(
                     "INSTALLATION_STATUS_INVALID",
-                    "status requires either --registry or both --store and --transaction-id",
+                    "status requires either --host-state-root or both --store and --transaction-id",
                 );
                 Ok(INVALID_REQUEST_EXIT)
             }
@@ -298,70 +300,63 @@ fn run_installation_create(input: &Path, store_path: &Path) -> Result<i32> {
     Ok(0)
 }
 
-fn run_installation_registry_status(registry: &Path) -> Result<i32> {
-    let registry_file_name = registry.file_name().and_then(|value| value.to_str());
-    if registry_file_name
-        .is_none_or(|value| !value.eq_ignore_ascii_case("installation-registry.redb"))
-    {
+fn run_installation_registry_status(host_state_root: &Path) -> Result<i32> {
+    if !host_state_root.is_absolute() {
         write_installation_error(
             "INSTALLATION_STATUS_INVALID",
-            "registry must name the fixed installation-registry.redb child",
+            "Host state root must be absolute",
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
-    match std::fs::symlink_metadata(registry) {
-        Ok(metadata) if metadata.is_file() => {}
+    match std::fs::symlink_metadata(host_state_root) {
+        Ok(metadata) if metadata.is_dir() => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             write_installation_error(
                 "INSTALLATION_STATUS_UNAVAILABLE",
-                "registry does not exist; status never creates it",
+                "Host state root does not exist; status never creates it",
             );
             return Ok(INVALID_REQUEST_EXIT);
         }
         Ok(_) | Err(_) => {
             write_installation_error(
                 "INSTALLATION_STATUS_INVALID",
-                "registry is not an existing regular file",
+                "Host state root is not an existing directory",
             );
             return Ok(INVALID_REQUEST_EXIT);
         }
     }
-    let Some(host_state_root) = registry.parent() else {
-        write_installation_error(
-            "INSTALLATION_STATUS_INVALID",
-            "registry has no absolute Host-state parent",
-        );
-        return Ok(INVALID_REQUEST_EXIT);
-    };
-    let host_state_root = match ProtectedRootLease::open_existing(host_state_root) {
+    let retained_root = match ProtectedRootLease::open_existing(host_state_root) {
         Ok(root) => root,
         Err(error) => {
             write_installation_error("INSTALLATION_STATUS_INVALID", &error.to_string());
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
-    let expected_registry = match host_state_root.canonical_path() {
-        Ok(root) => root.join("installation-registry.redb"),
+    let canonical_host_state_root = match retained_root.canonical_path() {
+        Ok(root) => root,
         Err(error) => {
             write_installation_error("INSTALLATION_STATUS_INVALID", &error.to_string());
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
-    let observed_registry = match canonical_windows_path(registry) {
-        Ok(path) => path,
-        Err(error) => {
-            write_installation_error("INSTALLATION_STATUS_INVALID", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    if observed_registry != expected_registry {
+    if !windows_paths_equal(&canonical_host_state_root, host_state_root) {
         write_installation_error(
             "INSTALLATION_STATUS_INVALID",
-            "registry is not the exact retained Host-state child",
+            "Host state root is not the exact retained installation root",
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
-    let registry_value = match RedbInstallationRegistry::inspect_existing_at(host_state_root) {
+    let read_root = match ProtectedRootLease::open_existing(&canonical_host_state_root) {
+        Ok(root) => root,
+        Err(error) => {
+            write_installation_error(
+                "INSTALLATION_STATUS_INVALID",
+                &format!("Host state root reopen failed: {error}"),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let registry_value = match RedbInstallationRegistry::inspect_existing_at(read_root) {
         Ok(Some(registry_value)) => registry_value,
         Ok(None) => {
             write_installation_error(
@@ -375,6 +370,16 @@ fn run_installation_registry_status(registry: &Path) -> Result<i32> {
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
+    if let Err(error) = retained_root.verify_stable_identity() {
+        write_installation_error("INSTALLATION_STATUS_INVALID", &error.to_string());
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    if let Err(error) =
+        validate_registry_host_state_root(&registry_value, &canonical_host_state_root)
+    {
+        write_installation_error(installation_status_error_code(&error), &error.to_string());
+        return Ok(INVALID_REQUEST_EXIT);
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -387,6 +392,52 @@ fn run_installation_registry_status(registry: &Path) -> Result<i32> {
         }))?
     );
     Ok(0)
+}
+
+fn validate_registry_host_state_root(
+    registry: &ApprovedGenerationRegistry,
+    canonical_host_state_root: &Path,
+) -> std::result::Result<(), InstallationError> {
+    for generation in registry.generations() {
+        validate_manifest_host_state_root(
+            &generation
+                .manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root,
+            canonical_host_state_root,
+            "approved_generation",
+        )?;
+    }
+    if let Some(pending) = registry.pending_activation() {
+        validate_manifest_host_state_root(
+            &pending
+                .manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root,
+            canonical_host_state_root,
+            "pending_activation",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_manifest_host_state_root(
+    declared_host_state_root: &eliot_installation::PlatformHandle,
+    canonical_host_state_root: &Path,
+    field_prefix: &str,
+) -> std::result::Result<(), InstallationError> {
+    if windows_paths_equal(
+        canonical_host_state_root,
+        Path::new(declared_host_state_root.as_str()),
+    ) {
+        return Ok(());
+    }
+    Err(InstallationError::InvalidField {
+        field: format!("{field_prefix}.runtime_state_roots.host_state_root"),
+        reason: "manifest Host state root does not equal the retained installation root".to_owned(),
+    })
 }
 
 fn run_installation_transaction_status(store_path: &Path, raw_transaction_id: &str) -> Result<i32> {
@@ -1210,5 +1261,33 @@ mod tests {
             )),
             "INSTALLATION_STATUS_INVALID"
         );
+    }
+
+    #[test]
+    fn installation_status_accepts_manifest_root_bound_to_retained_root() {
+        let retained_root = Path::new(
+            r"C:\ProgramData\Eliot\installations\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\host",
+        );
+        let declared_root = parse_installation_transaction_id(retained_root.to_string_lossy())
+            .expect("valid retained root fixture");
+        assert!(validate_manifest_host_state_root(&declared_root, retained_root, "active").is_ok());
+    }
+
+    #[test]
+    fn installation_status_rejects_manifest_root_substitution() {
+        let retained_root = Path::new(
+            r"C:\ProgramData\Eliot\installations\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\host",
+        );
+        let substituted_root = parse_installation_transaction_id(
+            r"C:\ProgramData\Eliot\installations\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\host",
+        )
+        .expect("valid substituted root fixture");
+        let error = validate_manifest_host_state_root(&substituted_root, retained_root, "active")
+            .expect_err("substituted manifest root must fail closed");
+        assert!(matches!(
+            error,
+            InstallationError::InvalidField { field, .. }
+                if field == "active.runtime_state_roots.host_state_root"
+        ));
     }
 }
