@@ -1363,6 +1363,56 @@ fn process_evidence_readback_rejects_noncanonical_raw_key_suffix() -> TestResult
 }
 
 #[test]
+fn process_evidence_raw_wire_handles_colon_percent_siblings_mixed_rows_and_endpoint() -> TestResult
+{
+    let path = database_path("process-evidence-raw-prefix");
+    let store = RedbRecoveryStore::open(&path)?;
+    let operation_id = OperationIdentity::new("process:evidence%target")?;
+    let sibling_id = OperationIdentity::new("process:evidence%target::sibling")?;
+    let record = process_evidence_record(operation_id.as_str(), "running", 100)?;
+    let sibling = process_evidence_record(sibling_id.as_str(), "running", 200)?;
+    store.persist_process_evidence(&record)?;
+    store.persist_process_evidence(&sibling)?;
+    assert_eq!(
+        store.load_process_evidence(&operation_id)?,
+        vec![record.clone()]
+    );
+    assert_eq!(store.load_process_evidence(&sibling_id)?, vec![sibling]);
+
+    let mixed_path = database_path("process-evidence-encoded-mixed");
+    let mixed_store = RedbRecoveryStore::open(&mixed_path)?;
+    mixed_store.persist_process_evidence(&record)?;
+    let canonical_key = record.record_key()?;
+    let raw_prefix = format!("{}::", operation_id.as_str());
+    let suffix = canonical_key
+        .strip_prefix(raw_prefix.as_str())
+        .ok_or("raw process-evidence key prefix")?;
+    let encoded_operation = operation_id
+        .as_str()
+        .replace('%', "%25")
+        .replace(':', "%3A");
+    let encoded_key = format!("{encoded_operation}::{suffix}");
+    mixed_store.write_process_evidence_raw_for_test(&encoded_key, &record)?;
+    assert!(matches!(
+        mixed_store.load_process_evidence(&operation_id),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    cleanup(&mixed_path);
+
+    let endpoint_path = database_path("process-evidence-prefix-endpoint");
+    let endpoint_store = RedbRecoveryStore::open(&endpoint_path)?;
+    let endpoint_key = format!("{raw_prefix}\u{10ffff}");
+    endpoint_store.write_process_evidence_raw_for_test(&endpoint_key, &record)?;
+    assert!(matches!(
+        endpoint_store.load_process_evidence(&operation_id),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    cleanup(&endpoint_path);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
 fn authority_handoff_is_typed_one_shot_and_survives_restart() -> TestResult {
     let path = database_path("authority-handoff");
     let store = RedbRecoveryStore::open(&path)?;

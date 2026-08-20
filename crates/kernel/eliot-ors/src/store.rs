@@ -854,9 +854,16 @@ impl RedbRecoveryStore {
     ) -> Result<Vec<ProcessEvidenceRecord>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
         let table = read.open_table(PROCESS_EVIDENCE).map_err(storage)?;
-        let prefix = format!("{}::", Self::encode_key_component(operation_id.as_str()));
+        // Process-evidence rows are written by ProcessEvidenceRecord::record_key with the
+        // operation identity preserved verbatim. Keep the reader on that wire and bound the
+        // physical prefix range inclusively so the U+10FFFF endpoint cannot hide a row.
+        let prefix = format!("{}::", operation_id.as_str());
+        let prefix_end = format!("{prefix}\u{10ffff}");
         let mut records = Vec::new();
-        for entry in table.range(prefix.as_str()..).map_err(storage)? {
+        for entry in table
+            .range(prefix.as_str()..=prefix_end.as_str())
+            .map_err(storage)?
+        {
             let (key, value) = entry.map_err(storage)?;
             let key = key.value();
             if !key.starts_with(prefix.as_str()) {
@@ -864,8 +871,14 @@ impl RedbRecoveryStore {
             }
             let record: ProcessEvidenceRecord = decode(value.value())?;
             record.validate()?;
+            // Raw sibling identities can fall inside the physical prefix range (for example,
+            // `op::sibling` while reading `op`). Decode the identity before applying the
+            // canonical-key check so those rows are not misclassified as corruption.
+            if record.operation_id != *operation_id {
+                continue;
+            }
             let canonical_key = record.record_key()?;
-            if record.operation_id != *operation_id || key != canonical_key {
+            if key != canonical_key {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "process_evidence",
                     reason: "evidence record does not match its canonical key".to_owned(),
@@ -877,6 +890,33 @@ impl RedbRecoveryStore {
                     record_type: "process_evidence",
                     reason: "evidence history exceeds the bounded readback limit".to_owned(),
                 });
+            }
+        }
+        // A prior/incorrect writer may have escaped the operation identity. Never silently
+        // accept those rows, but only classify rows whose decoded identity is the requested
+        // operation; encoded sibling identities remain outside this readback.
+        if operation_id.as_str().contains(':') || operation_id.as_str().contains('%') {
+            let encoded_prefix = format!("{}::", Self::encode_key_component(operation_id.as_str()));
+            let encoded_prefix_end = format!("{encoded_prefix}\u{10ffff}");
+            for entry in table
+                .range(encoded_prefix.as_str()..=encoded_prefix_end.as_str())
+                .map_err(storage)?
+            {
+                let (key, value) = entry.map_err(storage)?;
+                let key = key.value();
+                if !key.starts_with(encoded_prefix.as_str()) {
+                    break;
+                }
+                let record: ProcessEvidenceRecord = decode(value.value())?;
+                record.validate()?;
+                if record.operation_id == *operation_id && key != record.record_key()? {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "process_evidence",
+                        reason:
+                            "encoded evidence key requires migration to the raw operation-id wire"
+                                .to_owned(),
+                    });
+                }
             }
         }
         records.sort_by(|left, right| {

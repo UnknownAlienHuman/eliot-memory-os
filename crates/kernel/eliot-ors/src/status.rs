@@ -304,7 +304,6 @@ fn canonical_history_key(lease_id: &str, revision: u64) -> String {
     format!("{}::{revision:020}", encode_key_component(lease_id))
 }
 
-#[allow(dead_code)]
 fn raw_canonical_history_key(lease_id: &str, revision: u64) -> String {
     format!("{lease_id}::{revision:020}")
 }
@@ -324,9 +323,10 @@ fn load_history(
     let prefix = format!("{}::", encode_key_component(lease_id));
     let raw_prefix = format!("{lease_id}::");
     let has_legacy_chars = lease_id.contains(':') || lease_id.contains('%');
+    let prefix_end = format!("{prefix}\u{10ffff}");
     let mut out = Vec::new();
     for item in table
-        .range(prefix.as_str()..)
+        .range(prefix.as_str()..=prefix_end.as_str())
         .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?
     {
         let (k, v) = item.map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?;
@@ -371,20 +371,43 @@ fn load_history(
         }
         out.push(snap);
     }
-    #[allow(clippy::collapsible_if)]
-    if out.is_empty() && has_legacy_chars {
-        if let Some(item) = table
-            .range(raw_prefix.as_str()..)
+    if has_legacy_chars {
+        let raw_prefix_end = format!("{raw_prefix}\u{10ffff}");
+        let mut legacy_found = false;
+        for item in table
+            .range(raw_prefix.as_str()..=raw_prefix_end.as_str())
             .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?
-            .next()
         {
-            let (k, _) = item.map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?;
-            if k.value().starts_with(raw_prefix.as_str()) {
-                return Err(OrsSupervisionStatusError::MigrationRequired(
-                    "legacy lease_id encoding requires migration: history key uses unescaped colon"
-                        .to_owned(),
+            let (k, v) = item.map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?;
+            let key = k.value();
+            if !key.starts_with(raw_prefix.as_str()) {
+                break;
+            }
+            let suffix = &key[raw_prefix.len()..];
+            if suffix.len() != 20 || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            bounded_charge(used, key.len(), v.value().len())?;
+            let snap: SupervisionLeaseSnapshot =
+                decode_named(v.value(), "supervision_lease_history")?;
+            snap.validate()
+                .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?;
+            if snap.record.lease_id.as_str() != lease_id {
+                continue;
+            }
+            let expected_key = raw_canonical_history_key(lease_id, snap.record.revision);
+            if key != expected_key {
+                return Err(OrsSupervisionStatusError::Corrupt(
+                    "legacy history key does not match lease identity or revision".to_owned(),
                 ));
             }
+            legacy_found = true;
+        }
+        if legacy_found {
+            return Err(OrsSupervisionStatusError::MigrationRequired(
+                "legacy lease_id encoding requires migration: history key uses unescaped colon"
+                    .to_owned(),
+            ));
         }
     }
     if out.len() > usize::from(MAX_HISTORY) {
@@ -2249,8 +2272,8 @@ mod tests {
             let write = db.begin_write().unwrap();
             {
                 let mut table = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
-                let max_key = format!("lease-1::{}\u{10ffff}", "0".repeat(19));
-                table.insert(max_key.as_str(), "not-json").unwrap();
+                let max_key = "lease-1::\u{10ffff}";
+                table.insert(max_key, "not-json").unwrap();
             }
             write.commit().unwrap();
         }
@@ -2395,7 +2418,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_colon_key_without_encoding_is_migration_required() {
+    fn mixed_canonical_and_legacy_colon_keys_are_migration_required() {
         let p = path("legacy-colon-migration");
         cleanup(&p);
         let store = RedbRecoveryStore::open(&p).unwrap();
@@ -2465,16 +2488,13 @@ mod tests {
                 let mut hist = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
                 let encoded_key = format!("{}::{:020}", "lease%3Acolon", 1);
                 let raw_key = format!("{lease}::{:020}", 1);
-                if hist.get(encoded_key.as_str()).unwrap().is_some() {
-                    let val = hist
-                        .get(encoded_key.as_str())
-                        .unwrap()
-                        .unwrap()
-                        .value()
-                        .to_owned();
-                    hist.remove(encoded_key.as_str()).unwrap();
-                    hist.insert(raw_key.as_str(), val.as_str()).unwrap();
-                }
+                let val = hist
+                    .get(encoded_key.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .value()
+                    .to_owned();
+                hist.insert(raw_key.as_str(), val.as_str()).unwrap();
             }
             write.commit().unwrap();
         }
