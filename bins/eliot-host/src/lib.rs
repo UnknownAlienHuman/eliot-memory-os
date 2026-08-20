@@ -9953,8 +9953,8 @@ mod tests {
             connection_id: PlatformHandle::new("connection-1").unwrap(),
             expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
             expected_peer_session_id: 0,
-            approved_artifact_hash: PlatformHandle::new(&"a".repeat(64)).unwrap(),
-            approved_config_hash: PlatformHandle::new(&"b".repeat(64)).unwrap(),
+            approved_artifact_hash: PlatformHandle::new("a".repeat(64)).unwrap(),
+            approved_config_hash: PlatformHandle::new("b".repeat(64)).unwrap(),
             timeout_ms: 5000,
         };
         let mut bad = req.clone();

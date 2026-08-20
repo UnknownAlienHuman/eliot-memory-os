@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_kernel_service::{
     HostJobBinding, HostProcessBinding, HostStoreBootstrapRequirement, KernelService,

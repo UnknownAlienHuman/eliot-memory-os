@@ -3322,12 +3322,6 @@ impl KernelComposition {
             )
             .map_err(|e| KernelBuildError::Principal(e.to_string()))?;
         let _ = expectation;
-        let receipt = self
-            .service
-            .lock()
-            .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?
-            .rebind_store(&handoff, request_digest.clone())
-            .map_err(|e| KernelBuildError::Service(e.to_string()))?;
         let timeout = Duration::from_millis(handoff.requirement.timeout_ms());
         let requirement = handoff.requirement.clone();
         let job = handoff.process_binding.job.clone();
@@ -3412,6 +3406,19 @@ impl KernelComposition {
             Err(error) => {
                 gateway.fence();
                 return Err(error);
+            }
+        };
+        let receipt = {
+            let mut svc = self
+                .service
+                .lock()
+                .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
+            match svc.rebind_store(&handoff, request_digest.clone()) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    gateway.fence();
+                    return Err(KernelBuildError::Service(error.to_string()));
+                }
             }
         };
         let old_gateway =
