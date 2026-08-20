@@ -32,10 +32,10 @@ use eliot_host_state::{
     RecordFence, RecoveryLineageEvidence, RedbJournalBackend, WakeDisposition, record_checksum,
 };
 use eliot_installation::{
-    ApprovedGenerationRegistry, CandidateManifest, InstallationError, InstallationProfile,
-    InstallerServiceRegistrationApproval, InstallerServiceRole, PendingActivationState,
-    RedbInstallationRegistry, RuntimeLaunchDescriptor, verify_approved_path,
-    verify_file_digest_with_lease, verify_file_digest_with_user_lease,
+    ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest, InstallationError,
+    InstallationProfile, InstallerServiceRegistrationApproval, InstallerServiceRole,
+    PendingActivationState, RedbInstallationRegistry, RuntimeLaunchDescriptor,
+    verify_approved_path, verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
 use eliot_kernel_service::{
     EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
@@ -5233,11 +5233,177 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    fn fresh_pending_commit_fence(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+    ) -> Result<ActivationCommitFence, HostError> {
+        self.ensure_admission_open()?;
+        let durable = self.registry_store.load().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "activation commit readiness fence registry readback failed: {error}"
+            ))
+        })?;
+        let exact_pending = durable.pending_activation().is_some_and(|current| {
+            current == pending && matches!(current.state, PendingActivationState::Pending)
+        });
+        if !exact_pending {
+            return Err(HostError::RecoveryRequired(
+                "activation commit readiness fence found a stale, substituted, or recovery-required pending registry record"
+                    .to_owned(),
+            ));
+        }
+        self.registry = durable;
+
+        // Bypass HostReadinessGate's cached Instant lease: the final CAS must
+        // receive a newly Kernel-authored ProbeReady receipt and Store proof.
+        self.persist_process_observations(&pending.manifest.generation)?;
+
+        let (kernel_artifact, store_artifact) = pending
+            .manifest
+            .host_child_artifact_digests()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let contour = self.current_readiness_contour(
+            &pending.manifest.generation,
+            kernel_artifact,
+            store_artifact,
+            &pending.manifest.config_digest,
+        )?;
+        let store_proof_fence = contour.store_proof_fence.clone().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "activation commit readiness fence is missing the Store proof fence".to_owned(),
+            )
+        })?;
+        let state = self.journal.snapshot()?;
+        let active = state.kernel.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "activation commit readiness fence has no durable Kernel record".to_owned(),
+            )
+        })?;
+        let observation = state.readiness_observations.last().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "activation commit readiness fence has no durable Kernel readiness observation"
+                    .to_owned(),
+            )
+        })?;
+        let observation_checksum =
+            record_checksum(&HostStateRecord::ReadinessObservation(observation.clone()))?;
+        let last_checksum = state.last_checksum.as_deref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "activation commit readiness fence has no durable journal checksum".to_owned(),
+            )
+        })?;
+        if state.sequence == 0 || last_checksum != observation_checksum {
+            return Err(HostError::RecoveryRequired(
+                "activation commit readiness observation is not the final fresh journal frame"
+                    .to_owned(),
+            ));
+        }
+        let active_checksum = record_checksum(&HostStateRecord::Kernel(active.clone()))?;
+        let expected_authority = pending
+            .manifest
+            .runtime_launch
+            .authority_state_fence
+            .authority_epoch
+            .value();
+        if observation.active_kernel_record_checksum.as_str() != active_checksum
+            || observation.fence != active.fence
+            || observation.config_digest != pending.manifest.config_digest
+            || observation.store_fence != store_proof_fence
+            || observation.authority_epoch != expected_authority
+        {
+            return Err(HostError::RecoveryRequired(
+                "activation commit readiness fence is stale or substituted".to_owned(),
+            ));
+        }
+        let fence = ActivationCommitFence {
+            generation: pending.manifest.generation.clone(),
+            config_digest: pending.manifest.config_digest.clone(),
+            authority_generation: pending.manifest.runtime_launch.authority_generation,
+            authority_state_fence: pending
+                .manifest
+                .runtime_launch
+                .authority_state_fence
+                .clone(),
+            active_kernel_record_checksum: observation.active_kernel_record_checksum.clone(),
+            probe_request_digest: observation.probe_request_digest.clone(),
+            ready_receipt_digest: observation.ready_receipt_digest.clone(),
+            store_proof_fence: observation.store_fence.clone(),
+            candidate_binding_digest: contour.candidate_binding_digest,
+            store_requirement_digest: contour.store_requirement_digest,
+            readiness_sequence: state.sequence,
+            readiness_journal_checksum: PlatformHandle::new(last_checksum.to_owned())
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        };
+        fence.validate().map_err(HostError::Installation)?;
+        Ok(fence)
+    }
+
+    #[cfg(windows)]
+    fn verify_pending_commit_journal_fence(
+        &self,
+        commit_fence: &ActivationCommitFence,
+    ) -> Result<(), HostError> {
+        // The registry readback itself is not a liveness barrier. Re-snapshot
+        // the journal after that read and immediately before the CAS so an
+        // intervening degraded/recovery append cannot reuse the earlier fence.
+        let state = self.journal.snapshot().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "activation commit journal readback failed before CAS: {error}"
+            ))
+        })?;
+        let observation = state.readiness_observations.last().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "activation commit readiness observation disappeared before CAS".to_owned(),
+            )
+        })?;
+        let observation_checksum = record_checksum(&HostStateRecord::ReadinessObservation(
+            observation.clone(),
+        ))
+        .map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "activation commit readiness checksum failed before CAS: {error}"
+            ))
+        })?;
+        let journal_checksum = state.last_checksum.as_deref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "activation commit journal checksum disappeared before CAS".to_owned(),
+            )
+        })?;
+        if state.sequence != commit_fence.readiness_sequence
+            || journal_checksum != commit_fence.readiness_journal_checksum.as_str()
+            || observation_checksum != commit_fence.readiness_journal_checksum.as_str()
+        {
+            return Err(HostError::RecoveryRequired(
+                "activation commit readiness fence changed before registry CAS".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     fn commit_pending_durable(
         &mut self,
         pending: &eliot_installation::PendingActivation,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        let commit_fence = self.fresh_pending_commit_fence(pending)?;
+        let durable_before_commit = self.registry_store.load().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "activation commit registry readback failed after readiness proof: {error}"
+            ))
+        })?;
+        let exact_pending = durable_before_commit
+            .pending_activation()
+            .is_some_and(|current| {
+                current == pending && matches!(current.state, PendingActivationState::Pending)
+            });
+        if !exact_pending {
+            return Err(HostError::RecoveryRequired(
+                "activation commit registry changed after readiness proof".to_owned(),
+            ));
+        }
+        self.registry = durable_before_commit;
+        self.verify_pending_commit_journal_fence(&commit_fence)?;
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some() {
             expected_revision.checked_add(1).ok_or_else(|| {
@@ -5252,6 +5418,7 @@ impl HostComposition {
             host_capability,
             expected_revision,
             &pending.approval,
+            &commit_fence,
         );
         let durable = self.registry_store.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
@@ -5263,6 +5430,7 @@ impl HostComposition {
             && durable.active().is_some_and(|active| {
                 active.manifest.generation == pending.manifest.generation
                     && active.approval == pending.approval
+                    && durable.last_committed_activation_fence() == Some(&commit_fence)
             });
         self.registry = durable;
         let result = match outcome {
@@ -5810,15 +5978,21 @@ impl HostComposition {
         &mut self,
         generation: &PlatformHandle,
     ) -> Result<ReadinessContourIdentity, HostError> {
-        let active =
-            self.registry.active().cloned().ok_or_else(|| {
-                HostError::ProcessContour("no approved active generation".to_owned())
+        // A pending candidate is approved but intentionally not active until
+        // this fresh proof crosses the registry CAS.  Resolve the exact
+        // generation from the registry projection rather than treating the
+        // active pointer as readiness authority.
+        let active = self
+            .registry
+            .generations()
+            .iter()
+            .find(|item| item.manifest.generation == *generation)
+            .cloned()
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "readiness probe generation is not present in the approved registry".to_owned(),
+                )
             })?;
-        if active.manifest.generation != *generation {
-            return Err(HostError::ProcessContour(
-                "readiness probe generation is not the approved active generation".to_owned(),
-            ));
-        }
         let (kernel_artifact, store_artifact) = active
             .manifest
             .host_child_artifact_digests()

@@ -82,7 +82,7 @@ pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersi
 /// monotonic registry revision mandatory.  Older projections are never
 /// defaulted into the current activation authority; they require explicit
 /// re-stage.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 
 /// Returns the stable contract identity for handshakes and provenance.
 pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
@@ -2618,17 +2618,148 @@ pub struct ApprovedGeneration {
     pub last_known_good: bool,
 }
 
+/// Typed readiness fence that Host must present at the pending-to-active CAS.
+///
+/// The fence is an observation binding, not a claim that process liveness is
+/// atomic with the registry write. Host must re-probe the Kernel and Store and
+/// append the resulting Kernel-authored observation immediately before the CAS.
+/// The journal sequence/checksum make that bounded freshness evidence part of
+/// the durable idempotency receipt instead of relying on an in-memory lease.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationCommitFence {
+    /// Exact approved candidate generation being committed.
+    pub generation: PlatformHandle,
+    /// Exact approved configuration digest being committed.
+    pub config_digest: PlatformHandle,
+    /// Runtime authority resource generation.
+    pub authority_generation: ResourceGeneration,
+    /// Runtime authority state fence.
+    pub authority_state_fence: StateFence,
+    /// SHA-256 checksum of the active durable Kernel record observed by Host.
+    pub active_kernel_record_checksum: PlatformHandle,
+    /// SHA-256 digest of the Kernel `ProbeReady` request.
+    pub probe_request_digest: PlatformHandle,
+    /// SHA-256 digest of the Kernel-authored ready receipt.
+    pub ready_receipt_digest: PlatformHandle,
+    /// Exact Store proof fence returned by the authenticated readiness probe.
+    pub store_proof_fence: PlatformHandle,
+    /// Digest of the exact Kernel candidate binding used by the probe. This
+    /// is a dynamic Host/Kernel contour value; the static manifest cannot
+    /// derive process and Job identities, so Host authenticates it through
+    /// the fresh Kernel-authored journal observation before this CAS.
+    pub candidate_binding_digest: PlatformHandle,
+    /// Digest of the exact Store bootstrap requirement used by the probe. The
+    /// connection and peer-session portions are dynamic and likewise require
+    /// Host's fresh authenticated contour check rather than a manifest-only
+    /// reconstruction.
+    pub store_requirement_digest: PlatformHandle,
+    /// Monotonic Host journal sequence of the fresh readiness observation.
+    pub readiness_sequence: u64,
+    /// SHA-256 checksum of the journal's final frame at observation time.
+    pub readiness_journal_checksum: PlatformHandle,
+}
+
+impl ActivationCommitFence {
+    /// Validates the self-contained typed fence without asserting process
+    /// liveness beyond the supplied durable observation.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        handle(&self.generation, "activation_commit_fence.generation")?;
+        sha256_handle(&self.config_digest, "activation_commit_fence.config_digest")?;
+        if self.authority_generation.value() == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "activation_commit_fence.authority_generation".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        self.authority_state_fence
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "activation_commit_fence.authority_state_fence".to_owned(),
+                reason: error.to_string(),
+            })?;
+        if self.authority_state_fence.resource_generation != self.authority_generation {
+            return Err(InstallationError::IdentityConflict);
+        }
+        for (value, field) in [
+            (
+                &self.active_kernel_record_checksum,
+                "activation_commit_fence.active_kernel_record_checksum",
+            ),
+            (
+                &self.probe_request_digest,
+                "activation_commit_fence.probe_request_digest",
+            ),
+            (
+                &self.ready_receipt_digest,
+                "activation_commit_fence.ready_receipt_digest",
+            ),
+            (
+                &self.candidate_binding_digest,
+                "activation_commit_fence.candidate_binding_digest",
+            ),
+            (
+                &self.store_requirement_digest,
+                "activation_commit_fence.store_requirement_digest",
+            ),
+            (
+                &self.readiness_journal_checksum,
+                "activation_commit_fence.readiness_journal_checksum",
+            ),
+        ] {
+            sha256_handle(value, field)?;
+        }
+        handle(
+            &self.store_proof_fence,
+            "activation_commit_fence.store_proof_fence",
+        )?;
+        if self.readiness_sequence == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "activation_commit_fence.readiness_sequence".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_against_manifest(
+        &self,
+        manifest: &CandidateManifest,
+    ) -> Result<(), InstallationError> {
+        // Candidate and Store contour digests are intentionally not compared
+        // to a synthetic manifest value: their process, Job, connection, and
+        // peer-session identities are minted at runtime. Host remains the
+        // observer for those values and supplies this fence only after the
+        // Kernel-authored journal proof and current contour agree. The
+        // registry still validates their SHA-256 shape and persists them for
+        // exact terminal idempotency comparison.
+        self.validate()?;
+        let runtime = &manifest.runtime_launch;
+        if self.generation != manifest.generation
+            || self.config_digest != manifest.config_digest
+            || self.authority_generation != runtime.authority_generation
+            || self.authority_state_fence != runtime.authority_state_fence
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
 /// Durable idempotency receipt for the most recent terminal pending
 /// activation result.  Keeping the exact transaction and plan bindings lets
 /// a retried Host commit/abort return the original terminal result without
 /// accepting a different caller after the pending projection is cleared.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PendingActivationTerminal {
     transaction_id: PlatformHandle,
     plan_digest: PlatformHandle,
     generation: PlatformHandle,
     disposition: PendingActivationTerminalDisposition,
+    /// Exact readiness fence used for a committed activation. Aborted
+    /// terminals must carry explicit `null` and never a synthetic fence.
+    commit_fence: Option<ActivationCommitFence>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -2687,7 +2818,7 @@ fn validate_approval_against_manifest(
 /// ```
 ///
 /// The public registry type is also intentionally not deserializable.  Only
-/// the private v3 wire decoder can reconstruct an authority projection.
+/// the private v4 wire decoder can reconstruct an authority projection.
 ///
 /// ```compile_fail
 /// use eliot_installation::ApprovedGenerationRegistry;
@@ -2892,7 +3023,31 @@ impl PendingActivationWire {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RegistryWireV3 {
+struct PendingActivationTerminalWire {
+    transaction_id: PlatformHandle,
+    plan_digest: PlatformHandle,
+    generation: PlatformHandle,
+    disposition: PendingActivationTerminalDisposition,
+    /// The member is mandatory on the current wire, while explicit `null`
+    /// remains the only valid value for an aborted terminal.
+    commit_fence: RequiredOption<ActivationCommitFence>,
+}
+
+impl PendingActivationTerminalWire {
+    fn into_terminal(self) -> PendingActivationTerminal {
+        PendingActivationTerminal {
+            transaction_id: self.transaction_id,
+            plan_digest: self.plan_digest,
+            generation: self.generation,
+            disposition: self.disposition,
+            commit_fence: self.commit_fence.0,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryWireV4 {
     registry_wire_version: ContractVersion,
     revision: u64,
     generations: Vec<ApprovedGenerationWire>,
@@ -2900,7 +3055,7 @@ struct RegistryWireV3 {
     active_generation: RequiredOption<PlatformHandle>,
     last_known_good_generation: RequiredOption<PlatformHandle>,
     pending_activation: RequiredOption<PendingActivationWire>,
-    last_terminal_activation: RequiredOption<PendingActivationTerminal>,
+    last_terminal_activation: RequiredOption<PendingActivationTerminalWire>,
 }
 
 /// An optional wire member whose presence is mandatory.  Explicit `null` is
@@ -2920,7 +3075,7 @@ where
     }
 }
 
-impl RegistryWireV3 {
+impl RegistryWireV4 {
     fn into_registry(self) -> ApprovedGenerationRegistry {
         ApprovedGenerationRegistry {
             registry_wire_version: self.registry_wire_version,
@@ -2937,7 +3092,10 @@ impl RegistryWireV3 {
                 .pending_activation
                 .0
                 .map(PendingActivationWire::into_pending),
-            last_terminal_activation: self.last_terminal_activation.0,
+            last_terminal_activation: self
+                .last_terminal_activation
+                .0
+                .map(PendingActivationTerminalWire::into_terminal),
         }
     }
 }
@@ -3446,12 +3604,12 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
         && current_registry_wire_missing_field(&value)
     {
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v3 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v4 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
 
-    if let Ok(wire) = serde_json::from_value::<RegistryWireV3>(value.clone()) {
+    if let Ok(wire) = serde_json::from_value::<RegistryWireV4>(value.clone()) {
         if wire.registry_wire_version != INSTALLATION_REGISTRY_WIRE_VERSION {
             return Err(InstallationError::MigrationRequired {
                 reason: format!(
@@ -3484,7 +3642,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             });
         }
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v3 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v4 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
@@ -3992,12 +4150,15 @@ impl RedbInstallationRegistry {
         host: &HostOwnerEpochCapability,
         expected_revision: u64,
         approval: &InstallationActivationApproval,
+        commit_fence: &ActivationCommitFence,
     ) -> Result<(), InstallationError> {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         approval.validate()?;
+        commit_fence.validate()?;
         let approval = approval.clone();
+        let commit_fence = commit_fence.clone();
         self.mutate_atomic(expected_revision, |registry| {
             if let Some(pending) = registry.pending_activation.as_ref()
                 && pending.approval != approval
@@ -4008,6 +4169,7 @@ impl RedbInstallationRegistry {
                 &approval.transaction_id,
                 &approval.installer_plan_digest,
                 &approval.generation,
+                &commit_fence,
             )
         })
     }
@@ -4381,16 +4543,33 @@ impl ApprovedGenerationRegistry {
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         generation: Option<&PlatformHandle>,
+        commit_fence: Option<&ActivationCommitFence>,
         disposition: PendingActivationTerminalDisposition,
     ) -> bool {
         self.last_terminal_activation
             .as_ref()
             .is_some_and(|terminal| {
-                terminal.transaction_id == *transaction_id
-                    && terminal.plan_digest == *plan_digest
-                    && generation.is_none_or(|value| terminal.generation == *value)
-                    && terminal.disposition == disposition
+                Self::terminal_identity_matches(
+                    terminal,
+                    transaction_id,
+                    plan_digest,
+                    generation,
+                    disposition,
+                ) && terminal.commit_fence.as_ref() == commit_fence
             })
+    }
+
+    fn terminal_identity_matches(
+        terminal: &PendingActivationTerminal,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        generation: Option<&PlatformHandle>,
+        disposition: PendingActivationTerminalDisposition,
+    ) -> bool {
+        terminal.transaction_id == *transaction_id
+            && terminal.plan_digest == *plan_digest
+            && generation.is_none_or(|value| terminal.generation == *value)
+            && terminal.disposition == disposition
     }
 
     /// Host-only claim/retry transition for one exact pending identity.
@@ -4472,11 +4651,17 @@ impl ApprovedGenerationRegistry {
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
+        commit_fence: &ActivationCommitFence,
     ) -> Result<(), InstallationError> {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        self.commit_pending_activation_unchecked(transaction_id, plan_digest, generation)
+        self.commit_pending_activation_unchecked(
+            transaction_id,
+            plan_digest,
+            generation,
+            commit_fence,
+        )
     }
 
     fn commit_pending_activation_unchecked(
@@ -4484,16 +4669,34 @@ impl ApprovedGenerationRegistry {
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
+        commit_fence: &ActivationCommitFence,
     ) -> Result<(), InstallationError> {
         self.validate()?;
+        commit_fence.validate()?;
         let Some(pending) = self.pending_activation.as_ref() else {
             if self.terminal_matches(
                 transaction_id,
                 plan_digest,
                 Some(generation),
+                Some(commit_fence),
                 PendingActivationTerminalDisposition::Committed,
             ) {
                 return Ok(());
+            }
+            if self
+                .last_terminal_activation
+                .as_ref()
+                .is_some_and(|terminal| {
+                    Self::terminal_identity_matches(
+                        terminal,
+                        transaction_id,
+                        plan_digest,
+                        Some(generation),
+                        PendingActivationTerminalDisposition::Committed,
+                    )
+                })
+            {
+                return Err(InstallationError::IdentityConflict);
             }
             return Err(InstallationError::IncompleteObservation(
                 "no pending activation exists".to_owned(),
@@ -4510,6 +4713,7 @@ impl ApprovedGenerationRegistry {
                 "pending activation requires recovery before commit".to_owned(),
             ));
         }
+        commit_fence.validate_against_manifest(&pending.manifest)?;
         let pending_record = pending.clone();
         let pending = self.pending_activation.take();
         if let Err(error) = self.activate(generation) {
@@ -4521,6 +4725,7 @@ impl ApprovedGenerationRegistry {
             plan_digest: pending_record.plan_digest,
             generation: pending_record.manifest.generation,
             disposition: PendingActivationTerminalDisposition::Committed,
+            commit_fence: Some(commit_fence.clone()),
         });
         self.validate()
     }
@@ -4584,6 +4789,7 @@ impl ApprovedGenerationRegistry {
                 transaction_id,
                 plan_digest,
                 None,
+                None,
                 PendingActivationTerminalDisposition::Aborted,
             ) {
                 return Ok(());
@@ -4606,6 +4812,7 @@ impl ApprovedGenerationRegistry {
             plan_digest: pending.plan_digest.clone(),
             generation: generation.clone(),
             disposition: PendingActivationTerminalDisposition::Aborted,
+            commit_fence: None,
         };
         self.generations
             .retain(|item| item.manifest.generation != generation);
@@ -4666,6 +4873,17 @@ impl ApprovedGenerationRegistry {
         })
     }
 
+    /// Returns the exact fence recorded for the most recent committed
+    /// activation, if the terminal receipt is a committed disposition.
+    #[must_use]
+    pub fn last_committed_activation_fence(&self) -> Option<&ActivationCommitFence> {
+        self.last_terminal_activation.as_ref().and_then(|terminal| {
+            (terminal.disposition == PendingActivationTerminalDisposition::Committed)
+                .then_some(terminal.commit_fence.as_ref())
+                .flatten()
+        })
+    }
+
     fn validate_terminal_activation(
         &self,
         terminal: &PendingActivationTerminal,
@@ -4680,24 +4898,45 @@ impl ApprovedGenerationRegistry {
         )?;
         handle(&terminal.generation, "last_terminal_activation.generation")?;
         match terminal.disposition {
-            PendingActivationTerminalDisposition::Committed
-                if self.active_generation.as_ref() != Some(&terminal.generation) =>
-            {
-                Err(InstallationError::IncompleteObservation(
-                    "committed terminal activation is not the active generation".to_owned(),
-                ))
+            PendingActivationTerminalDisposition::Committed => {
+                if self.active_generation.as_ref() != Some(&terminal.generation) {
+                    return Err(InstallationError::IncompleteObservation(
+                        "committed terminal activation is not the active generation".to_owned(),
+                    ));
+                }
+                let Some(commit_fence) = terminal.commit_fence.as_ref() else {
+                    return Err(InstallationError::IncompleteObservation(
+                        "committed terminal activation is missing its readiness fence".to_owned(),
+                    ));
+                };
+                let manifest = self
+                    .generations
+                    .iter()
+                    .find(|item| item.manifest.generation == terminal.generation)
+                    .ok_or_else(|| {
+                        InstallationError::IncompleteObservation(
+                            "committed terminal activation generation is not approved".to_owned(),
+                        )
+                    })?;
+                commit_fence.validate_against_manifest(&manifest.manifest)
             }
-            PendingActivationTerminalDisposition::Aborted
+            PendingActivationTerminalDisposition::Aborted => {
+                if terminal.commit_fence.is_some() {
+                    return Err(InstallationError::IncompleteObservation(
+                        "aborted terminal activation carries a readiness fence".to_owned(),
+                    ));
+                }
                 if self
                     .generations
                     .iter()
-                    .any(|item| item.manifest.generation == terminal.generation) =>
-            {
-                Err(InstallationError::IncompleteObservation(
-                    "aborted terminal activation remains approved".to_owned(),
-                ))
+                    .any(|item| item.manifest.generation == terminal.generation)
+                {
+                    return Err(InstallationError::IncompleteObservation(
+                        "aborted terminal activation remains approved".to_owned(),
+                    ));
+                }
+                Ok(())
             }
-            _ => Ok(()),
         }
     }
 
@@ -10242,6 +10481,7 @@ mod tests {
                     &transaction.transaction_id,
                     &transaction.installer_plan_digest,
                     &transaction.candidate_manifest.generation,
+                    &test_commit_fence(&transaction.candidate_manifest),
                 )
                 .is_err()
         );
@@ -10527,6 +10767,24 @@ mod tests {
         );
         approval.required_owner = transaction.request.required_owner.clone();
         approval
+    }
+
+    fn test_commit_fence(manifest: &CandidateManifest) -> ActivationCommitFence {
+        let runtime = &manifest.runtime_launch;
+        ActivationCommitFence {
+            generation: manifest.generation.clone(),
+            config_digest: manifest.config_digest.clone(),
+            authority_generation: runtime.authority_generation,
+            authority_state_fence: runtime.authority_state_fence.clone(),
+            active_kernel_record_checksum: test_handle("a".repeat(64)),
+            probe_request_digest: test_handle("b".repeat(64)),
+            ready_receipt_digest: test_handle("c".repeat(64)),
+            store_proof_fence: test_handle("store-proof:test"),
+            candidate_binding_digest: test_handle("d".repeat(64)),
+            store_requirement_digest: test_handle("e".repeat(64)),
+            readiness_sequence: 1,
+            readiness_journal_checksum: test_handle("f".repeat(64)),
+        }
     }
 
     fn test_path(root: &Path, name: &str) -> PlatformHandle {
@@ -13362,7 +13620,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_registry_wire_rejects_omitted_optional_members() {
+    fn v4_registry_wire_rejects_omitted_optional_members() {
         let mut current = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         current
             .as_object_mut()
@@ -13373,6 +13631,42 @@ mod tests {
             decode_registry_bytes(&bytes),
             Err(InstallationError::CorruptRegistry { reason })
                 if reason.contains("missing mandatory fields")
+        ));
+    }
+
+    #[test]
+    fn v3_registry_terminal_without_readiness_fence_requires_explicit_restage() {
+        let transaction = registering_transaction();
+        let host = host_capability();
+        let mut registry = ApprovedGenerationRegistry::new();
+        must(registry.stage_pending_activation(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            transaction.candidate_manifest.clone(),
+            test_handle("approval:wire-fence"),
+        ));
+        must(registry.commit_pending_activation(
+            &host,
+            &transaction.transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest.generation,
+            &test_commit_fence(&transaction.candidate_manifest),
+        ));
+        let mut value = must(serde_json::to_value(registry));
+        value["last_terminal_activation"]
+            .as_object_mut()
+            .unwrap_or_else(|| unreachable!())
+            .remove("commit_fence");
+        let current_bytes = must(serde_json::to_vec(&value));
+        assert!(matches!(
+            decode_registry_bytes(&current_bytes),
+            Err(InstallationError::CorruptRegistry { .. })
+        ));
+        value["registry_wire_version"]["major"] = serde_json::json!(3);
+        let bytes = must(serde_json::to_vec(&value));
+        assert!(matches!(
+            decode_registry_bytes(&bytes),
+            Err(InstallationError::MigrationRequired { .. })
         ));
     }
 
@@ -14239,6 +14533,7 @@ mod tests {
                 &transaction.transaction_id,
                 &wrong_plan,
                 &transaction.candidate_manifest.generation,
+                &test_commit_fence(&transaction.candidate_manifest),
             ),
             Err(InstallationError::IdentityConflict)
         ));
@@ -14247,6 +14542,7 @@ mod tests {
             &transaction.transaction_id,
             &transaction.installer_plan_digest,
             &transaction.candidate_manifest.generation,
+            &test_commit_fence(&transaction.candidate_manifest),
         ));
         assert!(registry.pending_activation().is_none());
         assert_eq!(
@@ -14256,11 +14552,24 @@ mod tests {
         assert!(registry.last_known_good_generation().is_none());
         let bytes = must(serde_json::to_vec(&registry));
         let mut reloaded = must(decode_registry_bytes(&bytes));
+        let mut substituted_fence = test_commit_fence(&transaction.candidate_manifest);
+        substituted_fence.candidate_binding_digest = test_handle("1".repeat(64));
+        assert!(matches!(
+            reloaded.commit_pending_activation(
+                &host,
+                &transaction.transaction_id,
+                &transaction.installer_plan_digest,
+                &transaction.candidate_manifest.generation,
+                &substituted_fence,
+            ),
+            Err(InstallationError::IdentityConflict)
+        ));
         must(reloaded.commit_pending_activation(
             &host,
             &transaction.transaction_id,
             &transaction.installer_plan_digest,
             &transaction.candidate_manifest.generation,
+            &test_commit_fence(&transaction.candidate_manifest),
         ));
     }
 
@@ -14311,6 +14620,7 @@ mod tests {
             &first.transaction_id,
             &first.installer_plan_digest,
             &first.candidate_manifest.generation,
+            &test_commit_fence(&first.candidate_manifest),
         ));
 
         let mut upgrade = first.candidate_manifest.clone();
@@ -14370,7 +14680,7 @@ mod tests {
         must(registry.stage_pending_activation(
             transaction.transaction_id.clone(),
             transaction.installer_plan_digest.clone(),
-            transaction.candidate_manifest,
+            transaction.candidate_manifest.clone(),
             test_handle("approval:abort"),
         ));
         must(registry.abort_pending_activation(
@@ -14389,6 +14699,15 @@ mod tests {
             &host,
             &transaction.transaction_id,
             &transaction.installer_plan_digest,
+        ));
+        let mut malformed = must(serde_json::to_value(&registry));
+        malformed["last_terminal_activation"]["commit_fence"] = must(serde_json::to_value(
+            test_commit_fence(&transaction.candidate_manifest),
+        ));
+        let malformed_bytes = must(serde_json::to_vec(&malformed));
+        assert!(matches!(
+            decode_registry_bytes(&malformed_bytes),
+            Err(InstallationError::CorruptRegistry { .. })
         ));
         assert!(registry.generations().is_empty());
         assert!(registry.active_generation().is_none());
