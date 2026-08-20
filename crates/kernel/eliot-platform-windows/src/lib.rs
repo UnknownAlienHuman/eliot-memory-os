@@ -4922,9 +4922,9 @@ impl ServiceRuntimeObservation {
     /// configuration and the handle-observed PID, creation time, and image.
     #[must_use]
     pub fn runtime_identity_digest(&self) -> Option<String> {
-        self.process
-            .as_ref()
-            .map(|process| runtime_identity_digest_from_configuration(&self.configuration_digest, process))
+        self.process.as_ref().map(|process| {
+            runtime_identity_digest_from_configuration(&self.configuration_digest, process)
+        })
     }
 }
 
@@ -8045,6 +8045,9 @@ impl WindowsPlatform {
         &self,
         request: &ServiceRegistrationRequest,
     ) -> Result<ServiceStartOutcome, WindowsAdapterError> {
+        if request.bootstrap().is_none() {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
         start_service_registration(request)
     }
 
@@ -8060,6 +8063,9 @@ impl WindowsPlatform {
         &self,
         request: &ServiceRegistrationRequest,
     ) -> Result<ServiceStopOutcome, WindowsAdapterError> {
+        if request.bootstrap().is_none() {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
         stop_service_registration(request)
     }
 
@@ -10644,6 +10650,34 @@ fn stop_outcome_from_inspection(
 }
 
 #[cfg(windows)]
+fn admit_stop_runtime_observation(
+    inspection: ServiceRegistrationRuntimeInspection,
+    expected_digest: &str,
+) -> Result<(), ServiceStopOutcome> {
+    match inspection {
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopped() =>
+        {
+            Err(ServiceStopOutcome::AlreadyStopped { observation })
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopping()
+                && observation.runtime_identity_digest().as_deref() == Some(expected_digest) =>
+        {
+            Err(ServiceStopOutcome::AlreadyStopping { observation })
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_running()
+                && observation.runtime_identity_digest().as_deref() == Some(expected_digest) =>
+        {
+            let _ = observation;
+            Ok(())
+        }
+        _ => Err(ServiceStopOutcome::EffectUnknown),
+    }
+}
+
+#[cfg(windows)]
 fn start_service_registration(
     request: &ServiceRegistrationRequest,
 ) -> Result<ServiceStartOutcome, WindowsAdapterError> {
@@ -10653,6 +10687,10 @@ fn start_service_registration(
         SC_STATUS_PROCESS_INFO, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_START,
         SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
     };
+
+    if request.bootstrap().is_none() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
 
     match inspect_service_registration_runtime(request) {
         ServiceRegistrationRuntimeInspection::Matching { observation }
@@ -10764,24 +10802,17 @@ fn stop_service_registration(
         SERVICE_STOP,
     };
 
+    if request.bootstrap().is_none() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
     let Some(expected_digest) = request.expected_runtime_identity_digest() else {
         return Ok(ServiceStopOutcome::EffectUnknown);
     };
-    match inspect_service_registration_runtime(request) {
-        ServiceRegistrationRuntimeInspection::Matching { observation }
-            if observation.is_stopped() =>
-        {
-            return Ok(ServiceStopOutcome::AlreadyStopped { observation });
-        }
-        ServiceRegistrationRuntimeInspection::Matching { observation }
-            if observation.is_stopping() =>
-        {
-            return Ok(ServiceStopOutcome::AlreadyStopping { observation });
-        }
-        ServiceRegistrationRuntimeInspection::Matching { observation }
-            if observation.is_running()
-                && observation.runtime_identity_digest().as_deref() == Some(expected_digest) => {}
-        _ => return Ok(ServiceStopOutcome::EffectUnknown),
+    if let Err(outcome) = admit_stop_runtime_observation(
+        inspect_service_registration_runtime(request),
+        expected_digest,
+    ) {
+        return Ok(outcome);
     }
 
     let name = std::ffi::OsStr::new(request.service_name())
@@ -10843,7 +10874,8 @@ fn stop_service_registration(
         match inspect_service_registration_runtime(request) {
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_running()
-                    && observation.runtime_identity_digest().as_deref() == Some(expected_digest) =>
+                    && observation.runtime_identity_digest().as_deref()
+                        == Some(expected_digest) =>
             {
                 let _ = observation;
             }
@@ -10852,9 +10884,8 @@ fn stop_service_registration(
         let mut stop_status = SERVICE_STATUS::default();
         // SAFETY: service is the live exact-configuration handle. This is the
         // sole ControlService stop call for this effect attempt.
-        let stop_succeeded = unsafe {
-            ControlService(service, SERVICE_CONTROL_STOP, &raw mut stop_status)
-        } != 0;
+        let stop_succeeded =
+            unsafe { ControlService(service, SERVICE_CONTROL_STOP, &raw mut stop_status) } != 0;
         let post_stop = inspect_service_registration_runtime(request);
         if !stop_succeeded {
             return ServiceStopOutcome::EffectUnknown;
@@ -12849,6 +12880,27 @@ mod tests {
                 delete_service_registration(&request),
                 Err(WindowsAdapterError::InvalidInput)
             );
+            assert_eq!(
+                start_service_registration(&request),
+                Err(WindowsAdapterError::InvalidInput)
+            );
+            assert_eq!(
+                stop_service_registration(&request),
+                Err(WindowsAdapterError::InvalidInput)
+            );
+
+            let adapter = WindowsPlatform::new(std::env::temp_dir())
+                .unwrap_or_else(|error| panic!("temp root failed: {error}"));
+            // The public methods repeat the admission guard.  These calls must
+            // return before any SCM inspection or mutation can be attempted.
+            assert_eq!(
+                adapter.start_service_registration(&request),
+                Err(WindowsAdapterError::InvalidInput)
+            );
+            assert_eq!(
+                adapter.stop_service_registration(&request),
+                Err(WindowsAdapterError::InvalidInput)
+            );
         }
     }
 
@@ -13361,10 +13413,7 @@ mod tests {
             ServiceStartOutcome::Started { .. }
         ));
         assert_eq!(
-            start_outcome_from_inspection(
-                ServiceRegistrationRuntimeInspection::Unknown,
-                true,
-            ),
+            start_outcome_from_inspection(ServiceRegistrationRuntimeInspection::Unknown, true,),
             ServiceStartOutcome::EffectUnknown
         );
         assert!(matches!(
@@ -13386,11 +13435,58 @@ mod tests {
             ServiceStopOutcome::Stopped { .. }
         ));
         assert_eq!(
-            stop_outcome_from_inspection(
-                ServiceRegistrationRuntimeInspection::Mismatched,
-                true,
-            ),
+            stop_outcome_from_inspection(ServiceRegistrationRuntimeInspection::Mismatched, true,),
             ServiceStopOutcome::EffectUnknown
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stopping_runtime_requires_the_expected_identity_digest() {
+        let process = ProcessIdentity {
+            process_id: 41,
+            start_time_100ns: 99,
+            image_path: std::env::current_exe()
+                .unwrap_or_else(|_| unreachable!())
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let observation = ServiceRuntimeObservation {
+            service_name: ELIOT_HOST_SERVICE_NAME.to_owned(),
+            configuration_digest: "a".repeat(64),
+            state: ServiceState::Stopping,
+            checkpoint: 1,
+            wait_hint_ms: 250,
+            process: Some(process.clone()),
+        };
+        let expected_digest = observation
+            .runtime_identity_digest()
+            .unwrap_or_else(|| unreachable!());
+        assert!(matches!(
+            admit_stop_runtime_observation(
+                ServiceRegistrationRuntimeInspection::Matching {
+                    observation: observation.clone(),
+                },
+                &expected_digest,
+            ),
+            Err(ServiceStopOutcome::AlreadyStopping { .. })
+        ));
+
+        let mismatched = ServiceRuntimeObservation {
+            process: Some(ProcessIdentity {
+                start_time_100ns: process.start_time_100ns + 1,
+                ..process
+            }),
+            ..observation
+        };
+        assert_eq!(
+            admit_stop_runtime_observation(
+                ServiceRegistrationRuntimeInspection::Matching {
+                    observation: mismatched,
+                },
+                &expected_digest,
+            ),
+            Err(ServiceStopOutcome::EffectUnknown)
         );
     }
 
