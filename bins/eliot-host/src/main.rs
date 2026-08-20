@@ -1,9 +1,12 @@
 use std::io::{self, BufRead, Write};
+use std::sync::OnceLock;
 
 #[cfg(windows)]
 use eliot_host::{HostBranchDisposition, HostLivenessTick};
 use eliot_host::{HostComposition, HostError, HostLaunchOptions, PROTOCOL_VERSION, SERVICE_NAME};
 use serde::{Deserialize, Serialize};
+
+static PROCESS_BOOTSTRAP: OnceLock<Result<HostLaunchOptions, String>> = OnceLock::new();
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -31,6 +34,7 @@ enum Response {
 }
 
 fn main() {
+    let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(std::env::args_os().skip(1)));
     #[cfg(windows)]
     match run_as_scm_service() {
         Ok(true) => return,
@@ -89,6 +93,25 @@ fn run_console() -> bool {
         }
     }
     finish_console_shutdown(&mut host, "console input ended")
+}
+
+fn parse_process_bootstrap<I, S>(args: I) -> Result<HostLaunchOptions, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    HostLaunchOptions::parse_system_service(args).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn captured_process_bootstrap() -> Result<HostLaunchOptions, HostError> {
+    match PROCESS_BOOTSTRAP.get() {
+        Some(Ok(options)) => Ok(options.clone()),
+        Some(Err(error)) => Err(HostError::Platform(error.clone())),
+        None => Err(HostError::Platform(
+            "SCM process bootstrap was not captured before dispatch".to_owned(),
+        )),
+    }
 }
 
 fn open_host(launch_options: HostLaunchOptions) -> Result<HostComposition, HostError> {
@@ -311,12 +334,14 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
     let launch_options =
-        match unsafe { service_launch_options(service_arg_count, service_arg_vector) } {
+        match unsafe { service_launch_options(service_arg_count, service_arg_vector) }
+            .and_then(|()| captured_process_bootstrap())
+        {
             Ok(options) => options,
             Err(error) => {
                 let _ = writeln!(
                     io::stderr().lock(),
-                    "eliot-host: invalid SCM launch argv: {error}"
+                    "eliot-host: invalid SCM launch argv or process bootstrap: {error}"
                 );
                 status.dwCurrentState = SERVICE_STOPPED;
                 status.dwWin32ExitCode = 1;
@@ -433,37 +458,34 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
 unsafe fn service_launch_options(
     service_arg_count: u32,
     service_arg_vector: *mut *mut u16,
-) -> Result<HostLaunchOptions, HostError> {
+) -> Result<(), HostError> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     const MAX_SERVICE_ARG_UNITS: usize = 64 * 1024;
 
-    if service_arg_vector.is_null() || service_arg_count != 13 {
+    if service_arg_vector.is_null() || service_arg_count != 1 {
         return Err(HostError::Platform(
-            "SCM did not provide the canonical nonce-bound service argv".to_owned(),
+            "SCM did not provide the canonical EliotHost ServiceMain argv".to_owned(),
         ));
     }
     let raw = unsafe {
         std::slice::from_raw_parts(service_arg_vector.cast_const(), service_arg_count as usize)
     };
-    let mut launch_args = Vec::with_capacity(raw.len().saturating_sub(1));
-    for pointer in raw.iter().skip(1) {
-        if pointer.is_null() {
-            return Err(HostError::Platform(
-                "SCM provided a null service argv value".to_owned(),
-            ));
-        }
-        let mut length = 0usize;
-        while length < MAX_SERVICE_ARG_UNITS && unsafe { *pointer.add(length) } != 0 {
-            length += 1;
-        }
-        if length == MAX_SERVICE_ARG_UNITS {
-            return Err(HostError::Platform("SCM argv value is too long".to_owned()));
-        }
-        let value = unsafe { std::slice::from_raw_parts(*pointer, length) };
-        launch_args.push(OsString::from_wide(value));
+    let pointer = raw[0];
+    if pointer.is_null() {
+        return Err(HostError::Platform(
+            "SCM provided a null service argv value".to_owned(),
+        ));
     }
-    HostLaunchOptions::parse_system_service(launch_args)
+    let mut length = 0usize;
+    while length < MAX_SERVICE_ARG_UNITS && unsafe { *pointer.add(length) } != 0 {
+        length += 1;
+    }
+    if length == MAX_SERVICE_ARG_UNITS {
+        return Err(HostError::Platform("SCM argv value is too long".to_owned()));
+    }
+    let value = unsafe { std::slice::from_raw_parts(pointer.cast_const(), length) };
+    HostLaunchOptions::validate_service_main_argv([OsString::from_wide(value)])
 }
 
 #[cfg(windows)]
@@ -632,5 +654,59 @@ mod tests {
         assert_eq!(spy.file_digest_verifications, 1);
         assert_eq!(spy.pipe_exchanges, 1);
         assert_eq!(spy.durable_journal_operations, 1);
+    }
+}
+
+#[cfg(test)]
+mod process_bootstrap_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn valid_process_args() -> Vec<OsString> {
+        vec![
+            OsString::from("--config-descriptor"),
+            OsString::from(
+                std::env::temp_dir()
+                    .join("eliot-authority.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            OsString::from("--config-descriptor-sha256"),
+            OsString::from("a".repeat(64)),
+            OsString::from("--installation-id"),
+            OsString::from("installation-host-test"),
+            OsString::from("--tx-plan-generation"),
+            OsString::from("7"),
+            OsString::from("--host-state-root"),
+            OsString::from(
+                std::env::temp_dir()
+                    .join("eliot-host-state")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            OsString::from("--registration-nonce"),
+            OsString::from("b".repeat(64)),
+        ]
+    }
+
+    #[test]
+    fn process_bootstrap_and_start_service_zero_arg_callback_are_distinct() {
+        let process_args = valid_process_args();
+        let process = parse_process_bootstrap(process_args.clone())
+            .unwrap_or_else(|error| panic!("process bootstrap: {error}"));
+        assert!(
+            process
+                .registration_nonce()
+                .is_some_and(|value| value.as_str() == "b".repeat(64))
+        );
+
+        // StartServiceW is called with argc=0/argv=NULL, so ServiceMain sees
+        // only argv[0], the canonical service name.
+        assert!(
+            HostLaunchOptions::validate_service_main_argv([OsString::from(SERVICE_NAME)]).is_ok()
+        );
+        let callback_with_process_args =
+            std::iter::once(OsString::from(SERVICE_NAME)).chain(process_args);
+        assert!(HostLaunchOptions::validate_service_main_argv(callback_with_process_args).is_err());
     }
 }

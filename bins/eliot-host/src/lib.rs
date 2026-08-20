@@ -217,6 +217,32 @@ impl HostLaunchOptions {
         Ok(options)
     }
 
+    /// Validates the distinct `ServiceMain` callback argv.
+    ///
+    /// `StartServiceW` is invoked with zero service arguments by the Windows
+    /// platform adapter, so SCM supplies the callback with only the canonical
+    /// service name.  The immutable Host bootstrap is parsed from the process
+    /// command line before `StartServiceCtrlDispatcherW` is entered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::Platform`] when the callback vector contains
+    /// anything other than the canonical service name.
+    pub fn validate_service_main_argv<I, S>(args: I) -> Result<(), HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        if args.len() == 1 && args[0].to_str() == Some(SERVICE_NAME) {
+            Ok(())
+        } else {
+            Err(Self::invalid_argv(
+                "ServiceMain argv must contain only EliotHost",
+            ))
+        }
+    }
+
     #[must_use]
     pub fn config_descriptor_path(&self) -> &Path {
         &self.config_descriptor_path
@@ -360,6 +386,22 @@ mod launch_options_tests {
         assert!(HostLaunchOptions::parse(without_nonce.clone()).is_ok());
         assert!(HostLaunchOptions::parse_system_service(without_nonce).is_err());
         assert!(HostLaunchOptions::parse_system_service(valid_args()).is_ok());
+    }
+
+    #[test]
+    fn process_and_service_main_argv_have_distinct_contracts() {
+        let process_args = valid_args();
+        assert!(HostLaunchOptions::parse_system_service(process_args.clone()).is_ok());
+        assert!(
+            HostLaunchOptions::validate_service_main_argv([OsString::from(SERVICE_NAME)]).is_ok()
+        );
+
+        let callback_with_process_args =
+            std::iter::once(OsString::from(SERVICE_NAME)).chain(process_args);
+        assert!(HostLaunchOptions::validate_service_main_argv(callback_with_process_args).is_err());
+        assert!(
+            HostLaunchOptions::validate_service_main_argv(std::iter::empty::<OsString>()).is_err()
+        );
     }
 }
 
@@ -4717,10 +4759,8 @@ impl HostComposition {
         if let Some(pending) = composition.registry.pending_activation().cloned() {
             composition.reconcile_pending_activation(&pending)?;
         } else if let Some(active) = composition.registry.active().cloned() {
-            composition.start_approved_contour(
-                PathBuf::from(active.manifest.kernel_executable_path.as_str()),
-                PathBuf::from(active.manifest.canonical_store_executable_path.as_str()),
-            )?;
+            let (kernel, store_bridge) = approved_host_start_paths(&active.manifest);
+            composition.start_approved_contour(kernel, store_bridge)?;
         }
         Ok(composition)
     }
@@ -5104,10 +5144,9 @@ impl HostComposition {
             )?;
             return Err(HostError::RecoveryRequired(reason.to_owned()));
         }
-        let kernel = PathBuf::from(pending.manifest.kernel_executable_path.as_str());
-        let store = PathBuf::from(pending.manifest.canonical_store_executable_path.as_str());
+        let (kernel, store_bridge) = approved_host_start_paths(&pending.manifest);
         if let Err(error) =
-            self.start_manifest_contour(&pending.manifest, &kernel, &store, Some(&pending))
+            self.start_manifest_contour(&pending.manifest, &kernel, &store_bridge, Some(&pending))
         {
             if pending.prior_active_generation.is_none() {
                 self.abort_pending_durable(&pending, &host_capability)?;
@@ -6352,6 +6391,15 @@ fn owner_lease_release_error(error: HostOwnerLeaseReleaseError) -> HostError {
     ))
 }
 
+#[cfg(windows)]
+fn approved_host_start_paths(manifest: &CandidateManifest) -> (PathBuf, PathBuf) {
+    let (approved_kernel_path, approved_store_bridge_path, _) = manifest.host_child_paths();
+    (
+        PathBuf::from(approved_kernel_path.as_str()),
+        PathBuf::from(approved_store_bridge_path.as_str()),
+    )
+}
+
 #[cfg(all(test, windows))]
 mod watchdog_service_tests {
     use super::*;
@@ -6702,6 +6750,75 @@ mod watchdog_service_tests {
             )
             .is_err()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn production_active_start_selects_approved_store_bridge_without_path_rejection() {
+        let (manifest, root) =
+            super::journal_tests::liveness_manifest_with_distinct_store_digests();
+        let bridge_path = PathBuf::from(manifest.store_bridge_executable_path.as_str());
+        let provider_path = PathBuf::from(manifest.canonical_store_executable_path.as_str());
+        std::fs::write(&bridge_path, b"approved store bridge").expect("bridge fixture");
+        std::fs::write(&provider_path, b"canonical store provider").expect("provider fixture");
+
+        let (_, selected_store) = approved_host_start_paths(&manifest);
+        let (_, approved_store, _) = manifest.host_child_paths();
+        assert_eq!(selected_store, bridge_path);
+        assert_ne!(selected_store, provider_path);
+        assert!(
+            approved_locator(
+                &selected_store,
+                approved_store,
+                manifest.runtime_launch.profile
+            )
+            .is_ok()
+        );
+        assert!(
+            approved_locator(
+                &provider_path,
+                approved_store,
+                manifest.runtime_launch.profile
+            )
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn production_pending_start_selects_approved_store_bridge_without_path_rejection() {
+        let (pending_manifest, root) =
+            super::journal_tests::liveness_manifest_with_distinct_store_digests();
+        let bridge_path = PathBuf::from(pending_manifest.store_bridge_executable_path.as_str());
+        let provider_path =
+            PathBuf::from(pending_manifest.canonical_store_executable_path.as_str());
+        std::fs::write(&bridge_path, b"approved pending store bridge")
+            .expect("pending bridge fixture");
+        std::fs::write(&provider_path, b"pending canonical store provider")
+            .expect("pending provider fixture");
+
+        let (_, selected_store) = approved_host_start_paths(&pending_manifest);
+        let (_, approved_store, _) = pending_manifest.host_child_paths();
+        assert_eq!(selected_store, bridge_path);
+        assert_ne!(selected_store, provider_path);
+        assert!(
+            approved_locator(
+                &selected_store,
+                approved_store,
+                pending_manifest.runtime_launch.profile
+            )
+            .is_ok()
+        );
+        assert!(
+            approved_locator(
+                &provider_path,
+                approved_store,
+                pending_manifest.runtime_launch.profile
+            )
+            .is_err()
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
