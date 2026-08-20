@@ -492,7 +492,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     let planned: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
     assert_eq!(
         planned["transaction_wire_version"],
-        serde_json::json!({"major": 7, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 8, "minor": 0, "patch": 0})
     );
 
     let create = Command::new(env!("CARGO_BIN_EXE_eliot"))
@@ -517,7 +517,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     assert_eq!(created["contract_version"], "3.0.0");
     assert_eq!(
         created["transaction_wire_version"],
-        serde_json::json!({"major": 7, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 8, "minor": 0, "patch": 0})
     );
     assert_eq!(created["transaction_id"], "transaction:cli-positive");
     assert_eq!(created["revision"], 1);
@@ -546,7 +546,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     assert_eq!(status_value["stage"], "PLANNED");
     assert_eq!(
         status_value["transaction"]["transaction_wire_version"],
-        serde_json::json!({"major": 7, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 8, "minor": 0, "patch": 0})
     );
 
     let apply = Command::new(env!("CARGO_BIN_EXE_eliot"))
@@ -596,7 +596,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     );
     assert_eq!(
         applied["transaction"]["transaction_wire_version"],
-        serde_json::json!({"major": 7, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 8, "minor": 0, "patch": 0})
     );
 
     let status_after_apply = Command::new(env!("CARGO_BIN_EXE_eliot"))
