@@ -140,6 +140,44 @@ fn store_fence_for(handoff: &StoreRebindHandoff) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn temp_ors() -> (std::path::PathBuf, eliot_ors::RedbRecoveryStore) {
+    let dir = std::env::temp_dir().join(format!(
+        "rebind-ors-persist-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ors = eliot_ors::RedbRecoveryStore::open(dir.join("ors.redb")).unwrap();
+    (dir, ors)
+}
+
+fn replay_record(
+    handoff: &StoreRebindHandoff,
+    operation_id: &str,
+    request_digest: &str,
+    state: eliot_ors::StoreRebindReplayState,
+    receipt: Option<String>,
+) -> eliot_ors::StoreRebindReplayRecord {
+    eliot_ors::StoreRebindReplayRecord {
+        operation_id: eliot_ors::OperationIdentity::new(operation_id).unwrap(),
+        request_digest: request_digest.to_owned(),
+        candidate_binding_digest: handoff.candidate_binding_digest.clone(),
+        store_fence: handoff.store_fence.clone(),
+        requirement_digest: "a".repeat(64),
+        process_id: handoff.process_binding.process.process_id,
+        process_start_time_100ns: handoff.process_binding.process.start_time_100ns,
+        process_image_path: handoff.process_binding.process.image_path.clone(),
+        job_name: handoff.process_binding.job.as_str().to_owned(),
+        generation: 1,
+        authority_epoch: 1,
+        state,
+        receipt,
+    }
+}
+
 #[test]
 fn rebind_preserves_kernel_identity_and_changes_store_identity() {
     let (mut svc, cand) = ready_service();
@@ -1011,17 +1049,7 @@ fn rebind_requires_ready_state_and_fences_on_second_rebind() {
 
 #[test]
 fn rebind_ors_persist_failure_is_forward_fenced_and_pending_aborted() {
-    use eliot_ors::{RedbRecoveryStore, StoreRebindReplayRecord, StoreRebindReplayState};
-    let dir = std::env::temp_dir().join(format!(
-        "rebind-ors-persist-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let ors = RedbRecoveryStore::open(dir.join("ors.redb")).unwrap();
+    let (_dir, ors) = temp_ors();
     let (mut svc, cand) = ready_service();
     let cand_digest = cand.compute_digest().unwrap();
     let req = requirement();
@@ -1048,37 +1076,21 @@ fn rebind_ors_persist_failure_is_forward_fenced_and_pending_aborted() {
         svc.state(),
         eliot_kernel_service::KernelServiceState::Degraded
     );
-    let pending = StoreRebindReplayRecord {
-        operation_id: eliot_ors::OperationIdentity::new(handoff.operation_id.as_str()).unwrap(),
-        request_digest: "e".repeat(64),
-        candidate_binding_digest: handoff.candidate_binding_digest.clone(),
-        store_fence: handoff.store_fence.clone(),
-        requirement_digest: "a".repeat(64),
-        process_id: 99,
-        process_start_time_100ns: 100,
-        process_image_path: handoff.process_binding.process.image_path.clone(),
-        job_name: handoff.process_binding.job.as_str().to_owned(),
-        generation: 1,
-        authority_epoch: 1,
-        state: StoreRebindReplayState::Pending,
-        receipt: None,
-    };
+    let pending = replay_record(
+        &handoff,
+        handoff.operation_id.as_str(),
+        &"e".repeat(64),
+        eliot_ors::StoreRebindReplayState::Pending,
+        None,
+    );
     ors.begin_store_rebind(&pending).unwrap();
-    let committed = StoreRebindReplayRecord {
-        operation_id: eliot_ors::OperationIdentity::new(handoff.operation_id.as_str()).unwrap(),
-        request_digest: "e".repeat(64),
-        candidate_binding_digest: handoff.candidate_binding_digest.clone(),
-        store_fence: handoff.store_fence.clone(),
-        requirement_digest: "a".repeat(64),
-        process_id: 99,
-        process_start_time_100ns: 100,
-        process_image_path: handoff.process_binding.process.image_path.clone(),
-        job_name: handoff.process_binding.job.as_str().to_owned(),
-        generation: 1,
-        authority_epoch: 1,
-        state: StoreRebindReplayState::Committed,
-        receipt: Some(receipt.request_digest.clone()),
-    };
+    let committed = replay_record(
+        &handoff,
+        handoff.operation_id.as_str(),
+        &"e".repeat(64),
+        eliot_ors::StoreRebindReplayState::Committed,
+        Some(receipt.request_digest.clone()),
+    );
     ors.persist_store_rebind(&committed).unwrap();
     assert!(
         !ors.abort_store_rebind(
@@ -1088,21 +1100,13 @@ fn rebind_ors_persist_failure_is_forward_fenced_and_pending_aborted() {
         .unwrap(),
         "committed must not be aborted"
     );
-    let pending2 = StoreRebindReplayRecord {
-        operation_id: eliot_ors::OperationIdentity::new("rebind-op-abort").unwrap(),
-        request_digest: "f".repeat(64),
-        candidate_binding_digest: handoff.candidate_binding_digest.clone(),
-        store_fence: handoff.store_fence.clone(),
-        requirement_digest: "a".repeat(64),
-        process_id: 99,
-        process_start_time_100ns: 100,
-        process_image_path: handoff.process_binding.process.image_path.clone(),
-        job_name: handoff.process_binding.job.as_str().to_owned(),
-        generation: 1,
-        authority_epoch: 1,
-        state: StoreRebindReplayState::Pending,
-        receipt: None,
-    };
+    let pending2 = replay_record(
+        &handoff,
+        "rebind-op-abort",
+        &"f".repeat(64),
+        eliot_ors::StoreRebindReplayState::Pending,
+        None,
+    );
     ors.begin_store_rebind(&pending2).unwrap();
     assert!(
         ors.abort_store_rebind(
