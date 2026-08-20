@@ -50,8 +50,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 mod credential_provision;
+mod package_planner;
 mod redb_state;
-mod signed_activation;
 
 pub use credential_provision::{
     CredentialAccessReceipt, CredentialOwnershipMarkerIdentity, HOST_CREDENTIAL_CONTROL_PIPE,
@@ -64,6 +64,7 @@ pub use credential_provision::{
     credential_matching_response_digest, decode_credential_control_request_frame,
     decode_credential_control_response_frame, validate_store_credential_target,
 };
+pub use package_planner::SealedPackagePlanner;
 pub use redb_state::RedbInstallationTransactionStore;
 
 /// Stable wire name for the installation contract.
@@ -81,7 +82,7 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 /// private, durable activation-receipt binding: a transaction cannot be
 /// re-opened as `ActiveVerified` without the exact registry terminal that
 /// committed it.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(9, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(10, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -2562,41 +2563,6 @@ pub struct InstallationActivationApproval {
 }
 
 impl InstallationActivationApproval {
-    /// Constructs the private registry approval after an independent signed
-    /// authority verifier has authenticated every field.  The constructor is
-    /// crate-visible so the signed-activation bridge remains the sole
-    /// production path; external callers cannot manufacture this value.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_verified_parts(
-        approval_ref: PlatformHandle,
-        transaction_id: PlatformHandle,
-        installer_plan_digest: PlatformHandle,
-        generation: PlatformHandle,
-        candidate_manifest_digest: PlatformHandle,
-        runtime_descriptor_digest: PlatformHandle,
-        required_owner: PlatformHandle,
-        signature_ref: PlatformHandle,
-        authority_descriptor_path: PlatformHandle,
-        authority_descriptor_digest: PlatformHandle,
-        authority_generation: ResourceGeneration,
-        authority_state_fence: StateFence,
-    ) -> Self {
-        Self {
-            approval_ref,
-            transaction_id,
-            installer_plan_digest,
-            generation,
-            candidate_manifest_digest,
-            runtime_descriptor_digest,
-            required_owner,
-            signature_ref,
-            authority_descriptor_path,
-            authority_descriptor_digest,
-            authority_generation,
-            authority_state_fence,
-        }
-    }
-
     /// Validates the approval's self-contained typed binding.
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.approval_ref, "activation_approval.approval_ref")?;
@@ -4255,7 +4221,6 @@ impl RedbInstallationRegistry {
     /// `expected_revision` is checked against the registry snapshot inside the
     /// same redb write transaction that commits the projection.  An exact retry
     /// is a no-op and does not advance the revision.
-    #[cfg(test)]
     pub fn stage_pending_activation_from_transaction_store<S: InstallationTransactionStore>(
         &self,
         transaction_store: &S,
@@ -5648,18 +5613,6 @@ impl InstallerServiceRegistrationApproval {
     #[must_use]
     pub fn configuration_digest(&self) -> &PlatformHandle {
         &self.configuration_digest
-    }
-
-    pub(crate) fn registration_nonce(&self) -> &PlatformHandle {
-        &self.registration_nonce
-    }
-
-    pub(crate) fn service_name_handle(&self) -> &PlatformHandle {
-        &self.service_name
-    }
-
-    pub(crate) fn executable_path_handle(&self) -> &PlatformHandle {
-        &self.executable_path
     }
 
     /// Validates the durable approval without touching the filesystem or SCM.
@@ -7091,14 +7044,17 @@ impl InstallationTransaction {
                     InstallerEffectPlan::ProvisionStoreCredential { .. } => {
                         precondition.credential_snapshot.is_some()
                             && precondition.os_snapshot.is_none()
+                            && precondition.package_snapshot.is_none()
                     }
                     InstallerEffectPlan::StagePackage { .. } => {
-                        precondition.credential_snapshot.is_none()
+                        precondition.package_snapshot.is_some()
+                            && precondition.credential_snapshot.is_none()
                             && precondition.os_snapshot.is_none()
                     }
                     _ => {
                         precondition.os_snapshot.is_some()
                             && precondition.credential_snapshot.is_none()
+                            && precondition.package_snapshot.is_none()
                     }
                 };
                 if !snapshot_matches {
@@ -7762,6 +7718,139 @@ pub enum InstallationEffectAction {
     Rollback,
 }
 
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageObservedFile {
+    pub relative_path: String,
+    pub sha256: PlatformHandle,
+    pub size: u64,
+    pub identity: FileIdentity,
+}
+
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageObservationSnapshot {
+    pub source_bundle_identity: FileIdentity,
+    pub generation: PlatformHandle,
+    pub manifest_digest: PlatformHandle,
+    pub files: Vec<PackageObservedFile>,
+    pub total_bytes: u64,
+    pub digest: PlatformHandle,
+}
+
+impl PackageObservationSnapshot {
+    #[allow(missing_docs)]
+    pub fn compute_digest(
+        source_bundle_identity: &FileIdentity,
+        generation: &PlatformHandle,
+        manifest_digest: &PlatformHandle,
+        files: &[PackageObservedFile],
+        total_bytes: u64,
+    ) -> Result<PlatformHandle, InstallationError> {
+        #[derive(Serialize)]
+        struct Input<'a> {
+            source_bundle_identity: &'a FileIdentity,
+            generation: &'a PlatformHandle,
+            manifest_digest: &'a PlatformHandle,
+            files: &'a [PackageObservedFile],
+            total_bytes: u64,
+        }
+        let bytes = serde_json::to_vec(&Input {
+            source_bundle_identity,
+            generation,
+            manifest_digest,
+            files,
+            total_bytes,
+        })
+        .map_err(|error| InstallationError::InvalidField {
+            field: "effect.precondition.package_snapshot".to_owned(),
+            reason: error.to_string(),
+        })?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| platform_error(&error))
+    }
+    #[allow(missing_docs)]
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        use std::cmp::Ordering;
+        if self.source_bundle_identity.volume_serial_number == 0
+            || self.source_bundle_identity.file_index == 0
+        {
+            return Err(InstallationError::InvalidField {
+                field: "effect.precondition.package_snapshot.source_bundle_identity".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        handle(
+            &self.generation,
+            "effect.precondition.package_snapshot.generation",
+        )?;
+        sha256_handle(
+            &self.manifest_digest,
+            "effect.precondition.package_snapshot.manifest_digest",
+        )?;
+        sha256_handle(&self.digest, "effect.precondition.package_snapshot.digest")?;
+        if self.files.len() > 4096 {
+            return Err(InstallationError::InvalidField {
+                field: "effect.precondition.package_snapshot.files".to_owned(),
+                reason: "exceeds bound".to_owned(),
+            });
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for file in &self.files {
+            validate_package_relative_text(
+                &file.relative_path,
+                "effect.precondition.package_snapshot.files.relative_path",
+            )?;
+            sha256_handle(
+                &file.sha256,
+                "effect.precondition.package_snapshot.files.sha256",
+            )?;
+            if file.identity.volume_serial_number == 0 || file.identity.file_index == 0 {
+                return Err(InstallationError::InvalidField {
+                    field: "effect.precondition.package_snapshot.files.identity".to_owned(),
+                    reason: "must be non-zero".to_owned(),
+                });
+            }
+            if seen.iter().any(|existing| {
+                eliot_platform_windows::ordinal_eq_str(existing, &file.relative_path)
+            }) {
+                return Err(InstallationError::Duplicate {
+                    kind: "package snapshot file".to_owned(),
+                    identity: file.relative_path.clone(),
+                });
+            }
+            seen.push(file.relative_path.clone());
+        }
+        for window in self.files.windows(2) {
+            if eliot_platform_windows::ordinal_cmp_str(
+                &window[0].relative_path,
+                &window[1].relative_path,
+            ) != Ordering::Less
+            {
+                return Err(InstallationError::InvalidField {
+                    field: "effect.precondition.package_snapshot.files".to_owned(),
+                    reason: "must be sorted ordinal".to_owned(),
+                });
+            }
+        }
+        let expected = Self::compute_digest(
+            &self.source_bundle_identity,
+            &self.generation,
+            &self.manifest_digest,
+            &self.files,
+            self.total_bytes,
+        )?;
+        if expected != self.digest {
+            return Err(InstallationError::InvalidField {
+                field: "effect.precondition.package_snapshot.digest".to_owned(),
+                reason: "snapshot digest mismatch".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Exact precondition bound into an effect intent.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -7772,45 +7861,57 @@ pub struct InstallationEffectPrecondition {
     pub os_snapshot: Option<InstallationRootAbsentSnapshot>,
     /// Typed `LocalService` Host/marker/credential absence observation.
     pub credential_snapshot: Option<StoreCredentialAbsentSnapshot>,
-    /// Digest binding the planned references and typed OS snapshot in order.
+    /// Trusted package source observation bound to the exact retained root and manifest.
+    pub package_snapshot: Option<PackageObservationSnapshot>,
+    /// Digest binding the planned references and typed snapshots in order.
     pub digest: PlatformHandle,
 }
 
 impl InstallationEffectPrecondition {
     fn from_change(change: &PlannedChange) -> Result<Self, InstallationError> {
-        Self::new(change.precondition_refs.clone(), None, None)
+        Self::new(change.precondition_refs.clone(), None, None, None)
     }
 
     fn with_os_snapshot(
         &self,
         snapshot: InstallationRootAbsentSnapshot,
     ) -> Result<Self, InstallationError> {
-        Self::new(self.evidence_refs.clone(), Some(snapshot), None)
+        Self::new(self.evidence_refs.clone(), Some(snapshot), None, None)
     }
 
     fn with_credential_snapshot(
         &self,
         snapshot: StoreCredentialAbsentSnapshot,
     ) -> Result<Self, InstallationError> {
-        Self::new(self.evidence_refs.clone(), None, Some(snapshot))
+        Self::new(self.evidence_refs.clone(), None, Some(snapshot), None)
+    }
+
+    fn with_package_snapshot(
+        &self,
+        snapshot: PackageObservationSnapshot,
+    ) -> Result<Self, InstallationError> {
+        Self::new(self.evidence_refs.clone(), None, None, Some(snapshot))
     }
 
     fn new(
         evidence_refs: Vec<PlatformHandle>,
         os_snapshot: Option<InstallationRootAbsentSnapshot>,
         credential_snapshot: Option<StoreCredentialAbsentSnapshot>,
+        package_snapshot: Option<PackageObservationSnapshot>,
     ) -> Result<Self, InstallationError> {
         #[derive(Serialize)]
         struct DigestInput<'a> {
             evidence_refs: &'a [PlatformHandle],
             os_snapshot: &'a Option<InstallationRootAbsentSnapshot>,
             credential_snapshot: &'a Option<StoreCredentialAbsentSnapshot>,
+            package_snapshot: &'a Option<PackageObservationSnapshot>,
         }
         let digest = PlatformHandle::new(sha256_hex(
             &serde_json::to_vec(&DigestInput {
                 evidence_refs: &evidence_refs,
                 os_snapshot: &os_snapshot,
                 credential_snapshot: &credential_snapshot,
+                package_snapshot: &package_snapshot,
             })
             .map_err(|error| InstallationError::InvalidField {
                 field: "effect.precondition".to_owned(),
@@ -7822,6 +7923,7 @@ impl InstallationEffectPrecondition {
             evidence_refs,
             os_snapshot,
             credential_snapshot,
+            package_snapshot,
             digest,
         };
         value.validate()?;
@@ -7834,6 +7936,7 @@ impl InstallationEffectPrecondition {
             evidence_refs: &'a [PlatformHandle],
             os_snapshot: &'a Option<InstallationRootAbsentSnapshot>,
             credential_snapshot: &'a Option<StoreCredentialAbsentSnapshot>,
+            package_snapshot: &'a Option<PackageObservationSnapshot>,
         }
 
         handles(
@@ -7847,10 +7950,16 @@ impl InstallationEffectPrecondition {
         if let Some(snapshot) = &self.credential_snapshot {
             snapshot.validate()?;
         }
-        if self.os_snapshot.is_some() && self.credential_snapshot.is_some() {
+        if let Some(snapshot) = &self.package_snapshot {
+            snapshot.validate()?;
+        }
+        let present = u8::from(self.os_snapshot.is_some())
+            + u8::from(self.credential_snapshot.is_some())
+            + u8::from(self.package_snapshot.is_some());
+        if present > 1 {
             return Err(InstallationError::InvalidField {
                 field: "effect.precondition.snapshot".to_owned(),
-                reason: "root and credential snapshots are mutually exclusive".to_owned(),
+                reason: "snapshots are mutually exclusive".to_owned(),
             });
         }
         sha256_handle(&self.digest, "effect.precondition.digest")?;
@@ -7859,6 +7968,7 @@ impl InstallationEffectPrecondition {
                 evidence_refs: &self.evidence_refs,
                 os_snapshot: &self.os_snapshot,
                 credential_snapshot: &self.credential_snapshot,
+                package_snapshot: &self.package_snapshot,
             })
             .map_err(|error| InstallationError::InvalidField {
                 field: "effect.precondition".to_owned(),
@@ -8003,12 +8113,20 @@ impl InstallationEffectRequest {
                 InstallationEffectAction::Rollback,
                 Some(ownership),
             ) if ownership.lifecycle != InstallationSecretLifecycle::Deleted => {}
-            (
-                InstallerEffectPlan::ApplyAcl { .. } | InstallerEffectPlan::StagePackage { .. },
-                InstallationEffectAction::Apply,
-                None,
-            )
-            | (InstallerEffectPlan::RegisterService { .. }, _, None) => {
+            (InstallerEffectPlan::ApplyAcl { .. }, InstallationEffectAction::Apply, None)
+                if self.precondition.os_snapshot.is_none()
+                    && self.precondition.package_snapshot.is_none() => {}
+            (InstallerEffectPlan::StagePackage { .. }, InstallationEffectAction::Apply, None)
+                if self.precondition.package_snapshot.is_none()
+                    && self.precondition.os_snapshot.is_none()
+                    && self.precondition.credential_snapshot.is_none()
+                    && self.staging_receipt.is_none()
+                    && self.attempt == 1 => {}
+            (InstallerEffectPlan::StagePackage { .. }, _, None)
+                if self.precondition.package_snapshot.is_some()
+                    && self.precondition.os_snapshot.is_none()
+                    && self.precondition.credential_snapshot.is_none() => {}
+            (InstallerEffectPlan::RegisterService { .. }, _, None) => {
                 if matches!(&self.plan, InstallerEffectPlan::RegisterService { .. })
                     && self.service_bootstrap.is_none()
                 {
@@ -10052,6 +10170,95 @@ fn package_matching_observation(
     })
 }
 
+#[allow(missing_docs, clippy::unnecessary_sort_by)]
+pub(crate) fn validate_observed_against_plan(
+    observed: &eliot_platform_windows::PackageSourceObservation,
+    manifest: &PackageManifest,
+    expected: &[PackageArtifactDigest],
+) -> Result<(), PackageStagingError> {
+    if observed.files.len() != manifest.files.len() || observed.files.len() != expected.len() {
+        return Err(PackageStagingError::TreeMismatch);
+    }
+    let mut observed_sorted = observed.files.clone();
+    observed_sorted.sort_by(|a, b| {
+        eliot_platform_windows::ordinal_cmp_str(&a.relative_path, &b.relative_path)
+    });
+    let mut manifest_sorted = manifest.files.clone();
+    manifest_sorted.sort_by(|a, b| {
+        eliot_platform_windows::ordinal_cmp_str(&a.relative_path, &b.relative_path)
+    });
+    let mut expected_sorted = expected.to_vec();
+    expected_sorted.sort_by(|a, b| {
+        eliot_platform_windows::ordinal_cmp_str(&a.relative_path, &b.relative_path)
+    });
+    for ((obs, man), exp) in observed_sorted
+        .iter()
+        .zip(manifest_sorted.iter())
+        .zip(expected_sorted.iter())
+    {
+        if !eliot_platform_windows::ordinal_eq_str(&obs.relative_path, &man.relative_path)
+            || !eliot_platform_windows::ordinal_eq_str(&obs.relative_path, &exp.relative_path)
+        {
+            return Err(PackageStagingError::TreeMismatch);
+        }
+        if !obs.sha256.eq_ignore_ascii_case(exp.sha256.as_str()) {
+            return Err(PackageStagingError::HashMismatch);
+        }
+        if obs.size > man.max_size {
+            return Err(PackageStagingError::SizeMismatch);
+        }
+        if obs.sha256.len() != 64
+            || !obs
+                .sha256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        {
+            return Err(PackageStagingError::HashMismatch);
+        }
+    }
+    Ok(())
+}
+
+#[allow(missing_docs, clippy::unnecessary_sort_by)]
+pub(crate) fn build_package_snapshot(
+    source_identity: FileIdentity,
+    generation: PlatformHandle,
+    manifest_digest: PlatformHandle,
+    observed: &eliot_platform_windows::PackageSourceObservation,
+) -> Result<PackageObservationSnapshot, PackageStagingError> {
+    let mut files = Vec::with_capacity(observed.files.len());
+    for file in &observed.files {
+        let sha = PlatformHandle::new(file.sha256.clone())
+            .map_err(|_| PackageStagingError::HashMismatch)?;
+        files.push(PackageObservedFile {
+            relative_path: file.relative_path.clone(),
+            sha256: sha,
+            size: file.size,
+            identity: file.identity,
+        });
+    }
+    files.sort_by(|a, b| {
+        eliot_platform_windows::ordinal_cmp_str(&a.relative_path, &b.relative_path)
+    });
+    let total_bytes = observed.total_bytes;
+    let digest = PackageObservationSnapshot::compute_digest(
+        &source_identity,
+        &generation,
+        &manifest_digest,
+        &files,
+        total_bytes,
+    )
+    .map_err(|_| PackageStagingError::Io)?;
+    Ok(PackageObservationSnapshot {
+        source_bundle_identity: source_identity,
+        generation,
+        manifest_digest,
+        files,
+        total_bytes,
+        digest,
+    })
+}
+
 fn package_absent_observation(
     request: &InstallationEffectRequest,
 ) -> InstallationEffectObservation {
@@ -10071,30 +10278,111 @@ fn package_absent_observation(
     }
 }
 
+fn package_absent_with_snapshot(
+    request: &InstallationEffectRequest,
+    snapshot: PackageObservationSnapshot,
+) -> Result<InstallationEffectObservation, PackageStagingError> {
+    let precondition = request
+        .precondition
+        .with_package_snapshot(snapshot)
+        .map_err(|_| PackageStagingError::Io)?;
+    Ok(InstallationEffectObservation::Absent {
+        observed_precondition: precondition.clone(),
+        evidence: vec![precondition.digest.clone()],
+    })
+}
+
+#[allow(clippy::needless_return, clippy::collapsible_if)]
 fn inspect_package(
     request: &InstallationEffectRequest,
 ) -> Result<InstallationEffectObservation, PackageStagingError> {
     let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
+    let InstallerEffectPlan::StagePackage {
+        expected_file_digests,
+        generation,
+        candidate_manifest_digest,
+        ..
+    } = &request.plan
+    else {
+        return Err(PackageStagingError::Io);
+    };
+    if manifest.generation != generation.as_str() {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    if manifest.canonical_digest() != candidate_manifest_digest.as_str() {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let observed = stager.source().observe()?;
+    validate_observed_against_plan(&observed, &manifest, expected_file_digests)?;
+    let manifest_digest_handle = PlatformHandle::new(manifest.canonical_digest())
+        .map_err(|_| PackageStagingError::HashMismatch)?;
+    let snapshot = build_package_snapshot(
+        stager.source().identity(),
+        generation.clone(),
+        manifest_digest_handle,
+        &observed,
+    )?;
+    if let Some(persisted) = &request.precondition.package_snapshot {
+        if persisted.digest != snapshot.digest {
+            return Err(PackageStagingError::HashMismatch);
+        }
+    }
+    let absent = if request.precondition.package_snapshot.is_some() {
+        package_absent_observation(request)
+    } else {
+        package_absent_with_snapshot(request, snapshot)?
+    };
     match stager.inspect(&manifest)? {
-        PackageStagingObservation::Absent => Ok(package_absent_observation(request)),
-        PackageStagingObservation::Matching(receipt) => {
-            package_matching_observation(request, receipt)
-                .map_err(|_| PackageStagingError::IdentityMismatch)
+        PackageStagingObservation::Absent => Ok(absent),
+        PackageStagingObservation::Matching(_) => {
+            Ok(package_pending(&PackageStagingError::PartialTree))
         }
         PackageStagingObservation::Mismatch(error) => Ok(package_pending(&error)),
         PackageStagingObservation::Unknown(error) => Err(error),
     }
 }
 
+#[allow(clippy::needless_return, clippy::collapsible_if)]
 fn reconcile_package(
     request: &InstallationEffectRequest,
 ) -> Result<InstallationEffectObservation, PackageStagingError> {
     let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
+    let InstallerEffectPlan::StagePackage {
+        expected_file_digests,
+        generation,
+        candidate_manifest_digest,
+        ..
+    } = &request.plan
+    else {
+        return Err(PackageStagingError::Io);
+    };
+    let persisted = request
+        .precondition
+        .package_snapshot
+        .as_ref()
+        .ok_or(PackageStagingError::Io)?;
+    if manifest.generation != generation.as_str()
+        || manifest.canonical_digest() != candidate_manifest_digest.as_str()
+        || &persisted.generation != generation
+        || persisted.manifest_digest.as_str() != manifest.canonical_digest()
+        || persisted.source_bundle_identity != stager.source().identity()
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let observed = stager.source().observe()?;
+    validate_observed_against_plan(&observed, &manifest, expected_file_digests)?;
+    let fresh = build_package_snapshot(
+        stager.source().identity(),
+        generation.clone(),
+        persisted.manifest_digest.clone(),
+        &observed,
+    )?;
+    if fresh.digest != persisted.digest {
+        return Err(PackageStagingError::HashMismatch);
+    }
     let observation = if let Some(receipt) = &request.staging_receipt {
         stager.reconcile(receipt)?
     } else {
-        // A committed intent without a receipt cannot adopt a tree.  Inspect
-        // only classifies it; the coordinator will persist rollback-required.
         stager.inspect(&manifest)?
     };
     match observation {
@@ -10108,6 +10396,7 @@ fn reconcile_package(
     }
 }
 
+#[allow(clippy::manual_let_else, clippy::too_many_lines)]
 fn execute_package(
     request: &InstallationEffectRequest,
 ) -> PortOutcome<InstallationEffectExecution> {
@@ -10115,41 +10404,86 @@ fn execute_package(
         Ok(value) => value,
         Err(error) => return PortOutcome::Error(error),
     };
+    let Some(snapshot) = &request.precondition.package_snapshot else {
+        return PortOutcome::Error(PortError::InvalidRequestMetadata);
+    };
+    let InstallerEffectPlan::StagePackage {
+        expected_file_digests,
+        generation,
+        candidate_manifest_digest,
+        ..
+    } = &request.plan
+    else {
+        return PortOutcome::Error(PortError::InvalidRequestMetadata);
+    };
+    if manifest.generation != generation.as_str()
+        || manifest.canonical_digest() != candidate_manifest_digest.as_str()
+        || &snapshot.generation != generation
+        || snapshot.manifest_digest.as_str() != manifest.canonical_digest()
+        || snapshot.source_bundle_identity != stager.source().identity()
+    {
+        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+    }
+    let observed = match stager.source().observe() {
+        Ok(obs) => obs,
+        Err(error) => return package_staging_outcome(&error),
+    };
+    if validate_observed_against_plan(&observed, &manifest, expected_file_digests).is_err() {
+        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+    }
+    let fresh = match build_package_snapshot(
+        stager.source().identity(),
+        generation.clone(),
+        snapshot.manifest_digest.clone(),
+        &observed,
+    ) {
+        Ok(s) => s,
+        Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+    };
+    if fresh.digest != snapshot.digest {
+        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+    }
     match request.action {
-        InstallationEffectAction::Apply => {
-            match stager.stage(&manifest) {
-                Ok(receipt) => {
-                    if validate_staging_receipt_for_plan(&request.plan, &receipt).is_err() {
-                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
-                    }
-                    if receipt.files.len() != observed.files.len() {
-                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
-                    }
-                    for file in &receipt.files {
-                        let Some(matched) = observed.files.iter().find(|obs| {
-                            obs.relative_path.eq_ignore_ascii_case(&file.relative_path)
-                        }) else {
-                            return PortOutcome::Unknown(UnknownReason::Indeterminate);
-                        };
-                        if file.sha256 != matched.sha256
-                            || file.size != matched.size
-                            || file.source_identity != matched.identity
-                        {
-                            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+        InstallationEffectAction::Apply => match stager.stage(&manifest) {
+            Ok(receipt) => {
+                let valid = validate_staging_receipt_for_plan(&request.plan, &receipt).is_ok()
+                    && receipt.files.len() == observed.files.len()
+                    && {
+                        let mut ok = true;
+                        for file in &receipt.files {
+                            let Some(matched) = observed.files.iter().find(|obs| {
+                                eliot_platform_windows::ordinal_eq_str(
+                                    &obs.relative_path,
+                                    &file.relative_path,
+                                )
+                            }) else {
+                                ok = false;
+                                break;
+                            };
+                            if file.sha256 != matched.sha256
+                                || file.size != matched.size
+                                || file.source_identity != matched.identity
+                            {
+                                ok = false;
+                                break;
+                            }
                         }
-                    }
-                    let Ok(digest) = PlatformHandle::new(receipt.digest()) else {
-                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                        ok
                     };
-                    PortOutcome::Known(InstallationEffectExecution {
-                        evidence: vec![digest],
-                        create_disposition: None,
-                        credential_receipt: None,
-                        staging_receipt: Some(receipt),
-                    })
+                if !valid {
+                    let _ = stager.rollback(&receipt);
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
                 }
-                Err(error) => package_staging_outcome(&error),
-            }
+                let Ok(digest) = PlatformHandle::new(receipt.digest()) else {
+                    let _ = stager.rollback(&receipt);
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                };
+                PortOutcome::Known(InstallationEffectExecution {
+                    evidence: vec![digest],
+                    create_disposition: None,
+                    credential_receipt: None,
+                    staging_receipt: Some(receipt),
+                })
         }
         InstallationEffectAction::Rollback => {
             let Some(receipt) = request.staging_receipt.as_ref() else {
@@ -10637,7 +10971,8 @@ where
                     }
                     InstallerEffectPlan::RegisterService { .. } => true,
                     InstallerEffectPlan::StagePackage { .. } => {
-                        observed_precondition.os_snapshot.is_none()
+                        observed_precondition.package_snapshot.is_some()
+                            && observed_precondition.os_snapshot.is_none()
                             && observed_precondition.credential_snapshot.is_none()
                     }
                     _ => {
@@ -12668,14 +13003,45 @@ mod tests {
                 }
                 continue;
             };
-            progress.admitted_precondition =
-                Some(must(InstallationEffectPrecondition::from_change(
-                    transaction
-                        .planned_changes
-                        .iter()
-                        .find(|change| change.change_id == progress.effect_id)
-                        .unwrap_or_else(|| unreachable!()),
-                )));
+            let source_identity = match effect {
+                InstallerEffectPlan::StagePackage {
+                    source_bundle_identity,
+                    ..
+                } => *source_bundle_identity,
+                _ => unreachable!(),
+            };
+            let generation = match effect {
+                InstallerEffectPlan::StagePackage { generation, .. } => generation.clone(),
+                _ => unreachable!(),
+            };
+            let manifest_digest = must(PlatformHandle::new(manifest.canonical_digest()));
+            let snapshot = {
+                let mut snap = PackageObservationSnapshot {
+                    source_bundle_identity: source_identity,
+                    generation: generation.clone(),
+                    manifest_digest: manifest_digest.clone(),
+                    files: Vec::new(),
+                    total_bytes: 0,
+                    digest: test_handle("0".repeat(64)),
+                };
+                let digest = must(PackageObservationSnapshot::compute_digest(
+                    &snap.source_bundle_identity,
+                    &snap.generation,
+                    &snap.manifest_digest,
+                    &snap.files,
+                    snap.total_bytes,
+                ));
+                snap.digest = digest;
+                snap
+            };
+            let base = must(InstallationEffectPrecondition::from_change(
+                transaction
+                    .planned_changes
+                    .iter()
+                    .find(|change| change.change_id == progress.effect_id)
+                    .unwrap_or_else(|| unreachable!()),
+            ));
+            progress.admitted_precondition = Some(must(base.with_package_snapshot(snapshot)));
             let receipt = StagingReceipt {
                 generation: manifest.generation.clone(),
                 root_path: Path::new(staging_root.as_str()).join(&manifest.generation),
@@ -13104,6 +13470,7 @@ mod tests {
         let installation_root = test_handle(root.to_string_lossy().into_owned());
         let precondition = must(InstallationEffectPrecondition::new(
             vec![test_handle("evidence:service-precondition")],
+            None,
             None,
             None,
         ));
@@ -14419,7 +14786,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 9.0.0")
+                if reason.contains("requires explicit migration to 10.0.0")
         ));
     }
 
@@ -14443,7 +14810,7 @@ mod tests {
         let bytes = br#"{"transaction_wire_version":{"major":9,"minor":0,"patch":0},"transaction_id":"malformed"}"#;
         assert!(matches!(
             decode_installation_transaction_json(bytes),
-            Err(InstallationError::CorruptRegistry { .. })
+            Err(InstallationError::MigrationRequired { .. })
         ));
     }
 
@@ -16631,5 +16998,427 @@ mod tests {
         swapped.canonical_store_executable_path =
             test_path(&std::env::temp_dir(), "wrong-canonical-engine.exe");
         assert!(swapped.validate().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_precondition_snapshot_is_required_for_stage_package() {
+        let transaction = system_registration_transaction();
+        let index = transaction
+            .installer_effects
+            .iter()
+            .position(|e| matches!(e, InstallerEffectPlan::StagePackage { .. }))
+            .expect("stage package effect");
+        let plan = transaction.installer_effects[index].clone();
+        let change = transaction.planned_changes[index].clone();
+        let mut precondition = must(InstallationEffectPrecondition::from_change(&change));
+        let request = InstallationEffectRequest {
+            transaction_id: transaction.transaction_id.clone(),
+            plan: plan.clone(),
+            profile: transaction.profile,
+            installation_root: transaction
+                .candidate_manifest
+                .runtime_launch
+                .runtime_state_roots
+                .installation_root
+                .clone(),
+            effect_id: plan.effect_id().clone(),
+            attempt: 1,
+            plan_digest: transaction.installer_plan_digest.clone(),
+            precondition: precondition.clone(),
+            ownership_secret: None,
+            store_credential: None,
+            staging_receipt: None,
+            action: InstallationEffectAction::Apply,
+            expected_external_identity: None,
+            service_bootstrap: None,
+            registration_nonce: None,
+        };
+        assert!(
+            request.validate().is_ok(),
+            "StagePackage pre-inspect without snapshot must reach inspect"
+        );
+        let mut missing_after_intent = request.clone();
+        missing_after_intent.attempt = 2;
+        assert!(
+            missing_after_intent.validate().is_err(),
+            "StagePackage apply without package snapshot must be rejected after intent"
+        );
+        let snapshot = PackageObservationSnapshot {
+            source_bundle_identity: match &plan {
+                InstallerEffectPlan::StagePackage {
+                    source_bundle_identity,
+                    ..
+                } => *source_bundle_identity,
+                _ => unreachable!(),
+            },
+            generation: match &plan {
+                InstallerEffectPlan::StagePackage { generation, .. } => generation.clone(),
+                _ => unreachable!(),
+            },
+            manifest_digest: must(PlatformHandle::new(match &plan {
+                InstallerEffectPlan::StagePackage { manifest, .. } => manifest.canonical_digest(),
+                _ => unreachable!(),
+            })),
+            files: vec![PackageObservedFile {
+                relative_path: "bin/app.exe".to_owned(),
+                sha256: test_handle("a".repeat(64)),
+                size: 10,
+                identity: FileIdentity {
+                    volume_serial_number: 1,
+                    file_index: 2,
+                },
+            }],
+            total_bytes: 10,
+            digest: test_handle("b".repeat(64)),
+        };
+        let mut valid_snapshot = snapshot;
+        valid_snapshot.digest = must(PackageObservationSnapshot::compute_digest(
+            &valid_snapshot.source_bundle_identity,
+            &valid_snapshot.generation,
+            &valid_snapshot.manifest_digest,
+            &valid_snapshot.files,
+            valid_snapshot.total_bytes,
+        ));
+        precondition = must(precondition.with_package_snapshot(valid_snapshot));
+        let valid_request = InstallationEffectRequest {
+            precondition,
+            ..request
+        };
+        assert!(
+            valid_request.validate().is_ok(),
+            "StagePackage with valid snapshot must validate"
+        );
+    }
+
+    #[test]
+    fn package_snapshot_digest_is_ordinal_deterministic() {
+        let generation = test_handle("generation-1");
+        let manifest_digest = test_handle("a".repeat(64));
+        let identity = FileIdentity {
+            volume_serial_number: 1,
+            file_index: 2,
+        };
+        let file_a = PackageObservedFile {
+            relative_path: "bin/z.txt".to_owned(),
+            sha256: test_handle("a".repeat(64)),
+            size: 1,
+            identity,
+        };
+        let file_b = PackageObservedFile {
+            relative_path: "a.txt".to_owned(),
+            sha256: test_handle("b".repeat(64)),
+            size: 1,
+            identity: FileIdentity {
+                volume_serial_number: 1,
+                file_index: 3,
+            },
+        };
+        let unordered = vec![file_a.clone(), file_b.clone()];
+        let mut ordered = unordered.clone();
+        ordered.sort_by(|a, b| {
+            eliot_platform_windows::ordinal_cmp_str(&a.relative_path, &b.relative_path)
+        });
+        let digest_unordered = PackageObservationSnapshot::compute_digest(
+            &identity,
+            &generation,
+            &manifest_digest,
+            &unordered,
+            2,
+        )
+        .expect("digest");
+        let digest_ordered = PackageObservationSnapshot::compute_digest(
+            &identity,
+            &generation,
+            &manifest_digest,
+            &ordered,
+            2,
+        )
+        .expect("digest");
+        assert_ne!(
+            digest_unordered, digest_ordered,
+            "digest must be order-sensitive; caller must sort"
+        );
+        let snapshot = PackageObservationSnapshot {
+            source_bundle_identity: identity,
+            generation: generation.clone(),
+            manifest_digest: manifest_digest.clone(),
+            files: unordered,
+            total_bytes: 2,
+            digest: digest_unordered.clone(),
+        };
+        assert!(
+            snapshot.validate().is_err(),
+            "unsorted files must fail validation"
+        );
+        let snapshot_sorted = PackageObservationSnapshot {
+            source_bundle_identity: identity,
+            generation,
+            manifest_digest,
+            files: ordered,
+            total_bytes: 2,
+            digest: digest_ordered,
+        };
+        assert!(snapshot_sorted.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_observed_against_plan_rejects_extra_missing_and_hash_mismatch() {
+        use eliot_platform_windows::PackageFileSpec;
+        let manifest = PackageManifest::new(
+            "gen1",
+            vec![
+                PackageFileSpec::new("a.txt", false, 1024).unwrap(),
+                PackageFileSpec::new("b.txt", false, 1024).unwrap(),
+            ],
+        )
+        .unwrap();
+        let expected = vec![
+            PackageArtifactDigest {
+                relative_path: "a.txt".to_owned(),
+                sha256: test_handle(sha256_hex(b"a")),
+            },
+            PackageArtifactDigest {
+                relative_path: "b.txt".to_owned(),
+                sha256: test_handle(sha256_hex(b"b")),
+            },
+        ];
+        let observed_ok = eliot_platform_windows::PackageSourceObservation {
+            files: vec![
+                eliot_platform_windows::PackageSourceFileObservation {
+                    relative_path: "a.txt".to_owned(),
+                    sha256: sha256_hex(b"a"),
+                    identity: FileIdentity {
+                        volume_serial_number: 1,
+                        file_index: 1,
+                    },
+                    size: 1,
+                },
+                eliot_platform_windows::PackageSourceFileObservation {
+                    relative_path: "b.txt".to_owned(),
+                    sha256: sha256_hex(b"b"),
+                    identity: FileIdentity {
+                        volume_serial_number: 1,
+                        file_index: 2,
+                    },
+                    size: 1,
+                },
+            ],
+            total_bytes: 2,
+        };
+        assert!(validate_observed_against_plan(&observed_ok, &manifest, &expected).is_ok());
+        let mut observed_extra = observed_ok.clone();
+        observed_extra
+            .files
+            .push(eliot_platform_windows::PackageSourceFileObservation {
+                relative_path: "c.txt".to_owned(),
+                sha256: sha256_hex(b"c"),
+                identity: FileIdentity {
+                    volume_serial_number: 1,
+                    file_index: 3,
+                },
+                size: 1,
+            });
+        observed_extra.total_bytes = 3;
+        assert!(matches!(
+            validate_observed_against_plan(&observed_extra, &manifest, &expected),
+            Err(PackageStagingError::TreeMismatch)
+        ));
+        let mut observed_missing = observed_ok.clone();
+        observed_missing.files.pop();
+        observed_missing.total_bytes = 1;
+        assert!(matches!(
+            validate_observed_against_plan(&observed_missing, &manifest, &expected),
+            Err(PackageStagingError::TreeMismatch)
+        ));
+        let mut observed_hash = observed_ok.clone();
+        observed_hash.files[0].sha256 = sha256_hex(b"wrong");
+        assert!(matches!(
+            validate_observed_against_plan(&observed_hash, &manifest, &expected),
+            Err(PackageStagingError::HashMismatch)
+        ));
+    }
+
+    #[test]
+    fn v9_transaction_requires_migration_to_v10_with_package_snapshot() {
+        let mut legacy = must(serde_json::to_value(planned_transaction()));
+        let object = legacy.as_object_mut().unwrap();
+        object.insert(
+            "transaction_wire_version".to_owned(),
+            must(serde_json::to_value(ContractVersion::new(9, 0, 0))),
+        );
+        let bytes = must(serde_json::to_vec(&legacy));
+        assert!(matches!(
+            decode_installation_transaction_json(&bytes),
+            Err(InstallationError::MigrationRequired { reason }) if reason.contains("requires explicit migration to 10.0.0")
+        ));
+    }
+
+    #[test]
+    fn crash_reopen_without_blind_replay_requires_package_snapshot() {
+        let change = PlannedChange {
+            change_id: test_handle("change:package-crash"),
+            target: test_handle(r"C:\staging\candidate"),
+            precondition_refs: vec![test_handle("evidence:pre")],
+            postcondition_refs: vec![test_handle("evidence:post")],
+        };
+        let snapshot = {
+            let mut snap = PackageObservationSnapshot {
+                source_bundle_identity: FileIdentity {
+                    volume_serial_number: 123,
+                    file_index: 456,
+                },
+                generation: test_handle("generation:candidate"),
+                manifest_digest: test_handle("a".repeat(64)),
+                files: vec![],
+                total_bytes: 0,
+                digest: test_handle("b".repeat(64)),
+            };
+            let digest = must(PackageObservationSnapshot::compute_digest(
+                &snap.source_bundle_identity,
+                &snap.generation,
+                &snap.manifest_digest,
+                &snap.files,
+                snap.total_bytes,
+            ));
+            snap.digest = digest;
+            snap
+        };
+        let with = must(InstallationEffectPrecondition::new(
+            change.precondition_refs.clone(),
+            None,
+            None,
+            Some(snapshot.clone()),
+        ));
+        assert!(with.validate().is_ok());
+        let without = must(InstallationEffectPrecondition::from_change(&change));
+        assert!(without.validate().is_ok());
+        let request_with = InstallationEffectRequest {
+            transaction_id: test_handle("transaction:test"),
+            plan: InstallerEffectPlan::StagePackage {
+                effect_id: change.change_id.clone(),
+                source_bundle: test_handle(r"C:\source\bundle"),
+                source_bundle_identity: snapshot.source_bundle_identity,
+                generation: snapshot.generation.clone(),
+                manifest: must(PackageManifest::new("candidate", Vec::new())),
+                staging_root: test_handle(r"C:\staging"),
+                expected_file_digests: Vec::new(),
+                candidate_manifest_digest: snapshot.manifest_digest.clone(),
+            },
+            profile: InstallationProfile::PortableDev,
+            installation_root: test_handle(r"C:\portable"),
+            effect_id: change.change_id.clone(),
+            attempt: 1,
+            plan_digest: test_handle("c".repeat(64)),
+            precondition: with.clone(),
+            ownership_secret: None,
+            store_credential: None,
+            staging_receipt: None,
+            action: InstallationEffectAction::Apply,
+            expected_external_identity: None,
+            service_bootstrap: None,
+            registration_nonce: None,
+        };
+        assert!(request_with.validate().is_ok());
+        let request_without_pre = InstallationEffectRequest {
+            precondition: without.clone(),
+            ..request_with.clone()
+        };
+        assert!(
+            request_without_pre.validate().is_ok(),
+            "StagePackage pre-inspect without snapshot must be allowed"
+        );
+        let request_without = InstallationEffectRequest {
+            precondition: without,
+            attempt: 2,
+            ..request_with.clone()
+        };
+        assert!(
+            request_without.validate().is_err(),
+            "StagePackage without snapshot must be rejected after intent"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_source_observe_is_bound_to_retained_handle_and_fails_on_mutation() {
+        use eliot_platform_windows::TrustedSourceBundle;
+        let root = std::env::temp_dir().join(format!(
+            "eliot-package-observe-wiring-test-{}-{}",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        let bundle = TrustedSourceBundle::open(&root).unwrap();
+        let first = bundle.observe().unwrap();
+        assert_eq!(first.files.len(), 1);
+        assert_eq!(first.files[0].sha256, sha256_hex(b"a"));
+        std::fs::write(root.join("a.txt"), b"b").unwrap();
+        let second = bundle.observe().unwrap();
+        assert_ne!(first.files[0].sha256, second.files[0].sha256);
+        assert_eq!(second.files[0].sha256, sha256_hex(b"b"));
+        drop(bundle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn component_ordering_is_ordinal_and_unicode_aware() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            eliot_platform_windows::ordinal_cmp_str("a/c.txt", "a-b.txt"),
+            Ordering::Less,
+            "component ordering must place a/c.txt before a-b.txt"
+        );
+        assert!(
+            eliot_platform_windows::ordinal_eq_str("café.txt", "CAFÉ.TXT"),
+            "unicode case alias must be equal ordinal"
+        );
+        let generation = test_handle("generation-1");
+        let manifest_digest = test_handle("a".repeat(64));
+        let identity = FileIdentity {
+            volume_serial_number: 1,
+            file_index: 2,
+        };
+        let mut files = vec![
+            PackageObservedFile {
+                relative_path: "a-b.txt".to_owned(),
+                sha256: test_handle("a".repeat(64)),
+                size: 1,
+                identity,
+            },
+            PackageObservedFile {
+                relative_path: "a/c.txt".to_owned(),
+                sha256: test_handle("b".repeat(64)),
+                size: 1,
+                identity: FileIdentity {
+                    volume_serial_number: 1,
+                    file_index: 3,
+                },
+            },
+        ];
+        files.sort_by(|a, b| {
+            eliot_platform_windows::ordinal_cmp_str(&a.relative_path, &b.relative_path)
+        });
+        let digest = must(PackageObservationSnapshot::compute_digest(
+            &identity,
+            &generation,
+            &manifest_digest,
+            &files,
+            2,
+        ));
+        let snapshot = PackageObservationSnapshot {
+            source_bundle_identity: identity,
+            generation,
+            manifest_digest,
+            files,
+            total_bytes: 2,
+            digest,
+        };
+        assert!(
+            snapshot.validate().is_ok(),
+            "ordinal sorted snapshot must validate"
+        );
     }
 }

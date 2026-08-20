@@ -51,6 +51,7 @@ pub use package_staging::{
     PackageSourceFileObservation, PackageSourceObservation, PackageStager, PackageStagingError,
     PackageStagingObservation, PeCoffError, PeCoffEvidence, StagedDirectoryReceipt,
     StagedFileReceipt, StagingReceipt, TrustedSourceBundle, WindowsAuthenticodeVerifier,
+    ordinal_cmp_str, ordinal_component_cmp, ordinal_eq_str, ordinal_path_cmp, ordinal_path_eq,
     parse_pe_coff, validate_package_relative_path,
 };
 pub use tcp_listener_owner::{

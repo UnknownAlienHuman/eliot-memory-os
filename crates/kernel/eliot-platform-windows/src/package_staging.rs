@@ -161,7 +161,7 @@ fn is_windows_device_name(component: &str) -> bool {
         && upper.as_bytes()[3] != b'0')
 }
 
-fn ordinal_component_cmp(left: &str, right: &str) -> Ordering {
+pub fn ordinal_component_cmp(left: &str, right: &str) -> Ordering {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt as _;
@@ -175,10 +175,8 @@ fn ordinal_component_cmp(left: &str, right: &str) -> Ordering {
         let Ok(right_len) = i32::try_from(right.len()) else {
             return Ordering::Less;
         };
-        let result = unsafe {
-            // SAFETY: both UTF-16 buffers remain live for their exact lengths.
-            CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1)
-        };
+        let result =
+            unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
         match result {
             CSTR_LESS_THAN => Ordering::Less,
             CSTR_EQUAL => Ordering::Equal,
@@ -187,13 +185,11 @@ fn ordinal_component_cmp(left: &str, right: &str) -> Ordering {
     }
     #[cfg(not(windows))]
     {
-        let left_lower = left.to_ascii_lowercase();
-        let right_lower = right.to_ascii_lowercase();
-        left_lower.cmp(&right_lower)
+        left.to_lowercase().cmp(&right.to_lowercase())
     }
 }
 
-fn ordinal_path_cmp(left: &PackageRelativePath, right: &PackageRelativePath) -> Ordering {
+pub fn ordinal_path_cmp(left: &PackageRelativePath, right: &PackageRelativePath) -> Ordering {
     left.components
         .iter()
         .zip(&right.components)
@@ -202,13 +198,26 @@ fn ordinal_path_cmp(left: &PackageRelativePath, right: &PackageRelativePath) -> 
         .unwrap_or_else(|| left.components.len().cmp(&right.components.len()))
 }
 
-fn ordinal_path_eq(left: &PackageRelativePath, right: &PackageRelativePath) -> bool {
+pub fn ordinal_path_eq(left: &PackageRelativePath, right: &PackageRelativePath) -> bool {
     left.components.len() == right.components.len()
         && left
             .components
             .iter()
             .zip(&right.components)
             .all(|(left, right)| ordinal_component_cmp(left, right) == Ordering::Equal)
+}
+
+pub fn ordinal_cmp_str(a: &str, b: &str) -> Ordering {
+    let left = validate_relative_text(a);
+    let right = validate_relative_text(b);
+    match (left, right) {
+        (Ok(l), Ok(r)) => ordinal_path_cmp(&l, &r),
+        _ => a.to_lowercase().cmp(&b.to_lowercase()),
+    }
+}
+
+pub fn ordinal_eq_str(a: &str, b: &str) -> bool {
+    ordinal_cmp_str(a, b) == Ordering::Equal
 }
 
 /// One manifest file admitted to a package stage.

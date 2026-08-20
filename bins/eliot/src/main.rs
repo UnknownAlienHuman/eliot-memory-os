@@ -57,11 +57,29 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum InstallationCommand {
-    /// Validate an immutable v8 installation plan JSON without applying it.
+    /// Validate an immutable v8 installation plan JSON without applying it (untrusted import/validation only).
     Plan {
         /// Absolute path to an existing serialized `InstallationTransaction`.
         #[arg(long, value_parser = absolute_path)]
         input: PathBuf,
+    },
+    /// Sealed production planner: derive package facts from a pinned source bundle (no env/CWD/defaults).
+    PlanSealed {
+        /// Absolute path to the pinned source bundle directory.
+        #[arg(long, value_parser = absolute_path)]
+        source_bundle: PathBuf,
+        /// Absolute path to the transaction staging root.
+        #[arg(long, value_parser = absolute_path)]
+        staging_root: PathBuf,
+        /// Absolute path to the signed candidate manifest JSON.
+        #[arg(long, value_parser = absolute_path)]
+        candidate_manifest: PathBuf,
+        /// Absolute path to the signed package manifest JSON (generation + file specs, no digests).
+        #[arg(long, value_parser = absolute_path)]
+        package_manifest: PathBuf,
+        /// Absolute path to the output sealed transaction JSON.
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
     },
     /// Persist one validated constructor-produced transaction in an exact redb file.
     Create {
@@ -195,6 +213,19 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&transaction)?);
             Ok(0)
         }
+        InstallationCommand::PlanSealed {
+            source_bundle,
+            staging_root,
+            candidate_manifest,
+            package_manifest,
+            output,
+        } => run_installation_plan_sealed(
+            &source_bundle,
+            &staging_root,
+            &candidate_manifest,
+            &package_manifest,
+            &output,
+        ),
         InstallationCommand::Create { input, store } => run_installation_create(&input, &store),
         InstallationCommand::Apply {
             store,
@@ -244,6 +275,195 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             Ok(INVALID_REQUEST_EXIT)
         }
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_arguments
+)]
+fn run_installation_plan_sealed(
+    source_bundle: &Path,
+    staging_root: &Path,
+    candidate_manifest_path: &Path,
+    package_manifest_path: &Path,
+    output: &Path,
+) -> Result<i32> {
+    use eliot_installation::{
+        CandidateManifest, InstallationEpoch, InstallationProfile, ManagedEnvironmentChangeRequest,
+        PlatformHandle, SealedPackagePlanner,
+    };
+    use eliot_platform_windows::PackageManifest;
+    if output.exists() {
+        write_installation_error(
+            "INSTALLATION_PLAN_SEALED_EXISTS",
+            &format!("output already exists: {}", output.display()),
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    let candidate_bytes = match load_input(candidate_manifest_path) {
+        Ok(b) => b,
+        Err(e) => {
+            write_installation_error("INSTALLATION_PLAN_SEALED_INVALID", &e.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let candidate_manifest: CandidateManifest = match serde_json::from_slice(&candidate_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            write_installation_error("INSTALLATION_PLAN_SEALED_INVALID", &e.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let package_bytes = match load_input(package_manifest_path) {
+        Ok(b) => b,
+        Err(e) => {
+            write_installation_error("INSTALLATION_PLAN_SEALED_INVALID", &e.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let package_manifest: PackageManifest = match serde_json::from_slice(&package_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            write_installation_error("INSTALLATION_PLAN_SEALED_INVALID", &e.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let transaction_id = PlatformHandle::new(format!(
+        "transaction:sealed:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+    .unwrap();
+    let epoch = InstallationEpoch {
+        installation: PlatformHandle::new("installation:sealed").unwrap(),
+        lineage_id: PlatformHandle::new("lineage:sealed").unwrap(),
+        sequence: 1,
+    };
+    let request = ManagedEnvironmentChangeRequest {
+        request_id: PlatformHandle::new("request:sealed").unwrap(),
+        requester_and_reason: PlatformHandle::new("requester:sealed").unwrap(),
+        action: eliot_installation::ManagedEnvironmentAction::Install,
+        target_family: PlatformHandle::new("family:eliot").unwrap(),
+        exact_candidate: candidate_manifest.generation.clone(),
+        expected_delta: PlatformHandle::new("delta:installed").unwrap(),
+        source_assurance_refs: vec![PlatformHandle::new("evidence:source").unwrap()],
+        affected_refs: vec![],
+        impact_class: PlatformHandle::new("impact:sealed").unwrap(),
+        required_owner: PlatformHandle::new("owner:installation").unwrap(),
+        rollback_plan: PlatformHandle::new("rollback:sealed").unwrap(),
+        verifier: PlatformHandle::new("verifier:sealed").unwrap(),
+        budget: PlatformHandle::new("budget:sealed").unwrap(),
+        stop_condition: PlatformHandle::new("stop:on-failure").unwrap(),
+    };
+    let runtime_roots = candidate_manifest
+        .runtime_launch
+        .runtime_state_roots
+        .clone();
+    let profile = candidate_manifest.runtime_launch.profile;
+    let mut changes = Vec::new();
+    let mut effects = Vec::new();
+    let roots_list: Vec<(&str, &PlatformHandle)> = vec![
+        ("installation_root", &runtime_roots.installation_root),
+        ("host_state_root", &runtime_roots.host_state_root),
+        ("kernel_ors_root", &runtime_roots.kernel_ors_root),
+        ("kernel_work_root", &runtime_roots.kernel_work_root),
+        ("store_data_root", &runtime_roots.store_data_root),
+        ("store_work_root", &runtime_roots.store_work_root),
+        ("store_temp_root", &runtime_roots.store_temp_root),
+        ("watchdog_state_root", &runtime_roots.watchdog_state_root),
+    ];
+    for (field, root) in roots_list {
+        let eff = eliot_installation::InstallerEffectPlan::CreateRoot {
+            effect_id: PlatformHandle::new(format!("effect:create:{field}")).unwrap(),
+            root: root.clone(),
+        };
+        let ch = eliot_installation::PlannedChange {
+            change_id: PlatformHandle::new(format!("effect:create:{field}")).unwrap(),
+            target: root.clone(),
+            precondition_refs: vec![PlatformHandle::new("evidence:pre").unwrap()],
+            postcondition_refs: vec![PlatformHandle::new("evidence:post").unwrap()],
+        };
+        effects.push(eff);
+        changes.push(ch);
+        let principals = match profile {
+            InstallationProfile::SystemService => vec![
+                eliot_installation::InstallerAclPrincipal::Administrators,
+                eliot_installation::InstallerAclPrincipal::LocalService,
+                eliot_installation::InstallerAclPrincipal::LocalSystem,
+            ],
+            _ => vec![
+                eliot_installation::InstallerAclPrincipal::CurrentUser,
+                eliot_installation::InstallerAclPrincipal::LocalSystem,
+            ],
+        };
+        let eff2 = eliot_installation::InstallerEffectPlan::ApplyAcl {
+            effect_id: PlatformHandle::new(format!("effect:acl:{field}")).unwrap(),
+            root: root.clone(),
+            principals,
+        };
+        let ch2 = eliot_installation::PlannedChange {
+            change_id: PlatformHandle::new(format!("effect:acl:{field}")).unwrap(),
+            target: root.clone(),
+            precondition_refs: vec![PlatformHandle::new("evidence:pre2").unwrap()],
+            postcondition_refs: vec![PlatformHandle::new("evidence:post2").unwrap()],
+        };
+        effects.push(eff2);
+        changes.push(ch2);
+    }
+    let source_handle = PlatformHandle::new(source_bundle.to_string_lossy().into_owned())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let staging_handle = PlatformHandle::new(staging_root.to_string_lossy().into_owned())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let transaction = match SealedPackagePlanner::plan(
+        transaction_id,
+        epoch,
+        profile,
+        request,
+        candidate_manifest,
+        staging_handle,
+        source_handle,
+        package_manifest,
+        changes,
+        effects,
+        1,
+        vec![PlatformHandle::new("evidence:plan").unwrap()],
+        PlatformHandle::new("recovery:sealed").unwrap(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            write_installation_error("INSTALLATION_PLAN_SEALED_INVALID", &e.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let json = serde_json::to_vec_pretty(&transaction).unwrap();
+    if let Some(parent) = output.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            write_installation_error("INSTALLATION_PLAN_SEALED_INVALID", &e.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    file.write_all(&json).unwrap();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &json!({"status":"SEALED_PLANNED","output":output.display().to_string(),"transaction_id":transaction.transaction_id})
+        )?
+    );
+    Ok(0)
 }
 
 fn run_installation_create(input: &Path, store_path: &Path) -> Result<i32> {
