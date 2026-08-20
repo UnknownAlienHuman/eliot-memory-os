@@ -10,9 +10,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use eliot_contracts::{ArtifactId, ContractId, TransactionSequence};
 pub use eliot_contracts::{
     ContractError, ContractVersion, ErrorCode, OperationId, RequestMetadata, StateFence,
     canonical_json_bytes, sha256_hex,
+};
+use eliot_receipts::{
+    ArtifactBinding, AuthorityBinding, CausalBinding, OperationBinding, ProofCeiling, ReceiptCore,
+    ReceiptDisposition, ReceiptKind, RequestBinding, SessionBinding, TaskBinding, WorkScopeBinding,
+    contract_identity as receipt_contract_identity,
 };
 pub use eliot_receipts::{EffectClass, ReceiptEnvelope};
 pub use eliot_security_contracts::{
@@ -979,6 +985,13 @@ impl WriteReceipt {
         }
         if let Some(envelope) = &self.envelope {
             envelope.validate().map_err(StoreError::Receipt)?;
+            if envelope.core.operation.operation_id != self.operation_id
+                || envelope.core.operation.idempotency_key != self.idempotency_key
+                || envelope.core.request.state_fence != self.state_fence
+                || envelope.core.operation.state_fence != self.state_fence
+            {
+                return Err(StoreError::InvalidReceipt);
+            }
         }
         Ok(())
     }
@@ -990,6 +1003,251 @@ impl WriteReceipt {
         self.envelope
             .as_ref()
             .ok_or(StoreError::MissingReceiptEnvelope)
+    }
+}
+
+/// Issues the one store-owned receipt envelope for a planned committed write.
+///
+/// The adapters call this after deriving the complete top-level receipt and
+/// before sending their atomic transaction.  The envelope binds the exact
+/// request metadata, prepared transition, derived plan fields and durable
+/// commit sequence.  No caller-provided envelope is accepted, and no clock or
+/// environment value is consulted while issuing it.
+pub fn issue_store_receipt_envelope(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    receipt: &WriteReceipt,
+    commit_sequence: u64,
+) -> Result<ReceiptEnvelope, StoreError> {
+    validate_receipt_inputs(context, transition, receipt, commit_sequence)?;
+
+    let state_fence = context.state_fence.clone();
+    let task = receipt_task(context, transition, &state_fence)?;
+    let session = receipt_session(context, &state_fence);
+    let artifacts = receipt_artifacts(transition, receipt, commit_sequence)?;
+    let operation_id = transition.identity.operation_id.clone();
+    let operation_kind = operation_kind(transition.transition_class);
+    let proof_ceiling = proof_ceiling_for(transition.requested_effect_ceiling);
+
+    ReceiptEnvelope::issue(ReceiptCore {
+        contract: receipt_contract_identity().map_err(StoreError::Receipt)?,
+        kind: ReceiptKind::Operation,
+        work_scope: WorkScopeBinding {
+            scope_id: eliot_receipts::WorkScopeId::new(transition.scope_id.to_string())
+                .map_err(StoreError::Receipt)?,
+            product_id: context.product_id.clone(),
+            resource_generation: state_fence.resource_generation,
+            state_fence: state_fence.clone(),
+        },
+        task,
+        session,
+        causal: CausalBinding {
+            state_fence: state_fence.clone(),
+            // Store commit order is bound by the plan artifact above.  The
+            // receipt causal chain remains a valid genesis chain because the
+            // current store plan has no authoritative predecessor receipt id.
+            transaction_sequence: TransactionSequence::genesis(),
+            parent_receipt_id: None,
+            predecessor_receipt_ids: Vec::new(),
+        },
+        request: RequestBinding {
+            metadata: context.clone(),
+            state_fence: state_fence.clone(),
+        },
+        operation: OperationBinding {
+            operation_id,
+            request_id: context.request_id.clone(),
+            idempotency_key: transition.identity.idempotency_key.clone(),
+            operation_kind: operation_kind.to_owned(),
+            effect: transition.requested_effect_ceiling,
+            state_fence: state_fence.clone(),
+        },
+        authority: AuthorityBinding {
+            authority_id: ContractId::new(format!(
+                "eliot-store-manifest:{}",
+                transition.operation_manifest_digest
+            ))
+            .map_err(StoreError::Foundation)?,
+            authority_owner: context.source_id.to_string(),
+            authority_epoch: state_fence.authority_epoch,
+            state_fence: state_fence.clone(),
+            allowed_effect: transition.requested_effect_ceiling,
+            proof_ceiling,
+        },
+        artifacts,
+        verifier: None,
+        problem: None,
+        coordination: None,
+        disposition: ReceiptDisposition::Success {
+            proof: proof_ceiling,
+        },
+    })
+    .map_err(StoreError::Receipt)
+}
+
+fn validate_receipt_inputs(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    receipt: &WriteReceipt,
+    commit_sequence: u64,
+) -> Result<(), StoreError> {
+    context.validate().map_err(StoreError::Foundation)?;
+    transition.validate()?;
+    if receipt.envelope.is_some() {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let expected_committed_at = format!("commit-sequence-{commit_sequence:016}");
+    let identity_matches = context.state_fence == transition.state_fence
+        && context.state_fence == receipt.state_fence
+        && receipt.operation_id == transition.identity.operation_id
+        && receipt.idempotency_key == transition.identity.idempotency_key
+        && receipt.canonical_request_hash == transition.identity.canonical_request_hash
+        && receipt.transition_class == transition.transition_class
+        && receipt.operation_manifest_digest == transition.operation_manifest_digest
+        && receipt.status == WriteReceiptStatus::Committed
+        && receipt.commit_id.is_some()
+        && receipt.committed_at.as_deref() == Some(expected_committed_at.as_str())
+        && transition.task_id.as_deref()
+            == context
+                .task_id
+                .as_ref()
+                .map(eliot_contracts::TaskId::as_str);
+    if identity_matches {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidReceipt)
+    }
+}
+
+fn receipt_task(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    state_fence: &StateFence,
+) -> Result<Option<TaskBinding>, StoreError> {
+    if transition.task_id.as_deref()
+        != context
+            .task_id
+            .as_ref()
+            .map(eliot_contracts::TaskId::as_str)
+    {
+        return Err(StoreError::InvalidReceipt);
+    }
+    match (&context.task_id, state_fence.task_revision) {
+        (Some(task_id), Some(task_revision)) => Ok(Some(TaskBinding {
+            task_id: task_id.clone(),
+            task_revision,
+            state_fence: state_fence.clone(),
+        })),
+        (None, None) => Ok(None),
+        _ => Err(StoreError::InvalidReceipt),
+    }
+}
+
+fn receipt_session(context: &RequestMeta, state_fence: &StateFence) -> Option<SessionBinding> {
+    context.session_id.clone().map(|session_id| SessionBinding {
+        session_id,
+        authority_epoch: state_fence.authority_epoch,
+        state_fence: state_fence.clone(),
+    })
+}
+
+fn receipt_artifacts(
+    transition: &PreparedTransition,
+    receipt: &WriteReceipt,
+    commit_sequence: u64,
+) -> Result<Vec<ArtifactBinding>, StoreError> {
+    let transition_digest = digest_for_receipt(transition)?;
+    let plan_digest = digest_for_receipt(&(
+        &receipt.commit_id,
+        commit_sequence,
+        &receipt.ordering_sequences,
+        &receipt.revision_before_after,
+        &receipt.applied_command_ids,
+        &receipt.emitted_event_ids,
+        &receipt.projection_refs,
+        &receipt.outbox_refs,
+        &receipt.operation_manifest_digest,
+        &receipt.committed_at,
+    ))?;
+    let operation_id = transition.identity.operation_id.clone();
+    let commit_id = receipt
+        .commit_id
+        .as_ref()
+        .ok_or(StoreError::InvalidReceipt)?;
+    Ok(vec![
+        ArtifactBinding {
+            artifact_id: ArtifactId::new(format!("store-transition:{operation_id}"))
+                .map_err(StoreError::Foundation)?,
+            sha256: transition_digest,
+            role: ReceiptKind::Operation,
+            source_revision: Some(transition.operation_manifest_digest.to_string()),
+        },
+        ArtifactBinding {
+            artifact_id: ArtifactId::new(format!("store-plan:{commit_id}"))
+                .map_err(StoreError::Foundation)?,
+            sha256: plan_digest,
+            role: ReceiptKind::Artifact,
+            source_revision: Some(format!("commit-sequence-{commit_sequence:016}")),
+        },
+    ])
+}
+
+fn operation_kind(class: TransitionClass) -> &'static str {
+    match class {
+        TransitionClass::CaptureCandidate => "store.apply.capture_candidate",
+        TransitionClass::Epistemic => "store.apply.epistemic",
+        TransitionClass::TaskControl => "store.apply.task_control",
+        TransitionClass::LifecyclePolicy => "store.apply.lifecycle_policy",
+        TransitionClass::RecoverySchema => "store.apply.recovery_schema",
+    }
+}
+
+/// Rebuilds the store-owned envelope from a durable receipt and rejects any
+/// substitution, duplicate or payload/hash mismatch observed during replay.
+///
+/// The commit sequence is recovered only from the receipt's deterministic
+/// `committed_at` marker; malformed markers fail closed rather than falling
+/// back to a clock, environment or caller value.
+pub fn validate_store_receipt_envelope(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    receipt: &WriteReceipt,
+) -> Result<(), StoreError> {
+    let commit_sequence = receipt_commit_sequence(receipt)?;
+    let mut candidate = receipt.clone();
+    candidate.envelope = None;
+    let expected = issue_store_receipt_envelope(context, transition, &candidate, commit_sequence)?;
+    match receipt.envelope.as_ref() {
+        Some(actual) if actual == &expected => Ok(()),
+        Some(_) => Err(StoreError::InvalidReceipt),
+        None => Err(StoreError::MissingReceiptEnvelope),
+    }
+}
+
+fn receipt_commit_sequence(receipt: &WriteReceipt) -> Result<u64, StoreError> {
+    let value = receipt
+        .committed_at
+        .as_deref()
+        .and_then(|value| value.strip_prefix("commit-sequence-"))
+        .ok_or(StoreError::InvalidReceipt)?;
+    if value.len() != 16 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(StoreError::InvalidReceipt);
+    }
+    value.parse().map_err(|_| StoreError::InvalidReceipt)
+}
+
+fn digest_for_receipt<T: Serialize>(value: &T) -> Result<String, StoreError> {
+    let bytes = canonical_json_bytes(value)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn proof_ceiling_for(effect: EffectClass) -> ProofCeiling {
+    match effect {
+        EffectClass::Read => ProofCeiling::Observation,
+        EffectClass::Candidate => ProofCeiling::CandidateArtifact,
+        EffectClass::ReversibleMutation => ProofCeiling::ScopedVerification,
+        EffectClass::ExternalEffect => ProofCeiling::ObservedExternalEffect,
     }
 }
 

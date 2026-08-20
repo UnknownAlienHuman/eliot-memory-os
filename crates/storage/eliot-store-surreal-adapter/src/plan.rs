@@ -13,7 +13,8 @@ use eliot_store_api::{
     OutboxIntent, OutboxState, PreparedTransition, ProjectionMode, ProjectionPublicationId,
     ProjectionPublicationRecord, ProjectionStatus, RequestMeta, Resubmission, RevisionDelta,
     RevisionHead, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
-    canonical_json_bytes, sha256_hex,
+    canonical_json_bytes, issue_store_receipt_envelope, sha256_hex,
+    validate_store_receipt_envelope,
 };
 
 use crate::error::AdapterError;
@@ -21,6 +22,7 @@ use crate::error::AdapterError;
 /// Planned durable effects of one committed transition.
 #[derive(Clone, Debug)]
 pub(crate) struct ApplyPlan {
+    pub(crate) commit_sequence: u64,
     pub(crate) committed_at: String,
     pub(crate) commit_id: CommitId,
     pub(crate) revision_before_after: Vec<RevisionDelta>,
@@ -44,6 +46,7 @@ pub(crate) fn plan_apply(
     next_outbox_sequence: u64,
 ) -> Result<ApplyPlan, StoreError> {
     transition.validate()?;
+    let commit_sequence = next_commit_sequence;
     let committed_at = format!("commit-sequence-{next_commit_sequence:016}");
     let next_commit_sequence =
         checked_increment(next_commit_sequence, "commit.sequence", "sequence overflow")?;
@@ -105,6 +108,7 @@ pub(crate) fn plan_apply(
     )?;
 
     Ok(ApplyPlan {
+        commit_sequence,
         committed_at,
         commit_id,
         revision_before_after,
@@ -121,10 +125,11 @@ pub(crate) fn plan_apply(
 
 /// Builds and validates the immutable write receipt for a planned transition.
 pub(crate) fn build_receipt(
+    ctx: &RequestMeta,
     transition: &PreparedTransition,
     plan: &ApplyPlan,
 ) -> Result<WriteReceipt, StoreError> {
-    let receipt = WriteReceipt {
+    let mut receipt = WriteReceipt {
         operation_id: transition.identity.operation_id.clone(),
         idempotency_key: transition.identity.idempotency_key.clone(),
         canonical_request_hash: transition.identity.canonical_request_hash.clone(),
@@ -152,6 +157,12 @@ pub(crate) fn build_receipt(
         committed_at: Some(plan.committed_at.clone()),
         envelope: None,
     };
+    receipt.envelope = Some(issue_store_receipt_envelope(
+        ctx,
+        transition,
+        &receipt,
+        plan.commit_sequence,
+    )?);
     receipt.validate()?;
     Ok(receipt)
 }
@@ -162,6 +173,7 @@ pub(crate) fn validate_receipt_identity(
     ctx: &RequestMeta,
     transition: &PreparedTransition,
 ) -> Result<(), AdapterError> {
+    receipt.validate()?;
     if receipt.operation_id != transition.identity.operation_id
         || receipt.idempotency_key != transition.identity.idempotency_key
         || receipt.canonical_request_hash != transition.identity.canonical_request_hash
@@ -171,6 +183,7 @@ pub(crate) fn validate_receipt_identity(
     {
         return Err(AdapterError::Store(StoreError::InvalidReceipt));
     }
+    validate_store_receipt_envelope(ctx, transition, receipt)?;
     Ok(())
 }
 
@@ -324,4 +337,106 @@ fn ensure_unique_ordering_scopes(scopes: &[OrderingScopeId]) -> Result<(), Store
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{
+        AuthorityEpoch, ClockReading, ProductId, RequestId, ResourceGeneration, SourceId,
+    };
+    use eliot_store_api::{
+        EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        OperationId, OperationIdentity, OperationManifestDigest, OrderingScopeId, ReceiptEnvelope,
+        ScopeId, SecurityContext, StateFence, TransitionClass,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn fixture() -> Result<(RequestMeta, PreparedTransition), StoreError> {
+        let state_fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let context = RequestMeta {
+            request_id: RequestId::new("request-1").map_err(StoreError::Foundation)?,
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-1").map_err(StoreError::Foundation)?,
+            source_id: SourceId::new("source-1").map_err(StoreError::Foundation)?,
+            state_fence: state_fence.clone(),
+            clock: ClockReading {
+                valid_time_ms: Some(1),
+                known_time_ms: Some(1),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+        };
+        let operation = "op-envelope";
+        let transition = PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new(operation).map_err(StoreError::Foundation)?,
+                idempotency_key: format!("idem-{operation}"),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence,
+            scope_id: ScopeId::new("scope-1")?,
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "a".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-1")?,
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(String::from("subject"), json!(operation))]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: vec![String::from("task_state")],
+                relation_kinds: vec![String::from("causes")],
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        };
+        Ok((context, transition))
+    }
+
+    #[test]
+    fn build_receipt_binds_authoritative_context_and_is_deterministic() -> Result<(), StoreError> {
+        let (context, transition) = fixture()?;
+        let plan = plan_apply(&transition, &[], &[], 1, 1)?;
+        let first = build_receipt(&context, &transition, &plan)?;
+        let replay = build_receipt(&context, &transition, &plan)?;
+
+        assert_eq!(first, replay);
+        assert_eq!(
+            first
+                .require_reconciliation_envelope()?
+                .core
+                .request
+                .metadata,
+            context
+        );
+        validate_store_receipt_envelope(&context, &transition, &first)?;
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_identity_rejects_transition_and_envelope_substitution() -> Result<(), StoreError> {
+        let (context, transition) = fixture()?;
+        let plan = plan_apply(&transition, &[], &[], 1, 1)?;
+        let receipt = build_receipt(&context, &transition, &plan)?;
+
+        let mut substituted_transition = transition.clone();
+        substituted_transition.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!("substituted"));
+        assert!(validate_receipt_identity(&receipt, &context, &substituted_transition).is_err());
+
+        let mut substituted_core = receipt.require_reconciliation_envelope()?.core.clone();
+        substituted_core.operation.operation_kind = "store.apply.substituted".to_owned();
+        let mut substituted_receipt = receipt.clone();
+        substituted_receipt.envelope =
+            Some(ReceiptEnvelope::issue(substituted_core).map_err(StoreError::Receipt)?);
+        assert!(validate_receipt_identity(&substituted_receipt, &context, &transition).is_err());
+        Ok(())
+    }
 }

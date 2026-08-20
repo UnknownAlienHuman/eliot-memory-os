@@ -17,7 +17,8 @@ use eliot_store_api::{
     ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RequestMeta,
     Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
     ScopeRevisionView, SplitView, StateFence, StoreError, StoreHealth, StoreHealthStatus,
-    WriteReceipt, WriteReceiptStatus, canonical_json_bytes, sha256_hex,
+    WriteReceipt, WriteReceiptStatus, canonical_json_bytes, issue_store_receipt_envelope,
+    sha256_hex, validate_store_receipt_envelope,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -81,9 +82,14 @@ impl MemoryStore {
         let mut state = self.lock_state()?;
         let canonical_hash = transition.identity.canonical_request_hash.clone();
         let idempotency_key = transition.identity.idempotency_key.clone();
-        if let Some(receipt) =
-            existing_receipt(&state, &operation_key, &idempotency_key, &canonical_hash)?
-        {
+        if let Some(receipt) = existing_receipt(
+            &state,
+            ctx,
+            &transition,
+            &operation_key,
+            &idempotency_key,
+            &canonical_hash,
+        )? {
             return Ok(receipt);
         }
         validate_transaction_state(
@@ -93,13 +99,8 @@ impl MemoryStore {
             expected_ordering_heads,
         )?;
         let plan = transaction_plan(&state, &transition, &operation_key)?;
-        let receipt = transaction_receipt(
-            &transition,
-            idempotency_key,
-            canonical_hash,
-            &plan,
-            state.next_commit_sequence,
-        )?;
+        let receipt =
+            transaction_receipt(ctx, &transition, idempotency_key, canonical_hash, &plan)?;
         Ok(commit_transaction(
             &mut state,
             transition,
@@ -124,6 +125,8 @@ fn validate_transaction(
 
 fn existing_receipt(
     state: &MemoryState,
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
     operation_key: &str,
     idempotency_key: &str,
     canonical_hash: &str,
@@ -132,6 +135,7 @@ fn existing_receipt(
         if receipt.idempotency_key == idempotency_key
             && receipt.canonical_request_hash == canonical_hash
         {
+            validate_store_receipt_envelope(ctx, transition, receipt)?;
             return Ok(Some(receipt.clone()));
         }
         return Err(StoreError::IdentityConflict);
@@ -143,6 +147,7 @@ fn existing_receipt(
             && existing_operation == operation_key
             && let Some(receipt) = state.receipts_by_operation.get(existing_operation)
         {
+            validate_store_receipt_envelope(ctx, transition, receipt)?;
             return Ok(Some(receipt.clone()));
         }
         return Err(StoreError::IdentityConflict);
@@ -172,6 +177,7 @@ fn validate_transaction_state(
 }
 
 struct TransactionPlan {
+    commit_sequence: u64,
     revision_before_after: Vec<RevisionDelta>,
     next_revision_heads: Vec<RevisionHead>,
     next_ordering_heads: Vec<OrderingHead>,
@@ -189,11 +195,9 @@ fn transaction_plan(
     transition: &PreparedTransition,
     operation_key: &str,
 ) -> Result<TransactionPlan, StoreError> {
-    let next_commit_sequence = checked_increment(
-        state.next_commit_sequence,
-        "commit.sequence",
-        "sequence overflow",
-    )?;
+    let commit_sequence = state.next_commit_sequence;
+    let next_commit_sequence =
+        checked_increment(commit_sequence, "commit.sequence", "sequence overflow")?;
     let revision_keys = revision_keys(transition)?;
     let mut revision_before_after = Vec::with_capacity(revision_keys.len());
     let mut next_revision_heads = Vec::with_capacity(revision_keys.len());
@@ -251,6 +255,7 @@ fn transaction_plan(
         state.next_outbox_sequence,
     )?;
     Ok(TransactionPlan {
+        commit_sequence,
         revision_before_after,
         next_revision_heads,
         next_ordering_heads,
@@ -265,13 +270,13 @@ fn transaction_plan(
 }
 
 fn transaction_receipt(
+    ctx: &RequestMeta,
     transition: &PreparedTransition,
     idempotency_key: String,
     canonical_hash: String,
     plan: &TransactionPlan,
-    commit_sequence: u64,
 ) -> Result<WriteReceipt, StoreError> {
-    let receipt = WriteReceipt {
+    let mut receipt = WriteReceipt {
         operation_id: transition.identity.operation_id.clone(),
         idempotency_key,
         canonical_request_hash: canonical_hash,
@@ -296,9 +301,15 @@ fn transaction_receipt(
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
         error_code: None,
         resubmission: Resubmission::None,
-        committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
+        committed_at: Some(format!("commit-sequence-{:016}", plan.commit_sequence)),
         envelope: None,
     };
+    receipt.envelope = Some(issue_store_receipt_envelope(
+        ctx,
+        transition,
+        &receipt,
+        plan.commit_sequence,
+    )?);
     receipt.validate()?;
     Ok(receipt)
 }
@@ -924,6 +935,67 @@ mod tests {
         let replay = store.apply_transaction(&ctx, prepared, &[], &[])?;
         assert_eq!(first, replay);
         assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    #[test]
+    fn committed_receipt_has_exact_reconciliation_envelope() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = transition("op-envelope", &state_fence)?;
+
+        let receipt = store.apply_transaction(&ctx, prepared.clone(), &[], &[])?;
+        assert!(receipt.require_reconciliation_envelope().is_ok());
+        validate_store_receipt_envelope(&ctx, &prepared, &receipt)?;
+        let envelope = receipt
+            .envelope
+            .as_ref()
+            .ok_or(StoreError::MissingReceiptEnvelope)?;
+        assert_eq!(envelope.core.request.metadata, ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_rejects_prepared_payload_substitution() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = transition("op-substitution", &state_fence)?;
+        store.apply_transaction(&ctx, prepared.clone(), &[], &[])?;
+
+        let mut substituted = prepared;
+        substituted.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!("substituted"));
+        assert_eq!(
+            store.apply_transaction(&ctx, substituted, &[], &[]),
+            Err(StoreError::InvalidReceipt)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_rejects_receipt_envelope_substitution() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let first = transition("op-envelope-a", &state_fence)?;
+        let second = transition("op-envelope-b", &state_fence)?;
+        store.apply_transaction(&ctx, first.clone(), &[], &[])?;
+        let second_receipt = store.apply_transaction(&ctx, second, &[], &[])?;
+        {
+            let mut state = store.lock_state()?;
+            let stored = state
+                .receipts_by_operation
+                .get_mut(first.identity.operation_id.as_str())
+                .ok_or(StoreError::ReceiptNotFound)?;
+            stored.envelope = second_receipt.envelope;
+        }
+        assert_eq!(
+            store.apply_transaction(&ctx, first, &[], &[]),
+            Err(StoreError::InvalidReceipt)
+        );
         Ok(())
     }
 

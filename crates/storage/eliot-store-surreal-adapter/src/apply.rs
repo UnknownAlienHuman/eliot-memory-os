@@ -20,7 +20,7 @@ use eliot_store_api::{
     CONTRACT_VERSION, CanonicalValidationSnapshot, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StateFence,
-    StoreError, StoreHealth, StoreHealthStatus, WriteReceipt,
+    StoreError, StoreHealth, StoreHealthStatus, WriteReceipt, validate_store_receipt_envelope,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -447,7 +447,7 @@ pub(crate) async fn apply_prepared(
 
     let _guard = adapter.write_lock.lock().await;
 
-    match read_idempotency(db, &adapter.config, &transition).await? {
+    match read_idempotency(db, &adapter.config, ctx, &transition).await? {
         Idempotency::Replay(receipt) => {
             validate_receipt_identity(&receipt, ctx, &transition)?;
             return Ok(receipt);
@@ -489,7 +489,7 @@ pub(crate) async fn apply_prepared(
         next_commit_sequence,
         next_outbox_sequence,
     )?;
-    let receipt = build_receipt(&transition, &plan)?;
+    let receipt = build_receipt(ctx, &transition, &plan)?;
 
     write_transaction(
         db,
@@ -550,6 +550,7 @@ async fn read_receipt_by_operation(
     let receipt = take_optional::<WriteReceipt>(&mut response, 0)?;
     if let Some(receipt) = &receipt {
         receipt.validate()?;
+        receipt.require_reconciliation_envelope()?;
     }
     Ok(receipt)
 }
@@ -557,6 +558,7 @@ async fn read_receipt_by_operation(
 async fn read_idempotency(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
+    ctx: &eliot_store_api::RequestMeta,
     transition: &eliot_store_api::PreparedTransition,
 ) -> Result<Idempotency, AdapterError> {
     let mut bindings = Map::new();
@@ -584,6 +586,7 @@ async fn read_idempotency(
         return if receipt.idempotency_key == transition.identity.idempotency_key
             && receipt.canonical_request_hash == transition.identity.canonical_request_hash
         {
+            validate_store_receipt_envelope(ctx, transition, &receipt)?;
             Ok(Idempotency::Replay(receipt))
         } else {
             Ok(Idempotency::Conflict)
@@ -594,6 +597,7 @@ async fn read_idempotency(
         return if receipt.canonical_request_hash == transition.identity.canonical_request_hash
             && receipt.operation_id == transition.identity.operation_id
         {
+            validate_store_receipt_envelope(ctx, transition, &receipt)?;
             Ok(Idempotency::Replay(receipt))
         } else {
             Ok(Idempotency::Conflict)
