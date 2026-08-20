@@ -209,6 +209,8 @@ pub struct KernelService {
     ready: Option<KernelReadyReceipt>,
     failure: Option<ServiceFailure>,
     generation_fenced: bool,
+    store_rebind_receipt: Option<crate::protocol::StoreRebindReceipt>,
+    store_rebind_request_digest: Option<String>,
 }
 
 impl KernelService {
@@ -232,6 +234,8 @@ impl KernelService {
             ready: None,
             failure: None,
             generation_fenced: false,
+            store_rebind_receipt: None,
+            store_rebind_request_digest: None,
         })
     }
 
@@ -339,6 +343,18 @@ impl KernelService {
                 return Err(KernelServiceError::InvalidField {
                     field: "activation_query",
                     reason: "activation reconciliation requires the authenticated request boundary",
+                });
+            }
+            KernelControlCommand::RebindStore(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "store_rebind",
+                    reason: "Store rebind requires the authenticated Kernel composition boundary",
+                });
+            }
+            KernelControlCommand::ReconcileRebindStore(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "store_rebind_query",
+                    reason: "Store rebind reconciliation requires the authenticated request boundary",
                 });
             }
             KernelControlCommand::ProbeReady => {
@@ -451,6 +467,115 @@ impl KernelService {
                 field: "activation_query",
             }),
         }
+    }
+
+    /// Admits a Store-only same-lineage rebind without restarting Kernel.
+    ///
+    /// Validates the immutable requirement, fresh Store process/Job, current
+    /// candidate/generation/authority epoch and Store fence, transitions
+    /// `Ready -> Degraded`, preserves PID/start/Job, authority epoch,
+    /// generation and consumed activation nonce, and returns a bound receipt
+    /// without clearing initial one-shot flags.
+    pub fn rebind_store(
+        &mut self,
+        handoff: &crate::protocol::StoreRebindHandoff,
+        request_digest: String,
+    ) -> Result<crate::protocol::StoreRebindReceipt, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        if self.state != KernelServiceState::Ready {
+            return Err(KernelServiceError::IllegalTransition {
+                from: self.state,
+                to: KernelServiceState::Degraded,
+            });
+        }
+        let candidate = self
+            .candidate
+            .as_ref()
+            .ok_or(KernelServiceError::HandshakeMismatch {
+                field: "missing_candidate",
+            })?;
+        if self.activation_receipt.is_none() || self.activation_request_digest.is_none() {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "missing_activation",
+            });
+        }
+        handoff.validate()?;
+        if handoff.candidate_binding_digest != candidate.compute_digest()? {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "store_rebind.candidate_binding",
+            });
+        }
+        if request_digest.len() != 64
+            || !request_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "store_rebind.request_digest",
+            });
+        }
+        if self.store_rebind_receipt.is_some() || self.store_rebind_request_digest.is_some() {
+            if self.store_rebind_request_digest.as_deref() == Some(request_digest.as_str())
+                && self.store_rebind_receipt.as_ref().is_some_and(|r| {
+                    r.operation_id == handoff.operation_id && r.request_digest == request_digest
+                })
+            {
+                return Ok(self.store_rebind_receipt.clone().unwrap());
+            }
+            return Err(KernelServiceError::InvalidField {
+                field: "store_rebind.operation_id",
+                reason: "Store rebind already consumed for this lineage",
+            });
+        }
+        self.transition(KernelServiceState::Degraded)?;
+        self.ready = None;
+        self.failure = Some(ServiceFailure::Contract(
+            "store-rebind:degraded-for-fence".to_owned(),
+        ));
+        let requirement_digest = handoff.compute_requirement_digest()?;
+        let receipt = crate::protocol::StoreRebindReceipt {
+            operation_id: handoff.operation_id.clone(),
+            request_digest: request_digest.clone(),
+            requirement_digest,
+            process_binding: handoff.process_binding.clone(),
+            candidate_binding_digest: handoff.candidate_binding_digest.clone(),
+            generation: handoff.generation,
+            authority_epoch: handoff.authority_epoch,
+            store_fence: handoff.store_fence.clone(),
+        };
+        receipt.validate()?;
+        self.store_rebind_receipt = Some(receipt.clone());
+        self.store_rebind_request_digest = Some(request_digest);
+        Ok(receipt)
+    }
+
+    /// Reconciles an unknown Store rebind delivery without resending authority.
+    pub fn reconcile_store_rebind(
+        &self,
+        query: &crate::protocol::StoreRebindQuery,
+    ) -> Result<Option<crate::protocol::StoreRebindReceipt>, KernelServiceError> {
+        query.validate()?;
+        match (
+            self.store_rebind_receipt.as_ref(),
+            self.store_rebind_request_digest.as_deref(),
+        ) {
+            (Some(receipt), Some(digest))
+                if receipt.operation_id == query.operation_id && digest == query.request_digest =>
+            {
+                Ok(Some(receipt.clone()))
+            }
+            (None, None) => Ok(None),
+            _ => Err(KernelServiceError::HandshakeMismatch {
+                field: "store_rebind_query",
+            }),
+        }
+    }
+
+    /// Returns the last Store rebind receipt, if any.
+    pub fn store_rebind_receipt(&self) -> Option<&crate::protocol::StoreRebindReceipt> {
+        self.store_rebind_receipt.as_ref()
     }
 
     /// Publishes an initial, repeated, or recovery readiness receipt after

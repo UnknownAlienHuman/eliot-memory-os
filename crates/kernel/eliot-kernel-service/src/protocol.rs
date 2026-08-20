@@ -293,6 +293,188 @@ impl StoreBootstrapHandoff {
     }
 }
 
+/// Typed Store-only same-lineage rebind handoff. It is distinct from
+/// `StoreBootstrapHandoff` and binds the immutable requirement, fresh
+/// Store PID/start/image/Job, current Kernel candidate/generation/authority
+/// epoch, operation/request digest and Store fence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRebindHandoff {
+    /// Host-owned stable rebind operation identity.
+    pub operation_id: PlatformHandle,
+    /// Digest of the original rebind request payload.
+    pub request_digest: String,
+    /// Immutable original bootstrap requirement.
+    pub requirement: HostStoreBootstrapRequirement,
+    /// Fresh Store process/Job evidence after relaunch.
+    pub process_binding: StoreProcessBinding,
+    /// Digest of the current active Kernel candidate binding.
+    pub candidate_binding_digest: String,
+    /// Current Kernel generation.
+    pub generation: ResourceGeneration,
+    /// Current Kernel authority epoch.
+    pub authority_epoch: AuthorityEpoch,
+    /// Store proof-fence digest binding fresh peer evidence.
+    pub store_fence: String,
+}
+
+impl StoreRebindHandoff {
+    /// Validates the bounded rebind handoff without OS observation.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        handle(&self.operation_id, "store_rebind.operation_id")?;
+        if self.request_digest.len() != 64
+            || !self
+                .request_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "store_rebind.request_digest",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        self.requirement.validate()?;
+        self.process_binding.validate()?;
+        if self.candidate_binding_digest.len() != 64
+            || !self
+                .candidate_binding_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "store_rebind.candidate_binding_digest",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        if self.store_fence.len() != 64
+            || !self
+                .store_fence
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "store_rebind.store_fence",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        if self.generation.value() == 0
+            || self.generation != self.requirement.store_generation
+            || self.requirement.state_fence.resource_generation != self.generation
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "store_rebind.generation",
+            });
+        }
+        if self.authority_epoch.value() == 0
+            || self.authority_epoch != self.requirement.state_fence.authority_epoch
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "store_rebind.authority_epoch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns canonical digest over requirement plus fresh binding and fence.
+    pub fn compute_requirement_digest(&self) -> Result<String, KernelServiceError> {
+        serde_json::to_vec(&self.requirement)
+            .map(|b| sha256_hex(&b))
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "store_rebind.requirement",
+                reason: "cannot canonicalize requirement",
+            })
+    }
+}
+
+/// Digest-only reconciliation query for a rebind whose delivery was unknown.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRebindQuery {
+    /// Exact rebind operation identity.
+    pub operation_id: PlatformHandle,
+    /// Digest of the original rebind request.
+    pub request_digest: String,
+}
+
+impl StoreRebindQuery {
+    /// Validates the bounded reconciliation identity.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        handle(&self.operation_id, "store_rebind_query.operation_id")?;
+        if self.request_digest.len() != 64
+            || !self
+                .request_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "store_rebind_query.request_digest",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Bound receipt for a successful Store rebind.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRebindReceipt {
+    /// Echoed rebind operation identity.
+    pub operation_id: PlatformHandle,
+    /// Echoed rebind request digest.
+    pub request_digest: String,
+    /// Digest of the immutable requirement.
+    pub requirement_digest: String,
+    /// Fresh Store process/Job binding.
+    pub process_binding: StoreProcessBinding,
+    /// Candidate binding digest at rebind time.
+    pub candidate_binding_digest: String,
+    /// Generation at rebind time.
+    pub generation: ResourceGeneration,
+    /// Authority epoch at rebind time.
+    pub authority_epoch: AuthorityEpoch,
+    /// Store proof-fence digest binding fresh peer evidence.
+    pub store_fence: String,
+}
+
+impl StoreRebindReceipt {
+    /// Validates the receipt shape.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        handle(&self.operation_id, "store_rebind_receipt.operation_id")?;
+        for (value, field) in [
+            (&self.request_digest, "store_rebind_receipt.request_digest"),
+            (
+                &self.requirement_digest,
+                "store_rebind_receipt.requirement_digest",
+            ),
+            (
+                &self.candidate_binding_digest,
+                "store_rebind_receipt.candidate_binding_digest",
+            ),
+            (&self.store_fence, "store_rebind_receipt.store_fence"),
+        ] {
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err(KernelServiceError::InvalidField {
+                    field,
+                    reason: "must be a lowercase SHA-256 digest",
+                });
+            }
+        }
+        self.process_binding.validate()?;
+        if self.generation.value() == 0 || self.authority_epoch.value() == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "store_rebind_receipt.generation_or_epoch",
+                reason: "must be non-zero",
+            });
+        }
+        Ok(())
+    }
+}
+
 impl HostProcessBinding {
     /// Validates the bounded, inert wire projection.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
@@ -472,6 +654,24 @@ impl KernelControlRequest {
         if let KernelControlCommand::BootstrapStore(handoff) = &self.command {
             handoff.validate()?;
         }
+        if let KernelControlCommand::RebindStore(handoff) = &self.command {
+            handoff.validate()?;
+            if handoff.candidate_binding_digest != self.candidate.compute_digest()? {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "store_rebind.candidate_binding",
+                });
+            }
+            if handoff.generation != self.generation
+                || handoff.authority_epoch != self.candidate.kernel_epoch
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "store_rebind.generation_or_epoch",
+                });
+            }
+        }
+        if let KernelControlCommand::ReconcileRebindStore(query) = &self.command {
+            query.validate()?;
+        }
         if let KernelControlCommand::Activate(permit) = &self.command {
             permit.validate(&self.candidate, self.generation)?;
         }
@@ -510,6 +710,9 @@ pub struct KernelControlResponse {
     /// Exact receipt returned after one activation permit is consumed, or
     /// after a nonce-free operation-identity reconciliation finds it.
     pub activation_receipt: Option<KernelActivationReceipt>,
+    /// Bound receipt returned after a successful Store rebind or its
+    /// digest-only reconciliation.
+    pub store_rebind_receipt: Option<StoreRebindReceipt>,
     /// Stable rejection detail, when the command was not accepted.
     pub error: Option<String>,
     /// Digest over all fields except this digest.
@@ -528,6 +731,7 @@ impl KernelControlResponse {
             state: KernelServiceState,
             receipt: &'a Option<KernelReadyReceipt>,
             activation_receipt: &'a Option<KernelActivationReceipt>,
+            store_rebind_receipt: &'a Option<StoreRebindReceipt>,
             error: &'a Option<String>,
         }
         serde_json::to_vec(&Unsigned {
@@ -538,6 +742,7 @@ impl KernelControlResponse {
             state: self.state,
             receipt: &self.receipt,
             activation_receipt: &self.activation_receipt,
+            store_rebind_receipt: &self.store_rebind_receipt,
             error: &self.error,
         })
         .map_err(|_| KernelServiceError::InvalidField {
@@ -1702,6 +1907,12 @@ pub enum KernelControlCommand {
     /// Bind the freshly launched Store process/Job and establish the one
     /// canonical Store route before ordinary lifecycle commands are admitted.
     BootstrapStore(StoreBootstrapHandoff),
+    /// Rebind the Store with same lineage, same approved executable/config
+    /// and Job, fresh PID/start/image and Store fence, without restarting
+    /// Kernel.
+    RebindStore(StoreRebindHandoff),
+    /// Reconcile a RebindStore request by operation digest after unknown delivery.
+    ReconcileRebindStore(StoreRebindQuery),
     /// Begin reconciliation of the request's nonce-free candidate binding.
     Reconcile,
     /// Enter side-by-side candidate mode without authority.

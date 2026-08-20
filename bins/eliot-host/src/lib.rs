@@ -41,8 +41,8 @@ use eliot_kernel_service::{
     HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationPermit,
     KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
     KernelControlResponse, KernelReadyReceipt, KernelServiceState, RestartBudget,
-    StoreBootstrapHandoff, StoreProcessBinding, control_request_frame,
-    decode_control_response_frame,
+    StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
+    StoreRebindReceipt, control_request_frame, decode_control_response_frame,
 };
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
@@ -1684,7 +1684,10 @@ where
     }
 
     if store_dead && !both_dead {
-        if terminate_store(&mut state.store).is_err() || state.store_restart_attempts >= 1 {
+        if kernel_observation == ReconciliationObservation::Unknown {
+            kernel_degraded = true;
+            store_degraded = true;
+        } else if terminate_store(&mut state.store).is_err() || state.store_restart_attempts >= 1 {
             store_degraded = true;
         } else {
             state.store_restart_attempts += 1;
@@ -1694,30 +1697,6 @@ where
                     store_degraded = true;
                     if terminate_store(&mut state.store).is_err() {
                         store_degraded = true;
-                    }
-                } else if state.kernel.is_some() {
-                    // Store peer identity is immutable for one Kernel
-                    // lineage; a Store restart therefore requires a fresh
-                    // Kernel handoff before the contour can be healthy.
-                    if terminate_kernel(&mut state.kernel).is_err()
-                        || state.kernel_restart_attempts >= 1
-                    {
-                        kernel_degraded = true;
-                    } else {
-                        state.kernel_restart_attempts += 1;
-                        if let Ok(kernel) = launch_kernel() {
-                            state.kernel = Some(kernel);
-                            if observe_kernel(state.kernel.as_ref())
-                                != ReconciliationObservation::Live
-                            {
-                                kernel_degraded = true;
-                                if terminate_kernel(&mut state.kernel).is_err() {
-                                    kernel_degraded = true;
-                                }
-                            }
-                        } else {
-                            kernel_degraded = true;
-                        }
                     }
                 }
             } else {
@@ -2354,6 +2333,261 @@ impl HostJobBranches {
         self.kernel_candidate = Some(candidate);
         self.kernel_activation_receipt = Some(activation_receipt.clone());
         Ok((activation_receipt, ready))
+    }
+
+    #[cfg(windows)]
+    fn rebind_store_control<B: JournalBackend>(
+        &self,
+        generation: &PlatformHandle,
+        host: &HostInstallationEpoch,
+        journal: &HostStateJournalService<B>,
+        activation_id: &PlatformHandle,
+        activation_generation: &EpochTransition,
+    ) -> Result<StoreRebindReceipt, HostError> {
+        let launch = self.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
+        })?;
+        let candidate = self.kernel_candidate.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("retained Kernel candidate binding is missing".to_owned())
+        })?;
+        let activation = self.kernel_activation_receipt.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("retained Kernel activation receipt is missing".to_owned())
+        })?;
+        let requirement = self.store_bootstrap_requirement.clone().ok_or_else(|| {
+            HostError::ProcessContour("retained Store bootstrap requirement is missing".to_owned())
+        })?;
+        let store = self.store.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("Store process is missing for rebind".to_owned())
+        })?;
+        let store_process = store.evidence().process();
+        if !store
+            .job_processes()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            .iter()
+            .any(|observed| observed == store_process)
+        {
+            return Err(HostError::ProcessContour(
+                "Store Job observation does not contain exact relaunched Store process".to_owned(),
+            ));
+        }
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(
+            serde_json::to_vec(&requirement.state_fence)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        );
+        hasher.update(launch.authority_generation.value().to_le_bytes());
+        hasher.update(candidate.kernel_epoch.value().to_le_bytes());
+        hasher.update(requirement.approved_artifact_hash.as_str().as_bytes());
+        hasher.update(requirement.approved_config_hash.as_str().as_bytes());
+        hasher.update(store_process.process_id.to_le_bytes());
+        hasher.update(store_process.start_time_100ns.to_le_bytes());
+        hasher.update(store_process.image_path.as_bytes());
+        hasher.update(
+            PlatformHandle::new(store.job_identity().name())
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?
+                .as_str()
+                .as_bytes(),
+        );
+        hasher.update(candidate_digest.as_bytes());
+        let store_fence = format!("{:x}", hasher.finalize());
+        let operation_id = fresh_identity("store-rebind")?;
+        let handoff = StoreRebindHandoff {
+            operation_id: operation_id.clone(),
+            request_digest: "0".repeat(64),
+            requirement: requirement.clone(),
+            process_binding: StoreProcessBinding {
+                process: HostProcessBinding {
+                    process_id: store_process.process_id,
+                    start_time_100ns: store_process.start_time_100ns,
+                    image_path: store_process.image_path.clone(),
+                },
+                job: PlatformHandle::new(store.job_identity().name())
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            },
+            candidate_binding_digest: candidate_digest.clone(),
+            generation: launch.authority_generation,
+            authority_epoch: candidate.kernel_epoch,
+            store_fence: store_fence.clone(),
+        };
+        handoff
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        runtime.block_on(async {
+            let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let kernel_process = store_process;
+            let expected_kernel_image = self
+                .kernel_executable
+                .as_ref()
+                .ok_or_else(|| HostError::ProcessContour("Kernel image is missing".to_owned()))?
+                .clone();
+            let kprocess = self
+                .kernel
+                .as_ref()
+                .ok_or_else(|| HostError::ProcessContour("Kernel process is missing".to_owned()))?
+                .evidence()
+                .process();
+            let mut transport = NamedPipeTransport::connect_authenticated(
+                KERNEL_CONTROL_PIPE,
+                std::time::Duration::from_secs(5),
+                &expectation,
+            )
+            .await
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            validate_authenticated_kernel_peer(
+                transport.peer_identity(),
+                kprocess.process_id,
+                kprocess.start_time_100ns,
+                &expected_kernel_image,
+            )?;
+            let mut handoff_with_digest = handoff.clone();
+            let mut request = KernelControlRequest {
+                wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+                wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+                message_id: fresh_identity("store-rebind-req")?,
+                sequence: 1,
+                peer_process_id: std::process::id(),
+                generation: launch.authority_generation,
+                candidate: candidate.clone(),
+                command: KernelControlCommand::RebindStore(handoff_with_digest.clone()),
+                payload_digest: String::new(),
+            }
+            .with_computed_digest()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            handoff_with_digest.request_digest = request.payload_digest.clone();
+            request.command = KernelControlCommand::RebindStore(handoff_with_digest.clone());
+            request.payload_digest = request
+                .compute_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let frame = control_request_frame(
+                format!(
+                    "host-rebind:{}:{}",
+                    generation.as_str(),
+                    candidate.activation_id.as_str()
+                ),
+                &request,
+            )
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let limits = TransportLimits::default();
+            let outer_digest = request.payload_digest.clone();
+            let outer_message_id = request.message_id.clone();
+            let delivered = match transport.send_frame(&frame, limits).await {
+                Ok(DeliveryOutcome::Delivered) => true,
+                Ok(DeliveryOutcome::UnknownOutcome) | Err(_) => false,
+            };
+            let receipt = if delivered {
+                match transport.receive_frame(limits).await {
+                    Ok(frame) => match decode_control_response_frame(&frame) {
+                        Ok(response)
+                            if response.message_id == outer_message_id
+                                && response.request_digest == outer_digest
+                                && response.error.is_none() =>
+                        {
+                            response.store_rebind_receipt
+                        }
+                        Ok(_) => None,
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let final_receipt = if let Some(r) = receipt {
+                if r.operation_id != operation_id || r.request_digest != outer_digest {
+                    return Err(HostError::ProcessContour(
+                        "Store rebind direct receipt mismatch".to_owned(),
+                    ));
+                }
+                r
+            } else {
+                drop(transport);
+                let mut transport2 = NamedPipeTransport::connect_authenticated(
+                    KERNEL_CONTROL_PIPE,
+                    std::time::Duration::from_secs(5),
+                    &expectation,
+                )
+                .await
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                validate_authenticated_kernel_peer(
+                    transport2.peer_identity(),
+                    kprocess.process_id,
+                    kprocess.start_time_100ns,
+                    &expected_kernel_image,
+                )
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                let query = StoreRebindQuery {
+                    operation_id: operation_id.clone(),
+                    request_digest: outer_digest.clone(),
+                };
+                let query_request = KernelControlRequest {
+                    wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+                    wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+                    message_id: fresh_identity("store-rebind-query")?,
+                    sequence: 1,
+                    peer_process_id: std::process::id(),
+                    generation: launch.authority_generation,
+                    candidate: candidate.clone(),
+                    command: KernelControlCommand::ReconcileRebindStore(query),
+                    payload_digest: String::new(),
+                }
+                .with_computed_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                let query_frame = control_request_frame(
+                    format!(
+                        "host-rebind-query:{}:{}",
+                        generation.as_str(),
+                        candidate.activation_id.as_str()
+                    ),
+                    &query_request,
+                )
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                match transport2.send_frame(&query_frame, limits).await {
+                    Ok(DeliveryOutcome::Delivered) => {}
+                    _ => {
+                        return Err(HostError::RecoveryRequired(
+                            "Store rebind reconciliation delivery is unknown".to_owned(),
+                        ));
+                    }
+                }
+                let response = transport2
+                    .receive_frame(limits)
+                    .await
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                let response = decode_control_response_frame(&response)
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                if response.message_id != query_request.message_id
+                    || response.request_digest != query_request.payload_digest
+                    || response.error.is_some()
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "Store rebind reconciliation response not exact".to_owned(),
+                    ));
+                }
+                response.store_rebind_receipt.ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Kernel did not retain queried Store rebind operation".to_owned(),
+                    )
+                })?
+            };
+            if final_receipt.candidate_binding_digest != candidate_digest
+                || final_receipt.generation != launch.authority_generation
+                || final_receipt.authority_epoch != candidate.kernel_epoch
+                || final_receipt.store_fence != store_fence
+            {
+                return Err(HostError::ProcessContour(
+                    "Store rebind receipt binding mismatch".to_owned(),
+                ));
+            }
+            Ok(final_receipt)
+        })
     }
 
     #[allow(
@@ -5921,6 +6155,50 @@ impl HostComposition {
                     )),
                 });
             }
+        } else if store_requires_restart
+            && !kernel_requires_activation
+            && self.jobs.store.is_some()
+            && self.jobs.kernel.is_some()
+        {
+            if HostJobBranches::branch_state(self.jobs.kernel.as_ref()).is_err() {
+                self.readiness_gate.branch_degraded();
+                let _ = self.persist_degraded_process_observation(
+                    &active.manifest.generation,
+                    HostBranchDisposition::BothDegraded,
+                );
+                return Ok(HostBranchDisposition::BothDegraded);
+            }
+            self.readiness_gate.branch_degraded();
+            let _ = self.persist_degraded_process_observation(
+                &active.manifest.generation,
+                HostBranchDisposition::StoreDegraded,
+            );
+            if let Err(error) = self.jobs.rebind_store_control(
+                &active.manifest.generation,
+                &self.host,
+                &self.journal,
+                &self.activation_id,
+                &self.activation_generation,
+            ) {
+                if matches!(error, HostError::Journal(_)) {
+                    self.readiness_gate.fail(
+                        None,
+                        ReadinessFailureKind::JournalRejected,
+                        std::time::Instant::now(),
+                    );
+                    return Ok(HostBranchDisposition::ReadinessDegraded);
+                }
+                if error.to_string().contains("unknown") {
+                    self.readiness_gate.fail(
+                        None,
+                        ReadinessFailureKind::JournalOutcomeUnknown,
+                        std::time::Instant::now(),
+                    );
+                    return Ok(HostBranchDisposition::ReadinessDegraded);
+                }
+                self.readiness_gate.branch_degraded();
+                return Ok(HostBranchDisposition::ReadinessDegraded);
+            }
         }
         Ok(self.reconcile_branch_readiness_at(
             &active.manifest.generation,
@@ -7573,6 +7851,7 @@ mod journal_tests {
             state: KernelServiceState::Ready,
             receipt: Some(ready.clone()),
             activation_receipt: None,
+            store_rebind_receipt: None,
             error: None,
             payload_digest: String::new(),
         }
@@ -9254,6 +9533,7 @@ mod tests {
             state: KernelServiceState::Activating,
             receipt: None,
             activation_receipt: None,
+            store_rebind_receipt: None,
             error,
             payload_digest: String::new(),
         };

@@ -2297,6 +2297,7 @@ pub struct KernelStoreGateway {
     service: Arc<Mutex<KernelService>>,
     store: Arc<EbpCanonicalStoreClient<NamedPipeTransport>>,
     route: GenerationRoute,
+    fenced: AtomicBool,
 }
 
 #[cfg(windows)]
@@ -2321,7 +2322,16 @@ impl KernelStoreGateway {
             service,
             store,
             route,
+            fenced: AtomicBool::new(false),
         }
+    }
+
+    fn fence(&self) {
+        self.fenced.store(true, Ordering::Release);
+    }
+
+    fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::Acquire)
     }
 
     /// Applies one already prepared transition after fixed Kernel admission.
@@ -2332,6 +2342,9 @@ impl KernelStoreGateway {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, String> {
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
         context.validate().map_err(|error| error.to_string())?;
         transition.validate().map_err(|error| error.to_string())?;
         if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
@@ -3199,6 +3212,224 @@ impl KernelComposition {
         }
         *retained = Some(handoff);
         Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn rebind_store(
+        &self,
+        handoff: eliot_kernel_service::StoreRebindHandoff,
+        request_digest: String,
+    ) -> Result<eliot_kernel_service::StoreRebindReceipt, KernelBuildError> {
+        handoff
+            .validate()
+            .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+        if self.store_bootstrap.as_ref() != Some(&handoff.requirement) {
+            return Err(KernelBuildError::Service(
+                "Store rebind requirement is not the immutable bootstrap descriptor".to_owned(),
+            ));
+        }
+        if handoff.request_digest != request_digest {
+            return Err(KernelBuildError::Service(
+                "Store rebind request digest mismatch".to_owned(),
+            ));
+        }
+        {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
+            if service.state() != eliot_kernel_service::KernelServiceState::Ready {
+                return Err(KernelBuildError::Service(
+                    "Store rebind requires Ready Kernel".to_owned(),
+                ));
+            }
+            let candidate = service
+                .candidate_binding()
+                .ok_or(KernelBuildError::Service(
+                    "Store rebind missing candidate".to_owned(),
+                ))?;
+            let expected = candidate
+                .compute_digest()
+                .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+            if expected != handoff.candidate_binding_digest {
+                return Err(KernelBuildError::Service(
+                    "Store rebind candidate binding mismatch".to_owned(),
+                ));
+            }
+        }
+        let expected_fence = {
+            let mut hasher = Sha256::new();
+            hasher.update(
+                serde_json::to_vec(&handoff.requirement.state_fence)
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
+            );
+            hasher.update(handoff.generation.value().to_le_bytes());
+            hasher.update(handoff.authority_epoch.value().to_le_bytes());
+            hasher.update(
+                handoff
+                    .requirement
+                    .approved_artifact_hash
+                    .as_str()
+                    .as_bytes(),
+            );
+            hasher.update(handoff.requirement.approved_config_hash.as_str().as_bytes());
+            hasher.update(handoff.process_binding.process.process_id.to_le_bytes());
+            hasher.update(
+                handoff
+                    .process_binding
+                    .process
+                    .start_time_100ns
+                    .to_le_bytes(),
+            );
+            hasher.update(handoff.process_binding.process.image_path.as_bytes());
+            hasher.update(handoff.process_binding.job.as_str().as_bytes());
+            hasher.update(handoff.candidate_binding_digest.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        if expected_fence != handoff.store_fence {
+            return Err(KernelBuildError::Service(
+                "Store rebind fence does not bind fresh peer evidence".to_owned(),
+            ));
+        }
+        let observed = observe_named_pipe_peer_process_in_job(
+            handoff.process_binding.job.as_str(),
+            handoff.process_binding.process.process_id,
+        )
+        .map_err(|e| KernelBuildError::Principal(e.to_string()))?;
+        let observed_binding = observed.process_binding();
+        if observed_binding.process_id() != handoff.process_binding.process.process_id
+            || observed_binding.start_time_100ns()
+                != handoff.process_binding.process.start_time_100ns
+            || observed_binding.image_path() != handoff.process_binding.process.image_path
+        {
+            return Err(KernelBuildError::Principal(
+                "Store rebind process binding does not match observed Job peer".to_owned(),
+            ));
+        }
+        let expectation =
+            eliot_platform_windows::NamedPipePeerExpectation::new_with_process_and_job_binding(
+                handoff.requirement.expected_peer_sid.as_str(),
+                handoff.requirement.expected_peer_session_id,
+                observed,
+            )
+            .map_err(|e| KernelBuildError::Principal(e.to_string()))?;
+        let _ = expectation;
+        let receipt = self
+            .service
+            .lock()
+            .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?
+            .rebind_store(&handoff, request_digest.clone())
+            .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+        {
+            let old_gateway = {
+                let mut guard = self.canonical_store_gateway.lock().map_err(|_| {
+                    KernelBuildError::Service("store gateway lock poisoned".to_owned())
+                })?;
+                let old = guard.take();
+                if let Some(old) = &old {
+                    old.fence();
+                }
+                old
+            };
+            let _ = old_gateway;
+            let mut retained = self
+                .store_handoff
+                .lock()
+                .map_err(|_| KernelBuildError::Service("Store handoff lock poisoned".to_owned()))?;
+            *retained = Some(eliot_kernel_service::StoreBootstrapHandoff {
+                requirement: handoff.requirement.clone(),
+                process_binding: handoff.process_binding.clone(),
+            });
+        }
+        let timeout = Duration::from_millis(handoff.requirement.timeout_ms());
+        let requirement = handoff.requirement.clone();
+        let job = handoff.process_binding.job.clone();
+        let process = handoff.process_binding.process.clone();
+        let observed2 = observe_named_pipe_peer_process_in_job(job.as_str(), process.process_id)
+            .map_err(|e| KernelBuildError::Principal(e.to_string()))?;
+        if observed2.process_binding().process_id() != process.process_id
+            || observed2.process_binding().start_time_100ns() != process.start_time_100ns
+            || observed2.process_binding().image_path() != process.image_path
+        {
+            return Err(KernelBuildError::Principal(
+                "Store rebind second observation mismatch".to_owned(),
+            ));
+        }
+        let expectation2 =
+            eliot_platform_windows::NamedPipePeerExpectation::new_with_process_and_job_binding(
+                requirement.expected_peer_sid.as_str(),
+                requirement.expected_peer_session_id,
+                observed2,
+            )
+            .map_err(|e| KernelBuildError::Principal(e.to_string()))?;
+        let transport = eliot_ipc::NamedPipeTransport::connect_authenticated(
+            requirement.canonical_pipe_identity.as_str(),
+            timeout,
+            &expectation2,
+        )
+        .await
+        .map_err(KernelBuildError::Transport)?;
+        let client =
+            eliot_kernel_service::EbpCanonicalStoreClient::connect(transport, requirement.clone())
+                .await
+                .map_err(|e| match e {
+                    eliot_kernel_service::StoreClientError::Transport(e)
+                    | eliot_kernel_service::StoreClientError::Contract(e) => {
+                        KernelBuildError::Service(e)
+                    }
+                    eliot_kernel_service::StoreClientError::Store(e) => {
+                        KernelBuildError::Service(e.to_string())
+                    }
+                })?;
+        let route_scope = eliot_kernel_core::RouteScope::new(STORE_BRIDGE_ROUTE)
+            .map_err(|e| KernelBuildError::Core(e.to_string()))?;
+        let routes = self
+            .generation_route_snapshot()
+            .map_err(|e| KernelBuildError::Core(e.to_string()))?;
+        let route = routes
+            .route(&route_scope)
+            .map_err(|e| KernelBuildError::Core(e.to_string()))?
+            .clone();
+        if route.authority_epoch() != requirement.authority_epoch()
+            || route.active_generation() != requirement.store_generation
+            || requirement.route_identity.as_str() != STORE_BRIDGE_ROUTE
+        {
+            return Err(KernelBuildError::Core(
+                "store rebind does not match active Kernel store route".to_owned(),
+            ));
+        }
+        let gateway = std::sync::Arc::new(KernelStoreGateway::new(
+            self.service.clone(),
+            std::sync::Arc::new(client),
+            route,
+        ));
+        let attach_result = attach_then_retain_canonical_store(
+            std::sync::Arc::clone(&gateway),
+            &self.canonical_store_gateway,
+            |gw| {
+                self.process_gateway.as_ref().map_or_else(
+                    || {
+                        struct NoopAttachment;
+                        impl CanonicalStoreAttachmentTransaction for NoopAttachment {
+                            fn commit(self: Box<Self>) {}
+                        }
+                        Ok(Box::new(NoopAttachment)
+                            as Box<dyn CanonicalStoreAttachmentTransaction>)
+                    },
+                    |pg| {
+                        pg.attach_canonical_store(gw)
+                            .map(|a| Box::new(a) as Box<dyn CanonicalStoreAttachmentTransaction>)
+                    },
+                )
+            },
+        );
+        if attach_result.is_err() {
+            gateway.fence();
+            return Err(KernelBuildError::Service(
+                "store gateway retain failed after rebind".to_owned(),
+            ));
+        }
+        Ok(receipt)
     }
 
     /// Returns whether Host/installation authority bindings were injected.
@@ -5033,6 +5264,23 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
         }
+        let store_rebind_receipt: Option<eliot_kernel_service::StoreRebindReceipt> =
+            match &request.command {
+                KernelControlCommand::RebindStore(handoff) => {
+                    let receipt = self
+                        .rebind_store(handoff.clone(), request.payload_digest.clone())
+                        .await
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    Some(receipt)
+                }
+                KernelControlCommand::ReconcileRebindStore(query) => self
+                    .service
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .reconcile_store_rebind(query)
+                    .map_err(|_| TransportError::SessionFenced)?,
+                _ => None,
+            };
         let is_probe = matches!(&request.command, KernelControlCommand::ProbeReady);
         let receipt = if is_probe {
             #[cfg(windows)]
@@ -5064,6 +5312,8 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?
                 .reconcile_activation(query)
                 .map_err(|_| TransportError::SessionFenced)?,
+            KernelControlCommand::RebindStore(_)
+            | KernelControlCommand::ReconcileRebindStore(_) => None,
             _ => None,
         };
         #[cfg(windows)]
@@ -5097,7 +5347,9 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?,
                 KernelControlCommand::BootstrapStore(_)
                 | KernelControlCommand::Activate(_)
-                | KernelControlCommand::ReconcileActivation(_) => {}
+                | KernelControlCommand::ReconcileActivation(_)
+                | KernelControlCommand::RebindStore(_)
+                | KernelControlCommand::ReconcileRebindStore(_) => {}
                 command => {
                     self.apply_control(command.clone())
                         .map_err(|_| TransportError::SessionFenced)?;
@@ -5115,6 +5367,7 @@ impl KernelComposition {
             state,
             receipt,
             activation_receipt,
+            store_rebind_receipt,
             error: None,
             payload_digest: String::new(),
         }

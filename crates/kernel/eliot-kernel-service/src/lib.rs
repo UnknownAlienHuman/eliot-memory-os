@@ -32,7 +32,8 @@ pub use protocol::{
     KernelControlRequest, KernelControlResponse, KernelReadyReceipt,
     ProcessAuthorityHandoffDescriptor, ProcessExecutionRejection, ProcessExecutionRequest,
     ProcessExecutionResponse, ProcessObservation, RestartBudget, StoreBootstrapDescriptor,
-    StoreBootstrapHandoff, StoreProcessBinding, control_request_frame, control_response_frame,
+    StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
+    StoreRebindReceipt, control_request_frame, control_response_frame,
     decode_control_request_frame, decode_control_response_frame,
 };
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
