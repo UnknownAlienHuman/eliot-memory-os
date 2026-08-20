@@ -3536,10 +3536,10 @@ impl KernelComposition {
                 let mut gw_guard = self.canonical_store_gateway.lock().map_err(|_| {
                     KernelBuildError::Service("store gateway lock poisoned".to_owned())
                 })?;
-                let old = gw_guard.replace(Arc::clone(&gateway));
                 let mut handoff_guard = self.store_handoff.lock().map_err(|_| {
                     KernelBuildError::Service("Store handoff lock poisoned".to_owned())
                 })?;
+                let old = gw_guard.replace(Arc::clone(&gateway));
                 *handoff_guard = Some(eliot_kernel_service::StoreBootstrapHandoff {
                     requirement: handoff.requirement.clone(),
                     process_binding: handoff.process_binding.clone(),
