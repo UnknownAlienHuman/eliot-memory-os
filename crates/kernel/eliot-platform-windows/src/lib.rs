@@ -4608,6 +4608,7 @@ pub struct ServiceRegistrationRequest {
     account: ServiceAccount,
     bootstrap: Option<ServiceBootstrapArguments>,
     expected_current: Option<ServiceRegistrationCurrent>,
+    expected_runtime_identity_digest: Option<String>,
 }
 
 impl ServiceRegistrationRequest {
@@ -4647,6 +4648,7 @@ impl ServiceRegistrationRequest {
             account,
             bootstrap: None,
             expected_current: None,
+            expected_runtime_identity_digest: None,
         })
     }
 
@@ -4717,6 +4719,33 @@ impl ServiceRegistrationRequest {
     #[must_use]
     pub fn expected_current(&self) -> Option<&ServiceRegistrationCurrent> {
         self.expected_current.as_ref()
+    }
+
+    /// Binds a rollback request to the exact process identity observed by the
+    /// caller. The digest is evidence, not a caller-supplied PID; the typed
+    /// stop primitive validates it again against a fresh SCM/process readback
+    /// immediately before issuing its one stop call.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a digest that is not canonical lowercase
+    /// SHA-256 text.
+    pub fn with_expected_runtime_identity_digest(
+        mut self,
+        digest: impl Into<String>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let digest = digest.into();
+        if !valid_sha256_hex(&digest) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        self.expected_runtime_identity_digest = Some(digest);
+        Ok(self)
+    }
+
+    /// Returns the process identity digest bound to a rollback request, when
+    /// one was supplied by the caller.
+    #[must_use]
+    pub fn expected_runtime_identity_digest(&self) -> Option<&str> {
+        self.expected_runtime_identity_digest.as_deref()
     }
 
     #[must_use]
@@ -4887,6 +4916,16 @@ impl ServiceRuntimeObservation {
     pub const fn process(&self) -> Option<&ProcessIdentity> {
         self.process.as_ref()
     }
+
+    /// Computes the stable digest that a rollback request must bind before it
+    /// can issue a stop call. The digest covers the exact admitted service
+    /// configuration and the handle-observed PID, creation time, and image.
+    #[must_use]
+    pub fn runtime_identity_digest(&self) -> Option<String> {
+        self.process
+            .as_ref()
+            .map(|process| runtime_identity_digest_from_configuration(&self.configuration_digest, process))
+    }
 }
 
 /// Read-only classification of exact SCM configuration plus runtime state.
@@ -4907,6 +4946,51 @@ pub enum ServiceRegistrationRuntimeInspection {
     Mismatched,
     /// SCM or the live process could not be observed authoritatively.
     Unknown,
+}
+
+/// Result of one exact-registration-bound SCM start attempt.
+///
+/// The operation is deliberately separate from the provider-neutral
+/// `ServicePort::Start` request. It performs one fresh registration/runtime
+/// admission and issues at most one `StartServiceW` call. `Started` means that
+/// the call was issued and the post-call readback remained authoritative; it
+/// does not claim that SCM has already reached `Running`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceStartOutcome {
+    /// One `StartServiceW` call was issued and the post-call readback matches.
+    Started {
+        observation: ServiceRuntimeObservation,
+    },
+    /// The exact service was already running; no start call was issued.
+    AlreadyRunning {
+        observation: ServiceRuntimeObservation,
+    },
+    /// SCM reported an in-progress start; no start call was issued.
+    AlreadyStarting {
+        observation: ServiceRuntimeObservation,
+    },
+    /// A provider/readback race or failure prevented an authoritative result.
+    EffectUnknown,
+}
+
+/// Result of one exact-registration-bound SCM stop attempt used for rollback
+/// of a start effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceStopOutcome {
+    /// One stop call was issued and the post-call readback matches.
+    Stopped {
+        observation: ServiceRuntimeObservation,
+    },
+    /// The exact service was already stopped; no stop call was issued.
+    AlreadyStopped {
+        observation: ServiceRuntimeObservation,
+    },
+    /// SCM reported an in-progress stop; no stop call was issued.
+    AlreadyStopping {
+        observation: ServiceRuntimeObservation,
+    },
+    /// A provider/readback race or failure prevented an authoritative result.
+    EffectUnknown,
 }
 
 #[cfg(windows)]
@@ -7945,6 +8029,40 @@ impl WindowsPlatform {
         inspect_service_registration_runtime(request)
     }
 
+    /// Starts one exact canonical service at most once.
+    ///
+    /// The operation performs a fresh exact configuration/runtime admission,
+    /// issues at most one `StartServiceW`, and immediately performs the same
+    /// stable configuration/PID/start-time/image readback. A `Starting`
+    /// result is returned as wait/reconcile state; callers must not issue a
+    /// second start while it remains in progress.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when the provider cannot be opened before
+    /// the mutation boundary. A post-boundary ambiguity is preserved as
+    /// [`ServiceStartOutcome::EffectUnknown`].
+    pub fn start_service_registration(
+        &self,
+        request: &ServiceRegistrationRequest,
+    ) -> Result<ServiceStartOutcome, WindowsAdapterError> {
+        start_service_registration(request)
+    }
+
+    /// Stops one exact canonical service at most once for start-effect
+    /// rollback. A caller must bind an observed runtime identity digest before
+    /// a running service becomes eligible for the stop mutation.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when the provider cannot be opened before
+    /// the mutation boundary. A post-boundary ambiguity is preserved as
+    /// [`ServiceStopOutcome::EffectUnknown`].
+    pub fn stop_service_registration(
+        &self,
+        request: &ServiceRegistrationRequest,
+    ) -> Result<ServiceStopOutcome, WindowsAdapterError> {
+        stop_service_registration(request)
+    }
+
     /// Publishes bytes by staging beside the destination and replacing it once.
     ///
     /// # Errors
@@ -10454,6 +10572,310 @@ fn inspect_service_registration_runtime(
     ServiceRegistrationRuntimeInspection::Unknown
 }
 
+fn runtime_identity_digest_from_configuration(
+    configuration_digest: &str,
+    process: &ProcessIdentity,
+) -> String {
+    sha256_hex(
+        format!(
+            "{}:{}:{}:{}",
+            configuration_digest, process.process_id, process.start_time_100ns, process.image_path
+        )
+        .as_bytes(),
+    )
+}
+
+fn start_outcome_from_inspection(
+    inspection: ServiceRegistrationRuntimeInspection,
+    call_issued: bool,
+) -> ServiceStartOutcome {
+    match inspection {
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_running() && call_issued =>
+        {
+            ServiceStartOutcome::Started { observation }
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_starting() && call_issued =>
+        {
+            ServiceStartOutcome::Started { observation }
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_running() =>
+        {
+            ServiceStartOutcome::AlreadyRunning { observation }
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_starting() =>
+        {
+            ServiceStartOutcome::AlreadyStarting { observation }
+        }
+        _ => ServiceStartOutcome::EffectUnknown,
+    }
+}
+
+fn stop_outcome_from_inspection(
+    inspection: ServiceRegistrationRuntimeInspection,
+    call_issued: bool,
+) -> ServiceStopOutcome {
+    match inspection {
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopped() && call_issued =>
+        {
+            ServiceStopOutcome::Stopped { observation }
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopping() && call_issued =>
+        {
+            ServiceStopOutcome::Stopped { observation }
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopped() =>
+        {
+            ServiceStopOutcome::AlreadyStopped { observation }
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopping() =>
+        {
+            ServiceStopOutcome::AlreadyStopping { observation }
+        }
+        _ => ServiceStopOutcome::EffectUnknown,
+    }
+}
+
+#[cfg(windows)]
+fn start_service_registration(
+    request: &ServiceRegistrationRequest,
+) -> Result<ServiceStartOutcome, WindowsAdapterError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
+        SC_STATUS_PROCESS_INFO, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_START,
+        SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
+    };
+
+    match inspect_service_registration_runtime(request) {
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_running() =>
+        {
+            return Ok(ServiceStartOutcome::AlreadyRunning { observation });
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_starting() =>
+        {
+            return Ok(ServiceStartOutcome::AlreadyStarting { observation });
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopped() => {}
+        _ => return Ok(ServiceStartOutcome::EffectUnknown),
+    }
+
+    let name = std::ffi::OsStr::new(request.service_name())
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: null machine/database selects the local SCM; both handles are
+    // closed on every path below.
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(last_windows_adapter_error());
+    }
+    // SAFETY: the name is NUL-terminated and access is limited to exact
+    // configuration/status validation plus one start mutation.
+    let service = unsafe {
+        OpenServiceW(
+            manager,
+            name.as_ptr(),
+            SERVICE_START | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    };
+    if service.is_null() {
+        unsafe { CloseServiceHandle(manager) };
+        return Ok(ServiceStartOutcome::EffectUnknown);
+    }
+
+    let result = (|| {
+        let Some(configuration) = query_service_configuration(service) else {
+            return ServiceStartOutcome::EffectUnknown;
+        };
+        if !exact_service_configuration_matches(request, &configuration) {
+            return ServiceStartOutcome::EffectUnknown;
+        }
+        let mut status = SERVICE_STATUS_PROCESS::default();
+        let mut needed = 0_u32;
+        let status_size =
+            u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>()).unwrap_or(u32::MAX);
+        // SAFETY: status is writable storage and service is a live handle.
+        if unsafe {
+            QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                (&raw mut status).cast(),
+                status_size,
+                &raw mut needed,
+            )
+        } == 0
+        {
+            return ServiceStartOutcome::EffectUnknown;
+        }
+        if status.dwCurrentState != SERVICE_STOPPED {
+            return start_outcome_from_inspection(
+                inspect_service_registration_runtime(request),
+                false,
+            );
+        }
+        // SAFETY: service is the live exact-configuration handle and no
+        // arguments are supplied. This is the sole StartServiceW call.
+        let start_succeeded = unsafe {
+            windows_sys::Win32::System::Services::StartServiceW(service, 0, std::ptr::null())
+        } != 0;
+        let post_start = inspect_service_registration_runtime(request);
+        if !start_succeeded {
+            // A post-call state change is not proof that this call owned it.
+            // Preserve the ambiguity and never retry blindly.
+            return ServiceStartOutcome::EffectUnknown;
+        }
+        start_outcome_from_inspection(post_start, true)
+    })();
+    // SAFETY: both handles are owned by this function.
+    unsafe {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+fn start_service_registration(
+    _request: &ServiceRegistrationRequest,
+) -> Result<ServiceStartOutcome, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
+#[cfg(windows)]
+fn stop_service_registration(
+    request: &ServiceRegistrationRequest,
+) -> Result<ServiceStopOutcome, WindowsAdapterError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
+        SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_CONTROL_STOP, SERVICE_QUERY_CONFIG,
+        SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_PROCESS,
+        SERVICE_STOP,
+    };
+
+    let Some(expected_digest) = request.expected_runtime_identity_digest() else {
+        return Ok(ServiceStopOutcome::EffectUnknown);
+    };
+    match inspect_service_registration_runtime(request) {
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopped() =>
+        {
+            return Ok(ServiceStopOutcome::AlreadyStopped { observation });
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_stopping() =>
+        {
+            return Ok(ServiceStopOutcome::AlreadyStopping { observation });
+        }
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.is_running()
+                && observation.runtime_identity_digest().as_deref() == Some(expected_digest) => {}
+        _ => return Ok(ServiceStopOutcome::EffectUnknown),
+    }
+
+    let name = std::ffi::OsStr::new(request.service_name())
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: null machine/database selects the local SCM; both handles are
+    // closed on every path below.
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(last_windows_adapter_error());
+    }
+    // SAFETY: access is limited to exact configuration/status validation plus
+    // one stop mutation.
+    let service = unsafe {
+        OpenServiceW(
+            manager,
+            name.as_ptr(),
+            SERVICE_STOP | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    };
+    if service.is_null() {
+        unsafe { CloseServiceHandle(manager) };
+        return Ok(ServiceStopOutcome::EffectUnknown);
+    }
+    let result = (|| {
+        let Some(configuration) = query_service_configuration(service) else {
+            return ServiceStopOutcome::EffectUnknown;
+        };
+        if !exact_service_configuration_matches(request, &configuration) {
+            return ServiceStopOutcome::EffectUnknown;
+        }
+        let mut status = SERVICE_STATUS_PROCESS::default();
+        let mut needed = 0_u32;
+        let status_size =
+            u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>()).unwrap_or(u32::MAX);
+        // SAFETY: status is writable storage and service is live.
+        if unsafe {
+            QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                (&raw mut status).cast(),
+                status_size,
+                &raw mut needed,
+            )
+        } == 0
+        {
+            return ServiceStopOutcome::EffectUnknown;
+        }
+        if status.dwCurrentState != SERVICE_RUNNING {
+            return stop_outcome_from_inspection(
+                inspect_service_registration_runtime(request),
+                false,
+            );
+        }
+        // Re-admit the exact process immediately before the mutation. This
+        // closes the stale-PID window between the initial admission and the
+        // SCM handle operation; any remaining provider race is Unknown.
+        match inspect_service_registration_runtime(request) {
+            ServiceRegistrationRuntimeInspection::Matching { observation }
+                if observation.is_running()
+                    && observation.runtime_identity_digest().as_deref() == Some(expected_digest) =>
+            {
+                let _ = observation;
+            }
+            _ => return ServiceStopOutcome::EffectUnknown,
+        }
+        let mut stop_status = SERVICE_STATUS::default();
+        // SAFETY: service is the live exact-configuration handle. This is the
+        // sole ControlService stop call for this effect attempt.
+        let stop_succeeded = unsafe {
+            ControlService(service, SERVICE_CONTROL_STOP, &raw mut stop_status)
+        } != 0;
+        let post_stop = inspect_service_registration_runtime(request);
+        if !stop_succeeded {
+            return ServiceStopOutcome::EffectUnknown;
+        }
+        stop_outcome_from_inspection(post_stop, true)
+    })();
+    // SAFETY: both handles are owned by this function.
+    unsafe {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+fn stop_service_registration(
+    _request: &ServiceRegistrationRequest,
+) -> Result<ServiceStopOutcome, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
 #[cfg(windows)]
 fn inspect_service_registration(
     request: &ServiceRegistrationRequest,
@@ -12848,6 +13270,128 @@ mod tests {
         assert!(service_runtime_sample_is_stable(4, 41, 4, 41));
         assert!(!service_runtime_sample_is_stable(4, 41, 1, 0));
         assert!(!service_runtime_sample_is_stable(2, 41, 2, 42));
+    }
+
+    #[test]
+    fn runtime_identity_digest_binds_configuration_pid_start_time_and_image() {
+        let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+        let request = ServiceRegistrationRequest::new(
+            ELIOT_HOST_SERVICE_NAME,
+            ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            &image,
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+        )
+        .unwrap_or_else(|error| panic!("request failed: {error}"));
+        let process = ProcessIdentity {
+            process_id: 41,
+            start_time_100ns: 99,
+            image_path: image.to_string_lossy().into_owned(),
+        };
+        let observation = ServiceRuntimeObservation {
+            service_name: request.service_name().to_owned(),
+            configuration_digest: request.expected_configuration_digest(),
+            state: ServiceState::Running,
+            checkpoint: 0,
+            wait_hint_ms: 0,
+            process: Some(process.clone()),
+        };
+        let digest = observation
+            .runtime_identity_digest()
+            .unwrap_or_else(|| unreachable!());
+        assert!(valid_sha256_hex(&digest));
+        assert_eq!(
+            digest,
+            runtime_identity_digest_from_configuration(
+                observation.configuration_digest(),
+                &process,
+            )
+        );
+        assert_eq!(
+            request
+                .clone()
+                .with_expected_runtime_identity_digest(digest.clone())
+                .unwrap_or_else(|error| panic!("digest binding failed: {error}"))
+                .expected_runtime_identity_digest(),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            request
+                .clone()
+                .with_expected_runtime_identity_digest("A".repeat(64)),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+        let mut changed = process;
+        changed.start_time_100ns += 1;
+        assert_ne!(
+            digest,
+            runtime_identity_digest_from_configuration(
+                observation.configuration_digest(),
+                &changed,
+            )
+        );
+    }
+
+    #[test]
+    fn scm_mutation_outcomes_never_promote_unknown_readback() {
+        let observation = |state| ServiceRuntimeObservation {
+            service_name: ELIOT_HOST_SERVICE_NAME.to_owned(),
+            configuration_digest: "a".repeat(64),
+            state,
+            checkpoint: 0,
+            wait_hint_ms: 0,
+            process: None,
+        };
+        assert!(matches!(
+            start_outcome_from_inspection(
+                ServiceRegistrationRuntimeInspection::Matching {
+                    observation: observation(ServiceState::Running),
+                },
+                false,
+            ),
+            ServiceStartOutcome::AlreadyRunning { .. }
+        ));
+        assert!(matches!(
+            start_outcome_from_inspection(
+                ServiceRegistrationRuntimeInspection::Matching {
+                    observation: observation(ServiceState::Starting),
+                },
+                true,
+            ),
+            ServiceStartOutcome::Started { .. }
+        ));
+        assert_eq!(
+            start_outcome_from_inspection(
+                ServiceRegistrationRuntimeInspection::Unknown,
+                true,
+            ),
+            ServiceStartOutcome::EffectUnknown
+        );
+        assert!(matches!(
+            stop_outcome_from_inspection(
+                ServiceRegistrationRuntimeInspection::Matching {
+                    observation: observation(ServiceState::Stopped),
+                },
+                false,
+            ),
+            ServiceStopOutcome::AlreadyStopped { .. }
+        ));
+        assert!(matches!(
+            stop_outcome_from_inspection(
+                ServiceRegistrationRuntimeInspection::Matching {
+                    observation: observation(ServiceState::Stopping),
+                },
+                true,
+            ),
+            ServiceStopOutcome::Stopped { .. }
+        ));
+        assert_eq!(
+            stop_outcome_from_inspection(
+                ServiceRegistrationRuntimeInspection::Mismatched,
+                true,
+            ),
+            ServiceStopOutcome::EffectUnknown
+        );
     }
 
     #[test]
