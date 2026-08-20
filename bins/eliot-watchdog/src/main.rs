@@ -407,3 +407,18 @@ unsafe extern "system" fn service_control(
     }
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_has_no_non_scm_root_fallback() {
+        let error = run_watchdog(Arc::new(AtomicBool::new(true)), None)
+            .expect_err("Watchdog must refuse a launch without validated SCM bootstrap");
+        assert_eq!(
+            error,
+            "SCM bootstrap is required for Runtime contour selection"
+        );
+    }
+}
