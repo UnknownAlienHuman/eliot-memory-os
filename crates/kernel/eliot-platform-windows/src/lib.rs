@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 mod installer_authority_key;
 mod installer_root;
+mod package_staging;
 mod tcp_listener_owner;
 
 pub use installer_authority_key::{
@@ -43,6 +44,13 @@ pub use installer_root::{
     InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveCreate,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
     WindowsInstallerRootPrimitive, windows_path_identity_digest, windows_paths_equal,
+};
+pub use package_staging::{
+    AuthenticodeError, AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier,
+    PackageFileSpec, PackageManifest, PackageRelativePath, PackageStager, PackageStagingError,
+    PackageStagingObservation, PeCoffError, PeCoffEvidence, StagedDirectoryReceipt,
+    StagedFileReceipt, StagingReceipt, TrustedSourceBundle, WindowsAuthenticodeVerifier,
+    parse_pe_coff, validate_package_relative_path,
 };
 pub use tcp_listener_owner::{
     TcpListenerOwnerError, TcpListenerOwnerObservation, observe_loopback_tcp_listener_owner,
