@@ -26,9 +26,18 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod installer_authority_key;
 mod installer_root;
 mod tcp_listener_owner;
 
+pub use installer_authority_key::{
+    INSTALLATION_AUTHORITY_KEY_FILE_BYTES, INSTALLATION_AUTHORITY_KEY_FILE_VERSION,
+    INSTALLATION_AUTHORITY_KEY_ID_MAX_BYTES, INSTALLATION_AUTHORITY_KEY_MAGIC,
+    INSTALLATION_AUTHORITY_KEY_ROOT_RELATIVE, INSTALLATION_AUTHORITY_SIGNER_ID,
+    InstallationAuthorityKeyError, InstallationAuthorityKeyExpectation,
+    InstallationAuthorityKeyMetadata, InstallationAuthorityKeySigner,
+    WindowsInstallationAuthorityKeyProvider, WindowsInstallationAuthorityKeyStore,
+};
 pub use installer_root::{
     InstallerProtectedFileReadback, InstallerRootAbsentSnapshot, InstallerRootCreateDisposition,
     InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveCreate,
@@ -4959,6 +4968,15 @@ impl OwnedSecurityDescriptor {
         ))
     }
 
+    /// Exact security descriptor for the installation-authority key root and
+    /// immutable key slots.  This intentionally omits `LocalService` and all
+    /// broad user principals: the signing seed is an installer authority, not
+    /// a runtime service secret.
+    #[cfg(windows)]
+    fn for_installer_authority_key() -> Result<Self, WindowsAdapterError> {
+        Self::from_sddl("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)")
+    }
+
     fn for_local_service_host_marker() -> Result<Self, WindowsAdapterError> {
         // The marker is Host transaction authority, not administrator UI
         // state.  Granting BA full access lets an unrelated administrator
@@ -5048,6 +5066,93 @@ impl Drop for OwnedSecurityDescriptor {
             // SAFETY: Win32 allocated the descriptor and this wrapper owns it.
             unsafe { windows_sys::Win32::Foundation::LocalFree(self.raw.cast()) };
         }
+    }
+}
+
+/// Verifies the exact owner, protected DACL and descriptor bytes on a live
+/// handle.  This narrow helper is shared by protected installer primitives so
+/// they cannot accidentally downgrade to a path-only ACL check.
+#[cfg(windows)]
+pub(crate) fn verify_exact_file_security(
+    file: &std::fs::File,
+    expected: &OwnedSecurityDescriptor,
+    expected_owner: &str,
+) -> Result<(), WindowsAdapterError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    };
+
+    let expected_dacl = expected.dacl()?;
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        // SAFETY: `file` owns a live handle and all output pointers are valid
+        // locals; Windows owns `descriptor` until LocalFree below.
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() || owner.is_null() {
+        if !descriptor.is_null() {
+            // SAFETY: descriptor was allocated by GetSecurityInfo.
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(
+            if status == windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED {
+                WindowsAdapterError::PermissionDenied
+            } else {
+                WindowsAdapterError::AclMismatch
+            },
+        );
+    }
+
+    let mut present = 0;
+    let mut actual_dacl = std::ptr::null_mut();
+    let mut defaulted = 0;
+    let dacl_matches = unsafe {
+        // SAFETY: both descriptors remain live for these bounded ACL reads.
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut present,
+            &raw mut actual_dacl,
+            &raw mut defaulted,
+        ) != 0
+            && present != 0
+            && !actual_dacl.is_null()
+            && (*actual_dacl).AclSize == (*expected_dacl).AclSize
+            && std::slice::from_raw_parts(
+                actual_dacl.cast::<u8>(),
+                usize::from((*actual_dacl).AclSize),
+            ) == std::slice::from_raw_parts(
+                expected_dacl.cast::<u8>(),
+                usize::from((*expected_dacl).AclSize),
+            )
+    };
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    let protected = unsafe {
+        // SAFETY: descriptor remains live and output locals are valid.
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0
+    };
+    let owner_matches = sid_to_string(owner).is_ok_and(|observed| observed == expected_owner);
+    // SAFETY: descriptor is released exactly once after all reads complete.
+    unsafe { LocalFree(descriptor.cast()) };
+    if dacl_matches && protected && owner_matches {
+        Ok(())
+    } else {
+        Err(WindowsAdapterError::AclMismatch)
     }
 }
 
