@@ -37,7 +37,10 @@ use eliot_platform_windows::{
     fresh_service_registration_nonce, observe_running_eliot_host_process,
     protected_program_data_root, require_protected_program_data_path,
 };
-use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, TableHandle,
+    WriteTransaction,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -72,6 +75,14 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 /// so durable transaction records fail closed when their nested candidate
 /// manifest predates the required Host artifact binding.
 pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(7, 0, 0);
+
+/// Current durable approved-generation registry wire revision.
+///
+/// Registry wire version 3 makes both the wire discriminator and the
+/// monotonic registry revision mandatory.  Older projections are never
+/// defaulted into the current activation authority; they require explicit
+/// re-stage.
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 
 /// Returns the stable contract identity for handshakes and provenance.
 pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
@@ -2470,14 +2481,137 @@ impl CandidateManifest {
     }
 }
 
+/// The typed approval binding for one installer-produced activation candidate.
+///
+/// This is an evidence reference plus the complete identity contour which Host
+/// must consume.  It is deliberately not represented by a bare approval string:
+/// changing any one of the transaction, manifest, request-owner, runtime
+/// descriptor or authority-fence inputs invalidates the approval.
+///
+/// ```compile_fail
+/// use eliot_installation::{InstallationActivationApproval, PlatformHandle};
+/// fn forge(approval: &mut InstallationActivationApproval) {
+///     approval.approval_ref = PlatformHandle::new("forged").unwrap();
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationActivationApproval {
+    /// Non-secret approval evidence reference.  The fields are intentionally
+    /// private: installation accepts this value only from an independently
+    /// issuing authority that also supplies static-verification proof.
+    approval_ref: PlatformHandle,
+    /// Sole installation transaction identity.
+    transaction_id: PlatformHandle,
+    /// Digest of the immutable installer effect plan.
+    installer_plan_digest: PlatformHandle,
+    /// Candidate generation identity.
+    generation: PlatformHandle,
+    /// Digest of the exact candidate manifest bytes.
+    candidate_manifest_digest: PlatformHandle,
+    /// Self-digest of the exact runtime launch descriptor.
+    runtime_descriptor_digest: PlatformHandle,
+    /// Request owner required for admission.
+    required_owner: PlatformHandle,
+    /// Candidate signature/approval evidence reference.
+    signature_ref: PlatformHandle,
+    /// Exact authority handoff descriptor path.
+    authority_descriptor_path: PlatformHandle,
+    /// SHA-256 digest of the authority descriptor bytes.
+    authority_descriptor_digest: PlatformHandle,
+    /// Authority resource generation.
+    authority_generation: ResourceGeneration,
+    /// Exact authority state fence.
+    authority_state_fence: StateFence,
+}
+
+impl InstallationActivationApproval {
+    /// Validates the approval's self-contained typed binding.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        handle(&self.approval_ref, "activation_approval.approval_ref")?;
+        handle(&self.transaction_id, "activation_approval.transaction_id")?;
+        sha256_handle(
+            &self.installer_plan_digest,
+            "activation_approval.installer_plan_digest",
+        )?;
+        handle(&self.generation, "activation_approval.generation")?;
+        sha256_handle(
+            &self.candidate_manifest_digest,
+            "activation_approval.candidate_manifest_digest",
+        )?;
+        sha256_handle(
+            &self.runtime_descriptor_digest,
+            "activation_approval.runtime_descriptor_digest",
+        )?;
+        handle(&self.required_owner, "activation_approval.required_owner")?;
+        handle(&self.signature_ref, "activation_approval.signature_ref")?;
+        handle(
+            &self.authority_descriptor_path,
+            "activation_approval.authority_descriptor_path",
+        )?;
+        sha256_handle(
+            &self.authority_descriptor_digest,
+            "activation_approval.authority_descriptor_digest",
+        )?;
+        if self.authority_generation.value() == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "activation_approval.authority_generation".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        self.authority_state_fence
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "activation_approval.authority_state_fence".to_owned(),
+                reason: error.to_string(),
+            })?;
+        if self.authority_state_fence.resource_generation != self.authority_generation {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Validates every approval binding against the exact transaction.
+    ///
+    /// The all-effects gate runs first, so a partially applied or unknown
+    /// installer transaction can never produce a valid activation approval.
+    pub fn validate_against(
+        &self,
+        transaction: &InstallationTransaction,
+    ) -> Result<(), InstallationError> {
+        transaction.require_all_effects_applied()?;
+        self.validate()?;
+        let manifest = &transaction.candidate_manifest;
+        let runtime = &manifest.runtime_launch;
+        let expected_manifest_digest = candidate_manifest_digest(manifest)?;
+        let matches = [
+            self.transaction_id == transaction.transaction_id,
+            self.installer_plan_digest == transaction.installer_plan_digest,
+            self.generation == manifest.generation,
+            self.candidate_manifest_digest == expected_manifest_digest,
+            self.runtime_descriptor_digest == runtime.descriptor_digest,
+            self.required_owner == transaction.request.required_owner,
+            self.signature_ref == manifest.signature_ref,
+            self.authority_descriptor_path == runtime.authority_descriptor_path,
+            self.authority_descriptor_digest == runtime.authority_descriptor_digest,
+            self.authority_generation == runtime.authority_generation,
+            self.authority_state_fence == runtime.authority_state_fence,
+        ];
+        if matches.iter().any(|matches| !matches) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
 /// One artifact generation admitted by installation policy.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovedGeneration {
     /// The complete immutable candidate manifest.
     pub manifest: CandidateManifest,
-    /// Non-secret approval evidence reference.
-    pub approval_ref: PlatformHandle,
+    /// Full transaction-bound activation approval.
+    pub approval: InstallationActivationApproval,
     /// Whether this generation is currently active.
     pub active: bool,
     /// Whether this generation is the last-known-good activation.
@@ -2505,11 +2639,38 @@ enum PendingActivationTerminalDisposition {
 }
 
 impl ApprovedGeneration {
-    /// Validates the generation and its approval reference.
+    /// Validates the generation and its complete approval binding.
     pub fn validate(&self) -> Result<(), InstallationError> {
         self.manifest.validate()?;
-        handle(&self.approval_ref, "approved_generation.approval_ref")
+        self.approval.validate()?;
+        validate_approval_against_manifest(&self.approval, &self.manifest, "approved_generation")
     }
+}
+
+fn validate_approval_against_manifest(
+    approval: &InstallationActivationApproval,
+    manifest: &CandidateManifest,
+    field_prefix: &str,
+) -> Result<(), InstallationError> {
+    let runtime = &manifest.runtime_launch;
+    let expected_manifest_digest = candidate_manifest_digest(manifest)?;
+    let matches = [
+        approval.generation == manifest.generation,
+        approval.candidate_manifest_digest == expected_manifest_digest,
+        approval.runtime_descriptor_digest == runtime.descriptor_digest,
+        approval.signature_ref == manifest.signature_ref,
+        approval.authority_descriptor_path == runtime.authority_descriptor_path,
+        approval.authority_descriptor_digest == runtime.authority_descriptor_digest,
+        approval.authority_generation == runtime.authority_generation,
+        approval.authority_state_fence == runtime.authority_state_fence,
+    ];
+    if matches.iter().any(|matches| !matches) {
+        return Err(InstallationError::InvalidField {
+            field: field_prefix.to_owned(),
+            reason: "activation approval does not bind the exact candidate manifest".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Installation-owned approved-generation and last-known-good registry.
@@ -2524,9 +2685,23 @@ impl ApprovedGeneration {
 ///     registry.active_generation = None;
 /// }
 /// ```
-#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+///
+/// The public registry type is also intentionally not deserializable.  Only
+/// the private v3 wire decoder can reconstruct an authority projection.
+///
+/// ```compile_fail
+/// use eliot_installation::ApprovedGenerationRegistry;
+/// fn forge_registry(bytes: &str) {
+///     let _: ApprovedGenerationRegistry = serde_json::from_str(bytes).unwrap();
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovedGenerationRegistry {
+    /// Mandatory durable wire discriminator.
+    registry_wire_version: ContractVersion,
+    /// Monotonic CAS revision of this registry projection.
+    revision: u64,
     /// Approved generations keyed by their exact generation identity.
     generations: Vec<ApprovedGeneration>,
     /// Installer-owned Host and Watchdog SCM approvals keyed by generation and
@@ -2546,14 +2721,19 @@ pub struct ApprovedGenerationRegistry {
     /// Exact idempotency receipt for the most recent committed or aborted
     /// pending activation.  A new stage supersedes this single terminal
     /// receipt.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     last_terminal_activation: Option<PendingActivationTerminal>,
+}
+
+impl Default for ApprovedGenerationRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Durable activation candidate handed from the installer coordinator to the
 /// Host owner.  Every identity and digest is repeated from the immutable
 /// candidate so a stale or substituted pending record fails closed.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingActivation {
     /// Sole installation transaction identity.
@@ -2581,7 +2761,7 @@ pub struct PendingActivation {
     /// Prior active generation retained until Host commits this candidate.
     pub prior_active_generation: Option<PlatformHandle>,
     /// Installer approval evidence for this candidate.
-    pub approval_ref: PlatformHandle,
+    pub approval: InstallationActivationApproval,
     /// Durable recovery disposition after an interrupted/failed attempt.
     pub state: PendingActivationState,
 }
@@ -2610,6 +2790,157 @@ const LEGACY_REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eliot_approved_generations_v1");
 const REGISTRY_RELATIVE_PATH: &str = "Eliot/host/installation-registry.redb";
 const INSTALLATION_REGISTRY_FILE_NAME: &str = "installation-registry.redb";
+
+/// Private deserialization mirror for an authority-issued approval.  The
+/// public approval type intentionally has no `Deserialize` implementation;
+/// only this registry boundary may reconstruct a previously sealed value.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallationActivationApprovalWire {
+    approval_ref: PlatformHandle,
+    transaction_id: PlatformHandle,
+    installer_plan_digest: PlatformHandle,
+    generation: PlatformHandle,
+    candidate_manifest_digest: PlatformHandle,
+    runtime_descriptor_digest: PlatformHandle,
+    required_owner: PlatformHandle,
+    signature_ref: PlatformHandle,
+    authority_descriptor_path: PlatformHandle,
+    authority_descriptor_digest: PlatformHandle,
+    authority_generation: ResourceGeneration,
+    authority_state_fence: StateFence,
+}
+
+impl InstallationActivationApprovalWire {
+    fn into_approval(self) -> InstallationActivationApproval {
+        InstallationActivationApproval {
+            approval_ref: self.approval_ref,
+            transaction_id: self.transaction_id,
+            installer_plan_digest: self.installer_plan_digest,
+            generation: self.generation,
+            candidate_manifest_digest: self.candidate_manifest_digest,
+            runtime_descriptor_digest: self.runtime_descriptor_digest,
+            required_owner: self.required_owner,
+            signature_ref: self.signature_ref,
+            authority_descriptor_path: self.authority_descriptor_path,
+            authority_descriptor_digest: self.authority_descriptor_digest,
+            authority_generation: self.authority_generation,
+            authority_state_fence: self.authority_state_fence,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovedGenerationWire {
+    manifest: CandidateManifest,
+    approval: InstallationActivationApprovalWire,
+    active: bool,
+    last_known_good: bool,
+}
+
+impl ApprovedGenerationWire {
+    fn into_generation(self) -> ApprovedGeneration {
+        ApprovedGeneration {
+            manifest: self.manifest,
+            approval: self.approval.into_approval(),
+            active: self.active,
+            last_known_good: self.last_known_good,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingActivationWire {
+    transaction_id: PlatformHandle,
+    plan_digest: PlatformHandle,
+    manifest: CandidateManifest,
+    config_digest: PlatformHandle,
+    kernel_artifact_digest: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    host_executable_path: PlatformHandle,
+    host_artifact_digest: PlatformHandle,
+    runtime_state_roots_digest: PlatformHandle,
+    manifest_digest: PlatformHandle,
+    prior_active_generation: Option<PlatformHandle>,
+    approval: InstallationActivationApprovalWire,
+    state: PendingActivationState,
+}
+
+impl PendingActivationWire {
+    fn into_pending(self) -> PendingActivation {
+        PendingActivation {
+            transaction_id: self.transaction_id,
+            plan_digest: self.plan_digest,
+            manifest: self.manifest,
+            config_digest: self.config_digest,
+            kernel_artifact_digest: self.kernel_artifact_digest,
+            store_bridge_artifact_digest: self.store_bridge_artifact_digest,
+            canonical_store_artifact_digest: self.canonical_store_artifact_digest,
+            host_executable_path: self.host_executable_path,
+            host_artifact_digest: self.host_artifact_digest,
+            runtime_state_roots_digest: self.runtime_state_roots_digest,
+            manifest_digest: self.manifest_digest,
+            prior_active_generation: self.prior_active_generation,
+            approval: self.approval.into_approval(),
+            state: self.state,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryWireV3 {
+    registry_wire_version: ContractVersion,
+    revision: u64,
+    generations: Vec<ApprovedGenerationWire>,
+    service_registration_approvals: Vec<InstallerServiceRegistrationApproval>,
+    active_generation: RequiredOption<PlatformHandle>,
+    last_known_good_generation: RequiredOption<PlatformHandle>,
+    pending_activation: RequiredOption<PendingActivationWire>,
+    last_terminal_activation: RequiredOption<PendingActivationTerminal>,
+}
+
+/// An optional wire member whose presence is mandatory.  Explicit `null` is
+/// the only valid empty value; an omitted member is a schema migration rather
+/// than an implicit serde default.
+struct RequiredOption<T>(Option<T>);
+
+impl<'de, T> Deserialize<'de> for RequiredOption<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(Self)
+    }
+}
+
+impl RegistryWireV3 {
+    fn into_registry(self) -> ApprovedGenerationRegistry {
+        ApprovedGenerationRegistry {
+            registry_wire_version: self.registry_wire_version,
+            revision: self.revision,
+            generations: self
+                .generations
+                .into_iter()
+                .map(ApprovedGenerationWire::into_generation)
+                .collect(),
+            service_registration_approvals: self.service_registration_approvals,
+            active_generation: self.active_generation.0,
+            last_known_good_generation: self.last_known_good_generation.0,
+            pending_activation: self
+                .pending_activation
+                .0
+                .map(PendingActivationWire::into_pending),
+            last_terminal_activation: self.last_terminal_activation.0,
+        }
+    }
+}
 
 #[allow(
     dead_code,
@@ -2857,9 +3188,7 @@ struct PreHostArtifactBindingRegistryWire {
     generations: Vec<PreHostArtifactBindingApprovedGenerationWire>,
     active_generation: Option<PlatformHandle>,
     last_known_good_generation: Option<PlatformHandle>,
-    #[serde(default)]
     pending_activation: Option<serde_json::Value>,
-    #[serde(default)]
     last_terminal_activation: Option<serde_json::Value>,
 }
 
@@ -2953,9 +3282,7 @@ struct PreCredentialBindingRegistryWire {
     generations: Vec<PreCredentialBindingApprovedGenerationWire>,
     active_generation: Option<PlatformHandle>,
     last_known_good_generation: Option<PlatformHandle>,
-    #[serde(default)]
     pending_activation: Option<serde_json::Value>,
-    #[serde(default)]
     last_terminal_activation: Option<serde_json::Value>,
 }
 
@@ -3030,158 +3357,240 @@ struct PreCredentialBindingRuntimeLaunchDescriptorWire {
     descriptor_digest: PlatformHandle,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PrePendingRegistryWire {
-    generations: Vec<ApprovedGeneration>,
-    active_generation: Option<PlatformHandle>,
-    last_known_good_generation: Option<PlatformHandle>,
-}
-
 #[allow(dead_code)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreServiceRegistrationApprovalRegistryWire {
-    generations: Vec<ApprovedGeneration>,
+    generations: Vec<serde_json::Value>,
     active_generation: Option<PlatformHandle>,
     last_known_good_generation: Option<PlatformHandle>,
-    pending_activation: Option<PendingActivation>,
-    #[serde(default)]
+    pending_activation: Option<serde_json::Value>,
     last_terminal_activation: Option<serde_json::Value>,
 }
 
-fn is_pre_eliotd_config_registry(bytes: &[u8]) -> bool {
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+fn registry_has_prior_shape(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
         return false;
     };
-    let Some(generations) = value
-        .get_mut("generations")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return false;
-    };
-    if generations.is_empty() {
-        return false;
-    }
-    for (index, generation) in generations.iter_mut().enumerate() {
-        let Some(runtime) = generation
-            .get_mut("manifest")
-            .and_then(|manifest| manifest.get_mut("runtime_launch"))
-            .and_then(serde_json::Value::as_object_mut)
-        else {
-            return false;
-        };
+    [
+        "generations",
+        "active_generation",
+        "last_known_good_generation",
+    ]
+    .iter()
+    .all(|field| object.contains_key(*field))
+}
+
+fn registry_runtime_objects(
+    value: &serde_json::Value,
+) -> impl Iterator<Item = &serde_json::Map<String, serde_json::Value>> {
+    value
+        .get("generations")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flat_map(|generations| generations.iter())
+        .filter_map(serde_json::Value::as_object)
+        .filter_map(|generation| generation.get("manifest"))
+        .filter_map(serde_json::Value::as_object)
+        .filter_map(|manifest| manifest.get("runtime_launch"))
+        .filter_map(serde_json::Value::as_object)
+}
+
+fn is_pre_eliotd_config_registry(value: &serde_json::Value) -> bool {
+    let mut seen = false;
+    for runtime in registry_runtime_objects(value) {
+        seen = true;
         if runtime.contains_key("eliotd_config_path")
             || runtime.contains_key("eliotd_config_digest")
         {
             return false;
         }
-        runtime.insert(
-            "eliotd_config_path".to_owned(),
-            serde_json::Value::String(format!(
-                r"C:\ProgramData\Eliot\Migration\eliotd-governor-{index}.json"
-            )),
-        );
-        runtime.insert(
-            "eliotd_config_digest".to_owned(),
-            serde_json::Value::String("0".repeat(64)),
-        );
     }
-    value["service_registration_approvals"] = serde_json::json!([]);
-    let Ok(mut registry) = serde_json::from_value::<ApprovedGenerationRegistry>(value) else {
-        return false;
-    };
-    for generation in &mut registry.generations {
-        let Ok(bytes) = generation.manifest.runtime_launch.unsigned_bytes() else {
-            return false;
-        };
-        let Ok(digest) = PlatformHandle::new(sha256_hex(&bytes)) else {
-            return false;
-        };
-        generation.manifest.runtime_launch.descriptor_digest = digest;
-    }
-    registry.validate().is_ok()
+    seen
 }
 
+fn current_registry_wire_missing_field(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return true;
+    };
+    [
+        "registry_wire_version",
+        "revision",
+        "generations",
+        "service_registration_approvals",
+        "active_generation",
+        "last_known_good_generation",
+        "pending_activation",
+        "last_terminal_activation",
+    ]
+    .iter()
+    .any(|field| !object.contains_key(*field))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "registry decoding keeps strict current-wire and migration classification together"
+)]
 fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, InstallationError> {
-    match serde_json::from_slice::<ApprovedGenerationRegistry>(bytes) {
-        Ok(registry) => {
-            registry
-                .validate()
-                .map_err(|_| InstallationError::CorruptRegistry {
-                    reason: "current registry projection failed validation".to_owned(),
-                })?;
-            Ok(registry)
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| {
+        InstallationError::CorruptRegistry {
+            reason: format!("registry bytes are not valid JSON: {error}"),
         }
-        Err(_) => {
-            if serde_json::from_slice::<PreHostArtifactBindingRegistryWire>(bytes).is_ok() {
-                Err(InstallationError::MigrationRequired {
-                    reason: "approved-generation registry predates the approved Host executable artifact binding and requires explicit re-stage"
-                        .to_owned(),
-                })
-            } else if is_pre_eliotd_config_registry(bytes) {
-                Err(InstallationError::MigrationRequired {
-                    reason: "approved-generation registry predates the separate eliotd Governor config binding and requires explicit re-stage"
-                        .to_owned(),
-                })
-            } else if serde_json::from_slice::<PreCredentialBindingRegistryWire>(bytes).is_ok() {
-                Err(InstallationError::MigrationRequired {
-                    reason: "approved-generation registry predates the descriptor-bound Store credential target and requires explicit re-stage"
-                        .to_owned(),
-                })
-            } else if serde_json::from_slice::<PreSplitRegistryWire>(bytes).is_ok() {
-                Err(InstallationError::MigrationRequired {
-                    reason: "approved-generation registry predates split Store bridge/provider argv and requires explicit re-stage"
-                        .to_owned(),
-                })
-            } else if serde_json::from_slice::<V1RegistryWire>(bytes).is_ok() {
-                Err(InstallationError::MigrationRequired {
-                    reason: "approved-generation registry v1 requires explicit re-stage; runtime roots cannot be synthesized"
-                        .to_owned(),
-                })
-            } else if serde_json::from_slice::<LegacyRegistryWire>(bytes).is_ok() {
-                Err(InstallationError::MigrationRequired {
-                    reason: "approved-generation registry requires re-stage; legacy launch fields cannot be synthesized"
-                        .to_owned(),
-                })
-            } else if serde_json::from_slice::<PreServiceRegistrationApprovalRegistryWire>(bytes)
-                .is_ok()
-            {
-                Err(InstallationError::MigrationRequired {
-                    reason: "approved-generation registry predates installer-owned SCM registration approvals and requires explicit re-stage"
-                        .to_owned(),
-                })
-            } else if let Ok(previous) = serde_json::from_slice::<PrePendingRegistryWire>(bytes) {
-                let previous = ApprovedGenerationRegistry {
-                    generations: previous.generations,
-                    service_registration_approvals: Vec::new(),
-                    active_generation: previous.active_generation,
-                    last_known_good_generation: previous.last_known_good_generation,
-                    pending_activation: None,
-                    last_terminal_activation: None,
-                };
-                if previous.validate().is_ok() {
-                    Err(InstallationError::MigrationRequired {
-                        reason: "approved-generation registry predates durable pending activation and requires explicit re-stage"
-                            .to_owned(),
-                    })
-                } else {
-                    Err(InstallationError::CorruptRegistry {
-                        reason: "pre-pending registry projection failed validation".to_owned(),
-                    })
-                }
-            } else {
-                Err(InstallationError::CorruptRegistry {
-                    reason:
-                        "registry bytes are neither current nor structurally valid prior-v1 schema"
-                            .to_owned(),
-                })
-            }
-        }
+    })?;
+
+    let declared_major = value
+        .get("registry_wire_version")
+        .and_then(|version| version.get("major"))
+        .and_then(serde_json::Value::as_u64);
+    if declared_major == Some(u64::from(INSTALLATION_REGISTRY_WIRE_VERSION.major))
+        && current_registry_wire_missing_field(&value)
+    {
+        return Err(InstallationError::CorruptRegistry {
+            reason: "registry wire v3 is missing mandatory fields or contains an invalid field"
+                .to_owned(),
+        });
     }
+
+    if let Ok(wire) = serde_json::from_value::<RegistryWireV3>(value.clone()) {
+        if wire.registry_wire_version != INSTALLATION_REGISTRY_WIRE_VERSION {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "approved-generation registry wire {} requires explicit re-stage as {}",
+                    wire.registry_wire_version, INSTALLATION_REGISTRY_WIRE_VERSION
+                ),
+            });
+        }
+        if wire.revision == 0 {
+            return Err(InstallationError::CorruptRegistry {
+                reason: "current registry revision must be non-zero".to_owned(),
+            });
+        }
+        let registry = wire.into_registry();
+        registry
+            .validate()
+            .map_err(|_| InstallationError::CorruptRegistry {
+                reason: "current registry projection failed validation".to_owned(),
+            })?;
+        return Ok(registry);
+    }
+
+    if let Some(version) = declared_major {
+        if version < u64::from(INSTALLATION_REGISTRY_WIRE_VERSION.major) {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "approved-generation registry wire v{version} requires explicit re-stage as v{}",
+                    INSTALLATION_REGISTRY_WIRE_VERSION.major
+                ),
+            });
+        }
+        return Err(InstallationError::CorruptRegistry {
+            reason: "registry wire v3 is missing mandatory fields or contains an invalid field"
+                .to_owned(),
+        });
+    }
+
+    if registry_has_prior_shape(&value) {
+        if value.as_object().is_some_and(|object| {
+            object.keys().any(|field| {
+                !matches!(
+                    field.as_str(),
+                    "generations"
+                        | "active_generation"
+                        | "last_known_good_generation"
+                        | "service_registration_approvals"
+                        | "pending_activation"
+                        | "last_terminal_activation"
+                        | "registry_wire_version"
+                        | "revision"
+                )
+            })
+        }) {
+            return Err(InstallationError::CorruptRegistry {
+                reason: "prior registry schema contains unknown fields".to_owned(),
+            });
+        }
+        let runtimes = registry_runtime_objects(&value).collect::<Vec<_>>();
+        let manifests_missing_store_credential_target = value
+            .get("generations")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|generations| {
+                generations.iter().any(|generation| {
+                    generation
+                        .get("manifest")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|manifest| !manifest.contains_key("store_credential_target"))
+                })
+            });
+        let has_pending = value.get("pending_activation").is_some();
+        if manifests_missing_store_credential_target
+            || runtimes
+                .iter()
+                .any(|runtime| !runtime.contains_key("store_credential_target"))
+        {
+            return Err(InstallationError::MigrationRequired {
+                reason: "approved-generation registry predates the descriptor-bound Store credential target and requires explicit re-stage"
+                    .to_owned(),
+            });
+        }
+        if runtimes.iter().any(|runtime| {
+            !runtime.contains_key("host_executable_path")
+                || !runtime.contains_key("host_artifact_digest")
+        }) {
+            return Err(InstallationError::MigrationRequired {
+                reason: "approved-generation registry predates the approved Host executable artifact binding and requires explicit re-stage"
+                    .to_owned(),
+            });
+        }
+        if runtimes
+            .iter()
+            .any(|runtime| !runtime.contains_key("store_bridge_arguments"))
+        {
+            return Err(InstallationError::MigrationRequired {
+                reason: "approved-generation registry predates split Store bridge/provider argv and requires explicit re-stage"
+                    .to_owned(),
+            });
+        }
+        if is_pre_eliotd_config_registry(&value) {
+            return Err(InstallationError::MigrationRequired {
+                reason: "approved-generation registry predates the separate eliotd Governor config binding and requires explicit re-stage"
+                    .to_owned(),
+            });
+        }
+        if value.get("service_registration_approvals").is_none() {
+            return Err(InstallationError::MigrationRequired {
+                reason: "approved-generation registry predates installer-owned SCM registration approvals and requires explicit re-stage"
+                    .to_owned(),
+            });
+        }
+        if !has_pending {
+            return Err(InstallationError::MigrationRequired {
+                reason: "approved-generation registry predates durable pending activation and requires explicit re-stage"
+                    .to_owned(),
+            });
+        }
+        return Err(InstallationError::MigrationRequired {
+            reason: "approved-generation registry v2/pre-CAS requires explicit re-stage with a mandatory wire revision"
+                .to_owned(),
+        });
+    }
+
+    Err(InstallationError::CorruptRegistry {
+        reason: "registry bytes are neither current nor structurally valid prior schema".to_owned(),
+    })
 }
 
 /// Durable redb owner for approved generations and LKG activation state.
+///
+/// There is no public raw `save` operation.  Every production mutation must
+/// use a narrow transaction-bound operation with an expected revision and an
+/// exact typed approval.
+///
+/// ```compile_fail
+/// use eliot_installation::{ApprovedGenerationRegistry, RedbInstallationRegistry};
+/// fn raw_save(store: &RedbInstallationRegistry, registry: &ApprovedGenerationRegistry) {
+///     store.save(registry);
+/// }
+/// ```
 pub struct RedbInstallationRegistry {
     database: Database,
     _path_lease: RegistryPathLease,
@@ -3436,17 +3845,74 @@ impl RedbInstallationRegistry {
         Ok(registry)
     }
 
-    /// Durably stores one complete validated registry projection.
-    pub fn save(&self, registry: &ApprovedGenerationRegistry) -> Result<(), InstallationError> {
-        registry.validate()?;
-        classify_registry_table(&self.database)?;
-        let bytes = serde_json::to_vec(registry)
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    /// Loads the sealed transaction and atomically stages its exact pending
+    /// activation plus installer-owned SCM approvals.
+    ///
+    /// `approval` must have been issued by the independent authority after
+    /// static verification.  This crate deliberately exposes no constructor
+    /// or deserializer for that value; until the authority lane supplies the
+    /// sealed receipt, initial staging is unavailable and fails closed at the
+    /// caller's boundary.
+    ///
+    /// `expected_revision` is checked against the registry snapshot inside the
+    /// same redb write transaction that commits the projection.  An exact retry
+    /// is a no-op and does not advance the revision.
+    pub fn stage_pending_activation_from_transaction_store<S: InstallationTransactionStore>(
+        &self,
+        transaction_store: &S,
+        transaction_id: &PlatformHandle,
+        approval: InstallationActivationApproval,
+        expected_revision: u64,
+    ) -> Result<(), InstallationError> {
+        let transaction = transaction_store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        if transaction.transaction_id != *transaction_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if approval.transaction_id != *transaction_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        approval.validate_against(&transaction)?;
+        self.mutate_atomic(expected_revision, |registry| {
+            registry.stage_pending_activation_from_transaction_with_approval(&transaction, approval)
+        })
+    }
+
+    fn mutate_atomic<T, F>(&self, expected_revision: u64, mutate: F) -> Result<T, InstallationError>
+    where
+        F: FnOnce(&mut ApprovedGenerationRegistry) -> Result<T, InstallationError>,
+    {
         let write = self
             .database
             .begin_write()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        {
+        let mut current = read_registry_in_write(&write)?;
+        current.validate()?;
+        let actual_revision = current.revision();
+        if actual_revision != expected_revision {
+            return Err(InstallationError::CompareAndSaveConflict {
+                expected: expected_revision,
+                actual: actual_revision,
+            });
+        }
+        let before = current.clone();
+        let result = mutate(&mut current)?;
+        current.validate()?;
+        if current != before {
+            current.revision =
+                current
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| InstallationError::InvalidField {
+                        field: "registry.revision".to_owned(),
+                        reason: "overflow".to_owned(),
+                    })?;
+            current.validate()?;
+            let bytes = serde_json::to_vec(&current)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
             let mut table = write
                 .open_table(REGISTRY_TABLE)
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
@@ -3456,28 +3922,119 @@ impl RedbInstallationRegistry {
         }
         write
             .commit()
-            .map_err(|error| InstallationError::Platform(error.to_string()))
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        Ok(result)
     }
 
-    /// Loads the sealed transaction, projects its exact pending activation and
-    /// SCM approvals, and commits the complete registry in one durable save.
+    /// Atomically claims one exact pending activation for the live Host owner.
     ///
-    /// A successful return means the registry write committed.  If the process
-    /// stops between the transaction-store read and this commit, retrying the
-    /// same transaction identity is idempotent.
-    pub fn stage_pending_activation_from_transaction_store<S: InstallationTransactionStore>(
+    /// The registry snapshot, expected revision and complete typed approval
+    /// binding are checked inside one redb write transaction.  The returned
+    /// pending record is the exact durable value that Host must launch.
+    pub fn claim_pending_activation(
         &self,
-        transaction_store: &S,
-        transaction_id: &PlatformHandle,
-        approval_ref: PlatformHandle,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        approval: &InstallationActivationApproval,
+    ) -> Result<PendingActivation, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        approval.validate()?;
+        let approval = approval.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            let pending = registry.pending_activation.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            if pending.approval != approval {
+                return Err(InstallationError::IdentityConflict);
+            }
+            registry.claim_pending_activation_unchecked(
+                &approval.transaction_id,
+                &approval.installer_plan_digest,
+                &approval.generation,
+            )
+        })
+    }
+
+    /// Atomically records a Host recovery disposition for one exact approval.
+    pub fn mark_pending_recovery(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        approval: &InstallationActivationApproval,
+        reason: impl Into<String>,
     ) -> Result<(), InstallationError> {
-        let mut registry = self.load()?;
-        registry.stage_pending_activation_from_store(
-            transaction_store,
-            transaction_id,
-            approval_ref,
-        )?;
-        self.save(&registry)
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        approval.validate()?;
+        let approval = approval.clone();
+        let reason = reason.into();
+        self.mutate_atomic(expected_revision, |registry| {
+            let pending = registry.pending_activation.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            if pending.approval != approval {
+                return Err(InstallationError::IdentityConflict);
+            }
+            registry.mark_pending_recovery_unchecked(
+                &approval.transaction_id,
+                &approval.installer_plan_digest,
+                reason,
+            )
+        })
+    }
+
+    /// Atomically commits one exact Host-proven healthy pending approval.
+    pub fn commit_pending_activation(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        approval: &InstallationActivationApproval,
+    ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        approval.validate()?;
+        let approval = approval.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            if let Some(pending) = registry.pending_activation.as_ref()
+                && pending.approval != approval
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            registry.commit_pending_activation_unchecked(
+                &approval.transaction_id,
+                &approval.installer_plan_digest,
+                &approval.generation,
+            )
+        })
+    }
+
+    /// Atomically aborts one exact first-install pending approval.
+    pub fn abort_pending_activation(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        approval: &InstallationActivationApproval,
+    ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        approval.validate()?;
+        let approval = approval.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            if let Some(pending) = registry.pending_activation.as_ref()
+                && pending.approval != approval
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            registry.abort_pending_activation_unchecked(
+                &approval.transaction_id,
+                &approval.installer_plan_digest,
+            )
+        })
     }
 }
 
@@ -3576,6 +4133,7 @@ fn classify_missing_registry_table(read: &redb::ReadTransaction) -> Result<(), I
     Ok(())
 }
 
+#[cfg(test)]
 fn classify_registry_table(database: &impl ReadableDatabase) -> Result<bool, InstallationError> {
     let read = database
         .begin_read()
@@ -3591,11 +4149,61 @@ fn classify_registry_table(database: &impl ReadableDatabase) -> Result<bool, Ins
     }
 }
 
+fn read_registry_in_write(
+    write: &WriteTransaction,
+) -> Result<ApprovedGenerationRegistry, InstallationError> {
+    let has_registry_table = write
+        .list_tables()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?
+        .any(|table| table.name() == REGISTRY_TABLE.name());
+    let has_legacy_table = write
+        .list_tables()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?
+        .any(|table| table.name() == LEGACY_REGISTRY_TABLE.name());
+    if has_legacy_table {
+        return Err(InstallationError::MigrationRequired {
+            reason: "approved-generation registry uses the retired v1 table and requires explicit re-stage"
+                .to_owned(),
+        });
+    }
+    if !has_registry_table {
+        let has_standard_tables = write
+            .list_tables()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+            .next()
+            .is_some();
+        let has_multimap_tables = write
+            .list_multimap_tables()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+            .next()
+            .is_some();
+        if has_standard_tables || has_multimap_tables {
+            return Err(InstallationError::MigrationRequired {
+                reason: "existing nonempty registry store has no installation-registry v3 table"
+                    .to_owned(),
+            });
+        }
+        return Ok(ApprovedGenerationRegistry::new());
+    }
+    let table = write
+        .open_table(REGISTRY_TABLE)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let Some(value) = table
+        .get("registry")
+        .map_err(|error| InstallationError::Platform(error.to_string()))?
+    else {
+        return Ok(ApprovedGenerationRegistry::new());
+    };
+    decode_registry_bytes(value.value())
+}
+
 impl ApprovedGenerationRegistry {
     /// Creates an empty registry.
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            registry_wire_version: INSTALLATION_REGISTRY_WIRE_VERSION,
+            revision: 1,
             generations: Vec::new(),
             service_registration_approvals: Vec::new(),
             active_generation: None,
@@ -3603,6 +4211,18 @@ impl ApprovedGenerationRegistry {
             pending_activation: None,
             last_terminal_activation: None,
         }
+    }
+
+    /// Returns the mandatory durable registry wire version.
+    #[must_use]
+    pub const fn registry_wire_version(&self) -> ContractVersion {
+        self.registry_wire_version
+    }
+
+    /// Returns the current monotonic registry CAS revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Looks up one exact role approval for a generation without exposing a
@@ -3634,31 +4254,42 @@ impl ApprovedGenerationRegistry {
                 "SystemService activation requires transaction-bound SCM approvals".to_owned(),
             ));
         }
-        self.stage_pending_activation_unchecked(
-            transaction_id,
-            plan_digest,
-            manifest,
+        let runtime = &manifest.runtime_launch;
+        let approval = InstallationActivationApproval {
             approval_ref,
-            &[],
-        )
+            transaction_id,
+            installer_plan_digest: plan_digest,
+            generation: manifest.generation.clone(),
+            candidate_manifest_digest: candidate_manifest_digest(&manifest)?,
+            runtime_descriptor_digest: runtime.descriptor_digest.clone(),
+            required_owner: PlatformHandle::new("owner:test").map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "activation_approval.required_owner".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            signature_ref: manifest.signature_ref.clone(),
+            authority_descriptor_path: runtime.authority_descriptor_path.clone(),
+            authority_descriptor_digest: runtime.authority_descriptor_digest.clone(),
+            authority_generation: runtime.authority_generation,
+            authority_state_fence: runtime.authority_state_fence.clone(),
+        };
+        self.stage_pending_activation_unchecked(manifest, approval, &[])
     }
 
     fn stage_pending_activation_unchecked(
         &mut self,
-        transaction_id: PlatformHandle,
-        plan_digest: PlatformHandle,
         manifest: CandidateManifest,
-        approval_ref: PlatformHandle,
+        approval: InstallationActivationApproval,
         service_registration_approvals: &[InstallerServiceRegistrationApproval],
     ) -> Result<(), InstallationError> {
-        handle(&transaction_id, "pending_activation.transaction_id")?;
-        sha256_handle(&plan_digest, "pending_activation.plan_digest")?;
         manifest.validate()?;
-        handle(&approval_ref, "pending_activation.approval_ref")?;
+        approval.validate()?;
+        validate_approval_against_manifest(&approval, &manifest, "pending_activation")?;
         let manifest_digest = candidate_manifest_digest(&manifest)?;
         let pending = PendingActivation {
-            transaction_id,
-            plan_digest,
+            transaction_id: approval.transaction_id.clone(),
+            plan_digest: approval.installer_plan_digest.clone(),
             config_digest: manifest.config_digest.clone(),
             kernel_artifact_digest: manifest.kernel_artifact_digest.clone(),
             store_bridge_artifact_digest: manifest.store_bridge_artifact_digest.clone(),
@@ -3669,7 +4300,7 @@ impl ApprovedGenerationRegistry {
             manifest,
             manifest_digest,
             prior_active_generation: self.active_generation.clone(),
-            approval_ref,
+            approval,
             state: PendingActivationState::Pending,
         };
         if let Some(existing) = &self.pending_activation {
@@ -3692,7 +4323,7 @@ impl ApprovedGenerationRegistry {
         }
         self.generations.push(ApprovedGeneration {
             manifest: pending.manifest.clone(),
-            approval_ref: pending.approval_ref.clone(),
+            approval: pending.approval.clone(),
             active: false,
             last_known_good: false,
         });
@@ -3703,18 +4334,12 @@ impl ApprovedGenerationRegistry {
         self.validate()
     }
 
-    /// Stages one complete installer transaction, including its exact
-    /// Host/Watchdog SCM approval pair, as one in-memory registry projection.
-    ///
-    /// The caller can persist the returned registry with one `save` call.  No
-    /// nonce, manifest or digest is accepted from the caller; all service
-    /// bindings are projected from the transaction's applied effect progress.
-    fn stage_pending_activation_from_transaction(
+    fn stage_pending_activation_from_transaction_with_approval(
         &mut self,
         transaction: &InstallationTransaction,
-        approval_ref: PlatformHandle,
+        approval: InstallationActivationApproval,
     ) -> Result<(), InstallationError> {
-        transaction.require_all_effects_applied()?;
+        approval.validate_against(transaction)?;
         let approvals = transaction.service_registration_approvals()?;
         if transaction.profile == InstallationProfile::SystemService && approvals.len() != 2 {
             return Err(InstallationError::IncompleteObservation(
@@ -3726,7 +4351,7 @@ impl ApprovedGenerationRegistry {
             && existing.transaction_id == transaction.transaction_id
             && existing.plan_digest == transaction.installer_plan_digest
             && existing.manifest == transaction.candidate_manifest
-            && existing.approval_ref == approval_ref
+            && existing.approval == approval
         {
             for approval in &approvals {
                 if self.service_registration_approval(&approval.generation, approval.role)
@@ -3738,38 +4363,11 @@ impl ApprovedGenerationRegistry {
             return self.validate();
         }
         self.stage_pending_activation_unchecked(
-            transaction.transaction_id.clone(),
-            transaction.installer_plan_digest.clone(),
             transaction.candidate_manifest.clone(),
-            approval_ref,
+            approval,
             &approvals,
         )?;
         Ok(())
-    }
-
-    /// Loads one exact durable transaction and stages its complete pending
-    /// activation plus installer-owned SCM approval pair.
-    ///
-    /// The transaction is read through the sealed transaction-store boundary;
-    /// callers cannot supply a forged in-memory manifest or effect-progress
-    /// projection.  The caller should persist this registry once with
-    /// [`RedbInstallationRegistry::save`].
-    fn stage_pending_activation_from_store<S: InstallationTransactionStore>(
-        &mut self,
-        store: &S,
-        transaction_id: &PlatformHandle,
-        approval_ref: PlatformHandle,
-    ) -> Result<(), InstallationError> {
-        let transaction =
-            store
-                .load(transaction_id)?
-                .ok_or_else(|| InstallationError::TransactionNotFound {
-                    transaction_id: transaction_id.as_str().to_owned(),
-                })?;
-        if transaction.transaction_id != *transaction_id {
-            return Err(InstallationError::IdentityConflict);
-        }
-        self.stage_pending_activation_from_transaction(&transaction, approval_ref)
     }
 
     /// Returns the pending candidate, if one exists.
@@ -3811,7 +4409,8 @@ impl ApprovedGenerationRegistry {
     /// ```
     /// Recovery-required records may be retried with the same transaction and
     /// plan digest; substitutions are rejected before any process launch.
-    pub fn claim_pending_activation(
+    #[cfg(test)]
+    fn claim_pending_activation(
         &mut self,
         host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
@@ -3821,6 +4420,15 @@ impl ApprovedGenerationRegistry {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        self.claim_pending_activation_unchecked(transaction_id, plan_digest, generation)
+    }
+
+    fn claim_pending_activation_unchecked(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        generation: &PlatformHandle,
+    ) -> Result<PendingActivation, InstallationError> {
         self.validate()?;
         let pending = self.pending_activation.as_mut().ok_or_else(|| {
             InstallationError::IncompleteObservation("no pending activation exists".to_owned())
@@ -3857,7 +4465,8 @@ impl ApprovedGenerationRegistry {
 
     /// Commits a Host-proven healthy pending candidate and clears pending.
     /// The transaction and plan digest are mandatory idempotency bindings.
-    pub fn commit_pending_activation(
+    #[cfg(test)]
+    fn commit_pending_activation(
         &mut self,
         host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
@@ -3867,6 +4476,15 @@ impl ApprovedGenerationRegistry {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        self.commit_pending_activation_unchecked(transaction_id, plan_digest, generation)
+    }
+
+    fn commit_pending_activation_unchecked(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        generation: &PlatformHandle,
+    ) -> Result<(), InstallationError> {
         self.validate()?;
         let Some(pending) = self.pending_activation.as_ref() else {
             if self.terminal_matches(
@@ -3908,7 +4526,8 @@ impl ApprovedGenerationRegistry {
     }
 
     /// Records an unknown/failed Host attempt without advertising the candidate.
-    pub fn mark_pending_recovery(
+    #[cfg(test)]
+    fn mark_pending_recovery(
         &mut self,
         host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
@@ -3918,6 +4537,15 @@ impl ApprovedGenerationRegistry {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        self.mark_pending_recovery_unchecked(transaction_id, plan_digest, reason)
+    }
+
+    fn mark_pending_recovery_unchecked(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        reason: impl Into<String>,
+    ) -> Result<(), InstallationError> {
         self.validate()?;
         let pending = self.pending_activation.as_mut().ok_or_else(|| {
             InstallationError::IncompleteObservation("no pending activation exists".to_owned())
@@ -3932,7 +4560,8 @@ impl ApprovedGenerationRegistry {
     }
 
     /// Aborts a first-install candidate without creating an active/LKG state.
-    pub fn abort_pending_activation(
+    #[cfg(test)]
+    fn abort_pending_activation(
         &mut self,
         host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
@@ -3941,6 +4570,14 @@ impl ApprovedGenerationRegistry {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        self.abort_pending_activation_unchecked(transaction_id, plan_digest)
+    }
+
+    fn abort_pending_activation_unchecked(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+    ) -> Result<(), InstallationError> {
         self.validate()?;
         let Some(pending) = self.pending_activation.as_ref() else {
             if self.terminal_matches(
@@ -4070,6 +4707,20 @@ impl ApprovedGenerationRegistry {
         reason = "registry validation keeps the complete activation authority in one boundary"
     )]
     pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.registry_wire_version != INSTALLATION_REGISTRY_WIRE_VERSION {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "approved-generation registry wire {} cannot be read as {}",
+                    self.registry_wire_version, INSTALLATION_REGISTRY_WIRE_VERSION
+                ),
+            });
+        }
+        if self.revision == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "registry.revision".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
         let mut identities = BTreeSet::new();
         let mut service_identities = BTreeSet::new();
         let mut active_count = 0_usize;
@@ -4175,9 +4826,11 @@ impl ApprovedGenerationRegistry {
         }
         if let Some(pending) = &self.pending_activation {
             pending.validate(self.active_generation.as_ref())?;
-            if !self.generations.iter().any(|item| {
-                item.manifest == pending.manifest && item.approval_ref == pending.approval_ref
-            }) {
+            if !self
+                .generations
+                .iter()
+                .any(|item| item.manifest == pending.manifest && item.approval == pending.approval)
+            {
                 return Err(InstallationError::IncompleteObservation(
                     "pending activation candidate is absent from registry".to_owned(),
                 ));
@@ -4258,7 +4911,16 @@ impl PendingActivation {
         if self.prior_active_generation.as_ref() != active_generation {
             return Err(InstallationError::IdentityConflict);
         }
-        handle(&self.approval_ref, "pending_activation.approval_ref")?;
+        self.approval.validate()?;
+        if self.transaction_id != self.approval.transaction_id
+            || self.plan_digest != self.approval.installer_plan_digest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        validate_approval_against_manifest(&self.approval, &self.manifest, "pending_activation")?;
+        if self.manifest_digest != self.approval.candidate_manifest_digest {
+            return Err(InstallationError::IdentityConflict);
+        }
         if let PendingActivationState::RecoveryRequired { reason } = &self.state {
             text(reason, "pending_activation.state.reason")?;
         }
@@ -9498,7 +10160,7 @@ where
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
 
     use super::*;
     #[cfg(windows)]
@@ -9828,6 +10490,43 @@ mod tests {
 
     fn test_handle(value: impl Into<String>) -> PlatformHandle {
         must(PlatformHandle::new(value.into()))
+    }
+
+    fn test_activation_approval(
+        manifest: &CandidateManifest,
+        transaction_id: PlatformHandle,
+        installer_plan_digest: PlatformHandle,
+        approval_ref: PlatformHandle,
+    ) -> InstallationActivationApproval {
+        let runtime = &manifest.runtime_launch;
+        InstallationActivationApproval {
+            approval_ref,
+            transaction_id,
+            installer_plan_digest,
+            generation: manifest.generation.clone(),
+            candidate_manifest_digest: must(candidate_manifest_digest(manifest)),
+            runtime_descriptor_digest: runtime.descriptor_digest.clone(),
+            required_owner: test_handle("owner:test"),
+            signature_ref: manifest.signature_ref.clone(),
+            authority_descriptor_path: runtime.authority_descriptor_path.clone(),
+            authority_descriptor_digest: runtime.authority_descriptor_digest.clone(),
+            authority_generation: runtime.authority_generation,
+            authority_state_fence: runtime.authority_state_fence.clone(),
+        }
+    }
+
+    fn test_transaction_activation_approval(
+        transaction: &InstallationTransaction,
+        approval_ref: PlatformHandle,
+    ) -> InstallationActivationApproval {
+        let mut approval = test_activation_approval(
+            &transaction.candidate_manifest,
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            approval_ref,
+        );
+        approval.required_owner = transaction.request.required_owner.clone();
+        approval
     }
 
     fn test_path(root: &Path, name: &str) -> PlatformHandle {
@@ -11470,13 +12169,99 @@ mod tests {
 
         let mut registry = ApprovedGenerationRegistry::new();
         assert!(matches!(
-            registry.stage_pending_activation_from_transaction(
+            registry.stage_pending_activation_from_transaction_with_approval(
                 &transaction,
-                test_handle("approval:blocked"),
+                test_activation_approval(
+                    &transaction.candidate_manifest,
+                    transaction.transaction_id.clone(),
+                    transaction.installer_plan_digest.clone(),
+                    test_handle("approval:blocked"),
+                ),
             ),
             Err(InstallationError::IncompleteObservation(_))
         ));
         assert!(registry.pending_activation().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn activation_approval_rejects_each_transaction_binding_mismatch() {
+        let transaction = fully_applied_system_registration_transaction();
+        let approval =
+            test_transaction_activation_approval(&transaction, test_handle("approval:issued"));
+        must(approval.validate_against(&transaction));
+
+        let mut mismatches = Vec::new();
+        let mut value = approval.clone();
+        value.transaction_id = test_handle("transaction:other");
+        mismatches.push(value);
+        let mut value = approval.clone();
+        value.installer_plan_digest = test_handle("a".repeat(64));
+        mismatches.push(value);
+        let mut value = approval.clone();
+        value.generation = test_handle("generation:other");
+        mismatches.push(value);
+        let mut value = approval.clone();
+        value.candidate_manifest_digest = test_handle("b".repeat(64));
+        mismatches.push(value);
+        let mut value = approval.clone();
+        value.runtime_descriptor_digest = test_handle("c".repeat(64));
+        mismatches.push(value);
+        let mut value = approval.clone();
+        value.required_owner = test_handle("owner:other");
+        mismatches.push(value);
+        let mut value = approval.clone();
+        value.signature_ref = test_handle("signature:other");
+        mismatches.push(value);
+        let mut value = approval.clone();
+        value.authority_descriptor_path = test_handle("authority:other.json");
+        mismatches.push(value);
+        let mut value = approval.clone();
+        value.authority_descriptor_digest = test_handle("d".repeat(64));
+        mismatches.push(value);
+        let next_generation = must(ResourceGeneration::new(
+            approval.authority_generation.value() + 1,
+        ));
+        let mut value = approval.clone();
+        value.authority_generation = next_generation;
+        value.authority_state_fence.resource_generation = next_generation;
+        mismatches.push(value);
+        let mut value = approval.clone();
+        value.authority_state_fence.authority_epoch = must(AuthorityEpoch::new(
+            approval.authority_state_fence.authority_epoch.value() + 1,
+        ));
+        mismatches.push(value);
+
+        assert_eq!(mismatches.len(), 11);
+        for mismatch in mismatches {
+            assert!(matches!(
+                mismatch.validate_against(&transaction),
+                Err(InstallationError::IdentityConflict)
+            ));
+        }
+
+        // `approval_ref` is evidence identity, not a transaction-derived
+        // field.  Its authority provenance is sealed by the issuing lane;
+        // changing it alone is not a transaction binding mismatch.
+        let mut different_evidence = approval;
+        different_evidence.approval_ref = test_handle("approval:other");
+        must(different_evidence.validate_against(&transaction));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn activation_approval_rejects_partial_effects_before_binding_checks() {
+        let transaction = planned_transaction();
+        let approval = test_activation_approval(
+            &transaction.candidate_manifest,
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("approval:partial"),
+        );
+        assert!(matches!(
+            approval.validate_against(&transaction),
+            Err(InstallationError::IncompleteObservation(_))
+        ));
     }
 
     #[test]
@@ -12239,19 +13024,26 @@ mod tests {
         let database = must(Database::create(&path));
         let registry = RedbInstallationRegistry::from_database_for_test(database);
         let approval_ref = test_handle("approval:system-service");
+        let approval = test_transaction_activation_approval(&transaction, approval_ref);
         must(registry.stage_pending_activation_from_transaction_store(
             &transaction_store,
             &transaction.transaction_id,
-            approval_ref.clone(),
+            approval.clone(),
+            must(registry.load()).revision(),
         ));
 
         let loaded = must(registry.load());
+        assert_eq!(
+            loaded.revision(),
+            2,
+            "first durable stage advances CAS revision"
+        );
         let pending = loaded
             .pending_activation()
             .unwrap_or_else(|| unreachable!());
         assert_eq!(pending.transaction_id, transaction.transaction_id);
         assert_eq!(pending.plan_digest, transaction.installer_plan_digest);
-        assert_eq!(pending.approval_ref, approval_ref);
+        assert_eq!(pending.approval, approval);
         for role in [InstallerServiceRole::Host, InstallerServiceRole::Watchdog] {
             let approval = loaded
                 .service_registration_approval(&transaction.candidate_manifest.generation, role)
@@ -12267,7 +13059,8 @@ mod tests {
         must(registry.stage_pending_activation_from_transaction_store(
             &transaction_store,
             &transaction.transaction_id,
-            approval_ref.clone(),
+            approval.clone(),
+            before_retry.revision(),
         ));
         assert_eq!(must(registry.load()), before_retry);
 
@@ -12275,12 +13068,104 @@ mod tests {
             registry.stage_pending_activation_from_transaction_store(
                 &transaction_store,
                 &transaction.transaction_id,
-                test_handle("approval:substituted"),
+                approval.clone(),
+                1,
+            ),
+            Err(InstallationError::CompareAndSaveConflict {
+                expected: 1,
+                actual: 2,
+            })
+        ));
+        assert_eq!(must(registry.load()), before_retry);
+
+        assert!(matches!(
+            registry.stage_pending_activation_from_transaction_store(
+                &transaction_store,
+                &transaction.transaction_id,
+                {
+                    let mut substituted = approval.clone();
+                    substituted.approval_ref = test_handle("approval:substituted");
+                    substituted
+                },
+                before_retry.revision(),
             ),
             Err(InstallationError::IdentityConflict)
         ));
         assert_eq!(must(registry.load()), before_retry);
         drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_registry_stages_have_one_revision_winner() {
+        let transaction = fully_applied_system_registration_transaction();
+        let transaction_store = SharedStore::default();
+        *transaction_store
+            .state
+            .lock()
+            .unwrap_or_else(|_| unreachable!()) = Some(transaction.clone());
+        let approval =
+            test_transaction_activation_approval(&transaction, test_handle("approval:concurrent"));
+        let path = std::env::temp_dir().join(format!(
+            "eliot-installation-concurrent-stage-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first = Arc::new(RedbInstallationRegistry::from_database_for_test(must(
+            Database::create(&path),
+        )));
+        let second = first.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let first_store = transaction_store.clone();
+        let first_barrier = barrier.clone();
+        let first_approval = approval.clone();
+        let first_transaction_id = transaction.transaction_id.clone();
+        let first_registry = first.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_registry.stage_pending_activation_from_transaction_store(
+                &first_store,
+                &first_transaction_id,
+                first_approval,
+                1,
+            )
+        });
+        let second_store = transaction_store;
+        let second_barrier = barrier;
+        let second_transaction_id = transaction.transaction_id.clone();
+        let second_registry = second.clone();
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_registry.stage_pending_activation_from_transaction_store(
+                &second_store,
+                &second_transaction_id,
+                approval,
+                1,
+            )
+        });
+        let first_result = first_thread.join().unwrap_or_else(|_| unreachable!());
+        let second_result = second_thread.join().unwrap_or_else(|_| unreachable!());
+        let results = [first_result, second_result];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one concurrent stage may commit revision 1"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(InstallationError::CompareAndSaveConflict { .. })
+                ))
+                .count(),
+            1,
+            "the losing stage must report a stale revision"
+        );
+        assert_eq!(must(first.load()).revision(), 2);
+        drop(first);
+        drop(second);
         let _ = std::fs::remove_file(path);
     }
 
@@ -12415,7 +13300,12 @@ mod tests {
             let registry = ApprovedGenerationRegistry {
                 generations: vec![ApprovedGeneration {
                     manifest: transaction.candidate_manifest.clone(),
-                    approval_ref: test_handle("approval:wire"),
+                    approval: test_activation_approval(
+                        &transaction.candidate_manifest,
+                        transaction.transaction_id.clone(),
+                        transaction.installer_plan_digest.clone(),
+                        test_handle("approval:wire"),
+                    ),
                     active: false,
                     last_known_good: false,
                 }],
@@ -12424,6 +13314,7 @@ mod tests {
                 last_known_good_generation: None,
                 pending_activation: None,
                 last_terminal_activation: None,
+                ..ApprovedGenerationRegistry::new()
             };
             let bytes = must(serde_json::to_vec(&registry));
             assert!(matches!(
@@ -12453,6 +13344,36 @@ mod tests {
         ));
         drop(database);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v2_registry_wire_requires_explicit_restage_without_defaults() {
+        let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+        let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
+        object.remove("registry_wire_version");
+        object.remove("revision");
+        let bytes = must(serde_json::to_vec(&legacy));
+        assert!(matches!(
+            decode_registry_bytes(&bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("pending activation")
+                    || reason.contains("v2/pre-CAS")
+        ));
+    }
+
+    #[test]
+    fn v3_registry_wire_rejects_omitted_optional_members() {
+        let mut current = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+        current
+            .as_object_mut()
+            .unwrap_or_else(|| unreachable!())
+            .remove("pending_activation");
+        let bytes = must(serde_json::to_vec(&current));
+        assert!(matches!(
+            decode_registry_bytes(&bytes),
+            Err(InstallationError::CorruptRegistry { reason })
+                if reason.contains("missing mandatory fields")
+        ));
     }
 
     #[test]
@@ -12894,10 +13815,16 @@ mod tests {
     fn v1_registry_value() -> serde_json::Value {
         let transaction = registering_transaction();
         let generation = transaction.candidate_manifest.generation.clone();
+        let approval = test_activation_approval(
+            &transaction.candidate_manifest,
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("approval:legacy"),
+        );
         let registry = ApprovedGenerationRegistry {
             generations: vec![ApprovedGeneration {
                 manifest: transaction.candidate_manifest,
-                approval_ref: test_handle("approval:legacy"),
+                approval,
                 active: true,
                 last_known_good: false,
             }],
@@ -12906,11 +13833,14 @@ mod tests {
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
+            ..ApprovedGenerationRegistry::new()
         };
         let mut legacy = must(serde_json::to_value(registry));
         let Some(object) = legacy.as_object_mut() else {
             panic!("legacy registry object");
         };
+        object.remove("registry_wire_version");
+        object.remove("revision");
         object.remove("service_registration_approvals");
         object.remove("pending_activation");
         let Some(runtime) = legacy["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
@@ -12946,10 +13876,16 @@ mod tests {
     fn pre_split_registry_value() -> serde_json::Value {
         let transaction = registering_transaction();
         let generation = transaction.candidate_manifest.generation.clone();
+        let approval = test_activation_approval(
+            &transaction.candidate_manifest,
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("approval:pre-split"),
+        );
         let registry = ApprovedGenerationRegistry {
             generations: vec![ApprovedGeneration {
                 manifest: transaction.candidate_manifest,
-                approval_ref: test_handle("approval:pre-split"),
+                approval,
                 active: true,
                 last_known_good: false,
             }],
@@ -12958,11 +13894,14 @@ mod tests {
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
+            ..ApprovedGenerationRegistry::new()
         };
         let mut value = must(serde_json::to_value(registry));
         let Some(object) = value.as_object_mut() else {
             panic!("pre-split registry object");
         };
+        object.remove("registry_wire_version");
+        object.remove("revision");
         object.remove("service_registration_approvals");
         object.remove("pending_activation");
         let Some(manifest) = value["generations"][0]["manifest"].as_object_mut() else {
@@ -12999,10 +13938,16 @@ mod tests {
     fn pre_credential_binding_registry_value() -> serde_json::Value {
         let transaction = registering_transaction();
         let generation = transaction.candidate_manifest.generation.clone();
+        let approval = test_activation_approval(
+            &transaction.candidate_manifest,
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("approval:pre-credential-binding"),
+        );
         let registry = ApprovedGenerationRegistry {
             generations: vec![ApprovedGeneration {
                 manifest: transaction.candidate_manifest,
-                approval_ref: test_handle("approval:pre-credential-binding"),
+                approval,
                 active: true,
                 last_known_good: false,
             }],
@@ -13011,8 +13956,17 @@ mod tests {
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
+            ..ApprovedGenerationRegistry::new()
         };
         let mut value = must(serde_json::to_value(registry));
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-credential-binding registry object"))
+            .remove("registry_wire_version");
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-credential-binding registry object"))
+            .remove("revision");
         value
             .as_object_mut()
             .unwrap_or_else(|| panic!("pre-credential-binding registry object"))
@@ -13047,10 +14001,16 @@ mod tests {
     fn pre_eliotd_config_registry_value() -> serde_json::Value {
         let transaction = registering_transaction();
         let generation = transaction.candidate_manifest.generation.clone();
+        let approval = test_activation_approval(
+            &transaction.candidate_manifest,
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("approval:pre-eliotd-config"),
+        );
         let registry = ApprovedGenerationRegistry {
             generations: vec![ApprovedGeneration {
                 manifest: transaction.candidate_manifest,
-                approval_ref: test_handle("approval:pre-eliotd-config"),
+                approval,
                 active: true,
                 last_known_good: false,
             }],
@@ -13059,8 +14019,17 @@ mod tests {
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
+            ..ApprovedGenerationRegistry::new()
         };
         let mut value = must(serde_json::to_value(registry));
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-eliotd-config registry object"))
+            .remove("registry_wire_version");
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-eliotd-config registry object"))
+            .remove("revision");
         value
             .as_object_mut()
             .unwrap_or_else(|| panic!("pre-eliotd-config registry object"))
@@ -13077,10 +14046,16 @@ mod tests {
     fn pre_host_artifact_binding_registry_value() -> serde_json::Value {
         let transaction = registering_transaction();
         let generation = transaction.candidate_manifest.generation.clone();
+        let approval = test_activation_approval(
+            &transaction.candidate_manifest,
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("approval:pre-host-artifact-binding"),
+        );
         let registry = ApprovedGenerationRegistry {
             generations: vec![ApprovedGeneration {
                 manifest: transaction.candidate_manifest,
-                approval_ref: test_handle("approval:pre-host-artifact-binding"),
+                approval,
                 active: true,
                 last_known_good: false,
             }],
@@ -13089,8 +14064,17 @@ mod tests {
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
+            ..ApprovedGenerationRegistry::new()
         };
         let mut value = must(serde_json::to_value(registry));
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-host-artifact-binding registry object"))
+            .remove("registry_wire_version");
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-host-artifact-binding registry object"))
+            .remove("revision");
         value
             .as_object_mut()
             .unwrap_or_else(|| panic!("pre-host-artifact-binding registry object"))
@@ -13129,6 +14113,14 @@ mod tests {
             test_handle("approval:pre-service-registration"),
         ));
         let mut value = must(serde_json::to_value(registry));
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-service-registration registry object"))
+            .remove("registry_wire_version");
+        value
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("pre-service-registration registry object"))
+            .remove("revision");
         value
             .as_object_mut()
             .unwrap_or_else(|| panic!("pre-service-registration registry object"))
@@ -13494,10 +14486,16 @@ mod tests {
             assert!(matches!(error, InstallationError::CorruptRegistry { .. }));
         }
 
+        let current_transaction = registering_transaction();
         let mut current = must(serde_json::to_value(ApprovedGenerationRegistry {
             generations: vec![ApprovedGeneration {
-                manifest: registering_transaction().candidate_manifest,
-                approval_ref: test_handle("approval:current"),
+                manifest: current_transaction.candidate_manifest.clone(),
+                approval: test_activation_approval(
+                    &current_transaction.candidate_manifest,
+                    current_transaction.transaction_id.clone(),
+                    current_transaction.installer_plan_digest.clone(),
+                    test_handle("approval:current"),
+                ),
                 active: true,
                 last_known_good: false,
             }],
@@ -13506,6 +14504,7 @@ mod tests {
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
+            ..ApprovedGenerationRegistry::new()
         }));
         let Err(error) = decode_registry_bytes(&must(serde_json::to_vec(&current))) else {
             panic!("current corruption must fail closed");
