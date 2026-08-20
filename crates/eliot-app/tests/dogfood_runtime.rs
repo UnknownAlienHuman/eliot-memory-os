@@ -326,7 +326,12 @@ fn assert_codex_launch_contract(report: &Value) -> TestResult {
     ] {
         assert!(mcp_servers.contains(tool), "missing dogfood tool {tool}");
     }
-    for forbidden in ["external_review", "delegate", "antigravity", "raw"] {
+    for forbidden in [
+        "\"eliot_external_review",
+        "\"eliot_delegate",
+        "\"eliot_antigravity",
+        "\"raw",
+    ] {
         assert!(
             !mcp_servers.contains(forbidden),
             "dogfood MCP allow-list exposed forbidden tool family {forbidden}"

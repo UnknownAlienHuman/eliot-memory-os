@@ -513,6 +513,13 @@ pub(crate) const PART_E_WORKER_TOOLS: &[&str] = &[
     "eliot_write_cognitive_observation",
 ];
 
+pub(crate) const EXTERNAL_AUDITOR_TOOLS: &[&str] = &[
+    "eliot_current_state",
+    "eliot_recall_l0",
+    "eliot_fetch_l2",
+    "eliot_runtime_status",
+];
+
 const OPERATOR_TOOLS: &[&str] = &[
     "eliot_operator_contract",
     "eliot_operator_snapshot",
@@ -625,10 +632,10 @@ impl McpAccessProfile {
                     | "eliot_memory_influence_trace"
             ),
             Self::CognitiveGovernor | Self::HostGovernor | Self::CognitiveControl => false,
-            Self::DynamicAgent
-            | Self::ClaudeGoverned
-            | Self::CodexWorker
-            | Self::ExternalAuditor => PART_E_WORKER_TOOLS.contains(&name),
+            Self::DynamicAgent | Self::ClaudeGoverned | Self::CodexWorker => {
+                PART_E_WORKER_TOOLS.contains(&name)
+            }
+            Self::ExternalAuditor => EXTERNAL_AUDITOR_TOOLS.contains(&name),
             Self::CodexController => GOVERNED_TOOLS.contains(&name),
             Self::Verifier => READ_ONLY_TOOLS.contains(&name),
             Self::HumanOperator => OPERATOR_TOOLS.contains(&name),

@@ -477,7 +477,7 @@ impl ProviderOutputSpool {
         mut reader: R,
         max_bytes: u64,
     ) -> Result<ProviderOutputCapture, EngineError> {
-        if !matches!(stream_name, "stdout" | "stderr" | "structured") {
+        if !matches!(stream_name, "stdout" | "stderr" | "structured" | "log") {
             return Err(EngineError::WriteRejected(
                 "provider output stream name is not governed".to_owned(),
             ));

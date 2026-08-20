@@ -198,7 +198,7 @@ fn observe_scope_is_server_bound_and_has_no_project_selector() -> Result<()> {
     };
     assert!(error.to_string().contains("Governor-bound project"));
 
-    let schema = catalog::tool_definitions_for_profile(McpAccessProfile::ExternalAuditor)
+    let schema = catalog::tool_definitions_for_profile(McpAccessProfile::CodexWorker)
         .into_iter()
         .find(|tool| tool["name"] == "eliot.observe")
         .context("eliot.observe must be catalogued")?;
@@ -680,6 +680,7 @@ fn antigravity_live_status_reads_user_config_and_plugin_instead_of_cached_report
                     "command": executable,
                     "args": [
                         "mcp", "stdio", "--host", "antigravity",
+                        "--profile", "external_auditor",
                         "--instance", "default"
                     ]
                 }
@@ -1502,11 +1503,10 @@ fn unsupported_pair_fails_closed() -> Result<()> {
 fn bounded_catalog() {
     let profile = McpAccessProfile::ExternalAuditor;
     for allowed in [
+        "eliot_current_state",
         "eliot_recall_l0",
         "eliot_fetch_l2",
-        "eliot_compile_packet_l3",
-        "eliot_agent_candidate_submit",
-        "eliot_memory_influence_trace",
+        "eliot_runtime_status",
     ] {
         assert!(profile.allows(allowed), "{allowed} must remain bounded");
     }
@@ -1515,6 +1515,11 @@ fn bounded_catalog() {
         "eliot_submit_completion_proof",
         "eliot_worktree_review",
         "eliot_autonomy_runtime_action",
+        "eliot.observe",
+        "eliot_compile_packet_l3",
+        "eliot_agent_candidate_submit",
+        "eliot_memory_influence_trace",
+        "eliot_write_cognitive_observation",
     ] {
         assert!(!profile.allows(denied), "{denied} must remain unavailable");
     }
@@ -1528,13 +1533,34 @@ fn provider_tool_profiles_are_catalog_derived_and_hash_stable() {
     assert_eq!(auditor, replay);
     assert!(auditor.hash_is_valid());
     assert!(child.hash_is_valid());
-    assert_eq!(auditor.tool_names.len(), PART_E_WORKER_TOOLS.len());
+    assert_eq!(auditor.tool_names.len(), EXTERNAL_AUDITOR_TOOLS.len());
     assert_ne!(auditor.profile_hash_blake3, child.profile_hash_blake3);
     assert!(
         auditor
             .tool_names
             .iter()
             .all(|name| McpAccessProfile::ExternalAuditor.allows(name))
+    );
+    assert!(
+        auditor
+            .tool_names
+            .contains(&"eliot_runtime_status".to_owned())
+    );
+    assert!(!auditor.tool_names.contains(&"eliot.observe".to_owned()));
+    assert!(auditor.tool_names.iter().all(|name| {
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }));
+}
+
+#[test]
+fn external_auditor_surface_is_governed_and_raw_free() {
+    assert!(
+        AntigravityMcpBoundaryService
+            .exposes_only_governed(EXTERNAL_AUDITOR_TOOLS, governed_tool_names(),)
     );
 }
 

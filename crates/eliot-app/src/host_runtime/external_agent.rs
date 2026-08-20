@@ -3828,7 +3828,7 @@ fn ensure_antigravity_permissions(invocation_root: &Path) -> Result<(), eliot_en
             )
         })?;
     let mut added = Vec::new();
-    for tool in crate::mcp_stdio::PART_E_WORKER_TOOLS {
+    for tool in crate::mcp_stdio::EXTERNAL_AUDITOR_TOOLS {
         let rule = format!("mcp(eliot-governor/{tool})");
         if !allow.iter().any(|value| value.as_str() == Some(&rule)) {
             allow.push(Value::String(rule.clone()));

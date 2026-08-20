@@ -243,9 +243,23 @@ fn canonical_profiles_publish_bounded_tool_sets() -> TestResult {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
+        if profile == "external_auditor" {
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                vec![
+                    "eliot_current_state",
+                    "eliot_fetch_l2",
+                    "eliot_recall_l0",
+                    "eliot_runtime_status",
+                ],
+                "{profile}"
+            );
+            continue;
+        }
         if matches!(
             profile,
-            "codex_worker" | "claude_governed" | "dynamic_agent" | "external_auditor"
+            "codex_worker" | "claude_governed" | "dynamic_agent"
         ) {
             names.sort_unstable();
             let mut expected = vec![

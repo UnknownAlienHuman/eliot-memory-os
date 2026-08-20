@@ -673,10 +673,18 @@ pub fn result(root: &Path, delegation_id: &str) -> Result<Value> {
 pub fn outcome(root: &Path, delegation_id: &str) -> Result<Value> {
     let mut state = load_state(root)?;
     let mut work_state = load_work_state(root)?;
-    if state.outcomes.iter().any(|outcome| {
-        outcome.delegation_id == delegation_id
-            && outcome.status == DelegationOutcomeStatus::ProviderFailed
-    }) {
+    let normalized_result_exists = delegation_result_dir(root, delegation_id)
+        .join("latest.json")
+        .is_file();
+    let failed_provider_call_count = state
+        .outcomes
+        .iter()
+        .find(|outcome| {
+            outcome.delegation_id == delegation_id
+                && outcome.status == DelegationOutcomeStatus::ProviderFailed
+        })
+        .map_or(0, |outcome| outcome.provider_call_count);
+    if should_recover_completed_transcript(normalized_result_exists, failed_provider_call_count) {
         recover_completed_transcript(root, delegation_id, &mut state, &mut work_state)?;
         let health = health(root)?;
         save_work_state(root, &work_state)?;
@@ -688,6 +696,13 @@ pub fn outcome(root: &Path, delegation_id: &str) -> Result<Value> {
             .iter()
             .find(|item| item.delegation_id == delegation_id),
     )?)
+}
+
+const fn should_recover_completed_transcript(
+    normalized_result_exists: bool,
+    failed_provider_call_count: u32,
+) -> bool {
+    failed_provider_call_count > 0 && !normalized_result_exists
 }
 
 pub fn report(root: &Path) -> Result<Value> {
@@ -841,7 +856,10 @@ async fn execute_real(
         request_payload_hash: blake3::hash(provider_request.question.as_bytes())
             .to_hex()
             .to_string(),
-        route_or_model: Some("agy --mode=plan --print; model pinned by provider config".to_owned()),
+        route_or_model: Some(
+            "agy --mode=plan --print --model=gemini-3.7-flash-high --effort=high; single-turn JSON audit"
+                .to_owned(),
+        ),
         adapter_version: None,
         executable_or_transport: contract.binary_path.clone(),
         cwd: Some(worktree.worktree_path.clone()),
@@ -1309,7 +1327,7 @@ fn recover_completed_transcript(
 
 fn governed_provider_question(question: &str) -> String {
     format!(
-        "Operate only inside the current disposable working directory. Do not access the controller repository, call MCP tools, run commands, edit files, or claim verification/completion authority. Return candidate findings only.\n\n{question}"
+        "Operate only inside the current disposable working directory. You may read repository source and documentation and run bounded read-only inspection commands there. Do not access the controller repository, call MCP tools, edit files, or claim verification/completion authority. Return concise candidate findings with exact file anchors only.\n\n{question}"
     )
 }
 
@@ -1537,4 +1555,16 @@ pub(crate) fn real_provider_execution_input_flags(input: &DelegationReviewInput)
 pub(crate) fn real_provider_execution_flags(input: &DelegationReviewInput) -> bool {
     real_provider_execution_input_flags(input)
         && std::env::var_os("ELIOT_DISABLE_REAL_PROVIDER").is_none()
+}
+
+#[cfg(test)]
+mod outcome_recovery_tests {
+    use super::should_recover_completed_transcript;
+
+    #[test]
+    fn terminal_failed_run_with_normalized_rejection_skips_conversation_recovery() {
+        assert!(!should_recover_completed_transcript(true, 1));
+        assert!(should_recover_completed_transcript(false, 1));
+        assert!(!should_recover_completed_transcript(false, 0));
+    }
 }

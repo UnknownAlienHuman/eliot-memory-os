@@ -21,7 +21,7 @@ use time::{Duration, OffsetDateTime};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const HELP: &str = "Usage: agy --print --prompt <PROMPT> --print-timeout <DURATION> --log-file <PATH> --sandbox <MODE> --add-dir <PATH> --continue --conversation <ID>";
+const HELP: &str = "Usage: agy --print --prompt <PROMPT> --print-timeout <DURATION> --log-file <PATH> --sandbox <MODE> --disable-slash-commands --output-format <text|json> --model <MODEL> --effort <low|medium|high> --add-dir <PATH> --continue --conversation <ID>";
 
 #[test]
 fn windows_resolver_finds_agy_in_path() -> TestResult {
@@ -39,7 +39,7 @@ fn windows_resolver_finds_agy_in_path() -> TestResult {
 }
 
 #[test]
-fn plugin_default_unchanged() -> TestResult {
+fn plugin_default_is_the_bounded_external_auditor() -> TestResult {
     let executable = temp_binary("eliot-governor.exe")?;
     let desired = AntigravityMcpConfigService.desired_server_value(&executable)?;
     assert_eq!(
@@ -49,15 +49,11 @@ fn plugin_default_unchanged() -> TestResult {
             "stdio",
             "--host",
             "antigravity",
+            "--profile",
+            "external_auditor",
             "--instance",
             "default"
         ]))
-    );
-    assert!(
-        desired
-            .get("args")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|args| args.iter().all(|arg| arg != "external_auditor"))
     );
     Ok(())
 }
@@ -249,9 +245,14 @@ fn text_only_output_supported_by_wrapper() {
 }
 
 #[test]
-fn json_output_not_required() {
+fn governed_single_turn_json_output_is_required() {
     let contract = contract();
-    assert!(!contract.json_output_required);
+    assert!(contract.json_output_required);
+    assert_eq!(
+        contract.selected_model.as_deref(),
+        Some("gemini-3.7-flash-high")
+    );
+    assert_eq!(contract.reasoning_effort.as_deref(), Some("high"));
 }
 
 #[test]
@@ -325,6 +326,13 @@ fn env_policy_sets_hide_account_info_when_allowed() {
 fn argv_values_are_fused_or_rejected() -> TestResult {
     let argv = AntigravityCommandContractService.typed_review_argv(&contract(), "inspect this")?;
     assert!(argv.iter().any(|arg| arg.starts_with("--prompt=")));
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "--model=gemini-3.7-flash-high")
+    );
+    assert!(argv.iter().any(|arg| arg == "--effort=high"));
+    assert!(argv.iter().any(|arg| arg == "--disable-slash-commands"));
+    assert!(argv.iter().any(|arg| arg == "--output-format=json"));
     Ok(())
 }
 

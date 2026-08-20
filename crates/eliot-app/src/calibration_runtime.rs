@@ -15,7 +15,7 @@ use eliot_types::{
     DelegationCalibrationConfig, DelegationCalibrationCosts, DelegationCalibrationLabels,
     DelegationCalibrationSample, DelegationCalibrationState, DelegationCalibrationTaskFamily,
     DelegationDecisionKind, DelegationEvidenceFloorSnapshot, DelegationOutcomeStatus,
-    DelegationReviewKind, ExecutedProviderReview, ExecutedProviderReviewStatus,
+    DelegationReviewKind, DelegationState, ExecutedProviderReview, ExecutedProviderReviewStatus,
     IndependentOutcomeEvidence, ProjectId, TaskId, WorkLeaseId,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -305,12 +305,13 @@ pub fn campaign_bind_review(root: &Path, campaign_id: &str, delegation_id: &str)
         .join("latest.json");
     let normalized: AntigravityNormalizedResult =
         serde_json::from_reader(std::fs::File::open(&normalized_path)?)?;
-    let external = normalized
-        .external_review_result
-        .as_ref()
-        .context("provider output has no normalized external review result")?;
+    let external = normalized.external_review_result.as_ref();
+    if outcome.status != DelegationOutcomeStatus::ProviderFailed && external.is_none() {
+        bail!("successful provider output has no normalized external review result");
+    }
     let candidate_only = normalized.candidate_only
-        && external.candidate_only
+        && (outcome.status == DelegationOutcomeStatus::ProviderFailed
+            || external.is_some_and(|result| result.candidate_only))
         && execution
             .get("candidate_only")
             .and_then(Value::as_bool)
@@ -323,7 +324,7 @@ pub fn campaign_bind_review(root: &Path, campaign_id: &str, delegation_id: &str)
             .provider_id
             .clone()
             .unwrap_or_else(|| "antigravity".to_owned()),
-        model_route_if_known: None,
+        model_route_if_known: Some("gemini-3.7-flash-high;effort=high".to_owned()),
         request_ref: request.delegation_id.clone(),
         frozen_input_refs: campaign.frozen_input_refs.clone(),
         baseline_state_hash: campaign.baseline_state_hash.clone(),
@@ -341,16 +342,20 @@ pub fn campaign_bind_review(root: &Path, campaign_id: &str, delegation_id: &str)
             ExecutedProviderReviewStatus::Succeeded
         },
         raw_output_ref: "reports/delegation-provider-run/latest.json".to_owned(),
-        normalized_findings: external
-            .findings
-            .iter()
-            .map(|finding| finding.finding_id.clone())
-            .collect(),
-        proposed_changes: external
-            .proposed_changes
-            .iter()
-            .map(|change| change.change_id.clone())
-            .collect(),
+        normalized_findings: external.map_or_else(Vec::new, |result| {
+            result
+                .findings
+                .iter()
+                .map(|finding| finding.finding_id.clone())
+                .collect()
+        }),
+        proposed_changes: external.map_or_else(Vec::new, |result| {
+            result
+                .proposed_changes
+                .iter()
+                .map(|change| change.change_id.clone())
+                .collect()
+        }),
         candidate_only,
         trace_ref: execution
             .get("g2_external_review_job_ref")
@@ -361,18 +366,7 @@ pub fn campaign_bind_review(root: &Path, campaign_id: &str, delegation_id: &str)
     let inserted = DelegationCalibrationCampaignService
         .ingest_review(&mut state, review.clone())
         .map_err(anyhow::Error::msg)?;
-    let task_delegation_ids = delegation
-        .requests
-        .iter()
-        .filter(|item| item.task_id == request.task_id)
-        .map(|item| item.delegation_id.as_str())
-        .collect::<Vec<_>>();
-    let observed_provider_calls = delegation
-        .outcomes
-        .iter()
-        .filter(|item| task_delegation_ids.contains(&item.delegation_id.as_str()))
-        .map(|item| item.provider_call_count)
-        .sum::<u32>();
+    let observed_provider_calls = observed_provider_calls_for_task(&delegation, request.task_id);
     let campaign = state
         .campaigns
         .iter_mut()
@@ -388,7 +382,13 @@ pub fn campaign_bind_review(root: &Path, campaign_id: &str, delegation_id: &str)
             campaign.integrity_violations.push(violation);
         }
     }
-    if campaign.state == DelegationCalibrationCampaignState::ProviderExecuting {
+    if outcome.status == DelegationOutcomeStatus::ProviderFailed {
+        DelegationCalibrationCampaignService
+            .transition(campaign, DelegationCalibrationCampaignState::FailedProvider)
+            .map_err(anyhow::Error::msg)?;
+        campaign.closeout_status =
+            DelegationCalibrationCampaignCloseoutStatus::BlockedExternalDependency;
+    } else if campaign.state == DelegationCalibrationCampaignState::ProviderExecuting {
         DelegationCalibrationCampaignService
             .transition(
                 campaign,
@@ -1026,6 +1026,21 @@ fn baseline_hash(commit: &str, policy_snapshot: &str, frozen_refs: &[String]) ->
     blake3::hash(canonical.as_bytes()).to_hex().to_string()
 }
 
+fn observed_provider_calls_for_task(delegation: &DelegationState, task_id: TaskId) -> u32 {
+    let task_delegation_ids = delegation
+        .requests
+        .iter()
+        .filter(|item| item.task_id == task_id)
+        .map(|item| item.delegation_id.as_str())
+        .collect::<Vec<_>>();
+    delegation
+        .outcomes
+        .iter()
+        .filter(|item| task_delegation_ids.contains(&item.delegation_id.as_str()))
+        .map(|item| item.provider_call_count)
+        .sum()
+}
+
 #[allow(dead_code)]
 fn parse_ids(project: &str, task: &str) -> Result<(ProjectId, TaskId)> {
     Ok((ProjectId::from_str(project)?, TaskId::from_str(task)?))
@@ -1033,7 +1048,14 @@ fn parse_ids(project: &str, task: &str) -> Result<(ProjectId, TaskId)> {
 
 #[cfg(test)]
 mod tests {
-    use super::select_unique_campaign_repo_root;
+    use super::{observed_provider_calls_for_task, select_unique_campaign_repo_root};
+    use eliot_engine::DelegationOutcomeService;
+    use eliot_types::{
+        DelegationOrigin, DelegationOriginChain, DelegationProviderPreference, DelegationRequest,
+        DelegationReviewKind, DelegationRootOrigin, DelegationState, ProjectId, TaskId,
+        WorkLeaseId,
+    };
+    use time::OffsetDateTime;
 
     #[test]
     fn campaign_root_is_the_exact_active_work_scope_root() {
@@ -1055,5 +1077,44 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn terminal_failed_provider_dispatch_still_consumes_one_campaign_call() {
+        let task_id = TaskId::new_v7();
+        let delegation_id = "delegation:failed-provider".to_owned();
+        let mut state = DelegationState::default();
+        state.requests.push(DelegationRequest {
+            delegation_id: delegation_id.clone(),
+            project_id: ProjectId::new_v7(),
+            task_id,
+            origin: DelegationOrigin::UserDirected,
+            origin_chain: DelegationOriginChain {
+                root_origin: DelegationRootOrigin::User,
+                provider_chain: Vec::new(),
+                delegation_depth: 0,
+                parent_delegation_id: None,
+            },
+            review_kind: DelegationReviewKind::ArchitectureAudit,
+            question: "audit".to_owned(),
+            work_lease_id: WorkLeaseId::new_v7(),
+            evidence_refs: vec!["evidence:baseline".to_owned()],
+            preferred_provider: DelegationProviderPreference::Antigravity,
+            created_at: OffsetDateTime::now_utc(),
+        });
+        state.outcomes.push(DelegationOutcomeService.record(
+            &delegation_id,
+            None,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            false,
+            5_000,
+            1,
+            true,
+        ));
+        assert_eq!(observed_provider_calls_for_task(&state, task_id), 1);
     }
 }

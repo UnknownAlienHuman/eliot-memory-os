@@ -17,21 +17,21 @@ use eliot_types::{
     AntigravityLiveSmokeResult, AntigravityLiveSmokeStatus, AntigravityLiveTreeSnapshot,
     AntigravityLogFilePolicy, AntigravityMcpConfigStatus, AntigravityMcpConfigSurface,
     AntigravityMcpInvocationReceipt, AntigravityMcpRegistrationReceipt,
-    AntigravityNormalizedResult, AntigravityOfficialCliInstallerReceipt,
-    AntigravityOfficialPluginInstallReceipt, AntigravityOfficialPluginStatus,
-    AntigravityOutputMode, AntigravityOutputRedactionReceipt, AntigravityPromptPolicy,
-    AntigravityProviderState, AntigravityRealDoctorStatus, AntigravityRealReport,
-    AntigravityReport, AntigravityReviewMode, AntigravityReviewRequest, AntigravityRun,
-    AntigravityRunState, AntigravitySafetyReceipt, AntigravitySandboxPolicy,
-    AntigravitySensitivePathPolicy, AntigravitySessionPolicy, AntigravityStdinMode,
-    AntigravityTelemetryReport, AntigravityTrustReceipt, AntigravityVersionGateResult,
-    AntigravityVersionGateStatus, AntigravityVisibilityReport, AntigravityWindowsInstallDiscovery,
-    AntigravityWorkdirPolicy, BlobRef, CandidateDiff, ExternalOutputSchemaKind,
-    ExternalReviewBudget, ExternalReviewJob, ExternalReviewJobStatus, ExternalReviewRequest,
-    ExternalReviewRole, ProcessReapReceipt, ProjectId, ProviderInvocationAttempt,
-    ProviderInvocationState, ProviderRoutePolicy, ProviderTimeoutClass, TaintClass, TaskId,
-    WorkLease, WorkLeaseId, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId,
-    inspect_secret_bytes,
+    AntigravityModelObservation, AntigravityModelObservationAuthority, AntigravityNormalizedResult,
+    AntigravityOfficialCliInstallerReceipt, AntigravityOfficialPluginInstallReceipt,
+    AntigravityOfficialPluginStatus, AntigravityOutputMode, AntigravityOutputRedactionReceipt,
+    AntigravityPromptPolicy, AntigravityProviderState, AntigravityRealDoctorStatus,
+    AntigravityRealReport, AntigravityReport, AntigravityResponseProtocolReceipt,
+    AntigravityReviewMode, AntigravityReviewRequest, AntigravityRun, AntigravityRunState,
+    AntigravitySafetyReceipt, AntigravitySandboxPolicy, AntigravitySensitivePathPolicy,
+    AntigravitySessionPolicy, AntigravityStdinMode, AntigravityTelemetryReport,
+    AntigravityTrustReceipt, AntigravityVersionGateResult, AntigravityVersionGateStatus,
+    AntigravityVisibilityReport, AntigravityWindowsInstallDiscovery, AntigravityWorkdirPolicy,
+    BlobRef, CandidateDiff, ExternalOutputSchemaKind, ExternalReviewBudget, ExternalReviewJob,
+    ExternalReviewJobStatus, ExternalReviewRequest, ExternalReviewRole, ProcessReapReceipt,
+    ProjectId, ProviderInvocationAttempt, ProviderInvocationState, ProviderRoutePolicy,
+    ProviderTimeoutClass, TaintClass, TaskId, WorkLease, WorkLeaseId, WorktreeLease,
+    WorktreeLeaseId, WorktreeLeaseState, WriteId, inspect_secret_bytes,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -41,7 +41,7 @@ use std::future::Future;
 use std::io::Write;
 #[cfg(test)]
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration as StdDuration, Instant};
@@ -51,8 +51,11 @@ use time::{Duration, OffsetDateTime};
 // remain bounded while allowing the CLI to emit its own normalized timeout result.
 const DEFAULT_TIMEOUT_MS: u64 = 310_000;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
-const HELP_PROBE_TIMEOUT_MS: u64 = 2_000;
-const VERSION_PROBE_TIMEOUT_MS: u64 = 2_000;
+const ANTIGRAVITY_AUDIT_MODEL: &str = "gemini-3.7-flash-high";
+const ANTIGRAVITY_AUDIT_MODEL_LABEL: &str = "Gemini 3.7 Flash (High)";
+const ANTIGRAVITY_AUDIT_EFFORT: &str = "high";
+const HELP_PROBE_TIMEOUT_MS: u64 = 10_000;
+const VERSION_PROBE_TIMEOUT_MS: u64 = 10_000;
 const MINIMUM_AGY_VERSION: (u64, u64, u64) = (1, 1, 1);
 const MINIMUM_AGY_VERSION_TEXT: &str = "1.1.1";
 const ELIOT_MCP_SERVER_NAME: &str = "eliot-governor";
@@ -810,20 +813,41 @@ impl AntigravityCommandContractService {
         if !probe.capabilities.model_cli_arg {
             limitations.push("model selection is not exposed as a governed CLI flag".into());
         }
+        if !probe.capabilities.effort_cli_arg {
+            limitations.push("reasoning effort is not exposed as a governed CLI flag".into());
+        }
+        if !probe.capabilities.disable_slash_commands {
+            limitations.push("slash-command expansion cannot be disabled for audit mode".into());
+        }
+        if !probe.capabilities.json_output {
+            limitations.push("structured single-turn output is not available".into());
+        }
+        if !probe.capabilities.log_file {
+            limitations.push("a governed CLI log path is not available".into());
+        }
         if probe.provider_state == AntigravityProviderState::NotInstalled {
             limitations.push("Antigravity CLI is not installed or not found".into());
         }
-        let noninteractive_supported =
-            probe.capabilities.print_mode && probe.capabilities.prompt_arg;
+        let noninteractive_supported = probe.capabilities.print_mode
+            && probe.capabilities.prompt_arg
+            && probe.capabilities.print_timeout
+            && probe.capabilities.log_file
+            && probe.capabilities.sandbox
+            && probe.capabilities.json_output
+            && probe.capabilities.model_cli_arg
+            && probe.capabilities.effort_cli_arg
+            && probe.capabilities.disable_slash_commands;
         let review_args = if noninteractive_supported {
-            let mut args = vec!["--mode=plan".to_owned(), "--print".to_owned()];
-            if probe.capabilities.print_timeout {
-                args.push("--print-timeout=300s".to_owned());
-            }
-            if probe.capabilities.sandbox {
-                args.push("--sandbox=true".to_owned());
-            }
-            args
+            vec![
+                "--mode=plan".to_owned(),
+                "--print".to_owned(),
+                "--print-timeout=300s".to_owned(),
+                "--sandbox=true".to_owned(),
+                "--disable-slash-commands".to_owned(),
+                "--output-format=json".to_owned(),
+                format!("--model={ANTIGRAVITY_AUDIT_MODEL}"),
+                format!("--effort={ANTIGRAVITY_AUDIT_EFFORT}"),
+            ]
         } else {
             Vec::new()
         };
@@ -844,7 +868,11 @@ impl AntigravityCommandContractService {
             env_policy: default_env_policy(),
             sensitive_path_policy: default_sensitive_path_policy(),
             stdin_mode: AntigravityStdinMode::DevNull,
-            output_mode: AntigravityOutputMode::Text,
+            output_mode: if probe.capabilities.json_output {
+                AntigravityOutputMode::Json
+            } else {
+                AntigravityOutputMode::Text
+            },
             workdir_policy: AntigravityWorkdirPolicy::DisposableWorktreeForCandidateImplementation,
             sandbox_policy: if probe.capabilities.sandbox {
                 AntigravitySandboxPolicy::RequiredWhenSupported
@@ -861,10 +889,19 @@ impl AntigravityCommandContractService {
                 drop_ungoverned_conversation_env: true,
             },
             dangerous_flags_forbidden: true,
-            json_output_required: false,
+            json_output_required: true,
             model_cli_arg_supported: probe.capabilities.model_cli_arg,
-            model_selection_message: "No governed --model flag is used unless local help proves one; configure model in Antigravity itself."
-                .to_owned(),
+            selected_model: probe
+                .capabilities
+                .model_cli_arg
+                .then(|| ANTIGRAVITY_AUDIT_MODEL.to_owned()),
+            reasoning_effort: probe
+                .capabilities
+                .effort_cli_arg
+                .then(|| ANTIGRAVITY_AUDIT_EFFORT.to_owned()),
+            model_selection_message: format!(
+                "Governed single-turn audits pin --model={ANTIGRAVITY_AUDIT_MODEL} and --effort={ANTIGRAVITY_AUDIT_EFFORT} after local CLI capability discovery."
+            ),
             limitations,
             created_at: OffsetDateTime::now_utc(),
         }
@@ -904,6 +941,15 @@ impl AntigravityCommandContractService {
         contract: &AntigravityCommandContract,
         prompt: &str,
     ) -> Result<Vec<String>, EngineError> {
+        self.typed_review_argv_with_log(contract, prompt, None)
+    }
+
+    pub fn typed_review_argv_with_log(
+        &self,
+        contract: &AntigravityCommandContract,
+        prompt: &str,
+        log_file: Option<&Path>,
+    ) -> Result<Vec<String>, EngineError> {
         AntigravitySafetyPolicy.validate_prompt(prompt, &contract.prompt_policy)?;
         let binary = contract
             .binary_path
@@ -911,6 +957,12 @@ impl AntigravityCommandContractService {
             .unwrap_or_else(|| "agy-fixture".to_owned());
         let mut argv = vec![binary];
         argv.extend(contract.review_args.clone());
+        if let Some(log_file) = log_file {
+            if !log_file.is_absolute() {
+                return Err(rejected("Antigravity log file path must be absolute"));
+            }
+            argv.push(fused_arg("--log-file", &path_for_record(log_file))?);
+        }
         argv.push(fused_arg("--prompt", prompt)?);
         if argv
             .iter()
@@ -1377,19 +1429,12 @@ impl AntigravityLiveSmokeService {
         smoke: &AntigravityLiveSmokeRequest,
         run: &AntigravityRun,
     ) -> AntigravityLiveSmokeResult {
-        let marker_seen = run
-            .stdout_excerpt
-            .to_ascii_uppercase()
-            .contains(Self::EXPECTED_MARKER);
-        let mcp_call_marker_seen = run.stdout_excerpt.contains(Self::MCP_CALL_MARKER);
+        let marker_seen = run.response_protocol_receipt.expected_smoke_marker_seen;
+        let mcp_call_marker_seen = run.response_protocol_receipt.mcp_call_marker_seen;
         let normalized_ok = run.normalized_result.as_ref().is_some_and(|result| {
             result.candidate_only && result.taint == TaintClass::ExternalAgent && !result.rejected
         });
-        let candidate_final_line_seen = run
-            .stdout_excerpt
-            .lines()
-            .next_back()
-            .is_some_and(|line| line.trim() == Self::CANDIDATE_FINAL_LINE);
+        let candidate_final_line_seen = run.response_protocol_receipt.candidate_final_line_exact;
         let status = match run.state {
             AntigravityRunState::Succeeded
                 if marker_seen
@@ -1679,7 +1724,7 @@ impl AntigravityMcpConfigService {
     }
 
     pub fn desired_server_value(&self, eliot_exe: &Path) -> Result<Value, EngineError> {
-        self.desired_server_value_with_profile(eliot_exe, None)
+        self.desired_server_value_with_profile(eliot_exe, Some("external_auditor"))
     }
 
     pub fn desired_server_value_with_profile(
@@ -1800,6 +1845,8 @@ impl AntigravityMcpConfigService {
                 "stdio",
                 "--host",
                 "antigravity",
+                "--profile",
+                "external_auditor",
                 "--instance",
                 "default"
             ]));
@@ -1903,6 +1950,8 @@ impl AntigravityMcpConfigService {
                 "stdio".to_owned(),
                 "--host".to_owned(),
                 "antigravity".to_owned(),
+                "--profile".to_owned(),
+                "external_auditor".to_owned(),
                 "--instance".to_owned(),
                 "default".to_owned(),
             ],
@@ -2155,6 +2204,7 @@ impl AntigravityRunner {
         contract: &AntigravityCommandContract,
         worktree_lease: &WorktreeLease,
         effective_cwd: &Path,
+        data_root: &Path,
         runner: &dyn ProviderProcessRunner,
     ) -> Result<AntigravityRun, EngineError> {
         if std::env::var_os("ELIOT_DISABLE_REAL_PROVIDER").is_some() {
@@ -2169,8 +2219,13 @@ impl AntigravityRunner {
             ))
         })?;
         let effective_cwd = validate_real_worktree(request, worktree_lease, effective_cwd)?;
-        let argv =
-            AntigravityCommandContractService.typed_review_argv(contract, &request.question)?;
+        let log_source = OwnedAntigravityLogSource::prepare(data_root, &request.request_id)?;
+        let argv = AntigravityCommandContractService.typed_review_argv_with_log(
+            contract,
+            &request.question,
+            Some(&log_source.path),
+        )?;
+        let requested_model = exact_requested_model(contract, &argv)?;
         let binary = argv
             .first()
             .ok_or_else(|| rejected("Antigravity real run has no binary argv"))?;
@@ -2200,7 +2255,7 @@ impl AntigravityRunner {
                 DEFAULT_MAX_OUTPUT_BYTES as u64,
             ),
         );
-        let output = runner
+        let execution = runner
             .run(
                 ProviderProcessSpec {
                     operation_id: new_id("antigravity-process"),
@@ -2223,7 +2278,16 @@ impl AntigravityRunner {
                 },
                 &mut |_| Ok(()),
             )
-            .await?;
+            .await;
+        let output = match execution {
+            Ok(output) => output,
+            Err(error) => {
+                // Preserve any adapter log emitted before a supervisor failure. The
+                // owned source is deleted on Drop, so capture must precede return.
+                let _ = log_source.capture(data_root, &request.request_id);
+                return Err(error);
+            }
+        };
         if !output.reap_receipt.proves_complete_reap() {
             return Err(rejected(
                 "supervised Antigravity process returned an incomplete reap receipt",
@@ -2240,29 +2304,63 @@ impl AntigravityRunner {
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let redacted_stdout = redact_output(&stdout);
         let redacted_stderr = redact_output(&stderr);
-        let redaction_receipt =
-            merge_redaction_receipts(&redacted_stdout.receipt, &redacted_stderr.receipt);
-        let combined = output_text(
-            redacted_stdout.text.as_bytes(),
-            redacted_stderr.text.as_bytes(),
+        let provider_response = agy_single_turn_response(&stdout);
+        let response_protocol_receipt = provider_response.as_deref().map_or_else(
+            |_| AntigravityResponseProtocolReceipt::default(),
+            response_protocol_receipt,
         );
-        let normalized = AntigravityTextOutputNormalizer.normalize_text(request, &combined);
+        let visible_stdout = provider_response.as_ref().map_or_else(
+            |_| withhold_unstructured_output(&stdout),
+            |response| redact_output(response),
+        );
+        let redaction_receipt =
+            merge_redaction_receipts(&visible_stdout.receipt, &redacted_stderr.receipt);
+        let log_capture = log_source.capture(data_root, &request.request_id);
+        let model_observation = log_capture.as_ref().map_or_else(
+            |error| {
+                Err(rejected(&format!(
+                    "Antigravity governed log capture failed: {error}"
+                )))
+            },
+            |capture| observe_selected_model_from_log(data_root, capture, &requested_model),
+        );
         let exit_success = output.exit_code == Some(0);
+        let transport_complete = exit_success
+            && !output.timed_out
+            && !output.cancelled
+            && output.worker_error.is_none()
+            && output.reap_receipt.proves_complete_reap()
+            && provider_response.is_ok()
+            && model_observation.is_ok()
+            && governed_log_capture_complete(log_capture.as_ref().ok());
+        let normalized = match &provider_response {
+            Ok(response) if transport_complete => {
+                AntigravityTextOutputNormalizer.normalize_text(request, response)
+            }
+            Ok(_) => match model_observation.as_ref() {
+                Err(error) => {
+                    AntigravityTextOutputNormalizer.reject_output(request, error.to_string())
+                }
+                Ok(_) => AntigravityTextOutputNormalizer
+                    .reject_output(request, "Antigravity process did not complete successfully"),
+            },
+            Err(reason) => AntigravityTextOutputNormalizer.reject_output(request, reason.clone()),
+        };
         let state = if output.timed_out {
             AntigravityRunState::TimedOut
-        } else if exit_success {
+        } else if transport_complete && !normalized.rejected {
             AntigravityRunState::Succeeded
         } else {
             AntigravityRunState::Failed
         };
+        let log_blob_ref = log_capture.ok().map(|capture| capture.blob_ref);
         let (receipt_argv, prompt_hash_blake3) = safety_argv_receipt(&argv, &request.question);
         Ok(AntigravityRun {
             run_id: new_id("antigravity-run"),
             request_id: request.request_id.clone(),
             state,
-            provider_state: if exit_success {
+            provider_state: if state == AntigravityRunState::Succeeded {
                 AntigravityProviderState::ReadyEnabled
             } else {
                 AntigravityProviderState::DetectedDisabled
@@ -2273,14 +2371,14 @@ impl AntigravityRunner {
             effective_cwd: path_for_record(&effective_cwd),
             stdout_blob_ref: Some(blob_ref(
                 "antigravity/stdout.txt",
-                redacted_stdout.text.len(),
+                visible_stdout.text.len(),
             )),
             stderr_blob_ref: Some(blob_ref(
                 "antigravity/stderr.txt",
                 redacted_stderr.text.len(),
             )),
-            log_blob_ref: Some(blob_ref("antigravity/log.txt", combined.len())),
-            stdout_excerpt: truncate_text(&redacted_stdout.text, 2_000),
+            log_blob_ref,
+            stdout_excerpt: truncate_text(&visible_stdout.text, 2_000),
             stderr_excerpt: truncate_text(&redacted_stderr.text, 2_000),
             safety_receipt: AntigravitySafetyReceipt {
                 typed_argv: receipt_argv,
@@ -2293,16 +2391,20 @@ impl AntigravityRunner {
                 effective_cwd: path_for_record(&effective_cwd),
                 env_fixed_vars: process_env,
                 env_dropped_names: dropped_names,
+                model_observation: model_observation.ok(),
             },
             redaction_receipt,
+            response_protocol_receipt,
             normalized_result: Some(normalized),
             message: if output.timed_out {
                 "real Antigravity run timed out and its supervised Job Object was reaped".to_owned()
-            } else if exit_success {
-                "real Antigravity run completed through the shared supervised process primitive"
-                    .to_owned()
+            } else if state == AntigravityRunState::Succeeded {
+                format!(
+                    "real Antigravity single-turn audit completed with model {ANTIGRAVITY_AUDIT_MODEL} at {ANTIGRAVITY_AUDIT_EFFORT} effort"
+                )
             } else {
-                "real Antigravity run failed; supervised output was captured".to_owned()
+                "real Antigravity run failed or produced incomplete structured output; supervised evidence was captured"
+                    .to_owned()
             },
             created_at: started,
             completed_at: Some(OffsetDateTime::now_utc()),
@@ -2353,8 +2455,14 @@ impl AntigravityRunner {
             ))
         })?;
         let effective_cwd = validate_real_worktree(request, worktree_lease, effective_cwd)?;
-        let argv =
-            AntigravityCommandContractService.typed_review_argv(contract, &request.question)?;
+        let log_source =
+            OwnedAntigravityLogSource::prepare(data_root, &attempt.invocation_attempt_id)?;
+        let argv = AntigravityCommandContractService.typed_review_argv_with_log(
+            contract,
+            &request.question,
+            Some(&log_source.path),
+        )?;
+        let requested_model = exact_requested_model(contract, &argv)?;
         let binary = argv
             .first()
             .ok_or_else(|| rejected("Antigravity real run has no binary argv"))?;
@@ -2429,6 +2537,17 @@ impl AntigravityRunner {
             Ok(output) => output,
             Err(error) => {
                 let error_text = error.to_string();
+                let log_evidence =
+                    match log_source.capture(data_root, &attempt.invocation_attempt_id) {
+                        Ok(capture) => format!(
+                            "provider_log_blob:{}:{}:{};output_observed:{}",
+                            capture.blob_ref.algorithm,
+                            capture.blob_ref.digest_hex,
+                            capture.blob_ref.relative_path,
+                            capture.output_observed
+                        ),
+                        Err(_) => "provider_log_capture:missing_or_unreadable".to_owned(),
+                    };
                 let state = attempt
                     .state_transitions
                     .last()
@@ -2441,13 +2560,13 @@ impl AntigravityRunner {
                     journal.transition(
                         attempt,
                         ProviderInvocationState::PreDispatchAborted,
-                        vec![error.to_string()],
+                        vec![error.to_string(), log_evidence],
                     )?;
                 } else {
                     let _ = reservation_owner.mark_unknown_outcome(reservation_id, &error_text);
                     if let Err(journal_error) = journal.record_post_dispatch_failure(
                         attempt,
-                        vec![format!("supervisor_error:{error_text}")],
+                        vec![format!("supervisor_error:{error_text}"), log_evidence],
                     ) {
                         return Err(EngineError::WriteRejected(format!(
                             "Antigravity process failed after dispatch and reconciliation journaling failed; provider redispatch is forbidden; supervisor_error={error_text}; journal_error={journal_error}"
@@ -2529,8 +2648,60 @@ impl AntigravityRunner {
         }
         let stdout_text = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
-        let combined = output_text(stdout_text.as_bytes(), stderr_text.as_bytes());
-        let normalized = AntigravityTextOutputNormalizer.normalize_text(request, &combined);
+        let provider_response = agy_single_turn_response(&stdout_text);
+        let response_protocol_receipt = provider_response.as_deref().map_or_else(
+            |_| AntigravityResponseProtocolReceipt::default(),
+            response_protocol_receipt,
+        );
+        let visible_stdout = provider_response.as_ref().map_or_else(
+            |_| withhold_unstructured_output(&stdout_text),
+            |response| redact_output(response),
+        );
+        let visible_stderr = redact_output(&stderr_text);
+        let mut redaction_receipt =
+            merge_redaction_receipts(&visible_stdout.receipt, &visible_stderr.receipt);
+        redaction_receipt.original_bytes = output.stdout.len().saturating_add(output.stderr.len());
+        redaction_receipt.retained_bytes = visible_stdout
+            .text
+            .len()
+            .saturating_add(visible_stderr.text.len());
+        let log_capture = log_source.capture(data_root, &attempt.invocation_attempt_id);
+        let model_observation = log_capture.as_ref().map_or_else(
+            |error| {
+                Err(rejected(&format!(
+                    "Antigravity governed log capture failed: {error}"
+                )))
+            },
+            |capture| observe_selected_model_from_log(data_root, capture, &requested_model),
+        );
+        let exit_success = output.exit_code == Some(0);
+        let base_capture_complete = output.reap_receipt.proves_complete_reap()
+            && output.worker_error.is_none()
+            && !output.timed_out
+            && !output.cancelled
+            && !output.stdout_truncated
+            && !output.stderr_truncated
+            && !stdout_capture.truncation_detected
+            && !stderr_capture.truncation_detected
+            && stdout_capture.stream_closed_cleanly
+            && stderr_capture.stream_closed_cleanly
+            && model_observation.is_ok()
+            && governed_log_capture_complete(log_capture.as_ref().ok());
+        let normalized = match &provider_response {
+            Ok(response) if exit_success && base_capture_complete => {
+                AntigravityTextOutputNormalizer.normalize_text(request, response)
+            }
+            Ok(_) => match model_observation.as_ref() {
+                Err(error) => {
+                    AntigravityTextOutputNormalizer.reject_output(request, error.to_string())
+                }
+                Ok(_) => AntigravityTextOutputNormalizer.reject_output(
+                    request,
+                    "Antigravity process or governed capture did not complete successfully",
+                ),
+            },
+            Err(reason) => AntigravityTextOutputNormalizer.reject_output(request, reason.clone()),
+        };
         let structured_bytes = match serde_json::to_vec(&normalized) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -2576,18 +2747,11 @@ impl AntigravityRunner {
             );
             return Err(error);
         }
-        let exit_success = output.exit_code == Some(0);
-        let capture_complete = output.reap_receipt.proves_complete_reap()
-            && output.worker_error.is_none()
-            && !output.stdout_truncated
-            && !output.stderr_truncated
-            && !stdout_capture.truncation_detected
-            && !stderr_capture.truncation_detected
+        let capture_complete = base_capture_complete
             && !structured_capture.truncation_detected
-            && stdout_capture.stream_closed_cleanly
-            && stderr_capture.stream_closed_cleanly
-            && structured_capture.stream_closed_cleanly;
-        let state = if output.timed_out {
+            && structured_capture.stream_closed_cleanly
+            && !normalized.rejected;
+        let state = if output.timed_out || output.cancelled {
             AntigravityRunState::TimedOut
         } else if exit_success && capture_complete {
             AntigravityRunState::Succeeded
@@ -2598,10 +2762,12 @@ impl AntigravityRunner {
         let terminal_state =
             if output.worker_error.is_some() || !output.reap_receipt.proves_complete_reap() {
                 ProviderInvocationState::CleanupFailedAfterComplete
-            } else if !capture_complete {
-                ProviderInvocationState::LocalCaptureFailed
             } else if output.timed_out || stderr_text.contains("timeout waiting for response") {
                 ProviderInvocationState::TimeoutPendingReconciliation
+            } else if output.cancelled {
+                ProviderInvocationState::CancelledAfterDispatch
+            } else if !capture_complete {
+                ProviderInvocationState::LocalCaptureFailed
             } else if exit_success {
                 ProviderInvocationState::CompletedCaptured
             } else {
@@ -2620,12 +2786,6 @@ impl AntigravityRunner {
                 output.stderr_truncated
             )],
         )?;
-        let redaction_receipt = AntigravityOutputRedactionReceipt {
-            redacted: false,
-            redacted_markers: Vec::new(),
-            original_bytes: output.stdout.len().saturating_add(output.stderr.len()),
-            retained_bytes: output.stdout.len().saturating_add(output.stderr.len()),
-        };
         let (receipt_argv, prompt_hash_blake3) = safety_argv_receipt(&argv, &request.question);
         Ok(AntigravityRun {
             run_id: new_id("antigravity-run"),
@@ -2642,9 +2802,9 @@ impl AntigravityRunner {
             effective_cwd: path_for_record(&effective_cwd),
             stdout_blob_ref: Some(stdout_capture.blob_ref),
             stderr_blob_ref: Some(stderr_capture.blob_ref),
-            log_blob_ref: Some(blob_ref("antigravity/log.txt", combined.len())),
-            stdout_excerpt: truncate_text(&stdout_text, 2_000),
-            stderr_excerpt: truncate_text(&stderr_text, 2_000),
+            log_blob_ref: log_capture.ok().map(|capture| capture.blob_ref),
+            stdout_excerpt: truncate_text(&visible_stdout.text, 2_000),
+            stderr_excerpt: truncate_text(&visible_stderr.text, 2_000),
             safety_receipt: AntigravitySafetyReceipt {
                 typed_argv: receipt_argv,
                 prompt_hash_blake3,
@@ -2656,15 +2816,20 @@ impl AntigravityRunner {
                 effective_cwd: path_for_record(&effective_cwd),
                 env_fixed_vars: process_env,
                 env_dropped_names: dropped_names,
+                model_observation: model_observation.ok(),
             },
             redaction_receipt,
+            response_protocol_receipt,
             normalized_result: Some(normalized),
             message: if output.timed_out {
                 "real Antigravity run hit the supervised absolute deadline".to_owned()
-            } else if exit_success {
-                "real Antigravity run completed with supervised durable capture".to_owned()
+            } else if state == AntigravityRunState::Succeeded {
+                format!(
+                    "real Antigravity single-turn audit completed with model {ANTIGRAVITY_AUDIT_MODEL} at {ANTIGRAVITY_AUDIT_EFFORT} effort and durable capture"
+                )
             } else {
-                "real Antigravity run exited nonzero; output is pending reconciliation".to_owned()
+                "real Antigravity run failed or produced incomplete structured output; no candidate review was accepted"
+                    .to_owned()
             },
             created_at: started,
             completed_at: Some(completed_at),
@@ -2699,6 +2864,7 @@ impl AntigravityRunner {
             effective_cwd: path_for_record(effective_cwd),
             env_fixed_vars: default_env_policy().fixed_vars,
             env_dropped_names: default_env_policy().dropped_names,
+            model_observation: None,
         };
         Ok(AntigravityRun {
             run_id: new_id("antigravity-run"),
@@ -2719,6 +2885,7 @@ impl AntigravityRunner {
             stderr_excerpt: String::new(),
             safety_receipt,
             redaction_receipt: redacted_stdout.receipt,
+            response_protocol_receipt: response_protocol_receipt(&stdout),
             normalized_result: Some(normalized),
             message: "fixture dry-run completed without provider execution".to_owned(),
             created_at: OffsetDateTime::now_utc(),
@@ -2760,6 +2927,7 @@ impl AntigravityRunner {
                 effective_cwd: path_for_record(effective_cwd),
                 env_fixed_vars: default_env_policy().fixed_vars,
                 env_dropped_names: default_env_policy().dropped_names,
+                model_observation: None,
             },
             redaction_receipt: AntigravityOutputRedactionReceipt {
                 redacted: false,
@@ -2767,6 +2935,7 @@ impl AntigravityRunner {
                 original_bytes: 0,
                 retained_bytes: 0,
             },
+            response_protocol_receipt: AntigravityResponseProtocolReceipt::default(),
             normalized_result: None,
             message: format!("blocked by gate: {}", gate_decision.reasons.join("; ")),
             created_at: OffsetDateTime::now_utc(),
@@ -2776,6 +2945,25 @@ impl AntigravityRunner {
 }
 
 impl AntigravityTextOutputNormalizer {
+    pub fn reject_output(
+        &self,
+        request: &AntigravityReviewRequest,
+        reason: impl Into<String>,
+    ) -> AntigravityNormalizedResult {
+        AntigravityNormalizedResult {
+            result_id: new_id("antigravity-result"),
+            request_id: request.request_id.clone(),
+            run_id: new_id("antigravity-normalization-run"),
+            candidate_only: true,
+            taint: TaintClass::ExternalAgent,
+            external_review_result: None,
+            rejected: true,
+            rejection_reasons: vec![reason.into()],
+            write_receipt: None,
+            created_at: OffsetDateTime::now_utc(),
+        }
+    }
+
     pub fn normalize_text(
         &self,
         request: &AntigravityReviewRequest,
@@ -2802,6 +2990,7 @@ impl AntigravityTextOutputNormalizer {
                 created_at: OffsetDateTime::now_utc(),
             };
         }
+        let public_text = redact_output(text).text;
         let external_request = external_request_from_antigravity(request);
         let job = ExternalReviewJob {
             job_id: new_id("external-review-job"),
@@ -2821,7 +3010,7 @@ impl AntigravityTextOutputNormalizer {
             "findings": [{
                 "finding_id": new_id("antigravity-finding"),
                 "title": "Antigravity candidate output",
-                "detail": truncate_text(text, 1_000),
+                "detail": truncate_text(&public_text, 1_000),
                 "severity": "info",
                 "claim_status": "candidate",
                 "citations": [{
@@ -3236,6 +3425,116 @@ fn safe_invocation_component(value: &str) -> String {
         .collect()
 }
 
+fn governed_log_capture_complete(
+    capture: Option<&crate::provider_invocation::ProviderOutputCapture>,
+) -> bool {
+    capture.is_some_and(|capture| {
+        capture.output_observed && !capture.truncation_detected && capture.stream_closed_cleanly
+    })
+}
+
+fn observe_selected_model_from_log(
+    root: &Path,
+    capture: &crate::provider_invocation::ProviderOutputCapture,
+    requested_model: &str,
+) -> Result<AntigravityModelObservation, EngineError> {
+    if capture.blob_ref.algorithm != "blake3"
+        || capture.blob_ref.size_bytes > DEFAULT_MAX_OUTPUT_BYTES as u64
+    {
+        return Err(rejected(
+            "Antigravity model evidence has an unsupported log blob contract",
+        ));
+    }
+    let relative = Path::new(&capture.blob_ref.relative_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(rejected(
+            "Antigravity model evidence log path escapes the protected spool",
+        ));
+    }
+    let bytes = fs::read(root.join(relative))?;
+    let size = u64::try_from(bytes.len())
+        .map_err(|_| rejected("Antigravity model evidence size does not fit u64"))?;
+    if size != capture.blob_ref.size_bytes
+        || blake3::hash(&bytes).to_hex().as_str() != capture.blob_ref.digest_hex
+    {
+        return Err(rejected(
+            "Antigravity model evidence log differs from its captured blob receipt",
+        ));
+    }
+    let log = String::from_utf8(bytes)
+        .map_err(|_| rejected("Antigravity model evidence log is not valid UTF-8"))?;
+    authenticated_model_observation(&log, requested_model)
+}
+
+fn exact_requested_model(
+    contract: &AntigravityCommandContract,
+    argv: &[String],
+) -> Result<String, EngineError> {
+    let requested_model = contract
+        .selected_model
+        .as_deref()
+        .ok_or_else(|| rejected("Antigravity command contract has no selected model"))?;
+    if requested_model != ANTIGRAVITY_AUDIT_MODEL {
+        return Err(rejected(
+            "Antigravity command contract selected an unsupported audit model",
+        ));
+    }
+    let expected = format!("--model={requested_model}");
+    let mut model_args = argv
+        .iter()
+        .filter(|argument| argument.starts_with("--model="));
+    if model_args.next() != Some(&expected) || model_args.next().is_some() {
+        return Err(rejected(
+            "Antigravity launch argv does not contain one exact selected-model binding",
+        ));
+    }
+    Ok(requested_model.to_owned())
+}
+
+struct OwnedAntigravityLogSource {
+    path: PathBuf,
+}
+
+impl OwnedAntigravityLogSource {
+    fn prepare(root: &Path, invocation_id: &str) -> Result<Self, EngineError> {
+        let parent = root.join("provider-runtime/antigravity-logs");
+        fs::create_dir_all(&parent)?;
+        let path = parent.join(format!(
+            "{}-{}.log",
+            safe_invocation_component(invocation_id),
+            safe_invocation_component(&new_id("agy-log"))
+        ));
+        if path.exists() {
+            return Err(rejected("Antigravity log source path already exists"));
+        }
+        Ok(Self { path })
+    }
+
+    fn capture(
+        &self,
+        root: &Path,
+        invocation_id: &str,
+    ) -> Result<crate::provider_invocation::ProviderOutputCapture, EngineError> {
+        ProviderOutputSpool.capture(
+            root,
+            invocation_id,
+            "log",
+            fs::File::open(&self.path)?,
+            DEFAULT_MAX_OUTPUT_BYTES as u64,
+        )
+    }
+}
+
+impl Drop for OwnedAntigravityLogSource {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn authenticode_signature(path: &Path) -> (AntigravityBinarySignatureStatus, Option<String>) {
     #[cfg(windows)]
     {
@@ -3630,6 +3929,8 @@ fn parse_capabilities(help_text: &str) -> AntigravityCapabilities {
         conversation: lower.contains("--conversation"),
         json_output: lower.contains("--json") || lower.contains("json"),
         model_cli_arg: lower.contains("--model"),
+        effort_cli_arg: lower.contains("--effort"),
+        disable_slash_commands: lower.contains("--disable-slash-commands"),
         dangerously_skip_permissions_seen: lower.contains("--dangerously-skip-permissions"),
         text_output_supported: true,
     }
@@ -3723,6 +4024,109 @@ fn output_text(stdout: &[u8], stderr: &[u8]) -> String {
     truncate_text(&text, DEFAULT_MAX_OUTPUT_BYTES)
 }
 
+fn agy_single_turn_response(stdout: &str) -> Result<String, String> {
+    let envelope: Value = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("Antigravity JSON output is invalid: {error}"))?;
+    if envelope.get("status").and_then(Value::as_str) != Some("SUCCESS") {
+        return Err("Antigravity JSON output did not report SUCCESS".to_owned());
+    }
+    if envelope.get("num_turns").and_then(Value::as_u64) != Some(1) {
+        return Err("Antigravity audit was not an exact single-turn execution".to_owned());
+    }
+    let response = envelope
+        .get("response")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Antigravity JSON output has no non-empty response".to_owned())?;
+    Ok(response.to_owned())
+}
+
+fn response_protocol_receipt(response: &str) -> AntigravityResponseProtocolReceipt {
+    AntigravityResponseProtocolReceipt {
+        structured_single_turn: true,
+        expected_smoke_marker_seen: response
+            .to_ascii_uppercase()
+            .contains(AntigravityLiveSmokeService::EXPECTED_MARKER),
+        mcp_call_marker_seen: response.contains(AntigravityLiveSmokeService::MCP_CALL_MARKER),
+        candidate_final_line_exact: response
+            .lines()
+            .next_back()
+            .is_some_and(|line| line.trim() == AntigravityLiveSmokeService::CANDIDATE_FINAL_LINE),
+    }
+}
+
+fn authenticated_model_observation(
+    log: &str,
+    requested_model: &str,
+) -> Result<AntigravityModelObservation, EngineError> {
+    const AUTHENTICATED: &str = "printmode.go:366] Print mode: silent auth succeeded";
+    const STREAM_STARTED: &str = "streamGenerateContent?alt=sse";
+    const RESOLVING: &str = "model_resolver.go:80] Resolving model ";
+    const PROPAGATING: &str =
+        "model_config_manager.go:311] Propagating selected model override to backend: label=";
+    if requested_model != ANTIGRAVITY_AUDIT_MODEL {
+        return Err(rejected(
+            "Antigravity runtime observation requested an unsupported audit model",
+        ));
+    }
+    let authenticated = log.find(AUTHENTICATED).ok_or_else(|| {
+        rejected("Antigravity governed log has no authenticated runtime boundary")
+    })?;
+    let authenticated_log = &log[authenticated + AUTHENTICATED.len()..];
+    let stream_started = authenticated_log.find(STREAM_STARTED).ok_or_else(|| {
+        rejected("Antigravity governed log has no post-selection provider stream")
+    })?;
+    let selection_window = &authenticated_log[..stream_started];
+    if selection_window.contains("defaulting to")
+        || selection_window.contains("Model resolved via default")
+    {
+        return Err(rejected(
+            "Antigravity authenticated runtime selected a fallback or different model",
+        ));
+    }
+    let expected_label = format!("\"{ANTIGRAVITY_AUDIT_MODEL_LABEL}\"");
+    let mut resolved_at = None;
+    let mut propagated_at = None;
+    for (line_index, line) in selection_window.lines().enumerate() {
+        if let Some((_, observed_model)) = line.split_once(RESOLVING)
+            && (observed_model.trim() != requested_model
+                || resolved_at.replace(line_index).is_some())
+        {
+            return Err(rejected(
+                "Antigravity authenticated runtime resolved an ambiguous or different model",
+            ));
+        }
+        if let Some((_, observed_label)) = line.split_once(PROPAGATING)
+            && (observed_label.trim() != expected_label
+                || propagated_at.replace(line_index).is_some())
+        {
+            return Err(rejected(
+                "Antigravity authenticated runtime propagated an ambiguous or different model label",
+            ));
+        }
+    }
+    let resolved_at = resolved_at.ok_or_else(|| {
+        rejected("Antigravity authenticated runtime did not resolve the requested model")
+    })?;
+    let propagated_at = propagated_at.ok_or_else(|| {
+        rejected("Antigravity authenticated runtime did not propagate the selected model")
+    })?;
+    if propagated_at <= resolved_at {
+        return Err(rejected(
+            "Antigravity model propagation preceded its authenticated resolution",
+        ));
+    }
+    Ok(AntigravityModelObservation {
+        requested_model: requested_model.to_owned(),
+        observed_model: requested_model.to_owned(),
+        authority: AntigravityModelObservationAuthority::CliAuthenticatedRuntimeLog,
+        authenticated_runtime: true,
+        backend_propagation_observed: true,
+        stream_started_after_selection: true,
+    })
+}
+
 fn looks_executable(path: &Path) -> bool {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some(extension) => matches!(
@@ -3799,6 +4203,7 @@ fn contains_shell_interpolation(value: &str) -> bool {
 }
 
 const REDACTED_PROVIDER_LINE: &str = "[REDACTED:SENSITIVE_PROVIDER_OUTPUT]";
+const WITHHELD_UNSTRUCTURED_PROVIDER_OUTPUT: &str = "[WITHHELD:UNSTRUCTURED_PROVIDER_OUTPUT]";
 const SENSITIVE_OUTPUT_MARKERS: &[(&str, &str)] = &[
     ("token", "token"),
     ("secret", "secret"),
@@ -3921,6 +4326,18 @@ fn redact_output(text: &str) -> RedactedOutput {
     }
 }
 
+fn withhold_unstructured_output(text: &str) -> RedactedOutput {
+    RedactedOutput {
+        text: WITHHELD_UNSTRUCTURED_PROVIDER_OUTPUT.to_owned(),
+        receipt: AntigravityOutputRedactionReceipt {
+            redacted: true,
+            redacted_markers: vec!["unstructured_provider_output".to_owned()],
+            original_bytes: text.len(),
+            retained_bytes: WITHHELD_UNSTRUCTURED_PROVIDER_OUTPUT.len(),
+        },
+    }
+}
+
 fn merge_redaction_receipts(
     left: &AntigravityOutputRedactionReceipt,
     right: &AntigravityOutputRedactionReceipt,
@@ -3952,7 +4369,13 @@ fn safety_argv_receipt(argv: &[String], prompt: &str) -> (Vec<String>, String) {
                 skip_prompt_value = true;
                 return None;
             }
-            (!arg.starts_with("--prompt=")).then(|| arg.clone())
+            if arg.starts_with("--prompt=") {
+                return None;
+            }
+            if arg.starts_with("--log-file=") {
+                return Some("--log-file=<private>".to_owned());
+            }
+            Some(arg.clone())
         })
         .collect();
     (
@@ -4309,6 +4732,464 @@ mod security_tests {
         );
         let serialized = serde_json::to_string(&(safe_argv, prompt_hash))?;
         assert!(!serialized.contains(prompt));
+        Ok(())
+    }
+
+    #[test]
+    fn single_turn_json_requires_success_exactly_one_turn_and_nonempty_response() {
+        let valid = r#"{"status":"SUCCESS","response":"candidate finding\n","num_turns":1}"#;
+        assert_eq!(
+            agy_single_turn_response(valid).as_deref(),
+            Ok("candidate finding")
+        );
+        for invalid in [
+            r#"{"status":"ERROR","response":"x","num_turns":1}"#,
+            r#"{"status":"SUCCESS","response":"x","num_turns":2}"#,
+            r#"{"status":"SUCCESS","response":" ","num_turns":1}"#,
+            "",
+        ] {
+            assert!(agy_single_turn_response(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn authenticated_runtime_log_binds_exact_model_before_provider_stream() {
+        let log = format!(
+            "pre-auth defaulting to CCPA\n{}\nmodel_resolver.go:80] Resolving model {}\nmodel_config_manager.go:311] Propagating selected model override to backend: label=\"{}\"\nURL: https://example.invalid/streamGenerateContent?alt=sse\n",
+            "printmode.go:366] Print mode: silent auth succeeded",
+            ANTIGRAVITY_AUDIT_MODEL,
+            ANTIGRAVITY_AUDIT_MODEL_LABEL,
+        );
+        let Ok(observation) = authenticated_model_observation(&log, ANTIGRAVITY_AUDIT_MODEL) else {
+            panic!("authenticated exact model selection must be observed");
+        };
+        assert_eq!(observation.requested_model, ANTIGRAVITY_AUDIT_MODEL);
+        assert_eq!(observation.observed_model, ANTIGRAVITY_AUDIT_MODEL);
+        assert!(observation.authenticated_runtime);
+        assert!(observation.backend_propagation_observed);
+        assert!(observation.stream_started_after_selection);
+    }
+
+    #[test]
+    fn authenticated_runtime_log_rejects_fallback_wrong_model_and_missing_stream() {
+        for log in [
+            "printmode.go:366] Print mode: silent auth succeeded\nmodel_resolver.go:80] Resolving model other-model\nmodel_config_manager.go:311] Propagating selected model override to backend: label=\"Other\"\nstreamGenerateContent?alt=sse".to_owned(),
+            format!(
+                "printmode.go:366] Print mode: silent auth succeeded\ndefaulting to CCPA\nmodel_resolver.go:80] Resolving model {ANTIGRAVITY_AUDIT_MODEL}\nmodel_config_manager.go:311] Propagating selected model override to backend: label=\"{ANTIGRAVITY_AUDIT_MODEL_LABEL}\"\nstreamGenerateContent?alt=sse"
+            ),
+            format!(
+                "printmode.go:366] Print mode: silent auth succeeded\nmodel_resolver.go:80] Resolving model {ANTIGRAVITY_AUDIT_MODEL}\nmodel_config_manager.go:311] Propagating selected model override to backend: label=\"{ANTIGRAVITY_AUDIT_MODEL_LABEL}\""
+            ),
+        ] {
+            assert!(authenticated_model_observation(&log, ANTIGRAVITY_AUDIT_MODEL).is_err());
+        }
+
+        let prefix_substitution = format!(
+            "printmode.go:366] Print mode: silent auth succeeded\nmodel_resolver.go:80] Resolving model {ANTIGRAVITY_AUDIT_MODEL}-other\nmodel_config_manager.go:311] Propagating selected model override to backend: label=\"{ANTIGRAVITY_AUDIT_MODEL_LABEL}\"\nstreamGenerateContent?alt=sse"
+        );
+        assert!(
+            authenticated_model_observation(&prefix_substitution, ANTIGRAVITY_AUDIT_MODEL).is_err()
+        );
+
+        let valid_log = format!(
+            "printmode.go:366] Print mode: silent auth succeeded\nmodel_resolver.go:80] Resolving model {ANTIGRAVITY_AUDIT_MODEL}\nmodel_config_manager.go:311] Propagating selected model override to backend: label=\"{ANTIGRAVITY_AUDIT_MODEL_LABEL}\"\nstreamGenerateContent?alt=sse"
+        );
+        assert!(authenticated_model_observation(&valid_log, "other-model").is_err());
+    }
+
+    #[test]
+    fn model_observation_reloads_and_hash_checks_full_protected_log_blob()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("eliot-antigravity-model-{}", new_id("test")));
+        fs::create_dir_all(&root)?;
+        let log = format!(
+            "{}\nprintmode.go:366] Print mode: silent auth succeeded\nmodel_resolver.go:80] Resolving model {}\nmodel_config_manager.go:311] Propagating selected model override to backend: label=\"{}\"\nstreamGenerateContent?alt=sse\n",
+            "safe filler\n".repeat(300),
+            ANTIGRAVITY_AUDIT_MODEL,
+            ANTIGRAVITY_AUDIT_MODEL_LABEL,
+        );
+        let capture = ProviderOutputSpool.capture(
+            &root,
+            "model-observation",
+            "log",
+            std::io::Cursor::new(log),
+            DEFAULT_MAX_OUTPUT_BYTES as u64,
+        )?;
+        assert!(!capture.excerpt.contains("Resolving model"));
+        let observation =
+            observe_selected_model_from_log(&root, &capture, ANTIGRAVITY_AUDIT_MODEL)?;
+        assert_eq!(observation.observed_model, ANTIGRAVITY_AUDIT_MODEL);
+
+        fs::write(root.join(&capture.blob_ref.relative_path), b"tampered")?;
+        assert!(observe_selected_model_from_log(&root, &capture, ANTIGRAVITY_AUDIT_MODEL).is_err());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn safety_receipt_redacts_governed_log_source_path() {
+        let argv = vec![
+            "agy.exe".to_owned(),
+            "--model=gemini-3.7-flash-high".to_owned(),
+            "--effort=high".to_owned(),
+            "--log-file=C:/private/eliot/provider.log".to_owned(),
+            "--prompt=inspect".to_owned(),
+        ];
+        let (safe_argv, _) = safety_argv_receipt(&argv, "inspect");
+        assert!(safe_argv.contains(&"--model=gemini-3.7-flash-high".to_owned()));
+        assert!(safe_argv.contains(&"--effort=high".to_owned()));
+        assert!(safe_argv.contains(&"--log-file=<private>".to_owned()));
+        assert!(safe_argv.iter().all(|arg| !arg.contains("C:/private")));
+    }
+
+    #[test]
+    fn governed_log_requires_nonempty_complete_capture() {
+        let empty = crate::provider_invocation::ProviderOutputCapture {
+            blob_ref: BlobRef {
+                algorithm: "blake3".to_owned(),
+                digest_hex: blake3::hash(&[]).to_hex().to_string(),
+                size_bytes: 0,
+                relative_path: "spool/provider-invocations/test/log.bin".to_owned(),
+            },
+            excerpt: String::new(),
+            truncation_detected: false,
+            stream_closed_cleanly: true,
+            output_observed: false,
+        };
+        assert!(!governed_log_capture_complete(Some(&empty)));
+        assert!(!governed_log_capture_complete(None));
+
+        let observed = crate::provider_invocation::ProviderOutputCapture {
+            output_observed: true,
+            ..empty
+        };
+        assert!(governed_log_capture_complete(Some(&observed)));
+    }
+
+    #[test]
+    fn parsed_multiline_response_preserves_smoke_markers_after_redaction() {
+        let raw = serde_json::json!({
+            "status": "SUCCESS",
+            "response": format!(
+                "token metadata is not retained\n{}\n{}\n{}",
+                AntigravityLiveSmokeService::MCP_CALL_MARKER,
+                AntigravityLiveSmokeService::EXPECTED_MARKER,
+                AntigravityLiveSmokeService::CANDIDATE_FINAL_LINE
+            ),
+            "num_turns": 1
+        })
+        .to_string();
+        let Ok(response) = agy_single_turn_response(&raw) else {
+            panic!("single-turn response fixture must be valid");
+        };
+        let visible = redact_output(&response).text;
+        let protocol = response_protocol_receipt(&response);
+        assert!(visible.contains(REDACTED_PROVIDER_LINE));
+        assert!(visible.contains(AntigravityLiveSmokeService::MCP_CALL_MARKER));
+        assert!(visible.contains(AntigravityLiveSmokeService::EXPECTED_MARKER));
+        assert_eq!(
+            visible.lines().next_back(),
+            Some(AntigravityLiveSmokeService::CANDIDATE_FINAL_LINE)
+        );
+        assert!(protocol.structured_single_turn);
+        assert!(protocol.expected_smoke_marker_seen);
+        assert!(protocol.mcp_call_marker_seen);
+        assert!(protocol.candidate_final_line_exact);
+    }
+
+    struct RecordedRedactionRunner {
+        malformed_output: bool,
+    }
+
+    impl ProviderProcessRunner for RecordedRedactionRunner {
+        fn run<'a>(
+            &'a self,
+            spec: ProviderProcessSpec,
+            on_spawned: &'a mut (dyn FnMut(u32) -> Result<(), EngineError> + Send),
+        ) -> BoxProviderProcessFuture<'a> {
+            let malformed_output = self.malformed_output;
+            Box::pin(async move {
+                let version_probe = spec
+                    .args
+                    .iter()
+                    .any(|argument| argument.to_string_lossy() == "--version");
+                if !version_probe {
+                    let log_path = spec
+                        .args
+                        .iter()
+                        .find_map(|argument| {
+                            argument
+                                .to_string_lossy()
+                                .strip_prefix("--log-file=")
+                                .map(PathBuf::from)
+                        })
+                        .ok_or_else(|| rejected("test runner did not receive governed log path"))?;
+                    fs::write(
+                        log_path,
+                        format!(
+                            "printmode.go:366] Print mode: silent auth succeeded\nmodel_resolver.go:80] Resolving model {ANTIGRAVITY_AUDIT_MODEL}\nmodel_config_manager.go:311] Propagating selected model override to backend: label=\"{ANTIGRAVITY_AUDIT_MODEL_LABEL}\"\nstreamGenerateContent?alt=sse\n"
+                        ),
+                    )?;
+                }
+                on_spawned(42)?;
+                let stdout = if version_probe {
+                    b"Antigravity CLI v1.1.1".to_vec()
+                } else if malformed_output {
+                    br#"{"status":"ERROR","response":"MALFORMED_PROVIDER_BENIGN_SENTINEL","path":"Z:/workspace/internal.rs"} trailing"#.to_vec()
+                } else {
+                    serde_json::json!({
+                        "status": "SUCCESS",
+                        "response": format!(
+                            "token metadata must-not-publish-sentinel\n{} status=ready\n{}\n{}",
+                            AntigravityLiveSmokeService::MCP_CALL_MARKER,
+                            AntigravityLiveSmokeService::EXPECTED_MARKER,
+                            AntigravityLiveSmokeService::CANDIDATE_FINAL_LINE,
+                        ),
+                        "num_turns": 1,
+                    })
+                    .to_string()
+                    .into_bytes()
+                };
+                let now = OffsetDateTime::now_utc();
+                Ok(ProviderProcessOutcome {
+                    exit_code: Some(0),
+                    stdout_total_bytes: stdout.len() as u64,
+                    stderr_total_bytes: 0,
+                    stdout,
+                    stderr: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    timed_out: false,
+                    timeout_class: None,
+                    cancelled: false,
+                    worker_error: None,
+                    observed_processes: Vec::new(),
+                    process_started_at: now,
+                    first_output_at: Some(now),
+                    last_output_at: Some(now),
+                    process_exit_at: Some(now),
+                    cleanup_completed_at: now,
+                    reap_receipt: ProcessReapReceipt {
+                        operation_id: "recorded-redaction-test".to_owned(),
+                        generation: 1,
+                        job_object_name: "eliot-antigravity-test-job".to_owned(),
+                        root_pid: Some(42),
+                        process_count_before: 1,
+                        process_count_after: 0,
+                        graceful_attempted: true,
+                        forced_termination: false,
+                        stdout_closed: true,
+                        stderr_closed: true,
+                        all_tasks_joined: true,
+                        elapsed_ms: 1,
+                        terminal_error_codes: Vec::new(),
+                    },
+                })
+            })
+        }
+    }
+
+    // The regression intentionally assembles every durable owner used by the
+    // production recorded-supervised path so it cannot pass through a mock-only shortcut.
+    #[allow(clippy::too_many_lines)]
+    async fn recorded_supervised_fixture(
+        malformed_output: bool,
+    ) -> Result<AntigravityRun, Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("eliot-antigravity-recorded-{}", new_id("test")));
+        let live = root.join("live");
+        let worktree = root.join("worktree");
+        fs::create_dir_all(&live)?;
+        fs::create_dir_all(&worktree)?;
+        let mut request = antigravity_review_request(
+            "eliot-governor",
+            "recorded-redaction",
+            AntigravityReviewMode::AuditPlan,
+            "inspect candidate only",
+        );
+        request.provider_enabled = true;
+        let work_lease_id = WorkLeaseId::new_v7();
+        let worktree_lease_id = WorktreeLeaseId::new_v7();
+        request.work_lease_id = Some(work_lease_id);
+        request.worktree_lease_id = Some(worktree_lease_id);
+        let now = OffsetDateTime::now_utc();
+        let worktree_lease = WorktreeLease {
+            worktree_lease_id,
+            project_id: request.project_id,
+            task_id: request.task_id,
+            work_item_id: eliot_types::WorkItemId::new_v7(),
+            work_lease_id,
+            holder_session_id: eliot_types::AgentSessionId::new_v7(),
+            repo_root: path_for_record(&live),
+            worktree_path: path_for_record(&worktree),
+            branch_name: "test-recorded-redaction".to_owned(),
+            base_commit: "test".to_owned(),
+            allowed_read_set: vec![".".to_owned()],
+            allowed_write_set: Vec::new(),
+            state: WorktreeLeaseState::Active,
+            issued_at: now,
+            expires_at: now + Duration::minutes(5),
+            cleaned_at: None,
+            write_receipt: None,
+        };
+        let resolution = AntigravityBinaryResolver.resolve_known_paths(
+            vec![(
+                std::env::current_exe()?,
+                AntigravityBinaryCandidateSource::WhereAgy,
+            )],
+            false,
+        );
+        let help = "--mode --print --print-timeout --sandbox --disable-slash-commands --output-format json --model --effort --log-file --prompt";
+        let probe = AntigravityCapabilityProbeService.probe_from_help("agy.exe", help);
+        let contract = AntigravityCommandContractService.build(&resolution, &probe);
+        let reservation_owner = ProviderCallReservationOwner::new(&root);
+        let campaign_id = "recorded-redaction-campaign";
+        reservation_owner.open_campaign(crate::ProviderCallCampaignRequest {
+            campaign_id: campaign_id.to_owned(),
+            max_calls: 1,
+            closed: false,
+        })?;
+        let reservation_id =
+            match reservation_owner.reserve(crate::ProviderCallReservationRequest {
+                campaign_id: campaign_id.to_owned(),
+                task_id: request.task_id,
+                provider: "antigravity".to_owned(),
+                idempotency_key: "recorded-redaction".to_owned(),
+                gate_decision_ref: "test-gate".to_owned(),
+            })? {
+                crate::ProviderCallReservationDecision::Reserved(reservation) => {
+                    reservation.reservation_id
+                }
+                other => return Err(format!("unexpected reservation: {other:?}").into()),
+            };
+        reservation_owner.mark_dispatching(&reservation_id)?;
+        let journal = ProviderInvocationJournal::new(&root);
+        let route_policy = crate::antigravity_plan_route_policy();
+        let mut attempt = journal.create(ProviderInvocationAttempt {
+            invocation_attempt_id: "recorded-redaction-attempt".to_owned(),
+            provider: "antigravity".to_owned(),
+            campaign_id: campaign_id.to_owned(),
+            preregistration_id: "recorded-redaction-preregistration".to_owned(),
+            reservation_id: reservation_id.clone(),
+            idempotency_key: "recorded-redaction".to_owned(),
+            external_invocation_ref: None,
+            frozen_input_hash: "frozen".to_owned(),
+            request_payload_hash: "request".to_owned(),
+            route_or_model: Some(ANTIGRAVITY_AUDIT_MODEL.to_owned()),
+            adapter_version: Some("test".to_owned()),
+            executable_or_transport: contract.binary_path.clone(),
+            cwd: Some(path_for_record(&worktree)),
+            environment_fingerprint: Some("test".to_owned()),
+            timeout_profile_id: route_policy.timeout_profile().profile_id().to_owned(),
+            provider_route_policy: Some(route_policy.binding()),
+            state_transitions: Vec::new(),
+            dispatch_started_at: None,
+            process_started_at: None,
+            provider_ack_at: None,
+            first_output_at: None,
+            last_output_at: None,
+            process_exit_at: None,
+            cleanup_completed_at: None,
+            stdout_blob_or_hash: None,
+            stderr_blob_or_hash: None,
+            structured_output_blob_or_hash: None,
+            exit_code_or_signal: None,
+            process_or_job_identity: None,
+            timeout_class: None,
+            process_reap_receipt: None,
+            process_timed_out: None,
+            process_cancelled: None,
+            process_worker_error: None,
+            stdout_total_bytes: None,
+            stderr_total_bytes: None,
+            stdout_truncated: None,
+            stderr_truncated: None,
+            quota_or_cost_if_known: None,
+            original_closeout_ref: None,
+        })?;
+        journal.transition(
+            &mut attempt,
+            ProviderInvocationState::Reserved,
+            vec![format!("reservation:{reservation_id}")],
+        )?;
+        let run = AntigravityRunner
+            .run_real_recorded_supervised(
+                &request,
+                &contract,
+                &worktree_lease,
+                &worktree,
+                &root,
+                &reservation_owner,
+                &reservation_id,
+                &journal,
+                &mut attempt,
+                &RecordedRedactionRunner { malformed_output },
+            )
+            .await?;
+        fs::remove_dir_all(root)?;
+        Ok(run)
+    }
+
+    #[tokio::test]
+    async fn recorded_supervised_path_publishes_only_redacted_model_bound_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run = recorded_supervised_fixture(false).await?;
+        let public = serde_json::to_string(&run)?;
+        assert_eq!(run.state, AntigravityRunState::Succeeded);
+        assert!(run.redaction_receipt.redacted);
+        assert!(!public.contains("must-not-publish-sentinel"));
+        assert!(run.stdout_excerpt.contains(REDACTED_PROVIDER_LINE));
+        assert!(run.response_protocol_receipt.expected_smoke_marker_seen);
+        assert!(run.response_protocol_receipt.mcp_call_marker_seen);
+        assert!(run.response_protocol_receipt.candidate_final_line_exact);
+        assert_eq!(
+            run.safety_receipt
+                .model_observation
+                .as_ref()
+                .map(|observation| observation.observed_model.as_str()),
+            Some(ANTIGRAVITY_AUDIT_MODEL),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_recorded_output_is_withheld_from_every_public_run_surface()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run = recorded_supervised_fixture(true).await?;
+        let public = serde_json::to_string(&run)?;
+        assert_eq!(run.state, AntigravityRunState::Failed);
+        assert_eq!(run.stdout_excerpt, WITHHELD_UNSTRUCTURED_PROVIDER_OUTPUT);
+        assert!(run.redaction_receipt.redacted);
+        assert!(
+            run.redaction_receipt
+                .redacted_markers
+                .contains(&"unstructured_provider_output".to_owned())
+        );
+        for forbidden in [
+            "MALFORMED_PROVIDER_BENIGN_SENTINEL",
+            "Z:/workspace/internal.rs",
+            "\"status\":\"ERROR\"",
+        ] {
+            assert!(!public.contains(forbidden));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normalized_candidate_detail_never_publishes_sensitive_provider_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = antigravity_review_request(
+            "eliot-governor",
+            "redacted-normalization",
+            AntigravityReviewMode::AuditPlan,
+            "inspect",
+        );
+        let sentinel = "must-not-reach-public-report";
+        let response = format!("safe finding\nsecret={sentinel}\nfinal safe line");
+        let normalized = AntigravityTextOutputNormalizer.normalize_text(&request, &response);
+        let serialized = serde_json::to_string(&normalized)?;
+        assert!(!serialized.contains(sentinel));
+        assert!(serialized.contains(REDACTED_PROVIDER_LINE));
         Ok(())
     }
 }

@@ -988,7 +988,7 @@ async fn prepare_auditor_scope(
 }
 
 fn external_auditor_capability_scope() -> Vec<String> {
-    let mut capability_scope = crate::mcp_stdio::PART_E_WORKER_TOOLS
+    let mut capability_scope = crate::mcp_stdio::EXTERNAL_AUDITOR_TOOLS
         .iter()
         .copied()
         .map(str::to_owned)

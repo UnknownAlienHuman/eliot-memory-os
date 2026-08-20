@@ -408,29 +408,33 @@ pub fn run_antigravity_mcp_register(config_path: &Path, admin_confirm: bool) -> 
     let home = antigravity_home()?;
     let project_root = project_root_from_config(config_path).canonicalize()?;
     let executable = release_eliot_executable(config_path)?;
-    let receipt =
-        AntigravityMcpConfigService.register_gui_for_project(&home, &executable, &project_root)?;
+    let receipts =
+        AntigravityMcpConfigService.register_home_for_project(&home, &executable, &project_root)?;
     let statuses = AntigravityMcpConfigService.status(&home);
     let gui_registered = statuses.iter().any(|status| {
         status.surface == eliot_types::AntigravityMcpConfigSurface::Gui && status.registered
     });
+    let cli_registered = statuses.iter().any(|status| {
+        status.surface == eliot_types::AntigravityMcpConfigSurface::Cli && status.registered
+    });
     let report = serde_json::json!({
         "component": "antigravity_mcp_registration",
-        "receipt": receipt,
+        "receipts": receipts,
         "configs": statuses,
         "gui_registered": gui_registered,
+        "cli_registered": cli_registered,
         "registered_at": time::OffsetDateTime::now_utc()
     });
     write_antigravity_report_pair(
         &root,
         "antigravity-mcp-registration",
         "Antigravity MCP Registration",
-        &receipt,
+        &receipts,
     )?;
     write_antigravity_report_pair(&root, "antigravity-mcp", "Antigravity MCP Status", &report)?;
-    if !gui_registered {
+    if !gui_registered || !cli_registered {
         write_json(&report)?;
-        bail!("Antigravity HOME MCP registration did not validate");
+        bail!("Antigravity GUI and CLI HOME MCP registrations did not both validate");
     }
     write_json(&report)
 }
@@ -701,6 +705,16 @@ pub async fn run_antigravity_live_smoke(config_path: &Path, mode: &str) -> Resul
     let root = runtime_root(config_path);
     let project_root = project_root_from_config(config_path).canonicalize()?;
     let mode = parse_antigravity_live_smoke_mode(mode)?;
+    let governor = std::env::current_exe()
+        .context("resolve Eliot Governor executable for Antigravity runtime bootstrap")?;
+    crate::runtime_bootstrap::ensure_default_daemon_ready(
+        config_path,
+        &governor,
+        crate::named_pipe_ipc::IPC_PROTOCOL_VERSION,
+        "antigravity_live_smoke",
+    )
+    .await
+    .context("ensure the matching Eliot daemon is ready before Antigravity live smoke")?;
     let provider_runtime = crate::host_runtime::ProviderRuntime::production(config_path)?;
     let runner = provider_runtime.runner();
     let resolution =
@@ -804,6 +818,7 @@ pub async fn run_antigravity_live_smoke(config_path: &Path, mode: &str) -> Resul
                 &contract,
                 &worktree_lease,
                 &worktree_path,
+                &root,
                 runner.as_ref(),
             )
             .await

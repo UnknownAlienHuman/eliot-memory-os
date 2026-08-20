@@ -13,11 +13,11 @@ use eliot_types::{
     AgentId, AgentRole, AgentSessionId, AntigravityBinaryCandidateSource,
     AntigravityBinaryResolution, AntigravityBinaryResolutionStatus, AntigravityEnablementScope,
     AntigravityEnablementState, AntigravityExecutionGateDecisionKind, AntigravityLiveSmokeMode,
-    AntigravityLiveSmokeStatus, AntigravityMcpConfigSurface, AntigravityReviewMode,
-    AntigravityRunState, AntigravityVersionGateStatus, AuthorityProfile, CandidateDiffStatus,
-    ProjectId, RiskTier, TaintClass, TaskId, WorkItemId, WorkLease, WorkLeaseDecision,
-    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState, WorkScope,
-    WorktreeLease, WorktreeLeaseId, WorktreeLeaseState,
+    AntigravityLiveSmokeStatus, AntigravityMcpConfigSurface, AntigravityResponseProtocolReceipt,
+    AntigravityReviewMode, AntigravityRunState, AntigravityVersionGateStatus, AuthorityProfile,
+    CandidateDiffStatus, ProjectId, RiskTier, TaintClass, TaskId, WorkItemId, WorkLease,
+    WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
+    WorkScope, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -27,7 +27,7 @@ use time::{Duration, OffsetDateTime};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const HELP: &str = "Usage: agy --print --prompt <PROMPT> --print-timeout <DURATION> --log-file <PATH> --sandbox <MODE> --add-dir <PATH>";
+const HELP: &str = "Usage: agy --print --prompt <PROMPT> --print-timeout <DURATION> --log-file <PATH> --sandbox <MODE> --disable-slash-commands --output-format <text|json> --model <MODEL> --effort <low|medium|high> --add-dir <PATH>";
 
 #[test]
 fn version_gate_requires_1_1_1() {
@@ -153,6 +153,9 @@ fn minimal_windows_environment_preserves_home_and_drops_secrets() {
 }
 
 #[test]
+// This integration fixture keeps both config documents and their backup/readback
+// assertions together so the atomic merge contract remains visible end to end.
+#[allow(clippy::too_many_lines)]
 fn mcp_config_merge_backs_up_both_home_configs_and_preserves_unknown_data() -> TestResult {
     let root = TempRoot::new("mcp-config")?;
     let home = root.path.join("home");
@@ -193,6 +196,8 @@ fn mcp_config_merge_backs_up_both_home_configs_and_preserves_unknown_data() -> T
                     "stdio",
                     "--host",
                     "antigravity",
+                    "--profile",
+                    "external_auditor",
                     "--instance",
                     "default",
                 ]
@@ -241,6 +246,8 @@ fn mcp_config_merge_backs_up_both_home_configs_and_preserves_unknown_data() -> T
             "stdio",
             "--host",
             "antigravity",
+            "--profile",
+            "external_auditor",
             "--instance",
             "default"
         ]))
@@ -684,6 +691,12 @@ fn smoke_result_requires_marker_and_preserves_external_candidate_taint() -> Test
     run.state = AntigravityRunState::Succeeded;
     run.dry_run = false;
     run.stdout_excerpt = output.clone();
+    run.response_protocol_receipt = AntigravityResponseProtocolReceipt {
+        structured_single_turn: true,
+        expected_smoke_marker_seen: true,
+        mcp_call_marker_seen: true,
+        candidate_final_line_exact: true,
+    };
     run.normalized_result = Some(AntigravityTextOutputNormalizer.normalize_text(&request, &output));
     let smoke = AntigravityLiveSmokeService.build_request(
         request.project_id,

@@ -288,6 +288,17 @@ pub fn record_execution_terminal(
         _ => return Ok(()),
     };
     let campaign = campaign_mut(&mut state, campaign_id)?;
+    if matches!(
+        reservation.state,
+        ProviderCallReservationState::Completed
+            | ProviderCallReservationState::Failed
+            | ProviderCallReservationState::UnknownOutcome
+    ) {
+        // A campaign reserves at most one provider call.  Persisting the
+        // consumed marker as a set-to-one operation makes terminal replay
+        // idempotent while preserving any pre-existing integrity overflow.
+        campaign.observed_provider_calls = campaign.observed_provider_calls.max(1);
+    }
     if !DelegationCalibrationCampaignService::is_terminal(campaign.state) && campaign.state != next
     {
         transition(campaign, next, Some(reservation.reservation_id.clone()))?;
@@ -604,6 +615,54 @@ mod tests {
         }
     }
 
+    fn prepare_dispatched_reservation(
+        fixture: &Fixture,
+    ) -> Result<(
+        ProviderReviewPreRegistration,
+        ProviderCallReservationOwner,
+        ProviderCallReservation,
+    )> {
+        let preregistration = seal_or_reuse_preregistration(
+            &fixture.root,
+            &fixture.campaign_id,
+            fixture.project_id,
+            fixture.task_id,
+            "question",
+            &[],
+            None,
+        )?;
+        let owner = ProviderCallReservationOwner::new(&fixture.root);
+        owner.open_campaign(ProviderCallCampaignRequest {
+            campaign_id: fixture.campaign_id.clone(),
+            max_calls: 1,
+            closed: false,
+        })?;
+        let reservation = match owner.reserve(ProviderCallReservationRequest {
+            campaign_id: fixture.campaign_id.clone(),
+            task_id: fixture.task_id,
+            provider: PROVIDER.to_owned(),
+            idempotency_key: preregistration.idempotency_key.clone(),
+            gate_decision_ref: "gate:test".to_owned(),
+        })? {
+            ProviderCallReservationDecision::Reserved(reservation) => reservation,
+            other => panic!("expected first reservation, got {other:?}"),
+        };
+        record_reservation(
+            &fixture.root,
+            &fixture.campaign_id,
+            &preregistration.preregistration_id,
+            &reservation,
+        )?;
+        let dispatching = owner.mark_dispatching(&reservation.reservation_id)?;
+        record_dispatching(
+            &fixture.root,
+            &fixture.campaign_id,
+            &dispatching.reservation_id,
+        )?;
+        let dispatched = owner.mark_dispatched(&reservation.reservation_id, "agy:invocation")?;
+        Ok((preregistration, owner, dispatched))
+    }
+
     #[test]
     fn seal_is_idempotent_and_does_not_persist_raw_execution_token() -> Result<()> {
         let fixture = Fixture::new()?;
@@ -839,6 +898,69 @@ mod tests {
         assert!(ledger.reservations[0].external_invocation_ref.is_none());
         assert!(!ledger.reservations[0].consumes_budget);
         assert_eq!(ledger.budgets[0].remaining_calls, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_terminal_counts_one_provider_call_and_replay_is_idempotent() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (preregistration, owner, dispatched) = prepare_dispatched_reservation(&fixture)?;
+        let failed = owner.fail_after_dispatch(&dispatched.reservation_id, "provider failed")?;
+
+        record_execution_terminal(
+            &fixture.root,
+            &fixture.campaign_id,
+            &preregistration.preregistration_id,
+            &failed,
+        )?;
+        record_execution_terminal(
+            &fixture.root,
+            &fixture.campaign_id,
+            &preregistration.preregistration_id,
+            &failed,
+        )?;
+
+        let state = calibration_runtime::load_state(&fixture.root)?;
+        let campaign = &state.campaigns[0];
+        assert_eq!(
+            campaign.state,
+            DelegationCalibrationCampaignState::FailedProvider
+        );
+        assert_eq!(campaign.observed_provider_calls, 1);
+        assert_eq!(campaign.transition_history.len(), 3);
+        assert_eq!(owner.snapshot()?.budgets[0].terminal_slots, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_terminal_counts_one_provider_call_and_replay_is_idempotent() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (preregistration, owner, dispatched) = prepare_dispatched_reservation(&fixture)?;
+        let unknown =
+            owner.mark_unknown_outcome(&dispatched.reservation_id, "provider uncertain")?;
+
+        record_execution_terminal(
+            &fixture.root,
+            &fixture.campaign_id,
+            &preregistration.preregistration_id,
+            &unknown,
+        )?;
+        record_execution_terminal(
+            &fixture.root,
+            &fixture.campaign_id,
+            &preregistration.preregistration_id,
+            &unknown,
+        )?;
+
+        let state = calibration_runtime::load_state(&fixture.root)?;
+        let campaign = &state.campaigns[0];
+        assert_eq!(
+            campaign.state,
+            DelegationCalibrationCampaignState::UnknownOutcome
+        );
+        assert_eq!(campaign.observed_provider_calls, 1);
+        assert_eq!(campaign.transition_history.len(), 3);
+        assert_eq!(owner.snapshot()?.budgets[0].terminal_slots, 1);
         Ok(())
     }
 

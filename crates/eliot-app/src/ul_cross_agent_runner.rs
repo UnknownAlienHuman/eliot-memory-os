@@ -1246,13 +1246,17 @@ fn scoped_mcp_preflight(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let expected_tools = crate::mcp_stdio::PART_E_WORKER_TOOLS
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    let expected_tools = if host == AgentHostId::Antigravity {
+        crate::mcp_stdio::EXTERNAL_AUDITOR_TOOLS
+    } else {
+        crate::mcp_stdio::PART_E_WORKER_TOOLS
+    }
+    .iter()
+    .copied()
+    .collect::<BTreeSet<_>>();
     if actual_tools != expected_tools || tool_names.len() != expected_tools.len() {
         bail!(
-            "{} scoped MCP tool list is not the exact duplicate-free Part-E surface",
+            "{} scoped MCP tool list is not the exact duplicate-free bounded surface",
             host.as_str()
         );
     }

@@ -5663,6 +5663,11 @@ pub struct InstallationServiceBootstrap {
     pub installation_id: PlatformHandle,
     /// Authority generation bound to this candidate launch.
     pub plan_generation: u64,
+    /// Exact per-installation Host state root consumed by Host and Watchdog.
+    ///
+    /// This is carried in the SCM command line; consumers must not infer it
+    /// from `ProgramData`, the current directory, or an ambient environment.
+    pub host_state_root: PlatformHandle,
 }
 
 impl InstallationServiceBootstrap {
@@ -5673,6 +5678,7 @@ impl InstallationServiceBootstrap {
             "service_bootstrap.descriptor_digest",
         )?;
         handle(&self.installation_id, "service_bootstrap.installation_id")?;
+        approved_path(&self.host_state_root, "service_bootstrap.host_state_root")?;
         if self.plan_generation == 0 {
             return Err(InstallationError::InvalidField {
                 field: "service_bootstrap.plan_generation".to_owned(),
@@ -6086,6 +6092,16 @@ impl WindowsInstallationEffectPort {
             .registration_nonce
             .as_ref()
             .ok_or(PortError::InvalidRequestMetadata)?;
+        let expected_host_state_root =
+            joined_windows_path(request.installation_root.as_str(), "host");
+        if !same_windows_root(
+            bootstrap.host_state_root.as_str(),
+            &expected_host_state_root,
+        )
+        .map_err(|_| PortError::InvalidRequestMetadata)?
+        {
+            return Err(PortError::InvalidRequestMetadata);
+        }
         // `effect_request` has already validated the transaction-bound
         // installation root before this sealed port is reached. Host and its
         // sibling Watchdog must select the same fixed Host-state child; neither
@@ -6098,7 +6114,7 @@ impl WindowsInstallationEffectPort {
             bootstrap.plan_generation,
             Vec::<String>::new(),
         )
-        .and_then(|value| value.with_host_state_root(installation_root.join("host")))
+        .and_then(|value| value.with_host_state_root(Path::new(bootstrap.host_state_root.as_str())))
         .and_then(|value| value.with_registration_nonce(nonce.as_str()))
         .map_err(|_| PortError::InvalidRequestMetadata)?;
         let mut registration = ServiceRegistrationRequest::with_bootstrap(
@@ -8813,6 +8829,12 @@ fn effect_request(
                 .runtime_launch
                 .authority_generation
                 .value(),
+            host_state_root: transaction
+                .candidate_manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root
+                .clone(),
         }),
         registration_nonce: progress.registration_nonce.clone(),
     };
@@ -9816,6 +9838,7 @@ mod tests {
                     descriptor_digest: test_handle("b".repeat(64)),
                     installation_id: test_handle("installation:service"),
                     plan_generation: 7,
+                    host_state_root: test_handle(root.join("host").to_string_lossy().into_owned()),
                 }),
                 registration_nonce: Some(test_handle("c".repeat(64))),
             };

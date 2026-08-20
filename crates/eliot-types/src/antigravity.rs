@@ -453,6 +453,10 @@ pub struct AntigravityCapabilities {
     pub conversation: bool,
     pub json_output: bool,
     pub model_cli_arg: bool,
+    #[serde(default)]
+    pub effort_cli_arg: bool,
+    #[serde(default)]
+    pub disable_slash_commands: bool,
     pub dangerously_skip_permissions_seen: bool,
     pub text_output_supported: bool,
 }
@@ -470,6 +474,8 @@ impl Default for AntigravityCapabilities {
             conversation: false,
             json_output: false,
             model_cli_arg: false,
+            effort_cli_arg: false,
+            disable_slash_commands: false,
             dangerously_skip_permissions_seen: false,
             text_output_supported: true,
         }
@@ -532,6 +538,7 @@ pub enum AntigravityStdinMode {
 #[serde(rename_all = "snake_case")]
 pub enum AntigravityOutputMode {
     Text,
+    Json,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -592,6 +599,10 @@ pub struct AntigravityCommandContract {
     pub dangerous_flags_forbidden: bool,
     pub json_output_required: bool,
     pub model_cli_arg_supported: bool,
+    #[serde(default)]
+    pub selected_model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub model_selection_message: String,
     pub limitations: Vec<String>,
     #[serde(with = "time::serde::rfc3339")]
@@ -659,6 +670,39 @@ pub struct AntigravitySafetyReceipt {
     pub effective_cwd: PathRef,
     pub env_fixed_vars: Vec<(String, String)>,
     pub env_dropped_names: Vec<String>,
+    /// Exact model selection observed in the authenticated CLI runtime log.
+    ///
+    /// `None` means the process was not accepted as model-bound. The typed argv
+    /// alone is only request authority and must not populate this receipt.
+    #[serde(default)]
+    pub model_observation: Option<AntigravityModelObservation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AntigravityModelObservation {
+    pub requested_model: String,
+    pub observed_model: String,
+    pub authority: AntigravityModelObservationAuthority,
+    pub authenticated_runtime: bool,
+    pub backend_propagation_observed: bool,
+    pub stream_started_after_selection: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AntigravityModelObservationAuthority {
+    CliAuthenticatedRuntimeLog,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+// These four independent booleans are the stable serialized proof surface for
+// the smoke protocol; collapsing them would obscure which exact check failed.
+#[allow(clippy::struct_excessive_bools)]
+pub struct AntigravityResponseProtocolReceipt {
+    pub structured_single_turn: bool,
+    pub expected_smoke_marker_seen: bool,
+    pub mcp_call_marker_seen: bool,
+    pub candidate_final_line_exact: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -678,6 +722,10 @@ pub struct AntigravityRun {
     pub stderr_excerpt: String,
     pub safety_receipt: AntigravitySafetyReceipt,
     pub redaction_receipt: AntigravityOutputRedactionReceipt,
+    /// Safe marker facts derived from the internal parsed response before raw
+    /// provider text is confined to the protected spool.
+    #[serde(default)]
+    pub response_protocol_receipt: AntigravityResponseProtocolReceipt,
     pub normalized_result: Option<AntigravityNormalizedResult>,
     pub message: String,
     #[serde(with = "time::serde::rfc3339")]

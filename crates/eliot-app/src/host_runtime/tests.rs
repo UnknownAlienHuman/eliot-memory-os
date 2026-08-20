@@ -1103,10 +1103,13 @@ fn external_adapter_uses_deterministic_canonical_agent_result_contract() -> anyh
 }
 
 #[test]
-fn external_auditor_role_adds_broker_capabilities_without_changing_mcp_tools() {
+fn external_auditor_role_adds_broker_capabilities_to_read_only_mcp_tools() {
     let scope = super::external_auditor_capability_scope();
-    assert_eq!(scope.len(), crate::mcp_stdio::PART_E_WORKER_TOOLS.len() + 2);
-    for tool in crate::mcp_stdio::PART_E_WORKER_TOOLS {
+    assert_eq!(
+        scope.len(),
+        crate::mcp_stdio::EXTERNAL_AUDITOR_TOOLS.len() + 2
+    );
+    for tool in crate::mcp_stdio::EXTERNAL_AUDITOR_TOOLS {
         assert_eq!(
             scope.iter().filter(|capability| capability == tool).count(),
             1
