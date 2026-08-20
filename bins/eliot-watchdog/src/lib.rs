@@ -25,10 +25,9 @@ use eliot_installation::{
 };
 use eliot_platform_windows::{
     NamedPipePeerProcessBinding, ProcessIdentity, ProtectedPathLease, ProtectedRootLease,
-    ProtectedRuntimePathLease, ServiceBootstrapArguments, ServiceRegistrationInspection,
-    ServiceRegistrationRequest, WindowsAdapterError, WindowsPlatform,
-    observe_running_eliot_host_process, protected_program_data_root,
-    require_protected_program_data_path, windows_paths_equal,
+    ProtectedRuntimePathLease, ServiceBootstrapArguments, ServiceRegistrationRequest,
+    ServiceRegistrationRuntimeInspection, WindowsAdapterError, WindowsPlatform,
+    protected_program_data_root, require_protected_program_data_path, windows_paths_equal,
 };
 use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
@@ -66,8 +65,8 @@ pub enum WatchdogScmLaunchError {
     Platform(#[from] WindowsAdapterError),
     #[error("Watchdog SCM platform root: {0}")]
     PlatformRoot(String),
-    #[error("Watchdog SCM registration is not an exact read-only match: {0:?}")]
-    Registration(ServiceRegistrationInspection),
+    #[error("Watchdog SCM registration is not an exact read-only runtime match: {0:?}")]
+    Registration(WatchdogRuntimeReadback),
     #[error("Watchdog SCM installer approval is unavailable or invalid")]
     ApprovalUnavailable,
     #[error("Watchdog SCM bootstrap does not match the installer-approved registration")]
@@ -81,7 +80,7 @@ pub enum WatchdogScmLaunchError {
 pub struct ValidatedWatchdogScmLaunch {
     bootstrap: ServiceBootstrapArguments,
     registration: ServiceRegistrationRequest,
-    inspection: ServiceRegistrationInspection,
+    inspection: WatchdogRuntimeReadback,
 }
 
 impl ValidatedWatchdogScmLaunch {
@@ -96,7 +95,7 @@ impl ValidatedWatchdogScmLaunch {
     }
 
     #[must_use]
-    pub fn inspection(&self) -> &ServiceRegistrationInspection {
+    pub fn inspection(&self) -> &WatchdogRuntimeReadback {
         &self.inspection
     }
 }
@@ -329,8 +328,13 @@ pub fn validate_watchdog_scm_bootstrap(
     })?;
     let platform = WindowsPlatform::new(root.to_path_buf())
         .map_err(|error| WatchdogScmLaunchError::PlatformRoot(error.to_string()))?;
-    let inspection = platform.inspect_service_registration(&registration);
-    if !matches!(inspection, ServiceRegistrationInspection::Matching { .. }) {
+    let inspection = project_service_runtime_inspection(
+        platform.inspect_service_registration_runtime(&registration),
+    );
+    if matches!(
+        inspection,
+        WatchdogRuntimeReadback::Absent | WatchdogRuntimeReadback::Mismatched
+    ) {
         return Err(WatchdogScmLaunchError::Registration(inspection));
     }
     Ok(ValidatedWatchdogScmLaunch {
@@ -1223,6 +1227,247 @@ pub enum HostObservationState {
     Unknown,
 }
 
+/// Provider-neutral lifecycle state projected from one Windows SCM runtime
+/// observation. The projection keeps the Watchdog composition independent of
+/// the lower-level `eliot-platform` crate while preserving every state needed
+/// by bounded self-admission and Host liveness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchdogRuntimeState {
+    Absent,
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Unknown,
+}
+
+/// One atomic read-only SCM registration/runtime readback. The `Matching`
+/// variant already contains the configuration, lifecycle state, and
+/// handle-bound process identity from one platform query; callers must not
+/// reconstruct a second status/PID observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WatchdogRuntimeReadback {
+    Matching {
+        state: WatchdogRuntimeState,
+        process: Option<ProcessIdentity>,
+        checkpoint: u32,
+        wait_hint_ms: u32,
+    },
+    Absent,
+    Mismatched,
+    Unknown,
+}
+
+/// Projects the Windows runtime seam into the small state surface used by
+/// Watchdog. The Windows adapter has already checked the complete service
+/// configuration and, when required by the service state, captured process
+/// PID, creation time, and image path through a live process handle.
+#[must_use]
+pub fn project_service_runtime_inspection(
+    inspection: ServiceRegistrationRuntimeInspection,
+) -> WatchdogRuntimeReadback {
+    match inspection {
+        ServiceRegistrationRuntimeInspection::Matching { observation } => {
+            let state = if observation.is_starting() {
+                WatchdogRuntimeState::Starting
+            } else if observation.is_running() {
+                WatchdogRuntimeState::Running
+            } else if observation.is_stopping() {
+                WatchdogRuntimeState::Stopping
+            } else if observation.is_stopped() {
+                WatchdogRuntimeState::Stopped
+            } else {
+                WatchdogRuntimeState::Unknown
+            };
+            WatchdogRuntimeReadback::Matching {
+                state,
+                process: observation.process().cloned(),
+                checkpoint: observation.checkpoint(),
+                wait_hint_ms: observation.wait_hint_ms(),
+            }
+        }
+        ServiceRegistrationRuntimeInspection::Absent => WatchdogRuntimeReadback::Absent,
+        ServiceRegistrationRuntimeInspection::Mismatched => WatchdogRuntimeReadback::Mismatched,
+        ServiceRegistrationRuntimeInspection::Unknown => WatchdogRuntimeReadback::Unknown,
+    }
+}
+
+/// Fixed maximum interval in which the Watchdog may remain in
+/// `SERVICE_START_PENDING` while it reconciles its own SCM runtime identity.
+pub const WATCHDOG_SELF_ADMISSION_DEADLINE_MS: u64 = 30_000;
+const SELF_ADMISSION_MIN_POLL_MS: u32 = 25;
+const SELF_ADMISSION_MAX_POLL_MS: u32 = 250;
+const SELF_ADMISSION_DEFAULT_WAIT_HINT_MS: u32 = 250;
+
+/// Fail-closed outcomes for the bounded Watchdog self-admission gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum WatchdogSelfAdmissionError {
+    #[error("current Watchdog process identity is unavailable")]
+    CurrentProcessUnavailable,
+    #[error("Watchdog SCM registration is absent during self-admission")]
+    RegistrationAbsent,
+    #[error("Watchdog SCM registration or process identity mismatched during self-admission")]
+    RegistrationMismatched,
+    #[error("Watchdog SCM service stopped before self-admission")]
+    ServiceStopped,
+    #[error("Watchdog SCM service is stopping during self-admission")]
+    ServiceStopping,
+    #[error("Watchdog SCM self-admission timed out after the bounded deadline")]
+    Timeout,
+}
+
+/// Injectable read-only mechanics used by the bounded self-admission loop.
+/// Production supplies the Windows SCM runtime inspection and a monotonic
+/// clock; tests supply a deterministic sequence without sleeping 30 seconds.
+pub trait WatchdogSelfAdmissionProbe {
+    fn now_ms(&mut self) -> u64;
+    fn current_process_identity(&mut self) -> Option<ProcessIdentity>;
+    fn inspect(&mut self) -> WatchdogRuntimeReadback;
+    fn sleep_ms(&mut self, milliseconds: u32);
+}
+
+/// Injectable SCM status publisher for the self-admission loop. It is limited
+/// to progress updates while the service is already `START_PENDING`; it has
+/// no start/stop or registration mutation capability.
+pub trait WatchdogSelfAdmissionStatus {
+    fn report_start_pending(&mut self, checkpoint: u32, wait_hint_ms: u32);
+}
+
+/// Performs the production bounded self-admission with the fixed 30-second
+/// deadline required by the Runtime Live service contract.
+///
+/// # Errors
+///
+/// Returns a fail-closed error when the current process identity cannot be
+/// observed, the SCM registration is absent/mismatched/stopped, or the
+/// bounded deadline expires before an exact `Starting`/`Running` match.
+pub fn admit_watchdog_self_start<P, S>(
+    probe: &mut P,
+    status: &mut S,
+) -> Result<ProcessIdentity, WatchdogSelfAdmissionError>
+where
+    P: WatchdogSelfAdmissionProbe,
+    S: WatchdogSelfAdmissionStatus,
+{
+    admit_watchdog_self_start_with_deadline(probe, status, WATCHDOG_SELF_ADMISSION_DEADLINE_MS)
+}
+
+/// Testable form of [`admit_watchdog_self_start`] with a bounded injected
+/// deadline. The production entry point always uses the fixed 30-second
+/// value above; this form exists only to make timeout and transient-unknown
+/// behavior deterministic in unit tests.
+///
+/// # Errors
+///
+/// Returns a fail-closed error when the current process identity cannot be
+/// observed, the SCM registration is absent/mismatched/stopped, or the
+/// injected deadline expires before an exact `Starting`/`Running` match.
+pub fn admit_watchdog_self_start_with_deadline<P, S>(
+    probe: &mut P,
+    status: &mut S,
+    deadline_ms: u64,
+) -> Result<ProcessIdentity, WatchdogSelfAdmissionError>
+where
+    P: WatchdogSelfAdmissionProbe,
+    S: WatchdogSelfAdmissionStatus,
+{
+    let expected = probe
+        .current_process_identity()
+        .ok_or(WatchdogSelfAdmissionError::CurrentProcessUnavailable)?;
+    let started_at = probe.now_ms();
+    let deadline = started_at.saturating_add(deadline_ms);
+    let mut checkpoint = 1u32;
+
+    loop {
+        let now = probe.now_ms();
+        if now >= deadline {
+            return Err(WatchdogSelfAdmissionError::Timeout);
+        }
+        let observation = probe.inspect();
+        let wait_hint_ms = match observation {
+            WatchdogRuntimeReadback::Matching {
+                state: WatchdogRuntimeState::Starting | WatchdogRuntimeState::Running,
+                process: Some(ref actual),
+                ..
+            } if same_process_identity(actual, &expected) => {
+                if probe.now_ms() >= deadline {
+                    return Err(WatchdogSelfAdmissionError::Timeout);
+                }
+                return Ok(actual.clone());
+            }
+            WatchdogRuntimeReadback::Matching {
+                state: WatchdogRuntimeState::Starting | WatchdogRuntimeState::Running,
+                process: Some(_),
+                ..
+            }
+            | WatchdogRuntimeReadback::Mismatched => {
+                return Err(WatchdogSelfAdmissionError::RegistrationMismatched);
+            }
+            WatchdogRuntimeReadback::Matching {
+                state: WatchdogRuntimeState::Stopped,
+                ..
+            } => return Err(WatchdogSelfAdmissionError::ServiceStopped),
+            WatchdogRuntimeReadback::Matching {
+                state: WatchdogRuntimeState::Stopping,
+                ..
+            } => return Err(WatchdogSelfAdmissionError::ServiceStopping),
+            WatchdogRuntimeReadback::Matching {
+                state: WatchdogRuntimeState::Absent,
+                ..
+            } => return Err(WatchdogSelfAdmissionError::RegistrationAbsent),
+            WatchdogRuntimeReadback::Absent => {
+                return Err(WatchdogSelfAdmissionError::RegistrationAbsent);
+            }
+            WatchdogRuntimeReadback::Matching {
+                state: WatchdogRuntimeState::Starting | WatchdogRuntimeState::Running,
+                process: None,
+                wait_hint_ms,
+                ..
+            }
+            | WatchdogRuntimeReadback::Matching {
+                state: WatchdogRuntimeState::Unknown,
+                wait_hint_ms,
+                ..
+            } => wait_hint_ms,
+            WatchdogRuntimeReadback::Unknown => 0,
+        };
+
+        let wait_hint_ms = bounded_wait_hint_ms(wait_hint_ms);
+        let remaining_ms = deadline.saturating_sub(probe.now_ms());
+        if remaining_ms == 0 {
+            return Err(WatchdogSelfAdmissionError::Timeout);
+        }
+        let status_wait_hint_ms = wait_hint_ms.min(u32::try_from(remaining_ms).unwrap_or(u32::MAX));
+        checkpoint = checkpoint.saturating_add(1);
+        status.report_start_pending(checkpoint, status_wait_hint_ms);
+        let poll_ms = u64::from(bounded_poll_ms(wait_hint_ms)).min(remaining_ms);
+        probe.sleep_ms(u32::try_from(poll_ms).unwrap_or(u32::MAX));
+    }
+}
+
+fn bounded_wait_hint_ms(wait_hint_ms: u32) -> u32 {
+    if wait_hint_ms == 0 {
+        SELF_ADMISSION_DEFAULT_WAIT_HINT_MS
+    } else {
+        wait_hint_ms.clamp(SELF_ADMISSION_MIN_POLL_MS, 1_000)
+    }
+}
+
+fn bounded_poll_ms(wait_hint_ms: u32) -> u32 {
+    wait_hint_ms
+        .saturating_div(4)
+        .clamp(SELF_ADMISSION_MIN_POLL_MS, SELF_ADMISSION_MAX_POLL_MS)
+}
+
+fn same_process_identity(observed: &ProcessIdentity, expected: &ProcessIdentity) -> bool {
+    observed.process_id == expected.process_id
+        && observed.start_time_100ns == expected.start_time_100ns
+        && windows_paths_equal(
+            Path::new(&observed.image_path),
+            Path::new(&expected.image_path),
+        )
+}
+
 /// Retains the last trusted Host process identity and compares every later
 /// platform observation against PID, creation time, and image path.
 #[derive(Debug)]
@@ -1290,21 +1535,11 @@ impl HostIdentityMonitor {
     }
 
     /// Observes the canonical `EliotHost` service through the existing Windows
-    /// platform primitive and classifies all non-authoritative outcomes.
+    /// runtime readback primitive and classifies all non-authoritative
+    /// outcomes. Configuration and process identity are read atomically from
+    /// one SCM query; a second status/PID query is deliberately not used.
     #[must_use]
     pub fn observe(&mut self) -> HostObservation {
-        if self.require_registration_readback {
-            let registration_ok = self
-                .expected_registration
-                .as_ref()
-                .is_some_and(|registration| inspect_host_registration(registration).is_ok());
-            if !registration_ok {
-                return HostObservation {
-                    state: HostObservationState::Unknown,
-                    identity: None,
-                };
-            }
-        }
         if self.require_image_lease
             && self.expected_image_lease.is_none()
             && let Some(expected_image) = self.expected_image.as_deref()
@@ -1323,10 +1558,48 @@ impl HostIdentityMonitor {
                 identity: None,
             };
         }
-        match observe_running_eliot_host_process() {
-            Ok(binding) => self.observe_identity(&binding),
-            Err(error) => HostObservation {
-                state: classify_host_error(error),
+        if self.require_registration_readback {
+            let runtime = self.expected_registration.as_ref().map_or(
+                WatchdogRuntimeReadback::Unknown,
+                read_host_registration_runtime,
+            );
+            return self.observe_runtime_readback(runtime);
+        }
+        HostObservation {
+            state: HostObservationState::Unknown,
+            identity: None,
+        }
+    }
+
+    #[must_use]
+    fn observe_runtime_readback(&mut self, runtime: WatchdogRuntimeReadback) -> HostObservation {
+        match runtime {
+            WatchdogRuntimeReadback::Matching {
+                state: WatchdogRuntimeState::Running,
+                process: Some(process),
+                ..
+            } => self.observe_process_identity(process),
+            WatchdogRuntimeReadback::Matching {
+                state:
+                    WatchdogRuntimeState::Stopped
+                    | WatchdogRuntimeState::Starting
+                    | WatchdogRuntimeState::Stopping,
+                ..
+            }
+            | WatchdogRuntimeReadback::Absent => HostObservation {
+                state: HostObservationState::AbsentOrStopped,
+                identity: None,
+            },
+            WatchdogRuntimeReadback::Matching {
+                state:
+                    WatchdogRuntimeState::Absent
+                    | WatchdogRuntimeState::Running
+                    | WatchdogRuntimeState::Unknown,
+                ..
+            }
+            | WatchdogRuntimeReadback::Mismatched
+            | WatchdogRuntimeReadback::Unknown => HostObservation {
+                state: HostObservationState::Unknown,
                 identity: None,
             },
         }
@@ -1382,6 +1655,7 @@ impl HostIdentityMonitor {
     }
 }
 
+#[cfg(test)]
 #[must_use]
 fn classify_host_error(error: WindowsAdapterError) -> HostObservationState {
     match error {
@@ -2464,20 +2738,23 @@ pub fn inspect_approved_host_registration(
 }
 
 fn inspect_host_registration(approved: &ApprovedHostRegistration) -> Result<(), SpoolError> {
-    let registration = &approved.request;
-    let root = registration.binary_path().parent().ok_or_else(|| {
-        SpoolError::InvalidLease("approved Host image has no generation root".to_owned())
-    })?;
-    let platform = WindowsPlatform::new(root.to_path_buf())
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    let inspection = platform.inspect_service_registration(registration);
-    if matches!(inspection, ServiceRegistrationInspection::Matching { .. }) {
-        Ok(())
-    } else {
-        Err(SpoolError::InvalidLease(format!(
-            "approved Host SCM registration is not an exact read-only match: {inspection:?}"
-        )))
+    match read_host_registration_runtime(approved) {
+        WatchdogRuntimeReadback::Matching { .. } => Ok(()),
+        other => Err(SpoolError::InvalidLease(format!(
+            "approved Host SCM registration is not an exact read-only runtime match: {other:?}"
+        ))),
     }
+}
+
+fn read_host_registration_runtime(approved: &ApprovedHostRegistration) -> WatchdogRuntimeReadback {
+    let registration = &approved.request;
+    let Some(root) = registration.binary_path().parent() else {
+        return WatchdogRuntimeReadback::Unknown;
+    };
+    let Ok(platform) = WindowsPlatform::new(root.to_path_buf()) else {
+        return WatchdogRuntimeReadback::Unknown;
+    };
+    project_service_runtime_inspection(platform.inspect_service_registration_runtime(registration))
 }
 
 fn validate_runtime_binding(
@@ -2651,6 +2928,7 @@ fn is_sha256_hex(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 
     static FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -3393,7 +3671,12 @@ mod tests {
         let source = include_str!("main.rs");
         let library = include_str!("lib.rs");
         let default_surface = ["LiveHostObservationSource", "::", "default"].concat();
+        let removed_observer = ["observe_running_", "eliot_host_process"].concat();
+        let removed_config_probe = ["inspect_service_registration", "(registration)"].concat();
         assert!(!library.contains(&default_surface));
+        assert!(library.contains("inspect_service_registration_runtime"));
+        assert!(!library.contains(&removed_observer));
+        assert!(!library.contains(&removed_config_probe));
         for forbidden in [
             "register_service(",
             "update_service_registration(",
@@ -3467,6 +3750,255 @@ mod tests {
             .gap_reason(),
             Some(GapRecoveryReason::HostAbsentOrStopped)
         );
+    }
+
+    #[test]
+    fn host_runtime_readback_maps_stopped_and_starting_without_baselining() {
+        let identity = ProcessIdentity {
+            process_id: 41,
+            start_time_100ns: 100,
+            image_path: r"C:\ProgramData\Eliot\eliot-host.exe".to_owned(),
+        };
+        let mut monitor =
+            HostIdentityMonitor::new(Some(PathBuf::from(r"C:\ProgramData\Eliot\eliot-host.exe")));
+        assert_eq!(
+            monitor
+                .observe_runtime_readback(WatchdogRuntimeReadback::Matching {
+                    state: WatchdogRuntimeState::Stopped,
+                    process: None,
+                    checkpoint: 0,
+                    wait_hint_ms: 0,
+                })
+                .state,
+            HostObservationState::AbsentOrStopped
+        );
+        assert!(monitor.canonical_identity().is_none());
+        assert_eq!(
+            monitor
+                .observe_runtime_readback(WatchdogRuntimeReadback::Matching {
+                    state: WatchdogRuntimeState::Starting,
+                    process: Some(identity.clone()),
+                    checkpoint: 1,
+                    wait_hint_ms: 250,
+                })
+                .state,
+            HostObservationState::AbsentOrStopped
+        );
+        assert!(monitor.canonical_identity().is_none());
+        assert_eq!(
+            monitor
+                .observe_runtime_readback(WatchdogRuntimeReadback::Matching {
+                    state: WatchdogRuntimeState::Running,
+                    process: Some(identity),
+                    checkpoint: 0,
+                    wait_hint_ms: 0,
+                })
+                .state,
+            HostObservationState::Running
+        );
+        assert!(monitor.canonical_identity().is_some());
+    }
+
+    #[derive(Default)]
+    struct SelfAdmissionFixture {
+        now_ms: u64,
+        inspect_advance_ms: u64,
+        current: Option<ProcessIdentity>,
+        observations: VecDeque<WatchdogRuntimeReadback>,
+        sleeps: Vec<u32>,
+    }
+
+    impl WatchdogSelfAdmissionProbe for SelfAdmissionFixture {
+        fn now_ms(&mut self) -> u64 {
+            self.now_ms
+        }
+
+        fn current_process_identity(&mut self) -> Option<ProcessIdentity> {
+            self.current.clone()
+        }
+
+        fn inspect(&mut self) -> WatchdogRuntimeReadback {
+            self.now_ms = self.now_ms.saturating_add(self.inspect_advance_ms);
+            self.observations
+                .pop_front()
+                .unwrap_or(WatchdogRuntimeReadback::Unknown)
+        }
+
+        fn sleep_ms(&mut self, milliseconds: u32) {
+            self.sleeps.push(milliseconds);
+            self.now_ms = self.now_ms.saturating_add(u64::from(milliseconds));
+        }
+    }
+
+    #[derive(Default)]
+    struct SelfAdmissionStatusFixture {
+        reports: Vec<(u32, u32)>,
+    }
+
+    impl WatchdogSelfAdmissionStatus for SelfAdmissionStatusFixture {
+        fn report_start_pending(&mut self, checkpoint: u32, wait_hint_ms: u32) {
+            self.reports.push((checkpoint, wait_hint_ms));
+        }
+    }
+
+    fn self_identity() -> ProcessIdentity {
+        ProcessIdentity {
+            process_id: 99,
+            start_time_100ns: 1234,
+            image_path: r"C:\ProgramData\Eliot\eliot-watchdog.exe".to_owned(),
+        }
+    }
+
+    fn self_matching(
+        state: WatchdogRuntimeState,
+        process: Option<ProcessIdentity>,
+    ) -> WatchdogRuntimeReadback {
+        WatchdogRuntimeReadback::Matching {
+            state,
+            process,
+            checkpoint: 2,
+            wait_hint_ms: 250,
+        }
+    }
+
+    #[test]
+    fn self_admission_accepts_exact_starting_identity_without_start_effect() {
+        let identity = self_identity();
+        let mut fixture = SelfAdmissionFixture {
+            current: Some(identity.clone()),
+            observations: VecDeque::from([self_matching(
+                WatchdogRuntimeState::Starting,
+                Some(identity.clone()),
+            )]),
+            ..SelfAdmissionFixture::default()
+        };
+        let mut status = SelfAdmissionStatusFixture::default();
+        let admitted = admit_watchdog_self_start_with_deadline(&mut fixture, &mut status, 30)
+            .unwrap_or_else(|error| panic!("self-admission failed: {error}"));
+        assert_eq!(admitted, identity);
+        assert!(status.reports.is_empty());
+        assert!(fixture.sleeps.is_empty());
+    }
+
+    #[test]
+    fn self_admission_accepts_exact_running_identity() {
+        let identity = self_identity();
+        let mut fixture = SelfAdmissionFixture {
+            current: Some(identity.clone()),
+            observations: VecDeque::from([self_matching(
+                WatchdogRuntimeState::Running,
+                Some(identity.clone()),
+            )]),
+            ..SelfAdmissionFixture::default()
+        };
+        let mut status = SelfAdmissionStatusFixture::default();
+        let admitted = admit_watchdog_self_start_with_deadline(&mut fixture, &mut status, 30)
+            .unwrap_or_else(|error| panic!("self-admission failed: {error}"));
+        assert_eq!(admitted, identity);
+    }
+
+    #[test]
+    fn self_admission_rejects_exact_identity_observed_at_deadline() {
+        let identity = self_identity();
+        let mut fixture = SelfAdmissionFixture {
+            inspect_advance_ms: 30,
+            current: Some(identity.clone()),
+            observations: VecDeque::from([self_matching(
+                WatchdogRuntimeState::Starting,
+                Some(identity),
+            )]),
+            ..SelfAdmissionFixture::default()
+        };
+        let mut status = SelfAdmissionStatusFixture::default();
+
+        assert_eq!(
+            admit_watchdog_self_start_with_deadline(&mut fixture, &mut status, 30),
+            Err(WatchdogSelfAdmissionError::Timeout)
+        );
+        assert!(status.reports.is_empty());
+        assert!(fixture.sleeps.is_empty());
+    }
+
+    #[test]
+    fn self_admission_rejects_pid_reuse_and_image_substitution() {
+        let identity = self_identity();
+        for substituted in [
+            ProcessIdentity {
+                start_time_100ns: identity.start_time_100ns + 1,
+                ..identity.clone()
+            },
+            ProcessIdentity {
+                image_path: r"C:\Temp\evil.exe".to_owned(),
+                ..identity.clone()
+            },
+        ] {
+            let mut fixture = SelfAdmissionFixture {
+                current: Some(identity.clone()),
+                observations: VecDeque::from([self_matching(
+                    WatchdogRuntimeState::Starting,
+                    Some(substituted),
+                )]),
+                ..SelfAdmissionFixture::default()
+            };
+            let mut status = SelfAdmissionStatusFixture::default();
+            assert_eq!(
+                admit_watchdog_self_start_with_deadline(&mut fixture, &mut status, 30),
+                Err(WatchdogSelfAdmissionError::RegistrationMismatched)
+            );
+        }
+    }
+
+    #[test]
+    fn self_admission_rejects_stopped_service_and_times_out_unknown() {
+        let identity = self_identity();
+        let mut stopped = SelfAdmissionFixture {
+            current: Some(identity.clone()),
+            observations: VecDeque::from([self_matching(WatchdogRuntimeState::Stopped, None)]),
+            ..SelfAdmissionFixture::default()
+        };
+        let mut stopped_status = SelfAdmissionStatusFixture::default();
+        assert_eq!(
+            admit_watchdog_self_start_with_deadline(&mut stopped, &mut stopped_status, 30),
+            Err(WatchdogSelfAdmissionError::ServiceStopped)
+        );
+
+        let mut unknown = SelfAdmissionFixture {
+            current: Some(identity),
+            ..SelfAdmissionFixture::default()
+        };
+        let mut unknown_status = SelfAdmissionStatusFixture::default();
+        assert_eq!(
+            admit_watchdog_self_start_with_deadline(&mut unknown, &mut unknown_status, 100),
+            Err(WatchdogSelfAdmissionError::Timeout)
+        );
+        assert!(
+            unknown.now_ms <= 100,
+            "poll must not overshoot the deadline"
+        );
+        assert!(!unknown_status.reports.is_empty());
+        assert!(!unknown.sleeps.is_empty());
+        assert!(unknown_status.reports.windows(2).all(|window| {
+            window[1].0 > window[0].0 && window[1].1 >= SELF_ADMISSION_MIN_POLL_MS
+        }));
+    }
+
+    #[test]
+    fn self_admission_retries_missing_starting_identity_then_accepts() {
+        let identity = self_identity();
+        let mut fixture = SelfAdmissionFixture {
+            current: Some(identity.clone()),
+            observations: VecDeque::from([
+                self_matching(WatchdogRuntimeState::Starting, None),
+                self_matching(WatchdogRuntimeState::Running, Some(identity.clone())),
+            ]),
+            ..SelfAdmissionFixture::default()
+        };
+        let mut status = SelfAdmissionStatusFixture::default();
+        let admitted = admit_watchdog_self_start_with_deadline(&mut fixture, &mut status, 100)
+            .unwrap_or_else(|error| panic!("self-admission failed: {error}"));
+        assert_eq!(admitted, identity);
+        assert_eq!(status.reports.len(), 1);
+        assert_eq!(fixture.sleeps.len(), 1);
     }
 
     #[test]

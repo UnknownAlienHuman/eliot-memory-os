@@ -197,6 +197,83 @@ fn run_as_scm_service() -> Result<bool, u32> {
 }
 
 #[cfg(windows)]
+struct HostStartPendingReporter {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    task: Option<std::thread::JoinHandle<()>>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(windows)]
+impl HostStartPendingReporter {
+    fn start(
+        handle: windows_sys::Win32::System::Services::SERVICE_STATUS_HANDLE,
+    ) -> io::Result<Self> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Services::{
+            SERVICE_START_PENDING, SERVICE_STATUS, SetServiceStatus,
+        };
+
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let failed = std::sync::Arc::new(AtomicBool::new(false));
+        let task_failed = failed.clone();
+        let raw_handle = handle as isize;
+        let task = std::thread::Builder::new()
+            .name("eliot-host-scm-start-pending".to_owned())
+            .spawn(move || {
+                let mut checkpoint = 2u32;
+                loop {
+                    match stopped.recv_timeout(std::time::Duration::from_secs(2)) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let status = SERVICE_STATUS {
+                        dwServiceType: 0x0000_0010,
+                        dwCurrentState: SERVICE_START_PENDING,
+                        dwControlsAccepted: 0,
+                        dwWin32ExitCode: 0,
+                        dwServiceSpecificExitCode: 0,
+                        dwCheckPoint: checkpoint,
+                        dwWaitHint: 10_000,
+                    };
+                    // SAFETY: the service-main thread retains the registered
+                    // status handle until this reporter is stopped and joined.
+                    if unsafe { SetServiceStatus(raw_handle as _, &raw const status) } == 0 {
+                        task_failed.store(true, Ordering::Release);
+                        break;
+                    }
+                    checkpoint = checkpoint.saturating_add(1);
+                }
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            task: Some(task),
+            failed,
+        })
+    }
+
+    fn finish(mut self) -> bool {
+        self.stop_and_join()
+    }
+
+    fn stop_and_join(&mut self) -> bool {
+        use std::sync::atomic::Ordering;
+
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let joined = self.task.take().is_none_or(|task| task.join().is_ok());
+        joined && !self.failed.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HostStartPendingReporter {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
+}
+
+#[cfg(windows)]
 #[allow(
     clippy::too_many_lines,
     reason = "the SCM callback owns the complete fail-closed service lifecycle"
@@ -248,13 +325,39 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
                 return;
             }
         };
-    let Ok(mut host) = open_host(launch_options) else {
+    let reporter = match HostStartPendingReporter::start(handle) {
+        Ok(reporter) => reporter,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: SCM start-pending reporter could not start: {error}"
+            );
+            status.dwCurrentState = SERVICE_STOPPED;
+            status.dwWin32ExitCode = 1;
+            unsafe { SetServiceStatus(handle, &raw const status) };
+            return;
+        }
+    };
+    let host_result = open_host(launch_options);
+    let reporter_succeeded = reporter.finish();
+    let Ok(mut host) = host_result else {
         status.dwCurrentState = SERVICE_STOPPED;
         status.dwWin32ExitCode = 1;
         // SAFETY: handle is registered and status is initialized.
         unsafe { SetServiceStatus(handle, &raw const status) };
         return;
     };
+    if !reporter_succeeded {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "eliot-host: SCM start-pending progress could not be published"
+        );
+        status.dwCurrentState = SERVICE_STOPPED;
+        status.dwWin32ExitCode = 1;
+        let _ = host.stop();
+        unsafe { SetServiceStatus(handle, &raw const status) };
+        return;
+    }
     let Ok(credential_thread) = spawn_credential_control(&host) else {
         status.dwCurrentState = SERVICE_STOPPED;
         status.dwWin32ExitCode = 1;

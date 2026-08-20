@@ -3,12 +3,18 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(windows)]
+use std::time::{Duration, Instant};
+
 use eliot_platform_windows::ServiceBootstrapArguments;
+#[cfg(windows)]
+use eliot_platform_windows::{ServiceRegistrationRequest, WindowsPlatform};
 use eliot_watchdog::{
     FileWatchdogAdmission, INSTALLATION_REGISTRY_FILE_NAME, IndependentKernelSensor,
     LiveHostObservationSource, SERVICE_NAME, SUPERVISION_LEASE_FILE_NAME,
     WATCHDOG_ADMISSION_FILE_NAME, WatchdogAdmissionSource, WatchdogComposition, WatchdogConfig,
-    inspect_approved_host_registration,
+    WatchdogRuntimeReadback, WatchdogSelfAdmissionProbe, WatchdogSelfAdmissionStatus,
+    inspect_approved_host_registration, project_service_runtime_inspection,
 };
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<Option<ServiceBootstrapArguments>, String>> =
@@ -83,6 +89,24 @@ fn run_watchdog(
         stop_signal,
     )
     .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    if let Some(launch) = scm_launch {
+        let root = launch
+            .registration()
+            .binary_path()
+            .parent()
+            .ok_or_else(|| "approved Watchdog image has no package root".to_owned())?;
+        let platform = WindowsPlatform::new(root.to_path_buf())
+            .map_err(|error| format!("Watchdog self-admission platform root: {error}"))?;
+        let mut probe = WindowsWatchdogSelfAdmissionProbe {
+            platform,
+            request: launch.registration(),
+            started_at: Instant::now(),
+        };
+        let mut status = ScmWatchdogSelfAdmissionStatus;
+        eliot_watchdog::admit_watchdog_self_start(&mut probe, &mut status)
+            .map_err(|error| error.to_string())?;
+    }
     let readiness = composition.readiness();
     serde_json::to_writer(&mut io::stdout().lock(), &readiness)
         .map_err(|error| format!("{error:?}"))?;
@@ -99,6 +123,55 @@ fn run_watchdog(
     #[cfg(windows)]
     set_service_status_stopped();
     Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsWatchdogSelfAdmissionProbe<'a> {
+    platform: WindowsPlatform,
+    request: &'a ServiceRegistrationRequest,
+    started_at: Instant,
+}
+
+#[cfg(windows)]
+impl WatchdogSelfAdmissionProbe for WindowsWatchdogSelfAdmissionProbe<'_> {
+    fn now_ms(&mut self) -> u64 {
+        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn current_process_identity(&mut self) -> Option<eliot_platform_windows::ProcessIdentity> {
+        self.platform.process_identity(std::process::id()).ok()
+    }
+
+    fn inspect(&mut self) -> WatchdogRuntimeReadback {
+        project_service_runtime_inspection(
+            self.platform
+                .inspect_service_registration_runtime(self.request),
+        )
+    }
+
+    fn sleep_ms(&mut self, milliseconds: u32) {
+        std::thread::sleep(Duration::from_millis(u64::from(milliseconds)));
+    }
+}
+
+#[cfg(windows)]
+struct ScmWatchdogSelfAdmissionStatus;
+
+#[cfg(windows)]
+impl WatchdogSelfAdmissionStatus for ScmWatchdogSelfAdmissionStatus {
+    fn report_start_pending(&mut self, checkpoint: u32, wait_hint_ms: u32) {
+        let raw = SERVICE_STATUS_HANDLE.load(Ordering::Acquire);
+        if raw != 0 {
+            publish_service_status(
+                raw as _,
+                windows_sys::Win32::System::Services::SERVICE_START_PENDING,
+                0,
+                0,
+                checkpoint,
+                wait_hint_ms,
+            );
+        }
+    }
 }
 
 #[cfg(windows)]

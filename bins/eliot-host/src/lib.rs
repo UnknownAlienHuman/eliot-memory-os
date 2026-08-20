@@ -14,6 +14,8 @@ pub use credential_control::HostCredentialControl;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 use eliot_contracts::{
     AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
@@ -52,8 +54,8 @@ use eliot_platform::{
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerLease, HostOwnerLeaseError,
     HostOwnerLeaseReleaseError, ProtectedPathLease, ProtectedRootLease, ServiceAccount,
-    ServiceRegistrationInspection, ServiceRegistrationRequest, ServiceStartMode, WindowsPlatform,
-    fresh_kernel_activation_nonce,
+    ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection, ServiceStartMode,
+    WindowsPlatform, fresh_kernel_activation_nonce,
 };
 use eliot_runtime_contracts::{
     HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
@@ -450,7 +452,7 @@ where
 use eliot_platform_windows::{
     JobObjectIdentity, PinnedRuntimeFile, ProcessIdentity, RunningJobChild, SuspendedJobChild,
     SuspendedLaunchSpec, UserOwnedPathLease, UserOwnedRootLease, WindowsAdapterError,
-    observe_named_pipe_peer_process,
+    observe_named_pipe_peer_process, windows_paths_equal,
 };
 
 #[cfg(windows)]
@@ -3607,11 +3609,24 @@ fn select_watchdog_approval_for_start(
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InstalledWatchdogRuntimeInspection {
+    Matching {
+        state: ServiceState,
+        wait_hint_ms: u32,
+        process: Option<ProcessIdentity>,
+    },
+    Absent,
+    Mismatched,
+    Unknown,
+}
+
+#[cfg(windows)]
 trait InstalledWatchdogControl {
-    fn inspect_registration(
+    fn inspect_registration_runtime(
         &mut self,
         request: &ServiceRegistrationRequest,
-    ) -> ServiceRegistrationInspection;
+    ) -> InstalledWatchdogRuntimeInspection;
 
     fn start(
         &mut self,
@@ -3621,11 +3636,28 @@ trait InstalledWatchdogControl {
 
 #[cfg(windows)]
 impl InstalledWatchdogControl for WindowsPlatform {
-    fn inspect_registration(
+    fn inspect_registration_runtime(
         &mut self,
         request: &ServiceRegistrationRequest,
-    ) -> ServiceRegistrationInspection {
-        self.inspect_service_registration(request)
+    ) -> InstalledWatchdogRuntimeInspection {
+        match self.inspect_service_registration_runtime(request) {
+            ServiceRegistrationRuntimeInspection::Matching { observation } => {
+                InstalledWatchdogRuntimeInspection::Matching {
+                    state: observation.state(),
+                    wait_hint_ms: observation.wait_hint_ms(),
+                    process: observation.process().cloned(),
+                }
+            }
+            ServiceRegistrationRuntimeInspection::Absent => {
+                InstalledWatchdogRuntimeInspection::Absent
+            }
+            ServiceRegistrationRuntimeInspection::Mismatched => {
+                InstalledWatchdogRuntimeInspection::Mismatched
+            }
+            ServiceRegistrationRuntimeInspection::Unknown => {
+                InstalledWatchdogRuntimeInspection::Unknown
+            }
+        }
     }
 
     fn start(
@@ -3638,6 +3670,104 @@ impl InstalledWatchdogControl for WindowsPlatform {
 }
 
 #[cfg(windows)]
+trait WatchdogStartClock {
+    fn now_ms(&mut self) -> u64;
+
+    fn sleep(&mut self, duration: Duration);
+}
+
+#[cfg(windows)]
+struct SystemWatchdogStartClock {
+    origin: Instant,
+}
+
+#[cfg(windows)]
+impl SystemWatchdogStartClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl WatchdogStartClock for SystemWatchdogStartClock {
+    fn now_ms(&mut self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+#[cfg(windows)]
+const WATCHDOG_START_TIMEOUT_MS: u64 = 30_000;
+
+#[cfg(windows)]
+const WATCHDOG_START_MIN_WAIT_MS: u64 = 25;
+
+#[cfg(windows)]
+const WATCHDOG_START_MAX_WAIT_MS: u64 = 250;
+
+#[cfg(windows)]
+const WATCHDOG_START_UNKNOWN_WAIT_MS: u64 = 50;
+
+#[cfg(windows)]
+fn watchdog_start_wait(wait_hint_ms: u32) -> Duration {
+    let wait_ms =
+        u64::from(wait_hint_ms).clamp(WATCHDOG_START_MIN_WAIT_MS, WATCHDOG_START_MAX_WAIT_MS);
+    Duration::from_millis(wait_ms)
+}
+
+#[cfg(windows)]
+fn watchdog_unknown_wait() -> Duration {
+    Duration::from_millis(WATCHDOG_START_UNKNOWN_WAIT_MS)
+}
+
+#[cfg(windows)]
+fn bind_watchdog_process(
+    registration: &ServiceRegistrationRequest,
+    bound: &mut Option<ProcessIdentity>,
+    observed: Option<&ProcessIdentity>,
+    state: ServiceState,
+) -> Result<(), HostError> {
+    let Some(observed) = observed else {
+        if state == ServiceState::Running {
+            return Err(HostError::RecoveryRequired(
+                "Watchdog reached Running without a handle-bound process identity".to_owned(),
+            ));
+        }
+        return Ok(());
+    };
+    if observed.process_id == 0
+        || observed.start_time_100ns == 0
+        || !windows_paths_equal(Path::new(&observed.image_path), registration.binary_path())
+    {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog process identity is unusable or its image is not the approved image"
+                .to_owned(),
+        ));
+    }
+    if let Some(expected) = bound {
+        if expected.process_id != observed.process_id
+            || expected.start_time_100ns != observed.start_time_100ns
+            || !windows_paths_equal(
+                Path::new(&expected.image_path),
+                Path::new(&observed.image_path),
+            )
+        {
+            return Err(HostError::RecoveryRequired(
+                "Watchdog process identity changed during SCM start convergence".to_owned(),
+            ));
+        }
+    } else {
+        *bound = Some(observed.clone());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn start_installed_watchdog<C>(
     control: &mut C,
     registration: &ServiceRegistrationRequest,
@@ -3646,32 +3776,92 @@ fn start_installed_watchdog<C>(
 where
     C: InstalledWatchdogControl,
 {
-    match control.inspect_registration(registration) {
-        ServiceRegistrationInspection::Matching { observation }
-            if observation.state == ServiceState::Running =>
+    let mut clock = SystemWatchdogStartClock::new();
+    start_installed_watchdog_with_clock(control, registration, context, &mut clock)
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded SCM reconcile state machine keeps the one-start invariant and every terminal state in one reviewable contour"
+)]
+fn start_installed_watchdog_with_clock<C, W>(
+    control: &mut C,
+    registration: &ServiceRegistrationRequest,
+    context: RequestMetadata,
+    clock: &mut W,
+) -> Result<(), HostError>
+where
+    C: InstalledWatchdogControl,
+    W: WatchdogStartClock,
+{
+    let deadline = clock.now_ms().saturating_add(WATCHDOG_START_TIMEOUT_MS);
+    let mut bound_process = None;
+    let mut initial_wait = None;
+    match control.inspect_registration_runtime(registration) {
+        InstalledWatchdogRuntimeInspection::Matching { state, process, .. }
+            if state == ServiceState::Running =>
         {
+            bind_watchdog_process(registration, &mut bound_process, process.as_ref(), state)?;
             return Ok(());
         }
-        ServiceRegistrationInspection::Matching { observation }
-            if observation.state == ServiceState::Stopped => {}
-        ServiceRegistrationInspection::Matching { observation } => {
-            return Err(HostError::Platform(format!(
-                "canonical Watchdog service is not startable from observed state {:?}",
-                observation.state
+        InstalledWatchdogRuntimeInspection::Matching {
+            state: ServiceState::Stopped,
+            ..
+        } => {
+            if clock.now_ms() >= deadline {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog SCM start deadline expired before StartService could be issued"
+                        .to_owned(),
+                ));
+            }
+            let service = PlatformHandle::new(registration.service_name())
+                .map_err(|error| HostError::Platform(error.to_string()))?;
+            // A StartService result can be Known, Partial, Unknown, or Error
+            // while the external SCM effect remains live. Reconciliation below
+            // is the only authority, and this branch is the sole Start call.
+            let _ = control.start(&ServiceRequest {
+                context,
+                service,
+                operation: ServiceOperation::Start,
+            });
+        }
+        InstalledWatchdogRuntimeInspection::Matching {
+            state: ServiceState::Starting,
+            wait_hint_ms,
+            process,
+            ..
+        } => {
+            bind_watchdog_process(
+                registration,
+                &mut bound_process,
+                process.as_ref(),
+                ServiceState::Starting,
+            )?;
+            if clock.now_ms() >= deadline {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog SCM start did not converge before the bounded deadline".to_owned(),
+                ));
+            }
+            initial_wait = Some(watchdog_start_wait(wait_hint_ms));
+        }
+        InstalledWatchdogRuntimeInspection::Matching { state, .. } => {
+            return Err(HostError::RecoveryRequired(format!(
+                "canonical Watchdog service is not startable from observed state {state:?}"
             )));
         }
-        ServiceRegistrationInspection::Absent => {
+        InstalledWatchdogRuntimeInspection::Absent => {
             return Err(HostError::Platform(
                 "canonical Watchdog service is not installed".to_owned(),
             ));
         }
-        ServiceRegistrationInspection::Mismatched => {
+        InstalledWatchdogRuntimeInspection::Mismatched => {
             return Err(HostError::Platform(
                 "canonical Watchdog service registration does not match the approved plan"
                     .to_owned(),
             ));
         }
-        ServiceRegistrationInspection::Unknown => {
+        InstalledWatchdogRuntimeInspection::Unknown => {
             return Err(HostError::Platform(
                 "canonical Watchdog service registration is not authoritatively observable"
                     .to_owned(),
@@ -3679,26 +3869,77 @@ where
         }
     }
 
-    let service = PlatformHandle::new(ELIOT_WATCHDOG_SERVICE_NAME)
-        .map_err(|error| HostError::Platform(error.to_string()))?;
-    match control.start(&ServiceRequest {
-        context,
-        service,
-        operation: ServiceOperation::Start,
-    }) {
-        PortOutcome::Known(observation) if observation.state == ServiceState::Running => Ok(()),
-        PortOutcome::Known(observation) => Err(HostError::Platform(format!(
-            "Watchdog did not reach Known(Running): {:?}",
-            observation.state
-        ))),
-        PortOutcome::Partial { value, .. } => Err(HostError::RecoveryRequired(format!(
-            "Watchdog start observation is partial and state is {:?}",
-            value.state
-        ))),
-        PortOutcome::Unknown(reason) => Err(HostError::RecoveryRequired(format!(
-            "Watchdog SCM start outcome is unknown: {reason:?}"
-        ))),
-        PortOutcome::Error(error) => Err(HostError::Platform(error.to_string())),
+    if let Some(wait) = initial_wait {
+        let remaining_ms = deadline.saturating_sub(clock.now_ms());
+        if remaining_ms > 0 {
+            clock.sleep(wait.min(Duration::from_millis(remaining_ms)));
+        }
+    }
+
+    loop {
+        let wait = match control.inspect_registration_runtime(registration) {
+            InstalledWatchdogRuntimeInspection::Matching {
+                state,
+                wait_hint_ms,
+                process,
+            } => match state {
+                ServiceState::Running => {
+                    if clock.now_ms() >= deadline {
+                        return Err(HostError::RecoveryRequired(
+                            "Watchdog reached Running after the bounded SCM start deadline"
+                                .to_owned(),
+                        ));
+                    }
+                    bind_watchdog_process(
+                        registration,
+                        &mut bound_process,
+                        process.as_ref(),
+                        state,
+                    )?;
+                    return Ok(());
+                }
+                ServiceState::Starting => {
+                    bind_watchdog_process(
+                        registration,
+                        &mut bound_process,
+                        process.as_ref(),
+                        state,
+                    )?;
+                    watchdog_start_wait(wait_hint_ms)
+                }
+                ServiceState::Stopped
+                | ServiceState::Stopping
+                | ServiceState::Absent
+                | ServiceState::Failed
+                | ServiceState::Unknown => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "Watchdog SCM start converged to terminal state {state:?}"
+                    )));
+                }
+            },
+            // Readback uncertainty is transient only after the one permitted
+            // StartService call (or when SCM was already Starting). It can never
+            // authorize another start and expires at the fixed deadline above.
+            InstalledWatchdogRuntimeInspection::Unknown => watchdog_unknown_wait(),
+            InstalledWatchdogRuntimeInspection::Absent => {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog service disappeared during SCM start convergence".to_owned(),
+                ));
+            }
+            InstalledWatchdogRuntimeInspection::Mismatched => {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog service registration changed during SCM start convergence".to_owned(),
+                ));
+            }
+        };
+        let remaining_ms = deadline.saturating_sub(clock.now_ms());
+        if remaining_ms == 0 {
+            return Err(HostError::RecoveryRequired(
+                "Watchdog SCM start did not converge to Running before the bounded deadline"
+                    .to_owned(),
+            ));
+        }
+        clock.sleep(wait.min(Duration::from_millis(remaining_ms)));
     }
 }
 
@@ -5783,19 +6024,23 @@ fn owner_lease_release_error(error: HostOwnerLeaseReleaseError) -> HostError {
 mod watchdog_service_tests {
     use super::*;
     use eliot_platform_windows::ServiceBootstrapArguments;
+    use std::collections::VecDeque;
 
     struct FakeInstalledWatchdog {
-        inspection: Option<ServiceRegistrationInspection>,
-        start_outcome: Option<PortOutcome<eliot_platform::ServiceObservation>>,
+        inspections: VecDeque<InstalledWatchdogRuntimeInspection>,
+        fallback_inspection: InstalledWatchdogRuntimeInspection,
+        start_outcomes: VecDeque<PortOutcome<eliot_platform::ServiceObservation>>,
         starts: usize,
     }
 
     impl InstalledWatchdogControl for FakeInstalledWatchdog {
-        fn inspect_registration(
+        fn inspect_registration_runtime(
             &mut self,
             _request: &ServiceRegistrationRequest,
-        ) -> ServiceRegistrationInspection {
-            self.inspection.take().unwrap_or_else(|| unreachable!())
+        ) -> InstalledWatchdogRuntimeInspection {
+            self.inspections
+                .pop_front()
+                .unwrap_or_else(|| self.fallback_inspection.clone())
         }
 
         fn start(
@@ -5803,7 +6048,70 @@ mod watchdog_service_tests {
             _request: &ServiceRequest,
         ) -> PortOutcome<eliot_platform::ServiceObservation> {
             self.starts += 1;
-            self.start_outcome.take().unwrap_or_else(|| unreachable!())
+            self.start_outcomes
+                .pop_front()
+                .unwrap_or(PortOutcome::Unknown(
+                    eliot_platform::UnknownReason::Indeterminate,
+                ))
+        }
+    }
+
+    struct FakeWatchdogClock {
+        now_ms: u64,
+        sleeps: Vec<Duration>,
+    }
+
+    impl FakeWatchdogClock {
+        fn new() -> Self {
+            Self {
+                now_ms: 0,
+                sleeps: Vec::new(),
+            }
+        }
+    }
+
+    struct ScriptedWatchdogClock {
+        readings: VecDeque<u64>,
+        last: u64,
+        sleeps: Vec<Duration>,
+    }
+
+    impl WatchdogStartClock for ScriptedWatchdogClock {
+        fn now_ms(&mut self) -> u64 {
+            if let Some(reading) = self.readings.pop_front() {
+                self.last = reading;
+            }
+            self.last
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.sleeps.push(duration);
+        }
+    }
+
+    impl WatchdogStartClock for FakeWatchdogClock {
+        fn now_ms(&mut self) -> u64 {
+            self.now_ms
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.sleeps.push(duration);
+            self.now_ms = self
+                .now_ms
+                .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+        }
+    }
+
+    fn fake_control(
+        inspections: impl IntoIterator<Item = InstalledWatchdogRuntimeInspection>,
+        fallback_inspection: InstalledWatchdogRuntimeInspection,
+        start_outcomes: impl IntoIterator<Item = PortOutcome<eliot_platform::ServiceObservation>>,
+    ) -> FakeInstalledWatchdog {
+        FakeInstalledWatchdog {
+            inspections: inspections.into_iter().collect(),
+            fallback_inspection,
+            start_outcomes: start_outcomes.into_iter().collect(),
+            starts: 0,
         }
     }
 
@@ -5891,13 +6199,33 @@ mod watchdog_service_tests {
         (approval, root)
     }
 
-    fn observation(state: ServiceState) -> eliot_platform::ServiceObservation {
+    fn service_observation(state: ServiceState) -> eliot_platform::ServiceObservation {
         eliot_platform::ServiceObservation {
             service: PlatformHandle::new(ELIOT_WATCHDOG_SERVICE_NAME)
                 .unwrap_or_else(|_| unreachable!()),
             state,
             generation: None,
             process: None,
+        }
+    }
+
+    fn runtime_observation(
+        state: ServiceState,
+        wait_hint_ms: u32,
+        process: Option<ProcessIdentity>,
+    ) -> InstalledWatchdogRuntimeInspection {
+        InstalledWatchdogRuntimeInspection::Matching {
+            state,
+            wait_hint_ms,
+            process,
+        }
+    }
+
+    fn process_for(registration: &ServiceRegistrationRequest) -> ProcessIdentity {
+        ProcessIdentity {
+            process_id: 41,
+            start_time_100ns: 7,
+            image_path: registration.binary_path().to_string_lossy().into_owned(),
         }
     }
 
@@ -5923,55 +6251,102 @@ mod watchdog_service_tests {
     #[test]
     fn absent_mismatched_or_unknown_registration_never_starts() {
         for inspection in [
-            ServiceRegistrationInspection::Absent,
-            ServiceRegistrationInspection::Mismatched,
-            ServiceRegistrationInspection::Unknown,
+            InstalledWatchdogRuntimeInspection::Absent,
+            InstalledWatchdogRuntimeInspection::Mismatched,
+            InstalledWatchdogRuntimeInspection::Unknown,
         ] {
-            let mut control = FakeInstalledWatchdog {
-                inspection: Some(inspection),
-                start_outcome: None,
-                starts: 0,
-            };
-
+            let mut control = fake_control(
+                [inspection],
+                InstalledWatchdogRuntimeInspection::Unknown,
+                [],
+            );
             assert!(start_installed_watchdog(&mut control, &registration(), context()).is_err());
             assert_eq!(control.starts, 0);
         }
     }
 
     #[test]
-    fn partial_running_start_outcome_requires_recovery() {
-        let mut control = FakeInstalledWatchdog {
-            inspection: Some(ServiceRegistrationInspection::Matching {
-                observation: observation(ServiceState::Stopped),
-            }),
-            start_outcome: Some(PortOutcome::Partial {
-                value: observation(ServiceState::Running),
+    fn already_running_is_accepted_without_start() {
+        let registration = registration();
+        let process = process_for(&registration);
+        let mut control = fake_control(
+            [runtime_observation(ServiceState::Running, 0, Some(process))],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [],
+        );
+
+        start_installed_watchdog(&mut control, &registration, context())
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(control.starts, 0);
+    }
+
+    #[test]
+    fn starting_converges_without_start() {
+        let registration = registration();
+        let process = process_for(&registration);
+        let mut control = fake_control(
+            [
+                runtime_observation(ServiceState::Starting, 25, None),
+                runtime_observation(ServiceState::Running, 0, Some(process)),
+            ],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [],
+        );
+        let mut clock = FakeWatchdogClock::new();
+
+        start_installed_watchdog_with_clock(&mut control, &registration, context(), &mut clock)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(control.starts, 0);
+        assert_eq!(clock.sleeps, vec![Duration::from_millis(25)]);
+    }
+
+    #[test]
+    fn stopped_unknown_start_reconciles_through_starting_to_running_once() {
+        let registration = registration();
+        let process = process_for(&registration);
+        let mut control = fake_control(
+            [
+                runtime_observation(ServiceState::Stopped, 0, None),
+                InstalledWatchdogRuntimeInspection::Unknown,
+                runtime_observation(ServiceState::Starting, 1_000, None),
+                runtime_observation(ServiceState::Running, 0, Some(process)),
+            ],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [PortOutcome::Unknown(
+                eliot_platform::UnknownReason::Indeterminate,
+            )],
+        );
+        let mut clock = FakeWatchdogClock::new();
+
+        start_installed_watchdog_with_clock(&mut control, &registration, context(), &mut clock)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(control.starts, 1);
+        assert_eq!(
+            clock.sleeps,
+            vec![Duration::from_millis(50), Duration::from_millis(250)]
+        );
+    }
+
+    #[test]
+    fn start_partial_outcome_reconciles_to_running_without_trusting_start_result() {
+        let registration = registration();
+        let process = process_for(&registration);
+        let mut control = fake_control(
+            [
+                runtime_observation(ServiceState::Stopped, 0, None),
+                runtime_observation(ServiceState::Running, 0, Some(process)),
+            ],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [PortOutcome::Partial {
+                value: service_observation(ServiceState::Running),
                 missing: vec![
                     PlatformHandle::new("authority_bound_process_record")
                         .unwrap_or_else(|_| unreachable!()),
                 ],
-            }),
-            starts: 0,
-        };
+            }],
+        );
 
-        assert!(matches!(
-            start_installed_watchdog(&mut control, &registration(), context()),
-            Err(HostError::RecoveryRequired(_))
-        ));
-        assert_eq!(control.starts, 1);
-    }
-
-    #[test]
-    fn exact_stopped_registration_accepts_only_known_running() {
-        let mut control = FakeInstalledWatchdog {
-            inspection: Some(ServiceRegistrationInspection::Matching {
-                observation: observation(ServiceState::Stopped),
-            }),
-            start_outcome: Some(PortOutcome::Known(observation(ServiceState::Running))),
-            starts: 0,
-        };
-
-        start_installed_watchdog(&mut control, &registration(), context())
+        start_installed_watchdog(&mut control, &registration, context())
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(control.starts, 1);
     }
@@ -6126,22 +6501,170 @@ mod watchdog_service_tests {
     }
 
     #[test]
-    fn unknown_start_outcome_requires_recovery() {
-        let mut control = FakeInstalledWatchdog {
-            inspection: Some(ServiceRegistrationInspection::Matching {
-                observation: observation(ServiceState::Stopped),
-            }),
-            start_outcome: Some(PortOutcome::Unknown(
+    fn stopped_after_start_requires_recovery_without_resend() {
+        let registration = registration();
+        let mut control = fake_control(
+            [
+                runtime_observation(ServiceState::Stopped, 0, None),
+                runtime_observation(ServiceState::Stopped, 0, None),
+            ],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [PortOutcome::Unknown(
                 eliot_platform::UnknownReason::Indeterminate,
-            )),
-            starts: 0,
-        };
+            )],
+        );
 
         assert!(matches!(
-            start_installed_watchdog(&mut control, &registration(), context()),
+            start_installed_watchdog(&mut control, &registration, context()),
             Err(HostError::RecoveryRequired(_))
         ));
         assert_eq!(control.starts, 1);
+    }
+
+    #[test]
+    fn running_without_process_identity_requires_recovery() {
+        let registration = registration();
+        let mut control = fake_control(
+            [runtime_observation(ServiceState::Running, 0, None)],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [],
+        );
+
+        assert!(matches!(
+            start_installed_watchdog(&mut control, &registration, context()),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        assert_eq!(control.starts, 0);
+    }
+
+    #[test]
+    fn pid_reuse_during_start_requires_recovery_without_resend() {
+        let registration = registration();
+        let first = process_for(&registration);
+        let mut reused = first.clone();
+        reused.start_time_100ns += 1;
+        let mut control = fake_control(
+            [
+                runtime_observation(ServiceState::Stopped, 0, None),
+                runtime_observation(ServiceState::Starting, 25, Some(first)),
+                runtime_observation(ServiceState::Running, 0, Some(reused)),
+            ],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [PortOutcome::Unknown(
+                eliot_platform::UnknownReason::Indeterminate,
+            )],
+        );
+        let mut clock = FakeWatchdogClock::new();
+
+        assert!(matches!(
+            start_installed_watchdog_with_clock(&mut control, &registration, context(), &mut clock,),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        assert_eq!(control.starts, 1);
+    }
+
+    #[test]
+    fn pid_change_during_start_requires_recovery_without_resend() {
+        let registration = registration();
+        let first = process_for(&registration);
+        let mut changed = first.clone();
+        changed.process_id += 1;
+        let mut control = fake_control(
+            [
+                runtime_observation(ServiceState::Stopped, 0, None),
+                runtime_observation(ServiceState::Starting, 25, Some(first)),
+                runtime_observation(ServiceState::Running, 0, Some(changed)),
+            ],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [PortOutcome::Unknown(
+                eliot_platform::UnknownReason::Indeterminate,
+            )],
+        );
+        let mut clock = FakeWatchdogClock::new();
+
+        assert!(matches!(
+            start_installed_watchdog_with_clock(&mut control, &registration, context(), &mut clock,),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        assert_eq!(control.starts, 1);
+    }
+
+    #[test]
+    fn image_substitution_during_start_requires_recovery_without_resend() {
+        let registration = registration();
+        let first = process_for(&registration);
+        let mut substituted = first.clone();
+        substituted.image_path = r"C:\Windows\System32\not-eliot.exe".to_owned();
+        let mut control = fake_control(
+            [
+                runtime_observation(ServiceState::Stopped, 0, None),
+                runtime_observation(ServiceState::Starting, 25, Some(first)),
+                runtime_observation(ServiceState::Running, 0, Some(substituted)),
+            ],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [PortOutcome::Unknown(
+                eliot_platform::UnknownReason::Indeterminate,
+            )],
+        );
+        let mut clock = FakeWatchdogClock::new();
+
+        assert!(matches!(
+            start_installed_watchdog_with_clock(&mut control, &registration, context(), &mut clock,),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        assert_eq!(control.starts, 1);
+    }
+
+    #[test]
+    fn unknown_reconciliation_is_bounded_and_never_resends_start() {
+        let registration = registration();
+        let mut control = fake_control(
+            [runtime_observation(ServiceState::Stopped, 0, None)],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [PortOutcome::Unknown(
+                eliot_platform::UnknownReason::Indeterminate,
+            )],
+        );
+        let mut clock = FakeWatchdogClock::new();
+
+        assert!(matches!(
+            start_installed_watchdog_with_clock(&mut control, &registration, context(), &mut clock,),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        assert_eq!(control.starts, 1);
+        assert_eq!(clock.now_ms, WATCHDOG_START_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn running_observed_at_deadline_is_rejected_without_resending_start() {
+        let registration = registration();
+        let process = process_for(&registration);
+        let mut control = fake_control(
+            [
+                runtime_observation(ServiceState::Starting, 25, None),
+                runtime_observation(ServiceState::Running, 0, Some(process)),
+            ],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [],
+        );
+        let mut clock = ScriptedWatchdogClock {
+            readings: VecDeque::from([0, 0, 0, WATCHDOG_START_TIMEOUT_MS]),
+            last: 0,
+            sleeps: Vec::new(),
+        };
+
+        assert!(matches!(
+            start_installed_watchdog_with_clock(&mut control, &registration, context(), &mut clock),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        assert_eq!(control.starts, 0);
+    }
+
+    #[test]
+    fn wait_hint_is_clamped_to_bounded_poll_interval() {
+        assert_eq!(watchdog_start_wait(0), Duration::from_millis(25));
+        assert_eq!(watchdog_start_wait(1), Duration::from_millis(25));
+        assert_eq!(watchdog_start_wait(u32::MAX), Duration::from_millis(250));
     }
 }
 

@@ -4789,6 +4789,107 @@ pub enum ServiceRegistrationInspection {
     Unknown,
 }
 
+/// Exact read-only SCM runtime observation for one validated registration.
+///
+/// This is deliberately separate from [`eliot_platform::ServiceObservation`]:
+/// Windows can authoritatively observe a service PID, process creation time,
+/// and image path, but it cannot invent ELIOT's semantic authority epoch.
+/// The configuration digest binds the observation to the complete canonical
+/// service command, account, type, and start-mode request used for readback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceRuntimeObservation {
+    service_name: String,
+    configuration_digest: String,
+    state: ServiceState,
+    checkpoint: u32,
+    wait_hint_ms: u32,
+    process: Option<ProcessIdentity>,
+}
+
+impl ServiceRuntimeObservation {
+    /// Returns the exact canonical SCM service name.
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    /// Returns the digest of the complete configuration admitted during this
+    /// same readback.
+    #[must_use]
+    pub fn configuration_digest(&self) -> &str {
+        &self.configuration_digest
+    }
+
+    /// Returns the current SCM lifecycle state.
+    #[must_use]
+    pub const fn state(&self) -> ServiceState {
+        self.state
+    }
+
+    /// Returns whether SCM reports the service as fully stopped.
+    #[must_use]
+    pub const fn is_stopped(&self) -> bool {
+        matches!(self.state, ServiceState::Stopped)
+    }
+
+    /// Returns whether SCM reports an in-progress start transition.
+    #[must_use]
+    pub const fn is_starting(&self) -> bool {
+        matches!(self.state, ServiceState::Starting)
+    }
+
+    /// Returns whether SCM reports the service as running.
+    #[must_use]
+    pub const fn is_running(&self) -> bool {
+        matches!(self.state, ServiceState::Running)
+    }
+
+    /// Returns whether SCM reports an in-progress stop transition.
+    #[must_use]
+    pub const fn is_stopping(&self) -> bool {
+        matches!(self.state, ServiceState::Stopping)
+    }
+
+    /// Returns the SCM progress checkpoint for a pending transition.
+    #[must_use]
+    pub const fn checkpoint(&self) -> u32 {
+        self.checkpoint
+    }
+
+    /// Returns the SCM provider's bounded-wait hint in milliseconds.
+    #[must_use]
+    pub const fn wait_hint_ms(&self) -> u32 {
+        self.wait_hint_ms
+    }
+
+    /// Returns the handle-observed PID, creation time, and image identity when
+    /// the current state has a live service process.
+    #[must_use]
+    pub const fn process(&self) -> Option<&ProcessIdentity> {
+        self.process.as_ref()
+    }
+}
+
+/// Read-only classification of exact SCM configuration plus runtime state.
+///
+/// `Matching` is returned only when the canonical registration matches and
+/// every process identity required by the observed state is available from a
+/// live process handle. Unknown provider state or an inaccessible live
+/// process remains fail-closed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceRegistrationRuntimeInspection {
+    /// Exact configuration and runtime state were observed together.
+    Matching {
+        observation: ServiceRuntimeObservation,
+    },
+    /// The canonical service name is not registered.
+    Absent,
+    /// The registration or live image differs from the validated request.
+    Mismatched,
+    /// SCM or the live process could not be observed authoritatively.
+    Unknown,
+}
+
 #[cfg(windows)]
 static JOB_OBJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -7714,6 +7815,21 @@ impl WindowsPlatform {
         inspect_service_registration(request)
     }
 
+    /// Reads back the complete canonical registration and its current SCM
+    /// process state without mutating the service.
+    ///
+    /// This is the mechanics observation used to reconcile a single service
+    /// start across `Stopped`, `Starting`, and `Running`. A live PID is never
+    /// accepted alone: creation time and image path are captured through the
+    /// same process handle and compared with the approved registration image.
+    #[must_use]
+    pub fn inspect_service_registration_runtime(
+        &self,
+        request: &ServiceRegistrationRequest,
+    ) -> ServiceRegistrationRuntimeInspection {
+        inspect_service_registration_runtime(request)
+    }
+
     /// Publishes bytes by staging beside the destination and replacing it once.
     ///
     /// # Errors
@@ -10035,6 +10151,195 @@ fn service_config_multi_sz(
 }
 
 #[cfg(windows)]
+fn classify_service_runtime_observation(
+    request: &ServiceRegistrationRequest,
+    state: ServiceState,
+    checkpoint: u32,
+    wait_hint_ms: u32,
+    process_id: u32,
+    process: Option<ProcessIdentity>,
+) -> ServiceRegistrationRuntimeInspection {
+    let requires_process = matches!(state, ServiceState::Running | ServiceState::Stopping);
+    let permits_process = matches!(
+        state,
+        ServiceState::Starting | ServiceState::Running | ServiceState::Stopping
+    );
+    if matches!(
+        state,
+        ServiceState::Unknown | ServiceState::Absent | ServiceState::Failed
+    ) || (!permits_process && process_id != 0)
+        || (requires_process && process_id == 0)
+        || (process_id == 0 && process.is_some())
+        || (process_id != 0 && process.is_none())
+    {
+        return ServiceRegistrationRuntimeInspection::Unknown;
+    }
+    if let Some(process) = &process
+        && (process.process_id != process_id
+            || !process.is_usable()
+            || !same_windows_path(&process.image_path, &exact_path_text(request.binary_path())))
+    {
+        return ServiceRegistrationRuntimeInspection::Mismatched;
+    }
+    ServiceRegistrationRuntimeInspection::Matching {
+        observation: ServiceRuntimeObservation {
+            service_name: request.service_name().to_owned(),
+            configuration_digest: request.expected_configuration_digest(),
+            state,
+            checkpoint,
+            wait_hint_ms,
+            process,
+        },
+    }
+}
+
+#[cfg(windows)]
+const fn service_runtime_sample_is_stable(
+    first_state: u32,
+    first_process_id: u32,
+    confirmed_state: u32,
+    confirmed_process_id: u32,
+) -> bool {
+    first_state == confirmed_state && first_process_id == confirmed_process_id
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the two-sample SCM/config/process identity contour must remain one ordered fail-closed observation"
+)]
+fn inspect_service_registration_runtime(
+    request: &ServiceRegistrationRequest,
+) -> ServiceRegistrationRuntimeInspection {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
+        SC_STATUS_PROCESS_INFO, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+        SERVICE_START_PENDING, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    };
+
+    let name = OsStr::new(request.service_name())
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: null machine/database selects the local SCM; access is query-only.
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return ServiceRegistrationRuntimeInspection::Unknown;
+    }
+    // SAFETY: name is NUL-terminated and manager is a live query handle.
+    let service = unsafe {
+        OpenServiceW(
+            manager,
+            name.as_ptr(),
+            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    };
+    if service.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe { CloseServiceHandle(manager) };
+        return if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST.cast_signed()) {
+            ServiceRegistrationRuntimeInspection::Absent
+        } else {
+            ServiceRegistrationRuntimeInspection::Unknown
+        };
+    }
+
+    let result = (|| {
+        let Some(configuration) = query_service_configuration(service) else {
+            return ServiceRegistrationRuntimeInspection::Unknown;
+        };
+        if !exact_service_configuration_matches(request, &configuration) {
+            return ServiceRegistrationRuntimeInspection::Mismatched;
+        }
+        let mut status = SERVICE_STATUS_PROCESS::default();
+        let mut needed = 0;
+        let status_size =
+            u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>()).unwrap_or(u32::MAX);
+        // SAFETY: status is writable storage and service is a live query handle.
+        if unsafe {
+            QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                (&raw mut status).cast(),
+                status_size,
+                &raw mut needed,
+            )
+        } == 0
+        {
+            return ServiceRegistrationRuntimeInspection::Unknown;
+        }
+        let process = (status.dwProcessId != 0)
+            .then(|| inspect_process_identity(status.dwProcessId).ok())
+            .flatten();
+        let mut confirmed_status = SERVICE_STATUS_PROCESS::default();
+        let mut confirmed_needed = 0;
+        // Re-read SCM after opening the process. A stop/restart or PID reuse
+        // between the first status sample and handle-bound identity capture
+        // must never be published as one atomic Running observation.
+        if unsafe {
+            QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                (&raw mut confirmed_status).cast(),
+                status_size,
+                &raw mut confirmed_needed,
+            )
+        } == 0
+            || !service_runtime_sample_is_stable(
+                status.dwCurrentState,
+                status.dwProcessId,
+                confirmed_status.dwCurrentState,
+                confirmed_status.dwProcessId,
+            )
+        {
+            return ServiceRegistrationRuntimeInspection::Unknown;
+        }
+        let Some(confirmed_configuration) = query_service_configuration(service) else {
+            return ServiceRegistrationRuntimeInspection::Unknown;
+        };
+        if !exact_service_configuration_matches(request, &confirmed_configuration) {
+            return ServiceRegistrationRuntimeInspection::Mismatched;
+        }
+        let confirmed_process = (confirmed_status.dwProcessId != 0)
+            .then(|| inspect_process_identity(confirmed_status.dwProcessId).ok())
+            .flatten();
+        if process != confirmed_process {
+            return ServiceRegistrationRuntimeInspection::Unknown;
+        }
+        let state = match confirmed_status.dwCurrentState {
+            SERVICE_STOPPED => ServiceState::Stopped,
+            SERVICE_START_PENDING => ServiceState::Starting,
+            SERVICE_RUNNING => ServiceState::Running,
+            SERVICE_STOP_PENDING => ServiceState::Stopping,
+            _ => ServiceState::Unknown,
+        };
+        classify_service_runtime_observation(
+            request,
+            state,
+            confirmed_status.dwCheckPoint,
+            confirmed_status.dwWaitHint,
+            confirmed_status.dwProcessId,
+            confirmed_process,
+        )
+    })();
+    unsafe {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn inspect_service_registration_runtime(
+    _request: &ServiceRegistrationRequest,
+) -> ServiceRegistrationRuntimeInspection {
+    ServiceRegistrationRuntimeInspection::Unknown
+}
+
+#[cfg(windows)]
 fn inspect_service_registration(
     request: &ServiceRegistrationRequest,
 ) -> ServiceRegistrationInspection {
@@ -10715,30 +11020,62 @@ pub fn observe_running_eliot_host_process()
         unsafe { CloseServiceHandle(manager) };
         return Err(last_windows_adapter_error());
     }
-    let mut status = SERVICE_STATUS_PROCESS::default();
-    let mut needed = 0;
-    let status_bytes = u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>())
-        .map_err(|_| WindowsAdapterError::Failed)?;
-    let ok = unsafe {
-        QueryServiceStatusEx(
-            service,
-            SC_STATUS_PROCESS_INFO,
-            (&raw mut status).cast(),
-            status_bytes,
-            &raw mut needed,
-        )
-    };
+    let result = (|| {
+        let mut status = SERVICE_STATUS_PROCESS::default();
+        let mut needed = 0;
+        let status_bytes = u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>())
+            .map_err(|_| WindowsAdapterError::Failed)?;
+        if unsafe {
+            QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                (&raw mut status).cast(),
+                status_bytes,
+                &raw mut needed,
+            )
+        } == 0
+        {
+            return Err(last_windows_adapter_error());
+        }
+        if status.dwCurrentState != SERVICE_RUNNING || status.dwProcessId == 0 {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let binding = observe_named_pipe_peer_process(status.dwProcessId)?;
+        let mut confirmed_status = SERVICE_STATUS_PROCESS::default();
+        let mut confirmed_needed = 0;
+        if unsafe {
+            QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                (&raw mut confirmed_status).cast(),
+                status_bytes,
+                &raw mut confirmed_needed,
+            )
+        } == 0
+        {
+            return Err(last_windows_adapter_error());
+        }
+        if confirmed_status.dwCurrentState != SERVICE_RUNNING
+            || !service_runtime_sample_is_stable(
+                status.dwCurrentState,
+                status.dwProcessId,
+                confirmed_status.dwCurrentState,
+                confirmed_status.dwProcessId,
+            )
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let confirmed_binding = observe_named_pipe_peer_process(confirmed_status.dwProcessId)?;
+        if confirmed_binding != binding {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(binding)
+    })();
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
     }
-    if ok == 0 {
-        return Err(last_windows_adapter_error());
-    }
-    if status.dwCurrentState != SERVICE_RUNNING || status.dwProcessId == 0 {
-        return Err(WindowsAdapterError::IdentityMismatch);
-    }
-    observe_named_pipe_peer_process(status.dwProcessId)
+    result
 }
 
 #[cfg(not(windows))]
@@ -12297,6 +12634,105 @@ mod tests {
             }),
             ServiceRegistrationInspection::Unknown
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_runtime_service_observation_requires_handle_bound_live_identity() {
+        let image = std::env::current_exe().unwrap_or_else(|_| unreachable!());
+        let request = ServiceRegistrationRequest::new(
+            ELIOT_HOST_SERVICE_NAME,
+            ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            &image,
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let running = ProcessIdentity {
+            process_id: 41,
+            start_time_100ns: 99,
+            image_path: image.to_string_lossy().into_owned(),
+        };
+
+        let ServiceRegistrationRuntimeInspection::Matching { observation } =
+            classify_service_runtime_observation(&request, ServiceState::Stopped, 0, 0, 0, None)
+        else {
+            unreachable!();
+        };
+        assert_eq!(observation.state(), ServiceState::Stopped);
+        assert!(observation.process().is_none());
+        assert_eq!(
+            observation.configuration_digest(),
+            request.expected_configuration_digest()
+        );
+
+        let ServiceRegistrationRuntimeInspection::Matching { observation } =
+            classify_service_runtime_observation(
+                &request,
+                ServiceState::Starting,
+                3,
+                250,
+                running.process_id,
+                Some(running.clone()),
+            )
+        else {
+            unreachable!();
+        };
+        assert_eq!(observation.checkpoint(), 3);
+        assert_eq!(observation.wait_hint_ms(), 250);
+        assert_eq!(observation.process(), Some(&running));
+
+        assert!(matches!(
+            classify_service_runtime_observation(
+                &request,
+                ServiceState::Running,
+                0,
+                0,
+                running.process_id,
+                Some(running),
+            ),
+            ServiceRegistrationRuntimeInspection::Matching { .. }
+        ));
+        assert_eq!(
+            classify_service_runtime_observation(&request, ServiceState::Running, 0, 0, 41, None,),
+            ServiceRegistrationRuntimeInspection::Unknown
+        );
+        assert_eq!(
+            classify_service_runtime_observation(
+                &request,
+                ServiceState::Stopped,
+                0,
+                0,
+                41,
+                Some(ProcessIdentity {
+                    process_id: 41,
+                    start_time_100ns: 99,
+                    image_path: image.to_string_lossy().into_owned(),
+                }),
+            ),
+            ServiceRegistrationRuntimeInspection::Unknown
+        );
+        assert_eq!(
+            classify_service_runtime_observation(
+                &request,
+                ServiceState::Running,
+                0,
+                0,
+                41,
+                Some(ProcessIdentity {
+                    process_id: 41,
+                    start_time_100ns: 99,
+                    image_path: image
+                        .with_file_name("substituted.exe")
+                        .to_string_lossy()
+                        .into_owned(),
+                }),
+            ),
+            ServiceRegistrationRuntimeInspection::Mismatched
+        );
+        assert!(service_runtime_sample_is_stable(4, 41, 4, 41));
+        assert!(!service_runtime_sample_is_stable(4, 41, 1, 0));
+        assert!(!service_runtime_sample_is_stable(2, 41, 2, 42));
     }
 
     #[test]
