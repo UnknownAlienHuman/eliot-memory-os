@@ -445,8 +445,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        OpaqueLabel, OperationIdentity, RedbRecoveryStore, SupervisionLeaseBinding,
-        SupervisionLeaseOperation, SupervisionLeasePrepareRequest,
+        OpaqueLabel, RedbRecoveryStore, SupervisionLeaseBinding, SupervisionLeaseOperation,
+        SupervisionLeasePrepareRequest,
     };
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -521,6 +521,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn anchor_and_context(
         snap: &SupervisionLeaseSnapshot,
         now_ms: u64,
@@ -973,7 +974,7 @@ mod tests {
                 revocation_epoch: None,
             },
         };
-        let mut wrong_signer =
+        let wrong_signer =
             Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [9; 32])
                 .unwrap();
         let wrong_anchor = SupervisionTrustAnchor::new(
@@ -1152,6 +1153,402 @@ mod tests {
         assert!(matches!(res, Err(OrsSupervisionStatusError::Corrupt(_))));
         let after = fs::read(&p).unwrap();
         assert_eq!(before, after);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn empty_file_without_tables_is_not_healthy_and_read_only() {
+        let p = path("empty-no-tables");
+        cleanup(&p);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let signer =
+            Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])
+                .unwrap();
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .unwrap();
+        let ctx = SupervisionLeaseVerificationContext {
+            now_ms: 101,
+            lease_id: "lease-1".to_owned(),
+            host_epoch: AuthorityEpoch::new(1).unwrap(),
+            activation_id: "activation-1".to_owned(),
+            activation_generation: ResourceGeneration::new(1).unwrap(),
+            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
+            state_fence: StateFence::new(
+                AuthorityEpoch::new(2).unwrap(),
+                ResourceGeneration::new(1).unwrap(),
+            ),
+            scope_ref: "scope-supervision".to_owned(),
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["target-1".to_owned()],
+                sensor_profile: "kernel-heartbeat".to_owned(),
+                claimed_coverage: vec!["process".to_owned()],
+                governance_axis: "runtime-live".to_owned(),
+            },
+            target_id: "target-1".to_owned(),
+            module_id: "module-1".to_owned(),
+            process_id: "kernel-process-1".to_owned(),
+            target_generation: ResourceGeneration::new(1).unwrap(),
+            module_generation: ResourceGeneration::new(1).unwrap(),
+            process_generation: ResourceGeneration::new(1).unwrap(),
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: SupervisionOrsMirrorBinding {
+                record_id: "lease-1::r00000000000000000001".to_owned(),
+                subject_lease_id: "lease-1".to_owned(),
+                lease_revision: 1,
+                ticket_sha256: "aa".repeat(32),
+                previous_receipt_sha256: None,
+            },
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: LeaseState::Active,
+                revocation_id: None,
+                revocation_epoch: None,
+            },
+        };
+        let proj = observe_supervision_status(&p, &anchor, &ctx).unwrap();
+        assert_eq!(proj.health, HealthDimension::Failed);
+        assert_eq!(proj.reason, SupervisionStatusReason::MissingCurrent);
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn legacy_schema_is_migration_required_and_read_only() {
+        let p = path("legacy");
+        cleanup(&p);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let _ = write.open_table(SUPERVISION_LEASE_CURRENT).unwrap();
+                let _ = write
+                    .open_table(TableDefinition::<&str, &str>::new("ors_meta_v1"))
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let signer =
+            Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])
+                .unwrap();
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .unwrap();
+        let ctx = SupervisionLeaseVerificationContext {
+            now_ms: 101,
+            lease_id: "lease-1".to_owned(),
+            host_epoch: AuthorityEpoch::new(1).unwrap(),
+            activation_id: "activation-1".to_owned(),
+            activation_generation: ResourceGeneration::new(1).unwrap(),
+            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
+            state_fence: StateFence::new(
+                AuthorityEpoch::new(2).unwrap(),
+                ResourceGeneration::new(1).unwrap(),
+            ),
+            scope_ref: "scope-supervision".to_owned(),
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["target-1".to_owned()],
+                sensor_profile: "kernel-heartbeat".to_owned(),
+                claimed_coverage: vec!["process".to_owned()],
+                governance_axis: "runtime-live".to_owned(),
+            },
+            target_id: "target-1".to_owned(),
+            module_id: "module-1".to_owned(),
+            process_id: "kernel-process-1".to_owned(),
+            target_generation: ResourceGeneration::new(1).unwrap(),
+            module_generation: ResourceGeneration::new(1).unwrap(),
+            process_generation: ResourceGeneration::new(1).unwrap(),
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: SupervisionOrsMirrorBinding {
+                record_id: "lease-1::r00000000000000000001".to_owned(),
+                subject_lease_id: "lease-1".to_owned(),
+                lease_revision: 1,
+                ticket_sha256: "aa".repeat(32),
+                previous_receipt_sha256: None,
+            },
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: LeaseState::Active,
+                revocation_id: None,
+                revocation_epoch: None,
+            },
+        };
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(matches!(
+            res,
+            Err(OrsSupervisionStatusError::MigrationRequired(_))
+        ));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn unrelated_redb_is_migration_required_and_read_only() {
+        let p = path("unrelated");
+        cleanup(&p);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut t = write
+                    .open_table(TableDefinition::<&str, &str>::new("ors_envelopes_v1"))
+                    .unwrap();
+                t.insert("k", "v").unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let signer =
+            Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])
+                .unwrap();
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .unwrap();
+        let ctx = SupervisionLeaseVerificationContext {
+            now_ms: 101,
+            lease_id: "lease-1".to_owned(),
+            host_epoch: AuthorityEpoch::new(1).unwrap(),
+            activation_id: "activation-1".to_owned(),
+            activation_generation: ResourceGeneration::new(1).unwrap(),
+            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
+            state_fence: StateFence::new(
+                AuthorityEpoch::new(2).unwrap(),
+                ResourceGeneration::new(1).unwrap(),
+            ),
+            scope_ref: "scope-supervision".to_owned(),
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["target-1".to_owned()],
+                sensor_profile: "kernel-heartbeat".to_owned(),
+                claimed_coverage: vec!["process".to_owned()],
+                governance_axis: "runtime-live".to_owned(),
+            },
+            target_id: "target-1".to_owned(),
+            module_id: "module-1".to_owned(),
+            process_id: "kernel-process-1".to_owned(),
+            target_generation: ResourceGeneration::new(1).unwrap(),
+            module_generation: ResourceGeneration::new(1).unwrap(),
+            process_generation: ResourceGeneration::new(1).unwrap(),
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: SupervisionOrsMirrorBinding {
+                record_id: "lease-1::r00000000000000000001".to_owned(),
+                subject_lease_id: "lease-1".to_owned(),
+                lease_revision: 1,
+                ticket_sha256: "aa".repeat(32),
+                previous_receipt_sha256: None,
+            },
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: LeaseState::Active,
+                revocation_id: None,
+                revocation_epoch: None,
+            },
+        };
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(matches!(
+            res,
+            Err(OrsSupervisionStatusError::MigrationRequired(_))
+        ));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn terminal_lease_is_not_healthy_and_read_only() {
+        let p = path("terminal");
+        cleanup(&p);
+        let store = RedbRecoveryStore::open(&p).unwrap();
+        let stage = store
+            .prepare_supervision_lease(request(
+                "t1",
+                "o1",
+                "lease-1",
+                None,
+                SupervisionLeaseOperation::Commit,
+                binding(LeaseState::Active, 100),
+            ))
+            .unwrap();
+        let signer =
+            Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])
+                .unwrap();
+        let envelope = stage
+            .ticket
+            .expected_payload()
+            .unwrap()
+            .sign(&signer)
+            .unwrap();
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .unwrap();
+        let payload = &envelope.payload;
+        let generation = &payload.generation_binding;
+        let ctx_active = SupervisionLeaseVerificationContext {
+            now_ms: 101,
+            lease_id: payload.lease_id.clone(),
+            host_epoch: payload.host_epoch,
+            activation_id: payload.activation_id.clone(),
+            activation_generation: payload.activation_generation,
+            kernel_epoch: payload.kernel_epoch,
+            watchdog_epoch: payload.watchdog_epoch,
+            state_fence: payload.state_fence.clone(),
+            scope_ref: payload.scope_ref.clone(),
+            observation_scope: payload.observation_scope.clone(),
+            target_id: generation.target_id.clone(),
+            module_id: generation.module_id.clone(),
+            process_id: generation.process_id.clone(),
+            target_generation: generation.target_generation,
+            module_generation: generation.module_generation,
+            process_generation: generation.process_generation,
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: payload.ors_mirror.clone(),
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: payload.state,
+                revocation_id: None,
+                revocation_epoch: None,
+            },
+        };
+        let verified = anchor.verify(&envelope, &ctx_active).unwrap();
+        let committed = store
+            .commit_supervision_lease(&stage.ticket, &verified)
+            .unwrap();
+        let prior_active = verified;
+        let predecessor = eliot_runtime_contracts::SupervisionLeasePredecessorProof {
+            lease_id: committed.record.lease_id.as_str().to_owned(),
+            record_id: committed.record.record_id.as_str().to_owned(),
+            lease_revision: committed.record.revision,
+            receipt_sha256: committed.receipt.receipt_sha256.clone(),
+            envelope_sha256: prior_active.envelope_digest().to_owned(),
+        };
+        let stage2 = store
+            .prepare_supervision_lease(request(
+                "t2",
+                "o2",
+                "lease-1",
+                Some(1),
+                SupervisionLeaseOperation::Revoke,
+                SupervisionLeaseBinding {
+                    scope_ref: label("scope-supervision"),
+                    observation_scope: SupervisionObservationScope {
+                        targets: vec!["target-1".to_owned()],
+                        sensor_profile: "kernel-heartbeat".to_owned(),
+                        claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                        governance_axis: "runtime-live".to_owned(),
+                    },
+                    installation_id: label("installation-1"),
+                    host_epoch: AuthorityEpoch::new(1).unwrap(),
+                    activation_id: label("activation-1"),
+                    activation_generation: ResourceGeneration::new(1).unwrap(),
+                    kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+                    watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
+                    generation_binding: SupervisionGenerationBinding {
+                        target_id: "target-1".to_owned(),
+                        target_generation: ResourceGeneration::new(1).unwrap(),
+                        module_id: "module-1".to_owned(),
+                        module_generation: ResourceGeneration::new(1).unwrap(),
+                        process_id: "kernel-process-1".to_owned(),
+                        process_generation: ResourceGeneration::new(1).unwrap(),
+                    },
+                    state_fence: StateFence::new(
+                        AuthorityEpoch::new(2).unwrap(),
+                        ResourceGeneration::new(1).unwrap(),
+                    ),
+                    issued_at_ms: 100,
+                    expires_at_ms: 1000,
+                    renew_before_ms: 550,
+                    wake_policy: RegisteredActivityWakePolicy::Disabled,
+                    state: LeaseState::Revoked,
+                    terminal_disposition: Some(
+                        eliot_runtime_contracts::SupervisionLeaseTerminalDisposition::Revoked,
+                    ),
+                    revocation_reason: Some("revoked".to_owned()),
+                    revocation_id: Some("rev-1".to_owned()),
+                    revocation_epoch: Some(AuthorityEpoch::new(2).unwrap()),
+                },
+            ))
+            .unwrap();
+        let envelope2 = stage2
+            .ticket
+            .expected_payload()
+            .unwrap()
+            .sign(&signer)
+            .unwrap();
+        let terminal_verified = anchor
+            .verify_terminal_transition(&prior_active, &envelope2, &predecessor)
+            .unwrap();
+        store
+            .commit_terminal_supervision_lease(&stage2.ticket, &terminal_verified)
+            .unwrap();
+        drop(store);
+        let before = file_bytes_and_mtime(&p);
+        let ctx_terminal = SupervisionLeaseVerificationContext {
+            now_ms: 200,
+            lease_id: "lease-1".to_owned(),
+            host_epoch: AuthorityEpoch::new(1).unwrap(),
+            activation_id: "activation-1".to_owned(),
+            activation_generation: ResourceGeneration::new(1).unwrap(),
+            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
+            state_fence: StateFence::new(
+                AuthorityEpoch::new(2).unwrap(),
+                ResourceGeneration::new(1).unwrap(),
+            ),
+            scope_ref: "scope-supervision".to_owned(),
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["target-1".to_owned()],
+                sensor_profile: "kernel-heartbeat".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live".to_owned(),
+            },
+            target_id: "target-1".to_owned(),
+            module_id: "module-1".to_owned(),
+            process_id: "kernel-process-1".to_owned(),
+            target_generation: ResourceGeneration::new(1).unwrap(),
+            module_generation: ResourceGeneration::new(1).unwrap(),
+            process_generation: ResourceGeneration::new(1).unwrap(),
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: envelope2.payload.ors_mirror.clone(),
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: LeaseState::Revoked,
+                revocation_id: Some("rev-1".to_owned()),
+                revocation_epoch: Some(AuthorityEpoch::new(2).unwrap()),
+            },
+        };
+        let proj = observe_supervision_status(&p, &anchor, &ctx_terminal).unwrap();
+        assert_eq!(proj.health, HealthDimension::Failed);
+        assert!(matches!(
+            proj.reason,
+            SupervisionStatusReason::BindingMismatch(_)
+        ));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
         cleanup(&p);
     }
 }
