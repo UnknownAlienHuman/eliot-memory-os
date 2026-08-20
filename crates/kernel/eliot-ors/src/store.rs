@@ -750,6 +750,36 @@ impl RedbRecoveryStore {
         write.commit().map_err(storage)
     }
 
+    pub fn abort_store_rebind(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<bool, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let removed = {
+            let mut table = write.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
+            let pending_bytes = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|v| v.value().to_owned());
+            if let Some(bytes) = pending_bytes {
+                let existing: crate::StoreRebindReplayRecord = decode(&bytes)?;
+                existing.validate()?;
+                if existing.state == crate::StoreRebindReplayState::Pending {
+                    table.remove(key.as_str()).map_err(storage)?;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(removed)
+    }
+
     pub fn load_all_store_rebinds(&self) -> Result<Vec<crate::StoreRebindReplayRecord>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
         let table = read.open_table(STORE_REBIND_REPLAY).map_err(storage)?;

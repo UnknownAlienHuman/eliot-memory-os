@@ -3564,37 +3564,10 @@ impl KernelComposition {
                 ));
             }
         }
-        {
-            let requirement_digest = {
-                let bytes = serde_json::to_vec(&handoff.requirement)
-                    .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-                format!("{:x}", Sha256::digest(&bytes))
-            };
-            let pending = eliot_ors::StoreRebindReplayRecord {
-                operation_id: eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
-                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
-                request_digest: request_digest.clone(),
-                candidate_binding_digest: handoff.candidate_binding_digest.clone(),
-                store_fence: handoff.store_fence.clone(),
-                requirement_digest: requirement_digest.clone(),
-                process_id: handoff.process_binding.process.process_id,
-                process_start_time_100ns: handoff.process_binding.process.start_time_100ns,
-                process_image_path: handoff.process_binding.process.image_path.clone(),
-                job_name: handoff.process_binding.job.as_str().to_owned(),
-                generation: handoff.generation.value(),
-                authority_epoch: handoff.authority_epoch.value(),
-                state: eliot_ors::StoreRebindReplayState::Pending,
-                receipt: None,
-            };
-            self.generation_gateway
-                .ors
-                .begin_store_rebind(&pending)
-                .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-        }
         let gateway = std::sync::Arc::new(KernelStoreGateway::new(
             self.service.clone(),
             std::sync::Arc::new(client),
-            route,
+            route.clone(),
         ));
         let attachment: Box<dyn CanonicalStoreAttachmentTransaction> = self
             .process_gateway
@@ -3635,6 +3608,45 @@ impl KernelComposition {
             svc.rebind_store(&handoff, request_digest.clone())
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?
         };
+        if let Some(pg) = self.process_gateway.as_ref()
+            && let Ok(guard) = pg.canonical_store.lock()
+            && let Some(old) = guard.as_ref()
+            && !Arc::ptr_eq(old, &gateway)
+        {
+            old.fence();
+        }
+        if let Ok(guard) = self.canonical_store_gateway.lock()
+            && let Some(old) = guard.as_ref()
+        {
+            old.fence();
+        }
+        {
+            let requirement_digest = {
+                let bytes = serde_json::to_vec(&handoff.requirement)
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+                format!("{:x}", Sha256::digest(&bytes))
+            };
+            let pending = eliot_ors::StoreRebindReplayRecord {
+                operation_id: eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
+                request_digest: request_digest.clone(),
+                candidate_binding_digest: handoff.candidate_binding_digest.clone(),
+                store_fence: handoff.store_fence.clone(),
+                requirement_digest: requirement_digest.clone(),
+                process_id: handoff.process_binding.process.process_id,
+                process_start_time_100ns: handoff.process_binding.process.start_time_100ns,
+                process_image_path: handoff.process_binding.process.image_path.clone(),
+                job_name: handoff.process_binding.job.as_str().to_owned(),
+                generation: handoff.generation.value(),
+                authority_epoch: handoff.authority_epoch.value(),
+                state: eliot_ors::StoreRebindReplayState::Pending,
+                receipt: None,
+            };
+            self.generation_gateway
+                .ors
+                .begin_store_rebind(&pending)
+                .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+        }
         let committed_result = {
             let requirement_digest = {
                 let bytes = serde_json::to_vec(&handoff.requirement)
@@ -3669,6 +3681,9 @@ impl KernelComposition {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 svc.rollback_store_rebind_for_recovery_failure();
+            }
+            if let Ok(op) = eliot_ors::OperationIdentity::new(handoff.operation_id.as_str()) {
+                let _ = self.generation_gateway.ors.abort_store_rebind(&op, &request_digest);
             }
             return Err(error);
         }

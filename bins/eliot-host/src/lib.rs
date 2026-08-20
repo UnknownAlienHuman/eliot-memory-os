@@ -2408,28 +2408,6 @@ impl HostJobBranches {
                     && record.authority_epoch == candidate.kernel_epoch.value()
             })
         });
-        let operation_id = fresh_identity("store-rebind")?;
-        let handoff = StoreRebindHandoff {
-            operation_id: operation_id.clone(),
-            request_digest: "0".repeat(64),
-            requirement: requirement.clone(),
-            process_binding: StoreProcessBinding {
-                process: HostProcessBinding {
-                    process_id: store_process.process_id,
-                    start_time_100ns: store_process.start_time_100ns,
-                    image_path: store_process.image_path.clone(),
-                },
-                job: PlatformHandle::new(store.job_identity().name())
-                    .map_err(|error| HostError::ProcessContour(error.to_string()))?,
-            },
-            candidate_binding_digest: candidate_digest.clone(),
-            generation: launch.authority_generation,
-            authority_epoch: candidate.kernel_epoch,
-            store_fence: store_fence.clone(),
-        };
-        handoff
-            .validate()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2550,7 +2528,33 @@ impl HostJobBranches {
                     append_reconciled(journal, HostStateRecord::StoreRebind(committed_record))?;
                     return Ok(receipt);
                 }
+                return Err(HostError::RecoveryRequired(
+                    "store rebind pending requires successful query before fresh operation"
+                        .to_owned(),
+                ));
             }
+            let operation_id = fresh_identity("store-rebind")?;
+            let handoff = StoreRebindHandoff {
+                operation_id: operation_id.clone(),
+                request_digest: "0".repeat(64),
+                requirement: requirement.clone(),
+                process_binding: StoreProcessBinding {
+                    process: HostProcessBinding {
+                        process_id: store_process.process_id,
+                        start_time_100ns: store_process.start_time_100ns,
+                        image_path: store_process.image_path.clone(),
+                    },
+                    job: PlatformHandle::new(store.job_identity().name())
+                        .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+                },
+                candidate_binding_digest: candidate_digest.clone(),
+                generation: launch.authority_generation,
+                authority_epoch: candidate.kernel_epoch,
+                store_fence: store_fence.clone(),
+            };
+            handoff
+                .validate()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let mut handoff_with_digest = handoff.clone();
             let canonical = handoff_with_digest
                 .canonical_request_digest()
