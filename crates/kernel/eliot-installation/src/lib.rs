@@ -76,8 +76,11 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 ///
 /// This discriminator is intentionally independent from [`CONTRACT_VERSION`]
 /// so durable transaction records fail closed when their nested candidate
-/// manifest predates the required Host artifact binding.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(8, 0, 0);
+/// manifest predates the required Host artifact binding.  Version 9 adds the
+/// private, durable activation-receipt binding: a transaction cannot be
+/// re-opened as `ActiveVerified` without the exact registry terminal that
+/// committed it.
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(9, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -2513,6 +2516,19 @@ impl CandidateManifest {
 ///     approval.approval_ref = PlatformHandle::new("forged").unwrap();
 /// }
 /// ```
+///
+/// The approval is also intentionally not deserializable by callers. Only the
+/// private registry wire decoder may reconstruct a durable approval record;
+/// external JSON must first pass through the signed-authority verification
+/// lane.
+///
+/// ```compile_fail
+/// use eliot_installation::InstallationActivationApproval;
+///
+/// fn forge_from_json(bytes: &str) {
+///     let _: InstallationActivationApproval = serde_json::from_str(bytes).unwrap();
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallationActivationApproval {
@@ -2762,6 +2778,111 @@ impl ActivationCommitFence {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(())
+    }
+}
+
+/// An opaque proof that the installation registry has durably committed one
+/// exact pending activation.
+///
+/// The fields and constructor are private on purpose.  A caller can obtain a
+/// value only by asking a [`RedbInstallationRegistry`] to read its committed
+/// terminal projection.  In particular, serializing a Host-authored
+/// [`ActivationCommitFence`] is not sufficient to manufacture this proof.
+/// The proof is consumed by the transaction-store reconciliation boundary,
+/// which is the only owner allowed to advance the durable transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationCommitReceipt {
+    transaction_id: PlatformHandle,
+    plan_digest: PlatformHandle,
+    generation: PlatformHandle,
+    candidate_manifest_digest: PlatformHandle,
+    commit_fence: ActivationCommitFence,
+    registry_revision: u64,
+    terminal_digest: PlatformHandle,
+}
+
+impl ActivationCommitReceipt {
+    fn validate_against_transaction(
+        &self,
+        transaction: &InstallationTransaction,
+    ) -> Result<(), InstallationError> {
+        self.commit_fence
+            .validate_against_manifest(&transaction.candidate_manifest)?;
+        let expected_manifest_digest = candidate_manifest_digest(&transaction.candidate_manifest)?;
+        if self.transaction_id != transaction.transaction_id
+            || self.plan_digest != transaction.installer_plan_digest
+            || self.generation != transaction.candidate_manifest.generation
+            || self.candidate_manifest_digest != expected_manifest_digest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        sha256_handle(
+            &self.terminal_digest,
+            "activation_commit_receipt.terminal_digest",
+        )?;
+        if self.registry_revision == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "activation_commit_receipt.registry_revision".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn binding(self) -> ActiveVerifiedReceiptBinding {
+        ActiveVerifiedReceiptBinding {
+            transaction_id: self.transaction_id,
+            plan_digest: self.plan_digest,
+            generation: self.generation,
+            candidate_manifest_digest: self.candidate_manifest_digest,
+            commit_fence: self.commit_fence,
+            registry_revision: self.registry_revision,
+            terminal_digest: self.terminal_digest,
+        }
+    }
+}
+
+/// The private durable form of [`ActivationCommitReceipt`] retained after the
+/// transaction crosses the activation boundary.  It is deliberately part of
+/// the v9 transaction wire so a retry can distinguish the exact original
+/// registry terminal from a different fence or a stale epoch.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveVerifiedReceiptBinding {
+    transaction_id: PlatformHandle,
+    plan_digest: PlatformHandle,
+    generation: PlatformHandle,
+    candidate_manifest_digest: PlatformHandle,
+    commit_fence: ActivationCommitFence,
+    registry_revision: u64,
+    terminal_digest: PlatformHandle,
+}
+
+impl ActiveVerifiedReceiptBinding {
+    fn validate_against_transaction(
+        &self,
+        transaction: &InstallationTransaction,
+    ) -> Result<(), InstallationError> {
+        let receipt = ActivationCommitReceipt {
+            transaction_id: self.transaction_id.clone(),
+            plan_digest: self.plan_digest.clone(),
+            generation: self.generation.clone(),
+            candidate_manifest_digest: self.candidate_manifest_digest.clone(),
+            commit_fence: self.commit_fence.clone(),
+            registry_revision: self.registry_revision,
+            terminal_digest: self.terminal_digest.clone(),
+        };
+        receipt.validate_against_transaction(transaction)
+    }
+
+    fn matches_receipt(&self, receipt: &ActivationCommitReceipt) -> bool {
+        self.transaction_id == receipt.transaction_id
+            && self.plan_digest == receipt.plan_digest
+            && self.generation == receipt.generation
+            && self.candidate_manifest_digest == receipt.candidate_manifest_digest
+            && self.commit_fence == receipt.commit_fence
+            && self.registry_revision == receipt.registry_revision
+            && self.terminal_digest == receipt.terminal_digest
     }
 }
 
@@ -4022,6 +4143,70 @@ impl RedbInstallationRegistry {
         Ok(registry)
     }
 
+    /// Reads one exact committed activation terminal without mutating the
+    /// registry. The returned opaque receipt can only be produced from this
+    /// read path and binds the transaction, plan, generation, candidate
+    /// manifest, commit fence, registry revision and terminal digest.
+    pub fn read_committed_activation_receipt(
+        &self,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        generation: &PlatformHandle,
+    ) -> Result<ActivationCommitReceipt, InstallationError> {
+        let registry = self.load()?;
+        let terminal = registry.last_terminal_activation.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "no committed terminal activation exists".to_owned(),
+            )
+        })?;
+        if terminal.disposition != PendingActivationTerminalDisposition::Committed {
+            return Err(InstallationError::IncompleteObservation(
+                "last terminal activation is not committed".to_owned(),
+            ));
+        }
+        if terminal.transaction_id != *transaction_id
+            || terminal.plan_digest != *plan_digest
+            || terminal.generation != *generation
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if registry.active_generation.as_ref() != Some(generation) {
+            return Err(InstallationError::IncompleteObservation(
+                "committed terminal is not the active registry generation".to_owned(),
+            ));
+        }
+        let manifest = registry
+            .generations
+            .iter()
+            .find(|item| item.manifest.generation == *generation)
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "committed terminal generation is not approved".to_owned(),
+                )
+            })?;
+        let commit_fence = terminal.commit_fence.clone().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "committed terminal is missing its activation fence".to_owned(),
+            )
+        })?;
+        commit_fence.validate_against_manifest(&manifest.manifest)?;
+        let receipt = ActivationCommitReceipt {
+            transaction_id: terminal.transaction_id.clone(),
+            plan_digest: terminal.plan_digest.clone(),
+            generation: terminal.generation.clone(),
+            candidate_manifest_digest: candidate_manifest_digest(&manifest.manifest)?,
+            commit_fence,
+            registry_revision: registry.revision,
+            terminal_digest: activation_terminal_digest(terminal)?,
+        };
+        receipt.commit_fence.validate()?;
+        sha256_handle(
+            &receipt.terminal_digest,
+            "activation_commit_receipt.terminal_digest",
+        )?;
+        Ok(receipt)
+    }
+
     /// Loads the sealed transaction and atomically stages its exact pending
     /// activation plus installer-owned SCM approvals.
     ///
@@ -5107,6 +5292,19 @@ fn candidate_manifest_digest(
     })?;
     PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
         field: "pending_activation.manifest_digest".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+fn activation_terminal_digest(
+    terminal: &PendingActivationTerminal,
+) -> Result<PlatformHandle, InstallationError> {
+    let bytes =
+        serde_json::to_vec(terminal).map_err(|error| InstallationError::CorruptRegistry {
+            reason: format!("committed activation terminal could not be canonicalized: {error}"),
+        })?;
+    PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+        field: "activation_commit_receipt.terminal_digest".to_owned(),
         reason: error.to_string(),
     })
 }
@@ -6305,7 +6503,19 @@ pub struct InstallationEffectProgress {
 ///     transaction.stage = InstallationStage::Completed;
 /// }
 /// ```
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+///
+/// The raw stage transition is crate-private. In particular, callers cannot
+/// compile an arbitrary `ActiveVerified` advance; the public replacement
+/// requires an opaque [`ActivationCommitReceipt`].
+///
+/// ```compile_fail
+/// use eliot_installation::{InstallationStage, InstallationTransaction};
+///
+/// fn forge_active(transaction: &mut InstallationTransaction) {
+///     transaction.advance(InstallationStage::ActiveVerified, Vec::new());
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallationTransaction {
     /// Required breaking discriminator for this transaction projection only.
@@ -6350,6 +6560,9 @@ pub struct InstallationTransaction {
     pub no_return_boundary: Option<PlatformHandle>,
     /// Observed postconditions.
     pub observed_postconditions: Vec<PlatformHandle>,
+    /// Exact registry terminal that authorized `ActiveVerified`, retained as
+    /// a private v9 binding for crash/retry reconciliation.
+    active_verified_receipt: Option<ActiveVerifiedReceiptBinding>,
     /// Operator recovery command/reference.
     pub recovery_command: PlatformHandle,
     /// Monotonic state revision.
@@ -6482,6 +6695,7 @@ impl InstallationTransaction {
             last_known_good: None,
             no_return_boundary: None,
             observed_postconditions: Vec::new(),
+            active_verified_receipt: None,
             recovery_command,
             revision: 1,
         })
@@ -6755,6 +6969,31 @@ impl InstallationTransaction {
             "observed_postconditions",
             false,
         )?;
+        match (&self.stage, &self.active_verified_receipt) {
+            (
+                InstallationStage::ActiveVerified
+                | InstallationStage::Cleaning
+                | InstallationStage::Completed,
+                Some(receipt),
+            ) => receipt.validate_against_transaction(self)?,
+            (
+                InstallationStage::ActiveVerified
+                | InstallationStage::Cleaning
+                | InstallationStage::Completed,
+                None,
+            ) => {
+                return Err(InstallationError::IncompleteObservation(
+                    "active/completed transaction requires the exact committed activation receipt"
+                        .to_owned(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(InstallationError::IncompleteObservation(
+                    "activation receipt cannot exist before ActiveVerified".to_owned(),
+                ));
+            }
+            (_, None) => {}
+        }
         if matches!(
             self.stage,
             InstallationStage::ActiveVerified | InstallationStage::Completed
@@ -7154,6 +7393,7 @@ impl InstallationTransaction {
             && self.completed_stage_refs.is_empty()
             && self.pending_external_changes.is_empty()
             && self.observed_postconditions.is_empty()
+            && self.active_verified_receipt.is_none()
             && self.last_known_good.is_none()
             && self.no_return_boundary.is_none()
             && self
@@ -7200,12 +7440,22 @@ impl InstallationTransaction {
         }
     }
 
-    /// Advances one stage using observed evidence and increments the revision.
-    pub fn advance(
+    /// Advances one non-runtime-health stage using observed evidence and
+    /// increments the revision.
+    ///
+    /// This raw transition is crate-private. `ActiveVerified` is never a
+    /// value accepted by this path; it requires the opaque receipt produced by
+    /// the read-only registry terminal projection below.
+    fn advance(
         &mut self,
         next: InstallationStage,
         evidence: Vec<PlatformHandle>,
     ) -> Result<(), InstallationError> {
+        if next == InstallationStage::ActiveVerified {
+            return Err(InstallationError::IncompleteObservation(
+                "ActiveVerified requires the exact committed activation receipt".to_owned(),
+            ));
+        }
         if !self.stage.can_advance(next) {
             return Err(InstallationError::IllegalTransition {
                 from: self.stage,
@@ -7214,11 +7464,42 @@ impl InstallationTransaction {
         }
         handles(&evidence, "stage_evidence", true)?;
         self.completed_stage_refs.extend(evidence);
-        if next == InstallationStage::ActiveVerified {
-            self.observed_postconditions
-                .extend(self.completed_stage_refs.clone());
-        }
         self.stage = next;
+        self.revision =
+            self.revision
+                .checked_add(1)
+                .ok_or_else(|| InstallationError::InvalidField {
+                    field: "revision".to_owned(),
+                    reason: "overflow".to_owned(),
+                })?;
+        self.validate()
+    }
+
+    /// Advances from `Activating` to `ActiveVerified` using the exact
+    /// read-only registry terminal proof. The proof is consumed and its
+    /// complete binding is persisted in the v9 transaction projection.
+    pub fn advance_to_active_verified(
+        &mut self,
+        receipt: ActivationCommitReceipt,
+        evidence: Vec<PlatformHandle>,
+    ) -> Result<(), InstallationError> {
+        if self.stage != InstallationStage::Activating {
+            return Err(InstallationError::IllegalTransition {
+                from: self.stage,
+                to: InstallationStage::ActiveVerified,
+            });
+        }
+        self.validate()?;
+        handles(&evidence, "stage_evidence", true)?;
+        receipt.validate_against_transaction(self)?;
+        if self.active_verified_receipt.is_some() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.completed_stage_refs.extend(evidence);
+        self.observed_postconditions
+            .extend(self.completed_stage_refs.clone());
+        self.active_verified_receipt = Some(receipt.binding());
+        self.stage = InstallationStage::ActiveVerified;
         self.revision =
             self.revision
                 .checked_add(1)
@@ -7270,10 +7551,95 @@ impl InstallationTransaction {
     }
 }
 
-/// Decodes the canonical transaction JSON and classifies pre-v8 records as an
+/// Private durable decoder shape for [`InstallationTransaction`].  The
+/// public transaction intentionally does not implement `Deserialize`: an
+/// arbitrary caller-authored JSON record must not be able to manufacture the
+/// private v9 activation receipt binding.  Only the version-gated decoder
+/// below may reconstruct this shape, and it still runs the full transaction
+/// validator before admission.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallationTransactionWire {
+    transaction_wire_version: ContractVersion,
+    transaction_id: PlatformHandle,
+    installation_epoch: InstallationEpoch,
+    profile: InstallationProfile,
+    request: ManagedEnvironmentChangeRequest,
+    current_active_manifest: Option<CandidateManifest>,
+    candidate_manifest: CandidateManifest,
+    staging_root: PlatformHandle,
+    planned_changes: Vec<PlannedChange>,
+    installer_effects: Vec<InstallerEffectPlan>,
+    minimum_store_available_bytes: u64,
+    installer_plan_digest: PlatformHandle,
+    effect_progress: Vec<InstallationEffectProgress>,
+    precondition_evidence: Vec<PlatformHandle>,
+    stage: InstallationStage,
+    completed_stage_refs: Vec<PlatformHandle>,
+    pending_external_changes: Vec<PlatformHandle>,
+    rollback_plan: PlatformHandle,
+    last_known_good: Option<PlatformHandle>,
+    no_return_boundary: Option<PlatformHandle>,
+    observed_postconditions: Vec<PlatformHandle>,
+    active_verified_receipt: Option<ActiveVerifiedReceiptBinding>,
+    recovery_command: PlatformHandle,
+    revision: u64,
+}
+
+impl InstallationTransactionWire {
+    fn into_transaction(self) -> InstallationTransaction {
+        InstallationTransaction {
+            transaction_wire_version: self.transaction_wire_version,
+            transaction_id: self.transaction_id,
+            installation_epoch: self.installation_epoch,
+            profile: self.profile,
+            request: self.request,
+            current_active_manifest: self.current_active_manifest,
+            candidate_manifest: self.candidate_manifest,
+            staging_root: self.staging_root,
+            planned_changes: self.planned_changes,
+            installer_effects: self.installer_effects,
+            minimum_store_available_bytes: self.minimum_store_available_bytes,
+            installer_plan_digest: self.installer_plan_digest,
+            effect_progress: self.effect_progress,
+            precondition_evidence: self.precondition_evidence,
+            stage: self.stage,
+            completed_stage_refs: self.completed_stage_refs,
+            pending_external_changes: self.pending_external_changes,
+            rollback_plan: self.rollback_plan,
+            last_known_good: self.last_known_good,
+            no_return_boundary: self.no_return_boundary,
+            observed_postconditions: self.observed_postconditions,
+            active_verified_receipt: self.active_verified_receipt,
+            recovery_command: self.recovery_command,
+            revision: self.revision,
+        }
+    }
+}
+
+/// Decodes the canonical transaction JSON and classifies pre-v9 records as an
 /// explicit migration requirement rather than synthesizing missing progress.
 pub fn decode_installation_transaction_json(
     bytes: &[u8],
+) -> Result<InstallationTransaction, InstallationError> {
+    decode_installation_transaction_json_with_policy(bytes, false)
+}
+
+/// Decodes a transaction record from the ACL-protected redb store. This
+/// private replay lane may restore an already advanced transaction so the
+/// store can compare it with a freshly read registry receipt. Untrusted JSON
+/// callers must use [`decode_installation_transaction_json`], which rejects
+/// advanced runtime states before any caller can present them as installer
+/// authority.
+fn decode_installation_transaction_json_from_store(
+    bytes: &[u8],
+) -> Result<InstallationTransaction, InstallationError> {
+    decode_installation_transaction_json_with_policy(bytes, true)
+}
+
+fn decode_installation_transaction_json_with_policy(
+    bytes: &[u8],
+    allow_advanced_state: bool,
 ) -> Result<InstallationTransaction, InstallationError> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
@@ -7281,7 +7647,7 @@ pub fn decode_installation_transaction_json(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v8 discriminator".to_owned(),
+            reason: "installation transaction predates the required v9 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -7296,11 +7662,25 @@ pub fn decode_installation_transaction_json(
             ),
         });
     }
-    let transaction: InstallationTransaction =
+    let transaction: InstallationTransactionWire =
         serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
             reason: error.to_string(),
         })?;
+    let transaction = transaction.into_transaction();
     transaction.validate()?;
+    if !allow_advanced_state
+        && matches!(
+            transaction.stage(),
+            InstallationStage::ActiveVerified
+                | InstallationStage::Cleaning
+                | InstallationStage::Completed
+        )
+    {
+        return Err(InstallationError::MigrationRequired {
+            reason: "advanced transaction state requires ACL-protected store replay and an exact registry receipt"
+                .to_owned(),
+        });
+    }
     Ok(transaction)
 }
 
@@ -9863,6 +10243,16 @@ pub trait InstallationTransactionStore: transaction_store_private::Sealed + Send
         &self,
         transaction_id: &PlatformHandle,
     ) -> Result<Option<InstallationTransaction>, InstallationError>;
+
+    /// Reconciles the exact registry terminal after a crash window between
+    /// Host's registry commit and the transaction-store CAS. Implementations
+    /// must preserve idempotent retry and fail-closed stage rules; this is
+    /// intentionally part of the sealed durable-store boundary.
+    fn reconcile_active_verified(
+        &mut self,
+        receipt: ActivationCommitReceipt,
+        evidence: Vec<PlatformHandle>,
+    ) -> Result<InstallationStepOutcome, InstallationError>;
 }
 
 /// Result of one coordinator step.
@@ -9917,6 +10307,16 @@ where
     #[must_use]
     pub const fn store(&self) -> &S {
         &self.store
+    }
+
+    /// Reconciles a Host-committed activation terminal into the durable
+    /// transaction store. The store remains the sole transaction writer.
+    pub fn reconcile_active_verified(
+        &mut self,
+        receipt: ActivationCommitReceipt,
+        evidence: Vec<PlatformHandle>,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.store.reconcile_active_verified(receipt, evidence)
     }
 
     /// Drives exactly one effect through durable intent and authoritative readback.
@@ -11382,6 +11782,54 @@ mod tests {
                 .filter(|transaction| transaction.transaction_id == *transaction_id)
                 .cloned())
         }
+
+        fn reconcile_active_verified(
+            &mut self,
+            receipt: ActivationCommitReceipt,
+            evidence: Vec<PlatformHandle>,
+        ) -> Result<InstallationStepOutcome, InstallationError> {
+            let mut state = self.state.lock().unwrap_or_else(|_| unreachable!());
+            let transaction =
+                state
+                    .as_mut()
+                    .ok_or_else(|| InstallationError::TransactionNotFound {
+                        transaction_id: receipt.transaction_id.as_str().to_owned(),
+                    })?;
+            transaction.validate()?;
+            match transaction.stage() {
+                InstallationStage::Activating => {
+                    transaction.advance_to_active_verified(receipt, evidence)?;
+                    Ok(InstallationStepOutcome::Applied {
+                        stage: transaction.stage(),
+                        evidence_refs: transaction.observed_postconditions.clone(),
+                    })
+                }
+                InstallationStage::ActiveVerified
+                | InstallationStage::Cleaning
+                | InstallationStage::Completed => {
+                    let binding =
+                        transaction
+                            .active_verified_receipt
+                            .as_ref()
+                            .ok_or_else(|| {
+                                InstallationError::IncompleteObservation(
+                                "active transaction is missing its committed activation receipt"
+                                    .to_owned(),
+                            )
+                            })?;
+                    if !binding.matches_receipt(&receipt) {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    Ok(InstallationStepOutcome::Applied {
+                        stage: transaction.stage(),
+                        evidence_refs: transaction.observed_postconditions.clone(),
+                    })
+                }
+                _ => Err(InstallationError::IncompleteObservation(
+                    "test transaction is not in an activation-reconcilable stage".to_owned(),
+                )),
+            }
+        }
     }
 
     impl transaction_store_private::Sealed for SharedStore {
@@ -11614,6 +12062,24 @@ mod tests {
             readiness_sequence: 1,
             readiness_journal_checksum: test_handle("f".repeat(64)),
         }
+    }
+
+    #[cfg(windows)]
+    fn replace_real_redb_transaction(
+        store: &mut RedbInstallationTransactionStore,
+        current: &mut InstallationTransaction,
+        mut replacement: InstallationTransaction,
+    ) {
+        let expected = must(TransactionVersion::of(current));
+        replacement.revision = expected.revision + 1;
+        must(
+            <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+                store,
+                expected,
+                &replacement,
+            ),
+        );
+        *current = replacement;
     }
 
     fn test_path(root: &Path, name: &str) -> PlatformHandle {
@@ -13872,21 +14338,21 @@ mod tests {
     }
 
     #[test]
-    fn v6_transaction_json_requires_explicit_migration_to_v8() {
+    fn v8_transaction_json_requires_explicit_migration_to_v9() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
             "transaction_wire_version".to_owned(),
-            must(serde_json::to_value(ContractVersion::new(6, 0, 0))),
+            must(serde_json::to_value(ContractVersion::new(8, 0, 0))),
         );
         let bytes = must(serde_json::to_vec(&legacy));
         let Err(error) = decode_installation_transaction_json(&bytes) else {
-            panic!("v6 transaction must require migration");
+            panic!("v8 transaction must require migration");
         };
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 8.0.0")
+                if reason.contains("requires explicit migration to 9.0.0")
         ));
     }
 
@@ -13906,11 +14372,45 @@ mod tests {
     }
 
     #[test]
-    fn malformed_v8_transaction_json_is_corrupt_registry() {
-        let bytes = br#"{"transaction_wire_version":{"major":8,"minor":0,"patch":0},"transaction_id":"malformed"}"#;
+    fn malformed_v9_transaction_json_is_corrupt_registry() {
+        let bytes = br#"{"transaction_wire_version":{"major":9,"minor":0,"patch":0},"transaction_id":"malformed"}"#;
         assert!(matches!(
             decode_installation_transaction_json(bytes),
             Err(InstallationError::CorruptRegistry { .. })
+        ));
+    }
+
+    #[test]
+    fn untrusted_json_cannot_import_active_verified_receipt_state() {
+        let transaction = registering_transaction();
+        let mut value = must(serde_json::to_value(&transaction));
+        let object = value.as_object_mut().unwrap_or_else(|| unreachable!());
+        object.insert(
+            "stage".to_owned(),
+            serde_json::to_value(InstallationStage::ActiveVerified)
+                .unwrap_or_else(|_| unreachable!()),
+        );
+        object.insert(
+            "observed_postconditions".to_owned(),
+            serde_json::json!(["evidence:forged-active"]),
+        );
+        object.insert(
+            "active_verified_receipt".to_owned(),
+            serde_json::json!({
+                "transaction_id": transaction.transaction_id.clone(),
+                "plan_digest": transaction.installer_plan_digest.clone(),
+                "generation": transaction.candidate_manifest.generation.clone(),
+                "candidate_manifest_digest": must(candidate_manifest_digest(&transaction.candidate_manifest)),
+                "commit_fence": test_commit_fence(&transaction.candidate_manifest),
+                "registry_revision": 3,
+                "terminal_digest": "a".repeat(64),
+            }),
+        );
+        let bytes = must(serde_json::to_vec(&value));
+        assert!(matches!(
+            decode_installation_transaction_json(&bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("ACL-protected store replay")
         ));
     }
 
@@ -14283,6 +14783,237 @@ mod tests {
         assert_eq!(must(registry.load()), before_retry);
         drop(registry);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "this test exercises the complete real redb crash/retry boundary"
+    )]
+    fn committed_registry_terminal_reconciles_real_redb_transaction_once() {
+        let full = fully_applied_system_registration_transaction();
+        let planned = must(InstallationTransaction::new(
+            full.transaction_id.clone(),
+            full.installation_epoch.clone(),
+            full.profile,
+            full.request.clone(),
+            full.current_active_manifest.clone(),
+            full.candidate_manifest.clone(),
+            full.staging_root.clone(),
+            full.planned_changes.clone(),
+            full.installer_effects.clone(),
+            full.minimum_store_available_bytes,
+            full.precondition_evidence.clone(),
+            full.recovery_command.clone(),
+        ));
+        let mut activating = planned.clone();
+        activating.effect_progress = full.effect_progress.clone();
+        for (stage, evidence) in [
+            (InstallationStage::Staging, "evidence:receipt-staging"),
+            (InstallationStage::StaticVerified, "evidence:receipt-static"),
+            (
+                InstallationStage::Registering,
+                "evidence:receipt-registering",
+            ),
+            (InstallationStage::Activating, "evidence:receipt-activating"),
+        ] {
+            must(activating.advance(stage, vec![test_handle(evidence)]));
+        }
+        let transaction_path = std::env::temp_dir().join(format!(
+            "eliot-active-verified-receipt-transaction-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&transaction_path);
+        let mut transaction_store = must(
+            RedbInstallationTransactionStore::create_planned_at_exact_path(
+                &transaction_path,
+                &planned,
+            ),
+        );
+        let mut current = planned.clone();
+        for stage in [
+            InstallationStage::Staging,
+            InstallationStage::StaticVerified,
+            InstallationStage::Registering,
+            InstallationStage::Activating,
+        ] {
+            let expected = must(TransactionVersion::of(&current));
+            current = activating.clone();
+            current.stage = stage;
+            current.revision = expected.revision + 1;
+            // Rebuild the durable state one exact CAS step at a time. The
+            // in-memory fixture above supplies only authoritative effect
+            // progress; redb remains the source under test.
+            must(<RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+                &mut transaction_store,
+                expected,
+                &current,
+            ));
+            activating = current.clone();
+        }
+        let transaction = must(
+            transaction_store
+                .load(&current.transaction_id)
+                .map(|value| value.unwrap_or_else(|| unreachable!())),
+        );
+        assert_eq!(transaction.stage(), InstallationStage::Activating);
+
+        let registry_path = std::env::temp_dir().join(format!(
+            "eliot-active-verified-receipt-registry-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&registry_path);
+        let registry = RedbInstallationRegistry::from_database_for_test(must(Database::create(
+            &registry_path,
+        )));
+        let approval = test_transaction_activation_approval(
+            &transaction,
+            test_handle("approval:active-verified-receipt"),
+        );
+        must(registry.stage_pending_activation_from_transaction_store(
+            &transaction_store,
+            &transaction.transaction_id,
+            approval.clone(),
+            must(registry.load()).revision(),
+        ));
+        let (_owner_lease, host) = live_host_capability();
+        let fence = test_commit_fence(&transaction.candidate_manifest);
+        must(registry.commit_pending_activation(
+            &host,
+            must(registry.load()).revision(),
+            &approval,
+            &fence,
+        ));
+        let receipt = must(registry.read_committed_activation_receipt(
+            &transaction.transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest.generation,
+        ));
+        let outcome = must(transaction_store.reconcile_active_verified(
+            receipt.clone(),
+            vec![test_handle("evidence:receipt-ready")],
+        ));
+        assert!(matches!(
+            outcome,
+            InstallationStepOutcome::Applied {
+                stage: InstallationStage::ActiveVerified,
+                ..
+            }
+        ));
+        let committed = must(
+            transaction_store
+                .load(&transaction.transaction_id)
+                .map(|value| value.unwrap_or_else(|| unreachable!())),
+        );
+        let committed_revision = committed.revision();
+        assert_eq!(committed.stage(), InstallationStage::ActiveVerified);
+
+        let retry = must(transaction_store.reconcile_active_verified(
+            receipt.clone(),
+            vec![test_handle("evidence:retry-is-ignored")],
+        ));
+        assert!(matches!(
+            retry,
+            InstallationStepOutcome::Applied {
+                stage: InstallationStage::ActiveVerified,
+                ..
+            }
+        ));
+        assert_eq!(
+            must(
+                transaction_store
+                    .load(&transaction.transaction_id)
+                    .map(|value| value.unwrap_or_else(|| unreachable!())),
+            )
+            .revision(),
+            committed_revision,
+            "an exact retry must not advance the transaction revision"
+        );
+
+        let mut stale_epoch = receipt.clone();
+        stale_epoch
+            .commit_fence
+            .authority_state_fence
+            .authority_epoch = must(AuthorityEpoch::new(
+            stale_epoch
+                .commit_fence
+                .authority_state_fence
+                .authority_epoch
+                .value()
+                .checked_add(1)
+                .unwrap_or_else(|| unreachable!()),
+        ));
+        assert!(matches!(
+            transaction_store
+                .reconcile_active_verified(stale_epoch, vec![test_handle("evidence:stale-epoch")],),
+            Err(InstallationError::IdentityConflict)
+        ));
+
+        let mut different_fence = receipt.clone();
+        different_fence.commit_fence.readiness_sequence += 1;
+        assert!(matches!(
+            transaction_store.reconcile_active_verified(
+                different_fence,
+                vec![test_handle("evidence:different-fence")],
+            ),
+            Err(InstallationError::IdentityConflict)
+        ));
+
+        let mut current = committed;
+        let mut pending = planned.clone();
+        replace_real_redb_transaction(&mut transaction_store, &mut current, pending);
+        assert!(matches!(
+            transaction_store.reconcile_active_verified(
+                receipt.clone(),
+                vec![test_handle("evidence:pending-stage")],
+            ),
+            Err(InstallationError::IncompleteObservation(reason))
+                if reason.contains("before Activating")
+        ));
+
+        pending = planned.clone();
+        pending.stage = InstallationStage::RollbackRequired;
+        pending.pending_external_changes = vec![test_handle("pending:unknown")];
+        replace_real_redb_transaction(&mut transaction_store, &mut current, pending);
+        assert!(matches!(
+            transaction_store.reconcile_active_verified(
+                receipt.clone(),
+                vec![test_handle("evidence:unknown-stage")],
+            ),
+            Err(InstallationError::IncompleteObservation(reason))
+                if reason.contains("pending, aborted, or unknown")
+        ));
+
+        pending = planned.clone();
+        pending.stage = InstallationStage::RolledBack;
+        pending.completed_stage_refs = vec![test_handle("evidence:aborted")];
+        replace_real_redb_transaction(&mut transaction_store, &mut current, pending);
+        assert!(matches!(
+            transaction_store.reconcile_active_verified(
+                receipt.clone(),
+                vec![test_handle("evidence:aborted-stage")],
+            ),
+            Err(InstallationError::IncompleteObservation(reason))
+                if reason.contains("pending, aborted, or unknown")
+        ));
+
+        pending = planned;
+        pending.stage = InstallationStage::Quarantined;
+        pending.completed_stage_refs = vec![test_handle("evidence:quarantined")];
+        replace_real_redb_transaction(&mut transaction_store, &mut current, pending);
+        assert!(matches!(
+            transaction_store.reconcile_active_verified(
+                receipt,
+                vec![test_handle("evidence:quarantined-stage")],
+            ),
+            Err(InstallationError::IncompleteObservation(reason))
+                if reason.contains("pending, aborted, or unknown")
+        ));
+        let _ = std::fs::remove_file(transaction_path);
+        let _ = std::fs::remove_file(registry_path);
     }
 
     #[cfg(windows)]

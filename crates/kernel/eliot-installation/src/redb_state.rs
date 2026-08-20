@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use super::{
-    INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationError, InstallationTransaction,
-    InstallationTransactionStore, decode_installation_transaction_json,
+    ActivationCommitReceipt, INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationError,
+    InstallationStage, InstallationStepOutcome, InstallationTransaction,
+    InstallationTransactionStore, decode_installation_transaction_json_from_store,
     transaction_store_private::{self, TransactionVersion},
 };
 use eliot_contracts::ContractVersion;
@@ -22,7 +23,7 @@ const TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
 const TRANSACTION_TEMP_CREATE_ATTEMPTS: usize = 16;
 static NEXT_TRANSACTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct TransactionEnvelope {
     wire_version: ContractVersion,
@@ -54,7 +55,7 @@ impl RedbInstallationTransactionStore {
     }
 
     /// Creates and atomically publishes a new exact-path database containing
-    /// one planned constructor-produced transaction in its v7 table.
+    /// one planned constructor-produced transaction in its versioned table.
     ///
     /// The transaction is committed and synced in a unique same-directory
     /// temporary database before a no-clobber hard-link publication. A caller
@@ -70,7 +71,7 @@ impl RedbInstallationTransactionStore {
         if !transaction.is_constructor_planned() {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
-                reason: "create_planned accepts only constructor-produced Planned/Pending v7 state"
+                reason: "create_planned accepts only constructor-produced Planned/Pending v9 state"
                     .to_owned(),
             });
         }
@@ -300,7 +301,7 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
         if !transaction.is_constructor_planned() {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
-                reason: "create_planned accepts only constructor-produced Planned/Pending v7 state"
+                reason: "create_planned accepts only constructor-produced Planned/Pending v9 state"
                     .to_owned(),
             });
         }
@@ -331,6 +332,66 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
             return Ok(None);
         };
         decode(value.value()).map(Some)
+    }
+
+    fn reconcile_active_verified(
+        &mut self,
+        receipt: ActivationCommitReceipt,
+        evidence: Vec<PlatformHandle>,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let mut transaction = self.load(&receipt.transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: receipt.transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        match transaction.stage() {
+            InstallationStage::ActiveVerified
+            | InstallationStage::Cleaning
+            | InstallationStage::Completed => {
+                let binding = transaction
+                    .active_verified_receipt
+                    .as_ref()
+                    .ok_or_else(|| {
+                        InstallationError::IncompleteObservation(
+                            "active transaction is missing its committed activation receipt"
+                                .to_owned(),
+                        )
+                    })?;
+                if !binding.matches_receipt(&receipt) {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Ok(InstallationStepOutcome::Applied {
+                    stage: transaction.stage(),
+                    evidence_refs: transaction.observed_postconditions.clone(),
+                })
+            }
+            InstallationStage::Activating => {
+                let expected = TransactionVersion::of(&transaction)?;
+                transaction.advance_to_active_verified(receipt, evidence)?;
+                <Self as transaction_store_private::Sealed>::compare_and_save(
+                    self,
+                    expected,
+                    &transaction,
+                )?;
+                Ok(InstallationStepOutcome::Applied {
+                    stage: transaction.stage(),
+                    evidence_refs: transaction.observed_postconditions.clone(),
+                })
+            }
+            InstallationStage::Planned
+            | InstallationStage::Staging
+            | InstallationStage::StaticVerified
+            | InstallationStage::Registering => Err(InstallationError::IncompleteObservation(
+                "activation terminal cannot advance a transaction before Activating".to_owned(),
+            )),
+            InstallationStage::RollbackRequired
+            | InstallationStage::RolledBack
+            | InstallationStage::Quarantined => Err(InstallationError::IncompleteObservation(
+                "activation terminal cannot reconcile a pending, aborted, or unknown transaction"
+                    .to_owned(),
+            )),
+        }
     }
 }
 
@@ -517,7 +578,8 @@ fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
         value
             .get("wire_version")
             .ok_or_else(|| InstallationError::MigrationRequired {
-                reason: "transaction envelope predates required v7 wire discriminator".to_owned(),
+                reason: "transaction envelope predates the required transaction wire discriminator"
+                    .to_owned(),
             })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
         InstallationError::MigrationRequired {
@@ -535,21 +597,22 @@ fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
         value
             .get("transaction")
             .ok_or_else(|| InstallationError::MigrationRequired {
-                reason: "transaction envelope predates the required v7 payload".to_owned(),
+                reason: "transaction envelope predates the required transaction payload".to_owned(),
             })?;
     let transaction_bytes = serde_json::to_vec(transaction_value).map_err(|error| {
         InstallationError::CorruptRegistry {
             reason: error.to_string(),
         }
     })?;
-    let transaction = decode_installation_transaction_json(&transaction_bytes)?;
-    let envelope: TransactionEnvelope =
-        serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
+    let transaction = decode_installation_transaction_json_from_store(&transaction_bytes)?;
+    let canonical_transaction =
+        serde_json::to_value(&transaction).map_err(|error| InstallationError::CorruptRegistry {
             reason: error.to_string(),
         })?;
-    if envelope.transaction != transaction {
+    if transaction_value != &canonical_transaction {
         return Err(InstallationError::MigrationRequired {
-            reason: "transaction payload did not round-trip through the v7 envelope".to_owned(),
+            reason: "transaction payload did not round-trip through the current envelope"
+                .to_owned(),
         });
     }
     Ok(transaction)
