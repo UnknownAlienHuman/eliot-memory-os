@@ -40,6 +40,9 @@ use eliot_watchdog_core::{Epoch, Watchdog};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use thiserror::Error;
 
+#[cfg(test)]
+mod registry_fixture;
+
 pub const SERVICE_NAME: &str = "EliotWatchdog";
 pub const PROTOCOL_VERSION: &str = "eliot.watchdog.v1";
 /// Fixed files owned by the installer below the approved per-installation
@@ -2927,11 +2930,191 @@ fn is_sha256_hex(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::registry_fixture::RegistryFixture;
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 
     static FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn protected_redb_registry_selection_matrix() {
+        let fixture = RegistryFixture::new();
+
+        fixture.write_registry(&fixture.pending_only());
+        let (registry, manifest) = read_registry_for_bootstrap(&fixture.base_bootstrap())
+            .unwrap_or_else(|error| panic!("pending-only protected registry: {error}"));
+        assert_eq!(manifest.generation.as_str(), "generation-7");
+        assert!(registry.active().is_none());
+        assert!(matches!(
+            registry.pending_activation().map(|pending| &pending.state),
+            Some(PendingActivationState::Pending)
+        ));
+
+        fixture.write_registry(&fixture.active_with_pending());
+        let (registry, active_manifest) = read_registry_for_bootstrap(&fixture.bootstrap_for(6))
+            .unwrap_or_else(|error| panic!("active protected registry selection: {error}"));
+        assert_eq!(active_manifest.generation.as_str(), "generation-6");
+        assert_eq!(
+            registry
+                .active()
+                .map(|generation| generation.manifest.generation.as_str()),
+            Some("generation-6")
+        );
+        let (_, pending_manifest) = read_registry_for_bootstrap(&fixture.bootstrap_for(7))
+            .unwrap_or_else(|error| {
+                panic!("pending upgrade protected registry selection: {error}")
+            });
+        assert_eq!(pending_manifest.generation.as_str(), "generation-7");
+
+        fixture.write_registry(&fixture.ambiguous_generations());
+        assert!(read_registry_for_bootstrap(&fixture.base_bootstrap()).is_err());
+
+        fixture.write_registry(&fixture.recovery_required());
+        assert!(read_registry_for_bootstrap(&fixture.base_bootstrap()).is_err());
+
+        let missing_fixture = RegistryFixture::new();
+        assert!(read_registry_for_bootstrap(&missing_fixture.base_bootstrap()).is_err());
+
+        let migration_fixture = RegistryFixture::new();
+        migration_fixture.write_registry(&migration_fixture.migration_wire());
+        assert!(read_registry_for_bootstrap(&migration_fixture.base_bootstrap()).is_err());
+
+        let legacy_fixture = RegistryFixture::new();
+        legacy_fixture.write_legacy_table();
+        assert!(read_registry_for_bootstrap(&legacy_fixture.base_bootstrap()).is_err());
+
+        let corrupt_fixture = RegistryFixture::new();
+        corrupt_fixture.write_current_bytes(b"not-json");
+        assert!(read_registry_for_bootstrap(&corrupt_fixture.base_bootstrap()).is_err());
+    }
+
+    #[test]
+    fn protected_redb_registry_approval_and_bootstrap_substitution_matrix() {
+        let fixture = RegistryFixture::new();
+        fixture.write_registry(&fixture.active_only());
+        let (registry, manifest) = read_registry_for_bootstrap(&fixture.base_bootstrap())
+            .unwrap_or_else(|error| panic!("active protected registry: {error}"));
+        assert!(
+            approved_service_registration(&registry, &manifest, InstallerServiceRole::Host).is_ok()
+        );
+        assert!(
+            approved_service_registration(&registry, &manifest, InstallerServiceRole::Watchdog)
+                .is_ok()
+        );
+        assert!(
+            load_approved_service_registrations(&registry, &manifest, &fixture.base_bootstrap())
+                .is_ok()
+        );
+
+        for (field, replacement) in [
+            ("role", serde_json::json!("WATCHDOG")),
+            ("generation", serde_json::json!("generation-other")),
+            ("service_name", serde_json::json!("OtherService")),
+            (
+                "executable_path",
+                serde_json::json!(fixture.host_root().join("other.exe")),
+            ),
+            ("account", serde_json::json!("LOCAL_SYSTEM")),
+            ("automatic_start", serde_json::json!(false)),
+            ("registration_nonce", serde_json::json!("f".repeat(64))),
+            ("configuration_digest", serde_json::json!("e".repeat(64))),
+            (
+                "descriptor_path",
+                serde_json::json!(fixture.host_root().join("other.json")),
+            ),
+            ("descriptor_digest", serde_json::json!("d".repeat(64))),
+            ("installation_id", serde_json::json!("other-installation")),
+            ("plan_generation", serde_json::json!(8)),
+            (
+                "host_state_root",
+                serde_json::json!(fixture.host_root().join("other")),
+            ),
+        ] {
+            fixture.write_registry(&fixture.substituted_service_approval(field, replacement));
+            let result = read_registry_for_bootstrap(&fixture.base_bootstrap());
+            if let Ok((registry, manifest)) = result {
+                assert!(
+                    approved_service_registration(&registry, &manifest, InstallerServiceRole::Host)
+                        .is_err(),
+                    "service approval substitution {field} unexpectedly survived"
+                );
+            }
+        }
+
+        let base = fixture.base_bootstrap();
+        let bootstrap = |descriptor_path: PathBuf,
+                         descriptor_digest: String,
+                         installation_id: String,
+                         plan_generation: u64,
+                         host_state_root: PathBuf| {
+            ServiceBootstrapArguments::new(
+                descriptor_path,
+                descriptor_digest,
+                installation_id,
+                plan_generation,
+                std::iter::empty::<String>(),
+            )
+            .and_then(|value| value.with_host_state_root(host_state_root))
+            .and_then(|value| value.with_registration_nonce("c".repeat(64)))
+            .unwrap_or_else(|error| panic!("bootstrap substitution fixture: {error}"))
+        };
+        let cases = [
+            bootstrap(
+                base.config_descriptor_path().with_file_name("other.json"),
+                base.config_descriptor_digest().to_owned(),
+                base.installation_id().to_owned(),
+                base.transaction_plan_generation(),
+                fixture.host_root().to_path_buf(),
+            ),
+            bootstrap(
+                base.config_descriptor_path().to_path_buf(),
+                "b".repeat(64),
+                base.installation_id().to_owned(),
+                base.transaction_plan_generation(),
+                fixture.host_root().to_path_buf(),
+            ),
+            bootstrap(
+                base.config_descriptor_path().to_path_buf(),
+                base.config_descriptor_digest().to_owned(),
+                "other-installation".to_owned(),
+                base.transaction_plan_generation(),
+                fixture.host_root().to_path_buf(),
+            ),
+            bootstrap(
+                base.config_descriptor_path().to_path_buf(),
+                base.config_descriptor_digest().to_owned(),
+                base.installation_id().to_owned(),
+                8,
+                fixture.host_root().to_path_buf(),
+            ),
+            bootstrap(
+                base.config_descriptor_path().to_path_buf(),
+                base.config_descriptor_digest().to_owned(),
+                base.installation_id().to_owned(),
+                base.transaction_plan_generation(),
+                fixture.host_root().join("other"),
+            ),
+        ];
+        for substituted in cases {
+            assert!(read_registry_for_bootstrap(&substituted).is_err());
+        }
+    }
+
+    #[test]
+    fn protected_redb_registry_reopen_reload_drift_fails_closed() {
+        let fixture = RegistryFixture::new();
+        fixture.write_registry(&fixture.active_only());
+        let (_, first_manifest) = read_registry_for_bootstrap(&fixture.base_bootstrap())
+            .unwrap_or_else(|error| panic!("initial protected registry read: {error}"));
+        assert_eq!(first_manifest.generation.as_str(), "generation-7");
+
+        fixture.write_registry(&fixture.drifted_active_projection());
+        assert!(
+            read_registry_for_bootstrap(&fixture.base_bootstrap()).is_err(),
+            "reopened registry must reject a substituted projection"
+        );
+    }
 
     fn valid_scm_args() -> Vec<OsString> {
         let bootstrap = ServiceBootstrapArguments::new(
