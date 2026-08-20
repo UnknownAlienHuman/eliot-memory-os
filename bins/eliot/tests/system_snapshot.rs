@@ -8,12 +8,14 @@ use std::{
 };
 
 use eliot_installation::{
-    AuthorityEpoch, CandidateManifest, InstallationEpoch, InstallationProfile,
-    InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, ManagedEnvironmentAction,
-    ManagedEnvironmentChangeRequest, PlannedChange, RedbInstallationTransactionStore,
-    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, UserOwnedRootLease,
-    parse_installation_transaction_id,
+    parse_installation_transaction_id, AuthorityEpoch, CandidateManifest, InstallationEpoch,
+    InstallationProfile, InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan,
+    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PlannedChange,
+    RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
+    RuntimeStateRoots, StateFence, UserOwnedRootLease,
 };
+#[cfg(windows)]
+use eliot_platform_windows::protected_program_data_root;
 use serde_json::Value;
 
 fn repository_root() -> PathBuf {
@@ -22,6 +24,14 @@ fn repository_root() -> PathBuf {
         .and_then(Path::parent)
         .expect("workspace root")
         .to_owned()
+}
+
+fn assert_installation_error(output: &Value, code: &str) {
+    assert_eq!(output["status"], "ERROR");
+    assert_eq!(output["code"], code);
+    assert_eq!(output["completed"], false);
+    assert_eq!(output["scope"], "bounded_all_effects_or_exact_rollback");
+    assert!(output["detail"].is_string());
 }
 
 #[test]
@@ -124,7 +134,7 @@ fn installation_status_requires_existing_explicit_registry() {
     assert!(!result.status.success());
     assert!(!registry.exists(), "status created a missing registry");
     let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
-    assert_eq!(output["code"], "INSTALLATION_STATUS_UNAVAILABLE");
+    assert_installation_error(&output, "INSTALLATION_STATUS_UNAVAILABLE");
     let _ = fs::remove_dir_all(temp_root);
 }
 
@@ -150,8 +160,36 @@ fn installation_status_rejects_a_noncanonical_registry_child_without_creation() 
     assert!(!result.status.success());
     assert!(!registry.exists(), "status created a substituted registry");
     let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
-    assert_eq!(output["code"], "INSTALLATION_STATUS_INVALID");
+    assert_installation_error(&output, "INSTALLATION_STATUS_INVALID");
     let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(windows)]
+#[test]
+fn installation_status_reports_missing_legacy_registry_as_unavailable() {
+    let registry = protected_program_data_root()
+        .expect("ProgramData root")
+        .join("Eliot")
+        .join("host")
+        .join("installation-registry.redb");
+    if registry.exists() {
+        // A pre-existing machine registry is outside this test's ownership;
+        // the pure CLI classifier covers its migration/corruption branches.
+        return;
+    }
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .args([
+            "installation",
+            "status",
+            "--registry",
+            registry.to_str().expect("legacy registry is utf8"),
+        ])
+        .output()
+        .expect("run legacy status command");
+
+    assert!(!result.status.success());
+    let output: Value = serde_json::from_slice(&result.stdout).expect("legacy status JSON error");
+    assert_installation_error(&output, "INSTALLATION_STATUS_UNAVAILABLE");
 }
 
 #[test]
@@ -182,7 +220,7 @@ fn installation_create_rejects_migration_before_creating_store() {
 
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("create JSON error");
-    assert_eq!(output["code"], "INSTALLATION_CREATE_MIGRATION_REQUIRED");
+    assert_installation_error(&output, "INSTALLATION_CREATE_MIGRATION_REQUIRED");
     assert!(!store.exists(), "rejected input created a durable store");
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -399,7 +437,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
     clippy::too_many_lines,
     reason = "the round-trip assertion keeps the production CLI boundary evidence together"
 )]
-fn installation_cli_create_status_apply_round_trip_uses_one_durable_coordinator() {
+fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop() {
     let temp_root = std::env::temp_dir().join(format!(
         "eliot-installation-cli-round-trip-{}",
         std::process::id()
@@ -410,6 +448,24 @@ fn installation_cli_create_status_apply_round_trip_uses_one_durable_coordinator(
     fs::create_dir_all(&portable_root).expect("create nested portable fixture root");
     drop(UserOwnedRootLease::open_existing(&portable_root).expect("protect portable fixture root"));
     let transaction = portable_cli_transaction(&portable_root);
+    let state_roots = &transaction
+        .candidate_manifest
+        .runtime_launch
+        .runtime_state_roots;
+    for root in [
+        &state_roots.installation_root,
+        &state_roots.host_state_root,
+        &state_roots.kernel_ors_root,
+        &state_roots.kernel_work_root,
+        &state_roots.store_data_root,
+        &state_roots.store_work_root,
+        &state_roots.store_temp_root,
+        &state_roots.watchdog_state_root,
+    ] {
+        if let Some(parent) = Path::new(root.as_str()).parent() {
+            fs::create_dir_all(parent).expect("create effect parent contour");
+        }
+    }
     let input = temp_root.join("transaction.json");
     let store = temp_root.join("transaction.redb");
     fs::write(
@@ -511,10 +567,23 @@ fn installation_cli_create_status_apply_round_trip_uses_one_durable_coordinator(
         String::from_utf8_lossy(&apply.stderr)
     );
     let applied: Value = serde_json::from_slice(&apply.stdout).expect("apply JSON");
-    assert_eq!(applied["status"], "EFFECT_APPLIED");
-    assert_eq!(applied["revision"], 2);
+    assert_eq!(applied["status"], "EFFECTS_APPLIED");
+    assert_ne!(applied["status"], "EFFECT_APPLIED");
+    assert_eq!(applied["staging"]["disposition"], "NOT_APPLICABLE");
+    assert_eq!(
+        applied["staging"]["reason"],
+        "registry staging is not part of the PortableDev/UserMode effect command"
+    );
+    assert_eq!(applied["revision"], 31);
     assert_eq!(applied["stage"], "PLANNED");
     assert_eq!(applied["completed"], false);
+    let progress = applied["transaction"]["effect_progress"]
+        .as_array()
+        .expect("all effect progress entries");
+    assert_eq!(progress.len(), 16);
+    assert!(progress
+        .iter()
+        .all(|entry| entry["state"]["state"] == "APPLIED"));
     assert_eq!(
         applied["transaction"]["effect_progress"][0]["state"]["state"],
         "APPLIED"
@@ -551,8 +620,24 @@ fn installation_cli_create_status_apply_round_trip_uses_one_durable_coordinator(
         status_after_apply_value["transaction_id"],
         "transaction:cli-positive"
     );
-    assert_eq!(status_after_apply_value["revision"], 2);
+    assert_eq!(status_after_apply_value["revision"], 31);
     assert_eq!(status_after_apply_value["stage"], "PLANNED");
+
+    let recover = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "recover",
+            "--store",
+            store.to_str().expect("store is utf8"),
+            "--transaction-id",
+            "transaction:cli-positive",
+        ])
+        .output()
+        .expect("run recovery command");
+    assert!(!recover.status.success());
+    let recovery_value: Value = serde_json::from_slice(&recover.stdout).expect("recovery JSON");
+    assert_installation_error(&recovery_value, "INSTALLATION_RECOVER_ERROR");
 
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -578,8 +663,43 @@ fn installation_apply_opens_only_existing_transaction_store() {
 
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("apply JSON error");
-    assert_eq!(output["code"], "INSTALLATION_APPLY_UNAVAILABLE");
+    assert_installation_error(&output, "INSTALLATION_APPLY_UNAVAILABLE");
     assert!(!store.exists(), "apply created a missing transaction store");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn installation_apply_rejects_removed_raw_approval_ref_without_writing() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-raw-approval-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_root).expect("create raw approval fixture");
+    let store = temp_root.join("missing.redb");
+    let registry = temp_root.join("installation-registry.redb");
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "apply",
+            "--store",
+            store.to_str().expect("store is utf8"),
+            "--transaction-id",
+            "transaction:raw-approval",
+            "--approval-ref",
+            "caller-shaped",
+        ])
+        .output()
+        .expect("run raw approval command");
+
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("--approval-ref"),
+        "removed approval option was unexpectedly accepted: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!store.exists(), "raw approval created a transaction store");
+    assert!(!registry.exists(), "raw approval created a registry");
     let _ = fs::remove_dir_all(temp_root);
 }
 
@@ -609,7 +729,7 @@ fn installation_transaction_status_reads_existing_store_without_inventing_transa
 
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
-    assert_eq!(output["code"], "INSTALLATION_TRANSACTION_NOT_FOUND");
+    assert_installation_error(&output, "INSTALLATION_TRANSACTION_NOT_FOUND");
     let _ = fs::remove_dir_all(temp_root);
 }
 
@@ -636,7 +756,7 @@ fn installation_remove_canary_is_a_non_mutating_blocker() {
 
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("remove-canary JSON error");
-    assert_eq!(output["code"], "INSTALLATION_REMOVE_CANARY_UNSUPPORTED");
+    assert_installation_error(&output, "INSTALLATION_REMOVE_CANARY_UNSUPPORTED");
     assert!(
         !store_path.exists(),
         "remove-canary created a transaction store"
@@ -683,13 +803,10 @@ fn installation_plan_reports_missing_v7_discriminator_as_migration() {
 
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("plan JSON error");
-    assert_eq!(output["status"], "error");
-    assert_eq!(output["code"], "INSTALLATION_PLAN_MIGRATION_REQUIRED");
-    assert!(
-        output["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("required v7 discriminator"))
-    );
+    assert_installation_error(&output, "INSTALLATION_PLAN_MIGRATION_REQUIRED");
+    assert!(output["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("required v7 discriminator")));
 }
 
 #[test]
@@ -701,13 +818,10 @@ fn installation_plan_reports_v5_discriminator_as_migration() {
 
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("plan JSON error");
-    assert_eq!(output["status"], "error");
-    assert_eq!(output["code"], "INSTALLATION_PLAN_MIGRATION_REQUIRED");
-    assert!(
-        output["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("wire 5.0.0"))
-    );
+    assert_installation_error(&output, "INSTALLATION_PLAN_MIGRATION_REQUIRED");
+    assert!(output["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("wire 5.0.0")));
 }
 
 #[test]
@@ -719,11 +833,8 @@ fn installation_plan_reports_malformed_v7_as_invalid() {
 
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("plan JSON error");
-    assert_eq!(output["status"], "error");
-    assert_eq!(output["code"], "INSTALLATION_PLAN_INVALID");
-    assert!(
-        output["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("installation registry is corrupt"))
-    );
+    assert_installation_error(&output, "INSTALLATION_PLAN_INVALID");
+    assert!(output["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("installation registry is corrupt")));
 }
