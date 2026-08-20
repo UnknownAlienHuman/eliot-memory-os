@@ -14,13 +14,12 @@ pub use credential_control::HostCredentialControl;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 use std::time::{Duration, Instant};
 
-use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-    SourceId, StateFence,
-};
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+#[cfg(all(test, windows))]
+use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
     EliotActivationRecord, EpochIdentity, EpochTransition, HostInstallationEpoch,
@@ -48,9 +47,7 @@ use eliot_kernel_service::{
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
 };
-use eliot_platform::{
-    PlatformHandle, PortOutcome, ServiceOperation, ServicePort, ServiceRequest, ServiceState,
-};
+use eliot_platform::{PlatformHandle, ServiceState};
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerLease, HostOwnerLeaseError,
     HostOwnerLeaseReleaseError, ProtectedPathLease, ProtectedRootLease, ServiceAccount,
@@ -494,8 +491,11 @@ where
 use eliot_platform_windows::{
     JobObjectIdentity, PinnedRuntimeFile, ProcessIdentity, RunningJobChild, SuspendedJobChild,
     SuspendedLaunchSpec, UserOwnedPathLease, UserOwnedRootLease, WindowsAdapterError,
-    observe_named_pipe_peer_process, windows_paths_equal,
+    observe_named_pipe_peer_process,
 };
+
+#[cfg(all(test, windows))]
+use eliot_platform_windows::windows_paths_equal;
 
 #[cfg(windows)]
 const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 4] = [
@@ -3623,7 +3623,7 @@ fn approved_service_registration_request(
 }
 
 #[cfg(windows)]
-fn select_watchdog_approval_for_start(
+fn select_watchdog_approval_for_inspection(
     registry: &ApprovedGenerationRegistry,
     manifest: &CandidateManifest,
 ) -> Result<Option<InstallerServiceRegistrationApproval>, HostError> {
@@ -3665,15 +3665,11 @@ enum InstalledWatchdogRuntimeInspection {
 
 #[cfg(windows)]
 trait InstalledWatchdogControl {
+    /// Host startup has only this read-only capability.
     fn inspect_registration_runtime(
         &mut self,
         request: &ServiceRegistrationRequest,
     ) -> InstalledWatchdogRuntimeInspection;
-
-    fn start(
-        &mut self,
-        request: &ServiceRequest,
-    ) -> PortOutcome<eliot_platform::ServiceObservation>;
 }
 
 #[cfg(windows)]
@@ -3701,29 +3697,62 @@ impl InstalledWatchdogControl for WindowsPlatform {
             }
         }
     }
-
-    fn start(
-        &mut self,
-        request: &ServiceRequest,
-    ) -> PortOutcome<eliot_platform::ServiceObservation> {
-        debug_assert_eq!(request.operation, ServiceOperation::Start);
-        self.execute(request)
-    }
 }
 
 #[cfg(windows)]
+fn require_running_watchdog<C>(
+    control: &mut C,
+    registration: &ServiceRegistrationRequest,
+) -> Result<(), HostError>
+where
+    C: InstalledWatchdogControl,
+{
+    match control.inspect_registration_runtime(registration) {
+        InstalledWatchdogRuntimeInspection::Matching {
+            state: ServiceState::Running,
+            ..
+        } => Ok(()),
+        InstalledWatchdogRuntimeInspection::Matching { state, .. } => Err(
+            HostError::RecoveryRequired(format!(
+                "canonical EliotWatchdog service is not Running (observed {state:?})"
+            )),
+        ),
+        InstalledWatchdogRuntimeInspection::Absent => Err(HostError::Platform(
+            "canonical EliotWatchdog service is not installed; installer/SCM ordering requires Watchdog to be started before Host"
+                .to_owned(),
+        )),
+        InstalledWatchdogRuntimeInspection::Mismatched => Err(HostError::Platform(
+            "canonical EliotWatchdog service registration does not match the approved configuration"
+                .to_owned(),
+        )),
+        InstalledWatchdogRuntimeInspection::Unknown => Err(HostError::Platform(
+            "canonical EliotWatchdog service registration is not authoritatively observable"
+                .to_owned(),
+        )),
+    }
+}
+
+#[cfg(all(test, windows))]
+trait InstalledWatchdogStartControl: InstalledWatchdogControl {
+    fn start(
+        &mut self,
+        request: &eliot_platform::ServiceRequest,
+    ) -> eliot_platform::PortOutcome<eliot_platform::ServiceObservation>;
+}
+
+#[cfg(all(test, windows))]
 trait WatchdogStartClock {
     fn now_ms(&mut self) -> u64;
 
     fn sleep(&mut self, duration: Duration);
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 struct SystemWatchdogStartClock {
     origin: Instant,
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 impl SystemWatchdogStartClock {
     fn new() -> Self {
         Self {
@@ -3732,7 +3761,7 @@ impl SystemWatchdogStartClock {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 impl WatchdogStartClock for SystemWatchdogStartClock {
     fn now_ms(&mut self) -> u64 {
         u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -3743,31 +3772,31 @@ impl WatchdogStartClock for SystemWatchdogStartClock {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 const WATCHDOG_START_TIMEOUT_MS: u64 = 30_000;
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 const WATCHDOG_START_MIN_WAIT_MS: u64 = 25;
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 const WATCHDOG_START_MAX_WAIT_MS: u64 = 250;
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 const WATCHDOG_START_UNKNOWN_WAIT_MS: u64 = 50;
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn watchdog_start_wait(wait_hint_ms: u32) -> Duration {
     let wait_ms =
         u64::from(wait_hint_ms).clamp(WATCHDOG_START_MIN_WAIT_MS, WATCHDOG_START_MAX_WAIT_MS);
     Duration::from_millis(wait_ms)
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn watchdog_unknown_wait() -> Duration {
     Duration::from_millis(WATCHDOG_START_UNKNOWN_WAIT_MS)
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn bind_watchdog_process(
     registration: &ServiceRegistrationRequest,
     bound: &mut Option<ProcessIdentity>,
@@ -3809,20 +3838,20 @@ fn bind_watchdog_process(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn start_installed_watchdog<C>(
     control: &mut C,
     registration: &ServiceRegistrationRequest,
     context: RequestMetadata,
 ) -> Result<(), HostError>
 where
-    C: InstalledWatchdogControl,
+    C: InstalledWatchdogStartControl,
 {
     let mut clock = SystemWatchdogStartClock::new();
     start_installed_watchdog_with_clock(control, registration, context, &mut clock)
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 #[allow(
     clippy::too_many_lines,
     reason = "the bounded SCM reconcile state machine keeps the one-start invariant and every terminal state in one reviewable contour"
@@ -3834,7 +3863,7 @@ fn start_installed_watchdog_with_clock<C, W>(
     clock: &mut W,
 ) -> Result<(), HostError>
 where
-    C: InstalledWatchdogControl,
+    C: InstalledWatchdogStartControl,
     W: WatchdogStartClock,
 {
     let deadline = clock.now_ms().saturating_add(WATCHDOG_START_TIMEOUT_MS);
@@ -3862,10 +3891,10 @@ where
             // A StartService result can be Known, Partial, Unknown, or Error
             // while the external SCM effect remains live. Reconciliation below
             // is the only authority, and this branch is the sole Start call.
-            let _ = control.start(&ServiceRequest {
+            let _ = control.start(&eliot_platform::ServiceRequest {
                 context,
                 service,
-                operation: ServiceOperation::Start,
+                operation: eliot_platform::ServiceOperation::Start,
             });
         }
         InstalledWatchdogRuntimeInspection::Matching {
@@ -4566,6 +4595,47 @@ pub struct HostComposition {
     shutdown_failed: bool,
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostStartupBranch {
+    Active,
+    Pending,
+}
+
+#[cfg(windows)]
+trait ApprovedHostStartupPort {
+    fn start_approved_manifest(
+        &mut self,
+        manifest: &CandidateManifest,
+        branch: HostStartupBranch,
+        kernel_executable: &Path,
+        store_bridge_executable: &Path,
+        store_artifact: &PlatformHandle,
+        pending: Option<&eliot_installation::PendingActivation>,
+    ) -> Result<(), HostError>;
+}
+
+#[cfg(windows)]
+fn start_approved_manifest_contour<P: ApprovedHostStartupPort>(
+    port: &mut P,
+    manifest: &CandidateManifest,
+    branch: HostStartupBranch,
+    pending: Option<&eliot_installation::PendingActivation>,
+) -> Result<(), HostError> {
+    let (approved_kernel_path, approved_store_bridge_path, _) = manifest.host_child_paths();
+    let (_, store_artifact) = manifest
+        .host_child_artifact_digests()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    port.start_approved_manifest(
+        manifest,
+        branch,
+        Path::new(approved_kernel_path.as_str()),
+        Path::new(approved_store_bridge_path.as_str()),
+        store_artifact,
+        pending,
+    )
+}
+
 impl HostComposition {
     fn validate_launch_options_for_manifest(
         options: &HostLaunchOptions,
@@ -4759,8 +4829,12 @@ impl HostComposition {
         if let Some(pending) = composition.registry.pending_activation().cloned() {
             composition.reconcile_pending_activation(&pending)?;
         } else if let Some(active) = composition.registry.active().cloned() {
-            let (kernel, store_bridge) = approved_host_start_paths(&active.manifest);
-            composition.start_approved_contour(kernel, store_bridge)?;
+            start_approved_manifest_contour(
+                &mut composition,
+                &active.manifest,
+                HostStartupBranch::Active,
+                None,
+            )?;
         }
         Ok(composition)
     }
@@ -4854,8 +4928,7 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
-    fn request_watchdog(
-        &self,
+    fn inspect_watchdog(
         launch: &RuntimeLaunchDescriptor,
         approval: &InstallerServiceRegistrationApproval,
     ) -> Result<(), HostError> {
@@ -4898,11 +4971,7 @@ impl HostComposition {
             &launch.watchdog_executable_path,
         )?;
         debug_assert_eq!(registration.binary_path(), image.as_path());
-        start_installed_watchdog(
-            &mut platform,
-            &registration,
-            lifecycle_context(&self.host, "watchdog-start")?,
-        )
+        require_running_watchdog(&mut platform, &registration)
     }
 
     #[cfg(windows)]
@@ -5023,10 +5092,15 @@ impl HostComposition {
             self.registry.active().cloned().ok_or_else(|| {
                 HostError::ProcessContour("no approved active generation".to_owned())
             })?;
+        let (_, store_artifact) = active
+            .manifest
+            .host_child_artifact_digests()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         self.start_manifest_contour(
             &active.manifest,
             kernel_executable.as_ref(),
             store_executable.as_ref(),
+            store_artifact,
             None,
         )
     }
@@ -5037,10 +5111,11 @@ impl HostComposition {
         manifest: &CandidateManifest,
         kernel_executable: &Path,
         store_executable: &Path,
+        store_artifact: &PlatformHandle,
         pending: Option<&eliot_installation::PendingActivation>,
     ) -> Result<(), HostError> {
         Self::validate_launch_options_for_manifest(&self.launch_options, manifest)?;
-        let watchdog_approval = select_watchdog_approval_for_start(&self.registry, manifest)?;
+        let watchdog_approval = select_watchdog_approval_for_inspection(&self.registry, manifest)?;
         if let Some(pending) = pending {
             let current = self.journal.snapshot()?.activation.ok_or_else(|| {
                 HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
@@ -5057,11 +5132,16 @@ impl HostComposition {
             self.transition_activation(ActivationState::Starting, "host-start-approved")?;
         }
         if let Some(watchdog_approval) = watchdog_approval.as_ref() {
-            self.request_watchdog(&manifest.runtime_launch, watchdog_approval)?;
+            Self::inspect_watchdog(&manifest.runtime_launch, watchdog_approval)?;
         }
-        let (kernel_artifact, store_artifact) = manifest
+        let (kernel_artifact, approved_store_artifact) = manifest
             .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if approved_store_artifact != store_artifact {
+            return Err(HostError::ProcessContour(
+                "Store bridge artifact digest is not the approved manifest digest".to_owned(),
+            ));
+        }
         let (approved_kernel_path, approved_store_path, approved_config_path) =
             manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
@@ -5144,10 +5224,12 @@ impl HostComposition {
             )?;
             return Err(HostError::RecoveryRequired(reason.to_owned()));
         }
-        let (kernel, store_bridge) = approved_host_start_paths(&pending.manifest);
-        if let Err(error) =
-            self.start_manifest_contour(&pending.manifest, &kernel, &store_bridge, Some(&pending))
-        {
+        if let Err(error) = start_approved_manifest_contour(
+            self,
+            &pending.manifest,
+            HostStartupBranch::Pending,
+            Some(&pending),
+        ) {
             if pending.prior_active_generation.is_none() {
                 self.abort_pending_durable(&pending, &host_capability)?;
             } else {
@@ -6335,6 +6417,32 @@ impl HostComposition {
     }
 }
 
+#[cfg(windows)]
+impl ApprovedHostStartupPort for HostComposition {
+    fn start_approved_manifest(
+        &mut self,
+        manifest: &CandidateManifest,
+        branch: HostStartupBranch,
+        kernel_executable: &Path,
+        store_bridge_executable: &Path,
+        store_artifact: &PlatformHandle,
+        pending: Option<&eliot_installation::PendingActivation>,
+    ) -> Result<(), HostError> {
+        debug_assert_eq!(
+            matches!(branch, HostStartupBranch::Pending),
+            pending.is_some()
+        );
+        self.start_manifest_contour(
+            manifest,
+            kernel_executable,
+            store_bridge_executable,
+            store_artifact,
+            pending,
+        )
+    }
+}
+
+#[cfg(all(test, windows))]
 fn lifecycle_context(
     host: &HostInstallationEpoch,
     operation: &str,
@@ -6391,18 +6499,10 @@ fn owner_lease_release_error(error: HostOwnerLeaseReleaseError) -> HostError {
     ))
 }
 
-#[cfg(windows)]
-fn approved_host_start_paths(manifest: &CandidateManifest) -> (PathBuf, PathBuf) {
-    let (approved_kernel_path, approved_store_bridge_path, _) = manifest.host_child_paths();
-    (
-        PathBuf::from(approved_kernel_path.as_str()),
-        PathBuf::from(approved_store_bridge_path.as_str()),
-    )
-}
-
 #[cfg(all(test, windows))]
 mod watchdog_service_tests {
     use super::*;
+    use eliot_platform::{PortOutcome, ServiceRequest};
     use eliot_platform_windows::ServiceBootstrapArguments;
     use std::collections::VecDeque;
 
@@ -6422,7 +6522,9 @@ mod watchdog_service_tests {
                 .pop_front()
                 .unwrap_or_else(|| self.fallback_inspection.clone())
         }
+    }
 
+    impl InstalledWatchdogStartControl for FakeInstalledWatchdog {
         fn start(
             &mut self,
             _request: &ServiceRequest,
@@ -6492,6 +6594,39 @@ mod watchdog_service_tests {
             fallback_inspection,
             start_outcomes: start_outcomes.into_iter().collect(),
             starts: 0,
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ApprovedHostStartCall {
+        branch: HostStartupBranch,
+        kernel_executable: PathBuf,
+        store_bridge_executable: PathBuf,
+        store_artifact: PlatformHandle,
+    }
+
+    #[derive(Default)]
+    struct SpyApprovedHostStartup {
+        calls: Vec<ApprovedHostStartCall>,
+    }
+
+    impl ApprovedHostStartupPort for SpyApprovedHostStartup {
+        fn start_approved_manifest(
+            &mut self,
+            _manifest: &CandidateManifest,
+            branch: HostStartupBranch,
+            kernel_executable: &Path,
+            store_bridge_executable: &Path,
+            store_artifact: &PlatformHandle,
+            _pending: Option<&eliot_installation::PendingActivation>,
+        ) -> Result<(), HostError> {
+            self.calls.push(ApprovedHostStartCall {
+                branch,
+                kernel_executable: kernel_executable.to_path_buf(),
+                store_bridge_executable: store_bridge_executable.to_path_buf(),
+                store_artifact: store_artifact.clone(),
+            });
+            Ok(())
         }
     }
 
@@ -6629,6 +6764,33 @@ mod watchdog_service_tests {
     }
 
     #[test]
+    fn production_watchdog_inspection_rejects_stopped_without_start_and_accepts_running() {
+        let registration = registration();
+        let mut stopped = fake_control(
+            [runtime_observation(ServiceState::Stopped, 0, None)],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [],
+        );
+        assert!(matches!(
+            require_running_watchdog(&mut stopped, &registration),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        assert_eq!(stopped.starts, 0);
+
+        let mut running = fake_control(
+            [runtime_observation(
+                ServiceState::Running,
+                0,
+                Some(process_for(&registration)),
+            )],
+            InstalledWatchdogRuntimeInspection::Unknown,
+            [],
+        );
+        require_running_watchdog(&mut running, &registration).unwrap_or_else(|_| unreachable!());
+        assert_eq!(running.starts, 0);
+    }
+
+    #[test]
     fn absent_mismatched_or_unknown_registration_never_starts() {
         for inspection in [
             InstalledWatchdogRuntimeInspection::Absent,
@@ -6732,11 +6894,11 @@ mod watchdog_service_tests {
     }
 
     #[test]
-    fn production_start_selects_scm_only_for_system_service() {
+    fn production_inspection_selects_scm_only_for_system_service() {
         let (manifest, root) =
             super::journal_tests::liveness_manifest_with_distinct_store_digests();
         assert_eq!(
-            select_watchdog_approval_for_start(&ApprovedGenerationRegistry::new(), &manifest)
+            select_watchdog_approval_for_inspection(&ApprovedGenerationRegistry::new(), &manifest)
                 .unwrap_or_else(|_| unreachable!()),
             None
         );
@@ -6744,7 +6906,7 @@ mod watchdog_service_tests {
         let mut system_manifest = manifest.clone();
         system_manifest.runtime_launch.profile = InstallationProfile::SystemService;
         assert!(
-            select_watchdog_approval_for_start(
+            select_watchdog_approval_for_inspection(
                 &ApprovedGenerationRegistry::new(),
                 &system_manifest,
             )
@@ -6754,72 +6916,47 @@ mod watchdog_service_tests {
     }
 
     #[test]
-    fn production_active_start_selects_approved_store_bridge_without_path_rejection() {
+    fn production_active_and_pending_start_pass_bridge_and_digest_through_shared_port() {
         let (manifest, root) =
             super::journal_tests::liveness_manifest_with_distinct_store_digests();
-        let bridge_path = PathBuf::from(manifest.store_bridge_executable_path.as_str());
-        let provider_path = PathBuf::from(manifest.canonical_store_executable_path.as_str());
-        std::fs::write(&bridge_path, b"approved store bridge").expect("bridge fixture");
-        std::fs::write(&provider_path, b"canonical store provider").expect("provider fixture");
-
-        let (_, selected_store) = approved_host_start_paths(&manifest);
-        let (_, approved_store, _) = manifest.host_child_paths();
-        assert_eq!(selected_store, bridge_path);
-        assert_ne!(selected_store, provider_path);
-        assert!(
-            approved_locator(
-                &selected_store,
-                approved_store,
-                manifest.runtime_launch.profile
-            )
-            .is_ok()
-        );
-        assert!(
-            approved_locator(
-                &provider_path,
-                approved_store,
-                manifest.runtime_launch.profile
-            )
-            .is_err()
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn production_pending_start_selects_approved_store_bridge_without_path_rejection() {
-        let (pending_manifest, root) =
+        let (pending_manifest, pending_root) =
             super::journal_tests::liveness_manifest_with_distinct_store_digests();
-        let bridge_path = PathBuf::from(pending_manifest.store_bridge_executable_path.as_str());
-        let provider_path =
-            PathBuf::from(pending_manifest.canonical_store_executable_path.as_str());
-        std::fs::write(&bridge_path, b"approved pending store bridge")
-            .expect("pending bridge fixture");
-        std::fs::write(&provider_path, b"pending canonical store provider")
-            .expect("pending provider fixture");
+        let mut spy = SpyApprovedHostStartup::default();
+        start_approved_manifest_contour(&mut spy, &manifest, HostStartupBranch::Active, None)
+            .unwrap_or_else(|_| unreachable!());
+        start_approved_manifest_contour(
+            &mut spy,
+            &pending_manifest,
+            HostStartupBranch::Pending,
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!());
 
-        let (_, selected_store) = approved_host_start_paths(&pending_manifest);
-        let (_, approved_store, _) = pending_manifest.host_child_paths();
-        assert_eq!(selected_store, bridge_path);
-        assert_ne!(selected_store, provider_path);
-        assert!(
-            approved_locator(
-                &selected_store,
-                approved_store,
-                pending_manifest.runtime_launch.profile
-            )
-            .is_ok()
-        );
-        assert!(
-            approved_locator(
-                &provider_path,
-                approved_store,
-                pending_manifest.runtime_launch.profile
-            )
-            .is_err()
-        );
+        assert_eq!(spy.calls.len(), 2);
+        for (call, candidate) in spy.calls.iter().zip([&manifest, &pending_manifest]) {
+            let (approved_kernel, approved_store_bridge, _) = candidate.host_child_paths();
+            let (_, approved_store_artifact) = candidate
+                .host_child_artifact_digests()
+                .unwrap_or_else(|_| unreachable!());
+            assert_eq!(
+                call.kernel_executable,
+                PathBuf::from(approved_kernel.as_str())
+            );
+            assert_eq!(
+                call.store_bridge_executable,
+                PathBuf::from(approved_store_bridge.as_str())
+            );
+            assert_eq!(call.store_artifact, *approved_store_artifact);
+            assert_ne!(
+                call.store_bridge_executable,
+                PathBuf::from(candidate.canonical_store_executable_path.as_str())
+            );
+        }
+        assert_eq!(spy.calls[0].branch, HostStartupBranch::Active);
+        assert_eq!(spy.calls[1].branch, HostStartupBranch::Pending);
 
         let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(pending_root);
     }
 
     #[test]
