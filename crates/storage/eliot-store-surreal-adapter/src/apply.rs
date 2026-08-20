@@ -180,16 +180,20 @@ where
 pub(crate) async fn client(
     adapter: &SurrealStoreAdapter,
 ) -> Result<&client::RpcTransport, AdapterError> {
-    match adapter
+    let transport = match adapter
         .client
         .get_or_init(|| async {
             client::RpcTransport::connect(&adapter.config, &adapter.provider_process_lease).await
         })
         .await
     {
-        Ok(transport) => Ok(transport),
-        Err(error) => Err(error.clone()),
-    }
+        Ok(transport) => transport,
+        Err(error) => return Err(error.clone()),
+    };
+    transport
+        .validate_liveness(&adapter.config, &adapter.provider_process_lease)
+        .await?;
+    Ok(transport)
 }
 
 /// Reads the recorded schema generation, if any.

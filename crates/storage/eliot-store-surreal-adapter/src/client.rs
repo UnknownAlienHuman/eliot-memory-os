@@ -48,6 +48,12 @@ pub(crate) struct RpcTransport {
     socket: Mutex<RpcSocket>,
     request_timeout: Duration,
     provider_child: Mutex<Child>,
+    /// Process identity captured after the authenticated provider handshake.
+    /// Every later readiness/operation admission rechecks this identity and
+    /// the exact listener owner; a still-open transport is not standalone
+    /// liveness authority.
+    provider_process_id: u32,
+    provider_process_identity: ProcessIdentity,
 }
 
 impl fmt::Debug for RpcTransport {
@@ -57,6 +63,8 @@ impl fmt::Debug for RpcTransport {
             .field("socket", &"private")
             .field("request_timeout", &self.request_timeout)
             .field("provider_child", &"retained")
+            .field("provider_process_id", &self.provider_process_id)
+            .field("provider_process_identity", &self.provider_process_identity)
             .finish()
     }
 }
@@ -185,6 +193,8 @@ impl RpcTransport {
             socket: Mutex::new(socket),
             request_timeout: millis(config.query_timeout_ms),
             provider_child: Mutex::new(provider_child),
+            provider_process_id,
+            provider_process_identity: identity_before_auth.clone(),
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         timeout(remaining, authenticate_provider(&transport, config))
@@ -205,6 +215,57 @@ impl RpcTransport {
             )?;
         }
         Ok(transport)
+    }
+
+    /// Re-proves that the retained child and its exact loopback listener are
+    /// still the provider that authenticated this transport.
+    ///
+    /// A successful WebSocket connection is not enough: after a provider
+    /// crash/replacement, an old transport must never manufacture a fresh
+    /// readiness result from socket or database state alone.
+    pub(crate) async fn validate_liveness(
+        &self,
+        config: &SurrealAdapterConfig,
+        provider_process_lease: &RetainedProcessPathLease,
+    ) -> Result<(), AdapterError> {
+        let mut child = self.provider_child.lock().await;
+        let identity_before_listener = validate_child_process(
+            config,
+            provider_process_lease,
+            &mut child,
+            self.provider_process_id,
+        )?;
+        require_unchanged_identity(
+            &self.provider_process_identity,
+            &identity_before_listener,
+            "liveness precheck",
+        )?;
+        let endpoint = config
+            .provider_bind_address
+            .parse::<SocketAddr>()
+            .map_err(|_| {
+                AdapterError::Config(
+                    "provider bind address is not an exact loopback socket".to_owned(),
+                )
+            })?;
+        let owner = observe_loopback_tcp_listener_owner(endpoint).map_err(|_| {
+            AdapterError::Config(
+                "canonical provider listener ownership could not be proven".to_owned(),
+            )
+        })?;
+        require_listener_owner(self.provider_process_id, owner.process_id())?;
+        let identity_after_listener = validate_child_process(
+            config,
+            provider_process_lease,
+            &mut child,
+            self.provider_process_id,
+        )?;
+        require_unchanged_identity(
+            &identity_before_listener,
+            &identity_after_listener,
+            "liveness listener observation",
+        )?;
+        Ok(())
     }
 
     async fn signin(&self, username: &str, password: &SecretString) -> Result<(), AdapterError> {
