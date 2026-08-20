@@ -163,6 +163,9 @@ pub struct InstallationActivationPayload {
     pub candidate_manifest_digest: String,
     /// Digest of the exact runtime launch descriptor bytes.
     pub runtime_descriptor_digest: String,
+    /// Digest of the complete static-verification receipt which proved the
+    /// staged package, artifacts, configuration and authority descriptors.
+    pub static_verification_receipt_digest: String,
     /// All approved artifact image/configuration-independent digests.
     pub artifact_digests: Vec<InstallationDigestBinding>,
     /// All approved configuration digests.
@@ -209,6 +212,10 @@ impl InstallationActivationPayload {
         validate_sha256(&self.installer_plan_digest, "installer_plan_digest")?;
         validate_sha256(&self.candidate_manifest_digest, "candidate_manifest_digest")?;
         validate_sha256(&self.runtime_descriptor_digest, "runtime_descriptor_digest")?;
+        validate_sha256(
+            &self.static_verification_receipt_digest,
+            "static_verification_receipt_digest",
+        )?;
         validate_named_digests(&self.artifact_digests, "artifact_digests")?;
         validate_named_digests(&self.config_digests, "config_digests")?;
         validate_named_digests(
@@ -591,6 +598,8 @@ impl InstallationActivationApprovalTrustAnchor {
         }
         if payload.transaction_id != context.transaction_id
             || payload.transaction_revision != context.transaction_revision
+            || payload.static_verification_receipt_digest
+                != context.static_verification_receipt_digest
             || payload.installation_epoch != context.installation_epoch
             || payload.authority_generation != context.authority_generation
             || payload.authority_state_fence != context.authority_state_fence
@@ -648,6 +657,9 @@ pub struct InstallationActivationVerificationContext {
     pub transaction_id: String,
     /// Expected durable transaction revision.
     pub transaction_revision: u64,
+    /// Expected digest of the independently admitted complete
+    /// static-verification receipt.
+    pub static_verification_receipt_digest: String,
     /// Expected authority generation.
     pub authority_generation: ResourceGeneration,
     /// Expected authority fence.
@@ -668,6 +680,10 @@ impl InstallationActivationVerificationContext {
                 "must be greater than zero",
             ));
         }
+        validate_sha256(
+            &self.static_verification_receipt_digest,
+            "static_verification_receipt_digest",
+        )?;
         if self.authority_generation.value() == 0 {
             return Err(invalid_field(
                 "authority_generation",
@@ -939,6 +955,7 @@ mod tests {
             installer_plan_digest: digest('1'),
             candidate_manifest_digest: digest('2'),
             runtime_descriptor_digest: digest('3'),
+            static_verification_receipt_digest: digest('d'),
             artifact_digests: vec![InstallationDigestBinding {
                 name: "eliot-host.exe".to_owned(),
                 digest: digest('4'),
@@ -999,6 +1016,7 @@ mod tests {
             installation_epoch: value.installation_epoch,
             transaction_id: value.transaction_id,
             transaction_revision: value.transaction_revision,
+            static_verification_receipt_digest: value.static_verification_receipt_digest,
             authority_generation: value.authority_generation,
             authority_state_fence: value.authority_state_fence,
         }
@@ -1071,6 +1089,41 @@ mod tests {
     }
 
     #[test]
+    fn static_verification_receipt_is_mandatory_and_exactly_bound() {
+        let mut malformed_payload = payload();
+        malformed_payload.static_verification_receipt_digest = "ABC".to_owned();
+        assert!(malformed_payload.validate().is_err());
+
+        let mut malformed_context = context();
+        malformed_context.static_verification_receipt_digest = "ABC".to_owned();
+        assert!(malformed_context.validate().is_err());
+
+        let authority_signer = signer();
+        let signed = payload().sign(&authority_signer).expect("sign");
+        let mut substituted_payload = signed.clone();
+        substituted_payload
+            .payload
+            .static_verification_receipt_digest = digest('e');
+        substituted_payload.payload_sha256 = substituted_payload
+            .payload
+            .digest()
+            .expect("substituted payload digest");
+        let mut substituted_context = context();
+        substituted_context.static_verification_receipt_digest = digest('e');
+        assert!(matches!(
+            anchor().verify(&substituted_payload, &substituted_context),
+            Err(InstallationActivationError::SignatureInvalid(_))
+        ));
+
+        let mut mismatched_context = context();
+        mismatched_context.static_verification_receipt_digest = digest('e');
+        assert_eq!(
+            anchor().verify(&signed, &mismatched_context),
+            Err(InstallationActivationError::BindingMismatch)
+        );
+    }
+
+    #[test]
     fn anchor_rejects_expiry_not_yet_valid_and_context_mismatch() {
         let signer = signer();
         let mut not_yet_valid = payload();
@@ -1095,7 +1148,7 @@ mod tests {
         let payload = payload();
         let baseline = payload.digest().expect("digest");
         let mut altered = payload;
-        altered.scm_readbacks[0].configuration_digest = digest('e');
+        altered.static_verification_receipt_digest = digest('e');
         assert_ne!(altered.digest().expect("digest"), baseline);
     }
 }
