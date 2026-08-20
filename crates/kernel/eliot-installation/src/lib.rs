@@ -33,8 +33,8 @@ use eliot_platform_windows::{
     PackageStagingObservation, ProtectedPathError, ProtectedPathLease, ProtectedRootLease,
     ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
     ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
-    ServiceRegistrationRequest, ServiceStartMode, StagingReceipt, TrustedSourceBundle,
-    UserOwnedPathLease, UserOwnedRootReadLease, WindowsInstallerRootPrimitive,
+    ServiceRegistrationRequest, ServiceStartMode, StagedFileReceipt, StagingReceipt,
+    TrustedSourceBundle, UserOwnedPathLease, UserOwnedRootReadLease, WindowsInstallerRootPrimitive,
     WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
     current_user_local_app_data_root, fresh_service_registration_nonce,
     observe_running_eliot_host_process, protected_program_data_root,
@@ -82,7 +82,7 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 /// private, durable activation-receipt binding: a transaction cannot be
 /// re-opened as `ActiveVerified` without the exact registry terminal that
 /// committed it.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(11, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(12, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -1576,7 +1576,11 @@ pub struct CandidateManifest {
     pub store_credential_target: PlatformHandle,
     /// Installation-approved public-key fingerprint for supervision leases.
     pub supervision_key_fingerprint: PlatformHandle,
-    /// Signature/approval evidence reference.
+    /// Runtime Live canary artifact-set evidence reference.
+    ///
+    /// This is a content-addressed, domain-separated SHA-256 over the
+    /// canonical generation and exact ordered eleven-file facts.  It is not a
+    /// production release signature; production signing remains unclaimed.
     pub signature_ref: PlatformHandle,
     /// Digest of the exact mutable root topology approved by this manifest.
     pub runtime_state_roots_digest: PlatformHandle,
@@ -5347,19 +5351,22 @@ fn validate_package_binding(
         PackageManifest::new(&manifest.generation, manifest.files.clone())
             .map_err(|error| package_plan_error(&error))?;
         #[cfg(test)]
-        if package_planner::candidate_has_nonplaceholder_package_digests(candidate_manifest) {
+        let enforce_complete_package =
+            package_planner::candidate_has_nonplaceholder_package_digests(candidate_manifest);
+        #[cfg(not(test))]
+        let enforce_complete_package = true;
+        if enforce_complete_package {
             package_planner::validate_exact_expected_file_digests(
                 candidate_manifest,
                 manifest,
                 expected_file_digests,
             )?;
+            let expected_signature_ref =
+                package_planner::artifact_set_evidence_digest(manifest, expected_file_digests)?;
+            if candidate_manifest.signature_ref != expected_signature_ref {
+                return Err(InstallationError::IdentityConflict);
+            }
         }
-        #[cfg(not(test))]
-        package_planner::validate_exact_expected_file_digests(
-            candidate_manifest,
-            manifest,
-            expected_file_digests,
-        )?;
     }
     if package_count > 1 {
         return Err(InstallationError::Duplicate {
@@ -5427,6 +5434,26 @@ fn validate_staging_receipt_for_plan(
             "package receipt file count differs from its immutable manifest".to_owned(),
         ));
     }
+    // The immutable StagePackage manifest and expected digest set were already
+    // bound to CandidateManifest::signature_ref by validate_package_binding.
+    // The receipt checks below therefore bind retained source/destination
+    // identities, exact sizes, hashes, PE evidence, and Authenticode to that
+    // canary fact set without duplicating volatile identity in the reference.
+    let mut receipt_paths = BTreeSet::new();
+    for file in &receipt.files {
+        let path =
+            eliot_platform_windows::validate_package_relative_path(Path::new(&file.relative_path))
+                .map_err(|_| InstallationError::IdentityConflict)?;
+        if !receipt_paths.insert(path.as_str().to_ascii_lowercase()) {
+            return Err(InstallationError::Duplicate {
+                kind: "package receipt file".to_owned(),
+                identity: file.relative_path.clone(),
+            });
+        }
+        if !is_lower_sha256(&file.security_descriptor_sha256) {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
     for spec in &manifest.files {
         let Some(expected) = expected_file_digests
             .iter()
@@ -5448,7 +5475,7 @@ fn validate_staging_receipt_for_plan(
             "installer_effect.expected_file_digests.sha256",
         )?;
         if file.sha256 != expected.sha256.as_str()
-            || file.size > spec.max_size
+            || file.size != spec.expected_size
             || (spec.executable && (file.pe.is_none() || file.authenticode.is_none()))
             || (!spec.executable && (file.pe.is_some() || file.authenticode.is_some()))
             || file.source_identity.volume_serial_number == 0
@@ -5466,7 +5493,17 @@ fn validate_staging_receipt_for_plan(
             ));
         }
     }
+    if receipt_paths.len() != manifest.files.len() {
+        return Err(InstallationError::IdentityConflict);
+    }
     Ok(())
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 impl PendingActivation {
@@ -5754,6 +5791,8 @@ pub enum InstallerAclPrincipal {
 pub struct PackageArtifactDigest {
     /// Canonical path relative to the package generation root.
     pub relative_path: String,
+    /// Exact byte length of the immutable source and staged file.
+    pub expected_size: u64,
     /// Expected SHA-256 digest of the immutable source and staged file.
     pub sha256: PlatformHandle,
 }
@@ -5909,6 +5948,20 @@ impl InstallerEffectPlan {
                         return Err(InstallationError::Duplicate {
                             kind: "package artifact digest".to_owned(),
                             identity: digest.relative_path.clone(),
+                        });
+                    }
+                    let Some(spec) = manifest.files.iter().find(|spec| {
+                        spec.relative_path
+                            .eq_ignore_ascii_case(&digest.relative_path)
+                    }) else {
+                        return Err(InstallationError::IdentityConflict);
+                    };
+                    if digest.expected_size == 0 || digest.expected_size != spec.expected_size {
+                        return Err(InstallationError::InvalidField {
+                            field: "installer_effect.expected_file_digests.expected_size"
+                                .to_owned(),
+                            reason: "must exactly equal the immutable package manifest byte size"
+                                .to_owned(),
                         });
                     }
                     sha256_handle(
@@ -7800,8 +7853,14 @@ impl PackageObservationSnapshot {
         })?;
         PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| platform_error(&error))
     }
-    #[allow(missing_docs)]
+    #[allow(
+        missing_docs,
+        clippy::too_many_lines,
+        reason = "snapshot validation keeps every persisted package fact in one boundary"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
+        const MAX_PACKAGE_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
+        const MAX_PACKAGE_SNAPSHOT_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
         use std::cmp::Ordering;
         if self.source_bundle_identity.volume_serial_number == 0
             || self.source_bundle_identity.file_index == 0
@@ -7827,6 +7886,7 @@ impl PackageObservationSnapshot {
             });
         }
         let mut seen: Vec<String> = Vec::new();
+        let mut computed_total_bytes = 0_u64;
         for file in &self.files {
             validate_package_relative_text(
                 &file.relative_path,
@@ -7842,6 +7902,25 @@ impl PackageObservationSnapshot {
                     reason: "must be non-zero".to_owned(),
                 });
             }
+            if file.size == 0 || file.size > MAX_PACKAGE_SNAPSHOT_FILE_BYTES {
+                return Err(InstallationError::InvalidField {
+                    field: "effect.precondition.package_snapshot.files.size".to_owned(),
+                    reason: "must be a non-zero exact package byte size".to_owned(),
+                });
+            }
+            computed_total_bytes =
+                computed_total_bytes.checked_add(file.size).ok_or_else(|| {
+                    InstallationError::InvalidField {
+                        field: "effect.precondition.package_snapshot.total_bytes".to_owned(),
+                        reason: "overflows the bounded package byte total".to_owned(),
+                    }
+                })?;
+            if computed_total_bytes > MAX_PACKAGE_SNAPSHOT_TOTAL_BYTES {
+                return Err(InstallationError::InvalidField {
+                    field: "effect.precondition.package_snapshot.total_bytes".to_owned(),
+                    reason: "exceeds the bounded package byte total".to_owned(),
+                });
+            }
             if seen.iter().any(|existing| {
                 eliot_platform_windows::ordinal_eq_str(existing, &file.relative_path)
             }) {
@@ -7851,6 +7930,12 @@ impl PackageObservationSnapshot {
                 });
             }
             seen.push(file.relative_path.clone());
+        }
+        if computed_total_bytes != self.total_bytes {
+            return Err(InstallationError::InvalidField {
+                field: "effect.precondition.package_snapshot.total_bytes".to_owned(),
+                reason: "must equal the sum of exact file byte sizes".to_owned(),
+            });
         }
         for window in self.files.windows(2) {
             if eliot_platform_windows::ordinal_cmp_str(
@@ -10241,7 +10326,11 @@ pub(crate) fn validate_observed_against_plan(
         if !obs.sha256.eq_ignore_ascii_case(exp.sha256.as_str()) {
             return Err(PackageStagingError::HashMismatch);
         }
-        if obs.size > man.max_size {
+        if exp.expected_size != man.expected_size
+            || obs.size != exp.expected_size
+            || (man.executable && obs.pe.is_none())
+            || (!man.executable && obs.pe.is_some())
+        {
             return Err(PackageStagingError::SizeMismatch);
         }
         if obs.sha256.len() != 64
@@ -10333,10 +10422,11 @@ fn package_absent_with_snapshot(
 fn inspect_package(
     request: &InstallationEffectRequest,
 ) -> Result<InstallationEffectObservation, PackageStagingError> {
-    let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
+    let (stager, _manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
         generation,
+        manifest,
         package_manifest_digest,
         ..
     } = &request.plan
@@ -10350,7 +10440,7 @@ fn inspect_package(
         return Err(PackageStagingError::IdentityMismatch);
     }
     let observed = stager.source().observe()?;
-    validate_observed_against_plan(&observed, &manifest, expected_file_digests)?;
+    validate_observed_against_plan(&observed, manifest, expected_file_digests)?;
     let manifest_digest_handle = PlatformHandle::new(manifest.canonical_digest())
         .map_err(|_| PackageStagingError::HashMismatch)?;
     let snapshot = build_package_snapshot(
@@ -10369,7 +10459,7 @@ fn inspect_package(
     } else {
         package_absent_with_snapshot(request, snapshot)?
     };
-    match stager.inspect(&manifest)? {
+    match stager.inspect(manifest)? {
         PackageStagingObservation::Absent => Ok(absent),
         PackageStagingObservation::Matching(_) => {
             Ok(package_pending(&PackageStagingError::PartialTree))
@@ -10383,11 +10473,12 @@ fn inspect_package(
 fn reconcile_package(
     request: &InstallationEffectRequest,
 ) -> Result<InstallationEffectObservation, PackageStagingError> {
-    let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
         generation,
+        manifest,
         package_manifest_digest,
+        staging_root,
         ..
     } = &request.plan
     else {
@@ -10402,8 +10493,46 @@ fn reconcile_package(
         || manifest.canonical_digest() != package_manifest_digest.as_str()
         || &persisted.generation != generation
         || persisted.manifest_digest.as_str() != manifest.canonical_digest()
-        || persisted.source_bundle_identity != stager.source().identity()
     {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+
+    // A durable staging receipt is authoritative destination evidence. It is
+    // intentionally reconciled before opening the source bundle so recovery
+    // still converges after the source has been removed.
+    if let Some(receipt) = &request.staging_receipt {
+        if receipt.files.len() != persisted.files.len()
+            || receipt.files.iter().any(|file| {
+                let Some(expected) = persisted.files.iter().find(|expected| {
+                    eliot_platform_windows::ordinal_eq_str(
+                        &expected.relative_path,
+                        &file.relative_path,
+                    )
+                }) else {
+                    return true;
+                };
+                file.source_identity != expected.identity
+                    || file.sha256 != expected.sha256.as_str()
+                    || file.size != expected.size
+            })
+        {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        let observation =
+            PackageStager::reconcile_destination_only(Path::new(staging_root.as_str()), receipt)?;
+        return match observation {
+            PackageStagingObservation::Absent => Ok(package_absent_observation(request)),
+            PackageStagingObservation::Matching(receipt) => {
+                package_matching_observation(request, receipt)
+                    .map_err(|_| PackageStagingError::IdentityMismatch)
+            }
+            PackageStagingObservation::Mismatch(error) => Ok(package_pending(&error)),
+            PackageStagingObservation::Unknown(error) => Err(error),
+        };
+    }
+
+    let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
+    if persisted.source_bundle_identity != stager.source().identity() {
         return Err(PackageStagingError::IdentityMismatch);
     }
     let observed = stager.source().observe()?;
@@ -10417,11 +10546,7 @@ fn reconcile_package(
     if fresh.digest != persisted.digest {
         return Err(PackageStagingError::HashMismatch);
     }
-    let observation = if let Some(receipt) = &request.staging_receipt {
-        stager.reconcile(receipt)?
-    } else {
-        stager.inspect(&manifest)?
-    };
+    let observation = stager.inspect(&manifest)?;
     match observation {
         PackageStagingObservation::Absent => Ok(package_absent_observation(request)),
         PackageStagingObservation::Matching(receipt) => {
@@ -10472,21 +10597,90 @@ fn execute_package(
             Err(error) => package_staging_outcome(&error),
         };
     }
-    let (stager, manifest) = match package_stager(request) {
-        Ok(value) => value,
-        Err(error) => return PortOutcome::Error(error),
-    };
     let Some(snapshot) = &request.precondition.package_snapshot else {
         return PortOutcome::Error(PortError::InvalidRequestMetadata);
     };
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
         generation,
+        manifest,
         package_manifest_digest,
+        staging_root,
         ..
     } = &request.plan
     else {
         return PortOutcome::Error(PortError::InvalidRequestMetadata);
+    };
+
+    // If publication completed before the caller persisted its receipt, adopt
+    // only an exact destination tree. A complete or partial existing tree is
+    // never replayed through the mutating stage primitive.
+    if request.action == InstallationEffectAction::Apply && request.staging_receipt.is_none() {
+        let expectations = snapshot
+            .files
+            .iter()
+            .map(|file| StagedFileReceipt {
+                relative_path: file.relative_path.clone(),
+                source_identity: file.identity,
+                destination_identity: FileIdentity {
+                    volume_serial_number: 0,
+                    file_index: 0,
+                },
+                size: file.size,
+                sha256: file.sha256.as_str().to_owned(),
+                security_descriptor_sha256: String::new(),
+                pe: None,
+                authenticode: None,
+            })
+            .collect::<Vec<_>>();
+        if expectations.len() != expected_file_digests.len()
+            || expectations.iter().any(|file| {
+                expected_file_digests
+                    .iter()
+                    .find(|expected| {
+                        eliot_platform_windows::ordinal_eq_str(
+                            &expected.relative_path,
+                            &file.relative_path,
+                        )
+                    })
+                    .is_none_or(|expected| expected.sha256.as_str() != file.sha256)
+            })
+        {
+            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+        }
+        let published = match PackageStager::inspect_published_destination(
+            Path::new(staging_root.as_str()),
+            manifest,
+            &expectations,
+        ) {
+            Ok(observation) => observation,
+            Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+        };
+        match published {
+            PackageStagingObservation::Absent => {}
+            PackageStagingObservation::Matching(receipt) => {
+                if validate_staging_receipt_for_plan(&request.plan, &receipt).is_err() {
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                }
+                let Ok(digest) = PlatformHandle::new(receipt.digest()) else {
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                };
+                return PortOutcome::Known(InstallationEffectExecution {
+                    evidence: vec![digest],
+                    create_disposition: None,
+                    credential_receipt: None,
+                    staging_receipt: Some(receipt),
+                });
+            }
+            PackageStagingObservation::Mismatch(_) | PackageStagingObservation::Unknown(_) => {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            }
+        }
+    }
+
+    let (stager, manifest) = match package_stager(request) {
+        Ok(value) => value,
+        Err(error) => return PortOutcome::Error(error),
     };
     if manifest.generation != generation.as_str()
         || manifest.canonical_digest() != package_manifest_digest.as_str()
@@ -14861,7 +15055,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 11.0.0")
+                if reason.contains("requires explicit migration to 12.0.0")
         ));
     }
 
@@ -17243,18 +17437,20 @@ mod tests {
         let manifest = PackageManifest::new(
             "gen1",
             vec![
-                PackageFileSpec::new("a.txt", false, 1024).unwrap(),
-                PackageFileSpec::new("b.txt", false, 1024).unwrap(),
+                PackageFileSpec::new("a.txt", false, 1).unwrap(),
+                PackageFileSpec::new("b.txt", false, 1).unwrap(),
             ],
         )
         .unwrap();
         let expected = vec![
             PackageArtifactDigest {
                 relative_path: "a.txt".to_owned(),
+                expected_size: 1,
                 sha256: test_handle(sha256_hex(b"a")),
             },
             PackageArtifactDigest {
                 relative_path: "b.txt".to_owned(),
+                expected_size: 1,
                 sha256: test_handle(sha256_hex(b"b")),
             },
         ];
@@ -17268,6 +17464,7 @@ mod tests {
                         file_index: 1,
                     },
                     size: 1,
+                    pe: None,
                 },
                 eliot_platform_windows::PackageSourceFileObservation {
                     relative_path: "b.txt".to_owned(),
@@ -17277,6 +17474,7 @@ mod tests {
                         file_index: 2,
                     },
                     size: 1,
+                    pe: None,
                 },
             ],
             total_bytes: 2,
@@ -17293,6 +17491,7 @@ mod tests {
                     file_index: 3,
                 },
                 size: 1,
+                pe: None,
             });
         observed_extra.total_bytes = 3;
         assert!(matches!(
@@ -17312,6 +17511,19 @@ mod tests {
             validate_observed_against_plan(&observed_hash, &manifest, &expected),
             Err(PackageStagingError::HashMismatch)
         ));
+        let mut observed_size = observed_ok.clone();
+        observed_size.files[0].size = 2;
+        observed_size.total_bytes = 3;
+        assert!(matches!(
+            validate_observed_against_plan(&observed_size, &manifest, &expected),
+            Err(PackageStagingError::SizeMismatch)
+        ));
+        let mut expected_size = expected;
+        expected_size[0].expected_size = 2;
+        assert!(matches!(
+            validate_observed_against_plan(&observed_ok, &manifest, &expected_size),
+            Err(PackageStagingError::SizeMismatch)
+        ));
     }
 
     #[test]
@@ -17325,7 +17537,7 @@ mod tests {
         let bytes = must(serde_json::to_vec(&legacy));
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
-            Err(InstallationError::MigrationRequired { reason }) if reason.contains("requires explicit migration to 11.0.0")
+            Err(InstallationError::MigrationRequired { reason }) if reason.contains("requires explicit migration to 12.0.0")
         ));
     }
 

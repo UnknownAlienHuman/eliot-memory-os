@@ -406,8 +406,40 @@ fn installation_create_rejects_migration_before_creating_store() {
 
     assert!(!result.status.success());
     let output: Value = serde_json::from_slice(&result.stdout).expect("create JSON error");
-    assert_installation_error(&output, "INSTALLATION_CREATE_MIGRATION_REQUIRED");
+    assert_installation_error(&output, "INSTALLATION_CREATE_PRODUCTION_DISABLED");
     assert!(!store.exists(), "rejected input created a durable store");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn installation_create_raw_import_is_not_a_production_constructor() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-create-raw-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_root).expect("create raw-create fixture");
+    let input = temp_root.join("transaction.json");
+    let store = temp_root.join("transactions.redb");
+    fs::write(&input, br#"{"not":"a trusted planner artifact"}"#)
+        .expect("write raw-create fixture");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "create",
+            "--input",
+            input.to_str().expect("input is utf8"),
+            "--store",
+            store.to_str().expect("store is utf8"),
+        ])
+        .output()
+        .expect("run raw-create command");
+
+    assert!(!result.status.success());
+    let output: Value = serde_json::from_slice(&result.stdout).expect("raw-create JSON error");
+    assert_installation_error(&output, "INSTALLATION_CREATE_PRODUCTION_DISABLED");
+    assert!(!store.exists(), "raw import created a durable store");
     let _ = fs::remove_dir_all(temp_root);
 }
 
@@ -621,9 +653,9 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "the round-trip assertion keeps the production CLI boundary evidence together"
+    reason = "the raw-import rejection assertion keeps the production CLI boundary evidence together"
 )]
-fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop() {
+fn installation_cli_rejects_valid_raw_transaction_import() {
     let temp_root = std::env::temp_dir().join(format!(
         "eliot-installation-cli-round-trip-{}",
         std::process::id()
@@ -678,7 +710,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     let planned: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
     assert_eq!(
         planned["transaction_wire_version"],
-        serde_json::json!({"major": 11, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 12, "minor": 0, "patch": 0})
     );
 
     let create = Command::new(env!("CARGO_BIN_EXE_eliot"))
@@ -693,139 +725,13 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
         ])
         .output()
         .expect("run create command");
-    assert!(
-        create.status.success(),
-        "create failed: {}",
-        String::from_utf8_lossy(&create.stderr)
-    );
+    assert!(!create.status.success());
     let created: Value = serde_json::from_slice(&create.stdout).expect("create JSON");
-    assert_eq!(created["status"], "CREATED");
-    assert_eq!(created["contract_version"], "3.0.0");
-    assert_eq!(
-        created["transaction_wire_version"],
-        serde_json::json!({"major": 11, "minor": 0, "patch": 0})
-    );
-    assert_eq!(created["transaction_id"], "transaction:cli-positive");
-    assert_eq!(created["revision"], 1);
-
-    let status = Command::new(env!("CARGO_BIN_EXE_eliot"))
-        .current_dir(&temp_root)
-        .args([
-            "installation",
-            "status",
-            "--store",
-            store.to_str().expect("store is utf8"),
-            "--transaction-id",
-            "transaction:cli-positive",
-        ])
-        .output()
-        .expect("run transaction status command");
+    assert_installation_error(&created, "INSTALLATION_CREATE_PRODUCTION_DISABLED");
     assert!(
-        status.status.success(),
-        "status failed: {}",
-        String::from_utf8_lossy(&status.stderr)
+        !store.exists(),
+        "valid raw transaction created a durable store"
     );
-    let status_value: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
-    assert_eq!(status_value["status"], "TRANSACTION_STATUS");
-    assert_eq!(status_value["transaction_id"], "transaction:cli-positive");
-    assert_eq!(status_value["revision"], 1);
-    assert_eq!(status_value["stage"], "PLANNED");
-    assert_eq!(
-        status_value["transaction"]["transaction_wire_version"],
-        serde_json::json!({"major": 11, "minor": 0, "patch": 0})
-    );
-
-    let apply = Command::new(env!("CARGO_BIN_EXE_eliot"))
-        .current_dir(&temp_root)
-        .args([
-            "installation",
-            "apply",
-            "--store",
-            store.to_str().expect("store is utf8"),
-            "--transaction-id",
-            "transaction:cli-positive",
-        ])
-        .output()
-        .expect("run apply command");
-    assert!(
-        apply.status.success(),
-        "apply failed: {}",
-        String::from_utf8_lossy(&apply.stderr)
-    );
-    let applied: Value = serde_json::from_slice(&apply.stdout).expect("apply JSON");
-    assert_eq!(applied["status"], "EFFECTS_APPLIED");
-    assert_ne!(applied["status"], "EFFECT_APPLIED");
-    assert_eq!(applied["staging"]["disposition"], "NOT_APPLICABLE");
-    assert_eq!(
-        applied["staging"]["reason"],
-        "registry staging is not part of the PortableDev/UserMode effect command"
-    );
-    assert_eq!(applied["revision"], 31);
-    assert_eq!(applied["stage"], "PLANNED");
-    assert_eq!(applied["completed"], false);
-    let progress = applied["transaction"]["effect_progress"]
-        .as_array()
-        .expect("all effect progress entries");
-    assert_eq!(progress.len(), 16);
-    assert!(
-        progress
-            .iter()
-            .all(|entry| entry["state"]["state"] == "APPLIED")
-    );
-    assert_eq!(
-        applied["transaction"]["effect_progress"][0]["state"]["state"],
-        "APPLIED"
-    );
-    assert_eq!(
-        applied["transaction"]["effect_progress"][0]["state"]["disposition"],
-        "PREEXISTING_MATCHING"
-    );
-    assert_eq!(
-        applied["transaction"]["transaction_wire_version"],
-        serde_json::json!({"major": 11, "minor": 0, "patch": 0})
-    );
-
-    let status_after_apply = Command::new(env!("CARGO_BIN_EXE_eliot"))
-        .current_dir(&temp_root)
-        .args([
-            "installation",
-            "status",
-            "--store",
-            store.to_str().expect("store is utf8"),
-            "--transaction-id",
-            "transaction:cli-positive",
-        ])
-        .output()
-        .expect("run status-after-apply command");
-    assert!(
-        status_after_apply.status.success(),
-        "status-after-apply failed: {}",
-        String::from_utf8_lossy(&status_after_apply.stderr)
-    );
-    let status_after_apply_value: Value =
-        serde_json::from_slice(&status_after_apply.stdout).expect("status-after-apply JSON");
-    assert_eq!(
-        status_after_apply_value["transaction_id"],
-        "transaction:cli-positive"
-    );
-    assert_eq!(status_after_apply_value["revision"], 31);
-    assert_eq!(status_after_apply_value["stage"], "PLANNED");
-
-    let recover = Command::new(env!("CARGO_BIN_EXE_eliot"))
-        .current_dir(&temp_root)
-        .args([
-            "installation",
-            "recover",
-            "--store",
-            store.to_str().expect("store is utf8"),
-            "--transaction-id",
-            "transaction:cli-positive",
-        ])
-        .output()
-        .expect("run recovery command");
-    assert!(!recover.status.success());
-    let recovery_value: Value = serde_json::from_slice(&recover.stdout).expect("recovery JSON");
-    assert_installation_error(&recovery_value, "INSTALLATION_RECOVER_ERROR");
 
     let _ = fs::remove_dir_all(temp_root);
 }

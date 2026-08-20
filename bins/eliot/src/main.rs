@@ -107,6 +107,9 @@ enum InstallationCommand {
         /// Absolute new output JSON path. Its parent must already exist.
         #[arg(long, value_parser = absolute_path)]
         output: PathBuf,
+        /// Optional exact transaction store to create from this planner output.
+        #[arg(long, value_parser = absolute_path)]
+        store: Option<PathBuf>,
     },
     /// Validate an immutable v8 installation plan JSON without applying it (untrusted import/validation only).
     Plan {
@@ -114,7 +117,10 @@ enum InstallationCommand {
         #[arg(long, value_parser = absolute_path)]
         input: PathBuf,
     },
-    /// Persist one validated constructor-produced transaction in an exact redb file.
+    /// Retired raw transaction-import compatibility command.
+    ///
+    /// Production transaction creation is owned by `installation generate
+    /// --store`; this command always rejects caller-authored JSON.
     Create {
         /// Absolute path to an existing serialized `InstallationTransaction`.
         #[arg(long, value_parser = absolute_path)]
@@ -236,6 +242,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             minimum_store_available_bytes,
             recovery_command,
             output,
+            store,
         } => run_installation_generate(
             source_root,
             profile,
@@ -250,6 +257,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             minimum_store_available_bytes,
             recovery_command,
             output,
+            store,
         ),
         InstallationCommand::Plan { input } => {
             let bytes = match load_input(&input) {
@@ -276,7 +284,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&transaction)?);
             Ok(0)
         }
-        InstallationCommand::Create { input, store } => run_installation_create(&input, &store),
+        InstallationCommand::Create { input, store } => Ok(run_installation_create(&input, &store)),
         InstallationCommand::Apply {
             store,
             transaction_id,
@@ -342,6 +350,7 @@ fn run_installation_generate(
     minimum_store_available_bytes: u64,
     recovery_command: String,
     output: PathBuf,
+    store_path: Option<PathBuf>,
 ) -> Result<i32> {
     let input = GenerationPackagePlanInput {
         transaction_id: cli_handle(transaction_id, "transaction_id")?,
@@ -368,6 +377,13 @@ fn run_installation_generate(
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
+    if let Some(store_path) = &store_path
+        && let Err(error) =
+            RedbInstallationTransactionStore::create_planned_at_exact_path(store_path, &transaction)
+    {
+        write_installation_error("INSTALLATION_GENERATION_STORE_REJECTED", &error.to_string());
+        return Ok(INVALID_REQUEST_EXIT);
+    }
     write_transaction_artifact(&output, &transaction)
         .map_err(|error| anyhow::anyhow!("write generated installation transaction: {error}"))?;
     println!(
@@ -391,64 +407,19 @@ fn run_installation_generate(
                 })
                 .unwrap_or(0),
             "output": output.display().to_string(),
+            "store": store_path.as_ref().map(|path| path.display().to_string()),
             "scope": "trusted_generation_planner_only",
         }))?
     );
     Ok(0)
 }
 
-fn run_installation_create(input: &Path, store_path: &Path) -> Result<i32> {
-    let bytes = match load_input(input) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            write_installation_error("INSTALLATION_CREATE_INVALID", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    let transaction = match decode_installation_transaction_json(&bytes) {
-        Ok(transaction) => transaction,
-        Err(error @ InstallationError::MigrationRequired { .. }) => {
-            write_installation_error("INSTALLATION_CREATE_MIGRATION_REQUIRED", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-        Err(error) => {
-            write_installation_error("INSTALLATION_CREATE_INVALID", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    let store = match RedbInstallationTransactionStore::create_planned_at_exact_path(
-        store_path,
-        &transaction,
-    ) {
-        Ok(store) => store,
-        Err(error) => {
-            let code = match &error {
-                InstallationError::InvalidField { field, .. } if field == "transaction" => {
-                    "INSTALLATION_CREATE_REJECTED"
-                }
-                _ => "INSTALLATION_CREATE_STORE_INVALID",
-            };
-            write_installation_error(code, &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
-        }
-    };
-    drop(store);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "contract": "eliot.kernel.installation",
-            "contract_version": INSTALLATION_CONTRACT_VERSION,
-            "status": "CREATED",
-            "store": store_path.display().to_string(),
-            "transaction_id": transaction.transaction_id,
-            "transaction_wire_version": transaction.transaction_wire_version,
-            "stage": transaction.stage(),
-            "revision": transaction.revision(),
-            "effect_count": transaction.effect_progress().len(),
-            "scope": "durable_transaction_only",
-        }))?
+fn run_installation_create(_input: &Path, _store_path: &Path) -> i32 {
+    write_installation_error(
+        "INSTALLATION_CREATE_PRODUCTION_DISABLED",
+        "raw transaction import is not a production constructor; use installation generate --store",
     );
-    Ok(0)
+    INVALID_REQUEST_EXIT
 }
 
 fn run_installation_registry_status(host_state_root: &Path) -> Result<i32> {

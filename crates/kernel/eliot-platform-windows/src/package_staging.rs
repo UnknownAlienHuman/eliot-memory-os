@@ -229,12 +229,15 @@ pub struct PackageFileSpec {
     /// Whether the file must parse as an AMD64 PE/COFF executable and pass
     /// the Authenticode gate.
     pub executable: bool,
-    /// Explicit per-file byte bound.
-    pub max_size: u64,
+    /// Exact expected byte size measured from the retained source handle.
+    ///
+    /// This is an identity binding, not an upper bound: a file with one byte
+    /// more or less is a different package object and is rejected.
+    pub expected_size: u64,
 }
 
 impl PackageFileSpec {
-    /// Build one file specification after validating its path and size bound.
+    /// Build one file specification after validating its path and exact size.
     ///
     /// # Errors
     ///
@@ -242,16 +245,16 @@ impl PackageFileSpec {
     pub fn new(
         relative_path: impl AsRef<Path>,
         executable: bool,
-        max_size: u64,
+        expected_size: u64,
     ) -> Result<Self, PackageStagingError> {
         let relative_path = validate_package_relative_path(relative_path.as_ref())?;
-        if max_size == 0 || max_size > MAX_PACKAGE_FILE_BYTES {
+        if expected_size == 0 || expected_size > MAX_PACKAGE_FILE_BYTES {
             return Err(PackageStagingError::BoundExceeded);
         }
         Ok(Self {
             relative_path: relative_path.canonical,
             executable,
-            max_size,
+            expected_size,
         })
     }
 }
@@ -294,7 +297,7 @@ impl PackageManifest {
         let mut files = Vec::with_capacity(self.files.len());
         for file in &self.files {
             let path = validate_relative_text(&file.relative_path)?;
-            if file.max_size == 0 || file.max_size > MAX_PACKAGE_FILE_BYTES {
+            if file.expected_size == 0 || file.expected_size > MAX_PACKAGE_FILE_BYTES {
                 return Err(PackageStagingError::BoundExceeded);
             }
             files.push((path, file));
@@ -310,7 +313,7 @@ impl PackageManifest {
             .map(|(path, file)| PackageFileSpec {
                 relative_path: path.canonical,
                 executable: file.executable,
-                max_size: file.max_size,
+                expected_size: file.expected_size,
             })
             .collect();
         Ok(Self {
@@ -329,7 +332,7 @@ impl PackageManifest {
         for file in validated.files {
             append_text(&mut bytes, &file.relative_path);
             bytes.push(u8::from(file.executable));
-            append_u64(&mut bytes, file.max_size);
+            append_u64(&mut bytes, file.expected_size);
         }
         bytes
     }
@@ -1123,6 +1126,7 @@ impl TrustedSourceBundle {
                     sha256: observed.sha256,
                     identity,
                     size: observed.size,
+                    pe: observed.pe,
                 });
                 Ok(())
             })?;
@@ -1217,6 +1221,9 @@ pub struct PackageSourceFileObservation {
     pub identity: FileIdentity,
     /// Number of bytes read from the same handle.
     pub size: u64,
+    /// PE/COFF evidence parsed from the same handle-bound prefix when the
+    /// object is an AMD64 PE32+ executable.
+    pub pe: Option<PeCoffEvidence>,
 }
 
 /// Complete bounded read-only observation of a trusted source bundle.
@@ -1338,6 +1345,214 @@ impl fmt::Debug for PackageStager {
             .field("installation_root", &self.installation_root)
             .finish_non_exhaustive()
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "destination-only reconciliation keeps the complete receipt proof in one boundary"
+)]
+fn reconcile_receipt_at_installation_root(
+    installation_root: &Path,
+    receipt: &StagingReceipt,
+) -> Result<PackageStagingObservation, PackageStagingError> {
+    if !installation_root.is_absolute() {
+        return Err(PackageStagingError::RootUnavailable);
+    }
+    #[cfg(windows)]
+    verify_system_directory_at(installation_root)?;
+
+    if receipt.generation.is_empty()
+        || receipt.files.len() > MAX_PACKAGE_FILES
+        || receipt.directories.len() > MAX_ENUMERATED_ENTRIES
+    {
+        return Err(PackageStagingError::InvalidRelativePath);
+    }
+    validate_receipt_file_grammar(&receipt.files)?;
+    let files = receipt
+        .files
+        .iter()
+        .map(|file| PackageFileSpec {
+            relative_path: file.relative_path.clone(),
+            executable: file.pe.is_some(),
+            expected_size: file.size,
+        })
+        .collect::<Vec<_>>();
+    let manifest = PackageManifest::new(&receipt.generation, files)?;
+    if receipt.manifest_sha256 != manifest.canonical_digest() {
+        return Ok(PackageStagingObservation::Mismatch(
+            PackageStagingError::HashMismatch,
+        ));
+    }
+    validate_receipt_directories(receipt, &manifest)?;
+    let generation = validate_relative_text(&manifest.generation)?;
+    let parent_components = generation
+        .components
+        .get(..generation.components.len().saturating_sub(1))
+        .unwrap_or(&[]);
+    let mut parent_path = installation_root.to_path_buf();
+    for component in parent_components {
+        parent_path.push(component);
+    }
+    let parent = retain_destination_parent(&parent_path)?;
+    let root_path = generation.join_to(&parent.path);
+    if !receipt.root_path.is_absolute() {
+        return Err(PackageStagingError::RootUnavailable);
+    }
+    if !super::windows_paths_equal(&receipt.root_path, &root_path) {
+        return Ok(PackageStagingObservation::Mismatch(
+            PackageStagingError::IdentityMismatch,
+        ));
+    }
+    if !path_exists(&root_path)? {
+        return Ok(PackageStagingObservation::Absent);
+    }
+    let root = match open_existing_directory(&root_path) {
+        Ok(root) => root,
+        Err(PackageStagingError::ReparsePoint | PackageStagingError::WrongEntryKind) => {
+            return Ok(PackageStagingObservation::Mismatch(
+                PackageStagingError::TreeMismatch,
+            ));
+        }
+        Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
+    };
+    let root_identity = file_identity_from_open_handle(&root)?;
+    if root_identity != receipt.root_identity {
+        return Ok(PackageStagingObservation::Mismatch(
+            PackageStagingError::IdentityMismatch,
+        ));
+    }
+    if let Err(error) = verify_system_security(&root, true) {
+        return Ok(PackageStagingObservation::Mismatch(error));
+    }
+    let actual_tree = match enumerate_tree(&root_path, &manifest) {
+        Ok(tree) => tree,
+        Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
+    };
+    if ensure_tree_matches_manifest(&actual_tree, &manifest).is_err() {
+        return Ok(PackageStagingObservation::Mismatch(
+            PackageStagingError::TreeMismatch,
+        ));
+    }
+    let actual_directories = match PackageStager::read_current_directories(&root_path, &manifest) {
+        Ok(directories) => directories,
+        Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
+    };
+    if actual_directories != receipt.directories {
+        let error = if actual_directories
+            .iter()
+            .zip(&receipt.directories)
+            .any(|(actual, expected)| actual.relative_path != expected.relative_path)
+        {
+            PackageStagingError::TreeMismatch
+        } else if actual_directories
+            .iter()
+            .zip(&receipt.directories)
+            .any(|(actual, expected)| actual.identity != expected.identity)
+        {
+            PackageStagingError::IdentityMismatch
+        } else {
+            PackageStagingError::SecurityMismatch
+        };
+        return Ok(PackageStagingObservation::Mismatch(error));
+    }
+    let actual = match PackageStager::read_current_files(&root_path, &manifest, &receipt.files) {
+        Ok(files) => files,
+        Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
+    };
+    if actual != receipt.files {
+        return Ok(PackageStagingObservation::Mismatch(
+            PackageStagingError::HashMismatch,
+        ));
+    }
+    Ok(PackageStagingObservation::Matching(receipt.clone()))
+}
+
+fn inspect_published_destination_at_installation_root(
+    installation_root: &Path,
+    manifest: &PackageManifest,
+    expectations: &[StagedFileReceipt],
+) -> Result<PackageStagingObservation, PackageStagingError> {
+    if !installation_root.is_absolute() {
+        return Err(PackageStagingError::RootUnavailable);
+    }
+    #[cfg(windows)]
+    verify_system_directory_at(installation_root)?;
+
+    let manifest = manifest.validate()?;
+    if expectations.len() != manifest.files.len() {
+        return Ok(PackageStagingObservation::Mismatch(
+            PackageStagingError::TreeMismatch,
+        ));
+    }
+    for expected in expectations {
+        if expected.source_identity.volume_serial_number == 0
+            || expected.source_identity.file_index == 0
+            || expected.size == 0
+            || !super::valid_sha256_hex(&expected.sha256)
+        {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+    }
+    let generation = validate_relative_text(&manifest.generation)?;
+    let parent_components = generation
+        .components
+        .get(..generation.components.len().saturating_sub(1))
+        .unwrap_or(&[]);
+    let mut parent_path = installation_root.to_path_buf();
+    for component in parent_components {
+        parent_path.push(component);
+    }
+    let parent = retain_destination_parent(&parent_path)?;
+    let root_path = generation.join_to(&parent.path);
+    if !path_exists(&root_path)? {
+        return Ok(PackageStagingObservation::Absent);
+    }
+    let root = open_existing_directory(&root_path)?;
+    let root_identity = file_identity_from_open_handle(&root)?;
+    verify_system_security(&root, true)?;
+    let tree = enumerate_tree(&root_path, &manifest)?;
+    ensure_tree_matches_manifest(&tree, &manifest)?;
+    let directories = PackageStager::read_current_directories(&root_path, &manifest)?;
+    let files = PackageStager::read_current_files(&root_path, &manifest, expectations)?;
+    if files.iter().any(|actual| {
+        let Some(expected) = expectations
+            .iter()
+            .find(|expected| ordinal_eq_str(&expected.relative_path, &actual.relative_path))
+        else {
+            return true;
+        };
+        actual.source_identity != expected.source_identity
+            || actual.sha256 != expected.sha256
+            || actual.size != expected.size
+    }) {
+        return Ok(PackageStagingObservation::Mismatch(
+            PackageStagingError::HashMismatch,
+        ));
+    }
+    let published_root_path = {
+        #[cfg(windows)]
+        {
+            final_path_from_handle(&root)?
+        }
+        #[cfg(not(windows))]
+        {
+            root_path.clone()
+        }
+    };
+    let receipt = StagingReceipt {
+        generation: manifest.generation.clone(),
+        root_path: published_root_path,
+        root_identity,
+        directories,
+        files,
+        manifest_sha256: manifest.canonical_digest(),
+    };
+    if !super::windows_paths_equal(&receipt.root_path, &root_path) {
+        return Ok(PackageStagingObservation::Mismatch(
+            PackageStagingError::IdentityMismatch,
+        ));
+    }
+    Ok(PackageStagingObservation::Matching(receipt))
 }
 
 impl PackageStager {
@@ -1491,101 +1706,47 @@ impl PackageStager {
         &self,
         receipt: &StagingReceipt,
     ) -> Result<PackageStagingObservation, PackageStagingError> {
-        if receipt.generation.is_empty()
-            || receipt.files.len() > MAX_PACKAGE_FILES
-            || receipt.directories.len() > MAX_ENUMERATED_ENTRIES
-        {
-            return Err(PackageStagingError::InvalidRelativePath);
-        }
-        let files = receipt
-            .files
-            .iter()
-            .map(|file| PackageFileSpec {
-                relative_path: file.relative_path.clone(),
-                executable: file.pe.is_some(),
-                max_size: file.size.max(1),
-            })
-            .collect::<Vec<_>>();
-        let manifest = PackageManifest::new(&receipt.generation, files)?;
-        if receipt.manifest_sha256 != manifest.canonical_digest() {
-            return Ok(PackageStagingObservation::Mismatch(
-                PackageStagingError::HashMismatch,
-            ));
-        }
-        validate_receipt_directories(receipt, &manifest)?;
-        let generation = validate_relative_text(&manifest.generation)?;
-        let parent = self.retain_generation_parent(&generation)?;
-        let root_path = generation.join_to(&parent.path);
-        if !receipt.root_path.is_absolute() {
-            return Err(PackageStagingError::RootUnavailable);
-        }
-        if !super::windows_paths_equal(&receipt.root_path, &root_path) {
-            return Ok(PackageStagingObservation::Mismatch(
-                PackageStagingError::IdentityMismatch,
-            ));
-        }
-        if !path_exists(&root_path)? {
-            return Ok(PackageStagingObservation::Absent);
-        }
-        let root = match open_existing_directory(&root_path) {
-            Ok(root) => root,
-            Err(PackageStagingError::ReparsePoint | PackageStagingError::WrongEntryKind) => {
-                return Ok(PackageStagingObservation::Mismatch(
-                    PackageStagingError::TreeMismatch,
-                ));
-            }
-            Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
-        };
-        let root_identity = file_identity_from_open_handle(&root)?;
-        if root_identity != receipt.root_identity {
-            return Ok(PackageStagingObservation::Mismatch(
-                PackageStagingError::IdentityMismatch,
-            ));
-        }
-        if let Err(error) = verify_system_security(&root, true) {
-            return Ok(PackageStagingObservation::Mismatch(error));
-        }
-        let actual_tree = match enumerate_tree(&root_path, &manifest) {
-            Ok(tree) => tree,
-            Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
-        };
-        if ensure_tree_matches_manifest(&actual_tree, &manifest).is_err() {
-            return Ok(PackageStagingObservation::Mismatch(
-                PackageStagingError::TreeMismatch,
-            ));
-        }
-        let actual_directories = match Self::read_current_directories(&root_path, &manifest) {
-            Ok(directories) => directories,
-            Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
-        };
-        if actual_directories != receipt.directories {
-            let error = if actual_directories
-                .iter()
-                .zip(&receipt.directories)
-                .any(|(actual, expected)| actual.relative_path != expected.relative_path)
-            {
-                PackageStagingError::TreeMismatch
-            } else if actual_directories
-                .iter()
-                .zip(&receipt.directories)
-                .any(|(actual, expected)| actual.identity != expected.identity)
-            {
-                PackageStagingError::IdentityMismatch
-            } else {
-                PackageStagingError::SecurityMismatch
-            };
-            return Ok(PackageStagingObservation::Mismatch(error));
-        }
-        let actual = match self.read_current_files(&root_path, &manifest) {
-            Ok(files) => files,
-            Err(error) => return Ok(PackageStagingObservation::Unknown(error)),
-        };
-        if actual != receipt.files {
-            return Ok(PackageStagingObservation::Mismatch(
-                PackageStagingError::HashMismatch,
-            ));
-        }
-        Ok(PackageStagingObservation::Matching(receipt.clone()))
+        reconcile_receipt_at_installation_root(&self.installation_root, receipt)
+    }
+
+    /// Reconcile a durable receipt using only the retained destination root.
+    ///
+    /// This path deliberately never opens or infers the source bundle. It is
+    /// the recovery seam for a crash after destination publication (including
+    /// a source bundle that has already been removed).
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed observation error when the destination root, receipt,
+    /// identities, security descriptors or exact file evidence cannot be
+    /// validated.
+    pub fn reconcile_destination_only(
+        installation_root: &Path,
+        receipt: &StagingReceipt,
+    ) -> Result<PackageStagingObservation, PackageStagingError> {
+        reconcile_receipt_at_installation_root(installation_root, receipt)
+    }
+
+    /// Inspect a published generation and reconstruct its immutable receipt
+    /// from destination evidence plus the durable source precondition.
+    ///
+    /// No source path is opened. This is used when publication completed but
+    /// the caller crashed before persisting the returned [`StagingReceipt`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed staging error when the destination root or retained
+    /// source precondition cannot be validated.
+    pub fn inspect_published_destination(
+        installation_root: &Path,
+        manifest: &PackageManifest,
+        expectations: &[StagedFileReceipt],
+    ) -> Result<PackageStagingObservation, PackageStagingError> {
+        inspect_published_destination_at_installation_root(
+            installation_root,
+            manifest,
+            expectations,
+        )
     }
 
     /// Inspect a manifest without adopting an existing generation.
@@ -1633,6 +1794,7 @@ impl PackageStager {
     /// Returns an error when any file/root identity, tree, security descriptor
     /// or exact delete operation is not proven to match the receipt.
     pub fn rollback(&self, receipt: &StagingReceipt) -> Result<(), PackageStagingError> {
+        validate_receipt_file_grammar(&receipt.files)?;
         let manifest = PackageManifest::new(
             &receipt.generation,
             receipt
@@ -1641,7 +1803,7 @@ impl PackageStager {
                 .map(|file| PackageFileSpec {
                     relative_path: file.relative_path.clone(),
                     executable: file.pe.is_some(),
-                    max_size: file.size.max(1),
+                    expected_size: file.size,
                 })
                 .collect(),
         )?;
@@ -1735,21 +1897,24 @@ impl PackageStager {
     }
 
     fn read_current_files(
-        &self,
         root: &Path,
         manifest: &PackageManifest,
+        expected_files: &[StagedFileReceipt],
     ) -> Result<Vec<StagedFileReceipt>, PackageStagingError> {
         let verifier = WindowsAuthenticodeVerifier;
         let mut files = Vec::with_capacity(manifest.files.len());
         for spec in &manifest.files {
             let relative = validate_relative_text(&spec.relative_path)?;
-            let source = relative.join_to(self.source.path());
             let destination = relative.join_to(root);
-            let source_snapshot = snapshot_source_file(&source, spec.max_size)?;
+            let source_identity = expected_files
+                .iter()
+                .find(|file| ordinal_eq_str(&file.relative_path, &spec.relative_path))
+                .ok_or(PackageStagingError::TreeMismatch)?
+                .source_identity;
             let destination_file = open_existing_file(&destination)?;
             let destination_identity = file_identity_from_open_handle(&destination_file)?;
             let destination_snapshot =
-                read_destination_snapshot(&destination, spec.max_size, destination_identity)?;
+                read_destination_snapshot(&destination, spec.expected_size, destination_identity)?;
             let pe = if spec.executable {
                 let header = read_file_prefix(&destination, MAX_PE_HEADER_BYTES)?;
                 Some(parse_pe_coff(&header).map_err(PackageStagingError::PeParse)?)
@@ -1773,7 +1938,7 @@ impl PackageStager {
             };
             files.push(StagedFileReceipt {
                 relative_path: spec.relative_path.clone(),
-                source_identity: source_snapshot.identity,
+                source_identity,
                 destination_identity,
                 size: destination_snapshot.size,
                 sha256: destination_snapshot.sha256,
@@ -1839,7 +2004,7 @@ impl PackageStager {
         let relative = validate_relative_text(&spec.relative_path)?;
         let source = relative.join_to(self.source.path());
         let destination = relative.join_to(destination_root);
-        let source_snapshot = snapshot_source_file(&source, spec.max_size)?;
+        let source_snapshot = snapshot_source_file(&source, spec.expected_size)?;
         *total = total
             .checked_add(source_snapshot.size)
             .ok_or(PackageStagingError::BoundExceeded)?;
@@ -1852,7 +2017,7 @@ impl PackageStager {
             None
         };
         let (destination_file, destination_identity, destination_readback) =
-            copy_destination_bytes(&source_snapshot, &destination, spec.max_size)?;
+            copy_destination_bytes(&source_snapshot, &destination, spec.expected_size)?;
         let authenticode = if spec.executable {
             let evidence = match verifier.verify(
                 &destination,
@@ -1900,11 +2065,11 @@ impl PackageStager {
 fn copy_destination_bytes(
     source_snapshot: &SourceSnapshot,
     destination: &Path,
-    max_size: u64,
+    expected_size: u64,
 ) -> Result<(std::fs::File, FileIdentity, DestinationSnapshot), PackageStagingError> {
     let (mut destination_file, destination_identity) = create_destination_file(destination)?;
     let copy_hash =
-        match copy_source_to_destination(source_snapshot, &mut destination_file, max_size) {
+        match copy_source_to_destination(source_snapshot, &mut destination_file, expected_size) {
             Ok(hash) => hash,
             Err(error) => {
                 return Err(cleanup_created_handle(
@@ -1924,7 +2089,7 @@ fn copy_destination_bytes(
     let destination_readback = match read_destination_snapshot_handle(
         &destination_file,
         destination,
-        max_size,
+        expected_size,
         destination_identity,
     ) {
         Ok(snapshot) => snapshot,
@@ -1952,7 +2117,7 @@ fn copy_destination_bytes(
 fn copy_destination_bytes(
     _source_snapshot: &SourceSnapshot,
     _destination: &Path,
-    _max_size: u64,
+    _expected_size: u64,
 ) -> Result<(std::fs::File, FileIdentity, DestinationSnapshot), PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
 }
@@ -2065,6 +2230,27 @@ fn validate_receipt_directories(
         }
         if !super::valid_sha256_hex(&actual.security_descriptor_sha256) {
             return Err(PackageStagingError::SecurityMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_receipt_file_grammar(files: &[StagedFileReceipt]) -> Result<(), PackageStagingError> {
+    for file in files {
+        if file.source_identity.volume_serial_number == 0
+            || file.source_identity.file_index == 0
+            || file.destination_identity.volume_serial_number == 0
+            || file.destination_identity.file_index == 0
+            || file.size == 0
+            || !super::valid_sha256_hex(&file.sha256)
+            || !super::valid_sha256_hex(&file.security_descriptor_sha256)
+            || (file.pe.is_some() != file.authenticode.is_some())
+            || file
+                .authenticode
+                .as_ref()
+                .is_some_and(|evidence| evidence.verdict != AuthenticodeVerdict::Valid)
+        {
+            return Err(PackageStagingError::IdentityMismatch);
         }
     }
     Ok(())
@@ -2916,7 +3102,10 @@ fn cleanup_created_handle(
 }
 
 #[cfg(windows)]
-fn snapshot_source_file(path: &Path, max_size: u64) -> Result<SourceSnapshot, PackageStagingError> {
+fn snapshot_source_file(
+    path: &Path,
+    expected_size: u64,
+) -> Result<SourceSnapshot, PackageStagingError> {
     let mut file = open_trusted_source_file(path)?;
     let canonical = final_path_from_handle(&file)?;
     if !super::windows_paths_equal(&canonical, path) {
@@ -2925,7 +3114,10 @@ fn snapshot_source_file(path: &Path, max_size: u64) -> Result<SourceSnapshot, Pa
     let identity = file_identity_from_open_handle(&file)?;
     ensure_single_link(&file)?;
     let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
-    if metadata.len() > max_size || metadata.len() > MAX_PACKAGE_FILE_BYTES {
+    if metadata.len() != expected_size {
+        return Err(PackageStagingError::SizeMismatch);
+    }
+    if metadata.len() > MAX_PACKAGE_FILE_BYTES {
         return Err(PackageStagingError::BoundExceeded);
     }
     let size = metadata.len();
@@ -2945,8 +3137,8 @@ fn snapshot_source_file(path: &Path, max_size: u64) -> Result<SourceSnapshot, Pa
         read_total = read_total
             .checked_add(read as u64)
             .ok_or(PackageStagingError::BoundExceeded)?;
-        if read_total > max_size {
-            return Err(PackageStagingError::BoundExceeded);
+        if read_total > expected_size {
+            return Err(PackageStagingError::SizeMismatch);
         }
         digest.update(&buffer[..read]);
         if header.len() < MAX_PE_HEADER_BYTES {
@@ -2980,16 +3172,16 @@ fn snapshot_source_file(path: &Path, max_size: u64) -> Result<SourceSnapshot, Pa
 fn observe_source_handle(
     file: &std::fs::File,
     expected_path: &Path,
-    max_size: u64,
+    max_observation_size: u64,
 ) -> Result<ObservedSourceRead, PackageStagingError> {
-    observe_source_handle_with_post_read_hook(file, expected_path, max_size, || {})
+    observe_source_handle_with_post_read_hook(file, expected_path, max_observation_size, || {})
 }
 
 #[cfg(windows)]
 fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
     file: &std::fs::File,
     expected_path: &Path,
-    max_size: u64,
+    max_observation_size: u64,
     post_read_hook: H,
 ) -> Result<ObservedSourceRead, PackageStagingError> {
     let identity = file_identity_from_open_handle(file)?;
@@ -2998,7 +3190,7 @@ fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
         return Err(PackageStagingError::IdentityMismatch);
     }
     let before_size = file.metadata().map_err(|_| PackageStagingError::Io)?.len();
-    if before_size > max_size || before_size > MAX_PACKAGE_FILE_BYTES {
+    if before_size > max_observation_size || before_size > MAX_PACKAGE_FILE_BYTES {
         return Err(PackageStagingError::BoundExceeded);
     }
     let mut reader = file.try_clone().map_err(|_| PackageStagingError::Io)?;
@@ -3007,6 +3199,7 @@ fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
         .map_err(|_| PackageStagingError::Io)?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+    let mut header = Vec::new();
     let mut size = 0_u64;
     loop {
         let read = reader
@@ -3018,10 +3211,14 @@ fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
         size = size
             .checked_add(read as u64)
             .ok_or(PackageStagingError::BoundExceeded)?;
-        if size > max_size || size > MAX_PACKAGE_FILE_BYTES {
+        if size > max_observation_size || size > MAX_PACKAGE_FILE_BYTES {
             return Err(PackageStagingError::BoundExceeded);
         }
         digest.update(&buffer[..read]);
+        if header.len() < MAX_PE_HEADER_BYTES {
+            let take = (MAX_PE_HEADER_BYTES - header.len()).min(read);
+            header.extend_from_slice(&buffer[..take]);
+        }
     }
     if size != before_size {
         return Err(PackageStagingError::SizeMismatch);
@@ -3043,6 +3240,7 @@ fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
     Ok(ObservedSourceRead {
         size,
         sha256: format!("{:x}", digest.finalize()),
+        pe: parse_pe_coff(&header).ok(),
     })
 }
 
@@ -3051,12 +3249,13 @@ fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
 struct ObservedSourceRead {
     size: u64,
     sha256: String,
+    pe: Option<PeCoffEvidence>,
 }
 
 #[cfg(not(windows))]
 fn snapshot_source_file(
     _path: &Path,
-    _max_size: u64,
+    _expected_size: u64,
 ) -> Result<SourceSnapshot, PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
 }
@@ -3065,7 +3264,7 @@ fn snapshot_source_file(
 fn copy_source_to_destination(
     source_snapshot: &SourceSnapshot,
     destination: &mut std::fs::File,
-    max_size: u64,
+    expected_size: u64,
 ) -> Result<String, PackageStagingError> {
     let mut source = source_snapshot
         .file
@@ -3090,8 +3289,8 @@ fn copy_source_to_destination(
         total = total
             .checked_add(read as u64)
             .ok_or(PackageStagingError::BoundExceeded)?;
-        if total > max_size {
-            return Err(PackageStagingError::BoundExceeded);
+        if total > expected_size {
+            return Err(PackageStagingError::SizeMismatch);
         }
         destination
             .write_all(&buffer[..read])
@@ -3109,7 +3308,7 @@ fn copy_source_to_destination(
 fn copy_source_to_destination(
     _source: &SourceSnapshot,
     _destination: &mut std::fs::File,
-    _max_size: u64,
+    _expected_size: u64,
 ) -> Result<String, PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
 }
@@ -3136,7 +3335,7 @@ fn flush_file_buffers(_file: &std::fs::File) -> Result<(), PackageStagingError> 
 #[cfg(windows)]
 fn read_destination_snapshot(
     path: &Path,
-    max_size: u64,
+    expected_size: u64,
     expected_identity: FileIdentity,
 ) -> Result<DestinationSnapshot, PackageStagingError> {
     let file = open_existing_file(path)?;
@@ -3145,7 +3344,10 @@ fn read_destination_snapshot(
         return Err(PackageStagingError::IdentityMismatch);
     }
     let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
-    if metadata.len() > max_size {
+    if metadata.len() != expected_size {
+        return Err(PackageStagingError::SizeMismatch);
+    }
+    if metadata.len() > MAX_PACKAGE_FILE_BYTES {
         return Err(PackageStagingError::BoundExceeded);
     }
     let mut reader = file.try_clone().map_err(|_| PackageStagingError::Io)?;
@@ -3165,8 +3367,8 @@ fn read_destination_snapshot(
         size = size
             .checked_add(read as u64)
             .ok_or(PackageStagingError::BoundExceeded)?;
-        if size > max_size {
-            return Err(PackageStagingError::BoundExceeded);
+        if size > expected_size {
+            return Err(PackageStagingError::SizeMismatch);
         }
         digest.update(&buffer[..read]);
     }
@@ -3185,7 +3387,7 @@ fn read_destination_snapshot(
 fn read_destination_snapshot_handle(
     file: &std::fs::File,
     expected_path: &Path,
-    max_size: u64,
+    expected_size: u64,
     expected_identity: FileIdentity,
 ) -> Result<DestinationSnapshot, PackageStagingError> {
     let actual_identity = file_identity_from_open_handle(file)?;
@@ -3197,7 +3399,10 @@ fn read_destination_snapshot_handle(
         return Err(PackageStagingError::IdentityMismatch);
     }
     let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
-    if metadata.len() > max_size {
+    if metadata.len() != expected_size {
+        return Err(PackageStagingError::SizeMismatch);
+    }
+    if metadata.len() > MAX_PACKAGE_FILE_BYTES {
         return Err(PackageStagingError::BoundExceeded);
     }
     let mut reader = file.try_clone().map_err(|_| PackageStagingError::Io)?;
@@ -3217,8 +3422,8 @@ fn read_destination_snapshot_handle(
         size = size
             .checked_add(read as u64)
             .ok_or(PackageStagingError::BoundExceeded)?;
-        if size > max_size {
-            return Err(PackageStagingError::BoundExceeded);
+        if size > expected_size {
+            return Err(PackageStagingError::SizeMismatch);
         }
         digest.update(&buffer[..read]);
     }
@@ -3237,7 +3442,7 @@ fn read_destination_snapshot_handle(
 fn read_destination_snapshot_handle(
     _file: &std::fs::File,
     _expected_path: &Path,
-    _max_size: u64,
+    _expected_size: u64,
     _expected_identity: FileIdentity,
 ) -> Result<DestinationSnapshot, PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
@@ -3246,7 +3451,7 @@ fn read_destination_snapshot_handle(
 #[cfg(not(windows))]
 fn read_destination_snapshot(
     _path: &Path,
-    _max_size: u64,
+    _expected_size: u64,
     _expected_identity: FileIdentity,
 ) -> Result<DestinationSnapshot, PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
@@ -3337,7 +3542,7 @@ mod tests {
         PackageFileSpec {
             relative_path: path.to_owned(),
             executable,
-            max_size: 1024,
+            expected_size: 1024,
         }
     }
 
@@ -3841,10 +4046,7 @@ mod tests {
                 result.is_ok(),
                 "exclusive handle should block same-size/different-size writer"
             );
-            assert!(matches!(
-                std::fs::write(&path, b"replacement-with-a-different-size"),
-                Err(_)
-            ));
+            assert!(std::fs::write(&path, b"replacement-with-a-different-size").is_err());
         }
         drop(file);
         std::fs::remove_file(&path).expect("file cleanup");
@@ -3914,7 +4116,7 @@ mod tests {
         );
         assert!(matches!(
             trusted_open,
-            Err(PackageStagingError::Io) | Err(PackageStagingError::RootUnavailable)
+            Err(PackageStagingError::Io | PackageStagingError::RootUnavailable)
         ));
         let source = TrustedSourceBundle::open(&root).expect("source");
         let observed = source.observe();
@@ -3939,7 +4141,7 @@ mod tests {
         let source_path = root.join("source.bin");
         let dest_path = root.join("dest.bin");
         std::fs::write(&source_path, b"retained").expect("source");
-        let snapshot = snapshot_source_file(&source_path, 64).expect("snapshot");
+        let snapshot = snapshot_source_file(&source_path, 8).expect("snapshot");
         let original_hash = snapshot.sha256.clone();
         let original_size = snapshot.size;
         let original_identity = snapshot.identity;
@@ -3949,7 +4151,7 @@ mod tests {
             "exclusive snapshot handle must block writer"
         );
         let mut dest = std::fs::File::create(&dest_path).expect("dest");
-        let copied_hash = copy_source_to_destination(&snapshot, &mut dest, 64).expect("copy");
+        let copied_hash = copy_source_to_destination(&snapshot, &mut dest, 8).expect("copy");
         assert_eq!(copied_hash, original_hash);
         drop(dest);
         assert_eq!(std::fs::read(&dest_path).expect("read dest"), b"retained");
@@ -3981,14 +4183,14 @@ mod tests {
         let source_path = root.join("source.bin");
         let destination_path = root.join("destination.bin");
         std::fs::write(&source_path, b"before").expect("source");
-        let snapshot = snapshot_source_file(&source_path, 64).expect("snapshot");
+        let snapshot = snapshot_source_file(&source_path, 6).expect("snapshot");
         let writer_blocked = std::fs::OpenOptions::new()
             .write(true)
             .open(&source_path)
             .is_err();
         if writer_blocked {
             let mut destination = std::fs::File::create(&destination_path).expect("destination");
-            let copied = copy_source_to_destination(&snapshot, &mut destination, 64)
+            let copied = copy_source_to_destination(&snapshot, &mut destination, 6)
                 .expect("copy blocked writer should retain original bytes");
             assert_eq!(copied, snapshot.sha256);
             drop(destination);
@@ -4000,7 +4202,7 @@ mod tests {
             changed.write_all(b"after!").expect("mutate source");
             drop(changed);
             let mut destination = std::fs::File::create(&destination_path).expect("destination");
-            let copied = copy_source_to_destination(&snapshot, &mut destination, 64)
+            let copied = copy_source_to_destination(&snapshot, &mut destination, 6)
                 .expect("copy changed bytes");
             assert_ne!(
                 copied, snapshot.sha256,
@@ -4011,14 +4213,14 @@ mod tests {
         drop(snapshot);
 
         std::fs::write(&source_path, b"before").expect("reset source");
-        let snapshot = snapshot_source_file(&source_path, 64).expect("snapshot");
+        let snapshot = snapshot_source_file(&source_path, 6).expect("snapshot");
         let writer_blocked = std::fs::OpenOptions::new()
             .append(true)
             .open(&source_path)
             .is_err();
         if writer_blocked {
             let mut destination = std::fs::File::create(&destination_path).expect("destination");
-            let copied = copy_source_to_destination(&snapshot, &mut destination, 64)
+            let copied = copy_source_to_destination(&snapshot, &mut destination, 6)
                 .expect("copy should succeed with original bytes when writer blocked");
             assert_eq!(copied, snapshot.sha256);
             drop(destination);
@@ -4031,7 +4233,7 @@ mod tests {
             drop(appended);
             let mut destination = std::fs::File::create(&destination_path).expect("destination");
             assert_eq!(
-                copy_source_to_destination(&snapshot, &mut destination, 64),
+                copy_source_to_destination(&snapshot, &mut destination, 6),
                 Err(PackageStagingError::SizeMismatch)
             );
             drop(destination);
