@@ -3661,30 +3661,6 @@ impl KernelComposition {
                 "Store rebind outer digest invalid".to_owned(),
             ));
         }
-        {
-            let service = self
-                .service
-                .lock()
-                .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
-            if service.state() != eliot_kernel_service::KernelServiceState::Ready {
-                return Err(KernelBuildError::Service(
-                    "Store rebind requires Ready Kernel".to_owned(),
-                ));
-            }
-            let candidate = service
-                .candidate_binding()
-                .ok_or(KernelBuildError::Service(
-                    "Store rebind missing candidate".to_owned(),
-                ))?;
-            let expected = candidate
-                .compute_digest()
-                .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-            if expected != handoff.candidate_binding_digest {
-                return Err(KernelBuildError::Service(
-                    "Store rebind candidate binding mismatch".to_owned(),
-                ));
-            }
-        }
         let expected_fence = {
             let mut hasher = Sha256::new();
             hasher.update(
@@ -3838,6 +3814,34 @@ impl KernelComposition {
             ) {
                 return Err(KernelBuildError::Service(
                     "existing store rebind conflicts".to_owned(),
+                ));
+            }
+        }
+        // A durable exact commit is the idempotence source of truth.  Check
+        // it before requiring the volatile service to be Ready so a replay
+        // after Kernel publication loss can recover from ORS rather than
+        // treating the in-memory Degraded state as a conflicting operation.
+        {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
+            if service.state() != eliot_kernel_service::KernelServiceState::Ready {
+                return Err(KernelBuildError::Service(
+                    "Store rebind requires Ready Kernel".to_owned(),
+                ));
+            }
+            let candidate = service
+                .candidate_binding()
+                .ok_or(KernelBuildError::Service(
+                    "Store rebind missing candidate".to_owned(),
+                ))?;
+            let expected = candidate
+                .compute_digest()
+                .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+            if expected != handoff.candidate_binding_digest {
+                return Err(KernelBuildError::Service(
+                    "Store rebind candidate binding mismatch".to_owned(),
                 ));
             }
         }
