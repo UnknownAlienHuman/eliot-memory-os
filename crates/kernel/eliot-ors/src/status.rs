@@ -610,6 +610,13 @@ pub fn open_existing_read_only(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::unnested_or_patterns,
+    reason = "test fixtures use unwrap/expect and long helpers; production lints remain -D warnings"
+)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
@@ -1961,7 +1968,7 @@ mod tests {
         let res = observe_supervision_status(&p, &anchor, &ctx);
         assert!(matches!(
             res,
-            Err(OrsSupervisionStatusError::Corrupt(_)) | Err(OrsSupervisionStatusError::Unknown(_))
+            Err(OrsSupervisionStatusError::Corrupt(_) | OrsSupervisionStatusError::Unknown(_))
         ));
         let after = file_bytes_and_mtime(&p);
         assert_eq!(before.0, after.0);
