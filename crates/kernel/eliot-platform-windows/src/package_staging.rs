@@ -165,7 +165,7 @@ fn ordinal_component_cmp(left: &str, right: &str) -> Ordering {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt as _;
-        use windows_sys::Win32::Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal};
+        use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_LESS_THAN};
 
         let left: Vec<u16> = std::ffi::OsStr::new(left).encode_wide().collect();
         let right: Vec<u16> = std::ffi::OsStr::new(right).encode_wide().collect();
@@ -671,10 +671,9 @@ fn verify_signature(
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::Security::WinTrust::{
-        WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
+        WinVerifyTrustEx, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
         WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_CHAIN,
         WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
-        WinVerifyTrustEx,
     };
 
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -856,7 +855,7 @@ fn certificate_evidence(
     context: &windows_sys::Win32::Security::Cryptography::CERT_CONTEXT,
 ) -> (Option<String>, Option<i64>, Option<i64>) {
     use windows_sys::Win32::Security::Cryptography::{
-        CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW,
+        CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE,
     };
     let (not_before, not_after) = if context.pCertInfo.is_null() {
         (None, None)
@@ -1095,7 +1094,7 @@ impl TrustedSourceBundle {
             let mut identities = HashSet::new();
             let mut total_bytes = 0_u64;
             let mut files = Vec::new();
-            let _tree = walk_tree(self.path(), |relative, path, file, identity| {
+            let _tree = walk_trusted_source_tree(self.path(), |relative, path, file, identity| {
                 if !identities.insert(identity) {
                     return Err(PackageStagingError::IdentityMismatch);
                 }
@@ -1406,7 +1405,7 @@ impl PackageStager {
         let generation = validate_relative_text(&manifest.generation)?;
         let parent = self.retain_generation_parent(&generation)?;
         self.source.verify_stable()?;
-        let source_tree = enumerate_tree(self.source.path(), &manifest)?;
+        let source_tree = enumerate_trusted_source_tree(self.source.path(), &manifest)?;
         ensure_tree_matches_manifest(&source_tree, &manifest)?;
         let generation_root = generation.join_to(&parent.path);
         if path_exists(&generation_root)? {
@@ -2191,6 +2190,118 @@ where
     Ok(entries)
 }
 
+#[cfg(windows)]
+fn walk_trusted_source_tree<F>(
+    root: &Path,
+    mut on_file: F,
+) -> Result<Vec<TreeEntry>, PackageStagingError>
+where
+    F: FnMut(
+        &PackageRelativePath,
+        &Path,
+        &std::fs::File,
+        FileIdentity,
+    ) -> Result<(), PackageStagingError>,
+{
+    let root_handle = open_existing_directory(root)?;
+    let root_final = final_path_from_handle(&root_handle)?;
+    if !super::windows_paths_equal(&root_final, root) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let mut entries = Vec::new();
+    let mut stack = vec![(
+        root.to_path_buf(),
+        Vec::<String>::new(),
+        0_usize,
+        root_handle,
+    )];
+    while let Some((directory, prefix, depth, directory_handle)) = stack.pop() {
+        if depth > MAX_PACKAGE_PATH_DEPTH {
+            return Err(PackageStagingError::BoundExceeded);
+        }
+        let mut pending = Vec::new();
+        let read_dir = std::fs::read_dir(&directory).map_err(|_| PackageStagingError::Io)?;
+        for entry in read_dir {
+            let entry = entry.map_err(|_| PackageStagingError::Io)?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .ok_or(PackageStagingError::InvalidRelativePath)?
+                .to_owned();
+            let relative_text = if prefix.is_empty() {
+                name
+            } else {
+                format!("{}/{}", prefix.join("/"), name)
+            };
+            let relative = validate_relative_text(&relative_text)?;
+            pending.push((relative, entry.path()));
+        }
+        pending.sort_by(|left, right| ordinal_path_cmp(&left.0, &right.0));
+        for pair in pending.windows(2) {
+            if ordinal_path_eq(&pair[0].0, &pair[1].0) {
+                return Err(PackageStagingError::ManifestCollision);
+            }
+        }
+        if pending.is_empty() && !prefix.is_empty() {
+            return Err(PackageStagingError::TreeMismatch);
+        }
+        let mut child_directories = Vec::new();
+        for (relative, path) in pending {
+            if entries.len() >= MAX_ENUMERATED_ENTRIES {
+                return Err(PackageStagingError::BoundExceeded);
+            }
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| PackageStagingError::Io)?;
+            if is_reparse_metadata(&metadata) {
+                return Err(PackageStagingError::ReparsePoint);
+            }
+            if metadata.is_dir() {
+                let child = open_existing_directory(&path)?;
+                let final_path = final_path_from_handle(&child)?;
+                if !super::windows_paths_equal(&final_path, &path) {
+                    return Err(PackageStagingError::IdentityMismatch);
+                }
+                entries.push(TreeEntry {
+                    relative: relative.clone(),
+                    kind: TreeEntryKind::Directory,
+                });
+                child_directories.push((
+                    path,
+                    relative.components.clone(),
+                    depth.saturating_add(1),
+                    child,
+                ));
+            } else if metadata.is_file() {
+                let file = open_trusted_source_file(&path)?;
+                let identity = file_identity_from_open_handle(&file)?;
+                let final_path = final_path_from_handle(&file)?;
+                if !super::windows_paths_equal(&final_path, &path) {
+                    return Err(PackageStagingError::IdentityMismatch);
+                }
+                on_file(&relative, &path, &file, identity)?;
+                entries.push(TreeEntry {
+                    relative,
+                    kind: TreeEntryKind::File,
+                });
+            } else {
+                return Err(PackageStagingError::WrongEntryKind);
+            }
+        }
+        drop(directory_handle);
+        stack.extend(child_directories.into_iter().rev());
+    }
+    Ok(entries)
+}
+
+#[cfg(windows)]
+fn enumerate_trusted_source_tree(
+    root: &Path,
+    manifest: &PackageManifest,
+) -> Result<Vec<TreeEntry>, PackageStagingError> {
+    let entries = walk_trusted_source_tree(root, |_relative, _path, _file, _identity| Ok(()))?;
+    let _ = manifest;
+    Ok(entries)
+}
+
 #[cfg(not(windows))]
 fn enumerate_tree(
     _root: &Path,
@@ -2351,6 +2462,37 @@ fn open_existing_file(path: &Path) -> Result<std::fs::File, PackageStagingError>
     Ok(file)
 }
 
+#[cfg(windows)]
+fn open_trusted_source_file(path: &Path) -> Result<std::fs::File, PackageStagingError> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_GENERIC_READ)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            PackageStagingError::RootUnavailable
+        } else {
+            PackageStagingError::Io
+        }
+    })?;
+    let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(PackageStagingError::ReparsePoint);
+    }
+    if !metadata.is_file() {
+        return Err(PackageStagingError::WrongEntryKind);
+    }
+    ensure_single_link(&file)?;
+    Ok(file)
+}
+
 #[cfg(not(windows))]
 fn open_existing_file(_path: &Path) -> Result<std::fs::File, PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
@@ -2397,7 +2539,7 @@ fn file_identity_from_open_handle(
 fn ensure_single_link(file: &std::fs::File) -> Result<(), PackageStagingError> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
     };
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
     let ok = unsafe {
@@ -2510,10 +2652,10 @@ fn verify_system_directory_handles(contour: &[std::fs::File]) -> Result<(), Pack
 #[cfg(windows)]
 fn security_descriptor_digest(file: &std::fs::File) -> Result<String, PackageStagingError> {
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorLength, OWNER_SECURITY_INFORMATION,
+        GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR,
     };
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -2556,7 +2698,7 @@ fn security_descriptor_digest(file: &std::fs::File) -> Result<String, PackageSta
 
 #[cfg(windows)]
 fn create_generation_root(path: &Path) -> Result<std::fs::File, PackageStagingError> {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
@@ -2619,11 +2761,11 @@ fn create_destination_file(
 ) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
     use std::os::windows::io::FromRawHandle as _;
     use windows_sys::Win32::Foundation::{
-        ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE,
+        GetLastError, ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        CreateFileW, CREATE_NEW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
         FILE_SHARE_WRITE,
     };
@@ -2694,7 +2836,7 @@ fn create_destination_file(
 fn create_destination_directory(
     path: &Path,
 ) -> Result<(std::fs::File, FileIdentity, String), PackageStagingError> {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
@@ -2765,12 +2907,13 @@ fn cleanup_created_handle(
 
 #[cfg(windows)]
 fn snapshot_source_file(path: &Path, max_size: u64) -> Result<SourceSnapshot, PackageStagingError> {
-    let mut file = open_existing_file(path)?;
+    let mut file = open_trusted_source_file(path)?;
     let canonical = final_path_from_handle(&file)?;
     if !super::windows_paths_equal(&canonical, path) {
         return Err(PackageStagingError::IdentityMismatch);
     }
     let identity = file_identity_from_open_handle(&file)?;
+    ensure_single_link(&file)?;
     let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
     if metadata.len() > max_size || metadata.len() > MAX_PACKAGE_FILE_BYTES {
         return Err(PackageStagingError::BoundExceeded);
@@ -2803,6 +2946,16 @@ fn snapshot_source_file(path: &Path, max_size: u64) -> Result<SourceSnapshot, Pa
     }
     if read_total != size {
         return Err(PackageStagingError::SizeMismatch);
+    }
+    ensure_single_link(&file)?;
+    let after_identity = file_identity_from_open_handle(&file)?;
+    let after_path = final_path_from_handle(&file)?;
+    let after_size = file.metadata().map_err(|_| PackageStagingError::Io)?.len();
+    if after_identity != identity
+        || !super::windows_paths_equal(&after_path, path)
+        || after_size != size
+    {
+        return Err(PackageStagingError::IdentityMismatch);
     }
     Ok(SourceSnapshot {
         identity,
@@ -3133,7 +3286,7 @@ fn delete_open_handle(
 ) -> Result<(), PackageStagingError> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
     };
     let actual = file_identity_from_open_handle(&file)?;
     if actual != expected_identity {
@@ -3664,13 +3817,144 @@ mod tests {
         std::fs::create_dir(&root).expect("root");
         let path = root.join("mutable.bin");
         std::fs::write(&path, b"before").expect("before");
-        let file = open_existing_file(&path).expect("open");
+        let file = open_trusted_source_file(&path).expect("open");
+        let mut hook_write_succeeded = false;
         let result = observe_source_handle_with_post_read_hook(&file, &path, 64, || {
-            std::fs::write(&path, b"replacement-with-a-different-size").expect("replace");
+            if std::fs::write(&path, b"replacement-with-a-different-size").is_ok() {
+                hook_write_succeeded = true;
+            }
         });
-        assert!(matches!(result, Err(PackageStagingError::SizeMismatch)));
+        if hook_write_succeeded {
+            assert!(matches!(result, Err(PackageStagingError::SizeMismatch)));
+        } else {
+            assert!(
+                result.is_ok(),
+                "exclusive handle should block same-size/different-size writer"
+            );
+            assert!(matches!(
+                std::fs::write(&path, b"replacement-with-a-different-size"),
+                Err(_)
+            ));
+        }
         drop(file);
         std::fs::remove_file(&path).expect("file cleanup");
+        std::fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_source_same_size_overwrite_is_blocked_or_detected() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-package-source-same-size-{}-{}",
+            std::process::id(),
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("same.bin");
+        std::fs::write(&path, b"AAAAAA").expect("before");
+        let before_hash = hex_digest(b"AAAAAA");
+        let file = open_trusted_source_file(&path).expect("open");
+        let mut hook_write_succeeded = false;
+        let result = observe_source_handle_with_post_read_hook(&file, &path, 64, || {
+            if std::fs::write(&path, b"BBBBBB").is_ok() {
+                hook_write_succeeded = true;
+            }
+        });
+        if hook_write_succeeded {
+            assert!(result.is_err(), "same-size mutation must be detected");
+        } else {
+            let observed = result.expect("blocked same-size write should still observe original");
+            assert_eq!(observed.sha256, before_hash);
+            assert_eq!(observed.size, 6);
+        }
+        drop(file);
+        assert_eq!(std::fs::read(&path).expect("read"), b"AAAAAA");
+        std::fs::remove_file(&path).expect("file cleanup");
+        std::fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_source_observer_fails_closed_when_writer_holds_file() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let root = std::env::temp_dir().join(format!(
+            "eliot-package-writer-hold-{}-{}",
+            std::process::id(),
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("held.bin");
+        std::fs::write(&path, b"held").expect("before");
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .or_else(|_| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+            })
+            .expect("writer hold");
+        let trusted_open = open_trusted_source_file(&path);
+        assert!(
+            trusted_open.is_err(),
+            "observer must fail closed when writer holds file"
+        );
+        assert!(matches!(
+            trusted_open,
+            Err(PackageStagingError::Io) | Err(PackageStagingError::RootUnavailable)
+        ));
+        let source = TrustedSourceBundle::open(&root).expect("source");
+        let observed = source.observe();
+        assert!(
+            observed.is_err(),
+            "observe must fail closed when file is write-locked"
+        );
+        drop(writer);
+        drop(source);
+        std::fs::remove_file(&path).expect("file cleanup");
+        std::fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staging_copies_from_retained_handle_not_reopened_path() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-package-retained-copy-{}",
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&root).expect("root");
+        let source_path = root.join("source.bin");
+        let dest_path = root.join("dest.bin");
+        std::fs::write(&source_path, b"retained").expect("source");
+        let snapshot = snapshot_source_file(&source_path, 64).expect("snapshot");
+        let original_hash = snapshot.sha256.clone();
+        let original_size = snapshot.size;
+        let original_identity = snapshot.identity;
+        let writer_attempt = std::fs::OpenOptions::new().write(true).open(&source_path);
+        assert!(
+            writer_attempt.is_err(),
+            "exclusive snapshot handle must block writer"
+        );
+        let mut dest = std::fs::File::create(&dest_path).expect("dest");
+        let copied_hash = copy_source_to_destination(&snapshot, &mut dest, 64).expect("copy");
+        assert_eq!(copied_hash, original_hash);
+        drop(dest);
+        assert_eq!(std::fs::read(&dest_path).expect("read dest"), b"retained");
+        drop(snapshot);
+        std::fs::write(&source_path, b"mutated")
+            .expect("mutate after handle closed should succeed");
+        assert_eq!(
+            std::fs::read(&source_path).expect("read mutated"),
+            b"mutated"
+        );
+        assert_ne!(original_hash, hex_digest(b"mutated"));
+        assert_eq!(original_size, 8);
+        let _ = original_identity;
+        std::fs::remove_file(&source_path).expect("source cleanup");
+        std::fs::remove_file(&dest_path).expect("dest cleanup");
         std::fs::remove_dir(&root).expect("root cleanup");
     }
 
@@ -3688,36 +3972,60 @@ mod tests {
         let destination_path = root.join("destination.bin");
         std::fs::write(&source_path, b"before").expect("source");
         let snapshot = snapshot_source_file(&source_path, 64).expect("snapshot");
-        let mut changed = std::fs::OpenOptions::new()
+        let writer_blocked = std::fs::OpenOptions::new()
             .write(true)
             .open(&source_path)
-            .expect("open source");
-        changed.write_all(b"after!").expect("mutate source");
-        drop(changed);
-        let mut destination = std::fs::File::create(&destination_path).expect("destination");
-        let copied = copy_source_to_destination(&snapshot, &mut destination, 64)
-            .expect("copy changed bytes");
-        assert_ne!(
-            copied, snapshot.sha256,
-            "changed source must fail hash proof"
-        );
-        drop(destination);
+            .is_err();
+        if writer_blocked {
+            let mut destination = std::fs::File::create(&destination_path).expect("destination");
+            let copied = copy_source_to_destination(&snapshot, &mut destination, 64)
+                .expect("copy blocked writer should retain original bytes");
+            assert_eq!(copied, snapshot.sha256);
+            drop(destination);
+        } else {
+            let mut changed = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&source_path)
+                .expect("open source");
+            changed.write_all(b"after!").expect("mutate source");
+            drop(changed);
+            let mut destination = std::fs::File::create(&destination_path).expect("destination");
+            let copied = copy_source_to_destination(&snapshot, &mut destination, 64)
+                .expect("copy changed bytes");
+            assert_ne!(
+                copied, snapshot.sha256,
+                "changed source must fail hash proof"
+            );
+            drop(destination);
+        }
         drop(snapshot);
 
         std::fs::write(&source_path, b"before").expect("reset source");
         let snapshot = snapshot_source_file(&source_path, 64).expect("snapshot");
-        let mut appended = std::fs::OpenOptions::new()
+        let writer_blocked = std::fs::OpenOptions::new()
             .append(true)
             .open(&source_path)
-            .expect("append source");
-        appended.write_all(b"-size").expect("grow source");
-        drop(appended);
-        let mut destination = std::fs::File::create(&destination_path).expect("destination");
-        assert_eq!(
-            copy_source_to_destination(&snapshot, &mut destination, 64),
-            Err(PackageStagingError::SizeMismatch)
-        );
-        drop(destination);
+            .is_err();
+        if writer_blocked {
+            let mut destination = std::fs::File::create(&destination_path).expect("destination");
+            let copied = copy_source_to_destination(&snapshot, &mut destination, 64)
+                .expect("copy should succeed with original bytes when writer blocked");
+            assert_eq!(copied, snapshot.sha256);
+            drop(destination);
+        } else {
+            let mut appended = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&source_path)
+                .expect("append source");
+            appended.write_all(b"-size").expect("grow source");
+            drop(appended);
+            let mut destination = std::fs::File::create(&destination_path).expect("destination");
+            assert_eq!(
+                copy_source_to_destination(&snapshot, &mut destination, 64),
+                Err(PackageStagingError::SizeMismatch)
+            );
+            drop(destination);
+        }
         drop(snapshot);
         std::fs::remove_file(&source_path).expect("source cleanup");
         std::fs::remove_file(&destination_path).expect("destination cleanup");

@@ -10116,23 +10116,41 @@ fn execute_package(
         Err(error) => return PortOutcome::Error(error),
     };
     match request.action {
-        InstallationEffectAction::Apply => match stager.stage(&manifest) {
-            Ok(receipt) => {
-                if validate_staging_receipt_for_plan(&request.plan, &receipt).is_err() {
-                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+        InstallationEffectAction::Apply => {
+            match stager.stage(&manifest) {
+                Ok(receipt) => {
+                    if validate_staging_receipt_for_plan(&request.plan, &receipt).is_err() {
+                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    }
+                    if receipt.files.len() != observed.files.len() {
+                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    }
+                    for file in &receipt.files {
+                        let Some(matched) = observed.files.iter().find(|obs| {
+                            obs.relative_path.eq_ignore_ascii_case(&file.relative_path)
+                        }) else {
+                            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                        };
+                        if file.sha256 != matched.sha256
+                            || file.size != matched.size
+                            || file.source_identity != matched.identity
+                        {
+                            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                        }
+                    }
+                    let Ok(digest) = PlatformHandle::new(receipt.digest()) else {
+                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    };
+                    PortOutcome::Known(InstallationEffectExecution {
+                        evidence: vec![digest],
+                        create_disposition: None,
+                        credential_receipt: None,
+                        staging_receipt: Some(receipt),
+                    })
                 }
-                let Ok(digest) = PlatformHandle::new(receipt.digest()) else {
-                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
-                };
-                PortOutcome::Known(InstallationEffectExecution {
-                    evidence: vec![digest],
-                    create_disposition: None,
-                    credential_receipt: None,
-                    staging_receipt: Some(receipt),
-                })
+                Err(error) => package_staging_outcome(&error),
             }
-            Err(error) => package_staging_outcome(&error),
-        },
+        }
         InstallationEffectAction::Rollback => {
             let Some(receipt) = request.staging_receipt.as_ref() else {
                 return PortOutcome::Error(PortError::InvalidRequestMetadata);
