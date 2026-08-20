@@ -14,8 +14,10 @@ pub use credential_control::HostCredentialControl;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::time::Duration;
 #[cfg(all(test, windows))]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
 #[cfg(all(test, windows))]
