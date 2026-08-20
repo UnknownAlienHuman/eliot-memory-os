@@ -7,7 +7,7 @@ use eliot_runtime_contracts::{
 use redb::{ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use serde::de::DeserializeOwned;
 
-use crate::{MAX_RECOVERY_PAGE, SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt};
+use crate::{SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt};
 
 const SUPERVISION_LEASE_STAGED: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_staged_v1");
@@ -282,6 +282,14 @@ fn load_staged(
     Ok(Some(stage))
 }
 
+fn canonical_history_key(lease_id: &str, revision: u64) -> String {
+    format!("{lease_id}::{revision:020}")
+}
+
+fn canonical_record_id(lease_id: &str, revision: u64) -> String {
+    format!("{lease_id}::r{revision:020}")
+}
+
 fn load_history(
     read: &redb::ReadTransaction,
     lease_id: &str,
@@ -299,26 +307,189 @@ fn load_history(
     {
         let (k, v) = item.map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?;
         bounded_charge(used, k.value().len(), v.value().len())?;
-        if out.len() >= usize::from(MAX_HISTORY) {
-            break;
-        }
         let snap: SupervisionLeaseSnapshot = decode_named(v.value(), "supervision_lease_history")?;
         snap.validate()
             .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?;
         if snap.record.lease_id.as_str() != lease_id {
             return Err(OrsSupervisionStatusError::Corrupt(
-                "history key does not match lease identity".to_owned(),
+                "history lease identity does not match key".to_owned(),
+            ));
+        }
+        let expected_key = canonical_history_key(lease_id, snap.record.revision);
+        if k.value() != expected_key {
+            return Err(OrsSupervisionStatusError::Corrupt(
+                "history key does not match canonical revision key".to_owned(),
+            ));
+        }
+        let expected_record_id = canonical_record_id(lease_id, snap.record.revision);
+        if snap.record.record_id.as_str() != expected_record_id {
+            return Err(OrsSupervisionStatusError::Corrupt(
+                "history record_id does not match canonical revision key".to_owned(),
+            ));
+        }
+        if snap.record.artifact.payload.ors_mirror.record_id != expected_record_id {
+            return Err(OrsSupervisionStatusError::Corrupt(
+                "ors_mirror record_id does not match canonical key".to_owned(),
+            ));
+        }
+        if snap.record.artifact.payload.ors_mirror.lease_revision != snap.record.revision {
+            return Err(OrsSupervisionStatusError::Corrupt(
+                "ors_mirror revision does not match key".to_owned(),
+            ));
+        }
+        if snap.record.artifact.payload.ors_mirror.subject_lease_id != lease_id {
+            return Err(OrsSupervisionStatusError::Corrupt(
+                "ors_mirror subject does not match lease identity".to_owned(),
             ));
         }
         out.push(snap);
     }
-    if out.len() > usize::from(MAX_RECOVERY_PAGE) {
-        return Err(OrsSupervisionStatusError::Corrupt(
-            "history exceeds bounded limit".to_owned(),
+    if out.len() > usize::from(MAX_HISTORY) {
+        return Err(OrsSupervisionStatusError::Unknown(
+            "history overflow: bounded proof incomplete".to_owned(),
         ));
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.record.revision));
     Ok(out)
+}
+
+fn validate_history_provenance(
+    current: Option<&SupervisionLeaseSnapshot>,
+    history: &[SupervisionLeaseSnapshot],
+) -> Result<(), OrsSupervisionStatusError> {
+    if history.is_empty() {
+        if current.is_some() {
+            return Err(OrsSupervisionStatusError::Corrupt(
+                "history empty but current exists".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let Some(cur) = current else {
+        return Err(OrsSupervisionStatusError::Corrupt(
+            "history exists without current".to_owned(),
+        ));
+    };
+    if history[0] != *cur {
+        return Err(OrsSupervisionStatusError::Corrupt(
+            "current is not the newest history record".to_owned(),
+        ));
+    }
+    for idx in 0..history.len() {
+        let snap = &history[idx];
+        if idx + 1 < history.len() {
+            let pred = &history[idx + 1];
+            if snap.record.revision != pred.record.revision + 1 {
+                return Err(OrsSupervisionStatusError::Corrupt(
+                    "history revision gap".to_owned(),
+                ));
+            }
+            match &snap.receipt.previous_receipt_sha256 {
+                Some(prev_digest) if *prev_digest == pred.receipt.receipt_sha256 => {}
+                _ => {
+                    return Err(OrsSupervisionStatusError::Corrupt(
+                        "history previous receipt does not match predecessor".to_owned(),
+                    ));
+                }
+            }
+            if snap.record.previous_receipt_sha256 != snap.receipt.previous_receipt_sha256 {
+                return Err(OrsSupervisionStatusError::Corrupt(
+                    "history record previous does not match receipt".to_owned(),
+                ));
+            }
+            if snap.record.previous_receipt_sha256.as_deref()
+                != Some(pred.receipt.receipt_sha256.as_str())
+            {
+                return Err(OrsSupervisionStatusError::Corrupt(
+                    "history record previous does not match predecessor receipt".to_owned(),
+                ));
+            }
+        } else {
+            if snap.record.revision != 1 {
+                return Err(OrsSupervisionStatusError::Unknown(
+                    "history incomplete: oldest revision is not genesis".to_owned(),
+                ));
+            }
+            if snap.receipt.previous_receipt_sha256.is_some()
+                || snap.record.previous_receipt_sha256.is_some()
+            {
+                return Err(OrsSupervisionStatusError::Corrupt(
+                    "genesis must have no predecessor".to_owned(),
+                ));
+            }
+        }
+    }
+    if history[0].record.revision != history.len() as u64 {
+        return Err(OrsSupervisionStatusError::Corrupt(
+            "history length does not match newest revision".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_replay_authority(
+    read: &redb::ReadTransaction,
+    current: &SupervisionLeaseSnapshot,
+    used: &mut usize,
+) -> Result<(), OrsSupervisionStatusError> {
+    let table = read
+        .open_table(SUPERVISION_LEASE_RESULTS)
+        .map_err(map_table_error)?;
+    let key = current.record.ticket_id.as_str();
+    let Some(val) = table
+        .get(key)
+        .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?
+    else {
+        return Err(OrsSupervisionStatusError::Unknown(
+            "replay authority missing: no results row for current ticket".to_owned(),
+        ));
+    };
+    bounded_charge(used, key.len(), val.value().len())?;
+    let result: DurableSupervisionLeaseResult =
+        decode_named(val.value(), "supervision_lease_result")?;
+    result
+        .snapshot
+        .validate()
+        .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?;
+    if result.snapshot != *current {
+        return Err(OrsSupervisionStatusError::Corrupt(
+            "replay result snapshot does not match current".to_owned(),
+        ));
+    }
+    if result.artifact != current.record.artifact {
+        return Err(OrsSupervisionStatusError::Corrupt(
+            "replay artifact does not match current".to_owned(),
+        ));
+    }
+    if result.ticket.ticket_id != current.record.ticket_id
+        || result.ticket.record_id != current.record.record_id
+        || result.ticket.lease_id != current.record.lease_id
+        || result.ticket.revision != current.record.revision
+    {
+        return Err(OrsSupervisionStatusError::Corrupt(
+            "replay ticket does not match current".to_owned(),
+        ));
+    }
+    let expected_ticket_sha256 = result
+        .ticket
+        .ticket_sha256()
+        .map_err(|e| OrsSupervisionStatusError::Corrupt(e.to_string()))?;
+    if expected_ticket_sha256 != current.record.ticket_sha256
+        || expected_ticket_sha256 != current.receipt.ticket_sha256
+        || result.snapshot.record.ticket_sha256 != expected_ticket_sha256
+    {
+        return Err(OrsSupervisionStatusError::Corrupt(
+            "replay ticket_sha256 does not match current".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct DurableSupervisionLeaseResult {
+    ticket: crate::SupervisionLeaseCommitTicket,
+    artifact: eliot_runtime_contracts::SignedSupervisionLease,
+    snapshot: SupervisionLeaseSnapshot,
 }
 
 fn verify_health(
@@ -368,6 +539,10 @@ pub fn observe_supervision_status(
     let staged = load_staged(&read, lease_id, &mut used)?;
     let current = load_current(&read, lease_id, &mut used)?;
     let history = load_history(&read, lease_id, &mut used)?;
+    validate_history_provenance(current.as_ref(), &history)?;
+    if let Some(cur) = &current {
+        validate_replay_authority(&read, cur, &mut used)?;
+    }
     let (health, reason) = if staged.is_some() && current.is_none() {
         (HealthDimension::Failed, SupervisionStatusReason::StagedOnly)
     } else if let Some(cur) = &current {
@@ -1546,6 +1721,372 @@ mod tests {
             proj.reason,
             SupervisionStatusReason::BindingMismatch(_)
         ));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    fn build_chain(
+        p: &PathBuf,
+        n: usize,
+    ) -> (SupervisionTrustAnchor, SupervisionLeaseVerificationContext) {
+        let store = RedbRecoveryStore::open(p).unwrap();
+        let signer =
+            Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])
+                .unwrap();
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .unwrap();
+        let mut last: Option<SupervisionLeaseSnapshot> = None;
+        for i in 1..=n {
+            let expected = if i == 1 { None } else { Some((i - 1) as u64) };
+            let op = SupervisionLeaseOperation::Commit;
+            let op = if i == 1 {
+                op
+            } else {
+                SupervisionLeaseOperation::Renew
+            };
+            let stage = store
+                .prepare_supervision_lease(request(
+                    &format!("t{i}"),
+                    &format!("o{i}"),
+                    "lease-1",
+                    expected,
+                    op,
+                    binding(LeaseState::Active, 100),
+                ))
+                .unwrap();
+            let envelope = stage
+                .ticket
+                .expected_payload()
+                .unwrap()
+                .sign(&signer)
+                .unwrap();
+            let payload = &envelope.payload;
+            let generation = &payload.generation_binding;
+            let ctx = SupervisionLeaseVerificationContext {
+                now_ms: 101,
+                lease_id: payload.lease_id.clone(),
+                host_epoch: payload.host_epoch,
+                activation_id: payload.activation_id.clone(),
+                activation_generation: payload.activation_generation,
+                kernel_epoch: payload.kernel_epoch,
+                watchdog_epoch: payload.watchdog_epoch,
+                state_fence: payload.state_fence.clone(),
+                scope_ref: payload.scope_ref.clone(),
+                observation_scope: payload.observation_scope.clone(),
+                target_id: generation.target_id.clone(),
+                module_id: generation.module_id.clone(),
+                process_id: generation.process_id.clone(),
+                target_generation: generation.target_generation,
+                module_generation: generation.module_generation,
+                process_generation: generation.process_generation,
+                public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+                ors_mirror: payload.ors_mirror.clone(),
+                active_state: SupervisionLeaseActiveStateBinding {
+                    state: payload.state,
+                    revocation_id: None,
+                    revocation_epoch: None,
+                },
+            };
+            let verified = anchor.verify(&envelope, &ctx).unwrap();
+            let snap = store
+                .commit_supervision_lease(&stage.ticket, &verified)
+                .unwrap();
+            last = Some(snap);
+        }
+        let snap = last.unwrap();
+        let payload = &snap.record.artifact.payload;
+        let generation = &payload.generation_binding;
+        let ctx = SupervisionLeaseVerificationContext {
+            now_ms: 101,
+            lease_id: payload.lease_id.clone(),
+            host_epoch: payload.host_epoch,
+            activation_id: payload.activation_id.clone(),
+            activation_generation: payload.activation_generation,
+            kernel_epoch: payload.kernel_epoch,
+            watchdog_epoch: payload.watchdog_epoch,
+            state_fence: payload.state_fence.clone(),
+            scope_ref: payload.scope_ref.clone(),
+            observation_scope: payload.observation_scope.clone(),
+            target_id: generation.target_id.clone(),
+            module_id: generation.module_id.clone(),
+            process_id: generation.process_id.clone(),
+            target_generation: generation.target_generation,
+            module_generation: generation.module_generation,
+            process_generation: generation.process_generation,
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: payload.ors_mirror.clone(),
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: payload.state,
+                revocation_id: None,
+                revocation_epoch: None,
+            },
+        };
+        drop(store);
+        (anchor, ctx)
+    }
+
+    #[test]
+    fn history_key_substitution_is_corrupt_and_read_only() {
+        let p = path("history-key-sub");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 2);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
+                let truth = table
+                    .get("lease-1::00000000000000000001")
+                    .unwrap()
+                    .unwrap()
+                    .value()
+                    .to_owned();
+                table.insert("lease-1::evil", truth.as_str()).unwrap();
+                table
+                    .remove("lease-1::00000000000000000001")
+                    .unwrap()
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(matches!(res, Err(OrsSupervisionStatusError::Corrupt(_))));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn history_revision_gap_is_corrupt_and_read_only() {
+        let p = path("history-gap");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 3);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
+                table
+                    .remove("lease-1::00000000000000000002")
+                    .unwrap()
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(matches!(res, Err(OrsSupervisionStatusError::Corrupt(_))));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn history_wrong_predecessor_digest_is_corrupt_and_read_only() {
+        let p = path("history-wrong-pred");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 2);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
+                let key = "lease-1::00000000000000000002";
+                let val = table.get(key).unwrap().unwrap().value().to_owned();
+                let mut v: serde_json::Value = serde_json::from_str(&val).unwrap();
+                v["receipt"]["previous_receipt_sha256"] =
+                    serde_json::Value::String("ff".repeat(32));
+                v["record"]["previous_receipt_sha256"] = serde_json::Value::String("ff".repeat(32));
+                let encoded = serde_json::to_string(&v).unwrap();
+                table.insert(key, encoded.as_str()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(matches!(res, Err(OrsSupervisionStatusError::Corrupt(_))));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn history_overflow_is_unknown_and_read_only() {
+        let p = path("history-overflow");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 9);
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(matches!(res, Err(OrsSupervisionStatusError::Unknown(_))));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn history_corruption_after_bound_is_not_ignored_and_read_only() {
+        let p = path("history-after-bound");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 8);
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(SUPERVISION_LEASE_HISTORY).unwrap();
+                table
+                    .insert("lease-1::00000000000000000009", "not-json")
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(matches!(
+            res,
+            Err(OrsSupervisionStatusError::Corrupt(_)) | Err(OrsSupervisionStatusError::Unknown(_))
+        ));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn replay_result_missing_is_unknown_and_read_only() {
+        let p = path("replay-missing");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 2);
+        let current_ticket = {
+            let db = redb::Database::create(&p).unwrap();
+            let read = db.begin_read().unwrap();
+            let table = read.open_table(SUPERVISION_LEASE_CURRENT).unwrap();
+            let val = table.get("lease-1").unwrap().unwrap().value().to_owned();
+            let snap: SupervisionLeaseSnapshot = serde_json::from_str(&val).unwrap();
+            snap.record.ticket_id.as_str().to_owned()
+        };
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(SUPERVISION_LEASE_RESULTS).unwrap();
+                table.remove(current_ticket.as_str()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(matches!(res, Err(OrsSupervisionStatusError::Unknown(_))));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn replay_result_substitution_is_corrupt_and_read_only() {
+        let p = path("replay-sub");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 2);
+        let current_ticket = {
+            let db = redb::Database::create(&p).unwrap();
+            let read = db.begin_read().unwrap();
+            let table = read.open_table(SUPERVISION_LEASE_CURRENT).unwrap();
+            let val = table.get("lease-1").unwrap().unwrap().value().to_owned();
+            let snap: SupervisionLeaseSnapshot = serde_json::from_str(&val).unwrap();
+            snap.record.ticket_id.as_str().to_owned()
+        };
+        {
+            let db = redb::Database::create(&p).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(SUPERVISION_LEASE_RESULTS).unwrap();
+                let val = table
+                    .get(current_ticket.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .value()
+                    .to_owned();
+                let mut v: serde_json::Value = serde_json::from_str(&val).unwrap();
+                v["snapshot"]["receipt"]["receipt_sha256"] =
+                    serde_json::Value::String("00".repeat(32));
+                let encoded = serde_json::to_string(&v).unwrap();
+                table
+                    .insert(current_ticket.as_str(), encoded.as_str())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = file_bytes_and_mtime(&p);
+        let res = observe_supervision_status(&p, &anchor, &ctx);
+        assert!(matches!(res, Err(OrsSupervisionStatusError::Corrupt(_))));
+        let after = file_bytes_and_mtime(&p);
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn torn_database_is_corrupt_and_read_only() {
+        let p = path("torn");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 1);
+        let before = file_bytes_and_mtime(&p);
+        {
+            let bytes = std::fs::read(&p).unwrap();
+            let mut truncated = bytes.clone();
+            truncated.truncate(bytes.len() / 2);
+            std::fs::write(&p, &truncated).unwrap();
+        }
+        let before_corrupt = file_bytes_and_mtime(&p);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observe_supervision_status(&p, &anchor, &ctx)
+        }));
+        let is_torn = match res {
+            Ok(Ok(_)) => false,
+            Ok(Err(e)) => matches!(
+                e,
+                OrsSupervisionStatusError::Corrupt(_)
+                    | OrsSupervisionStatusError::Unknown(_)
+                    | OrsSupervisionStatusError::Missing(_)
+                    | OrsSupervisionStatusError::AccessDenied(_)
+            ),
+            Err(_) => true,
+        };
+        assert!(
+            is_torn,
+            "torn database must be reported as corrupt/unknown or panic"
+        );
+        let after_corrupt = file_bytes_and_mtime(&p);
+        assert_eq!(before_corrupt.0, after_corrupt.0);
+        assert_eq!(before_corrupt.1, after_corrupt.1);
+        std::fs::write(&p, &before.0).unwrap();
+        let restored = file_bytes_and_mtime(&p);
+        assert_eq!(restored.0, before.0);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn valid_history_with_replay_is_healthy_and_read_only() {
+        let p = path("valid-with-replay");
+        cleanup(&p);
+        let (anchor, ctx) = build_chain(&p, 3);
+        let before = file_bytes_and_mtime(&p);
+        let proj = observe_supervision_status(&p, &anchor, &ctx).unwrap();
+        assert_eq!(proj.health, HealthDimension::Healthy);
+        assert_eq!(proj.history.len(), 3);
+        assert!(proj.current.is_some());
         let after = file_bytes_and_mtime(&p);
         assert_eq!(before.0, after.0);
         assert_eq!(before.1, after.1);
