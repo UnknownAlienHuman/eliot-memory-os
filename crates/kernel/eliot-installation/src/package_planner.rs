@@ -51,7 +51,36 @@ fn validate_candidate_package_binding(
     candidate: &CandidateManifest,
     manifest: &PackageManifest,
 ) -> Result<(), InstallationError> {
-    let _ = (candidate, manifest);
+    if manifest.generation != candidate.generation.as_str() {
+        return Err(InstallationError::IdentityConflict);
+    }
+    crate::sha256_handle(&candidate.signature_ref, "manifest.signature_ref")?;
+    if candidate.signature_ref.as_str() == "0".repeat(64)
+        || candidate.signature_ref.as_str() == "1".repeat(64)
+    {
+        return Err(InstallationError::InvalidField {
+            field: "manifest.signature_ref".to_owned(),
+            reason: "placeholder signature not admitted".to_owned(),
+        });
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for spec in &manifest.files {
+        let validated = validate_package_relative_path(Path::new(&spec.relative_path))
+            .map_err(|e| package_plan_error(&e))?;
+        let lower = validated.as_str().to_ascii_lowercase();
+        if !seen.insert(lower) {
+            return Err(InstallationError::Duplicate {
+                kind: "package file".to_owned(),
+                identity: spec.relative_path.clone(),
+            });
+        }
+        if spec.max_size == 0 || spec.max_size > 512 * 1024 * 1024 {
+            return Err(InstallationError::InvalidField {
+                field: "installer_effect.package_manifest.files.max_size".to_owned(),
+                reason: "out of bounds".to_owned(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -85,8 +114,33 @@ fn derive_expected_digests(
             for comp in relative.components() {
                 full.push(comp);
             }
+            let meta = std::fs::symlink_metadata(&full)
+                .map_err(|e| InstallationError::Platform(e.to_string()))?;
+            if meta.is_symlink() {
+                return Err(InstallationError::Platform(
+                    "reparse point in package file".to_owned(),
+                ));
+            }
             let bytes =
                 std::fs::read(&full).map_err(|e| InstallationError::Platform(e.to_string()))?;
+            if bytes.len() as u64 != entry.size {
+                return Err(InstallationError::Platform(
+                    "size mismatch after read (possible mutation)".to_owned(),
+                ));
+            }
+            let actual_sha = hex_digest(&bytes);
+            if actual_sha != entry.sha256 {
+                return Err(InstallationError::Platform(
+                    "hash mismatch (same-size mutation)".to_owned(),
+                ));
+            }
+            let meta2 =
+                std::fs::metadata(&full).map_err(|e| InstallationError::Platform(e.to_string()))?;
+            if meta2.len() != entry.size {
+                return Err(InstallationError::Platform(
+                    "post-read size mismatch".to_owned(),
+                ));
+            }
             let header_len = bytes.len().min(1024 * 1024);
             eliot_platform_windows::parse_pe_coff(&bytes[..header_len]).map_err(|e| {
                 InstallationError::InvalidField {
@@ -115,58 +169,19 @@ fn derive_expected_digests(
 fn enumerate_source_tree(
     source: &TrustedSourceBundle,
 ) -> Result<BTreeSet<String>, InstallationError> {
-    let root = source.path();
+    let observed = source
+        .observe()
+        .map_err(|e| InstallationError::Platform(format!("source observe failed: {e}")))?;
     let mut set = BTreeSet::new();
-    let mut stack = vec![PathBuf::from(root)];
-    let mut prefix_stack = vec![Vec::<String>::new()];
-    let mut depth = 0usize;
-    while let Some(dir) = stack.pop() {
-        let prefix = prefix_stack.pop().unwrap_or_default();
-        if depth > 32 {
-            return Err(InstallationError::InvalidField {
-                field: "source_bundle".to_owned(),
-                reason: "path depth exceeded".to_owned(),
+    for file in observed.files {
+        let validated = validate_package_relative_path(Path::new(&file.relative_path))
+            .map_err(|e| package_plan_error(&e))?;
+        let lower = validated.as_str().to_ascii_lowercase();
+        if !set.insert(lower) {
+            return Err(InstallationError::Duplicate {
+                kind: "package file".to_owned(),
+                identity: file.relative_path,
             });
-        }
-        let entries =
-            std::fs::read_dir(&dir).map_err(|e| InstallationError::Platform(e.to_string()))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| InstallationError::Platform(e.to_string()))?;
-            let name_os = entry.file_name();
-            let name = name_os.to_str().ok_or(InstallationError::InvalidField {
-                field: "source_bundle".to_owned(),
-                reason: "invalid utf8 filename".to_owned(),
-            })?;
-            let meta = std::fs::symlink_metadata(entry.path())
-                .map_err(|e| InstallationError::Platform(e.to_string()))?;
-            if meta.is_symlink() {
-                return Err(InstallationError::InvalidField {
-                    field: "source_bundle".to_owned(),
-                    reason: "reparse point in source tree".to_owned(),
-                });
-            }
-            let mut comps = prefix.clone();
-            comps.push(name.to_owned());
-            let rel = comps.join("/");
-            validate_package_relative_path(Path::new(&rel)).map_err(|e| package_plan_error(&e))?;
-            if meta.is_dir() {
-                stack.push(entry.path());
-                prefix_stack.push(comps);
-                depth += 1;
-            } else if meta.is_file() {
-                let lower = rel.to_ascii_lowercase();
-                if !set.insert(lower) {
-                    return Err(InstallationError::Duplicate {
-                        kind: "package file".to_owned(),
-                        identity: rel,
-                    });
-                }
-            } else {
-                return Err(InstallationError::InvalidField {
-                    field: "source_bundle".to_owned(),
-                    reason: "unsupported entry kind".to_owned(),
-                });
-            }
         }
     }
     Ok(set)
@@ -530,7 +545,7 @@ mod tests {
             config_digest: h("2".repeat(64)),
             store_credential_target: h("eliot/store/v1/0123456789abcdef0123456789abcdef"),
             supervision_key_fingerprint: h("3".repeat(64)),
-            signature_ref: h("evidence:sig"),
+            signature_ref: h("a".repeat(64)),
             runtime_state_roots_digest: roots.roots_digest.clone(),
             runtime_launch: desc,
         }
