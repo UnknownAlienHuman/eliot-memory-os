@@ -3232,9 +3232,13 @@ impl KernelComposition {
                 "Store rebind requirement is not the immutable bootstrap descriptor".to_owned(),
             ));
         }
-        if handoff.request_digest != request_digest {
+        if request_digest.len() != 64
+            || !request_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
             return Err(KernelBuildError::Service(
-                "Store rebind request digest mismatch".to_owned(),
+                "Store rebind outer digest invalid".to_owned(),
             ));
         }
         {
@@ -3324,27 +3328,6 @@ impl KernelComposition {
             .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?
             .rebind_store(&handoff, request_digest.clone())
             .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-        {
-            let old_gateway = {
-                let mut guard = self.canonical_store_gateway.lock().map_err(|_| {
-                    KernelBuildError::Service("store gateway lock poisoned".to_owned())
-                })?;
-                let old = guard.take();
-                if let Some(old) = &old {
-                    old.fence();
-                }
-                old
-            };
-            let _ = old_gateway;
-            let mut retained = self
-                .store_handoff
-                .lock()
-                .map_err(|_| KernelBuildError::Service("Store handoff lock poisoned".to_owned()))?;
-            *retained = Some(eliot_kernel_service::StoreBootstrapHandoff {
-                requirement: handoff.requirement.clone(),
-                process_binding: handoff.process_binding.clone(),
-            });
-        }
         let timeout = Duration::from_millis(handoff.requirement.timeout_ms());
         let requirement = handoff.requirement.clone();
         let job = handoff.process_binding.job.clone();
@@ -3407,31 +3390,48 @@ impl KernelComposition {
             std::sync::Arc::new(client),
             route,
         ));
-        let attach_result = attach_then_retain_canonical_store(
-            std::sync::Arc::clone(&gateway),
-            &self.canonical_store_gateway,
-            |gw| {
-                self.process_gateway.as_ref().map_or_else(
-                    || {
-                        struct NoopAttachment;
-                        impl CanonicalStoreAttachmentTransaction for NoopAttachment {
-                            fn commit(self: Box<Self>) {}
-                        }
-                        Ok(Box::new(NoopAttachment)
-                            as Box<dyn CanonicalStoreAttachmentTransaction>)
-                    },
-                    |pg| {
-                        pg.attach_canonical_store(gw)
-                            .map(|a| Box::new(a) as Box<dyn CanonicalStoreAttachmentTransaction>)
-                    },
-                )
+        let attachment_result: Result<
+            Box<dyn CanonicalStoreAttachmentTransaction>,
+            KernelBuildError,
+        > = self.process_gateway.as_ref().map_or_else(
+            || {
+                struct NoopAttachment;
+                impl CanonicalStoreAttachmentTransaction for NoopAttachment {
+                    fn commit(self: Box<Self>) {}
+                }
+                Ok(Box::new(NoopAttachment) as Box<dyn CanonicalStoreAttachmentTransaction>)
+            },
+            |pg| {
+                pg.attach_canonical_store(Arc::clone(&gateway))
+                    .map(|a| Box::new(a) as Box<dyn CanonicalStoreAttachmentTransaction>)
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))
             },
         );
-        if attach_result.is_err() {
-            gateway.fence();
-            return Err(KernelBuildError::Service(
-                "store gateway retain failed after rebind".to_owned(),
-            ));
+        let attachment: Box<dyn CanonicalStoreAttachmentTransaction> = match attachment_result {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                gateway.fence();
+                return Err(error);
+            }
+        };
+        let old_gateway =
+            {
+                let mut gw_guard = self.canonical_store_gateway.lock().map_err(|_| {
+                    KernelBuildError::Service("store gateway lock poisoned".to_owned())
+                })?;
+                let old = gw_guard.replace(gateway);
+                let mut handoff_guard = self.store_handoff.lock().map_err(|_| {
+                    KernelBuildError::Service("Store handoff lock poisoned".to_owned())
+                })?;
+                *handoff_guard = Some(eliot_kernel_service::StoreBootstrapHandoff {
+                    requirement: handoff.requirement.clone(),
+                    process_binding: handoff.process_binding.clone(),
+                });
+                old
+            };
+        attachment.commit();
+        if let Some(old) = old_gateway {
+            old.fence();
         }
         Ok(receipt)
     }
