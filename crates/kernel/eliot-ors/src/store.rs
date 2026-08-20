@@ -706,6 +706,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?
                 .map(|value| decode(value.value()))
                 .transpose()?;
+            let mut next = record.clone();
             if let Some(existing) = &existing {
                 existing.validate()?;
                 if existing.request_digest.clone() != record.request_digest.clone()
@@ -718,30 +719,56 @@ impl RedbRecoveryStore {
                         reason: "store rebind replacement rejected".to_owned(),
                     });
                 }
-                let allowed = match (existing.state, record.state) {
+                match (existing.state, record.state) {
                     (
-                        crate::StoreRebindReplayState::Pending
-                        | crate::StoreRebindReplayState::Committed,
-                        crate::StoreRebindReplayState::Committed,
-                    )
-                    | (
                         crate::StoreRebindReplayState::Pending,
                         crate::StoreRebindReplayState::Pending,
                     ) => {
-                        existing == record
-                            || existing.state == crate::StoreRebindReplayState::Pending
+                        // A repeated begin is idempotent and must not replace
+                        // the original durable binding.
+                        next = existing.clone();
                     }
-                    _ => false,
-                };
-                if !allowed {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "store_rebind_replay",
-                        reason: "non-monotonic store rebind transition".to_owned(),
-                    });
+                    (
+                        crate::StoreRebindReplayState::Pending,
+                        crate::StoreRebindReplayState::Committed,
+                    ) => {
+                        // The caller cannot choose the linearization point;
+                        // the ORS write transaction assigns it atomically.
+                        next.commit_order = Self::next_operational_order(&write)?;
+                    }
+                    (
+                        crate::StoreRebindReplayState::Committed,
+                        crate::StoreRebindReplayState::Committed,
+                    ) => {
+                        if existing.receipt != record.receipt {
+                            return Err(OrsError::IntegrityProblem {
+                                record_type: "store_rebind_replay",
+                                reason: "committed receipt replacement rejected".to_owned(),
+                            });
+                        }
+                        // The first durable commit order is authoritative;
+                        // retries cannot overwrite it with a caller-local
+                        // zero or a different order.
+                        next = existing.clone();
+                        if next.commit_order == 0 {
+                            next.commit_order = Self::next_operational_order(&write)?;
+                        }
+                    }
+                    _ => {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "store_rebind_replay",
+                            reason: "non-monotonic store rebind transition".to_owned(),
+                        });
+                    }
                 }
+            } else if next.state == crate::StoreRebindReplayState::Committed {
+                // A direct committed write is still ordered by this
+                // transaction, never by a caller-provided value.
+                next.commit_order = Self::next_operational_order(&write)?;
             }
-            if existing.as_ref().is_none_or(|current| current != record) {
-                let payload = encode(record)?;
+            next.validate()?;
+            if existing.as_ref().is_none_or(|current| current != &next) {
+                let payload = encode(&next)?;
                 table
                     .insert(key.as_str(), payload.as_str())
                     .map_err(storage)?;

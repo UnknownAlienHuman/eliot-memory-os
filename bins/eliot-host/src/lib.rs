@@ -2339,7 +2339,213 @@ impl HostJobBranches {
         }
         self.kernel_candidate = Some(candidate);
         self.kernel_activation_receipt = Some(activation_receipt.clone());
+        self.reconcile_store_rebind_records(generation, journal)?;
         Ok((activation_receipt, ready))
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the exact query carries every authenticated process and request binding"
+    )]
+    async fn query_store_rebind_exact(
+        operation_id: &PlatformHandle,
+        request_digest: &str,
+        generation: &PlatformHandle,
+        candidate: &HostKernelCandidateBinding,
+        authority_generation: ResourceGeneration,
+        kernel_process_id: u32,
+        kernel_process_start_time_100ns: u64,
+        expected_kernel_image: &Path,
+        label: &str,
+    ) -> Result<Option<StoreRebindReceipt>, HostError> {
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let mut transport = NamedPipeTransport::connect_authenticated(
+            KERNEL_CONTROL_PIPE,
+            Duration::from_secs(5),
+            &expectation,
+        )
+        .await
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        validate_authenticated_kernel_peer(
+            transport.peer_identity(),
+            kernel_process_id,
+            kernel_process_start_time_100ns,
+            expected_kernel_image,
+        )
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let query = StoreRebindQuery {
+            operation_id: operation_id.clone(),
+            request_digest: request_digest.to_owned(),
+        };
+        let request = KernelControlRequest {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: fresh_identity(&format!("{label}-message"))?,
+            sequence: 1,
+            peer_process_id: std::process::id(),
+            generation: authority_generation,
+            candidate: candidate.clone(),
+            command: KernelControlCommand::ReconcileRebindStore(query),
+            payload_digest: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let frame = control_request_frame(
+            format!(
+                "{label}:{}:{}",
+                generation.as_str(),
+                candidate.activation_id.as_str()
+            ),
+            &request,
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        match transport
+            .send_frame(&frame, TransportLimits::default())
+            .await
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+        {
+            DeliveryOutcome::Delivered => {}
+            DeliveryOutcome::UnknownOutcome => {
+                return Err(HostError::RecoveryRequired(
+                    "Store rebind exact query delivery outcome is unknown".to_owned(),
+                ));
+            }
+        }
+        let frame = transport
+            .receive_frame(TransportLimits::default())
+            .await
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let response = decode_control_response_frame(&frame)
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        if response.message_id != request.message_id
+            || response.request_digest != request.payload_digest
+            || response.error.is_some()
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store rebind exact query response was not bound".to_owned(),
+            ));
+        }
+        let Some(receipt) = response.store_rebind_receipt else {
+            return Ok(None);
+        };
+        if receipt.operation_id != *operation_id || receipt.request_digest != request_digest {
+            return Err(HostError::RecoveryRequired(
+                "Store rebind exact query receipt identity mismatch".to_owned(),
+            ));
+        }
+        receipt
+            .validate()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        Ok(Some(receipt))
+    }
+
+    #[cfg(windows)]
+    fn reconcile_store_rebind_records<B: JournalBackend>(
+        &self,
+        generation: &PlatformHandle,
+        journal: &HostStateJournalService<B>,
+    ) -> Result<(), HostError> {
+        let records = journal
+            .snapshot()?
+            .store_rebinds
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    StoreRebindState::Pending | StoreRebindState::Unknown
+                )
+            })
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return Ok(());
+        }
+        let launch = self.launch.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store rebind startup recovery has no runtime launch descriptor".to_owned(),
+            )
+        })?;
+        let candidate = self.kernel_candidate.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store rebind startup recovery has no Kernel candidate".to_owned(),
+            )
+        })?;
+        let kernel = self.kernel.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store rebind startup recovery has no live Kernel".to_owned(),
+            )
+        })?;
+        let kernel_process = kernel.evidence().process();
+        let expected_kernel_image = self.kernel_executable.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store rebind startup recovery has no Kernel image".to_owned(),
+            )
+        })?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let mut unknown = Vec::new();
+        runtime.block_on(async {
+            for record in records {
+                let result = Self::query_store_rebind_exact(
+                    &record.operation_id,
+                    record.request_digest.as_str(),
+                    generation,
+                    candidate,
+                    launch.authority_generation,
+                    kernel_process.process_id,
+                    kernel_process.start_time_100ns,
+                    expected_kernel_image,
+                    "host-store-rebind-startup-query",
+                )
+                .await;
+                match result {
+                    Ok(Some(receipt)) => {
+                        append_store_rebind_terminal(
+                            journal,
+                            record,
+                            StoreRebindState::Committed,
+                            Some(&receipt),
+                        )?;
+                    }
+                    Ok(None) => {
+                        append_store_rebind_terminal(
+                            journal,
+                            record,
+                            StoreRebindState::Aborted,
+                            None,
+                        )?;
+                    }
+                    Err(error) => {
+                        let operation_id = record.operation_id.clone();
+                        let request_digest = record.request_digest.as_str().to_owned();
+                        persist_store_rebind_disposition(
+                            journal,
+                            &operation_id,
+                            &request_digest,
+                            StoreRebindState::Unknown,
+                        )?;
+                        unknown.push(format!(
+                            "{}:{}: {}",
+                            operation_id.as_str(),
+                            request_digest,
+                            error
+                        ));
+                    }
+                }
+            }
+            Ok::<(), HostError>(())
+        })?;
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(HostError::RecoveryRequired(format!(
+                "Store rebind startup recovery remains unknown: {}",
+                unknown.join(", ")
+            )))
+        }
     }
 
     #[cfg(windows)]
@@ -2381,6 +2587,7 @@ impl HostJobBranches {
                 "Store Job observation does not contain exact relaunched Store process".to_owned(),
             ));
         }
+        self.reconcile_store_rebind_records(generation, journal)?;
         let candidate_digest = candidate
             .compute_digest()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -2409,12 +2616,14 @@ impl HostJobBranches {
             matches!(
                 record.state,
                 StoreRebindState::Pending | StoreRebindState::Unknown
-            ) && record.store_fence.as_str() == store_fence
-                && record.process_id == store_process.process_id
-                && record.process_start_time_100ns == store_process.start_time_100ns
-                && record.generation == launch.authority_generation.value()
-                && record.authority_epoch == candidate.kernel_epoch.value()
+            )
         });
+        let mut disposition_operation_id = snapshot_pending
+            .as_ref()
+            .map(|record| record.operation_id.clone());
+        let mut disposition_request_digest = snapshot_pending
+            .as_ref()
+            .map(|record| record.request_digest.as_str().to_owned());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2502,37 +2711,12 @@ impl HostJobBranches {
                     && receipt.operation_id == pending.operation_id
                     && receipt.request_digest == pending.request_digest.as_str()
                 {
-                    receipt
-                        .validate()
-                        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-                    let committed_record = StoreRebindRecord {
-                        fence: record_fence(host, activation_id, activation_generation),
-                        operation: operation(&format!(
-                            "store-rebind:{}:committed",
-                            pending.operation_id.as_str()
-                        ))?,
-                        state: StoreRebindState::Committed,
-                        operation_id: pending.operation_id.clone(),
-                        request_digest: pending.request_digest.clone(),
-                        requirement: pending.requirement.clone(),
-                        candidate_binding_digest: pending.candidate_binding_digest.clone(),
-                        store_fence: pending.store_fence.clone(),
-                        process_id: pending.process_id,
-                        process_start_time_100ns: pending.process_start_time_100ns,
-                        process_image_path: pending.process_image_path.clone(),
-                        job_name: pending.job_name.clone(),
-                        generation: pending.generation,
-                        authority_epoch: pending.authority_epoch,
-                        receipt_request_digest: Some(
-                            PlatformHandle::new(receipt.request_digest.clone())
-                                .map_err(|error| HostError::Platform(error.to_string()))?,
-                        ),
-                        receipt_store_fence: Some(
-                            PlatformHandle::new(receipt.store_fence.clone())
-                                .map_err(|error| HostError::Platform(error.to_string()))?,
-                        ),
-                    };
-                    append_reconciled(journal, HostStateRecord::StoreRebind(committed_record))?;
+                    append_store_rebind_terminal(
+                        journal,
+                        pending,
+                        StoreRebindState::Committed,
+                        Some(&receipt),
+                    )?;
                     return Ok(receipt);
                 }
                 return Err(HostError::RecoveryRequired(
@@ -2541,6 +2725,7 @@ impl HostJobBranches {
                 ));
             }
             let operation_id = fresh_identity("store-rebind")?;
+            disposition_operation_id = Some(operation_id.clone());
             let handoff = StoreRebindHandoff {
                 operation_id: operation_id.clone(),
                 request_digest: "0".repeat(64),
@@ -2570,6 +2755,10 @@ impl HostJobBranches {
             handoff_with_digest
                 .validate_canonical_digest()
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            // Retain the exact request identity before any frame construction
+            // or delivery can fail; every later terminal disposition must use
+            // this operation/request pair rather than a current fence.
+            disposition_request_digest = Some(canonical.clone());
             let request = KernelControlRequest {
                 wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
                 wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
@@ -2832,13 +3021,23 @@ impl HostJobBranches {
             } else {
                 StoreRebindState::Unknown
             };
+            let disposition_operation_id = disposition_operation_id.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Store rebind failed before an exact operation identity was retained"
+                        .to_owned(),
+                )
+            })?;
+            let disposition_request_digest =
+                disposition_request_digest.as_deref().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Store rebind failed before an exact request digest was retained"
+                            .to_owned(),
+                    )
+                })?;
             if let Err(disposition_error) = persist_store_rebind_disposition(
                 journal,
-                &record_fence(host, activation_id, activation_generation),
-                &store_fence,
-                store_process,
-                launch.authority_generation.value(),
-                candidate.kernel_epoch.value(),
+                disposition_operation_id,
+                disposition_request_digest,
                 disposition,
             ) {
                 return Err(HostError::RecoveryRequired(format!(
@@ -4733,13 +4932,76 @@ fn append_reconciled<B: JournalBackend>(
 }
 
 #[cfg(windows)]
-fn persist_store_rebind_disposition(
-    journal: &ProductionHostStateJournal,
-    fence: &RecordFence,
-    store_fence: &str,
-    process: &ProcessIdentity,
-    generation: u64,
-    authority_epoch: u64,
+fn append_store_rebind_terminal<B: JournalBackend>(
+    journal: &HostStateJournalService<B>,
+    mut record: StoreRebindRecord,
+    state: StoreRebindState,
+    receipt: Option<&StoreRebindReceipt>,
+) -> Result<(), HostError> {
+    if record.state == state && state == StoreRebindState::Unknown {
+        return Ok(());
+    }
+    match state {
+        StoreRebindState::Committed => {
+            let receipt = receipt.ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "committed Store rebind disposition has no receipt".to_owned(),
+                )
+            })?;
+            if receipt.operation_id != record.operation_id
+                || receipt.request_digest != record.request_digest.as_str()
+                || receipt.requirement_digest != record.requirement.as_str()
+                || receipt.candidate_binding_digest != record.candidate_binding_digest.as_str()
+                || receipt.store_fence != record.store_fence.as_str()
+                || receipt.generation.value() != record.generation
+                || receipt.authority_epoch.value() != record.authority_epoch
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Store rebind startup receipt did not match exact journal identity".to_owned(),
+                ));
+            }
+            receipt
+                .validate()
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            record.receipt_request_digest = Some(
+                PlatformHandle::new(receipt.request_digest.clone())
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+            );
+            record.receipt_store_fence = Some(
+                PlatformHandle::new(receipt.store_fence.clone())
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+            );
+        }
+        StoreRebindState::Aborted | StoreRebindState::Unknown => {
+            record.receipt_request_digest = None;
+            record.receipt_store_fence = None;
+        }
+        StoreRebindState::Pending => {
+            return Err(HostError::RecoveryRequired(
+                "Store rebind terminal helper received Pending".to_owned(),
+            ));
+        }
+    }
+    record.state = state;
+    record.operation = operation(&format!(
+        "store-rebind:{}:{}",
+        record.operation_id.as_str(),
+        match state {
+            StoreRebindState::Committed => "committed",
+            StoreRebindState::Aborted => "aborted",
+            StoreRebindState::Unknown => "unknown",
+            StoreRebindState::Pending => unreachable!(),
+        }
+    ))?;
+    append_reconciled(journal, HostStateRecord::StoreRebind(record))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn persist_store_rebind_disposition<B: JournalBackend>(
+    journal: &HostStateJournalService<B>,
+    operation_id: &PlatformHandle,
+    request_digest: &str,
     disposition: StoreRebindState,
 ) -> Result<(), HostError> {
     if !matches!(
@@ -4755,16 +5017,12 @@ fn persist_store_rebind_disposition(
         .store_rebinds
         .into_iter()
         .find(|record| {
-            record.fence == *fence
+            record.operation_id == *operation_id
+                && record.request_digest.as_str() == request_digest
                 && matches!(
                     record.state,
                     StoreRebindState::Pending | StoreRebindState::Unknown
                 )
-                && record.store_fence.as_str() == store_fence
-                && record.process_id == process.process_id
-                && record.process_start_time_100ns == process.start_time_100ns
-                && record.generation == generation
-                && record.authority_epoch == authority_epoch
         })
         .ok_or_else(|| {
             HostError::RecoveryRequired(
@@ -9688,6 +9946,79 @@ mod journal_tests {
             NonceState::Consumed
         );
         assert_eq!(recovered_state.readiness_observations.len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn store_rebind_disposition_uses_exact_operation_and_request_identity() {
+        let host = test_host();
+        let activation_generation = root_epoch(fresh_identity("store-rebind-disposition").unwrap());
+        let activation_id = fresh_identity("store-rebind-disposition-activation").unwrap();
+        let journal =
+            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone()).unwrap();
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(
+                initial_activation_record(
+                    &host,
+                    &activation_id,
+                    &activation_generation,
+                    ActivationState::Starting,
+                    "store-rebind-disposition-starting",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let make_pending = |operation_id: &str, request_digest: &str| StoreRebindRecord {
+            fence: record_fence(&host, &activation_id, &activation_generation),
+            operation: operation(&format!("store-rebind:{operation_id}")).unwrap(),
+            state: StoreRebindState::Pending,
+            operation_id: PlatformHandle::new(operation_id).unwrap(),
+            request_digest: PlatformHandle::new(request_digest).unwrap(),
+            requirement: PlatformHandle::new("a".repeat(64)).unwrap(),
+            candidate_binding_digest: PlatformHandle::new("b".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("c".repeat(64)).unwrap(),
+            process_id: 42,
+            process_start_time_100ns: 7,
+            process_image_path: PlatformHandle::new(r"C:\eliot\store.exe").unwrap(),
+            job_name: PlatformHandle::new(r"Local\Eliot-Host-Store-disposition").unwrap(),
+            generation: 1,
+            authority_epoch: 1,
+            receipt_request_digest: None,
+            receipt_store_fence: None,
+        };
+        let first = make_pending("store-rebind-first", &"d".repeat(64));
+        let second = make_pending("store-rebind-second", &"e".repeat(64));
+        append_reconciled(&journal, HostStateRecord::StoreRebind(first)).unwrap();
+        append_reconciled(&journal, HostStateRecord::StoreRebind(second.clone())).unwrap();
+
+        persist_store_rebind_disposition(
+            &journal,
+            &second.operation_id,
+            second.request_digest.as_str(),
+            StoreRebindState::Unknown,
+        )
+        .unwrap();
+        let state = journal.snapshot().unwrap();
+        assert_eq!(
+            state
+                .store_rebinds
+                .iter()
+                .find(|record| record.operation_id == second.operation_id)
+                .unwrap()
+                .state,
+            StoreRebindState::Unknown
+        );
+        assert_eq!(
+            state
+                .store_rebinds
+                .iter()
+                .find(|record| record.operation_id.as_str() == "store-rebind-first")
+                .unwrap()
+                .state,
+            StoreRebindState::Pending
+        );
     }
 }
 

@@ -136,6 +136,101 @@ fn cleanup(path: &PathBuf) {
     let _ignored = std::fs::remove_file(path);
 }
 
+#[test]
+fn store_rebind_commit_order_is_durable_and_idempotent() -> TestResult {
+    let path = database_path("store-rebind-order");
+    let store = RedbRecoveryStore::open(&path)?;
+    let make_record = |operation_id: &str,
+                       request_digest: &str,
+                       state: StoreRebindReplayState|
+     -> Result<StoreRebindReplayRecord, OrsError> {
+        Ok(StoreRebindReplayRecord {
+            operation_id: OperationIdentity::new(operation_id)?,
+            request_digest: request_digest.to_owned(),
+            candidate_binding_digest: "a".repeat(64),
+            store_fence: "b".repeat(64),
+            requirement_digest: "c".repeat(64),
+            process_id: 42,
+            process_start_time_100ns: 7,
+            process_image_path: r"C:\eliot\store.exe".to_owned(),
+            job_name: r"Local\Eliot-Store-order".to_owned(),
+            generation: 1,
+            authority_epoch: 1,
+            state,
+            receipt: (state == StoreRebindReplayState::Committed)
+                .then(|| request_digest.to_owned()),
+            commit_order: 0,
+        })
+    };
+
+    let first_pending = make_record(
+        "store-rebind-order-first",
+        &"d".repeat(64),
+        StoreRebindReplayState::Pending,
+    )?;
+    assert!(store.begin_store_rebind(&first_pending)?.is_none());
+    let mut first_committed = make_record(
+        first_pending.operation_id.as_str(),
+        &first_pending.request_digest,
+        StoreRebindReplayState::Committed,
+    )?;
+    first_committed.commit_order = 999;
+    store.persist_store_rebind(&first_committed)?;
+    let first = store
+        .load_store_rebind(&first_pending.operation_id, &first_pending.request_digest)?
+        .ok_or_else(|| std::io::Error::other("first committed replay is absent"))?;
+    assert!(first.commit_order > 0);
+    assert_ne!(first.commit_order, 999);
+
+    let second_pending = make_record(
+        "store-rebind-order-second",
+        &"e".repeat(64),
+        StoreRebindReplayState::Pending,
+    )?;
+    assert!(store.begin_store_rebind(&second_pending)?.is_none());
+    let second_committed = make_record(
+        second_pending.operation_id.as_str(),
+        &second_pending.request_digest,
+        StoreRebindReplayState::Committed,
+    )?;
+    store.persist_store_rebind(&second_committed)?;
+    let second = store
+        .load_store_rebind(&second_pending.operation_id, &second_pending.request_digest)?
+        .ok_or_else(|| std::io::Error::other("second committed replay is absent"))?;
+    assert!(second.commit_order > first.commit_order);
+
+    // A retry with the caller's zero order cannot overwrite the durable
+    // linearization point.
+    store.persist_store_rebind(&first_committed)?;
+    let retried = store
+        .load_store_rebind(&first_pending.operation_id, &first_pending.request_digest)?
+        .ok_or_else(|| std::io::Error::other("idempotent committed replay is absent"))?;
+    assert_eq!(retried.commit_order, first.commit_order);
+
+    drop(store);
+    let reopened = RedbRecoveryStore::open(&path)?;
+    let reopened_records = reopened.load_all_store_rebinds()?;
+    assert_eq!(
+        reopened_records
+            .iter()
+            .map(|record| record.commit_order)
+            .filter(|order| *order > 0)
+            .count(),
+        2
+    );
+    let mut substituted = first_committed.clone();
+    substituted.receipt = Some("f".repeat(64));
+    assert!(matches!(
+        substituted.validate(),
+        Err(OrsError::InvalidField {
+            field: "store_rebind_receipt",
+            ..
+        })
+    ));
+    cleanup(&path);
+    Ok(())
+}
+
 fn label(value: &str) -> Result<OpaqueLabel, OrsError> {
     OpaqueLabel::new(value)
 }

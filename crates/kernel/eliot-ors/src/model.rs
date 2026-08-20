@@ -2142,6 +2142,12 @@ pub struct StoreRebindReplayRecord {
     pub authority_epoch: u64,
     pub state: StoreRebindReplayState,
     pub receipt: Option<String>,
+    /// Monotonic ORS order assigned atomically when this operation becomes
+    /// committed.  Zero is retained for legacy records written before the
+    /// ordering field existed; new committed records are assigned a non-zero
+    /// value by `RedbRecoveryStore::persist_store_rebind`.
+    #[serde(default)]
+    pub commit_order: u64,
 }
 
 impl StoreRebindReplayRecord {
@@ -2176,10 +2182,22 @@ impl StoreRebindReplayRecord {
                     reason: "receipt only for committed",
                 });
             }
+            if receipt != &self.request_digest {
+                return Err(OrsError::InvalidField {
+                    field: "store_rebind_receipt",
+                    reason: "committed receipt must bind the exact request digest",
+                });
+            }
         } else if self.state == StoreRebindReplayState::Committed {
             return Err(OrsError::InvalidField {
                 field: "store_rebind_receipt",
                 reason: "committed requires receipt",
+            });
+        }
+        if self.state == StoreRebindReplayState::Pending && self.commit_order != 0 {
+            return Err(OrsError::InvalidField {
+                field: "store_rebind_commit_order",
+                reason: "pending must not carry a commit order",
             });
         }
         Ok(())

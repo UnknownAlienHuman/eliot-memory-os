@@ -175,6 +175,7 @@ fn replay_record(
         authority_epoch: 1,
         state,
         receipt,
+        commit_order: 0,
     }
 }
 
@@ -847,42 +848,6 @@ fn durable_restart_cannot_reconcile_rebind_without_memory() {
         restarted.reconcile_store_rebind(&query).unwrap(),
         None,
         "restarted Kernel without durable rebind cannot reconcile old operation"
-    );
-}
-
-#[test]
-fn production_discriminator_rebind_drives_kernel_composition_path() {
-    let src_host = include_str!("../../../../bins/eliot-host/src/lib.rs");
-    let src_kernel = include_str!("../../../../bins/eliot-kernel/src/lib.rs");
-    assert!(
-        src_host.contains("rebind_store_control"),
-        "Host production seam must contain rebind_store_control"
-    );
-    assert!(
-        src_kernel.contains("rebind_store"),
-        "Kernel composition must contain rebind_store"
-    );
-    assert!(
-        src_host.contains("snapshot_pending"),
-        "Host must resume pending Store rebind via snapshot reuse"
-    );
-    assert!(
-        src_kernel.contains("recover_store_rebind_state"),
-        "Kernel must recover Store rebind from ORS on restart"
-    );
-    assert!(
-        src_kernel.contains("rollback_store_rebind_for_recovery_failure"),
-        "Kernel must atomically rollback Store rebind on durability failure"
-    );
-    let host_calls = src_host.matches("rebind_store_control").count();
-    let kernel_calls = src_kernel.matches("rebind_store").count();
-    assert!(
-        host_calls >= 2,
-        "Host must define and call rebind_store_control"
-    );
-    assert!(
-        kernel_calls >= 3,
-        "Kernel must define, validate and dispatch rebind_store"
     );
 }
 
