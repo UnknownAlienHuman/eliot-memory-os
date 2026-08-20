@@ -82,7 +82,7 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 /// private, durable activation-receipt binding: a transaction cannot be
 /// re-opened as `ActiveVerified` without the exact registry terminal that
 /// committed it.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(10, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(11, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -5324,6 +5324,7 @@ fn validate_package_binding(
             manifest,
             staging_root,
             candidate_manifest_digest: bound_manifest_digest,
+            package_manifest_digest: bound_package_digest,
             ..
         } = effect
         else {
@@ -5334,6 +5335,9 @@ fn validate_package_binding(
             return Err(InstallationError::IdentityConflict);
         }
         if bound_manifest_digest != &expected_manifest_digest {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if bound_package_digest.as_str() != manifest.canonical_digest() {
             return Err(InstallationError::IdentityConflict);
         }
         if !same_windows_root(staging_root.as_str(), transaction_staging_root.as_str())? {
@@ -5780,6 +5784,8 @@ pub enum InstallerEffectPlan {
         expected_file_digests: Vec<PackageArtifactDigest>,
         /// Digest of the complete candidate manifest, including runtime argv.
         candidate_manifest_digest: PlatformHandle,
+        /// Canonical digest of the exact package manifest.
+        package_manifest_digest: PlatformHandle,
     },
     /// Register one own-process SCM service.
     RegisterService {
@@ -5847,6 +5853,7 @@ impl InstallerEffectPlan {
                 staging_root,
                 expected_file_digests,
                 candidate_manifest_digest,
+                package_manifest_digest,
                 ..
             } => {
                 approved_path(source_bundle, "installer_effect.source_bundle")?;
@@ -5869,6 +5876,13 @@ impl InstallerEffectPlan {
                     candidate_manifest_digest,
                     "installer_effect.candidate_manifest_digest",
                 )?;
+                sha256_handle(
+                    package_manifest_digest,
+                    "installer_effect.package_manifest_digest",
+                )?;
+                if package_manifest_digest.as_str() != manifest.canonical_digest() {
+                    return Err(InstallationError::IdentityConflict);
+                }
                 let mut paths = BTreeSet::new();
                 for digest in expected_file_digests {
                     validate_package_relative_text(
@@ -10079,6 +10093,13 @@ fn package_stager(
     Ok((stager, manifest.clone()))
 }
 
+fn package_stager_for_rollback(staging_root: &PlatformHandle) -> Result<PackageStager, PortError> {
+    let dummy_source = Path::new(staging_root.as_str());
+    let source = TrustedSourceBundle::open(dummy_source).map_err(|e| package_port_error(&e))?;
+    PackageStager::open(source, Path::new(staging_root.as_str()))
+        .map_err(|e| package_port_error(&e))
+}
+
 fn package_port_error(error: &PackageStagingError) -> PortError {
     match error {
         PackageStagingError::InvalidRelativePath
@@ -10300,7 +10321,7 @@ fn inspect_package(
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
         generation,
-        candidate_manifest_digest,
+        package_manifest_digest,
         ..
     } = &request.plan
     else {
@@ -10309,7 +10330,7 @@ fn inspect_package(
     if manifest.generation != generation.as_str() {
         return Err(PackageStagingError::IdentityMismatch);
     }
-    if manifest.canonical_digest() != candidate_manifest_digest.as_str() {
+    if manifest.canonical_digest() != package_manifest_digest.as_str() {
         return Err(PackageStagingError::IdentityMismatch);
     }
     let observed = stager.source().observe()?;
@@ -10350,7 +10371,7 @@ fn reconcile_package(
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
         generation,
-        candidate_manifest_digest,
+        package_manifest_digest,
         ..
     } = &request.plan
     else {
@@ -10362,7 +10383,7 @@ fn reconcile_package(
         .as_ref()
         .ok_or(PackageStagingError::Io)?;
     if manifest.generation != generation.as_str()
-        || manifest.canonical_digest() != candidate_manifest_digest.as_str()
+        || manifest.canonical_digest() != package_manifest_digest.as_str()
         || &persisted.generation != generation
         || persisted.manifest_digest.as_str() != manifest.canonical_digest()
         || persisted.source_bundle_identity != stager.source().identity()
@@ -10400,6 +10421,41 @@ fn reconcile_package(
 fn execute_package(
     request: &InstallationEffectRequest,
 ) -> PortOutcome<InstallationEffectExecution> {
+    if request.action == InstallationEffectAction::Rollback {
+        let Some(receipt) = request.staging_receipt.as_ref() else {
+            return PortOutcome::Error(PortError::InvalidRequestMetadata);
+        };
+        let InstallerEffectPlan::StagePackage {
+            staging_root,
+            manifest,
+            package_manifest_digest,
+            ..
+        } = &request.plan
+        else {
+            return PortOutcome::Error(PortError::InvalidRequestMetadata);
+        };
+        if manifest.canonical_digest() != package_manifest_digest.as_str() {
+            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+        }
+        let stager = match package_stager_for_rollback(staging_root) {
+            Ok(s) => s,
+            Err(e) => return PortOutcome::Error(e),
+        };
+        return match stager.rollback(receipt) {
+            Ok(()) => PortOutcome::Known(InstallationEffectExecution {
+                evidence: vec![
+                    PlatformHandle::new(sha256_hex(
+                        format!("package-rollback-v1\0{}", receipt.digest()).as_bytes(),
+                    ))
+                    .unwrap_or_else(|_| unreachable!()),
+                ],
+                create_disposition: None,
+                credential_receipt: None,
+                staging_receipt: None,
+            }),
+            Err(error) => package_staging_outcome(&error),
+        };
+    }
     let (stager, manifest) = match package_stager(request) {
         Ok(value) => value,
         Err(error) => return PortOutcome::Error(error),
@@ -10410,14 +10466,14 @@ fn execute_package(
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
         generation,
-        candidate_manifest_digest,
+        package_manifest_digest,
         ..
     } = &request.plan
     else {
         return PortOutcome::Error(PortError::InvalidRequestMetadata);
     };
     if manifest.generation != generation.as_str()
-        || manifest.canonical_digest() != candidate_manifest_digest.as_str()
+        || manifest.canonical_digest() != package_manifest_digest.as_str()
         || &snapshot.generation != generation
         || snapshot.manifest_digest.as_str() != manifest.canonical_digest()
         || snapshot.source_bundle_identity != stager.source().identity()
@@ -12896,10 +12952,11 @@ mod tests {
                 file_index: 1,
             },
             generation: manifest.generation.clone(),
-            manifest: package_manifest,
+            manifest: package_manifest.clone(),
             staging_root: system_path("staging"),
             expected_file_digests: Vec::new(),
             candidate_manifest_digest: must(candidate_manifest_digest(&manifest)),
+            package_manifest_digest: must(PlatformHandle::new(package_manifest.canonical_digest())),
         };
         let package_change = PlannedChange {
             change_id: package_effect.effect_id().clone(),
@@ -14786,7 +14843,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 10.0.0")
+                if reason.contains("requires explicit migration to 11.0.0")
         ));
     }
 
@@ -17245,12 +17302,12 @@ mod tests {
         let object = legacy.as_object_mut().unwrap();
         object.insert(
             "transaction_wire_version".to_owned(),
-            must(serde_json::to_value(ContractVersion::new(9, 0, 0))),
+            must(serde_json::to_value(ContractVersion::new(10, 0, 0))),
         );
         let bytes = must(serde_json::to_vec(&legacy));
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
-            Err(InstallationError::MigrationRequired { reason }) if reason.contains("requires explicit migration to 10.0.0")
+            Err(InstallationError::MigrationRequired { reason }) if reason.contains("requires explicit migration to 11.0.0")
         ));
     }
 
@@ -17304,6 +17361,9 @@ mod tests {
                 staging_root: test_handle(r"C:\staging"),
                 expected_file_digests: Vec::new(),
                 candidate_manifest_digest: snapshot.manifest_digest.clone(),
+                package_manifest_digest: must(PlatformHandle::new(
+                    must(PackageManifest::new("candidate", Vec::new())).canonical_digest(),
+                )),
             },
             profile: InstallationProfile::PortableDev,
             installation_root: test_handle(r"C:\portable"),

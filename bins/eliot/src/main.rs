@@ -331,19 +331,23 @@ fn run_installation_plan_sealed(
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
+    if candidate_manifest.signature_ref.as_str().trim().is_empty() {
+        write_installation_error(
+            "INSTALLATION_PLAN_SEALED_INVALID",
+            "candidate signature_ref is empty; not approved",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
     let transaction_id = PlatformHandle::new(format!(
-        "transaction:sealed:{}",
+        "transaction:sealed:{}:{}",
+        candidate_manifest.generation.as_str(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
     ))
     .unwrap();
-    let epoch = InstallationEpoch {
-        installation: PlatformHandle::new("installation:sealed").unwrap(),
-        lineage_id: PlatformHandle::new("lineage:sealed").unwrap(),
-        sequence: 1,
-    };
+    let epoch = candidate_manifest.runtime_launch.installation_epoch.clone();
     let request = ManagedEnvironmentChangeRequest {
         request_id: PlatformHandle::new("request:sealed").unwrap(),
         requester_and_reason: PlatformHandle::new("requester:sealed").unwrap(),

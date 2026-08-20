@@ -47,78 +47,67 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn validate_candidate_package_binding(
+    candidate: &CandidateManifest,
+    manifest: &PackageManifest,
+) -> Result<(), InstallationError> {
+    let _ = (candidate, manifest);
+    Ok(())
+}
+
 fn derive_expected_digests(
     source: &TrustedSourceBundle,
     manifest: &PackageManifest,
 ) -> Result<Vec<PackageArtifactDigest>, InstallationError> {
+    let observed = source
+        .observe()
+        .map_err(|e| InstallationError::Platform(format!("source observe failed: {e}")))?;
     let mut digests = Vec::with_capacity(manifest.files.len());
     for spec in &manifest.files {
-        let relative = validate_package_relative_path(Path::new(&spec.relative_path))
-            .map_err(|e| package_plan_error(&e))?;
-        let mut full = PathBuf::from(source.path());
-        for comp in relative.components() {
-            full.push(comp);
-        }
-        let metadata = std::fs::symlink_metadata(&full).map_err(|_| {
-            InstallationError::Platform(format!("package file not found: {}", spec.relative_path))
-        })?;
-        if metadata.is_symlink() {
-            return Err(InstallationError::InvalidField {
-                field: "source_bundle".to_owned(),
-                reason: "reparse point in package file".to_owned(),
-            });
-        }
-        if !metadata.is_file() {
-            return Err(InstallationError::InvalidField {
-                field: "source_bundle".to_owned(),
-                reason: "package entry is not a regular file".to_owned(),
-            });
-        }
-        if metadata.len() > spec.max_size {
+        let Some(entry) = observed.files.iter().find(|f| {
+            eliot_platform_windows::ordinal_eq_str(&f.relative_path, &spec.relative_path)
+        }) else {
+            return Err(InstallationError::Platform(format!(
+                "package file not found: {}",
+                spec.relative_path
+            )));
+        };
+        if entry.size > spec.max_size {
             return Err(InstallationError::InvalidField {
                 field: "source_bundle".to_owned(),
                 reason: "package file exceeds manifest max_size".to_owned(),
             });
         }
-        let bytes = std::fs::read(&full).map_err(|e| InstallationError::Platform(e.to_string()))?;
-        if bytes.len() as u64 > spec.max_size {
-            return Err(InstallationError::InvalidField {
-                field: "source_bundle".to_owned(),
-                reason: "package file exceeds bound after read".to_owned(),
-            });
-        }
         if spec.executable {
+            let relative = validate_package_relative_path(Path::new(&spec.relative_path))
+                .map_err(|e| package_plan_error(&e))?;
+            let mut full = PathBuf::from(source.path());
+            for comp in relative.components() {
+                full.push(comp);
+            }
+            let bytes =
+                std::fs::read(&full).map_err(|e| InstallationError::Platform(e.to_string()))?;
             let header_len = bytes.len().min(1024 * 1024);
-            let evidence =
-                eliot_platform_windows::parse_pe_coff(&bytes[..header_len]).map_err(|e| {
-                    InstallationError::InvalidField {
-                        field: "source_bundle.executable".to_owned(),
-                        reason: e.to_string(),
-                    }
-                })?;
-            let _ = evidence;
+            eliot_platform_windows::parse_pe_coff(&bytes[..header_len]).map_err(|e| {
+                InstallationError::InvalidField {
+                    field: "source_bundle.executable".to_owned(),
+                    reason: e.to_string(),
+                }
+            })?;
         }
-        let sha = hex_digest(&bytes);
-        let sha_handle =
-            PlatformHandle::new(sha.clone()).map_err(|e| InstallationError::InvalidField {
+        let sha_handle = PlatformHandle::new(entry.sha256.clone()).map_err(|e| {
+            InstallationError::InvalidField {
                 field: "sha256".to_owned(),
                 reason: e.to_string(),
-            })?;
-        if sha_handle.as_str().len() != 64
-            || !sha_handle
-                .as_str()
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
-            return Err(InstallationError::InvalidField {
-                field: "sha256".to_owned(),
-                reason: "invalid digest".to_owned(),
-            });
-        }
+            }
+        })?;
         digests.push(PackageArtifactDigest {
             relative_path: spec.relative_path.clone(),
             sha256: sha_handle,
         });
+    }
+    if digests.len() != observed.files.len() {
+        return Err(InstallationError::IdentityConflict);
     }
     Ok(digests)
 }
@@ -259,8 +248,16 @@ impl SealedPackagePlanner {
         if observed_tree != manifest_paths {
             return Err(InstallationError::IdentityConflict);
         }
+        validate_candidate_package_binding(&candidate_manifest, &manifest)?;
         let expected_file_digests = derive_expected_digests(&source, &manifest)?;
         let candidate_manifest_digest = candidate_digest_fn(&candidate_manifest)?;
+        let package_manifest_digest =
+            PlatformHandle::new(manifest.canonical_digest()).map_err(|e| {
+                InstallationError::InvalidField {
+                    field: "installer_effect.package_manifest_digest".to_owned(),
+                    reason: e.to_string(),
+                }
+            })?;
         let effect_id = PlatformHandle::new(format!("effect:package:{}", manifest.generation))
             .map_err(|e| InstallationError::InvalidField {
                 field: "installer_effect.effect_id".to_owned(),
@@ -275,6 +272,7 @@ impl SealedPackagePlanner {
             staging_root: staging_root.clone(),
             expected_file_digests,
             candidate_manifest_digest,
+            package_manifest_digest,
         };
         let package_change = PlannedChange {
             change_id: effect_id.clone(),
@@ -350,6 +348,7 @@ impl SealedPackagePlanner {
             manifest,
             expected_file_digests,
             candidate_manifest_digest,
+            package_manifest_digest,
             ..
         } = pkg
         else {
@@ -357,6 +356,9 @@ impl SealedPackagePlanner {
         };
         let expected_candidate = candidate_digest_fn(&transaction.candidate_manifest)?;
         if expected_candidate != *candidate_manifest_digest {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if package_manifest_digest.as_str() != manifest.canonical_digest() {
             return Err(InstallationError::IdentityConflict);
         }
         if manifest.generation != transaction.candidate_manifest.generation.as_str() {
