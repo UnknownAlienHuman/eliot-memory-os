@@ -2617,6 +2617,12 @@ impl KernelComposition {
         store_bootstrap: Option<&HostStoreBootstrapRequirement>,
     ) -> Result<Option<eliot_kernel_service::StoreBootstrapHandoff>, String> {
         let records = ors.load_all_store_rebinds().map_err(|e| e.to_string())?;
+        for pending in records
+            .iter()
+            .filter(|r| r.state == eliot_ors::StoreRebindReplayState::Pending)
+        {
+            let _ = ors.abort_store_rebind(&pending.operation_id, &pending.request_digest);
+        }
         let committed = records
             .into_iter()
             .filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
@@ -3608,18 +3614,6 @@ impl KernelComposition {
             svc.rebind_store(&handoff, request_digest.clone())
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?
         };
-        if let Some(pg) = self.process_gateway.as_ref()
-            && let Ok(guard) = pg.canonical_store.lock()
-            && let Some(old) = guard.as_ref()
-            && !Arc::ptr_eq(old, &gateway)
-        {
-            old.fence();
-        }
-        if let Ok(guard) = self.canonical_store_gateway.lock()
-            && let Some(old) = guard.as_ref()
-        {
-            old.fence();
-        }
         {
             let requirement_digest = {
                 let bytes = serde_json::to_vec(&handoff.requirement)
@@ -3683,9 +3677,24 @@ impl KernelComposition {
                 svc.rollback_store_rebind_for_recovery_failure();
             }
             if let Ok(op) = eliot_ors::OperationIdentity::new(handoff.operation_id.as_str()) {
-                let _ = self.generation_gateway.ors.abort_store_rebind(&op, &request_digest);
+                let _ = self
+                    .generation_gateway
+                    .ors
+                    .abort_store_rebind(&op, &request_digest);
             }
             return Err(error);
+        }
+        if let Some(pg) = self.process_gateway.as_ref()
+            && let Ok(guard) = pg.canonical_store.lock()
+            && let Some(old) = guard.as_ref()
+            && !Arc::ptr_eq(old, &gateway)
+        {
+            old.fence();
+        }
+        if let Ok(guard) = self.canonical_store_gateway.lock()
+            && let Some(old) = guard.as_ref()
+        {
+            old.fence();
         }
         let old_gateway = match (|| {
             let mut gw_guard = self
