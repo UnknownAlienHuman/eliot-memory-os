@@ -7,15 +7,20 @@ use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
 use eliot_installation::{
-    ApprovedGenerationRegistry, InstallationError, InstallationProfile, InstallationStage,
-    InstallationStepOutcome, InstallationTransaction, InstallationTransactionStore,
+    ApprovedGenerationRegistry, GenerationPackagePlanInput, GenerationPackagePlanner,
+    InstallationEpoch, InstallationError, InstallationProfile, InstallationStage,
+    InstallationStepOutcome, InstallationTransaction, InstallationTransactionStore, PlatformHandle,
     RedbInstallationRegistry, RedbInstallationTransactionStore, WindowsInstallationCoordinator,
     decode_installation_transaction_json, parse_installation_transaction_id,
 };
 use eliot_platform_windows::{ProtectedRootLease, windows_paths_equal};
 use serde_json::json;
 use std::path::PathBuf;
-use std::{fs, io::Read, path::Path};
+use std::{
+    fs,
+    io::{Read, Write},
+    path::Path,
+};
 use tracing_subscriber::EnvFilter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,6 +37,7 @@ struct Cli {
     command: Command,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     Catalogue {
@@ -55,8 +61,53 @@ enum Command {
     Ui,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum InstallationCommand {
+    /// Derive one complete trusted generation transaction from explicit roots
+    /// and installation identity. No candidate/package JSON is accepted here.
+    #[command(alias = "plan-generation", alias = "generation-plan")]
+    Generate {
+        /// Absolute retained source bundle containing the exact eleven-file inventory.
+        #[arg(long, value_parser = absolute_path)]
+        source_root: PathBuf,
+        /// Explicit installation profile (`system_service`, `user_mode`, or `portable_dev`).
+        #[arg(long, value_parser = parse_installation_profile)]
+        profile: InstallationProfile,
+        /// Absolute OS-validated profile anchor root.
+        #[arg(long, value_parser = absolute_path)]
+        profile_anchor_root: PathBuf,
+        /// Lowercase SHA-256 installation key; required for profiled installations.
+        #[arg(long)]
+        installation_key: Option<String>,
+        /// Stable installation identity.
+        #[arg(long)]
+        installation: String,
+        /// Stable lineage identity.
+        #[arg(long)]
+        lineage_id: String,
+        /// Non-zero sequence within the lineage.
+        #[arg(long)]
+        sequence: u64,
+        /// Canonical relative package generation identity.
+        #[arg(long)]
+        generation: String,
+        /// Absolute immutable staging root.
+        #[arg(long, value_parser = absolute_path)]
+        staging_root: PathBuf,
+        /// Stable transaction identity.
+        #[arg(long)]
+        transaction_id: String,
+        /// Explicit non-zero Store-space policy value.
+        #[arg(long)]
+        minimum_store_available_bytes: u64,
+        /// Explicit recovery command/reference retained by the transaction.
+        #[arg(long)]
+        recovery_command: String,
+        /// Absolute new output JSON path. Its parent must already exist.
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
+    },
     /// Validate an immutable v8 installation plan JSON without applying it (untrusted import/validation only).
     Plan {
         /// Absolute path to an existing serialized `InstallationTransaction`.
@@ -168,8 +219,38 @@ fn run() -> Result<i32> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_installation(command: InstallationCommand) -> Result<i32> {
     match command {
+        InstallationCommand::Generate {
+            source_root,
+            profile,
+            profile_anchor_root,
+            installation_key,
+            installation,
+            lineage_id,
+            sequence,
+            generation,
+            staging_root,
+            transaction_id,
+            minimum_store_available_bytes,
+            recovery_command,
+            output,
+        } => run_installation_generate(
+            source_root,
+            profile,
+            profile_anchor_root,
+            installation_key,
+            installation,
+            lineage_id,
+            sequence,
+            generation,
+            staging_root,
+            transaction_id,
+            minimum_store_available_bytes,
+            recovery_command,
+            output,
+        ),
         InstallationCommand::Plan { input } => {
             let bytes = match load_input(&input) {
                 Ok(bytes) => bytes,
@@ -244,6 +325,76 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             Ok(INVALID_REQUEST_EXIT)
         }
     }
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+fn run_installation_generate(
+    source_root: PathBuf,
+    profile: InstallationProfile,
+    profile_anchor_root: PathBuf,
+    installation_key: Option<String>,
+    installation: String,
+    lineage_id: String,
+    sequence: u64,
+    generation: String,
+    staging_root: PathBuf,
+    transaction_id: String,
+    minimum_store_available_bytes: u64,
+    recovery_command: String,
+    output: PathBuf,
+) -> Result<i32> {
+    let input = GenerationPackagePlanInput {
+        transaction_id: cli_handle(transaction_id, "transaction_id")?,
+        installation_epoch: InstallationEpoch {
+            installation: cli_handle(installation, "installation")?,
+            lineage_id: cli_handle(lineage_id, "lineage_id")?,
+            sequence,
+        },
+        profile,
+        profile_anchor_root: cli_path_handle(&profile_anchor_root, "profile_anchor_root")?,
+        installation_key: installation_key
+            .map(|value| cli_handle(value, "installation_key"))
+            .transpose()?,
+        generation: cli_handle(generation, "generation")?,
+        source_root: cli_path_handle(&source_root, "source_root")?,
+        staging_root: cli_path_handle(&staging_root, "staging_root")?,
+        minimum_store_available_bytes,
+        recovery_command: cli_handle(recovery_command, "recovery_command")?,
+    };
+    let transaction = match GenerationPackagePlanner::plan(input) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            write_installation_error("INSTALLATION_GENERATION_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    write_transaction_artifact(&output, &transaction)
+        .map_err(|error| anyhow::anyhow!("write generated installation transaction: {error}"))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": "GENERATED",
+            "transaction_id": transaction.transaction_id,
+            "generation": transaction.candidate_manifest.generation,
+            "profile": transaction.profile,
+            "effect_count": transaction.effect_progress().len(),
+            "package_file_count": transaction
+                .installer_effects
+                .iter()
+                .find_map(|effect| match effect {
+                    eliot_installation::InstallerEffectPlan::StagePackage { manifest, .. } => {
+                        Some(manifest.files.len())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0),
+            "output": output.display().to_string(),
+            "scope": "trusted_generation_planner_only",
+        }))?
+    );
+    Ok(0)
 }
 
 fn run_installation_create(input: &Path, store_path: &Path) -> Result<i32> {
@@ -896,6 +1047,46 @@ fn absolute_path(value: &str) -> std::result::Result<PathBuf, String> {
     } else {
         Err("path must be absolute".to_owned())
     }
+}
+
+fn parse_installation_profile(value: &str) -> std::result::Result<InstallationProfile, String> {
+    match value {
+        "system_service" => Ok(InstallationProfile::SystemService),
+        "user_mode" => Ok(InstallationProfile::UserMode),
+        "portable_dev" => Ok(InstallationProfile::PortableDev),
+        _ => Err("profile must be one of system_service, user_mode, portable_dev".to_owned()),
+    }
+}
+
+fn cli_handle(value: String, field: &str) -> Result<PlatformHandle> {
+    PlatformHandle::new(value).map_err(|error| anyhow::anyhow!("invalid {field}: {error}"))
+}
+
+fn cli_path_handle(path: &Path, field: &str) -> Result<PlatformHandle> {
+    if !path.is_absolute() {
+        anyhow::bail!("{field} must be absolute");
+    }
+    cli_handle(path.to_string_lossy().into_owned(), field)
+}
+
+fn write_transaction_artifact(
+    path: &Path,
+    transaction: &InstallationTransaction,
+) -> Result<(), std::io::Error> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "transaction output must be absolute",
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(transaction)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")
 }
 
 /// Non-Windows builds have no authenticated Windows Kernel front door.

@@ -165,7 +165,7 @@ pub fn ordinal_component_cmp(left: &str, right: &str) -> Ordering {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt as _;
-        use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_LESS_THAN};
+        use windows_sys::Win32::Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal};
 
         let left: Vec<u16> = std::ffi::OsStr::new(left).encode_wide().collect();
         let right: Vec<u16> = std::ffi::OsStr::new(right).encode_wide().collect();
@@ -680,9 +680,10 @@ fn verify_signature(
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::Security::WinTrust::{
-        WinVerifyTrustEx, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
+        WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
         WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_CHAIN,
         WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+        WinVerifyTrustEx,
     };
 
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -864,7 +865,7 @@ fn certificate_evidence(
     context: &windows_sys::Win32::Security::Cryptography::CERT_CONTEXT,
 ) -> (Option<String>, Option<i64>, Option<i64>) {
     use windows_sys::Win32::Security::Cryptography::{
-        CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+        CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW,
     };
     let (not_before, not_after) = if context.pCertInfo.is_null() {
         (None, None)
@@ -2548,7 +2549,7 @@ fn file_identity_from_open_handle(
 fn ensure_single_link(file: &std::fs::File) -> Result<(), PackageStagingError> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
     let ok = unsafe {
@@ -2661,10 +2662,10 @@ fn verify_system_directory_handles(contour: &[std::fs::File]) -> Result<(), Pack
 #[cfg(windows)]
 fn security_descriptor_digest(file: &std::fs::File) -> Result<String, PackageStagingError> {
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorLength, OWNER_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR,
     };
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -2707,7 +2708,7 @@ fn security_descriptor_digest(file: &std::fs::File) -> Result<String, PackageSta
 
 #[cfg(windows)]
 fn create_generation_root(path: &Path) -> Result<std::fs::File, PackageStagingError> {
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
@@ -2770,11 +2771,11 @@ fn create_destination_file(
 ) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
     use std::os::windows::io::FromRawHandle as _;
     use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE,
+        ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, CREATE_NEW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
         FILE_SHARE_WRITE,
     };
@@ -2845,7 +2846,7 @@ fn create_destination_file(
 fn create_destination_directory(
     path: &Path,
 ) -> Result<(std::fs::File, FileIdentity, String), PackageStagingError> {
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
@@ -3295,7 +3296,7 @@ fn delete_open_handle(
 ) -> Result<(), PackageStagingError> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
     };
     let actual = file_identity_from_open_handle(&file)?;
     if actual != expected_identity {

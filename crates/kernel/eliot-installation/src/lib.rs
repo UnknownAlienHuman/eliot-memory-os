@@ -64,7 +64,7 @@ pub use credential_provision::{
     credential_matching_response_digest, decode_credential_control_request_frame,
     decode_credential_control_response_frame, validate_store_credential_target,
 };
-pub use package_planner::SealedPackagePlanner;
+pub use package_planner::{GenerationPackagePlanInput, GenerationPackagePlanner};
 pub use redb_state::RedbInstallationTransactionStore;
 
 /// Stable wire name for the installation contract.
@@ -5323,6 +5323,7 @@ fn validate_package_binding(
             generation,
             manifest,
             staging_root,
+            expected_file_digests,
             candidate_manifest_digest: bound_manifest_digest,
             package_manifest_digest: bound_package_digest,
             ..
@@ -5345,6 +5346,20 @@ fn validate_package_binding(
         }
         PackageManifest::new(&manifest.generation, manifest.files.clone())
             .map_err(|error| package_plan_error(&error))?;
+        #[cfg(test)]
+        if package_planner::candidate_has_nonplaceholder_package_digests(candidate_manifest) {
+            package_planner::validate_exact_expected_file_digests(
+                candidate_manifest,
+                manifest,
+                expected_file_digests,
+            )?;
+        }
+        #[cfg(not(test))]
+        package_planner::validate_exact_expected_file_digests(
+            candidate_manifest,
+            manifest,
+            expected_file_digests,
+        )?;
     }
     if package_count > 1 {
         return Err(InstallationError::Duplicate {
@@ -10541,7 +10556,9 @@ fn execute_package(
                     credential_receipt: None,
                     staging_receipt: Some(receipt),
                 })
-        }
+            }
+            Err(error) => package_staging_outcome(&error),
+        },
         InstallationEffectAction::Rollback => {
             let Some(receipt) = request.staging_receipt.as_ref() else {
                 return PortOutcome::Error(PortError::InvalidRequestMetadata);

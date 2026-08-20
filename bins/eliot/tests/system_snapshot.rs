@@ -34,6 +34,124 @@ fn assert_installation_error(output: &Value, code: &str) {
     assert!(output["detail"].is_string());
 }
 
+#[cfg(windows)]
+#[allow(clippy::cast_possible_truncation)]
+fn minimal_pe(label: &str) -> Vec<u8> {
+    let pe_offset = 0x80_usize;
+    let optional_size = 0xf0_usize;
+    let section_end = pe_offset + 4 + 20 + optional_size + 40;
+    let mut bytes = vec![0_u8; section_end];
+    bytes[..2].copy_from_slice(b"MZ");
+    bytes[0x3c..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+    bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+    let coff = pe_offset + 4;
+    bytes[coff..coff + 2].copy_from_slice(&0x8664_u16.to_le_bytes());
+    bytes[coff + 2..coff + 4].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[coff + 16..coff + 18].copy_from_slice(&(optional_size as u16).to_le_bytes());
+    bytes[coff + 18..coff + 20].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[coff + 20..coff + 22].copy_from_slice(&0x20b_u16.to_le_bytes());
+    bytes.extend_from_slice(label.as_bytes());
+    bytes
+}
+
+#[cfg(windows)]
+#[test]
+fn installation_generate_cli_builds_exact_eleven_file_transaction() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-generate-{}",
+        std::process::id()
+    ));
+    let portable_root = temp_root.join("portable");
+    let source_root = temp_root.join("source");
+    let other_cwd = temp_root.join("other-cwd");
+    let output = temp_root.join("generated.json");
+    fs::create_dir_all(&portable_root).expect("create portable root");
+    fs::create_dir_all(&source_root).expect("create source root");
+    fs::create_dir_all(&other_cwd).expect("create unrelated cwd");
+    drop(UserOwnedRootLease::open_existing(&portable_root).expect("protect portable root"));
+    for (name, executable) in [
+        ("eliot-host.exe", true),
+        ("eliot-watchdog.exe", true),
+        ("eliot-kernel.exe", true),
+        ("eliot-store-surreal.exe", true),
+        ("surreal.exe", true),
+        ("eliotd.exe", true),
+        ("generation.json", false),
+        ("eliotd-governor.json", false),
+        ("eliotd.json", false),
+        ("store-bootstrap.json", false),
+        ("authority.json", false),
+    ] {
+        let bytes = if executable {
+            minimal_pe(name)
+        } else {
+            format!("descriptor:{name}").into_bytes()
+        };
+        fs::write(source_root.join(name), bytes).expect("write source role");
+    }
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&other_cwd)
+        .args([
+            "installation",
+            "generate",
+            "--source-root",
+            source_root.to_str().expect("source root is utf8"),
+            "--profile",
+            "portable_dev",
+            "--profile-anchor-root",
+            portable_root.to_str().expect("portable root is utf8"),
+            "--installation",
+            "installation:cli",
+            "--lineage-id",
+            "lineage:cli",
+            "--sequence",
+            "1",
+            "--generation",
+            "candidate",
+            "--staging-root",
+            portable_root.to_str().expect("staging root is utf8"),
+            "--transaction-id",
+            "transaction:cli",
+            "--minimum-store-available-bytes",
+            "1",
+            "--recovery-command",
+            "eliot installation recover --transaction-id transaction:cli",
+            "--output",
+            output.to_str().expect("output is utf8"),
+        ])
+        .output()
+        .expect("run trusted generation command");
+    assert!(
+        result.status.success(),
+        "generation failed: {}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    let summary: Value = serde_json::from_slice(&result.stdout).expect("generation summary JSON");
+    assert_eq!(summary["status"], "GENERATED");
+    assert_eq!(summary["package_file_count"], 11);
+    let wire = fs::read_to_string(&output).expect("generated transaction artifact");
+    assert!(!wire.contains("host_runtime_activation_nonce"));
+    let transaction: Value = serde_json::from_str(&wire).expect("generated transaction JSON");
+    let package = transaction["installer_effects"]
+        .as_array()
+        .and_then(|effects| {
+            effects.iter().find(|effect| {
+                effect["kind"] == "STAGE_PACKAGE"
+                    && effect["manifest"]["files"].as_array().is_some()
+            })
+        })
+        .expect("one generated StagePackage effect");
+    assert_eq!(
+        package["manifest"]["files"]
+            .as_array()
+            .expect("generated manifest files")
+            .len(),
+        11
+    );
+    assert_eq!(transaction["transaction_id"], "transaction:cli");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
 #[test]
 fn snapshot_binds_explicit_root_when_process_starts_in_non_git_directory() {
     let root = repository_root();
@@ -560,7 +678,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     let planned: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
     assert_eq!(
         planned["transaction_wire_version"],
-        serde_json::json!({"major": 9, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 11, "minor": 0, "patch": 0})
     );
 
     let create = Command::new(env!("CARGO_BIN_EXE_eliot"))
@@ -585,7 +703,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     assert_eq!(created["contract_version"], "3.0.0");
     assert_eq!(
         created["transaction_wire_version"],
-        serde_json::json!({"major": 9, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 11, "minor": 0, "patch": 0})
     );
     assert_eq!(created["transaction_id"], "transaction:cli-positive");
     assert_eq!(created["revision"], 1);
@@ -614,7 +732,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     assert_eq!(status_value["stage"], "PLANNED");
     assert_eq!(
         status_value["transaction"]["transaction_wire_version"],
-        serde_json::json!({"major": 9, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 11, "minor": 0, "patch": 0})
     );
 
     let apply = Command::new(env!("CARGO_BIN_EXE_eliot"))
@@ -664,7 +782,7 @@ fn installation_cli_create_status_apply_round_trip_uses_bounded_all_effects_loop
     );
     assert_eq!(
         applied["transaction"]["transaction_wire_version"],
-        serde_json::json!({"major": 9, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 11, "minor": 0, "patch": 0})
     );
 
     let status_after_apply = Command::new(env!("CARGO_BIN_EXE_eliot"))

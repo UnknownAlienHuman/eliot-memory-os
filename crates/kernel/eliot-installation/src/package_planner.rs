@@ -6,14 +6,36 @@ use eliot_platform_windows::{
     PackageManifest, PackageStagingError, TrustedSourceBundle, validate_package_relative_path,
 };
 
-use crate::PackageArtifactDigest;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CandidateManifest, InstallationEpoch, InstallationError, InstallationProfile,
-    InstallationTransaction, InstallerEffectPlan, ManagedEnvironmentChangeRequest, PlannedChange,
+    AuthorityEpoch, CandidateManifest, InstallationEpoch, InstallationError, InstallationProfile,
+    InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, InstallerServiceAccount,
+    InstallerServiceRole, LOCAL_SERVICE_SID, ManagedEnvironmentAction,
+    ManagedEnvironmentChangeRequest, PackageArtifactDigest, PlannedChange, ResourceGeneration,
+    RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, StoreCredentialProvider,
+    StoreCredentialProvisionPlan, StoreCredentialScope,
     candidate_manifest_digest as candidate_digest_fn, handle,
 };
+
+/// The immutable package inventory produced by the trusted generation seam.
+///
+/// The role names deliberately live in one place.  A caller cannot provide a
+/// partial candidate and ask the stager to infer the missing Host, Watchdog,
+/// Kernel, Store or daemon contour.
+const REQUIRED_PACKAGE_ROLES: [(&str, bool); 11] = [
+    ("eliot-host.exe", true),
+    ("eliot-watchdog.exe", true),
+    ("eliot-kernel.exe", true),
+    ("eliot-store-surreal.exe", true),
+    ("surreal.exe", true),
+    ("eliotd.exe", true),
+    ("generation.json", false),
+    ("eliotd-governor.json", false),
+    ("eliotd.json", false),
+    ("store-bootstrap.json", false),
+    ("authority.json", false),
+];
 
 fn package_plan_error(error: &PackageStagingError) -> InstallationError {
     InstallationError::InvalidField {
@@ -47,6 +69,7 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[cfg(test)]
 fn expected_role_map(candidate: &CandidateManifest) -> Vec<(String, bool, String)> {
     let rt = &candidate.runtime_launch;
     let file_name = |p: &PlatformHandle| {
@@ -118,6 +141,7 @@ fn expected_role_map(candidate: &CandidateManifest) -> Vec<(String, bool, String
     ]
 }
 
+#[cfg(test)]
 fn validate_candidate_package_binding(
     candidate: &CandidateManifest,
     manifest: &PackageManifest,
@@ -223,6 +247,205 @@ fn validate_candidate_package_binding(
     Ok(())
 }
 
+pub(crate) fn strict_role_bindings(
+    candidate: &CandidateManifest,
+) -> [(&'static str, bool, &PlatformHandle, &PlatformHandle); 11] {
+    let runtime = &candidate.runtime_launch;
+    [
+        (
+            "eliot-host.exe",
+            true,
+            &candidate.host_executable_path,
+            &candidate.host_artifact_digest,
+        ),
+        (
+            "eliot-watchdog.exe",
+            true,
+            &runtime.watchdog_executable_path,
+            &runtime.watchdog_artifact_digest,
+        ),
+        (
+            "eliot-kernel.exe",
+            true,
+            &candidate.kernel_executable_path,
+            &candidate.kernel_artifact_digest,
+        ),
+        (
+            "eliot-store-surreal.exe",
+            true,
+            &candidate.store_bridge_executable_path,
+            &candidate.store_bridge_artifact_digest,
+        ),
+        (
+            "surreal.exe",
+            true,
+            &candidate.canonical_store_executable_path,
+            &candidate.canonical_store_artifact_digest,
+        ),
+        (
+            "eliotd.exe",
+            true,
+            &runtime.eliotd_executable_path,
+            &runtime.eliotd_artifact_digest,
+        ),
+        (
+            "generation.json",
+            false,
+            &candidate.config_path,
+            &candidate.config_digest,
+        ),
+        (
+            "eliotd-governor.json",
+            false,
+            &runtime.eliotd_config_path,
+            &runtime.eliotd_config_digest,
+        ),
+        (
+            "eliotd.json",
+            false,
+            &runtime.eliotd_descriptor_path,
+            &runtime.eliotd_descriptor_digest,
+        ),
+        (
+            "store-bootstrap.json",
+            false,
+            &runtime.store_bootstrap_descriptor_path,
+            &runtime.store_bootstrap_descriptor_digest,
+        ),
+        (
+            "authority.json",
+            false,
+            &runtime.authority_descriptor_path,
+            &runtime.authority_descriptor_digest,
+        ),
+    ]
+}
+
+/// Validate the complete production package bijection.
+///
+/// This boundary is intentionally independent of the caller's manifest and
+/// expected-digest vectors.  It binds all eleven canonical role names and
+/// requires every `CandidateManifest` path/digest to participate exactly once.
+pub(crate) fn validate_exact_candidate_package_binding(
+    candidate: &CandidateManifest,
+    manifest: &PackageManifest,
+) -> Result<(), InstallationError> {
+    if manifest.generation != candidate.generation.as_str() {
+        return Err(InstallationError::IdentityConflict);
+    }
+    if manifest.files.len() != REQUIRED_PACKAGE_ROLES.len() {
+        return Err(InstallationError::IncompleteObservation(
+            "package manifest must contain the complete eleven-file runtime inventory".to_owned(),
+        ));
+    }
+    let bindings = strict_role_bindings(candidate);
+    let mut expected_names = BTreeSet::new();
+    let mut candidate_paths = BTreeSet::new();
+    for (name, executable, path, digest) in bindings {
+        if !expected_names.insert(name.to_ascii_lowercase()) {
+            return Err(InstallationError::Duplicate {
+                kind: "package role".to_owned(),
+                identity: name.to_owned(),
+            });
+        }
+        let actual_name = Path::new(path.as_str())
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if actual_name != name {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if !candidate_paths.insert(path.as_str().to_ascii_lowercase()) {
+            return Err(InstallationError::Duplicate {
+                kind: "candidate package path".to_owned(),
+                identity: path.as_str().to_owned(),
+            });
+        }
+        crate::sha256_handle(digest, "candidate package role digest")?;
+        let Some(spec) = manifest
+            .files
+            .iter()
+            .find(|spec| spec.relative_path == name)
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        if spec.executable != executable || spec.max_size == 0 {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    let mut manifest_names = BTreeSet::new();
+    for spec in &manifest.files {
+        let Some((name, executable)) = REQUIRED_PACKAGE_ROLES
+            .iter()
+            .find(|(name, _)| *name == spec.relative_path)
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        if spec.executable != *executable || !manifest_names.insert((*name).to_owned()) {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    if manifest_names != expected_names {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn candidate_has_nonplaceholder_package_digests(candidate: &CandidateManifest) -> bool {
+    strict_role_bindings(candidate)
+        .into_iter()
+        .any(|(_, _, _, digest)| {
+            let value = digest.as_str();
+            value.len() != 64
+                || value
+                    .chars()
+                    .next()
+                    .is_none_or(|first| !value.chars().all(|item| item == first))
+        })
+}
+
+pub(crate) fn validate_exact_expected_file_digests(
+    candidate: &CandidateManifest,
+    manifest: &PackageManifest,
+    expected: &[PackageArtifactDigest],
+) -> Result<(), InstallationError> {
+    validate_exact_candidate_package_binding(candidate, manifest)?;
+    if expected.len() != REQUIRED_PACKAGE_ROLES.len() {
+        return Err(InstallationError::IncompleteObservation(
+            "expected package digest set must contain all eleven runtime files".to_owned(),
+        ));
+    }
+    let bindings = strict_role_bindings(candidate);
+    let mut seen = BTreeSet::new();
+    for item in expected {
+        if !seen.insert(item.relative_path.clone()) {
+            return Err(InstallationError::Duplicate {
+                kind: "expected package digest".to_owned(),
+                identity: item.relative_path.clone(),
+            });
+        }
+        let Some((name, _, _, digest)) = bindings
+            .into_iter()
+            .find(|(name, _, _, _)| *name == item.relative_path)
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        crate::sha256_handle(&item.sha256, "expected package digest")?;
+        if item.sha256 != *digest || name != item.relative_path.as_str() {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    let expected_names = REQUIRED_PACKAGE_ROLES
+        .iter()
+        .map(|(name, _)| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    if seen != expected_names {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(())
+}
+
 fn derive_expected_digests(
     source: &TrustedSourceBundle,
     manifest: &PackageManifest,
@@ -304,6 +527,7 @@ fn derive_expected_digests(
     Ok(digests)
 }
 
+#[cfg(test)]
 fn enumerate_source_tree(
     source: &TrustedSourceBundle,
 ) -> Result<BTreeSet<String>, InstallationError> {
@@ -325,9 +549,722 @@ fn enumerate_source_tree(
     Ok(set)
 }
 
-/// Sealed production planner that derives package facts from a pinned source bundle.
-pub struct SealedPackagePlanner;
+/// Explicit inputs accepted by the production generation planner.
+///
+/// Every identity and path is supplied by the caller.  In particular, there
+/// is no environment, current-directory, timestamp or implicit profile-root
+/// lookup in this value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationPackagePlanInput {
+    /// Stable transaction identity.
+    pub transaction_id: PlatformHandle,
+    /// Installation and lineage identity with its explicit sequence.
+    pub installation_epoch: InstallationEpoch,
+    /// Explicit supervision/path profile.
+    pub profile: InstallationProfile,
+    /// OS-validated profile anchor selected by the caller.
+    pub profile_anchor_root: PlatformHandle,
+    /// Lowercase installation key required by profiled roots.
+    pub installation_key: Option<PlatformHandle>,
+    /// Canonical relative package generation identity.
+    pub generation: PlatformHandle,
+    /// Absolute retained source bundle directory.
+    pub source_root: PlatformHandle,
+    /// Absolute immutable staging destination root.
+    pub staging_root: PlatformHandle,
+    /// Explicit store-volume minimum required by the transaction policy.
+    pub minimum_store_available_bytes: u64,
+    /// Explicit recovery command/reference retained in the transaction.
+    pub recovery_command: PlatformHandle,
+}
 
+/// The sole production package/transaction composition seam.
+pub struct GenerationPackagePlanner;
+
+impl GenerationPackagePlanner {
+    /// Derive the complete candidate/package/effect graph and create one
+    /// immutable `PLANNED` transaction.
+    ///
+    /// The source is opened and observed independently of every manifest claim.
+    /// The exact eleven-file inventory is then used to construct all canonical
+    /// destination paths, descriptor/config bindings, argv and artifact
+    /// digests before the single transaction constructor is called.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the production seam keeps candidate, package and effect derivation auditable"
+    )]
+    pub fn plan(
+        input: GenerationPackagePlanInput,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        handle(&input.transaction_id, "generation.transaction_id")?;
+        input.installation_epoch.validate()?;
+        approved_path(&input.profile_anchor_root, "generation.profile_anchor_root")?;
+        approved_path(&input.source_root, "generation.source_root")?;
+        approved_path(&input.staging_root, "generation.staging_root")?;
+        handle(&input.generation, "generation.generation")?;
+        handle(&input.recovery_command, "generation.recovery_command")?;
+        if input.minimum_store_available_bytes == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "generation.minimum_store_available_bytes".to_owned(),
+                reason: "must be an explicit non-zero policy value".to_owned(),
+            });
+        }
+        let canonical_generation =
+            validate_package_relative_path(Path::new(input.generation.as_str()))
+                .map_err(|error| package_plan_error(&error))?;
+        if canonical_generation.as_str() != input.generation.as_str() {
+            return Err(InstallationError::IdentityConflict);
+        }
+
+        let roots = match input.profile {
+            InstallationProfile::PortableDev => {
+                if input.installation_key.is_some() {
+                    return Err(InstallationError::ProfileViolation(
+                        "portable_dev does not accept a profiled installation key".to_owned(),
+                    ));
+                }
+                RuntimeStateRoots::derive_portable(input.profile_anchor_root.clone())?
+            }
+            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+                let key = input.installation_key.as_ref().ok_or_else(|| {
+                    InstallationError::InvalidField {
+                        field: "generation.installation_key".to_owned(),
+                        reason: "profiled installations require an explicit key".to_owned(),
+                    }
+                })?;
+                RuntimeStateRoots::derive_profiled(
+                    input.profile,
+                    input.profile_anchor_root.clone(),
+                    key.as_str(),
+                )?
+            }
+        };
+        let source =
+            TrustedSourceBundle::open(Path::new(input.source_root.as_str())).map_err(|error| {
+                InstallationError::Platform(format!("trusted source open failed: {error}"))
+            })?;
+        let source_identity = source.identity();
+        if source_identity.volume_serial_number == 0 || source_identity.file_index == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "generation.source_root_identity".to_owned(),
+                reason: "trusted source identity must be non-zero".to_owned(),
+            });
+        }
+        let observed = source.observe().map_err(|error| {
+            InstallationError::Platform(format!("source observe failed: {error}"))
+        })?;
+        validate_exact_source_inventory(&observed)?;
+
+        let files = observed
+            .files
+            .iter()
+            .map(|entry| {
+                let executable = REQUIRED_PACKAGE_ROLES
+                    .iter()
+                    .find(|(name, _)| *name == entry.relative_path)
+                    .map(|(_, executable)| *executable)
+                    .ok_or(InstallationError::IdentityConflict)?;
+                eliot_platform_windows::PackageFileSpec::new(
+                    &entry.relative_path,
+                    executable,
+                    entry.size.max(1),
+                )
+                .map_err(|error| package_plan_error(&error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let package_manifest = PackageManifest::new(input.generation.as_str(), files)
+            .map_err(|error| package_plan_error(&error))?;
+
+        let generation_root =
+            Path::new(input.staging_root.as_str()).join(input.generation.as_str());
+        let destination = |name: &str| {
+            PlatformHandle::new(generation_root.join(name).to_string_lossy().into_owned()).map_err(
+                |error| InstallationError::InvalidField {
+                    field: "generation.destination_path".to_owned(),
+                    reason: error.to_string(),
+                },
+            )
+        };
+        let host_path = destination("eliot-host.exe")?;
+        let watchdog_path = destination("eliot-watchdog.exe")?;
+        let kernel_path = destination("eliot-kernel.exe")?;
+        let store_bridge_path = destination("eliot-store-surreal.exe")?;
+        let canonical_store_path = destination("surreal.exe")?;
+        let eliotd_path = destination("eliotd.exe")?;
+        let config_path = destination("generation.json")?;
+        let eliotd_config_path = destination("eliotd-governor.json")?;
+        let eliotd_descriptor_path = destination("eliotd.json")?;
+        let store_bootstrap_path = destination("store-bootstrap.json")?;
+        let authority_path = destination("authority.json")?;
+        for (path, field) in [
+            (&host_path, "generation.host_path"),
+            (&watchdog_path, "generation.watchdog_path"),
+            (&kernel_path, "generation.kernel_path"),
+            (&store_bridge_path, "generation.store_bridge_path"),
+            (&canonical_store_path, "generation.canonical_store_path"),
+            (&eliotd_path, "generation.eliotd_path"),
+            (&config_path, "generation.config_path"),
+            (&eliotd_config_path, "generation.eliotd_config_path"),
+            (&eliotd_descriptor_path, "generation.eliotd_descriptor_path"),
+            (&store_bootstrap_path, "generation.store_bootstrap_path"),
+            (&authority_path, "generation.authority_path"),
+        ] {
+            approved_path(path, field)?;
+        }
+
+        let expected_file_digests = derive_expected_digests(&source, &package_manifest)?;
+        if expected_file_digests.len() != REQUIRED_PACKAGE_ROLES.len() {
+            return Err(InstallationError::IncompleteObservation(
+                "trusted source digest set is incomplete".to_owned(),
+            ));
+        }
+        let digest_for = |name: &str| {
+            expected_file_digests
+                .iter()
+                .find(|digest| digest.relative_path == name)
+                .map(|digest| digest.sha256.clone())
+                .ok_or(InstallationError::IdentityConflict)
+        };
+        let kernel_digest = digest_for("eliot-kernel.exe")?;
+        let host_digest = digest_for("eliot-host.exe")?;
+        let watchdog_digest = digest_for("eliot-watchdog.exe")?;
+        let store_bridge_digest = digest_for("eliot-store-surreal.exe")?;
+        let canonical_store_digest = digest_for("surreal.exe")?;
+        let eliotd_digest = digest_for("eliotd.exe")?;
+        let config_digest = digest_for("generation.json")?;
+        let eliotd_config_digest = digest_for("eliotd-governor.json")?;
+        let eliotd_descriptor_digest = digest_for("eliotd.json")?;
+        let store_bootstrap_digest = digest_for("store-bootstrap.json")?;
+        let authority_digest = digest_for("authority.json")?;
+
+        let authority_generation = ResourceGeneration::new(input.installation_epoch.sequence)
+            .map_err(|error| InstallationError::InvalidField {
+                field: "generation.authority_generation".to_owned(),
+                reason: error.to_string(),
+            })?;
+        let authority_epoch =
+            AuthorityEpoch::new(input.installation_epoch.sequence).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "generation.authority_epoch".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+        let authority_state_fence = StateFence::new(authority_epoch, authority_generation);
+        let nonce_seed = format!(
+            "eliotd:{}:{}:{}:{}",
+            input.transaction_id,
+            input.installation_epoch.installation,
+            input.generation,
+            source_identity.file_index
+        );
+        let eliotd_launch_nonce =
+            PlatformHandle::new(format!("eliotd:{}", hex_digest(nonce_seed.as_bytes()))).map_err(
+                |error| InstallationError::InvalidField {
+                    field: "generation.eliotd_launch_nonce".to_owned(),
+                    reason: error.to_string(),
+                },
+            )?;
+        let credential_token = hex_digest(
+            format!(
+                "eliot-store-credential:{}:{}:{}",
+                input.installation_epoch.installation, input.generation, source_identity.file_index
+            )
+            .as_bytes(),
+        );
+        let store_credential_target =
+            PlatformHandle::new(format!("eliot/store/v1/{}", &credential_token[..32])).map_err(
+                |error| InstallationError::InvalidField {
+                    field: "generation.store_credential_target".to_owned(),
+                    reason: error.to_string(),
+                },
+            )?;
+        let handle_vec = |values: Vec<String>| {
+            values
+                .into_iter()
+                .map(|value| {
+                    PlatformHandle::new(value).map_err(|error| InstallationError::InvalidField {
+                        field: "generation.runtime_arguments".to_owned(),
+                        reason: error.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let kernel_arguments = handle_vec(vec![
+            "--work-root".to_owned(),
+            roots.kernel_work_root.as_str().to_owned(),
+            "--store-bootstrap".to_owned(),
+            store_bootstrap_path.as_str().to_owned(),
+            "--store-bootstrap-sha256".to_owned(),
+            store_bootstrap_digest.as_str().to_owned(),
+            "--authority-descriptor".to_owned(),
+            authority_path.as_str().to_owned(),
+            "--authority-descriptor-sha256".to_owned(),
+            authority_digest.as_str().to_owned(),
+            "--kernel-artifact-sha256".to_owned(),
+            kernel_digest.as_str().to_owned(),
+            "--eliotd-descriptor".to_owned(),
+            eliotd_descriptor_path.as_str().to_owned(),
+            "--eliotd-descriptor-sha256".to_owned(),
+            eliotd_descriptor_digest.as_str().to_owned(),
+        ])?;
+        let store_bridge_arguments = handle_vec(match input.profile {
+            InstallationProfile::PortableDev => vec![
+                "--portable-dev-root".to_owned(),
+                input.profile_anchor_root.as_str().to_owned(),
+                "--config".to_owned(),
+                config_path.as_str().to_owned(),
+            ],
+            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+                vec!["--config".to_owned(), config_path.as_str().to_owned()]
+            }
+        })?;
+        let canonical_store_arguments = handle_vec(vec![
+            "start".to_owned(),
+            "--no-banner".to_owned(),
+            "--bind".to_owned(),
+            "127.0.0.1:8000".to_owned(),
+            "--temporary-directory".to_owned(),
+            roots.store_temp_root.as_str().to_owned(),
+            "--log-file-enabled".to_owned(),
+            "--log-file-path".to_owned(),
+            roots.store_work_root.as_str().to_owned(),
+            "--log-file-name".to_owned(),
+            "surrealdb.log".to_owned(),
+            format!(
+                "surrealkv://{}",
+                roots.store_data_root.as_str().replace('\\', "/")
+            ),
+        ])?;
+        let launch = RuntimeLaunchDescriptor {
+            profile: input.profile,
+            portable_root: (input.profile == InstallationProfile::PortableDev)
+                .then(|| input.profile_anchor_root.clone()),
+            installation_epoch: input.installation_epoch.clone(),
+            generation: input.generation.clone(),
+            authority_generation,
+            authority_state_fence,
+            authority_descriptor_path: authority_path,
+            authority_descriptor_digest: authority_digest,
+            runtime_state_roots: roots.clone(),
+            kernel_work_root: roots.kernel_work_root.clone(),
+            kernel_artifact_digest: kernel_digest.clone(),
+            eliotd_executable_path: eliotd_path,
+            eliotd_artifact_digest: eliotd_digest,
+            eliotd_config_path,
+            eliotd_config_digest,
+            eliotd_descriptor_path,
+            eliotd_descriptor_digest,
+            eliotd_launch_nonce,
+            store_config_path: config_path.clone(),
+            store_credential_target: store_credential_target.clone(),
+            store_bridge_executable_path: store_bridge_path.clone(),
+            store_bridge_artifact_digest: store_bridge_digest.clone(),
+            store_bootstrap_descriptor_path: store_bootstrap_path,
+            store_bootstrap_descriptor_digest: store_bootstrap_digest,
+            canonical_store_executable_path: canonical_store_path.clone(),
+            canonical_store_artifact_digest: canonical_store_digest.clone(),
+            kernel_arguments,
+            store_bridge_arguments,
+            canonical_store_arguments,
+            host_executable_path: host_path.clone(),
+            host_artifact_digest: host_digest.clone(),
+            watchdog_executable_path: watchdog_path.clone(),
+            watchdog_artifact_digest: watchdog_digest.clone(),
+            descriptor_digest: PlatformHandle::new("0".repeat(64)).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "generation.descriptor_digest".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+        }
+        .with_computed_digest()?;
+        let signature_ref = PlatformHandle::new(hex_digest(
+            format!(
+                "eliot-candidate-signature:{}:{}:{}",
+                input.generation, launch.descriptor_digest, source_identity.file_index
+            )
+            .as_bytes(),
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "generation.signature_ref".to_owned(),
+            reason: error.to_string(),
+        })?;
+        let candidate = CandidateManifest {
+            generation: input.generation.clone(),
+            components: REQUIRED_PACKAGE_ROLES
+                .iter()
+                .map(|(name, _)| {
+                    PlatformHandle::new(format!("component:{name}")).map_err(|error| {
+                        InstallationError::InvalidField {
+                            field: "generation.components".to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            kernel_artifact_digest: kernel_digest,
+            store_bridge_artifact_digest: store_bridge_digest,
+            canonical_store_artifact_digest: canonical_store_digest,
+            host_artifact_digest: host_digest,
+            kernel_executable_path: kernel_path,
+            store_bridge_executable_path: store_bridge_path,
+            canonical_store_executable_path: canonical_store_path,
+            host_executable_path: host_path,
+            config_path,
+            dependency_closure_refs: vec![
+                PlatformHandle::new(format!("evidence:source:{}", source_identity.file_index))
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "generation.dependency_closure_refs".to_owned(),
+                        reason: error.to_string(),
+                    })?,
+            ],
+            license_refs: vec![
+                PlatformHandle::new("evidence:license:eliot-runtime").map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "generation.license_refs".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?,
+            ],
+            config_digest,
+            store_credential_target: store_credential_target.clone(),
+            supervision_key_fingerprint: PlatformHandle::new(hex_digest(
+                format!(
+                    "eliot-supervision-key:{}:{}",
+                    input.installation_epoch.installation, input.generation
+                )
+                .as_bytes(),
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "generation.supervision_key_fingerprint".to_owned(),
+                reason: error.to_string(),
+            })?,
+            signature_ref,
+            runtime_state_roots_digest: roots.roots_digest.clone(),
+            runtime_launch: launch,
+        };
+        candidate.validate()?;
+        validate_exact_candidate_package_binding(&candidate, &package_manifest)?;
+        for digest in &expected_file_digests {
+            let (_, _, _, expected) = strict_role_bindings(&candidate)
+                .into_iter()
+                .find(|(name, _, _, _)| *name == digest.relative_path)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if digest.sha256 != *expected {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        let candidate_manifest_digest = candidate_digest_fn(&candidate)?;
+        let package_manifest_digest = PlatformHandle::new(package_manifest.canonical_digest())
+            .map_err(|error| InstallationError::InvalidField {
+                field: "generation.package_manifest_digest".to_owned(),
+                reason: error.to_string(),
+            })?;
+        let package_effect_id = PlatformHandle::new(format!("effect:package:{}", input.generation))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "generation.package_effect_id".to_owned(),
+                reason: error.to_string(),
+            })?;
+        let mut effects = Vec::new();
+        for (field, root) in std::iter::once(("installation_root", &roots.installation_root))
+            .chain(roots.root_fields())
+        {
+            let create_id =
+                PlatformHandle::new(format!("effect:create:{field}")).map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "generation.effect_id".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?;
+            effects.push(InstallerEffectPlan::CreateRoot {
+                effect_id: create_id,
+                root: root.clone(),
+            });
+            let acl_id = PlatformHandle::new(format!("effect:acl:{field}")).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "generation.effect_id".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+            let principals = if input.profile == InstallationProfile::SystemService {
+                vec![
+                    InstallerAclPrincipal::Administrators,
+                    InstallerAclPrincipal::LocalService,
+                    InstallerAclPrincipal::LocalSystem,
+                ]
+            } else {
+                vec![
+                    InstallerAclPrincipal::CurrentUser,
+                    InstallerAclPrincipal::LocalSystem,
+                ]
+            };
+            effects.push(InstallerEffectPlan::ApplyAcl {
+                effect_id: acl_id,
+                root: root.clone(),
+                principals,
+            });
+        }
+        effects.push(InstallerEffectPlan::StagePackage {
+            effect_id: package_effect_id,
+            source_bundle: input.source_root.clone(),
+            source_bundle_identity: source_identity,
+            generation: input.generation.clone(),
+            manifest: package_manifest,
+            staging_root: input.staging_root.clone(),
+            expected_file_digests,
+            candidate_manifest_digest,
+            package_manifest_digest,
+        });
+        if input.profile == InstallationProfile::SystemService {
+            for (role, name, executable_path) in [
+                (
+                    InstallerServiceRole::Host,
+                    "EliotHost",
+                    candidate.host_executable_path.clone(),
+                ),
+                (
+                    InstallerServiceRole::Watchdog,
+                    "EliotWatchdog",
+                    candidate.runtime_launch.watchdog_executable_path.clone(),
+                ),
+            ] {
+                effects.push(InstallerEffectPlan::RegisterService {
+                    effect_id: PlatformHandle::new(format!("effect:service:{name}")).map_err(
+                        |error| InstallationError::InvalidField {
+                            field: "generation.effect_id".to_owned(),
+                            reason: error.to_string(),
+                        },
+                    )?,
+                    role,
+                    service_name: PlatformHandle::new(name).map_err(|error| {
+                        InstallationError::InvalidField {
+                            field: "generation.service_name".to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?,
+                    executable_path,
+                    account: InstallerServiceAccount::LocalService,
+                    automatic_start: true,
+                });
+            }
+            effects.push(InstallerEffectPlan::ProvisionStoreCredential {
+                effect_id: PlatformHandle::new("effect:store-credential").map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "generation.effect_id".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?,
+                provision: StoreCredentialProvisionPlan {
+                    host_state_root: roots.host_state_root.clone(),
+                    expected_host_executable: candidate.host_executable_path.clone(),
+                    target: candidate.store_credential_target.clone(),
+                    provider: StoreCredentialProvider::WindowsCredentialManager,
+                    scope: StoreCredentialScope::LocalService,
+                    expected_principal_sid: PlatformHandle::new(LOCAL_SERVICE_SID).map_err(
+                        |error| InstallationError::InvalidField {
+                            field: "generation.expected_principal_sid".to_owned(),
+                            reason: error.to_string(),
+                        },
+                    )?,
+                    generation: authority_generation,
+                    config_digest: candidate.config_digest.clone(),
+                },
+            });
+        }
+        let planned_changes = effects
+            .iter()
+            .map(|effect| {
+                let target = match effect {
+                    InstallerEffectPlan::CreateRoot { root, .. }
+                    | InstallerEffectPlan::ApplyAcl { root, .. } => root.clone(),
+                    InstallerEffectPlan::StagePackage { staging_root, .. } => staging_root.clone(),
+                    InstallerEffectPlan::RegisterService { service_name, .. } => {
+                        service_name.clone()
+                    }
+                    InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
+                        provision.target.clone()
+                    }
+                };
+                let change_id = effect.effect_id().clone();
+                Ok(PlannedChange {
+                    change_id: change_id.clone(),
+                    target,
+                    precondition_refs: vec![
+                        PlatformHandle::new(format!("evidence:precondition:{change_id}")).map_err(
+                            |error| InstallationError::InvalidField {
+                                field: "generation.precondition".to_owned(),
+                                reason: error.to_string(),
+                            },
+                        )?,
+                    ],
+                    postcondition_refs: vec![
+                        PlatformHandle::new(format!("evidence:postcondition:{change_id}"))
+                            .map_err(|error| InstallationError::InvalidField {
+                                field: "generation.postcondition".to_owned(),
+                                reason: error.to_string(),
+                            })?,
+                    ],
+                })
+            })
+            .collect::<Result<Vec<_>, InstallationError>>()?;
+        let request = build_generation_request(&input, source_identity)?;
+        let precondition_evidence = vec![
+            PlatformHandle::new(format!(
+                "evidence:trusted-source:{}:{}",
+                source_identity.volume_serial_number, source_identity.file_index
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "generation.precondition_evidence".to_owned(),
+                reason: error.to_string(),
+            })?,
+            PlatformHandle::new(format!(
+                "evidence:profile-anchor:{}",
+                input.profile_anchor_root
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "generation.precondition_evidence".to_owned(),
+                reason: error.to_string(),
+            })?,
+        ];
+        InstallationTransaction::new(
+            input.transaction_id,
+            input.installation_epoch,
+            input.profile,
+            request,
+            None,
+            candidate,
+            input.staging_root,
+            planned_changes,
+            effects,
+            input.minimum_store_available_bytes,
+            precondition_evidence,
+            input.recovery_command,
+        )
+    }
+}
+
+fn validate_exact_source_inventory(
+    observed: &eliot_platform_windows::PackageSourceObservation,
+) -> Result<(), InstallationError> {
+    if observed.files.len() != REQUIRED_PACKAGE_ROLES.len() {
+        return Err(InstallationError::IncompleteObservation(
+            "trusted source must contain exactly eleven runtime files".to_owned(),
+        ));
+    }
+    let expected = REQUIRED_PACKAGE_ROLES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<BTreeSet<_>>();
+    let mut actual = BTreeSet::new();
+    for file in &observed.files {
+        validate_package_relative_path(Path::new(&file.relative_path))
+            .map_err(|error| package_plan_error(&error))?;
+        if !actual.insert(file.relative_path.as_str()) {
+            return Err(InstallationError::Duplicate {
+                kind: "trusted source package file".to_owned(),
+                identity: file.relative_path.clone(),
+            });
+        }
+        if !expected.contains(file.relative_path.as_str()) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if file.size == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "generation.source_file.size".to_owned(),
+                reason: "runtime inventory files must be non-empty".to_owned(),
+            });
+        }
+        if file.sha256.len() != 64 || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    if actual != expected {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(())
+}
+
+fn build_generation_request(
+    input: &GenerationPackagePlanInput,
+    source_identity: eliot_platform_windows::FileIdentity,
+) -> Result<ManagedEnvironmentChangeRequest, InstallationError> {
+    let make = |value: String, field: &str| {
+        PlatformHandle::new(value).map_err(|error| InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: error.to_string(),
+        })
+    };
+    Ok(ManagedEnvironmentChangeRequest {
+        request_id: make(
+            format!("request:generation:{}", input.transaction_id),
+            "generation.request_id",
+        )?,
+        requester_and_reason: make(
+            "owner:trusted-generation-planner".to_owned(),
+            "generation.requester_and_reason",
+        )?,
+        action: ManagedEnvironmentAction::Install,
+        target_family: make(
+            "family:eliot-runtime-live".to_owned(),
+            "generation.target_family",
+        )?,
+        exact_candidate: input.generation.clone(),
+        expected_delta: make(
+            format!("install:complete-runtime-inventory:{}", input.generation),
+            "generation.expected_delta",
+        )?,
+        source_assurance_refs: vec![make(
+            format!(
+                "source:{}:{}:{}",
+                input.source_root, source_identity.volume_serial_number, source_identity.file_index
+            ),
+            "generation.source_assurance_refs",
+        )?],
+        affected_refs: vec![
+            make(
+                format!("affected:staging-root:{}", input.staging_root),
+                "generation.affected_refs",
+            )?,
+            make(
+                format!("affected:profile-anchor:{}", input.profile_anchor_root),
+                "generation.affected_refs",
+            )?,
+        ],
+        impact_class: make(
+            "bounded:immutable-generation".to_owned(),
+            "generation.impact_class",
+        )?,
+        required_owner: make(
+            "owner:installation-coordinator".to_owned(),
+            "generation.required_owner",
+        )?,
+        rollback_plan: make(
+            "rollback:exact-owned-package".to_owned(),
+            "generation.rollback_plan",
+        )?,
+        verifier: make(
+            "verifier:complete-path-digest-set".to_owned(),
+            "generation.verifier",
+        )?,
+        budget: make(
+            format!(
+                "budget:store-available-bytes:{}",
+                input.minimum_store_available_bytes
+            ),
+            "generation.budget",
+        )?,
+        stop_condition: make(
+            "stop:on-missing-extra-duplicate-alias-or-tamper".to_owned(),
+            "generation.stop_condition",
+        )?,
+    })
+}
+
+/// Sealed production planner that derives package facts from a pinned source bundle.
+#[cfg(test)]
+pub(crate) struct SealedPackagePlanner;
+
+#[cfg(test)]
 impl SealedPackagePlanner {
     /// Plan a v8 transaction by opening the source bundle and deriving digests.
     #[allow(
@@ -738,6 +1675,8 @@ mod tests {
         let path = dir.path().to_string_lossy().into_owned();
         let portable = test_handle(path.clone());
         std::fs::create_dir_all(dir.path().join("host")).unwrap();
+        #[cfg(windows)]
+        drop(crate::UserOwnedRootLease::open_existing(dir.path()).unwrap());
         let roots = crate::RuntimeStateRoots {
             profile: crate::InstallationProfile::PortableDev,
             profile_anchor_root: portable.clone(),
@@ -1139,6 +2078,165 @@ mod tests {
         }
         map
     }
+
+    fn production_input(
+        source_root: &std::path::Path,
+        portable_root: PlatformHandle,
+    ) -> GenerationPackagePlanInput {
+        GenerationPackagePlanInput {
+            transaction_id: h("transaction:generation"),
+            installation_epoch: make_epoch(),
+            profile: crate::InstallationProfile::PortableDev,
+            profile_anchor_root: portable_root,
+            installation_key: None,
+            generation: h("candidate"),
+            source_root: h(source_root.to_string_lossy().into_owned()),
+            staging_root: h(source_root.to_string_lossy().into_owned()),
+            minimum_store_available_bytes: 1,
+            recovery_command: h(
+                "eliot installation recover --transaction-id transaction:generation",
+            ),
+        }
+    }
+
+    #[test]
+    fn generation_planner_builds_and_binds_complete_inventory() {
+        let (_tmp, portable, _roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        populate_source_with_roles(source_dir.path());
+        let transaction =
+            GenerationPackagePlanner::plan(production_input(source_dir.path(), portable))
+                .expect("trusted generation planner should build one transaction");
+        transaction
+            .validate()
+            .expect("generated transaction validates");
+        let package = transaction
+            .installer_effects
+            .iter()
+            .find_map(|effect| match effect {
+                InstallerEffectPlan::StagePackage { manifest, .. } => Some(manifest),
+                _ => None,
+            })
+            .expect("generated transaction has one package effect");
+        assert_eq!(package.files.len(), REQUIRED_PACKAGE_ROLES.len());
+        assert_eq!(
+            package
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<BTreeSet<_>>(),
+            REQUIRED_PACKAGE_ROLES
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .eliotd_launch_nonce
+                .as_str()
+                .starts_with("eliotd:")
+        );
+        let wire = serde_json::to_string(&transaction).unwrap();
+        assert!(!wire.contains("host_runtime_activation_nonce"));
+        assert!(!wire.contains("host_activation_nonce"));
+    }
+
+    #[test]
+    fn generated_transaction_rejects_empty_subset_duplicate_alias_and_digest_tamper() {
+        let (_tmp, portable, _roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        populate_source_with_roles(source_dir.path());
+        let transaction =
+            GenerationPackagePlanner::plan(production_input(source_dir.path(), portable))
+                .expect("trusted generation planner should build one transaction");
+        let package_index = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::StagePackage { .. }))
+            .unwrap();
+
+        let mut empty = transaction.clone();
+        if let InstallerEffectPlan::StagePackage { manifest, .. } =
+            &mut empty.installer_effects[package_index]
+        {
+            manifest.files.clear();
+        }
+        assert!(empty.validate().is_err(), "empty package must be rejected");
+
+        let mut subset = transaction.clone();
+        if let InstallerEffectPlan::StagePackage { manifest, .. } =
+            &mut subset.installer_effects[package_index]
+        {
+            manifest.files.pop();
+        }
+        assert!(
+            subset.validate().is_err(),
+            "subset package must be rejected"
+        );
+
+        let mut duplicate = transaction.clone();
+        if let InstallerEffectPlan::StagePackage {
+            expected_file_digests,
+            ..
+        } = &mut duplicate.installer_effects[package_index]
+        {
+            expected_file_digests.push(expected_file_digests[0].clone());
+        }
+        assert!(
+            duplicate.validate().is_err(),
+            "duplicate digest must be rejected"
+        );
+
+        let mut alias = transaction.clone();
+        alias.candidate_manifest.host_executable_path = h(alias
+            .candidate_manifest
+            .host_executable_path
+            .as_str()
+            .replace("eliot-host.exe", "eliot-host-copy.exe"));
+        assert!(alias.validate().is_err(), "artifact alias must be rejected");
+
+        let mut tampered = transaction;
+        if let InstallerEffectPlan::StagePackage {
+            expected_file_digests,
+            ..
+        } = &mut tampered.installer_effects[package_index]
+        {
+            expected_file_digests[0].sha256 = h("a".repeat(64));
+        }
+        assert!(
+            tampered.validate().is_err(),
+            "digest tamper must be rejected"
+        );
+    }
+
+    #[test]
+    fn generation_planner_rejects_source_missing_extra_and_alias_files() {
+        for mutation in ["missing", "extra", "alias"] {
+            let (_tmp, portable, _roots) = temp_portable_root();
+            let source_dir = tempfile::TempDir::new().unwrap();
+            populate_source_with_roles(source_dir.path());
+            match mutation {
+                "missing" => {
+                    std::fs::remove_file(source_dir.path().join("authority.json")).unwrap()
+                }
+                "extra" => std::fs::write(source_dir.path().join("extra.bin"), b"extra").unwrap(),
+                "alias" => {
+                    std::fs::remove_file(source_dir.path().join("authority.json")).unwrap();
+                    std::fs::write(source_dir.path().join("authority-copy.json"), b"alias")
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                GenerationPackagePlanner::plan(production_input(source_dir.path(), portable))
+                    .is_err(),
+                "source mutation {mutation} must be rejected"
+            );
+        }
+    }
+
     #[test]
     fn role_swap_duplicate_missing_extra_rejected() {
         let (_tmp, portable, roots) = temp_portable_root();
