@@ -6,8 +6,8 @@ namespace Eliot.Operator.Protocol;
 public static class OperatorProtocol
 {
     public const string SchemaVersion = "eliot-operator-contract-v1";
-    public const string IpcProtocolVersion = "eliot-ipc-l3-v1";
-    public const string PinnedContractHash = "3c1a50d6581e90838a2375fadd70f6868a499d48f4e83223613a0a5fdedf2278";
+    public const string IpcProtocolVersion = "eliot-ipc-l3-v2";
+    public const string PinnedContractHash = "b00a82807e003ad1e1b9b717a9759024335ffe461a0cc3f5d67867ec8750394f";
     public const int MaxPageSize = 100;
 }
 
