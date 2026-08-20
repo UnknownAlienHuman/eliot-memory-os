@@ -6494,6 +6494,7 @@ impl KernelComposition {
                 | KernelControlCommand::RebindStore(_)
                 | KernelControlCommand::ReconcileRebindStore(_)
                 | KernelControlCommand::Reconcile
+                | KernelControlCommand::ProbeReady
         ) {
             Some(self.store_rebind_gate.lock().await)
         } else {
@@ -11380,6 +11381,407 @@ mod tests {
             let result = kernel.apply_control_request(request, &peer, 0).await;
             assert!(result.is_err(), "legacy {op} should be fenced");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_lines, clippy::unwrap_used, clippy::expect_used)]
+    #[tokio::test]
+    async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_publication() {
+        assert_eq!(
+            KernelComposition::production_store_rebind_discriminator(),
+            KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "c183-probe-gate-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let requirement = HostStoreBootstrapRequirement {
+            route_identity: PlatformHandle::new("store_bridge").unwrap(),
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
+            store_generation: ResourceGeneration::genesis(),
+            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            launch_nonce: PlatformHandle::new("store-launch-nonce").unwrap(),
+            connection_id: PlatformHandle::new("store-connection").unwrap(),
+            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            expected_peer_session_id: 0,
+            approved_artifact_hash: PlatformHandle::new("a".repeat(64)).unwrap(),
+            approved_config_hash: PlatformHandle::new("b".repeat(64)).unwrap(),
+            timeout_ms: 5000,
+        };
+        let kernel = KernelComposition::new(
+            KernelConfig::new(&dir).with_store_bootstrap(requirement.clone()),
+        )
+        .unwrap();
+        let candidate = {
+            let mut svc = kernel.service.lock().unwrap();
+            let cand = HostKernelCandidateBinding {
+                installation_id: PlatformHandle::new("installation-1").unwrap(),
+                host_epoch: AuthorityEpoch::new(1).unwrap(),
+                kernel_epoch: AuthorityEpoch::genesis(),
+                activation_id: PlatformHandle::new("activation-1").unwrap(),
+                artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
+                config_hash: PlatformHandle::new("config-1").unwrap(),
+                job_object_id: PlatformHandle::new("Local\\Eliot-Host-Kernel-test").unwrap(),
+                pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
+                host_process: eliot_kernel_service::HostProcessBinding {
+                    process_id: 7,
+                    start_time_100ns: 9,
+                    image_path: r"C:\eliot\host.exe".to_owned(),
+                },
+                job_binding: eliot_kernel_service::HostJobBinding {
+                    job: eliot_kernel_service::HostJobIdentity {
+                        name: "Local\\Eliot-Host-Kernel-test".to_owned(),
+                    },
+                    root: eliot_kernel_service::HostJobRoot {
+                        process: eliot_kernel_service::HostProcessBinding {
+                            process_id: 42,
+                            start_time_100ns: 10,
+                            image_path: r"C:\eliot\kernel.exe".to_owned(),
+                        },
+                        executable: eliot_kernel_service::HostFileIdentity {
+                            volume_serial_number: 1,
+                            file_index: 2,
+                        },
+                    },
+                },
+                restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
+                containment_action: None,
+            };
+            svc.reconcile(cand.clone()).unwrap();
+            svc.apply(KernelControlCommand::Shadow).unwrap();
+            svc.apply(KernelControlCommand::PrepareHandoff).unwrap();
+            let permit = eliot_kernel_service::KernelActivationPermit {
+                operation_id: PlatformHandle::new("op-c183").unwrap(),
+                candidate_binding_digest: cand.compute_digest().unwrap(),
+                prior_kernel_disposition_digest: "b".repeat(64),
+                journal_transaction_id: PlatformHandle::new("txn-1").unwrap(),
+                journal_sequence: 1,
+                generation: ResourceGeneration::genesis(),
+                authority_epoch: cand.kernel_epoch,
+                activation_nonce: eliot_platform::KernelActivationNonce::new(
+                    PlatformHandle::new("a".repeat(64)).unwrap(),
+                )
+                .unwrap(),
+            };
+            svc.activate_permit(&permit, ResourceGeneration::genesis(), "c".repeat(64))
+                .unwrap();
+            let ready = KernelReadyReceipt {
+                activation_id: cand.activation_id.clone(),
+                activation_operation_id: permit.operation_id.clone(),
+                activation_nonce_digest: svc
+                    .activation_receipt()
+                    .unwrap()
+                    .activation_nonce_digest
+                    .clone(),
+                process: eliot_kernel_service::ProcessObservation {
+                    process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
+                    job_object_id: cand.job_object_id.clone(),
+                    state: eliot_runtime_contracts::ServiceProcessState::Ready,
+                    health: eliot_runtime_contracts::HealthVector::healthy(),
+                    evidence_refs: vec![PlatformHandle::new("ev1").unwrap()],
+                },
+                health: eliot_runtime_contracts::HealthVector::healthy(),
+                evidence_refs: vec![PlatformHandle::new("ev1").unwrap()],
+            };
+            svc.publish_ready(ready).unwrap();
+            cand
+        };
+        let peer = eliot_ipc::PeerIdentity::authenticated_for_test(
+            eliot_ipc::ProcessBinding::from_observation(
+                candidate.host_process.process_id,
+                candidate.host_process.start_time_100ns,
+                candidate.host_process.image_path.clone(),
+            )
+            .unwrap(),
+            "S-1-5-18".to_owned(),
+            "0".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            kernel.service.lock().unwrap().state(),
+            KernelServiceState::Ready
+        );
+        let kernel = std::sync::Arc::new(kernel);
+        let gate_kernel = std::sync::Arc::clone(&kernel);
+        let holder = tokio::spawn(async move {
+            let _guard = gate_kernel.store_rebind_gate.lock().await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            kernel.store_rebind_gate.try_lock().is_err(),
+            "gate must be held by holder task"
+        );
+        let probe_request = KernelControlRequest {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: PlatformHandle::new("probe-gate-1").unwrap(),
+            sequence: 1,
+            peer_process_id: candidate.host_process.process_id,
+            generation: ResourceGeneration::genesis(),
+            candidate: candidate.clone(),
+            command: KernelControlCommand::ProbeReady,
+            payload_digest: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let probe_fut = kernel.apply_control_request(probe_request, &peer, 1);
+        let mut probe_fut = Box::pin(probe_fut);
+        let timeout = tokio::time::sleep(std::time::Duration::from_millis(150));
+        tokio::pin!(timeout);
+        let blocked = tokio::select! {
+            _ = &mut probe_fut => false,
+            _ = &mut timeout => true,
+        };
+        assert!(
+            blocked,
+            "ProbeReady must share store_rebind_gate and block while gate is held"
+        );
+        let _ = holder.await;
+        let probe_result = probe_fut.await;
+        assert!(
+            probe_result.is_err(),
+            "ProbeReady still fenced without Store gateway publication"
+        );
+        let operation_id = PlatformHandle::new("c183-rebind-1").unwrap();
+        let candidate_digest = candidate.compute_digest().unwrap();
+        let make_fence = |pid: u32, start: u64| {
+            let mut h = Sha256::new();
+            h.update(serde_json::to_vec(&requirement.state_fence).unwrap());
+            h.update(ResourceGeneration::genesis().value().to_le_bytes());
+            h.update(AuthorityEpoch::genesis().value().to_le_bytes());
+            h.update(requirement.approved_artifact_hash.as_str().as_bytes());
+            h.update(requirement.approved_config_hash.as_str().as_bytes());
+            h.update(pid.to_le_bytes());
+            h.update(start.to_le_bytes());
+            h.update(r"C:\Eliot\store.exe".as_bytes());
+            h.update(r"Local\Eliot-Store-test".as_bytes());
+            h.update(candidate_digest.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        let store_fence = make_fence(99, 199);
+        let handoff = eliot_kernel_service::StoreRebindHandoff {
+            operation_id: operation_id.clone(),
+            request_digest: String::new(),
+            requirement: requirement.clone(),
+            process_binding: eliot_kernel_service::StoreProcessBinding {
+                process: eliot_kernel_service::HostProcessBinding {
+                    process_id: 99,
+                    start_time_100ns: 199,
+                    image_path: r"C:\Eliot\store.exe".to_owned(),
+                },
+                job: PlatformHandle::new(r"Local\Eliot-Store-test").unwrap(),
+            },
+            candidate_binding_digest: candidate_digest.clone(),
+            generation: ResourceGeneration::genesis(),
+            authority_epoch: AuthorityEpoch::genesis(),
+            store_fence: store_fence.clone(),
+        };
+        let mut handoff = handoff;
+        handoff.request_digest = handoff.canonical_request_digest().unwrap();
+        let request_digest = handoff.request_digest.clone();
+        let requirement_digest = {
+            let b = serde_json::to_vec(&requirement).unwrap();
+            format!("{:x}", Sha256::digest(b))
+        };
+        let pending = eliot_ors::StoreRebindReplayRecord {
+            operation_id: eliot_ors::OperationIdentity::new(operation_id.as_str()).unwrap(),
+            request_digest: request_digest.clone(),
+            candidate_binding_digest: candidate_digest.clone(),
+            store_fence: store_fence.clone(),
+            requirement_digest: requirement_digest.clone(),
+            process_id: 99,
+            process_start_time_100ns: 199,
+            process_image_path: r"C:\Eliot\store.exe".to_owned(),
+            job_name: r"Local\Eliot-Store-test".to_owned(),
+            generation: 1,
+            authority_epoch: 1,
+            state: eliot_ors::StoreRebindReplayState::Pending,
+            receipt: None,
+            commit_order: 0,
+        };
+        kernel
+            .generation_gateway
+            .ors
+            .begin_store_rebind(&pending)
+            .unwrap();
+        {
+            let mut svc = kernel.service.lock().unwrap();
+            svc.rebind_store(&handoff, request_digest.clone()).unwrap();
+            assert_eq!(svc.state(), KernelServiceState::Degraded);
+            *kernel.store_handoff.lock().unwrap() =
+                Some(eliot_kernel_service::StoreBootstrapHandoff {
+                    requirement: requirement.clone(),
+                    process_binding: handoff.process_binding.clone(),
+                });
+        }
+        let query = eliot_kernel_service::StoreRebindQuery {
+            operation_id: operation_id.clone(),
+            request_digest: request_digest.clone(),
+        };
+        let reconcile_pending = KernelControlRequest {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: PlatformHandle::new("reconcile-pending").unwrap(),
+            sequence: 1,
+            peer_process_id: candidate.host_process.process_id,
+            generation: ResourceGeneration::genesis(),
+            candidate: candidate.clone(),
+            command: KernelControlCommand::ReconcileRebindStore(query.clone()),
+            payload_digest: request_digest.clone(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let pending_result = kernel
+            .apply_control_request(reconcile_pending, &peer, 1)
+            .await;
+        assert!(pending_result.is_ok());
+        assert!(pending_result.unwrap().store_rebind_receipt.is_none());
+        assert_eq!(
+            kernel.service.lock().unwrap().state(),
+            KernelServiceState::Ready
+        );
+        let aborted = kernel
+            .generation_gateway
+            .ors
+            .load_store_rebind(
+                &eliot_ors::OperationIdentity::new(operation_id.as_str()).unwrap(),
+                &request_digest,
+            )
+            .unwrap();
+        assert!(aborted.is_none());
+        kernel
+            .generation_gateway
+            .ors
+            .begin_store_rebind(&pending)
+            .unwrap();
+        {
+            let mut svc = kernel.service.lock().unwrap();
+            if svc.state() == KernelServiceState::Ready {
+                let _ = svc.rebind_store(&handoff, request_digest.clone());
+                *kernel.store_handoff.lock().unwrap() =
+                    Some(eliot_kernel_service::StoreBootstrapHandoff {
+                        requirement: requirement.clone(),
+                        process_binding: handoff.process_binding.clone(),
+                    });
+            }
+        }
+        let committed = eliot_ors::StoreRebindReplayRecord {
+            state: eliot_ors::StoreRebindReplayState::Committed,
+            receipt: Some(request_digest.clone()),
+            ..pending.clone()
+        };
+        kernel
+            .generation_gateway
+            .ors
+            .persist_store_rebind(&committed)
+            .unwrap();
+        {
+            let mut svc = kernel.service.lock().unwrap();
+            let _ = svc.commit_store_rebind();
+        }
+        let query2 = eliot_kernel_service::StoreRebindQuery {
+            operation_id: operation_id.clone(),
+            request_digest: request_digest.clone(),
+        };
+        let reconcile_committed = KernelControlRequest {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: PlatformHandle::new("reconcile-committed").unwrap(),
+            sequence: 1,
+            peer_process_id: candidate.host_process.process_id,
+            generation: ResourceGeneration::genesis(),
+            candidate: candidate.clone(),
+            command: KernelControlCommand::ReconcileRebindStore(query2),
+            payload_digest: request_digest.clone(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let committed_result = kernel
+            .apply_control_request(reconcile_committed, &peer, 1)
+            .await;
+        assert!(
+            committed_result.is_err(),
+            "publication not yet drained: gateway missing so ReconcileRebindStore must stay fenced"
+        );
+        {
+            let svc = kernel.service.lock().unwrap();
+            assert!(svc.store_rebind_receipt().is_some());
+            assert_eq!(svc.state(), KernelServiceState::Degraded);
+        }
+        let svc = kernel.service.lock().unwrap();
+        let activation = svc.activation_receipt().unwrap().clone();
+        drop(svc);
+        let fresh = KernelReadyReceipt {
+            activation_id: candidate.activation_id.clone(),
+            activation_operation_id: activation.operation_id.clone(),
+            activation_nonce_digest: activation.activation_nonce_digest.clone(),
+            process: eliot_kernel_service::ProcessObservation {
+                process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
+                job_object_id: candidate.job_object_id.clone(),
+                state: eliot_runtime_contracts::ServiceProcessState::Ready,
+                health: eliot_runtime_contracts::HealthVector::healthy(),
+                evidence_refs: vec![PlatformHandle::new("ev1").unwrap()],
+            },
+            health: eliot_runtime_contracts::HealthVector::healthy(),
+            evidence_refs: vec![PlatformHandle::new("ev-fresh").unwrap()],
+        };
+        let probe_ready_after = KernelControlRequest {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: PlatformHandle::new("probe-after-commit").unwrap(),
+            sequence: 1,
+            peer_process_id: candidate.host_process.process_id,
+            generation: ResourceGeneration::genesis(),
+            candidate: candidate.clone(),
+            command: KernelControlCommand::ProbeReady,
+            payload_digest: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let still_fenced = kernel
+            .apply_control_request(probe_ready_after, &peer, 1)
+            .await;
+        assert!(
+            still_fenced.is_err(),
+            "ProbeReady must remain fenced until fresh proof with exact committed publication"
+        );
+        {
+            let mut svc = kernel.service.lock().unwrap();
+            let second = svc.publish_ready(fresh.clone());
+            assert!(second.is_ok() || svc.state() == KernelServiceState::Degraded);
+        }
+        let replay_probe = KernelControlRequest {
+            wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+            message_id: PlatformHandle::new("probe-replay").unwrap(),
+            sequence: 1,
+            peer_process_id: candidate.host_process.process_id,
+            generation: ResourceGeneration::genesis(),
+            candidate: candidate.clone(),
+            command: KernelControlCommand::ProbeReady,
+            payload_digest: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let gate_before_replay = kernel.store_rebind_gate.lock().await;
+        let replay_fut = kernel.apply_control_request(replay_probe, &peer, 1);
+        let mut replay_fut = Box::pin(replay_fut);
+        let replay_timeout = tokio::time::sleep(std::time::Duration::from_millis(80));
+        tokio::pin!(replay_timeout);
+        let replay_blocked = tokio::select! {
+            _ = &mut replay_fut => false,
+            _ = &mut replay_timeout => true,
+        };
+        assert!(
+            replay_blocked,
+            "replayed ProbeReady must also share store_rebind_gate"
+        );
+        drop(gate_before_replay);
+        let _ = replay_fut.await;
         let _ = std::fs::remove_dir_all(dir);
     }
 }
