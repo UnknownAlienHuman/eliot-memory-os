@@ -1219,6 +1219,7 @@ dependencies = [
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",
+ "eliot-runtime-contracts",
  "redb",
  "schemars",
  "serde",

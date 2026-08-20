@@ -241,6 +241,15 @@ impl InstallationAuthorityKeySigner {
         installation_id: impl Into<String>,
         signer_id: impl Into<String>,
     ) -> Result<InstallationActivationApprovalTrustAnchor, InstallationAuthorityKeyError> {
+        // Revalidate the retained protected contour at the exact point where
+        // public verification authority is derived.  A signer may have lived
+        // across a root/slot ACL, identity or reparse-point change; metadata
+        // captured at open time is not an independent current observation.
+        #[cfg(windows)]
+        {
+            validate_signer_contour(&self.contour, &self.metadata.slot_path, self.root_identity)?;
+            validate_signer_slot(self)?;
+        }
         let signer_id = signer_id.into();
         if signer_id != INSTALLATION_AUTHORITY_SIGNER_ID {
             return Err(InstallationAuthorityKeyError::IdentityMismatch);

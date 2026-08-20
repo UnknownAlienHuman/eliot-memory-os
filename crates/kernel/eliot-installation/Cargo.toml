@@ -19,6 +19,7 @@ eliot-ipc.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
+eliot-runtime-contracts.workspace = true
 redb.workspace = true
 schemars.workspace = true
 serde.workspace = true

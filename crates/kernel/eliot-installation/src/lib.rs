@@ -51,6 +51,7 @@ use thiserror::Error;
 
 mod credential_provision;
 mod redb_state;
+mod signed_activation;
 
 pub use credential_provision::{
     CredentialAccessReceipt, CredentialOwnershipMarkerIdentity, HOST_CREDENTIAL_CONTROL_PIPE,
@@ -2561,6 +2562,41 @@ pub struct InstallationActivationApproval {
 }
 
 impl InstallationActivationApproval {
+    /// Constructs the private registry approval after an independent signed
+    /// authority verifier has authenticated every field.  The constructor is
+    /// crate-visible so the signed-activation bridge remains the sole
+    /// production path; external callers cannot manufacture this value.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_verified_parts(
+        approval_ref: PlatformHandle,
+        transaction_id: PlatformHandle,
+        installer_plan_digest: PlatformHandle,
+        generation: PlatformHandle,
+        candidate_manifest_digest: PlatformHandle,
+        runtime_descriptor_digest: PlatformHandle,
+        required_owner: PlatformHandle,
+        signature_ref: PlatformHandle,
+        authority_descriptor_path: PlatformHandle,
+        authority_descriptor_digest: PlatformHandle,
+        authority_generation: ResourceGeneration,
+        authority_state_fence: StateFence,
+    ) -> Self {
+        Self {
+            approval_ref,
+            transaction_id,
+            installer_plan_digest,
+            generation,
+            candidate_manifest_digest,
+            runtime_descriptor_digest,
+            required_owner,
+            signature_ref,
+            authority_descriptor_path,
+            authority_descriptor_digest,
+            authority_generation,
+            authority_state_fence,
+        }
+    }
+
     /// Validates the approval's self-contained typed binding.
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.approval_ref, "activation_approval.approval_ref")?;
@@ -4219,6 +4255,7 @@ impl RedbInstallationRegistry {
     /// `expected_revision` is checked against the registry snapshot inside the
     /// same redb write transaction that commits the projection.  An exact retry
     /// is a no-op and does not advance the revision.
+    #[cfg(test)]
     pub fn stage_pending_activation_from_transaction_store<S: InstallationTransactionStore>(
         &self,
         transaction_store: &S,
@@ -5611,6 +5648,18 @@ impl InstallerServiceRegistrationApproval {
     #[must_use]
     pub fn configuration_digest(&self) -> &PlatformHandle {
         &self.configuration_digest
+    }
+
+    pub(crate) fn registration_nonce(&self) -> &PlatformHandle {
+        &self.registration_nonce
+    }
+
+    pub(crate) fn service_name_handle(&self) -> &PlatformHandle {
+        &self.service_name
+    }
+
+    pub(crate) fn executable_path_handle(&self) -> &PlatformHandle {
+        &self.executable_path
     }
 
     /// Validates the durable approval without touching the filesystem or SCM.
