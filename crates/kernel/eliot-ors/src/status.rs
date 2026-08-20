@@ -69,12 +69,18 @@ pub struct SupervisionStatusProjection {
 
 #[allow(clippy::needless_pass_by_value)]
 fn map_io_error(err: std::io::Error) -> OrsSupervisionStatusError {
+    let msg = err.to_string();
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("permission denied")
+        || lower.contains("access is denied")
+        || lower.contains("os error 5")
+    {
+        return OrsSupervisionStatusError::AccessDenied(msg);
+    }
     match err.kind() {
-        std::io::ErrorKind::NotFound => OrsSupervisionStatusError::Missing(err.to_string()),
-        std::io::ErrorKind::PermissionDenied => {
-            OrsSupervisionStatusError::AccessDenied(err.to_string())
-        }
-        _ => OrsSupervisionStatusError::Unknown(err.to_string()),
+        std::io::ErrorKind::NotFound => OrsSupervisionStatusError::Missing(msg),
+        std::io::ErrorKind::PermissionDenied => OrsSupervisionStatusError::AccessDenied(msg),
+        _ => OrsSupervisionStatusError::Unknown(msg),
     }
 }
 
