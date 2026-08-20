@@ -393,32 +393,30 @@ pub(crate) async fn apply_migration(
     }
 }
 
-/// Bounded bridge health observation; never a semantic readiness verdict.
+/// Bounded bridge health observation.
+///
+/// `Available` is deliberately withheld until the semantic readiness probe
+/// confirms both the expected schema generation and the canonical fence. A
+/// reachable provider with missing/mismatched schema remains unavailable to
+/// Store callers.
 pub(crate) async fn adapter_health(adapter: &SurrealStoreAdapter) -> AdapterHealth {
-    let Ok(db) = client(adapter).await else {
-        return AdapterHealth::unprobed();
-    };
-    match probe_generation(db, &adapter.config).await {
-        Ok(Some(generation))
-            if generation == adapter.config.expected_schema_generation.as_str() =>
-        {
-            AdapterHealth {
-                protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
-                availability: AdapterAvailability::Available,
-                provider: ProviderHealth::Reachable,
-                schema_generation: Some(generation),
-            }
-        }
-        Ok(Some(generation)) => AdapterHealth {
+    match probe_readiness(adapter).await {
+        Ok(SemanticReadiness::Ready { generation }) => AdapterHealth {
             protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
-            availability: AdapterAvailability::MigrationUnavailable,
+            availability: AdapterAvailability::Available,
             provider: ProviderHealth::Reachable,
-            schema_generation: Some(generation),
+            schema_generation: Some(generation.to_string()),
         },
-        Ok(None) => AdapterHealth {
+        Ok(SemanticReadiness::MigrationRequired { observed, .. }) => AdapterHealth {
             protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
             availability: AdapterAvailability::MigrationUnavailable,
             provider: ProviderHealth::Reachable,
+            schema_generation: observed,
+        },
+        Ok(SemanticReadiness::Unavailable) => AdapterHealth {
+            protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+            availability: AdapterAvailability::Unavailable,
+            provider: ProviderHealth::Unknown,
             schema_generation: None,
         },
         Err(_) => AdapterHealth {

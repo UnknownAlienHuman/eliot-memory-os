@@ -64,6 +64,27 @@ impl CompiledMigration {
         }
         Ok(())
     }
+
+    /// Returns the sealed migration identity without exposing its `SurrealQL`.
+    ///
+    /// Store-side orchestration may bind an authenticated command to the
+    /// compiler-approved identity, while the physical statements remain
+    /// private to this adapter crate.
+    pub fn migration_id(&self) -> &str {
+        &self.migration_id
+    }
+
+    /// Returns the compiler-derived lowercase SHA-256 of the migration body.
+    #[must_use]
+    pub fn checksum_sha256(&self) -> &str {
+        &self.checksum_sha256
+    }
+
+    /// Returns the schema generation reached by this migration.
+    #[must_use]
+    pub fn generation_after(&self) -> &SchemaGeneration {
+        &self.generation_after
+    }
 }
 
 /// Durable outcome of one applied migration.

@@ -1,7 +1,9 @@
 //! Bounded provider and adapter health observations.
 //!
-//! These types report liveness and schema-generation position. They are
-//! observations, never semantic readiness or authority verdicts.
+//! These types report liveness and schema-generation position. The adapter
+//! only reports `Available` after its semantic readiness probe has also
+//! validated the canonical fence; they remain observations, not authority
+//! verdicts.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
