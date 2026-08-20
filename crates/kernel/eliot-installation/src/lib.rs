@@ -24,18 +24,21 @@ use eliot_platform::{
 };
 pub use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{
-    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
-    ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerEpochCapability, InstallerRootAbsentSnapshot,
-    InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
-    InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
-    InstallerSecretCreateDisposition, InstallerSecretObservation, ProtectedPathError,
-    ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease, ServiceAccount,
-    ServiceBootstrapArguments, ServiceRegistrationCurrent, ServiceRegistrationInspection,
-    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceStartMode, UserOwnedPathLease,
-    UserOwnedRootReadLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
-    WindowsPlatform, WindowsStoreCredentialTargetGenerator, current_user_local_app_data_root,
-    fresh_service_registration_nonce, observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path,
+    AuthenticodeVerdict, ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
+    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, FileIdentity,
+    HostOwnerEpochCapability, InstallerRootAbsentSnapshot, InstallerRootCreateDisposition,
+    InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation,
+    InstallerRootPrimitiveSpec, InstallerRootProfile, InstallerSecretCreateDisposition,
+    InstallerSecretObservation, PackageManifest, PackageStager, PackageStagingError,
+    PackageStagingObservation, ProtectedPathError, ProtectedPathLease, ProtectedRootLease,
+    ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
+    ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
+    ServiceRegistrationRequest, ServiceStartMode, StagingReceipt, TrustedSourceBundle,
+    UserOwnedPathLease, UserOwnedRootReadLease, WindowsInstallerRootPrimitive,
+    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
+    current_user_local_app_data_root, fresh_service_registration_nonce,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path,
 };
 use redb::{
     Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, TableHandle,
@@ -74,7 +77,7 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 /// This discriminator is intentionally independent from [`CONTRACT_VERSION`]
 /// so durable transaction records fail closed when their nested candidate
 /// manifest predates the required Host artifact binding.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(7, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(8, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -269,6 +272,22 @@ fn approved_path(value: &PlatformHandle, field: &str) -> Result<(), Installation
         });
     }
     Ok(())
+}
+
+fn package_plan_error(error: &PackageStagingError) -> InstallationError {
+    InstallationError::InvalidField {
+        field: "installer_effect.package_manifest".to_owned(),
+        reason: error.to_string(),
+    }
+}
+
+fn validate_package_relative_text(value: &str, field: &str) -> Result<(), InstallationError> {
+    eliot_platform_windows::validate_package_relative_path(Path::new(value))
+        .map(|_| ())
+        .map_err(|error| InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: error.to_string(),
+        })
 }
 
 fn lexical_windows_path(value: &str) -> Option<String> {
@@ -5092,6 +5111,145 @@ fn candidate_manifest_digest(
     })
 }
 
+fn validate_package_binding(
+    candidate_manifest: &CandidateManifest,
+    transaction_staging_root: &PlatformHandle,
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    let expected_manifest_digest = candidate_manifest_digest(candidate_manifest)?;
+    let mut package_count = 0_u8;
+    for effect in effects {
+        let InstallerEffectPlan::StagePackage {
+            generation,
+            manifest,
+            staging_root,
+            candidate_manifest_digest: bound_manifest_digest,
+            ..
+        } = effect
+        else {
+            continue;
+        };
+        package_count = package_count.saturating_add(1);
+        if generation != &candidate_manifest.generation {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if bound_manifest_digest != &expected_manifest_digest {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if !same_windows_root(staging_root.as_str(), transaction_staging_root.as_str())? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        PackageManifest::new(&manifest.generation, manifest.files.clone())
+            .map_err(|error| package_plan_error(&error))?;
+    }
+    if package_count > 1 {
+        return Err(InstallationError::Duplicate {
+            kind: "package staging effect".to_owned(),
+            identity: candidate_manifest.generation.as_str().to_owned(),
+        });
+    }
+    let service_requires_package = effects.iter().any(|effect| {
+        matches!(
+            effect,
+            InstallerEffectPlan::RegisterService { .. }
+                | InstallerEffectPlan::ProvisionStoreCredential { .. }
+        )
+    });
+    if service_requires_package && package_count == 0 {
+        return Err(InstallationError::IncompleteObservation(
+            "service effects require one package/static-verification effect".to_owned(),
+        ));
+    }
+    let package_index = effects
+        .iter()
+        .position(|effect| matches!(effect, InstallerEffectPlan::StagePackage { .. }));
+    if let Some(package_index) = package_index
+        && effects[..package_index].iter().any(|effect| {
+            matches!(
+                effect,
+                InstallerEffectPlan::RegisterService { .. }
+                    | InstallerEffectPlan::ProvisionStoreCredential { .. }
+            )
+        })
+    {
+        return Err(InstallationError::IncompleteObservation(
+            "package/static verification must precede service and credential effects".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_staging_receipt_for_plan(
+    effect: &InstallerEffectPlan,
+    receipt: &StagingReceipt,
+) -> Result<(), InstallationError> {
+    let InstallerEffectPlan::StagePackage {
+        manifest,
+        staging_root,
+        expected_file_digests,
+        ..
+    } = effect
+    else {
+        return Err(InstallationError::IdentityConflict);
+    };
+    if receipt.generation != manifest.generation
+        || receipt.manifest_sha256 != manifest.canonical_digest()
+        || receipt.root_identity.volume_serial_number == 0
+        || receipt.root_identity.file_index == 0
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let expected_root = Path::new(staging_root.as_str()).join(&manifest.generation);
+    if !eliot_platform_windows::windows_paths_equal(&receipt.root_path, &expected_root) {
+        return Err(InstallationError::IdentityConflict);
+    }
+    if receipt.files.len() != manifest.files.len() {
+        return Err(InstallationError::IncompleteObservation(
+            "package receipt file count differs from its immutable manifest".to_owned(),
+        ));
+    }
+    for spec in &manifest.files {
+        let Some(expected) = expected_file_digests
+            .iter()
+            .find(|item| item.relative_path.eq_ignore_ascii_case(&spec.relative_path))
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        let Some(file) = receipt
+            .files
+            .iter()
+            .find(|item| item.relative_path.eq_ignore_ascii_case(&spec.relative_path))
+        else {
+            return Err(InstallationError::IncompleteObservation(
+                "package receipt is missing a manifest file".to_owned(),
+            ));
+        };
+        sha256_handle(
+            &expected.sha256,
+            "installer_effect.expected_file_digests.sha256",
+        )?;
+        if file.sha256 != expected.sha256.as_str()
+            || file.size > spec.max_size
+            || (spec.executable && (file.pe.is_none() || file.authenticode.is_none()))
+            || (!spec.executable && (file.pe.is_some() || file.authenticode.is_some()))
+            || file.source_identity.volume_serial_number == 0
+            || file.source_identity.file_index == 0
+            || file.destination_identity.volume_serial_number == 0
+            || file.destination_identity.file_index == 0
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if let Some(authenticode) = &file.authenticode
+            && authenticode.verdict != AuthenticodeVerdict::Valid
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "package receipt does not contain a valid Authenticode verdict".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl PendingActivation {
     fn validate(
         &self,
@@ -5371,6 +5529,16 @@ pub enum InstallerAclPrincipal {
     CurrentUser,
 }
 
+/// One expected package-file digest bound to a [`InstallerEffectPlan::StagePackage`] effect.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageArtifactDigest {
+    /// Canonical path relative to the package generation root.
+    pub relative_path: String,
+    /// Expected SHA-256 digest of the immutable source and staged file.
+    pub sha256: PlatformHandle,
+}
+
 /// One immutable installer effect owned by the enclosing
 /// [`InstallationTransaction`]. The elevated adapter reports observations
 /// through the existing transaction coordinator.
@@ -5392,6 +5560,26 @@ pub enum InstallerEffectPlan {
         root: PlatformHandle,
         /// Complete admitted principal set.
         principals: Vec<InstallerAclPrincipal>,
+    },
+    /// Stage one immutable source bundle into the transaction staging root and
+    /// retain the complete static-verification receipt in effect progress.
+    StagePackage {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Absolute retained source bundle directory.
+        source_bundle: PlatformHandle,
+        /// File identity captured when the plan was admitted.
+        source_bundle_identity: FileIdentity,
+        /// Candidate generation identity from the immutable manifest.
+        generation: PlatformHandle,
+        /// Exact package manifest used by the bounded stager.
+        manifest: PackageManifest,
+        /// Destination root for the immutable generation.
+        staging_root: PlatformHandle,
+        /// Expected file bytes bound to the candidate artifact set.
+        expected_file_digests: Vec<PackageArtifactDigest>,
+        /// Digest of the complete candidate manifest, including runtime argv.
+        candidate_manifest_digest: PlatformHandle,
     },
     /// Register one own-process SCM service.
     RegisterService {
@@ -5422,6 +5610,7 @@ impl InstallerEffectPlan {
         match self {
             Self::CreateRoot { effect_id, .. }
             | Self::ApplyAcl { effect_id, .. }
+            | Self::StagePackage { effect_id, .. }
             | Self::RegisterService { effect_id, .. }
             | Self::ProvisionStoreCredential { effect_id, .. } => effect_id,
         }
@@ -5447,6 +5636,63 @@ impl InstallerEffectPlan {
                         kind: "installer ACL principal".to_owned(),
                         identity: self.effect_id().as_str().to_owned(),
                     });
+                }
+                Ok(())
+            }
+            Self::StagePackage {
+                source_bundle,
+                source_bundle_identity,
+                generation,
+                manifest,
+                staging_root,
+                expected_file_digests,
+                candidate_manifest_digest,
+                ..
+            } => {
+                approved_path(source_bundle, "installer_effect.source_bundle")?;
+                approved_path(staging_root, "installer_effect.staging_root")?;
+                handle(generation, "installer_effect.generation")?;
+                if source_bundle_identity.volume_serial_number == 0
+                    || source_bundle_identity.file_index == 0
+                {
+                    return Err(InstallationError::InvalidField {
+                        field: "installer_effect.source_bundle_identity".to_owned(),
+                        reason: "must contain a non-zero retained file identity".to_owned(),
+                    });
+                }
+                let validated = PackageManifest::new(&manifest.generation, manifest.files.clone())
+                    .map_err(|error| package_plan_error(&error))?;
+                if validated != *manifest {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                sha256_handle(
+                    candidate_manifest_digest,
+                    "installer_effect.candidate_manifest_digest",
+                )?;
+                let mut paths = BTreeSet::new();
+                for digest in expected_file_digests {
+                    validate_package_relative_text(
+                        &digest.relative_path,
+                        "installer_effect.expected_file_digests.relative_path",
+                    )?;
+                    if !paths.insert(digest.relative_path.to_ascii_lowercase()) {
+                        return Err(InstallationError::Duplicate {
+                            kind: "package artifact digest".to_owned(),
+                            identity: digest.relative_path.clone(),
+                        });
+                    }
+                    sha256_handle(
+                        &digest.sha256,
+                        "installer_effect.expected_file_digests.sha256",
+                    )?;
+                }
+                let manifest_paths = manifest
+                    .files
+                    .iter()
+                    .map(|file| file.relative_path.to_ascii_lowercase())
+                    .collect::<BTreeSet<_>>();
+                if paths != manifest_paths {
+                    return Err(InstallationError::IdentityConflict);
                 }
                 Ok(())
             }
@@ -5477,7 +5723,7 @@ fn validate_effect_profile(
     plan: &InstallerEffectPlan,
 ) -> Result<(), InstallationError> {
     match plan {
-        InstallerEffectPlan::CreateRoot { .. } => Ok(()),
+        InstallerEffectPlan::CreateRoot { .. } | InstallerEffectPlan::StagePackage { .. } => Ok(()),
         InstallerEffectPlan::ApplyAcl { principals, .. } => {
             let expected = match profile {
                 InstallationProfile::SystemService => [
@@ -5552,7 +5798,8 @@ fn validate_installer_effects(
     let mut service_roles = BTreeSet::new();
     let mut host_service_image = None;
     let mut credential_host_image = None;
-    for effect in effects {
+    let mut package_index = None;
+    for (index, effect) in effects.iter().enumerate() {
         effect.validate()?;
         if !effect_ids.insert(effect.effect_id().as_str()) {
             return Err(InstallationError::Duplicate {
@@ -5595,6 +5842,14 @@ fn validate_installer_effects(
                     root.as_str(),
                     "installer_effect.root",
                 )?);
+            }
+            InstallerEffectPlan::StagePackage { .. } => {
+                if package_index.replace(index).is_some() {
+                    return Err(InstallationError::Duplicate {
+                        kind: "package staging effect".to_owned(),
+                        identity: effect.effect_id().as_str().to_owned(),
+                    });
+                }
             }
             InstallerEffectPlan::RegisterService {
                 role,
@@ -5679,6 +5934,17 @@ fn validate_installer_effects(
                     });
                 }
             }
+        }
+        if package_index.is_some_and(|package| {
+            index > package
+                && matches!(
+                    effect,
+                    InstallerEffectPlan::CreateRoot { .. } | InstallerEffectPlan::ApplyAcl { .. }
+                )
+        }) {
+            return Err(InstallationError::IncompleteObservation(
+                "root and ACL effects must precede package staging".to_owned(),
+            ));
         }
     }
     if planned_ids != effect_ids {
@@ -6022,6 +6288,8 @@ pub struct InstallationEffectProgress {
     pub registration_nonce: Option<PlatformHandle>,
     /// `LocalService` Store credential lifecycle, present only for its effect.
     pub store_credential: Option<StoreCredentialProgress>,
+    /// Complete immutable package receipt, present only for `StagePackage`.
+    pub staging_receipt: Option<StagingReceipt>,
     /// Current durable effect state.
     pub state: InstallationEffectProgressState,
 }
@@ -6164,10 +6432,13 @@ impl InstallationTransaction {
                 "portable staging root must remain repository-local".to_owned(),
             ));
         }
+        validate_package_binding(&candidate_manifest, &staging_root, &installer_effects)?;
         let rollback_plan = request.rollback_plan.clone();
         let installer_plan_digest =
             PlatformHandle::new(sha256_hex(&Self::installer_plan_unsigned_bytes(
                 &transaction_id,
+                &candidate_manifest,
+                &staging_root,
                 &candidate_manifest.runtime_launch.runtime_state_roots,
                 minimum_store_available_bytes,
                 &planned_changes,
@@ -6185,6 +6456,7 @@ impl InstallationTransaction {
                 ownership_secret: None,
                 registration_nonce: None,
                 store_credential: None,
+                staging_receipt: None,
                 state: InstallationEffectProgressState::Pending,
             })
             .collect();
@@ -6359,6 +6631,8 @@ impl InstallationTransaction {
 
     fn installer_plan_unsigned_bytes(
         transaction_id: &PlatformHandle,
+        candidate_manifest: &CandidateManifest,
+        staging_root: &PlatformHandle,
         runtime_state_roots: &RuntimeStateRoots,
         minimum_store_available_bytes: u64,
         planned_changes: &[PlannedChange],
@@ -6367,6 +6641,8 @@ impl InstallationTransaction {
         #[derive(Serialize)]
         struct Unsigned<'a> {
             transaction_id: &'a PlatformHandle,
+            candidate_manifest: &'a CandidateManifest,
+            staging_root: &'a PlatformHandle,
             runtime_state_roots: &'a RuntimeStateRoots,
             minimum_store_available_bytes: u64,
             planned_changes: &'a [PlannedChange],
@@ -6374,6 +6650,8 @@ impl InstallationTransaction {
         }
         serde_json::to_vec(&Unsigned {
             transaction_id,
+            candidate_manifest,
+            staging_root,
             runtime_state_roots,
             minimum_store_available_bytes,
             planned_changes,
@@ -6436,9 +6714,16 @@ impl InstallationTransaction {
             &self.planned_changes,
             &self.installer_effects,
         )?;
+        validate_package_binding(
+            &self.candidate_manifest,
+            &self.staging_root,
+            &self.installer_effects,
+        )?;
         sha256_handle(&self.installer_plan_digest, "installer_plan_digest")?;
         if sha256_hex(&Self::installer_plan_unsigned_bytes(
             &self.transaction_id,
+            &self.candidate_manifest,
+            &self.staging_root,
             &self.candidate_manifest.runtime_launch.runtime_state_roots,
             self.minimum_store_available_bytes,
             &self.planned_changes,
@@ -6451,6 +6736,7 @@ impl InstallationTransaction {
             });
         }
         self.validate_effect_progress()?;
+        self.validate_stage_progress()?;
         if self.revision == 0 {
             return Err(InstallationError::InvalidField {
                 field: "revision".to_owned(),
@@ -6516,6 +6802,10 @@ impl InstallationTransaction {
                 let snapshot_matches = match effect {
                     InstallerEffectPlan::ProvisionStoreCredential { .. } => {
                         precondition.credential_snapshot.is_some()
+                            && precondition.os_snapshot.is_none()
+                    }
+                    InstallerEffectPlan::StagePackage { .. } => {
+                        precondition.credential_snapshot.is_none()
                             && precondition.os_snapshot.is_none()
                     }
                     _ => {
@@ -6627,6 +6917,27 @@ impl InstallationTransaction {
                         .to_owned(),
                 });
             }
+            if let Some(receipt) = &progress.staging_receipt {
+                let InstallerEffectPlan::StagePackage { .. } = effect else {
+                    return Err(InstallationError::InvalidField {
+                        field: "effect_progress.staging_receipt".to_owned(),
+                        reason: "package receipts belong only to the StagePackage effect"
+                            .to_owned(),
+                    });
+                };
+                validate_staging_receipt_for_plan(effect, receipt)?;
+            } else if matches!(
+                (&progress.state, effect),
+                (
+                    InstallationEffectProgressState::Applied { .. },
+                    InstallerEffectPlan::StagePackage { .. }
+                )
+            ) {
+                return Err(InstallationError::InvalidField {
+                    field: "effect_progress.staging_receipt".to_owned(),
+                    reason: "applied package effect requires its typed staging receipt".to_owned(),
+                });
+            }
             match (
                 &progress.state,
                 effect,
@@ -6650,6 +6961,17 @@ impl InstallationTransaction {
                     InstallerEffectPlan::CreateRoot { .. },
                     Some(_),
                     Some(_),
+                )
+                | (
+                    InstallationEffectProgressState::IntentCommitted { .. }
+                    | InstallationEffectProgressState::Unknown { .. }
+                    | InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        ..
+                    },
+                    InstallerEffectPlan::StagePackage { .. },
+                    Some(_),
+                    None,
                 )
                 | (
                     InstallationEffectProgressState::Applied {
@@ -6696,7 +7018,11 @@ impl InstallationTransaction {
                     ..
                 } if !unsettled_seen => {
                     if *disposition == InstallationEffectDisposition::CreatedByTransaction
-                        && !matches!(effect, InstallerEffectPlan::RegisterService { .. })
+                        && !matches!(
+                            effect,
+                            InstallerEffectPlan::RegisterService { .. }
+                                | InstallerEffectPlan::StagePackage { .. }
+                        )
                         && progress.ownership_secret.as_ref().is_none_or(|ownership| {
                             ownership.create_disposition != InstallationCreateDisposition::Created
                         })
@@ -6730,6 +7056,14 @@ impl InstallationTransaction {
                                 .to_owned(),
                         });
                     }
+                    if matches!(effect, InstallerEffectPlan::StagePackage { .. })
+                        && progress.staging_receipt.is_none()
+                    {
+                        return Err(InstallationError::InvalidField {
+                            field: "effect_progress.staging_receipt".to_owned(),
+                            reason: "applied package effect requires a durable receipt".to_owned(),
+                        });
+                    }
                 }
                 InstallationEffectProgressState::Pending => unsettled_seen = true,
                 InstallationEffectProgressState::IntentCommitted {
@@ -6758,6 +7092,57 @@ impl InstallationTransaction {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_stage_progress(&self) -> Result<(), InstallationError> {
+        let Some(package_index) = self
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::StagePackage { .. }))
+        else {
+            return Ok(());
+        };
+        let package_applied = matches!(
+            self.effect_progress[package_index].state,
+            InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                ..
+            }
+        ) && self.effect_progress[package_index]
+            .staging_receipt
+            .is_some();
+        if matches!(
+            self.stage,
+            InstallationStage::StaticVerified
+                | InstallationStage::Registering
+                | InstallationStage::Activating
+                | InstallationStage::ActiveVerified
+                | InstallationStage::Cleaning
+                | InstallationStage::Completed
+        ) && !package_applied
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "static verification and later stages require the applied package receipt"
+                    .to_owned(),
+            ));
+        }
+        if self.stage == InstallationStage::Staging
+            && package_index > 0
+            && self.effect_progress[..package_index]
+                .iter()
+                .any(|progress| {
+                    !matches!(
+                        progress.state,
+                        InstallationEffectProgressState::Applied { .. }
+                    )
+                })
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "package staging cannot begin before preceding root/ACL effects are applied"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
@@ -6885,7 +7270,7 @@ impl InstallationTransaction {
     }
 }
 
-/// Decodes the canonical transaction JSON and classifies pre-v7 records as an
+/// Decodes the canonical transaction JSON and classifies pre-v8 records as an
 /// explicit migration requirement rather than synthesizing missing progress.
 pub fn decode_installation_transaction_json(
     bytes: &[u8],
@@ -6896,7 +7281,7 @@ pub fn decode_installation_transaction_json(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v7 discriminator".to_owned(),
+            reason: "installation transaction predates the required v8 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -7123,6 +7508,8 @@ pub struct InstallationEffectRequest {
     pub ownership_secret: Option<InstallationOwnershipSecret>,
     /// Typed durable Store credential progress for its exact effect.
     pub store_credential: Option<StoreCredentialProgress>,
+    /// Typed durable package receipt for a committed stage/recovery request.
+    pub staging_receipt: Option<StagingReceipt>,
     /// Apply or exact-identity rollback.
     pub action: InstallationEffectAction,
     /// Required exact identity for rollback; absent for apply.
@@ -7170,6 +7557,9 @@ impl InstallationEffectRequest {
         if let Some(credential) = &self.store_credential {
             credential.validate()?;
         }
+        if let Some(receipt) = &self.staging_receipt {
+            validate_staging_receipt_for_plan(&self.plan, receipt)?;
+        }
         match (&self.plan, self.action, &self.ownership_secret) {
             (
                 InstallerEffectPlan::CreateRoot { .. },
@@ -7184,7 +7574,11 @@ impl InstallationEffectRequest {
                 InstallationEffectAction::Rollback,
                 Some(ownership),
             ) if ownership.lifecycle != InstallationSecretLifecycle::Deleted => {}
-            (InstallerEffectPlan::ApplyAcl { .. }, InstallationEffectAction::Apply, None)
+            (
+                InstallerEffectPlan::ApplyAcl { .. } | InstallerEffectPlan::StagePackage { .. },
+                InstallationEffectAction::Apply,
+                None,
+            )
             | (InstallerEffectPlan::RegisterService { .. }, _, None) => {
                 if matches!(&self.plan, InstallerEffectPlan::RegisterService { .. })
                     && self.service_bootstrap.is_none()
@@ -7212,6 +7606,17 @@ impl InstallationEffectRequest {
                     reason: "must match the root effect phase and lifecycle".to_owned(),
                 });
             }
+        }
+        if matches!(&self.plan, InstallerEffectPlan::StagePackage { .. }) {
+            if self.action == InstallationEffectAction::Rollback && self.staging_receipt.is_none() {
+                return Err(InstallationError::InvalidField {
+                    field: "effect.staging_receipt".to_owned(),
+                    reason: "exact package rollback requires the durable staging receipt"
+                        .to_owned(),
+                });
+            }
+        } else if self.staging_receipt.is_some() {
+            return Err(InstallationError::IdentityConflict);
         }
         match (&self.plan, self.action, &self.store_credential) {
             (
@@ -7264,6 +7669,7 @@ impl InstallationEffectRequest {
         if let Some(credential) = &mut intent.store_credential {
             credential.receipt = None;
         }
+        intent.staging_receipt = None;
         let bytes =
             serde_json::to_vec(&intent).map_err(|error| InstallationError::InvalidField {
                 field: "effect.intent".to_owned(),
@@ -7300,6 +7706,8 @@ pub enum InstallationEffectObservation {
         postcondition_digest: PlatformHandle,
         /// Typed credential receipt, only for the Store credential effect.
         credential_receipt: Option<CredentialAccessReceipt>,
+        /// Typed package receipt, only for the `StagePackage` effect.
+        staging_receipt: Option<StagingReceipt>,
     },
     /// Readback proved a conflicting object or precondition.
     Mismatch {
@@ -7316,8 +7724,36 @@ impl InstallationEffectObservation {
     fn validate_for_effect(&self, effect: &InstallerEffectPlan) -> Result<(), InstallationError> {
         self.validate_with_service_absence(matches!(
             effect,
-            InstallerEffectPlan::RegisterService { .. }
-        ))
+            InstallerEffectPlan::RegisterService { .. } | InstallerEffectPlan::StagePackage { .. }
+        ))?;
+        if let Self::Matching {
+            staging_receipt: Some(receipt),
+            ..
+        } = self
+        {
+            if !matches!(effect, InstallerEffectPlan::StagePackage { .. }) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            validate_staging_receipt_for_plan(effect, receipt)?;
+        } else if matches!(effect, InstallerEffectPlan::StagePackage { .. })
+            && matches!(self, Self::Matching { .. })
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "package matching readback requires its typed receipt".to_owned(),
+            ));
+        }
+        if !matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
+            && matches!(
+                self,
+                Self::Matching {
+                    credential_receipt: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
     }
 
     fn validate_with_service_absence(
@@ -7347,6 +7783,7 @@ impl InstallationEffectObservation {
                 evidence,
                 postcondition_digest,
                 credential_receipt,
+                staging_receipt,
                 ..
             } => {
                 handle(external_identity, "observation.external_identity")?;
@@ -7354,6 +7791,24 @@ impl InstallationEffectObservation {
                 sha256_handle(postcondition_digest, "observation.postcondition_digest")?;
                 if let Some(receipt) = credential_receipt {
                     receipt.validate()?;
+                }
+                if let Some(receipt) = staging_receipt {
+                    if receipt.generation.trim().is_empty() || !receipt.root_path.is_absolute() {
+                        return Err(InstallationError::InvalidField {
+                            field: "observation.staging_receipt".to_owned(),
+                            reason:
+                                "package receipt root and generation must be absolute/non-blank"
+                                    .to_owned(),
+                        });
+                    }
+                    if receipt.root_identity.volume_serial_number == 0
+                        || receipt.root_identity.file_index == 0
+                    {
+                        return Err(InstallationError::InvalidField {
+                            field: "observation.staging_receipt.root_identity".to_owned(),
+                            reason: "package receipt root identity must be non-zero".to_owned(),
+                        });
+                    }
                 }
                 Ok(())
             }
@@ -7372,6 +7827,8 @@ pub struct InstallationEffectExecution {
     pub create_disposition: Option<InstallationCreateDisposition>,
     /// Typed `LocalService` receipt returned only by credential provision/reconcile.
     pub credential_receipt: Option<CredentialAccessReceipt>,
+    /// Typed package receipt returned only by `StagePackage` execution/readback.
+    pub staging_receipt: Option<StagingReceipt>,
 }
 
 /// Object-safe adapter seam for bounded installation effects.
@@ -7980,6 +8437,7 @@ impl WindowsInstallationEffectPort {
                     evidence: vec![receipt.response_digest.clone()],
                     postcondition_digest: digest,
                     credential_receipt: Some(receipt),
+                    staging_receipt: None,
                 })
             }
             HostCredentialControlResponse::Deleted { absence_digest } => {
@@ -8033,6 +8491,7 @@ impl WindowsInstallationEffectPort {
                     evidence: vec![receipt.response_digest.clone()],
                     create_disposition: None,
                     credential_receipt: Some(receipt),
+                    staging_receipt: None,
                 })
             }
             Ok(HostCredentialControlResponse::Deleted { absence_digest })
@@ -8054,6 +8513,7 @@ impl WindowsInstallationEffectPort {
                     evidence: vec![absence_digest],
                     create_disposition: None,
                     credential_receipt: None,
+                    staging_receipt: None,
                 })
             }
             Ok(HostCredentialControlResponse::Unknown { .. }) => {
@@ -8132,6 +8592,9 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         &mut self,
         request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationEffectExecution> {
+        if matches!(&request.plan, InstallerEffectPlan::StagePackage { .. }) {
+            return execute_package(request);
+        }
         if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
             return self.execute_service(request);
         }
@@ -8153,6 +8616,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 ],
                 create_disposition: None,
                 credential_receipt: None,
+                staging_receipt: None,
             }),
             WindowsRootOperation::Create => {
                 let Some(expected) = request.precondition.os_snapshot.as_ref() else {
@@ -8175,6 +8639,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                         ],
                         create_disposition: Some(InstallationCreateDisposition::AlreadyExists),
                         credential_receipt: None,
+                        staging_receipt: None,
                     });
                 }
                 let Some(root) = created.root else {
@@ -8203,6 +8668,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                     evidence: vec![evidence],
                     create_disposition: Some(InstallationCreateDisposition::Created),
                     credential_receipt: None,
+                    staging_receipt: None,
                 })
             }
             WindowsRootOperation::Rollback => {
@@ -8254,6 +8720,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                     ],
                     create_disposition: None,
                     credential_receipt: None,
+                    staging_receipt: None,
                 })
             }
         }
@@ -8324,6 +8791,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 ],
                 create_disposition: None,
                 credential_receipt: None,
+                staging_receipt: None,
             });
         }
         let configuration_digest = registration.expected_configuration_digest();
@@ -8382,6 +8850,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             ],
             create_disposition: Some(InstallationCreateDisposition::Created),
             credential_receipt: None,
+            staging_receipt: None,
         })
     }
 
@@ -8391,6 +8860,8 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
     ) -> PortOutcome<InstallationEffectObservation> {
         let result = if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
             self.inspect_service(request)
+        } else if matches!(&request.plan, InstallerEffectPlan::StagePackage { .. }) {
+            inspect_package(request).map_err(|error| package_port_error(&error))
         } else if matches!(
             request.plan,
             InstallerEffectPlan::ProvisionStoreCredential { .. }
@@ -8411,6 +8882,8 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
     ) -> PortOutcome<InstallationEffectObservation> {
         let result = if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
             self.reconcile_service(request)
+        } else if matches!(&request.plan, InstallerEffectPlan::StagePackage { .. }) {
+            reconcile_package(request).map_err(|error| package_port_error(&error))
         } else if matches!(
             request.plan,
             InstallerEffectPlan::ProvisionStoreCredential { .. }
@@ -8740,6 +9213,7 @@ fn ownership_receipt_path(request: &InstallationEffectRequest) -> std::path::Pat
         InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
             Path::new(provision.host_state_root.as_str())
         }
+        InstallerEffectPlan::StagePackage { staging_root, .. } => Path::new(staging_root.as_str()),
     };
     let name = sha256_hex(
         format!(
@@ -8817,6 +9291,7 @@ fn matching_preexisting(
         ],
         postcondition_digest,
         credential_receipt: None,
+        staging_receipt: None,
     })
 }
 
@@ -8858,6 +9333,7 @@ fn matching_created(
         ],
         postcondition_digest,
         credential_receipt: None,
+        staging_receipt: None,
     })
 }
 
@@ -9029,7 +9505,225 @@ fn service_matching_observation(
         evidence: vec![evidence],
         postcondition_digest,
         credential_receipt: None,
+        staging_receipt: None,
     })
+}
+
+fn package_stager(
+    request: &InstallationEffectRequest,
+) -> Result<(PackageStager, PackageManifest), PortError> {
+    let InstallerEffectPlan::StagePackage {
+        source_bundle,
+        source_bundle_identity,
+        manifest,
+        staging_root,
+        ..
+    } = &request.plan
+    else {
+        return Err(PortError::InvalidRequestMetadata);
+    };
+    let source = TrustedSourceBundle::open(Path::new(source_bundle.as_str()))
+        .map_err(|error| package_port_error(&error))?;
+    if source.identity() != *source_bundle_identity {
+        return Err(PortError::IdentityConflict);
+    }
+    let stager = PackageStager::open(source, Path::new(staging_root.as_str()))
+        .map_err(|error| package_port_error(&error))?;
+    Ok((stager, manifest.clone()))
+}
+
+fn package_port_error(error: &PackageStagingError) -> PortError {
+    match error {
+        PackageStagingError::InvalidRelativePath
+        | PackageStagingError::ManifestCollision
+        | PackageStagingError::BoundExceeded
+        | PackageStagingError::RootUnavailable => PortError::InvalidRequestMetadata,
+        PackageStagingError::UnsupportedPlatform => PortError::Provider(ProviderError {
+            code: ProviderErrorCode::Unavailable,
+            retryable: false,
+        }),
+        PackageStagingError::SecurityMismatch => PortError::Provider(ProviderError {
+            code: ProviderErrorCode::PermissionDenied,
+            retryable: false,
+        }),
+        _ => PortError::Provider(ProviderError {
+            code: ProviderErrorCode::Failed,
+            retryable: false,
+        }),
+    }
+}
+
+fn package_staging_outcome<T>(error: &PackageStagingError) -> PortOutcome<T> {
+    match error {
+        PackageStagingError::UnsupportedPlatform => {
+            PortOutcome::Unknown(UnknownReason::Unsupported)
+        }
+        PackageStagingError::InvalidRelativePath
+        | PackageStagingError::ManifestCollision
+        | PackageStagingError::BoundExceeded
+        | PackageStagingError::RootUnavailable => {
+            PortOutcome::Error(PortError::InvalidRequestMetadata)
+        }
+        _ => PortOutcome::Unknown(UnknownReason::Indeterminate),
+    }
+}
+
+fn package_pending(error: &PackageStagingError) -> InstallationEffectObservation {
+    InstallationEffectObservation::Mismatch {
+        pending_ref: PlatformHandle::new(format!("mismatch:package:{error}"))
+            .unwrap_or_else(|_| unreachable!()),
+    }
+}
+
+fn package_receipt_binding(
+    request: &InstallationEffectRequest,
+    receipt: &StagingReceipt,
+) -> Result<(PlatformHandle, PlatformHandle, PlatformHandle), PortError> {
+    let receipt_digest =
+        PlatformHandle::new(receipt.digest()).map_err(|_| PortError::IdentityConflict)?;
+    let external_identity = PlatformHandle::new(sha256_hex(
+        &serde_json::to_vec(&(
+            "package-receipt-external-v1",
+            request.transaction_id.as_str(),
+            request.effect_id.as_str(),
+            request.plan_digest.as_str(),
+            receipt_digest.as_str(),
+        ))
+        .map_err(|_| PortError::InvalidRequestMetadata)?,
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let postcondition_digest = PlatformHandle::new(sha256_hex(
+        &serde_json::to_vec(&(
+            "package-receipt-postcondition-v1",
+            request.plan_digest.as_str(),
+            receipt_digest.as_str(),
+            receipt,
+        ))
+        .map_err(|_| PortError::InvalidRequestMetadata)?,
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)?;
+    Ok((receipt_digest, external_identity, postcondition_digest))
+}
+
+fn package_matching_observation(
+    request: &InstallationEffectRequest,
+    receipt: StagingReceipt,
+) -> Result<InstallationEffectObservation, PortError> {
+    validate_staging_receipt_for_plan(&request.plan, &receipt)
+        .map_err(|_| PortError::IdentityConflict)?;
+    let (receipt_digest, external_identity, postcondition_digest) =
+        package_receipt_binding(request, &receipt)?;
+    Ok(InstallationEffectObservation::Matching {
+        disposition: InstallationEffectDisposition::CreatedByTransaction,
+        external_identity,
+        evidence: vec![receipt_digest],
+        postcondition_digest,
+        credential_receipt: None,
+        staging_receipt: Some(receipt),
+    })
+}
+
+fn package_absent_observation(
+    request: &InstallationEffectRequest,
+) -> InstallationEffectObservation {
+    InstallationEffectObservation::Absent {
+        observed_precondition: request.precondition.clone(),
+        evidence: vec![
+            PlatformHandle::new(sha256_hex(
+                format!(
+                    "package-absent-v1\0{}\0{}",
+                    request.effect_id.as_str(),
+                    request.plan_digest.as_str()
+                )
+                .as_bytes(),
+            ))
+            .unwrap_or_else(|_| unreachable!()),
+        ],
+    }
+}
+
+fn inspect_package(
+    request: &InstallationEffectRequest,
+) -> Result<InstallationEffectObservation, PackageStagingError> {
+    let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
+    match stager.inspect(&manifest)? {
+        PackageStagingObservation::Absent => Ok(package_absent_observation(request)),
+        PackageStagingObservation::Matching(receipt) => {
+            package_matching_observation(request, receipt)
+                .map_err(|_| PackageStagingError::IdentityMismatch)
+        }
+        PackageStagingObservation::Mismatch(error) => Ok(package_pending(&error)),
+        PackageStagingObservation::Unknown(error) => Err(error),
+    }
+}
+
+fn reconcile_package(
+    request: &InstallationEffectRequest,
+) -> Result<InstallationEffectObservation, PackageStagingError> {
+    let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
+    let observation = if let Some(receipt) = &request.staging_receipt {
+        stager.reconcile(receipt)?
+    } else {
+        // A committed intent without a receipt cannot adopt a tree.  Inspect
+        // only classifies it; the coordinator will persist rollback-required.
+        stager.inspect(&manifest)?
+    };
+    match observation {
+        PackageStagingObservation::Absent => Ok(package_absent_observation(request)),
+        PackageStagingObservation::Matching(receipt) => {
+            package_matching_observation(request, receipt)
+                .map_err(|_| PackageStagingError::IdentityMismatch)
+        }
+        PackageStagingObservation::Mismatch(error) => Ok(package_pending(&error)),
+        PackageStagingObservation::Unknown(error) => Err(error),
+    }
+}
+
+fn execute_package(
+    request: &InstallationEffectRequest,
+) -> PortOutcome<InstallationEffectExecution> {
+    let (stager, manifest) = match package_stager(request) {
+        Ok(value) => value,
+        Err(error) => return PortOutcome::Error(error),
+    };
+    match request.action {
+        InstallationEffectAction::Apply => match stager.stage(&manifest) {
+            Ok(receipt) => {
+                if validate_staging_receipt_for_plan(&request.plan, &receipt).is_err() {
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                }
+                let Ok(digest) = PlatformHandle::new(receipt.digest()) else {
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                };
+                PortOutcome::Known(InstallationEffectExecution {
+                    evidence: vec![digest],
+                    create_disposition: None,
+                    credential_receipt: None,
+                    staging_receipt: Some(receipt),
+                })
+            }
+            Err(error) => package_staging_outcome(&error),
+        },
+        InstallationEffectAction::Rollback => {
+            let Some(receipt) = request.staging_receipt.as_ref() else {
+                return PortOutcome::Error(PortError::InvalidRequestMetadata);
+            };
+            match stager.rollback(receipt) {
+                Ok(()) => PortOutcome::Known(InstallationEffectExecution {
+                    evidence: vec![
+                        PlatformHandle::new(sha256_hex(
+                            format!("package-rollback-v1\0{}", receipt.digest()).as_bytes(),
+                        ))
+                        .unwrap_or_else(|_| unreachable!()),
+                    ],
+                    create_disposition: None,
+                    credential_receipt: None,
+                    staging_receipt: None,
+                }),
+                Err(error) => package_staging_outcome(&error),
+            }
+        }
+    }
 }
 
 fn root_port_error(error: InstallerRootError) -> PortError {
@@ -9263,6 +9957,43 @@ where
         };
         if matches!(
             transaction.installer_effects[index],
+            InstallerEffectPlan::StagePackage { .. }
+        ) && transaction.stage == InstallationStage::Planned
+        {
+            let expected = TransactionVersion::of(&transaction)?;
+            let evidence = PlatformHandle::new(format!(
+                "stage:staging-intent:{}",
+                transaction.installer_effects[index].effect_id().as_str()
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "stage_evidence".to_owned(),
+                reason: error.to_string(),
+            })?;
+            transaction.advance(InstallationStage::Staging, vec![evidence])?;
+            self.store.compare_and_save(expected, &transaction)?;
+        } else if !matches!(
+            transaction.installer_effects[index],
+            InstallerEffectPlan::StagePackage { .. }
+        ) && transaction.stage == InstallationStage::StaticVerified
+            && transaction
+                .installer_effects
+                .iter()
+                .any(|effect| matches!(effect, InstallerEffectPlan::StagePackage { .. }))
+        {
+            let expected = TransactionVersion::of(&transaction)?;
+            let evidence = PlatformHandle::new(format!(
+                "stage:registering:{}",
+                transaction.installer_effects[index].effect_id().as_str()
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "stage_evidence".to_owned(),
+                reason: error.to_string(),
+            })?;
+            transaction.advance(InstallationStage::Registering, vec![evidence])?;
+            self.store.compare_and_save(expected, &transaction)?;
+        }
+        if matches!(
+            transaction.installer_effects[index],
             InstallerEffectPlan::RegisterService { .. }
         ) && transaction.effect_progress[index]
             .registration_nonce
@@ -9372,6 +10103,7 @@ where
                 evidence,
                 postcondition_digest,
                 credential_receipt,
+                staging_receipt,
             } => {
                 if !was_intent {
                     if disposition != InstallationEffectDisposition::PreexistingMatching {
@@ -9383,6 +10115,10 @@ where
                         );
                     }
                 } else if disposition == InstallationEffectDisposition::CreatedByTransaction
+                    && !matches!(
+                        transaction.installer_effects[index],
+                        InstallerEffectPlan::StagePackage { .. }
+                    )
                     && transaction.effect_progress[index]
                         .ownership_secret
                         .as_ref()
@@ -9417,6 +10153,7 @@ where
                     evidence,
                     postcondition_digest,
                     credential_receipt,
+                    staging_receipt,
                 )
             }
             InstallationEffectObservation::Mismatch { pending_ref } => {
@@ -9432,6 +10169,10 @@ where
                             && observed_precondition.os_snapshot.is_none()
                     }
                     InstallerEffectPlan::RegisterService { .. } => true,
+                    InstallerEffectPlan::StagePackage { .. } => {
+                        observed_precondition.os_snapshot.is_none()
+                            && observed_precondition.credential_snapshot.is_none()
+                    }
                     _ => {
                         observed_precondition.os_snapshot.is_some()
                             && observed_precondition.credential_snapshot.is_none()
@@ -9587,7 +10328,8 @@ where
                     (InstallerEffectPlan::CreateRoot { .. }, None)
                     | (
                         InstallerEffectPlan::ApplyAcl { .. }
-                        | InstallerEffectPlan::ProvisionStoreCredential { .. },
+                        | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                        | InstallerEffectPlan::StagePackage { .. },
                         Some(_),
                     ) => {
                         return self.persist_unknown(
@@ -9600,7 +10342,8 @@ where
                     (
                         InstallerEffectPlan::ApplyAcl { .. }
                         | InstallerEffectPlan::RegisterService { .. }
-                        | InstallerEffectPlan::ProvisionStoreCredential { .. },
+                        | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                        | InstallerEffectPlan::StagePackage { .. },
                         None,
                     )
                     | (InstallerEffectPlan::RegisterService { .. }, Some(_)) => {}
@@ -9641,6 +10384,42 @@ where
                             .map_err(|error| platform_error(&error))?,
                     );
                 }
+                if matches!(
+                    transaction.installer_effects[index],
+                    InstallerEffectPlan::StagePackage { .. }
+                ) {
+                    let Some(receipt) = execution.staging_receipt else {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            PlatformHandle::new("mismatch:package-execution-receipt")
+                                .map_err(|error| platform_error(&error))?,
+                        );
+                    };
+                    validate_staging_receipt_for_plan(
+                        &transaction.installer_effects[index],
+                        &receipt,
+                    )?;
+                    let expected = TransactionVersion::of(&transaction)?;
+                    transaction.effect_progress[index].staging_receipt = Some(receipt);
+                    increment_revision(&mut transaction)?;
+                    transaction.validate()?;
+                    self.store.compare_and_save(expected, &transaction)?;
+                    request = effect_request(
+                        &transaction,
+                        index,
+                        next_attempt,
+                        InstallationEffectAction::Apply,
+                        None,
+                    )?;
+                } else if execution.staging_receipt.is_some() {
+                    return self.persist_unknown(
+                        transaction,
+                        index,
+                        PlatformHandle::new("mismatch:unexpected-staging-receipt")
+                            .map_err(|error| platform_error(&error))?,
+                    );
+                }
                 let reconciled = match self.port.reconcile(&request) {
                     PortOutcome::Known(observation) => observation,
                     other => return self.persist_unknown(transaction, index, port_pending(other)),
@@ -9653,6 +10432,7 @@ where
                         evidence,
                         postcondition_digest,
                         credential_receipt,
+                        staging_receipt,
                     } => {
                         let ownership =
                             transaction.effect_progress[index].ownership_secret.as_ref();
@@ -9667,6 +10447,10 @@ where
                                 ) && transaction.effect_progress[index]
                                     .registration_nonce
                                     .is_some())
+                                    || (matches!(
+                                        transaction.installer_effects[index],
+                                        InstallerEffectPlan::StagePackage { .. }
+                                    ) && staging_receipt.is_some())
                             }
                             InstallationEffectDisposition::PreexistingMatching => {
                                 ownership.is_none()
@@ -9681,6 +10465,7 @@ where
                                 evidence,
                                 postcondition_digest,
                                 credential_receipt,
+                                staging_receipt,
                             )
                         } else {
                             self.persist_unknown(
@@ -9736,7 +10521,7 @@ where
         let max_steps = transaction
             .installer_effects
             .len()
-            .checked_add(1)
+            .checked_add(3)
             .ok_or_else(|| InstallationError::InvalidField {
                 field: "installer_effects".to_owned(),
                 reason: "bounded drive limit overflow".to_owned(),
@@ -10098,6 +10883,7 @@ where
         evidence: Vec<PlatformHandle>,
         postcondition_digest: PlatformHandle,
         credential_receipt: Option<CredentialAccessReceipt>,
+        staging_receipt: Option<StagingReceipt>,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
         if let Some(receipt) = credential_receipt {
@@ -10107,6 +10893,24 @@ where
                 .ok_or(InstallationError::IdentityConflict)?
                 .receipt = Some(receipt);
         }
+        if let Some(receipt) = staging_receipt {
+            if !matches!(
+                transaction.installer_effects[index],
+                InstallerEffectPlan::StagePackage { .. }
+            ) || disposition != InstallationEffectDisposition::CreatedByTransaction
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            validate_staging_receipt_for_plan(&transaction.installer_effects[index], &receipt)?;
+            transaction.effect_progress[index].staging_receipt = Some(receipt.clone());
+        } else if matches!(
+            transaction.installer_effects[index],
+            InstallerEffectPlan::StagePackage { .. }
+        ) {
+            return Err(InstallationError::IncompleteObservation(
+                "applied package effect requires its typed staging receipt".to_owned(),
+            ));
+        }
         transaction.effect_progress[index].state = InstallationEffectProgressState::Applied {
             disposition,
             external_identity,
@@ -10114,8 +10918,31 @@ where
             postcondition_digest,
         };
         transaction.observed_postconditions.extend(evidence.clone());
-        increment_revision(&mut transaction)?;
-        transaction.validate()?;
+        if matches!(
+            transaction.installer_effects[index],
+            InstallerEffectPlan::StagePackage { .. }
+        ) {
+            let receipt = transaction.effect_progress[index]
+                .staging_receipt
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?;
+            let receipt_digest = PlatformHandle::new(receipt.digest()).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "effect_progress.staging_receipt".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+            if transaction.stage != InstallationStage::Staging {
+                return Err(InstallationError::IllegalTransition {
+                    from: transaction.stage,
+                    to: InstallationStage::StaticVerified,
+                });
+            }
+            transaction.advance(InstallationStage::StaticVerified, vec![receipt_digest])?;
+        } else {
+            increment_revision(&mut transaction)?;
+            transaction.validate()?;
+        }
         self.store.compare_and_save(expected, &transaction)?;
         Ok(InstallationStepOutcome::Applied {
             stage: transaction.stage,
@@ -10280,6 +11107,7 @@ fn effect_request(
         },
         ownership_secret: progress.ownership_secret.clone(),
         store_credential: progress.store_credential.clone(),
+        staging_receipt: progress.staging_receipt.clone(),
         action,
         expected_external_identity,
         service_bootstrap: is_service.then(|| InstallationServiceBootstrap {
@@ -10668,6 +11496,7 @@ mod tests {
                     && matches!(request.plan, InstallerEffectPlan::CreateRoot { .. }))
                 .then_some(self.create_disposition),
                 credential_receipt: None,
+                staging_receipt: None,
             })
         }
 
@@ -10882,6 +11711,7 @@ mod tests {
                     InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
                         provision.target.clone()
                     }
+                    InstallerEffectPlan::StagePackage { staging_root, .. } => staging_root.clone(),
                 },
                 precondition_refs: vec![test_handle("evidence:installer-precondition")],
                 postcondition_refs: vec![test_handle("evidence:installer-postcondition")],
@@ -11120,6 +11950,7 @@ mod tests {
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
+        clippy::needless_continue,
         reason = "the production-bound fixture exercises the complete SystemService projection"
     )]
     fn system_registration_transaction() -> InstallationTransaction {
@@ -11187,7 +12018,33 @@ mod tests {
         manifest.config_path = descriptor.store_config_path.clone();
         manifest.runtime_launch = descriptor;
 
-        let (planned_changes, mut installer_effects) = installer_plan_parts(&roots);
+        let (mut planned_changes, mut installer_effects) = installer_plan_parts(&roots);
+        let package_manifest = must(PackageManifest::new("candidate", Vec::new()));
+        let package_effect = InstallerEffectPlan::StagePackage {
+            effect_id: test_handle("effect:package-stage"),
+            source_bundle: system_path("source-bundle"),
+            source_bundle_identity: FileIdentity {
+                volume_serial_number: 1,
+                file_index: 1,
+            },
+            generation: manifest.generation.clone(),
+            manifest: package_manifest,
+            staging_root: system_path("staging"),
+            expected_file_digests: Vec::new(),
+            candidate_manifest_digest: must(candidate_manifest_digest(&manifest)),
+        };
+        let package_change = PlannedChange {
+            change_id: package_effect.effect_id().clone(),
+            target: system_path("staging"),
+            precondition_refs: vec![test_handle("evidence:installer-precondition")],
+            postcondition_refs: vec![test_handle("evidence:installer-postcondition")],
+        };
+        let package_index = installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::RegisterService { .. }))
+            .unwrap_or_else(|| unreachable!());
+        installer_effects.insert(package_index, package_effect);
+        planned_changes.insert(package_index, package_change);
         for effect in &mut installer_effects {
             match effect {
                 InstallerEffectPlan::RegisterService {
@@ -11205,19 +12062,32 @@ mod tests {
                 InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
                     provision.expected_host_executable = manifest.host_executable_path.clone();
                 }
-                InstallerEffectPlan::CreateRoot { .. } | InstallerEffectPlan::ApplyAcl { .. } => {}
+                InstallerEffectPlan::CreateRoot { .. }
+                | InstallerEffectPlan::ApplyAcl { .. }
+                | InstallerEffectPlan::StagePackage { .. } => {}
             }
         }
         let mut ordered_effects = installer_effects
             .iter()
-            .filter(|effect| matches!(effect, InstallerEffectPlan::RegisterService { .. }))
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    InstallerEffectPlan::CreateRoot { .. }
+                        | InstallerEffectPlan::ApplyAcl { .. }
+                        | InstallerEffectPlan::StagePackage { .. }
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         ordered_effects.extend(
             installer_effects
-                .into_iter()
-                .filter(|effect| !matches!(effect, InstallerEffectPlan::RegisterService { .. })),
+                .iter()
+                .filter(|effect| matches!(effect, InstallerEffectPlan::RegisterService { .. }))
+                .cloned(),
         );
+        ordered_effects.extend(installer_effects.into_iter().filter(|effect| {
+            matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
+        }));
 
         let mut transaction = must(InstallationTransaction::new(
             portable.transaction_id,
@@ -11234,20 +12104,65 @@ mod tests {
             portable.recovery_command,
         ));
 
-        must(transaction.advance(
-            InstallationStage::Staging,
-            vec![test_handle("evidence:staged")],
-        ));
-        must(transaction.advance(
-            InstallationStage::StaticVerified,
-            vec![test_handle("evidence:static-verified")],
-        ));
-        must(transaction.advance(
-            InstallationStage::Registering,
-            vec![test_handle("evidence:registered")],
-        ));
-
         let bootstrap = transaction.candidate_manifest.runtime_launch.clone();
+        for (effect, progress) in transaction
+            .installer_effects
+            .iter()
+            .zip(transaction.effect_progress.iter_mut())
+        {
+            let InstallerEffectPlan::StagePackage {
+                manifest,
+                staging_root,
+                ..
+            } = effect
+            else {
+                if matches!(
+                    effect,
+                    InstallerEffectPlan::CreateRoot { .. } | InstallerEffectPlan::ApplyAcl { .. }
+                ) {
+                    progress.state = InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::PreexistingMatching,
+                        external_identity: test_handle(format!(
+                            "external:root:{}",
+                            progress.effect_id.as_str()
+                        )),
+                        evidence: vec![test_handle(format!(
+                            "evidence:root:{}",
+                            progress.effect_id.as_str()
+                        ))],
+                        postcondition_digest: test_handle("d".repeat(64)),
+                    };
+                }
+                continue;
+            };
+            progress.admitted_precondition =
+                Some(must(InstallationEffectPrecondition::from_change(
+                    transaction
+                        .planned_changes
+                        .iter()
+                        .find(|change| change.change_id == progress.effect_id)
+                        .unwrap_or_else(|| unreachable!()),
+                )));
+            let receipt = StagingReceipt {
+                generation: manifest.generation.clone(),
+                root_path: Path::new(staging_root.as_str()).join(&manifest.generation),
+                root_identity: FileIdentity {
+                    volume_serial_number: 1,
+                    file_index: 2,
+                },
+                directories: Vec::new(),
+                files: Vec::new(),
+                manifest_sha256: manifest.canonical_digest(),
+            };
+            progress.staging_receipt = Some(receipt);
+            progress.state = InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                external_identity: test_handle("external:package-stage"),
+                evidence: vec![test_handle("evidence:package-stage")],
+                postcondition_digest: test_handle("e".repeat(64)),
+            };
+            continue;
+        }
         for (effect, progress) in transaction
             .installer_effects
             .iter()
@@ -11301,6 +12216,18 @@ mod tests {
                 postcondition_digest: test_handle("c".repeat(64)),
             };
         }
+        must(transaction.advance(
+            InstallationStage::Staging,
+            vec![test_handle("evidence:staged")],
+        ));
+        must(transaction.advance(
+            InstallationStage::StaticVerified,
+            vec![test_handle("evidence:static-verified")],
+        ));
+        must(transaction.advance(
+            InstallationStage::Registering,
+            vec![test_handle("evidence:registered")],
+        ));
         must(transaction.validate());
         transaction
     }
@@ -11401,7 +12328,8 @@ mod tests {
                             postcondition_digest: test_handle(format!("{index:064x}")),
                         };
                 }
-                InstallerEffectPlan::RegisterService { .. } => {}
+                InstallerEffectPlan::RegisterService { .. }
+                | InstallerEffectPlan::StagePackage { .. } => {}
             }
         }
         must(transaction.validate());
@@ -11516,6 +12444,7 @@ mod tests {
             evidence: vec![test_handle("evidence:matching")],
             postcondition_digest: test_handle("a".repeat(64)),
             credential_receipt: None,
+            staging_receipt: None,
         }
     }
 
@@ -11529,6 +12458,7 @@ mod tests {
             evidence: vec![test_handle(format!("evidence:matching-{index}"))],
             postcondition_digest: test_handle(format!("{index:064x}")),
             credential_receipt: None,
+            staging_receipt: None,
         }
     }
 
@@ -11666,6 +12596,7 @@ mod tests {
                 precondition: precondition.clone(),
                 ownership_secret: None,
                 store_credential: None,
+                staging_receipt: None,
                 action: InstallationEffectAction::Apply,
                 expected_external_identity: None,
                 service_bootstrap: Some(InstallationServiceBootstrap {
@@ -12941,7 +13872,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_transaction_json_requires_explicit_migration_to_v7() {
+    fn v6_transaction_json_requires_explicit_migration_to_v8() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -12955,7 +13886,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 7.0.0")
+                if reason.contains("requires explicit migration to 8.0.0")
         ));
     }
 
@@ -12975,8 +13906,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_v7_transaction_json_is_corrupt_registry() {
-        let bytes = br#"{"transaction_wire_version":{"major":7,"minor":0,"patch":0},"transaction_id":"malformed"}"#;
+    fn malformed_v8_transaction_json_is_corrupt_registry() {
+        let bytes = br#"{"transaction_wire_version":{"major":8,"minor":0,"patch":0},"transaction_id":"malformed"}"#;
         assert!(matches!(
             decode_installation_transaction_json(bytes),
             Err(InstallationError::CorruptRegistry { .. })
