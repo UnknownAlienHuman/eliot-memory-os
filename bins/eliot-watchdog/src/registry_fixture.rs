@@ -131,19 +131,19 @@ impl RegistryFixture {
         self.bootstrap_for(7)
     }
 
-    /// Returns a valid SystemService bootstrap for one fixture generation.
+    /// Returns a valid `SystemService` bootstrap for one fixture generation.
     #[must_use]
     pub fn bootstrap_for(&self, generation: u64) -> ServiceBootstrapArguments {
         let descriptor_path = self.authority_descriptor_path(generation);
         ServiceBootstrapArguments::new(
             descriptor_path,
-            self.digest(generation),
+            Self::digest(generation),
             &self.installation_key,
             generation,
             std::iter::empty::<String>(),
         )
         .and_then(|value| value.with_host_state_root(&self.host_root))
-        .and_then(|value| value.with_registration_nonce(self.digest(generation + 200)))
+        .and_then(|value| value.with_registration_nonce(Self::digest(generation + 200)))
         .unwrap_or_else(|error| panic!("invalid fixture bootstrap: {error}"))
     }
 
@@ -184,14 +184,14 @@ impl RegistryFixture {
     #[must_use]
     pub fn pending_only(&self) -> Value {
         let manifest = self.manifest(7);
-        self.registry(
-            vec![self.generation(&manifest, false, false)],
+        Self::registry(
+            vec![Self::generation(&manifest, false, false)],
             vec![
                 self.service_approval(&manifest, true),
                 self.service_approval(&manifest, false),
             ],
             None,
-            Some(self.pending(&manifest, None, "PENDING")),
+            Some(Self::pending(&manifest, None, "PENDING")),
         )
     }
 
@@ -200,10 +200,10 @@ impl RegistryFixture {
     pub fn active_with_pending(&self) -> Value {
         let active = self.manifest(6);
         let pending = self.manifest(7);
-        self.registry(
+        Self::registry(
             vec![
-                self.generation(&active, true, false),
-                self.generation(&pending, false, false),
+                Self::generation(&active, true, false),
+                Self::generation(&pending, false, false),
             ],
             vec![
                 self.service_approval(&active, true),
@@ -212,7 +212,7 @@ impl RegistryFixture {
                 self.service_approval(&pending, false),
             ],
             Some("generation-6"),
-            Some(self.pending(&pending, Some("generation-6"), "PENDING")),
+            Some(Self::pending(&pending, Some("generation-6"), "PENDING")),
         )
     }
 
@@ -232,11 +232,11 @@ impl RegistryFixture {
             .runtime_launch
             .with_computed_digest()
             .unwrap_or_else(|error| panic!("re-seal ambiguous fixture descriptor: {error}"));
-        second = self.rebind_manifest(second);
-        self.registry(
+        second = Self::rebind_manifest(second);
+        Self::registry(
             vec![
-                self.generation(&first, false, false),
-                self.generation(&second, false, false),
+                Self::generation(&first, false, false),
+                Self::generation(&second, false, false),
             ],
             vec![
                 self.service_approval(&first, true),
@@ -249,18 +249,18 @@ impl RegistryFixture {
         )
     }
 
-    /// Returns a pending projection whose state is RecoveryRequired.
+    /// Returns a pending projection whose state is `RecoveryRequired`.
     #[must_use]
     pub fn recovery_required(&self) -> Value {
         let manifest = self.manifest(7);
-        self.registry(
-            vec![self.generation(&manifest, false, false)],
+        Self::registry(
+            vec![Self::generation(&manifest, false, false)],
             vec![
                 self.service_approval(&manifest, true),
                 self.service_approval(&manifest, false),
             ],
             None,
-            Some(self.pending(&manifest, None, "RECOVERY_REQUIRED")),
+            Some(Self::pending(&manifest, None, "RECOVERY_REQUIRED")),
         )
     }
 
@@ -268,8 +268,8 @@ impl RegistryFixture {
     #[must_use]
     pub fn active_only(&self) -> Value {
         let manifest = self.manifest(7);
-        self.registry(
-            vec![self.generation(&manifest, true, false)],
+        Self::registry(
+            vec![Self::generation(&manifest, true, false)],
             vec![
                 self.service_approval(&manifest, true),
                 self.service_approval(&manifest, false),
@@ -320,12 +320,15 @@ impl RegistryFixture {
     pub fn drifted_active_projection(&self) -> Value {
         let mut value = self.active_only();
         value["generations"][0]["manifest"]["runtime_launch"]["authority_descriptor_digest"] =
-            Value::String(self.digest(9));
+            Value::String(Self::digest(9));
         value
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "owned JSON vectors keep each projection independent in the fixture"
+    )]
     fn registry(
-        &self,
         generations: Vec<Value>,
         service_registration_approvals: Vec<Value>,
         active_generation: Option<&str>,
@@ -343,27 +346,17 @@ impl RegistryFixture {
         })
     }
 
-    fn generation(
-        &self,
-        manifest: &CandidateManifest,
-        active: bool,
-        last_known_good: bool,
-    ) -> Value {
+    fn generation(manifest: &CandidateManifest, active: bool, last_known_good: bool) -> Value {
         json!({
             "manifest": manifest,
-            "approval": self.activation_approval(manifest),
+            "approval": Self::activation_approval(manifest),
             "active": active,
             "last_known_good": last_known_good,
         })
     }
 
-    fn pending(
-        &self,
-        manifest: &CandidateManifest,
-        prior_active: Option<&str>,
-        state: &str,
-    ) -> Value {
-        let approval = self.activation_approval(manifest);
+    fn pending(manifest: &CandidateManifest, prior_active: Option<&str>, state: &str) -> Value {
+        let approval = Self::activation_approval(manifest);
         let manifest_value = serde_json::to_value(manifest)
             .unwrap_or_else(|error| panic!("serialize pending manifest: {error}"));
         let manifest_digest = sha256_hex(
@@ -381,7 +374,7 @@ impl RegistryFixture {
         };
         json!({
             "transaction_id": format!("transaction:{}", manifest.generation.as_str()),
-            "plan_digest": self.digest(manifest.runtime_launch.authority_generation.value()),
+            "plan_digest": Self::digest(manifest.runtime_launch.authority_generation.value()),
             "manifest": manifest_value,
             "config_digest": manifest.config_digest,
             "kernel_artifact_digest": manifest.kernel_artifact_digest,
@@ -397,12 +390,12 @@ impl RegistryFixture {
         })
     }
 
-    fn activation_approval(&self, manifest: &CandidateManifest) -> Value {
+    fn activation_approval(manifest: &CandidateManifest) -> Value {
         let generation = manifest.runtime_launch.authority_generation.value();
         json!({
             "approval_ref": format!("evidence:activation:{}", manifest.generation.as_str()),
             "transaction_id": format!("transaction:{}", manifest.generation.as_str()),
-            "installer_plan_digest": self.digest(generation),
+            "installer_plan_digest": Self::digest(generation),
             "generation": manifest.generation,
             "candidate_manifest_digest": sha256_hex(
                 &serde_json::to_vec(manifest)
@@ -437,9 +430,9 @@ impl RegistryFixture {
             self.artifact_root.join("eliot-watchdog.exe")
         };
         let nonce = if host {
-            self.digest(generation + 100)
+            Self::digest(generation + 100)
         } else {
-            self.digest(generation + 200)
+            Self::digest(generation + 200)
         };
         let bootstrap = ServiceBootstrapArguments::new(
             PathBuf::from(manifest.runtime_launch.authority_descriptor_path.as_str()),
@@ -506,16 +499,16 @@ impl RegistryFixture {
         let config_path = self
             .artifact_root
             .join(format!("generation-{generation}.json"));
-        let authority_digest = self.digest(generation);
-        let kernel_digest = self.digest(10);
-        let eliotd_digest = self.digest(11);
-        let eliotd_config_digest = self.digest(12);
-        let eliotd_descriptor_digest = self.digest(13);
-        let store_bridge_digest = self.digest(14);
-        let store_bootstrap_digest = self.digest(15);
-        let canonical_store_digest = self.digest(16);
-        let host_digest = self.digest(17);
-        let watchdog_digest = self.digest(18);
+        let authority_digest = Self::digest(generation);
+        let kernel_digest = Self::digest(10);
+        let eliotd_digest = Self::digest(11);
+        let eliotd_config_digest = Self::digest(12);
+        let eliotd_descriptor_digest = Self::digest(13);
+        let store_bridge_digest = Self::digest(14);
+        let store_bootstrap_digest = Self::digest(15);
+        let canonical_store_digest = Self::digest(16);
+        let host_digest = Self::digest(17);
+        let watchdog_digest = Self::digest(18);
         let kernel_path = self.artifact_root.join("eliot-kernel.exe");
         let eliotd_path = self.artifact_root.join("eliotd.exe");
         let eliotd_config_path = self
@@ -628,31 +621,31 @@ impl RegistryFixture {
             config_path: config_handle,
             dependency_closure_refs: vec![handle("evidence:dependency-closure")],
             license_refs: vec![handle("evidence:licenses")],
-            config_digest: handle(self.digest(19)),
+            config_digest: handle(Self::digest(19)),
             store_credential_target: runtime_launch.store_credential_target.clone(),
-            supervision_key_fingerprint: handle(self.digest(20)),
+            supervision_key_fingerprint: handle(Self::digest(20)),
             signature_ref: handle(format!("evidence:signature:generation-{generation}")),
             runtime_state_roots_digest: roots.roots_digest.clone(),
             runtime_launch,
         }
     }
 
-    fn rebind_manifest(&self, mut manifest: CandidateManifest) -> CandidateManifest {
+    fn rebind_manifest(mut manifest: CandidateManifest) -> CandidateManifest {
         manifest.generation = manifest.runtime_launch.generation.clone();
         manifest.runtime_state_roots_digest = manifest
             .runtime_launch
             .runtime_state_roots
             .roots_digest
             .clone();
-        manifest = manifest
+        let runtime_launch = manifest
             .runtime_launch
             .clone()
             .with_computed_digest()
-            .map(|runtime_launch| CandidateManifest {
-                runtime_launch,
-                ..manifest
-            })
             .unwrap_or_else(|error| panic!("rebind ambiguous manifest: {error}"));
+        manifest = CandidateManifest {
+            runtime_launch,
+            ..manifest
+        };
         manifest
     }
 
@@ -661,7 +654,7 @@ impl RegistryFixture {
             .join(format!("authority-{generation}.json"))
     }
 
-    fn digest(&self, value: u64) -> String {
+    fn digest(value: u64) -> String {
         let nibble = b"0123456789abcdef"[(value % 16) as usize] as char;
         std::iter::repeat_n(nibble, 64).collect()
     }

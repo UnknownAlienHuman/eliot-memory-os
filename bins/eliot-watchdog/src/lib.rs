@@ -27,7 +27,7 @@ use eliot_platform_windows::{
     NamedPipePeerProcessBinding, ProcessIdentity, ProtectedPathLease, ProtectedRootLease,
     ProtectedRuntimePathLease, ServiceBootstrapArguments, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, WindowsAdapterError, WindowsPlatform,
-    protected_program_data_root, require_protected_program_data_path, windows_paths_equal,
+    windows_paths_equal,
 };
 use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
@@ -584,7 +584,7 @@ const SPOOL_HEADER_KEY: u64 = 0;
 const SPOOL_MAX_RECORDS: u64 = 4096;
 const SPOOL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SPOOL_MAX_RECORD_BYTES: usize = 64 * 1024;
-const SPOOL_RELATIVE_PATH: &str = "Eliot/watchdog/watchdog.redb";
+const WATCHDOG_SPOOL_FILE_NAME: &str = "watchdog.redb";
 const SPOOL_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("eliot_watchdog_spool_v1");
 // The high-water record deliberately lives in a different redb table from
 // the bounded observation records.  A damaged header or record must not be
@@ -654,17 +654,13 @@ pub struct WatchdogSpoolEntry {
 #[derive(Debug)]
 struct WatchdogSpool {
     database: Database,
-    _path_lease: Option<ProtectedPathLease>,
+    _path_lease: Option<ProtectedRuntimePathLease>,
 }
 
 impl WatchdogSpool {
     fn open_runtime_binding(binding: &WatchdogRuntimeBinding) -> Result<Self, SpoolError> {
-        let root = binding.watchdog_state_root();
-        let path = root.join("watchdog.redb");
-        let program_data =
-            protected_program_data_root().map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        let relative = runtime_spool_relative_path(&path, &program_data)?;
-        let path_lease = ProtectedPathLease::open_or_create(relative)
+        let path = watchdog_spool_path(binding.watchdog_state_root());
+        let path_lease = ProtectedRuntimePathLease::open_or_create_absolute(&path)
             .map_err(|_| SpoolError::InvalidProtectedRoot)?;
         if path_lease.path() != path {
             return Err(SpoolError::InvalidProtectedRoot);
@@ -680,6 +676,24 @@ impl WatchdogSpool {
         };
         spool.initialize_or_recover()?;
         Ok(spool)
+    }
+
+    fn open_existing_runtime_binding(binding: &WatchdogRuntimeBinding) -> Result<Self, SpoolError> {
+        let path = watchdog_spool_path(binding.watchdog_state_root());
+        let path_lease = ProtectedRuntimePathLease::open_existing_absolute(&path)
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        if path_lease.path() != path {
+            return Err(SpoolError::InvalidProtectedRoot);
+        }
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        let database = Database::open(path_lease.path())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        Ok(Self {
+            database,
+            _path_lease: Some(path_lease),
+        })
     }
 
     #[cfg(test)]
@@ -1019,10 +1033,8 @@ impl WatchdogSpool {
     }
 }
 
-fn runtime_spool_relative_path(path: &Path, program_data: &Path) -> Result<PathBuf, SpoolError> {
-    path.strip_prefix(program_data)
-        .map(Path::to_path_buf)
-        .map_err(|_| SpoolError::InvalidProtectedRoot)
+fn watchdog_spool_path(watchdog_state_root: &Path) -> PathBuf {
+    watchdog_state_root.join(WATCHDOG_SPOOL_FILE_NAME)
 }
 
 fn encode_entry(entry: &WatchdogSpoolEntry) -> Result<Vec<u8>, SpoolError> {
@@ -1814,27 +1826,13 @@ impl IndependentKernelSensor {
     ///
     /// # Errors
     ///
-    /// Returns an error if the path is not the protected canonical spool or
-    /// if its retained identity, database, header, sequence, or records fail validation.
-    pub fn readback(path: impl AsRef<Path>) -> Result<Vec<WatchdogSpoolEntry>, SpoolError> {
-        let path = path.as_ref();
-        require_protected_program_data_path(path, SPOOL_RELATIVE_PATH)
-            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        let path_lease = ProtectedPathLease::open_existing(SPOOL_RELATIVE_PATH)
-            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        if path_lease.path() != path {
-            return Err(SpoolError::InvalidProtectedRoot);
-        }
-        path_lease
-            .verify_path_identity()
-            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        let database = Database::open(path_lease.path())
-            .map_err(|error| SpoolError::Database(error.to_string()))?;
-        WatchdogSpool {
-            database,
-            _path_lease: Some(path_lease),
-        }
-        .readback()
+    /// Returns an error if the retained per-installation spool cannot be
+    /// opened or if its identity, database, header, sequence, or records fail
+    /// validation.
+    pub fn readback(
+        binding: &WatchdogRuntimeBinding,
+    ) -> Result<Vec<WatchdogSpoolEntry>, SpoolError> {
+        WatchdogSpool::open_existing_runtime_binding(binding)?.readback()
     }
 
     fn record_heartbeat(
@@ -2989,6 +2987,10 @@ mod tests {
         assert!(read_registry_for_bootstrap(&corrupt_fixture.base_bootstrap()).is_err());
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the matrix keeps all protected approval and bootstrap substitutions together"
+    )]
     #[test]
     fn protected_redb_registry_approval_and_bootstrap_substitution_matrix() {
         let fixture = RegistryFixture::new();
@@ -4267,6 +4269,10 @@ mod tests {
         assert!(!source.contains("protected_program_data_path"));
         assert!(library.contains("ProtectedRootLease::open_existing"));
         assert!(library.contains("RedbInstallationRegistry::inspect_existing_at"));
+        assert!(library.contains("ProtectedRuntimePathLease::open_existing_absolute"));
+        assert!(library.contains("binding.watchdog_state_root()"));
+        let legacy_spool_path = ["Eliot/", "watchdog/watchdog.redb"].concat();
+        assert!(!library.contains(&legacy_spool_path));
         let legacy_registry_call = ["RedbInstallationRegistry::inspect_existing", "("].concat();
         let mutating_registry_call = ["RedbInstallationRegistry::open_at", "("].concat();
         assert!(!library.contains(&legacy_registry_call));
@@ -4289,13 +4295,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_spool_path_rejects_root_substitution() {
-        let program_data = Path::new(r"C:\ProgramData");
-        let outside = Path::new(r"C:\Users\Public\watchdog.redb");
-        assert!(matches!(
-            runtime_spool_relative_path(outside, program_data),
-            Err(SpoolError::InvalidProtectedRoot)
-        ));
+    fn watchdog_spool_path_is_bound_to_the_retained_installation_root() {
+        let watchdog_root = Path::new(
+            r"C:\ProgramData\Eliot\installations\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\watchdog",
+        );
+        let expected = watchdog_root.join("watchdog.redb");
+        assert_eq!(watchdog_spool_path(watchdog_root), expected);
+        assert_ne!(
+            expected,
+            Path::new(r"C:\ProgramData\Eliot\watchdog\watchdog.redb")
+        );
     }
 
     #[test]
