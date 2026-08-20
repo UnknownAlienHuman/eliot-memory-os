@@ -798,6 +798,10 @@ fn supervision_lease_commit_rejects_substitution_and_replays_exactly() -> TestRe
     let first = store.commit_supervision_lease(&stage.ticket, &valid)?;
     let replay = store.commit_supervision_lease(&stage.ticket, &valid)?;
     assert_eq!(first, replay);
+    assert_eq!(
+        store.replay_supervision_lease_commit(&stage.ticket)?,
+        Some(first.clone())
+    );
     drop(store);
     cleanup(&path);
     Ok(())

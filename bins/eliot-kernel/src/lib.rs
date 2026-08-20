@@ -43,8 +43,12 @@ use eliot_ors::{
     ProcessEvidenceRecord, ProcessStartReplayRecord as OrsReplayRecord,
     ProcessStartReplayState as OrsReplayState,
 };
-use eliot_ors::{OperationalRecoveryStore, RedbRecoveryStore};
-use eliot_platform::{ClockObservation, PlatformHandle, PortError};
+use eliot_ors::{
+    OperationalRecoveryStore, RedbRecoveryStore, SupervisionLeaseCommitTicket,
+    SupervisionLeaseOperation, SupervisionLeasePrepareRequest, SupervisionLeaseSnapshot,
+    SupervisionLeaseStageReceipt,
+};
+use eliot_platform::{ClockObservation, PlatformHandle, PortError, SecretReference};
 use eliot_platform_windows::{
     ProtectedPathLease, ProtectedSecret, RecoverableJobBinding, RecoverableJobObject,
     RetainedProcessPathLease, UserOwnedPathLease, UserOwnedRootLease, WindowsPlatform,
@@ -62,8 +66,11 @@ use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 use eliot_runtime_contracts::{
-    GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
-    HealthVector, ModuleGeneration, ModuleGenerationState,
+    Ed25519SupervisionLeaseSigner, GenerationCutoverRecord as RuntimeGenerationCutoverRecord,
+    GenerationCutoverState, HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState,
+    SupervisionLease, SupervisionLeaseActiveStateBinding, SupervisionLeaseError,
+    SupervisionLeasePredecessorProof, SupervisionLeaseSigner, SupervisionLeaseVerificationContext,
+    SupervisionLeaseVerifier, SupervisionTrustAnchor,
 };
 use eliot_store_api::{
     CanonicalStoreClient, CanonicalValidationSnapshot, OrderingHeadExpectation, PreparedTransition,
@@ -216,6 +223,36 @@ impl IpcImplementation {
     }
 }
 
+/// Host-approved protected key reference and installation-pinned public trust
+/// anchor for Kernel-owned supervision leases.
+///
+/// The reference identifies a Windows Credential Manager item; it never
+/// carries the signing seed.  The public key is safe to retain in the
+/// installation binding and is used to reject a substituted/missing secret
+/// before any ORS ticket is signed.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupervisionLeaseAuthorityConfig {
+    pub key_reference: SecretReference,
+    pub trust_anchor: SupervisionTrustAnchor,
+}
+
+#[cfg(windows)]
+impl SupervisionLeaseAuthorityConfig {
+    /// Validates the secret-provider contour before Credential Manager is
+    /// touched.  The key itself is checked by the Kernel authority at
+    /// construction and before every signing operation.
+    pub fn validate(&self) -> Result<(), String> {
+        self.trust_anchor
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if self.key_reference.provider.as_str() != "windows-credential-manager" {
+            return Err("supervision signing requires Windows Credential Manager".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// Explicit construction input for the Kernel process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelConfig {
@@ -233,6 +270,11 @@ pub struct KernelConfig {
     /// daemon's generation snapshot. This is a different artifact domain
     /// from the `eliotd` child executable digest.
     pub kernel_artifact_sha256: Option<String>,
+    /// Host-approved protected supervision signing authority.  The absence of
+    /// this binding keeps the lease surface unavailable; no in-memory or test
+    /// signer is fabricated by the production composition.
+    #[cfg(windows)]
+    pub supervision_lease_authority: Option<SupervisionLeaseAuthorityConfig>,
 }
 
 impl KernelConfig {
@@ -244,6 +286,8 @@ impl KernelConfig {
             store_bootstrap: None,
             daemon_launch: None,
             kernel_artifact_sha256: None,
+            #[cfg(windows)]
+            supervision_lease_authority: None,
         }
     }
 
@@ -274,6 +318,18 @@ impl KernelConfig {
     #[must_use]
     pub fn with_kernel_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
         self.kernel_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the Host-approved protected supervision signer and trust
+    /// anchor.  The seed itself is intentionally not part of this config.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn with_supervision_lease_authority(
+        mut self,
+        authority: SupervisionLeaseAuthorityConfig,
+    ) -> Self {
+        self.supervision_lease_authority = Some(authority);
         self
     }
 }
@@ -412,6 +468,8 @@ pub struct KernelComposition {
     canonical_store_claimed: AtomicBool,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
+    #[cfg(windows)]
+    supervision_lease_authority: Option<Arc<KernelSupervisionLeaseAuthority>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -432,6 +490,405 @@ struct DaemonRuntimeState {
     status: DaemonRuntimeStatus,
     receipt: Option<ProcessStartReceipt>,
     recovery_fenced: bool,
+}
+
+/// Fail-closed errors for the Kernel-owned supervision lease authority.  The
+/// protected-key branch deliberately exposes only stable categories; provider
+/// diagnostics are never allowed to include a secret target's contents.
+#[cfg(windows)]
+#[derive(Debug)]
+pub enum SupervisionLeaseAuthorityError {
+    Configuration(String),
+    ProtectedKeyUnavailable,
+    Contract(String),
+    Ors(OrsError),
+}
+
+#[cfg(windows)]
+impl fmt::Display for SupervisionLeaseAuthorityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configuration(reason) => {
+                write!(formatter, "invalid supervision authority: {reason}")
+            }
+            Self::ProtectedKeyUnavailable => {
+                formatter.write_str("protected supervision signing key is unavailable")
+            }
+            Self::Contract(reason) => {
+                write!(formatter, "supervision lease contract rejected: {reason}")
+            }
+            Self::Ors(error) => {
+                write!(formatter, "supervision ORS rejected the operation: {error}")
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for SupervisionLeaseAuthorityError {}
+
+#[cfg(windows)]
+impl From<OrsError> for SupervisionLeaseAuthorityError {
+    fn from(error: OrsError) -> Self {
+        Self::Ors(error)
+    }
+}
+
+/// Kernel-held signer which reloads a 32-byte Ed25519 seed from the existing
+/// Windows Credential Manager reference for each operation.  It retains no
+/// seed bytes, has no serializable representation, and redacts its Debug view.
+#[cfg(windows)]
+pub struct ProtectedSupervisionLeaseSigner {
+    platform: Arc<WindowsPlatform>,
+    key_reference: SecretReference,
+    signer_id: String,
+    key_id: String,
+    expected_public_key_fingerprint: String,
+}
+
+#[cfg(windows)]
+impl fmt::Debug for ProtectedSupervisionLeaseSigner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtectedSupervisionLeaseSigner")
+            .field("signer_id", &self.signer_id)
+            .field("key_id", &self.key_id)
+            .field(
+                "expected_public_key_fingerprint",
+                &self.expected_public_key_fingerprint,
+            )
+            .field("key_provider", &self.key_reference.provider.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl ProtectedSupervisionLeaseSigner {
+    fn new(
+        platform: Arc<WindowsPlatform>,
+        config: &SupervisionLeaseAuthorityConfig,
+    ) -> Result<Self, SupervisionLeaseAuthorityError> {
+        config
+            .validate()
+            .map_err(SupervisionLeaseAuthorityError::Configuration)?;
+        let signer = Self {
+            platform,
+            key_reference: config.key_reference.clone(),
+            signer_id: config.trust_anchor.signer_id.clone(),
+            key_id: config.trust_anchor.key_id.clone(),
+            expected_public_key_fingerprint: config.trust_anchor.public_key_fingerprint.clone(),
+        };
+        signer
+            .load_signer()
+            .map_err(|_| SupervisionLeaseAuthorityError::ProtectedKeyUnavailable)?;
+        Ok(signer)
+    }
+
+    fn load_signer(&self) -> Result<Ed25519SupervisionLeaseSigner, SupervisionLeaseError> {
+        let secret = self
+            .platform
+            .read_credential(self.key_reference.key.as_str())
+            .map_err(|_| SupervisionLeaseError::Signing("protected key read failed".to_owned()))?;
+        if secret.expose().len() != 32 || secret.expose().iter().all(|byte| *byte == 0) {
+            return Err(SupervisionLeaseError::Signing(
+                "protected key has invalid length or value".to_owned(),
+            ));
+        }
+        let mut key_bytes = [0_u8; 32];
+        key_bytes.copy_from_slice(secret.expose());
+        let signer = Ed25519SupervisionLeaseSigner::from_secret_key(
+            self.signer_id.clone(),
+            self.key_id.clone(),
+            key_bytes,
+        )?;
+        // CredentialSecret zeroizes its provider-owned buffer on drop. Clear
+        // this independent stack copy as soon as the signing key owns its
+        // internal zeroizing representation.
+        key_bytes.fill(0);
+        if sha256_hex(&signer.public_key()) != self.expected_public_key_fingerprint {
+            return Err(SupervisionLeaseError::Signing(
+                "protected key does not match the installation trust anchor".to_owned(),
+            ));
+        }
+        Ok(signer)
+    }
+
+    /// Returns the provider reference only; no secret bytes cross this API.
+    pub fn key_reference(&self) -> &SecretReference {
+        &self.key_reference
+    }
+}
+
+#[cfg(windows)]
+impl SupervisionLeaseSigner for ProtectedSupervisionLeaseSigner {
+    fn signer_id(&self) -> &str {
+        &self.signer_id
+    }
+
+    fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    fn sign(&self, canonical_payload: &[u8]) -> Result<Vec<u8>, SupervisionLeaseError> {
+        let signer = self.load_signer()?;
+        signer.sign(canonical_payload)
+    }
+}
+
+/// The one Kernel composition that may turn an ORS ticket into a signed
+/// supervision-lease record.  ORS remains the only durable ticket/transition
+/// issuer; this type owns only the protected key boundary and authenticated
+/// orchestration around it.
+#[cfg(windows)]
+pub struct KernelSupervisionLeaseAuthority {
+    ors: Arc<RedbRecoveryStore>,
+    signer: ProtectedSupervisionLeaseSigner,
+    trust_anchor: SupervisionTrustAnchor,
+}
+
+#[cfg(windows)]
+impl fmt::Debug for KernelSupervisionLeaseAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KernelSupervisionLeaseAuthority")
+            .field("trust_anchor", &self.trust_anchor)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl KernelSupervisionLeaseAuthority {
+    fn new(
+        ors: Arc<RedbRecoveryStore>,
+        platform: &Arc<WindowsPlatform>,
+        config: SupervisionLeaseAuthorityConfig,
+    ) -> Result<Self, KernelBuildError> {
+        let signer = ProtectedSupervisionLeaseSigner::new(Arc::clone(platform), &config)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        Ok(Self {
+            ors,
+            signer,
+            trust_anchor: config.trust_anchor,
+        })
+    }
+
+    /// Returns the installation-pinned public trust anchor.
+    pub fn trust_anchor(&self) -> &SupervisionTrustAnchor {
+        &self.trust_anchor
+    }
+
+    /// Returns the protected key reference; no seed is exposed.
+    pub fn key_reference(&self) -> &SecretReference {
+        self.signer.key_reference()
+    }
+
+    fn validate_binding(
+        &self,
+        binding: &eliot_ors::SupervisionLeaseBinding,
+    ) -> Result<(), SupervisionLeaseAuthorityError> {
+        if binding.installation_id.as_str() != self.trust_anchor.installation_id {
+            return Err(SupervisionLeaseAuthorityError::Configuration(
+                "lease installation identity does not match the trust anchor".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reserves one exact operation/revision/predecessor through ORS.
+    pub fn prepare(
+        &self,
+        request: SupervisionLeasePrepareRequest,
+    ) -> Result<SupervisionLeaseStageReceipt, SupervisionLeaseAuthorityError> {
+        self.validate_binding(&request.binding)?;
+        self.ors
+            .prepare_supervision_lease(request)
+            .map_err(Into::into)
+    }
+
+    fn verification_context(
+        &self,
+        payload: &SupervisionLease,
+        now_ms: u64,
+    ) -> SupervisionLeaseVerificationContext {
+        SupervisionLeaseVerificationContext {
+            now_ms,
+            lease_id: payload.lease_id.clone(),
+            host_epoch: payload.host_epoch,
+            activation_id: payload.activation_id.clone(),
+            activation_generation: payload.activation_generation,
+            kernel_epoch: payload.kernel_epoch,
+            watchdog_epoch: payload.watchdog_epoch,
+            state_fence: payload.state_fence.clone(),
+            scope_ref: payload.scope_ref.clone(),
+            observation_scope: payload.observation_scope.clone(),
+            target_id: payload.generation_binding.target_id.clone(),
+            module_id: payload.generation_binding.module_id.clone(),
+            process_id: payload.generation_binding.process_id.clone(),
+            target_generation: payload.generation_binding.target_generation,
+            module_generation: payload.generation_binding.module_generation,
+            process_generation: payload.generation_binding.process_generation,
+            public_key_fingerprint: self.trust_anchor.public_key_fingerprint.clone(),
+            ors_mirror: payload.ors_mirror.clone(),
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: payload.state,
+                revocation_id: payload.revocation_id.clone(),
+                revocation_epoch: payload.revocation_epoch,
+            },
+        }
+    }
+
+    fn staged_ticket(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+    ) -> Result<(), SupervisionLeaseAuthorityError> {
+        let stage = self
+            .ors
+            .reconcile_staged_supervision_lease(&ticket.lease_id)?
+            .ok_or({
+                SupervisionLeaseAuthorityError::Ors(OrsError::SupervisionLeaseTicketNotStaged)
+            })?;
+        if stage.ticket != *ticket || stage.ticket_sha256 != ticket.ticket_sha256()? {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseTicketConflict,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Signs and commits an active/renewed ticket.  An already committed
+    /// result is returned before Credential Manager is read, preventing a
+    /// response-loss retry from signing or reusing the revision again.
+    pub fn commit_active(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+    ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
+        if !matches!(
+            ticket.operation,
+            SupervisionLeaseOperation::Commit | SupervisionLeaseOperation::Renew
+        ) {
+            return Err(SupervisionLeaseAuthorityError::Configuration(
+                "active commit requires COMMIT or RENEW".to_owned(),
+            ));
+        }
+        if let Some(snapshot) = self.ors.replay_supervision_lease_commit(ticket)? {
+            return Ok(snapshot);
+        }
+        self.staged_ticket(ticket)?;
+        let payload = ticket
+            .expected_payload()
+            .map_err(SupervisionLeaseAuthorityError::Ors)?;
+        self.validate_binding(&ticket.binding)?;
+        let envelope = payload.sign(&self.signer).map_err(|error| match error {
+            SupervisionLeaseError::Signing(_) => {
+                SupervisionLeaseAuthorityError::ProtectedKeyUnavailable
+            }
+            error => SupervisionLeaseAuthorityError::Contract(error.to_string()),
+        })?;
+        let context = self.verification_context(&payload, unix_ms());
+        let verified = self
+            .trust_anchor
+            .verify(&envelope, &context)
+            .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+        self.ors
+            .commit_supervision_lease(ticket, &verified)
+            .map_err(Into::into)
+    }
+
+    /// Signs and commits a terminal transition using the exact active ORS
+    /// predecessor.  The caller cannot substitute a predecessor proof.
+    pub fn commit_terminal(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+    ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
+        if matches!(
+            ticket.operation,
+            SupervisionLeaseOperation::Commit | SupervisionLeaseOperation::Renew
+        ) {
+            return Err(SupervisionLeaseAuthorityError::Configuration(
+                "terminal commit requires a terminal operation".to_owned(),
+            ));
+        }
+        if let Some(snapshot) = self.ors.replay_supervision_lease_commit(ticket)? {
+            return Ok(snapshot);
+        }
+        self.staged_ticket(ticket)?;
+        let current = self
+            .ors
+            .load_current_supervision_lease(&ticket.lease_id)?
+            .ok_or(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ))?;
+        if current.record.state != LeaseState::Active
+            || current.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+            || ticket.expected_revision != Some(current.record.revision)
+            || ticket.previous_receipt_sha256.as_deref()
+                != Some(current.receipt.receipt_sha256.as_str())
+        {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ));
+        }
+        self.validate_binding(&ticket.binding)?;
+        let prior_context = self.verification_context(
+            &current.record.artifact.payload,
+            current.record.artifact.payload.issued_at_ms,
+        );
+        let prior_active = self
+            .trust_anchor
+            .verify(&current.record.artifact, &prior_context)
+            .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+        let predecessor = SupervisionLeasePredecessorProof {
+            lease_id: current.record.lease_id.as_str().to_owned(),
+            record_id: current.record.record_id.as_str().to_owned(),
+            lease_revision: current.record.revision,
+            receipt_sha256: current.receipt.receipt_sha256.clone(),
+            envelope_sha256: current
+                .record
+                .artifact
+                .envelope_digest()
+                .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
+        };
+        let payload = ticket
+            .expected_payload()
+            .map_err(SupervisionLeaseAuthorityError::Ors)?;
+        let envelope = payload.sign(&self.signer).map_err(|error| match error {
+            SupervisionLeaseError::Signing(_) => {
+                SupervisionLeaseAuthorityError::ProtectedKeyUnavailable
+            }
+            error => SupervisionLeaseAuthorityError::Contract(error.to_string()),
+        })?;
+        let verified = self
+            .trust_anchor
+            .verify_terminal_transition(&prior_active, &envelope, &predecessor)
+            .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+        self.ors
+            .commit_terminal_supervision_lease(ticket, &verified)
+            .map_err(Into::into)
+    }
+
+    /// Reconciles bounded staged tickets after a Kernel restart.  It never
+    /// promotes an unrecognized or corrupt row and leaves the durable stage
+    /// in place when the protected key cannot be reloaded.
+    pub fn reconcile(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
+        let stages = self.ors.reconcile_staged_supervision_leases(limit)?;
+        let mut committed = Vec::with_capacity(stages.len());
+        for stage in stages {
+            let snapshot = match stage.ticket.operation {
+                SupervisionLeaseOperation::Commit | SupervisionLeaseOperation::Renew => {
+                    self.commit_active(&stage.ticket)?
+                }
+                SupervisionLeaseOperation::Revoke
+                | SupervisionLeaseOperation::Expire
+                | SupervisionLeaseOperation::Supersede
+                | SupervisionLeaseOperation::Close => self.commit_terminal(&stage.ticket)?,
+            };
+            committed.push(snapshot);
+        }
+        Ok(committed)
+    }
 }
 
 /// Result of the closed Kernel semantic gateway for one authenticated frame.
@@ -2530,6 +2987,14 @@ impl KernelComposition {
         let approved_config_hash = daemon_launch
             .as_ref()
             .map(|launch| launch.config_descriptor_sha256.clone());
+        #[cfg(windows)]
+        let supervision_lease_authority = config
+            .supervision_lease_authority
+            .clone()
+            .map(|authority| {
+                KernelSupervisionLeaseAuthority::new(Arc::clone(&ors), &platform, authority)
+            })
+            .transpose()?;
         let _ = &platform;
         let ipc = IpcImplementation::new(config.pipe_name)?;
         // An integrated Kernel must construct its active store route from the
@@ -2679,6 +3144,8 @@ impl KernelComposition {
             canonical_store_claimed: AtomicBool::new(false),
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
+            #[cfg(windows)]
+            supervision_lease_authority: supervision_lease_authority.map(Arc::new),
         })
     }
 
@@ -2747,6 +3214,14 @@ impl KernelComposition {
     #[must_use]
     pub fn daemon_launch(&self) -> Option<&EliotdLaunchDescriptor> {
         self.daemon_launch.as_ref()
+    }
+
+    /// Returns the protected supervision authority only when Host injected a
+    /// complete key reference and installation trust anchor.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn supervision_lease_authority(&self) -> Option<&KernelSupervisionLeaseAuthority> {
+        self.supervision_lease_authority.as_deref()
     }
 
     fn active_daemon_launch(&self) -> Result<Option<EliotdLaunchDescriptor>, KernelServiceError> {
@@ -4754,7 +5229,7 @@ mod tests {
     use eliot_kernel_core::{KernelError, KernelResult, SealedAuthoritySnapshot};
     use eliot_ors::{
         EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, RecoveryPayload,
-        StateFenceSnapshot,
+        StateFenceSnapshot, SupervisionLeaseBinding,
     };
     use eliot_platform::{PlatformHandle, SecretReference};
     use eliot_process::{
@@ -4762,7 +5237,10 @@ mod tests {
         EnvironmentInheritance, EnvironmentProjection, FencingToken, ImageId, JobId, OperationId,
         PermitIssuance, ProcessTreeId, ResourceLimits, SessionId,
     };
-    use eliot_runtime_contracts::ModuleContract;
+    use eliot_runtime_contracts::{
+        ModuleContract, RegisteredActivityWakePolicy, SupervisionGenerationBinding,
+        SupervisionLeaseTerminalDisposition, SupervisionObservationScope,
+    };
     use eliot_store_api::{RevisionHead, RevisionKey};
 
     #[cfg(windows)]
@@ -6287,6 +6765,77 @@ mod tests {
             platform: Arc::clone(platform),
             key: key.to_owned(),
         }
+    }
+
+    #[cfg(windows)]
+    fn supervision_authority_binding(
+        state: LeaseState,
+        issued_at_ms: u64,
+    ) -> Result<SupervisionLeaseBinding, Box<dyn std::error::Error>> {
+        let terminal_disposition = match state {
+            LeaseState::Released => Some(SupervisionLeaseTerminalDisposition::Released),
+            LeaseState::Expired => Some(SupervisionLeaseTerminalDisposition::Expired),
+            LeaseState::Revoked => Some(SupervisionLeaseTerminalDisposition::Revoked),
+            LeaseState::Superseded => Some(SupervisionLeaseTerminalDisposition::Superseded),
+            LeaseState::Closed => Some(SupervisionLeaseTerminalDisposition::Closed),
+            LeaseState::Requested
+            | LeaseState::Active
+            | LeaseState::Expiring
+            | LeaseState::Reconciling => None,
+        };
+        let revoked = state == LeaseState::Revoked;
+        Ok(SupervisionLeaseBinding {
+            scope_ref: OpaqueLabel::new("kernel-supervision-scope")?,
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["kernel-target".to_owned()],
+                sensor_profile: "kernel-supervision-test".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live".to_owned(),
+            },
+            installation_id: OpaqueLabel::new("installation-1")?,
+            host_epoch: AuthorityEpoch::new(1)?,
+            activation_id: OpaqueLabel::new("kernel-supervision-activation")?,
+            activation_generation: ResourceGeneration::new(1)?,
+            kernel_epoch: AuthorityEpoch::new(2)?,
+            watchdog_epoch: AuthorityEpoch::new(1)?,
+            generation_binding: SupervisionGenerationBinding {
+                target_id: "kernel-target".to_owned(),
+                target_generation: ResourceGeneration::new(1)?,
+                module_id: "kernel-supervision-module".to_owned(),
+                module_generation: ResourceGeneration::new(1)?,
+                process_id: "eliot-kernel".to_owned(),
+                process_generation: ResourceGeneration::new(1)?,
+            },
+            state_fence: StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::new(1)?),
+            issued_at_ms,
+            expires_at_ms: issued_at_ms.saturating_add(120_000),
+            renew_before_ms: issued_at_ms.saturating_add(60_000),
+            wake_policy: RegisteredActivityWakePolicy::Disabled,
+            state,
+            terminal_disposition,
+            revocation_reason: revoked.then(|| "kernel supervision test revocation".to_owned()),
+            revocation_id: revoked.then(|| "kernel-supervision-revocation".to_owned()),
+            revocation_epoch: revoked.then(|| AuthorityEpoch::new(2)).transpose()?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn supervision_authority_request(
+        ticket_id: &str,
+        operation_id: &str,
+        lease_id: &str,
+        expected_revision: Option<u64>,
+        operation: SupervisionLeaseOperation,
+        binding: SupervisionLeaseBinding,
+    ) -> Result<SupervisionLeasePrepareRequest, Box<dyn std::error::Error>> {
+        Ok(SupervisionLeasePrepareRequest {
+            ticket_id: OpaqueLabel::new(ticket_id)?,
+            operation_id: OpaqueLabel::new(operation_id)?,
+            lease_id: OpaqueLabel::new(lease_id)?,
+            expected_revision,
+            operation,
+            binding,
+        })
     }
 
     #[test]
@@ -7929,6 +8478,231 @@ mod tests {
             .expect("load consumed handoff")
             .expect("consumed handoff");
         assert_eq!(consumed.state, AuthorityHandoffState::Consumed);
+        drop(credential);
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::format_collect, clippy::too_many_lines)]
+    #[test]
+    fn protected_supervision_authority_restarts_replays_and_rejects_key_substitution() {
+        let suffix = authority_test_suffix();
+        let root = std::env::temp_dir().join(format!("eliot-kernel-supervision-{suffix}"));
+        let _cleanup = AuthorityTestCleanup {
+            paths: vec![root.clone()],
+        };
+        std::fs::create_dir_all(root.join(".eliot")).expect("supervision test root");
+
+        let platform = Arc::new(WindowsPlatform::new(&root).expect("supervision test platform"));
+        let key = format!("eliot/kernel/supervision/{suffix}");
+        let credential = credential_cleanup(&platform, &key);
+        let seed = [0xa5; 32];
+        let seed_hex = "a5".repeat(32);
+        let signer = Ed25519SupervisionLeaseSigner::from_secret_key(
+            "kernel-supervision",
+            "kernel-supervision-key",
+            seed,
+        )
+        .expect("supervision test signer");
+        let trust_anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            "kernel-supervision",
+            "kernel-supervision-key",
+            signer.public_key().to_vec(),
+        )
+        .expect("supervision trust anchor");
+        let authority_config = SupervisionLeaseAuthorityConfig {
+            key_reference: SecretReference::new("windows-credential-manager", &key)
+                .expect("supervision key reference"),
+            trust_anchor,
+        };
+        platform
+            .write_credential(&key, &seed)
+            .expect("write supervision protected seed");
+
+        let ors_path = root.join(".eliot").join("kernel-ors.redb");
+        let ors = Arc::new(RedbRecoveryStore::open(&ors_path).expect("supervision ORS"));
+        let authority = KernelSupervisionLeaseAuthority::new(
+            Arc::clone(&ors),
+            &platform,
+            authority_config.clone(),
+        )
+        .expect("protected supervision authority");
+        let authority_debug = format!("{authority:?}");
+        let signer_debug = format!("{:?}", authority.signer);
+        assert!(!authority_debug.contains(&seed_hex));
+        assert!(!signer_debug.contains(&seed_hex));
+        assert!(authority_debug.contains("KernelSupervisionLeaseAuthority"));
+
+        // The durable stage is the crash boundary: no current record exists
+        // until a restarted Kernel reconciles and signs the exact ticket.
+        let issued_at_ms = unix_ms().saturating_sub(1_000);
+        let stage = authority
+            .prepare(
+                supervision_authority_request(
+                    "supervision-ticket-1",
+                    "supervision-operation-1",
+                    "supervision-lease-1",
+                    None,
+                    SupervisionLeaseOperation::Commit,
+                    supervision_authority_binding(LeaseState::Active, issued_at_ms)
+                        .expect("supervision binding"),
+                )
+                .expect("supervision request"),
+            )
+            .expect("stage supervision ticket");
+        assert!(
+            ors.load_current_supervision_lease(&stage.ticket.lease_id)
+                .expect("load pre-commit current")
+                .is_none()
+        );
+        drop(authority);
+        drop(ors);
+
+        // Restart recovery consumes only the authoritative ORS stage and
+        // reloads the protected key reference; it does not invent a revision.
+        let ors = Arc::new(RedbRecoveryStore::open(&ors_path).expect("reopen supervision ORS"));
+        let authority = KernelSupervisionLeaseAuthority::new(
+            Arc::clone(&ors),
+            &platform,
+            authority_config.clone(),
+        )
+        .expect("restart supervision authority");
+        let recovered = authority
+            .reconcile(4)
+            .expect("reconcile staged supervision ticket");
+        assert_eq!(recovered.len(), 1);
+        let first = recovered.into_iter().next().expect("recovered snapshot");
+        assert_eq!(first.record.revision, 1);
+        assert_eq!(
+            first.record.projection,
+            eliot_ors::SupervisionLeaseProjection::Active
+        );
+
+        // A lost response is an exact ORS result replay. Removing the
+        // provider item proves this path does not read or sign again.
+        platform
+            .delete_credential(&key)
+            .expect("delete seed for response-loss replay");
+        let replay = authority
+            .commit_active(&stage.ticket)
+            .expect("replay durable supervision result");
+        assert_eq!(replay, first);
+
+        // A fresh successor ticket must fail closed on a substituted key and
+        // remain staged until the exact trusted key is restored.
+        platform
+            .write_credential(&key, &seed)
+            .expect("restore supervision protected seed");
+        let renew_issued_at_ms = unix_ms();
+        let renew_stage = authority
+            .prepare(
+                supervision_authority_request(
+                    "supervision-ticket-2",
+                    "supervision-operation-2",
+                    "supervision-lease-1",
+                    Some(1),
+                    SupervisionLeaseOperation::Renew,
+                    supervision_authority_binding(LeaseState::Active, renew_issued_at_ms)
+                        .expect("renew supervision binding"),
+                )
+                .expect("renew supervision request"),
+            )
+            .expect("stage renew supervision ticket");
+        platform
+            .write_credential(&key, &[0x5a; 32])
+            .expect("substitute supervision protected seed");
+        let substitution = authority
+            .commit_active(&renew_stage.ticket)
+            .expect_err("substituted supervision key must fail closed");
+        assert!(matches!(
+            substitution,
+            SupervisionLeaseAuthorityError::ProtectedKeyUnavailable
+        ));
+        assert!(
+            ors.reconcile_staged_supervision_lease(&renew_stage.ticket.lease_id)
+                .expect("load staged renew ticket")
+                .is_some()
+        );
+        assert_eq!(
+            ors.load_current_supervision_lease(&stage.ticket.lease_id)
+                .expect("load current after substitution")
+                .expect("current active lease")
+                .record
+                .revision,
+            1
+        );
+
+        platform
+            .write_credential(&key, &seed)
+            .expect("restore trusted supervision seed");
+        let renewed = authority
+            .commit_active(&renew_stage.ticket)
+            .expect("commit trusted supervision renewal");
+        assert_eq!(renewed.record.revision, 2);
+
+        let revoke_stage = authority
+            .prepare(
+                supervision_authority_request(
+                    "supervision-ticket-3",
+                    "supervision-operation-3",
+                    "supervision-lease-1",
+                    Some(2),
+                    SupervisionLeaseOperation::Revoke,
+                    supervision_authority_binding(LeaseState::Revoked, renew_issued_at_ms)
+                        .expect("revoke supervision binding"),
+                )
+                .expect("revoke supervision request"),
+            )
+            .expect("stage revoke supervision ticket");
+        let revoked = authority
+            .commit_terminal(&revoke_stage.ticket)
+            .expect("commit trusted supervision revoke");
+        assert_eq!(revoked.record.revision, 3);
+        assert_eq!(
+            revoked.record.projection,
+            eliot_ors::SupervisionLeaseProjection::Terminal
+        );
+        platform
+            .delete_credential(&key)
+            .expect("delete seed for terminal response-loss replay");
+        let terminal_replay = authority
+            .commit_terminal(&revoke_stage.ticket)
+            .expect("replay durable terminal supervision result");
+        assert_eq!(terminal_replay, revoked);
+
+        // Restart after the durable result still exposes the exact ORS replay
+        // through the composition-injected authority.
+        drop(authority);
+        drop(ors);
+        // The terminal response-loss replay above intentionally left the
+        // provider item absent; retain that absence for the constructor test.
+        let missing_ors =
+            Arc::new(RedbRecoveryStore::open(&ors_path).expect("open ORS for missing-key restart"));
+        assert!(matches!(
+            KernelSupervisionLeaseAuthority::new(
+                Arc::clone(&missing_ors),
+                &platform,
+                authority_config.clone(),
+            ),
+            Err(KernelBuildError::Service(_))
+        ));
+        drop(missing_ors);
+        platform
+            .write_credential(&key, &seed)
+            .expect("restore seed for composition restart");
+        let composition = KernelComposition::new(
+            KernelConfig::new(&root).with_supervision_lease_authority(authority_config.clone()),
+        )
+        .expect("composition with protected supervision authority");
+        let restarted_authority = composition
+            .supervision_lease_authority()
+            .expect("injected supervision authority");
+        let restarted_replay = restarted_authority
+            .commit_terminal(&revoke_stage.ticket)
+            .expect("restart exact supervision replay");
+        assert_eq!(restarted_replay, revoked);
+
+        drop(composition);
         drop(credential);
     }
 

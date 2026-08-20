@@ -1031,6 +1031,59 @@ impl RedbRecoveryStore {
         self.commit_supervision_lease_artifact(ticket, artifact, None)
     }
 
+    /// Replays an already linearized supervision-lease commit without asking
+    /// the producer to sign the same revision again.
+    ///
+    /// The result row is written in the same redb transaction as the current
+    /// and history projections.  A matching row is therefore authoritative
+    /// evidence that the commit crossed the ORS linearization point even when
+    /// the original caller lost its response.  A mismatching row is treated as
+    /// a durable conflict rather than being interpreted as a caller retry.
+    pub fn replay_supervision_lease_commit(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+    ) -> Result<Option<SupervisionLeaseSnapshot>, OrsError> {
+        let expected_ticket_sha256 = ticket.ticket_sha256()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let results = read
+            .open_table(SUPERVISION_LEASE_RESULTS)
+            .map_err(storage)?;
+        let result = results
+            .get(ticket.ticket_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                decode_named::<DurableSupervisionLeaseResult>(
+                    value.value(),
+                    "supervision_lease_result",
+                )
+            })
+            .transpose()?;
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        result.snapshot.validate()?;
+        if result.ticket != *ticket
+            || result.snapshot.record.ticket_sha256 != expected_ticket_sha256
+            || result.artifact != result.snapshot.record.artifact
+        {
+            return Err(OrsError::SupervisionLeaseTicketConflict);
+        }
+        drop(read);
+        let current = self
+            .load_current_supervision_lease(&ticket.lease_id)?
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "supervision_lease_current",
+                reason: "durable commit result has no current projection".to_owned(),
+            })?;
+        if current != result.snapshot {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "supervision_lease_current",
+                reason: "durable current projection disagrees with commit result".to_owned(),
+            });
+        }
+        Ok(Some(result.snapshot))
+    }
+
     /// Commits a terminal revision only from a sealed transition token whose
     /// active predecessor is compared with the current durable ORS snapshot.
     pub fn commit_terminal_supervision_lease(
