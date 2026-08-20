@@ -1911,7 +1911,7 @@ pub enum KernelControlCommand {
     /// and Job, fresh PID/start/image and Store fence, without restarting
     /// Kernel.
     RebindStore(StoreRebindHandoff),
-    /// Reconcile a RebindStore request by operation digest after unknown delivery.
+    /// Reconcile a `RebindStore` request by operation digest after unknown delivery.
     ReconcileRebindStore(StoreRebindQuery),
     /// Begin reconciliation of the request's nonce-free candidate binding.
     Reconcile,

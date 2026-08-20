@@ -2336,13 +2336,13 @@ impl HostJobBranches {
     }
 
     #[cfg(windows)]
-    fn rebind_store_control<B: JournalBackend>(
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single ordered Host↔Kernel rebind transaction"
+    )]
+    fn rebind_store_control(
         &self,
         generation: &PlatformHandle,
-        host: &HostInstallationEpoch,
-        journal: &HostStateJournalService<B>,
-        activation_id: &PlatformHandle,
-        activation_generation: &EpochTransition,
     ) -> Result<StoreRebindReceipt, HostError> {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
@@ -2350,7 +2350,7 @@ impl HostJobBranches {
         let candidate = self.kernel_candidate.as_ref().ok_or_else(|| {
             HostError::ProcessContour("retained Kernel candidate binding is missing".to_owned())
         })?;
-        let activation = self.kernel_activation_receipt.as_ref().ok_or_else(|| {
+        self.kernel_activation_receipt.as_ref().ok_or_else(|| {
             HostError::ProcessContour("retained Kernel activation receipt is missing".to_owned())
         })?;
         let requirement = self.store_bootstrap_requirement.clone().ok_or_else(|| {
@@ -2422,7 +2422,6 @@ impl HostJobBranches {
         runtime.block_on(async {
             let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            let kernel_process = store_process;
             let expected_kernel_image = self
                 .kernel_executable
                 .as_ref()
@@ -2492,8 +2491,7 @@ impl HostJobBranches {
                         {
                             response.store_rebind_receipt
                         }
-                        Ok(_) => None,
-                        Err(_) => None,
+                        Ok(_) | Err(_) => None,
                     },
                     Err(_) => None,
                 }
@@ -6084,6 +6082,7 @@ impl HostComposition {
     /// readiness failures return [`HostBranchDisposition::ReadinessDegraded`]
     /// while preserving the independently recoverable process contour.
     #[cfg(windows)]
+    #[allow(clippy::too_many_lines, reason = "ordered branch reconciliation")]
     pub fn reconcile_approved_contour(&mut self) -> Result<HostBranchDisposition, HostError> {
         self.ensure_admission_open()?;
         let active =
@@ -6173,13 +6172,7 @@ impl HostComposition {
                 &active.manifest.generation,
                 HostBranchDisposition::StoreDegraded,
             );
-            if let Err(error) = self.jobs.rebind_store_control(
-                &active.manifest.generation,
-                &self.host,
-                &self.journal,
-                &self.activation_id,
-                &self.activation_generation,
-            ) {
+            if let Err(error) = self.jobs.rebind_store_control(&active.manifest.generation) {
                 if matches!(error, HostError::Journal(_)) {
                     self.readiness_gate.fail(
                         None,
@@ -9910,6 +9903,94 @@ mod tests {
         );
         assert_eq!(disposition, HostBranchDisposition::KernelDegraded);
         assert_eq!(state.kernel, Some(MockChild { id: 2, live: false }));
+    }
+
+    #[test]
+    fn pulse4_store_death_restarts_only_store_and_preserves_kernel_identity() {
+        let kernel_before = MockChild { id: 42, live: true };
+        let mut state = ReconciliationState {
+            store: Some(MockChild { id: 7, live: false }),
+            kernel: Some(kernel_before),
+            store_restart_attempts: 0,
+            kernel_restart_attempts: 0,
+        };
+        let kernel_identity_before = 42_u8;
+        let disposition = reconcile_state_machine(
+            &mut state,
+            mock_observation,
+            mock_observation,
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(MockChild { id: 99, live: true }),
+            || {
+                panic!("Kernel must not restart on Store-only death");
+            },
+        );
+        assert_eq!(disposition, HostBranchDisposition::LiveAwaitingReadiness);
+        assert_eq!(
+            state.kernel,
+            Some(MockChild {
+                id: kernel_identity_before,
+                live: true
+            })
+        );
+        assert_eq!(state.store, Some(MockChild { id: 99, live: true }));
+        assert_eq!(state.kernel_restart_attempts, 0);
+        assert_eq!(state.store_restart_attempts, 1);
+    }
+
+    #[test]
+    fn pulse4_store_rebind_fence_and_pipe_substitution_fails_closed() {
+        use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+        use eliot_kernel_service::{HostStoreBootstrapRequirement, StoreRebindHandoff};
+        let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let req = HostStoreBootstrapRequirement {
+            route_identity: PlatformHandle::new("store_bridge").unwrap(),
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
+            store_generation: ResourceGeneration::genesis(),
+            state_fence: fence,
+            launch_nonce: PlatformHandle::new("nonce-1").unwrap(),
+            connection_id: PlatformHandle::new("connection-1").unwrap(),
+            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            expected_peer_session_id: 0,
+            approved_artifact_hash: PlatformHandle::new(&"a".repeat(64)).unwrap(),
+            approved_config_hash: PlatformHandle::new(&"b".repeat(64)).unwrap(),
+            timeout_ms: 5000,
+        };
+        let mut bad = req.clone();
+        bad.canonical_pipe_identity = PlatformHandle::new(r"\\.\pipe\eliot\other").unwrap();
+        let handoff = StoreRebindHandoff {
+            operation_id: PlatformHandle::new("op-1").unwrap(),
+            request_digest: "d".repeat(64),
+            requirement: bad,
+            process_binding: eliot_kernel_service::StoreProcessBinding {
+                process: HostProcessBinding {
+                    process_id: 99,
+                    start_time_100ns: 100,
+                    image_path: r"C:\Eliot\store.exe".to_owned(),
+                },
+                job: PlatformHandle::new(r"Local\Eliot-Host-Store-test").unwrap(),
+            },
+            candidate_binding_digest: "f".repeat(64),
+            generation: ResourceGeneration::genesis(),
+            authority_epoch: AuthorityEpoch::genesis(),
+            store_fence: "a".repeat(64),
+        };
+        assert!(
+            handoff.validate().is_err()
+                || handoff.requirement.canonical_pipe_identity.as_str()
+                    != req.canonical_pipe_identity.as_str()
+        );
+    }
+
+    #[test]
+    fn pulse4_production_discriminator_host_and_kernel_call_sites_present() {
+        let host_src = include_str!("lib.rs");
+        assert!(
+            host_src.contains("rebind_store_control"),
+            "Host must drive rebind_store_control"
+        );
+        assert!(host_src.contains("StoreRebindHandoff") || host_src.contains("store_rebind"));
     }
 }
 

@@ -3215,6 +3215,10 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single ordered Store rebind transaction"
+    )]
     async fn rebind_store(
         &self,
         handoff: eliot_kernel_service::StoreRebindHandoff,
@@ -5312,8 +5316,6 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?
                 .reconcile_activation(query)
                 .map_err(|_| TransportError::SessionFenced)?,
-            KernelControlCommand::RebindStore(_)
-            | KernelControlCommand::ReconcileRebindStore(_) => None,
             _ => None,
         };
         #[cfg(windows)]

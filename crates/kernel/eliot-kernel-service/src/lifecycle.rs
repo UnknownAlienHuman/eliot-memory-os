@@ -521,8 +521,9 @@ impl KernelService {
                 && self.store_rebind_receipt.as_ref().is_some_and(|r| {
                     r.operation_id == handoff.operation_id && r.request_digest == request_digest
                 })
+                && let Some(receipt) = self.store_rebind_receipt.clone()
             {
-                return Ok(self.store_rebind_receipt.clone().unwrap());
+                return Ok(receipt);
             }
             return Err(KernelServiceError::InvalidField {
                 field: "store_rebind.operation_id",
