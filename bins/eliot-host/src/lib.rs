@@ -24,11 +24,12 @@ use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
     EliotActivationRecord, EpochIdentity, EpochTransition, HostInstallationEpoch,
     HostKernelStoreLineage, HostObservationRecord, HostState, HostStateJournalService,
-    HostStateRecord, IdempotencyIdentity, JOURNAL_VERSION, JournalBackend, JournalError,
-    JournalManifest, KernelJobBinding, KernelReadinessObservationRecord, KernelRecord,
-    LifecycleTimestamps, NonceState, OneTimeNonceState, PriorKernelDisposition, PriorKernelSource,
-    ProductionHostStateJournal, ReadinessApprovedContour, ReadinessEvidence, ReconcileOutcome,
-    RecordFence, RecoveryLineageEvidence, RedbJournalBackend, WakeDisposition, record_checksum,
+    HostStateRecord, IdempotencyIdentity, StoreRebindRecord, StoreRebindState, JOURNAL_VERSION,
+    JournalBackend, JournalError, JournalManifest, KernelJobBinding,
+    KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps, NonceState,
+    OneTimeNonceState, PriorKernelDisposition, PriorKernelSource, ProductionHostStateJournal,
+    ReadinessApprovedContour, ReadinessEvidence, ReconcileOutcome, RecordFence,
+    RecoveryLineageEvidence, RedbJournalBackend, WakeDisposition, record_checksum,
 };
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest, InstallationError,
@@ -2343,6 +2344,10 @@ impl HostJobBranches {
     fn rebind_store_control(
         &self,
         generation: &PlatformHandle,
+        journal: &ProductionHostStateJournal,
+        host: &HostInstallationEpoch,
+        activation_id: &PlatformHandle,
+        activation_generation: &EpochTransition,
     ) -> Result<StoreRebindReceipt, HostError> {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
@@ -2447,7 +2452,14 @@ impl HostJobBranches {
                 &expected_kernel_image,
             )?;
             let mut handoff_with_digest = handoff.clone();
-            let mut request = KernelControlRequest {
+            let canonical = handoff_with_digest
+                .canonical_request_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            handoff_with_digest.request_digest = canonical.clone();
+            handoff_with_digest
+                .validate_canonical_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let request = KernelControlRequest {
                 wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
                 wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
                 message_id: fresh_identity("store-rebind-req")?,
@@ -2456,15 +2468,48 @@ impl HostJobBranches {
                 generation: launch.authority_generation,
                 candidate: candidate.clone(),
                 command: KernelControlCommand::RebindStore(handoff_with_digest.clone()),
-                payload_digest: String::new(),
-            }
-            .with_computed_digest()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            handoff_with_digest.request_digest = request.payload_digest.clone();
-            request.command = KernelControlCommand::RebindStore(handoff_with_digest.clone());
-            request.payload_digest = request
-                .compute_digest()
+                payload_digest: canonical.clone(),
+            };
+            request
+                .validate()
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let pending_record = StoreRebindRecord {
+                fence: record_fence(host, activation_id, activation_generation),
+                operation: operation(&format!("store-rebind:{}", handoff_with_digest.operation_id.as_str()))?,
+                state: StoreRebindState::Pending,
+                operation_id: handoff_with_digest.operation_id.clone(),
+                request_digest: PlatformHandle::new(canonical.clone())
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                requirement: PlatformHandle::new(format!(
+                    "{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(&handoff.requirement)
+                            .map_err(|error| HostError::Platform(error.to_string()))?
+                    )
+                ))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+                candidate_binding_digest: PlatformHandle::new(
+                    handoff_with_digest.candidate_binding_digest.clone(),
+                )
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+                store_fence: PlatformHandle::new(handoff_with_digest.store_fence.clone())
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                process_id: handoff_with_digest.process_binding.process.process_id,
+                process_start_time_100ns: handoff_with_digest
+                    .process_binding
+                    .process
+                    .start_time_100ns,
+                process_image_path: PlatformHandle::new(
+                    handoff_with_digest.process_binding.process.image_path.clone(),
+                )
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+                job_name: handoff_with_digest.process_binding.job.clone(),
+                generation: handoff_with_digest.generation.value(),
+                authority_epoch: handoff_with_digest.authority_epoch.value(),
+                receipt_request_digest: None,
+                receipt_store_fence: None,
+            };
+            append_reconciled(journal, HostStateRecord::StoreRebind(pending_record))?;
             let frame = control_request_frame(
                 format!(
                     "host-rebind:{}:{}",
@@ -2584,6 +2629,60 @@ impl HostJobBranches {
                     "Store rebind receipt binding mismatch".to_owned(),
                 ));
             }
+            if final_receipt.request_digest != canonical
+                || final_receipt.operation_id != handoff_with_digest.operation_id
+                || final_receipt.store_fence != handoff_with_digest.store_fence
+            {
+                return Err(HostError::ProcessContour(
+                    "Store rebind receipt exact fields mismatch".to_owned(),
+                ));
+            }
+            let committed_record = StoreRebindRecord {
+                fence: record_fence(host, activation_id, activation_generation),
+                operation: operation(&format!(
+                    "store-rebind:{}:committed",
+                    handoff_with_digest.operation_id.as_str()
+                ))?,
+                state: StoreRebindState::Committed,
+                operation_id: handoff_with_digest.operation_id.clone(),
+                request_digest: PlatformHandle::new(canonical.clone())
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                requirement: PlatformHandle::new(format!(
+                    "{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(&handoff.requirement)
+                            .map_err(|error| HostError::Platform(error.to_string()))?
+                    )
+                ))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+                candidate_binding_digest: PlatformHandle::new(
+                    handoff_with_digest.candidate_binding_digest.clone(),
+                )
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+                store_fence: PlatformHandle::new(handoff_with_digest.store_fence.clone())
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                process_id: handoff_with_digest.process_binding.process.process_id,
+                process_start_time_100ns: handoff_with_digest
+                    .process_binding
+                    .process
+                    .start_time_100ns,
+                process_image_path: PlatformHandle::new(
+                    handoff_with_digest.process_binding.process.image_path.clone(),
+                )
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+                job_name: handoff_with_digest.process_binding.job.clone(),
+                generation: handoff_with_digest.generation.value(),
+                authority_epoch: handoff_with_digest.authority_epoch.value(),
+                receipt_request_digest: Some(
+                    PlatformHandle::new(final_receipt.request_digest.clone())
+                        .map_err(|error| HostError::Platform(error.to_string()))?,
+                ),
+                receipt_store_fence: Some(
+                    PlatformHandle::new(final_receipt.store_fence.clone())
+                        .map_err(|error| HostError::Platform(error.to_string()))?,
+                ),
+            };
+            append_reconciled(journal, HostStateRecord::StoreRebind(committed_record))?;
             Ok(final_receipt)
         })
     }
@@ -6172,7 +6271,13 @@ impl HostComposition {
                 &active.manifest.generation,
                 HostBranchDisposition::StoreDegraded,
             );
-            if let Err(error) = self.jobs.rebind_store_control(&active.manifest.generation) {
+            if let Err(error) = self.jobs.rebind_store_control(
+                &active.manifest.generation,
+                &self.journal,
+                &self.host,
+                &self.activation_id,
+                &self.activation_generation,
+            ) {
                 if matches!(error, HostError::Journal(_)) {
                     self.readiness_gate.fail(
                         None,

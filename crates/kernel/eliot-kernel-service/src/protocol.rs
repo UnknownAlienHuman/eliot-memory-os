@@ -1,6 +1,6 @@
 //! Host↔Kernel protocol records.
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{sha256_hex, AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_ipc::TransportError;
 use eliot_kernel_core::AuthoritySnapshotBindingWire;
 use eliot_platform::{KernelActivationNonce, PlatformHandle, PortError, SecretReference};
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::{KernelServiceError, KernelServiceState, validate_text};
+use crate::{validate_text, KernelServiceError, KernelServiceState};
 
 fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServiceError> {
     validate_text(value.as_str(), field)
@@ -384,6 +384,46 @@ impl StoreRebindHandoff {
                 reason: "cannot canonicalize requirement",
             })
     }
+
+    /// Returns the canonical non-circular request digest.
+    pub fn canonical_request_digest(&self) -> Result<String, KernelServiceError> {
+        #[derive(serde::Serialize)]
+        struct Canonical<'a> {
+            operation_id: &'a PlatformHandle,
+            requirement: &'a HostStoreBootstrapRequirement,
+            process_binding: &'a StoreProcessBinding,
+            candidate_binding_digest: &'a str,
+            generation: ResourceGeneration,
+            authority_epoch: AuthorityEpoch,
+            store_fence: &'a str,
+        }
+        let canonical = Canonical {
+            operation_id: &self.operation_id,
+            requirement: &self.requirement,
+            process_binding: &self.process_binding,
+            candidate_binding_digest: &self.candidate_binding_digest,
+            generation: self.generation,
+            authority_epoch: self.authority_epoch,
+            store_fence: &self.store_fence,
+        };
+        serde_json::to_vec(&canonical)
+            .map(|b| sha256_hex(&b))
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "store_rebind.request_digest",
+                reason: "cannot canonicalize rebind",
+            })
+    }
+
+    /// Validates that the request digest equals the canonical digest.
+    pub fn validate_canonical_digest(&self) -> Result<(), KernelServiceError> {
+        let expected = self.canonical_request_digest()?;
+        if self.request_digest != expected {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "store_rebind.request_digest",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Digest-only reconciliation query for a rebind whose delivery was unknown.
@@ -656,6 +696,7 @@ impl KernelControlRequest {
         }
         if let KernelControlCommand::RebindStore(handoff) = &self.command {
             handoff.validate()?;
+            handoff.validate_canonical_digest()?;
             if handoff.candidate_binding_digest != self.candidate.compute_digest()? {
                 return Err(KernelServiceError::HandshakeMismatch {
                     field: "store_rebind.candidate_binding",
@@ -666,6 +707,11 @@ impl KernelControlRequest {
             {
                 return Err(KernelServiceError::HandshakeMismatch {
                     field: "store_rebind.generation_or_epoch",
+                });
+            }
+            if self.payload_digest != handoff.request_digest {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "store_rebind.request_digest",
                 });
             }
         }
@@ -680,7 +726,14 @@ impl KernelControlRequest {
                 .payload_digest
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            || self.compute_digest()? != self.payload_digest
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.payload_digest",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        if !matches!(&self.command, KernelControlCommand::RebindStore(_))
+            && self.compute_digest()? != self.payload_digest
         {
             return Err(KernelServiceError::InvalidField {
                 field: "control.payload_digest",
@@ -2314,17 +2367,13 @@ mod tests {
         stale_request.message_id = handle_value("probe-message-2");
         stale_request.sequence = 6;
         stale_request.payload_digest = stale_request.compute_digest().expect("stale digest");
-        assert!(
-            receipt
-                .validate_for_probe(&stale_request, &activation)
-                .is_err()
-        );
+        assert!(receipt
+            .validate_for_probe(&stale_request, &activation)
+            .is_err());
         let repeated = bound_ready_receipt(&stale_request, &activation);
-        assert!(
-            repeated
-                .validate_for_probe(&stale_request, &activation)
-                .is_ok()
-        );
+        assert!(repeated
+            .validate_for_probe(&stale_request, &activation)
+            .is_ok());
         assert_ne!(request.payload_digest, stale_request.payload_digest);
         assert_ne!(receipt.evidence_refs, repeated.evidence_refs);
         assert_eq!(
@@ -2338,16 +2387,12 @@ mod tests {
             .compute_digest()
             .expect("next repeat digest");
         let next_repeated = bound_ready_receipt(&next_repeat_request, &activation);
-        assert!(
-            next_repeated
-                .validate_for_probe(&next_repeat_request, &activation)
-                .is_ok()
-        );
-        assert!(
-            repeated
-                .validate_for_probe(&next_repeat_request, &activation)
-                .is_err()
-        );
+        assert!(next_repeated
+            .validate_for_probe(&next_repeat_request, &activation)
+            .is_ok());
+        assert!(repeated
+            .validate_for_probe(&next_repeat_request, &activation)
+            .is_err());
         assert_ne!(repeated.evidence_refs, next_repeated.evidence_refs);
         assert_eq!(
             repeated.activation_nonce_digest,
@@ -2357,29 +2402,23 @@ mod tests {
         let mut other_generation = request.clone();
         other_generation.generation = ResourceGeneration::new(4).expect("generation");
         other_generation.payload_digest = other_generation.compute_digest().expect("digest");
-        assert!(
-            receipt
-                .validate_for_probe(&other_generation, &activation)
-                .is_err()
-        );
+        assert!(receipt
+            .validate_for_probe(&other_generation, &activation)
+            .is_err());
 
         let mut other_fence = request.clone();
         other_fence.candidate.kernel_epoch = AuthorityEpoch::new(2).expect("epoch");
         other_fence.payload_digest = other_fence.compute_digest().expect("digest");
-        assert!(
-            receipt
-                .validate_for_probe(&other_fence, &activation)
-                .is_err()
-        );
+        assert!(receipt
+            .validate_for_probe(&other_fence, &activation)
+            .is_err());
 
         let mut other_config = request.clone();
         other_config.candidate.config_hash = handle_value("config-2");
         other_config.payload_digest = other_config.compute_digest().expect("digest");
-        assert!(
-            receipt
-                .validate_for_probe(&other_config, &activation)
-                .is_err()
-        );
+        assert!(receipt
+            .validate_for_probe(&other_config, &activation)
+            .is_err());
 
         let mut ambiguous = receipt.clone();
         ambiguous
@@ -2396,11 +2435,9 @@ mod tests {
         substituted
             .evidence_refs
             .push(handle_value("kernel-probe-authority-epoch:99"));
-        assert!(
-            substituted
-                .validate_for_probe(&request, &activation)
-                .is_err()
-        );
+        assert!(substituted
+            .validate_for_probe(&request, &activation)
+            .is_err());
 
         let mut non_probe = request;
         non_probe.command = KernelControlCommand::Drain;

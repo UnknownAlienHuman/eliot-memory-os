@@ -2119,6 +2119,70 @@ pub enum OrsError {
     Encoding(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StoreRebindReplayState {
+    Pending,
+    Committed,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRebindReplayRecord {
+    pub operation_id: OperationIdentity,
+    pub request_digest: String,
+    pub candidate_binding_digest: String,
+    pub store_fence: String,
+    pub requirement_digest: String,
+    pub process_id: u32,
+    pub process_start_time_100ns: u64,
+    pub process_image_path: String,
+    pub job_name: String,
+    pub generation: u64,
+    pub authority_epoch: u64,
+    pub state: StoreRebindReplayState,
+    pub receipt: Option<String>,
+}
+
+impl StoreRebindReplayRecord {
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(self.operation_id.as_str(), "store_rebind_operation_id")?;
+        validate_digest(&self.request_digest, "store_rebind_request_digest")?;
+        validate_digest(&self.candidate_binding_digest, "store_rebind_candidate_digest")?;
+        validate_digest(&self.store_fence, "store_rebind_store_fence")?;
+        validate_digest(&self.requirement_digest, "store_rebind_requirement_digest")?;
+        if self.process_id == 0 || self.process_start_time_100ns == 0 {
+            return Err(OrsError::InvalidField {
+                field: "store_rebind_process",
+                reason: "must be non-zero",
+            });
+        }
+        validate_text(&self.process_image_path, "store_rebind_image")?;
+        validate_text(&self.job_name, "store_rebind_job")?;
+        if self.generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "store_rebind_epoch",
+                reason: "must be non-zero",
+            });
+        }
+        if let Some(receipt) = &self.receipt {
+            validate_digest(receipt, "store_rebind_receipt")?;
+            if self.state != StoreRebindReplayState::Committed {
+                return Err(OrsError::InvalidField {
+                    field: "store_rebind_state",
+                    reason: "receipt only for committed",
+                });
+            }
+        } else if self.state == StoreRebindReplayState::Committed {
+            return Err(OrsError::InvalidField {
+                field: "store_rebind_receipt",
+                reason: "committed requires receipt",
+            });
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), OrsError> {
     if value.trim().is_empty() {
         return Err(OrsError::InvalidField {

@@ -1482,6 +1482,117 @@ impl EpochRetirementRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StoreRebindState {
+    Pending,
+    Committed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRebindRecord {
+    pub fence: RecordFence,
+    pub operation: IdempotencyIdentity,
+    pub state: StoreRebindState,
+    pub operation_id: PlatformHandle,
+    pub request_digest: PlatformHandle,
+    pub requirement: PlatformHandle,
+    pub candidate_binding_digest: PlatformHandle,
+    pub store_fence: PlatformHandle,
+    pub process_id: u32,
+    pub process_start_time_100ns: u64,
+    pub process_image_path: PlatformHandle,
+    pub job_name: PlatformHandle,
+    pub generation: u64,
+    pub authority_epoch: u64,
+    pub receipt_request_digest: Option<PlatformHandle>,
+    pub receipt_store_fence: Option<PlatformHandle>,
+}
+
+impl StoreRebindRecord {
+    fn validate(&self) -> Result<(), JournalError> {
+        self.fence.validate()?;
+        self.operation.validate()?;
+        handle(&self.operation_id, "store_rebind.operation_id")?;
+        digest(&self.request_digest, "store_rebind.request_digest")?;
+        handle(&self.requirement, "store_rebind.requirement")?;
+        digest(&self.candidate_binding_digest, "store_rebind.candidate_binding_digest")?;
+        digest(&self.store_fence, "store_rebind.store_fence")?;
+        if self.process_id == 0 || self.process_start_time_100ns == 0 {
+            return Err(JournalError::Invalid("store_rebind process identity must be non-zero".into()));
+        }
+        handle(&self.process_image_path, "store_rebind.process_image_path")?;
+        handle(&self.job_name, "store_rebind.job_name")?;
+        if self.generation == 0 || self.authority_epoch == 0 {
+            return Err(JournalError::Invalid("store_rebind generation and epoch must be non-zero".into()));
+        }
+        if let Some(value) = &self.receipt_request_digest {
+            digest(value, "store_rebind.receipt_request_digest")?;
+        }
+        if let Some(value) = &self.receipt_store_fence {
+            digest(value, "store_rebind.receipt_store_fence")?;
+        }
+        match self.state {
+            StoreRebindState::Pending => {
+                if self.receipt_request_digest.is_some() || self.receipt_store_fence.is_some() {
+                    return Err(JournalError::Invalid("pending store rebind must not carry receipt".into()));
+                }
+            }
+            StoreRebindState::Committed => {
+                if self.receipt_request_digest.is_none() || self.receipt_store_fence.is_none() {
+                    return Err(JournalError::Invalid("committed store rebind requires receipt".into()));
+                }
+                if self.receipt_request_digest.as_ref() != Some(&self.request_digest) {
+                    return Err(JournalError::Invalid("committed receipt digest must match request".into()));
+                }
+                if self.receipt_store_fence.as_ref() != Some(&self.store_fence) {
+                    return Err(JournalError::Invalid("committed receipt fence must match handoff fence".into()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn store_rebind_transition(
+    current: Option<&StoreRebindRecord>,
+    next: &StoreRebindRecord,
+) -> Result<(), JournalError> {
+    if let Some(current) = current {
+        if current.fence != next.fence
+            || current.operation_id != next.operation_id
+            || current.request_digest != next.request_digest
+        {
+            return Err(JournalError::StaleFence);
+        }
+        let legal = matches!(
+            (current.state, next.state),
+            (StoreRebindState::Pending, StoreRebindState::Committed)
+        );
+        if !legal {
+            return Err(illegal("store_rebind", current.state, next.state));
+        }
+        if current.requirement != next.requirement
+            || current.candidate_binding_digest != next.candidate_binding_digest
+            || current.store_fence != next.store_fence
+            || current.process_id != next.process_id
+            || current.process_start_time_100ns != next.process_start_time_100ns
+            || current.process_image_path != next.process_image_path
+            || current.job_name != next.job_name
+            || current.generation != next.generation
+            || current.authority_epoch != next.authority_epoch
+        {
+            return Err(JournalError::StaleFence);
+        }
+        Ok(())
+    } else if next.state == StoreRebindState::Pending {
+        Ok(())
+    } else {
+        Err(illegal("store_rebind", "NONE", next.state))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
@@ -1496,6 +1607,7 @@ pub enum HostStateRecord {
     ReadinessObservation(KernelReadinessObservationRecord),
     CleanMarker(CleanMarker),
     EpochRetirement(EpochRetirementRecord),
+    StoreRebind(StoreRebindRecord),
 }
 
 impl HostStateRecord {
@@ -1511,6 +1623,7 @@ impl HostStateRecord {
             Self::ReadinessObservation(value) => value.validate(),
             Self::CleanMarker(value) => value.validate(),
             Self::EpochRetirement(value) => value.validate(),
+            Self::StoreRebind(value) => value.validate(),
         }
     }
 
@@ -1534,6 +1647,7 @@ impl HostStateRecord {
             Self::ReadinessObservation(value) => &value.fence,
             Self::CleanMarker(value) => &value.fence,
             Self::EpochRetirement(value) => &value.fence,
+            Self::StoreRebind(value) => &value.fence,
         }
     }
 
@@ -1549,6 +1663,7 @@ impl HostStateRecord {
             Self::ReadinessObservation(value) => &value.operation,
             Self::CleanMarker(value) => &value.operation,
             Self::EpochRetirement(value) => &value.operation,
+            Self::StoreRebind(value) => &value.operation,
         }
     }
 }
@@ -1593,6 +1708,8 @@ pub struct HostState {
     pub wakes: Vec<WakeRecord>,
     pub observations: Vec<HostObservationRecord>,
     pub readiness_observations: Vec<KernelReadinessObservationRecord>,
+    #[serde(default)]
+    pub store_rebinds: Vec<StoreRebindRecord>,
     pub clean_marker: Option<CleanMarker>,
     pub retained_epochs: Vec<EpochEvidence>,
     pub retired_epochs: Vec<HostInstallationEpoch>,
@@ -1616,6 +1733,7 @@ impl HostState {
             wakes: Vec::new(),
             observations: Vec::new(),
             readiness_observations: Vec::new(),
+            store_rebinds: Vec::new(),
             clean_marker: None,
             retained_epochs,
             retired_epochs: Vec::new(),

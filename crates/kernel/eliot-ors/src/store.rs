@@ -68,6 +68,8 @@ const SUPERVISION_LEASE_HISTORY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_history_v1");
 const SUPERVISION_LEASE_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_results_v1");
+const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_store_rebind_replay_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 
 fn current_unix_ms() -> Result<i64, OrsError> {
@@ -627,6 +629,119 @@ impl RedbRecoveryStore {
         drop(table);
         write.commit().map_err(storage)?;
         Ok(result)
+    }
+
+    pub fn begin_store_rebind(
+        &self,
+        record: &crate::StoreRebindReplayRecord,
+    ) -> Result<Option<crate::StoreRebindReplayRecord>, OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = format!("{}::{}", record.operation_id.as_str(), record.request_digest.clone());
+        let existing = {
+            let mut table = write.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
+            if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
+                let existing: crate::StoreRebindReplayRecord = decode(existing.value())?;
+                existing.validate()?;
+                if existing.request_digest != record.request_digest
+                    || existing.candidate_binding_digest != record.candidate_binding_digest
+                    || existing.store_fence != record.store_fence
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "store_rebind_replay",
+                        reason: "existing store rebind conflicts".to_owned(),
+                    });
+                }
+                Some(existing)
+            } else {
+                let payload = encode(record)?;
+                table.insert(key.as_str(), payload.as_str()).map_err(storage)?;
+                None
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(existing)
+    }
+
+    pub fn load_store_rebind(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::StoreRebindReplayRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        table
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::StoreRebindReplayRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    pub fn persist_store_rebind(
+        &self,
+        record: &crate::StoreRebindReplayRecord,
+    ) -> Result<(), OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut table = write.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
+            let key = format!("{}::{}", record.operation_id.as_str(), record.request_digest.clone());
+            let existing: Option<crate::StoreRebindReplayRecord> = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?;
+            if let Some(existing) = &existing {
+                existing.validate()?;
+                if existing.request_digest.clone() != record.request_digest.clone()
+                    || existing.candidate_binding_digest.clone() != record.candidate_binding_digest.clone()
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "store_rebind_replay",
+                        reason: "store rebind replacement rejected".to_owned(),
+                    });
+                }
+                let allowed = match (existing.state, record.state) {
+                    (crate::StoreRebindReplayState::Pending, crate::StoreRebindReplayState::Committed)
+                    | (crate::StoreRebindReplayState::Pending, crate::StoreRebindReplayState::Pending)
+                    | (crate::StoreRebindReplayState::Committed, crate::StoreRebindReplayState::Committed) => {
+                        existing == record || existing.state == crate::StoreRebindReplayState::Pending
+                    }
+                    _ => false,
+                };
+                if !allowed {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "store_rebind_replay",
+                        reason: "non-monotonic store rebind transition".to_owned(),
+                    });
+                }
+            }
+            if existing.as_ref().is_none_or(|current| current != record) {
+                let payload = encode(record)?;
+                table.insert(key.as_str(), payload.as_str()).map_err(storage)?;
+            }
+        }
+        write.commit().map_err(storage)
+    }
+
+    pub fn load_all_store_rebinds(
+        &self,
+    ) -> Result<Vec<crate::StoreRebindReplayRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
+        let mut records = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let record: crate::StoreRebindReplayRecord = decode(value.value())?;
+            record.validate()?;
+            records.push(record);
+        }
+        Ok(records)
     }
 
     /// Test-only admission hook without a freshness check.
@@ -4495,6 +4610,14 @@ impl PersistedValue for DurableSupervisionLeaseResult {
             return Err(OrsError::SupervisionLeaseBindingMismatch);
         }
         Ok(())
+    }
+}
+
+impl PersistedValue for crate::StoreRebindReplayRecord {
+    const RECORD_TYPE: &'static str = "store_rebind_replay";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
     }
 }
 

@@ -3227,6 +3227,14 @@ impl KernelComposition {
         handoff
             .validate()
             .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+        handoff
+            .validate_canonical_digest()
+            .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+        if request_digest != handoff.request_digest {
+            return Err(KernelBuildError::Service(
+                "Store rebind request digest must equal canonical handoff digest".to_owned(),
+            ));
+        }
         if self.store_bootstrap.as_ref() != Some(&handoff.requirement) {
             return Err(KernelBuildError::Service(
                 "Store rebind requirement is not the immutable bootstrap descriptor".to_owned(),
@@ -3240,6 +3248,33 @@ impl KernelComposition {
             return Err(KernelBuildError::Service(
                 "Store rebind outer digest invalid".to_owned(),
             ));
+        }
+        {
+            let requirement_digest = {
+                let bytes = serde_json::to_vec(&handoff.requirement)
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+                format!("{:x}", Sha256::digest(&bytes))
+            };
+            let pending = eliot_ors::StoreRebindReplayRecord {
+                operation_id: eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
+                request_digest: request_digest.clone(),
+                candidate_binding_digest: handoff.candidate_binding_digest.clone(),
+                store_fence: handoff.store_fence.clone(),
+                requirement_digest: requirement_digest.clone(),
+                process_id: handoff.process_binding.process.process_id,
+                process_start_time_100ns: handoff.process_binding.process.start_time_100ns,
+                process_image_path: handoff.process_binding.process.image_path.clone(),
+                job_name: handoff.process_binding.job.as_str().to_owned(),
+                generation: handoff.generation.value(),
+                authority_epoch: handoff.authority_epoch.value(),
+                state: eliot_ors::StoreRebindReplayState::Pending,
+                receipt: None,
+            };
+            self.generation_gateway
+                .ors
+                .begin_store_rebind(&pending)
+                .map_err(|e| KernelBuildError::Service(e.to_string()))?;
         }
         {
             let service = self
@@ -3421,6 +3456,37 @@ impl KernelComposition {
                 }
             }
         };
+        {
+            let requirement_digest = {
+                let bytes = serde_json::to_vec(&handoff.requirement)
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))?;
+                format!("{:x}", Sha256::digest(&bytes))
+            };
+            let committed = eliot_ors::StoreRebindReplayRecord {
+                operation_id: eliot_ors::OperationIdentity::new(handoff.operation_id.as_str())
+                    .map_err(|e| KernelBuildError::Service(e.to_string()))?,
+                request_digest: request_digest.clone(),
+                candidate_binding_digest: handoff.candidate_binding_digest.clone(),
+                store_fence: handoff.store_fence.clone(),
+                requirement_digest,
+                process_id: handoff.process_binding.process.process_id,
+                process_start_time_100ns: handoff.process_binding.process.start_time_100ns,
+                process_image_path: handoff.process_binding.process.image_path.clone(),
+                job_name: handoff.process_binding.job.as_str().to_owned(),
+                generation: handoff.generation.value(),
+                authority_epoch: handoff.authority_epoch.value(),
+                state: eliot_ors::StoreRebindReplayState::Committed,
+                receipt: Some(receipt.request_digest.clone()),
+            };
+            if let Err(error) = self
+                .generation_gateway
+                .ors
+                .persist_store_rebind(&committed)
+            {
+                gateway.fence();
+                return Err(KernelBuildError::Service(error.to_string()));
+            }
+        }
         let old_gateway =
             {
                 let mut gw_guard = self.canonical_store_gateway.lock().map_err(|_| {
@@ -5284,12 +5350,58 @@ impl KernelComposition {
                         .map_err(|_| TransportError::SessionFenced)?;
                     Some(receipt)
                 }
-                KernelControlCommand::ReconcileRebindStore(query) => self
-                    .service
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .reconcile_store_rebind(query)
-                    .map_err(|_| TransportError::SessionFenced)?,
+                KernelControlCommand::ReconcileRebindStore(query) => {
+                    let svc_receipt = self
+                        .service
+                        .lock()
+                        .map_err(|_| TransportError::SessionFenced)?
+                        .reconcile_store_rebind(query)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    if svc_receipt.is_some() {
+                        svc_receipt
+                    } else {
+                        let op_id = eliot_ors::OperationIdentity::new(query.operation_id.as_str())
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        let record = self
+                            .generation_gateway
+                            .ors
+                            .load_store_rebind(&op_id, &query.request_digest)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        if let Some(record) =
+                            record.filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
+                        {
+                            let receipt = eliot_kernel_service::StoreRebindReceipt {
+                                operation_id: eliot_platform::PlatformHandle::new(
+                                    record.operation_id.as_str(),
+                                )
+                                .map_err(|_| TransportError::SessionFenced)?,
+                                request_digest: record.request_digest.clone(),
+                                requirement_digest: record.requirement_digest.clone(),
+                                process_binding: eliot_kernel_service::StoreProcessBinding {
+                                    process: eliot_kernel_service::HostProcessBinding {
+                                        process_id: record.process_id,
+                                        start_time_100ns: record.process_start_time_100ns,
+                                        image_path: record.process_image_path.clone(),
+                                    },
+                                    job: eliot_platform::PlatformHandle::new(record.job_name.clone())
+                                        .map_err(|_| TransportError::SessionFenced)?,
+                                },
+                                candidate_binding_digest: record.candidate_binding_digest.clone(),
+                                generation: ResourceGeneration::new(record.generation)
+                                    .map_err(|_| TransportError::SessionFenced)?,
+                                authority_epoch: AuthorityEpoch::new(record.authority_epoch)
+                                    .map_err(|_| TransportError::SessionFenced)?,
+                                store_fence: record.store_fence.clone(),
+                            };
+                            receipt
+                                .validate()
+                                .map_err(|_| TransportError::SessionFenced)?;
+                            Some(receipt)
+                        } else {
+                            None
+                        }
+                    }
+                }
                 _ => None,
             };
         let is_probe = matches!(&request.command, KernelControlCommand::ProbeReady);

@@ -579,6 +579,36 @@ impl KernelService {
         self.store_rebind_receipt.as_ref()
     }
 
+    /// Restores a durable Store rebind receipt before control admission.
+    pub fn restore_store_rebind_for_recovery(
+        &mut self,
+        receipt: crate::protocol::StoreRebindReceipt,
+        request_digest: String,
+    ) -> Result<(), KernelServiceError> {
+        receipt.validate()?;
+        if request_digest != receipt.request_digest {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "store_rebind.request_digest",
+            });
+        }
+        if self.store_rebind_receipt.is_some() || self.store_rebind_request_digest.is_some() {
+            return Err(KernelServiceError::InvalidField {
+                field: "store_rebind.operation_id",
+                reason: "Store rebind already consumed for this lineage",
+            });
+        }
+        self.store_rebind_receipt = Some(receipt);
+        self.store_rebind_request_digest = Some(request_digest);
+        if self.state == KernelServiceState::Ready {
+            self.transition(KernelServiceState::Degraded)?;
+            self.ready = None;
+            self.failure = Some(ServiceFailure::Contract(
+                "store-rebind:recovered-degraded".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Publishes an initial, repeated, or recovery readiness receipt after
     /// exact candidate, activation receipt, and health checks.
     pub fn mark_ready(&mut self, receipt: KernelReadyReceipt) -> Result<(), KernelServiceError> {

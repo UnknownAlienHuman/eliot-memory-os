@@ -8,7 +8,7 @@ use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, Prepa
 use crate::model::{
     AppliedOperation, EpochEvidence, HostInstallationEpoch, HostState, HostStateRecord,
     IdempotencyIdentity, RecoveryLineageReason, activation_transition, dependency_transition,
-    drain_transition, kernel_transition, wake_transition,
+    drain_transition, kernel_transition, store_rebind_transition, wake_transition,
 };
 use crate::{JournalBackend, JournalError, ReconcileOutcome};
 
@@ -488,6 +488,19 @@ fn apply(
             state.readiness_observations.push(next.clone());
             state.clean_marker = None;
         }
+        HostStateRecord::StoreRebind(next) => {
+            let key = (next.operation_id.as_str(), next.request_digest.as_str());
+            let index = state.store_rebinds.iter().position(|item| {
+                item.operation_id.as_str() == key.0 && item.request_digest.as_str() == key.1
+            });
+            store_rebind_transition(index.map(|i| &state.store_rebinds[i]), next)?;
+            if let Some(idx) = index {
+                state.store_rebinds[idx] = next.clone();
+            } else {
+                state.store_rebinds.push(next.clone());
+            }
+            state.clean_marker = None;
+        }
         HostStateRecord::CleanMarker(next) => {
             let genesis_without_runtime_contour = state
                 .activation
@@ -502,7 +515,8 @@ fn apply(
                 && state.drain_commit.is_none()
                 && state.wakes.is_empty()
                 && state.observations.is_empty()
-                && state.readiness_observations.is_empty();
+                && state.readiness_observations.is_empty()
+                && state.store_rebinds.is_empty();
             if next.manifest.schema_version != JOURNAL_VERSION
                 || next.manifest.last_sequence != state.sequence
                 || next.manifest.last_checksum.as_str()

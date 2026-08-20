@@ -36,7 +36,8 @@ pub use model::{
     KernelJobBinding, KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps,
     NonceState, OneTimeNonceState, PriorKernelDisposition, PriorKernelSource,
     ReadinessApprovedContour, ReadinessEvidence, RecordFence, RecoveryLineageEvidence,
-    RecoveryLineageReason, ServiceSafetyClass, WakeDisposition, WakeRecord,
+    RecoveryLineageReason, ServiceSafetyClass, StoreRebindRecord, StoreRebindState, WakeDisposition,
+    WakeRecord,
 };
 pub use redb_journal::{RedbJournalBackend, RedbJournalInspection};
 pub use redb_store::{
