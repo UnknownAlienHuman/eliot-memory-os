@@ -1320,6 +1320,332 @@ pub struct HostStoreBootstrapRequirement {
 /// Store-neutral name for the Host handoff descriptor.
 pub type StoreBootstrapDescriptor = HostStoreBootstrapRequirement;
 
+/// Computes the semantic Store configuration identity from the exact JSON
+/// bytes consumed by `eliot-store-surreal`.
+///
+/// The physical file SHA-256 is intentionally not used here. The Store's
+/// launch-config contract hashes the ordered operational projection and
+/// excludes its own `approved_config_hash` field, so harmless JSON whitespace
+/// or object-key order changes do not change this identity. This helper keeps
+/// that projection in the Host↔Kernel protocol crate without making Host
+/// depend on the Store composition crate.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the semantic Store digest keeps the wire projection and its digest domain in one auditable boundary"
+)]
+pub fn semantic_store_config_hash_from_json(
+    bytes: &[u8],
+) -> Result<PlatformHandle, KernelServiceError> {
+    fn invalid(reason: &'static str) -> KernelServiceError {
+        KernelServiceError::InvalidField {
+            field: "store_config.runtime_launch",
+            reason,
+        }
+    }
+
+    fn required_field(
+        value: &serde_json::Value,
+        field: &'static str,
+    ) -> Result<serde_json::Value, KernelServiceError> {
+        value
+            .get(field)
+            .cloned()
+            .ok_or_else(|| invalid("missing field"))
+    }
+
+    fn exact_object(value: &serde_json::Value, fields: &[&str]) -> Result<(), KernelServiceError> {
+        let Some(object) = value.as_object() else {
+            return Err(invalid("must be an object"));
+        };
+        if object.len() != fields.len() || object.keys().any(|key| !fields.contains(&key.as_str()))
+        {
+            return Err(invalid("contains an unknown or missing field"));
+        }
+        Ok(())
+    }
+
+    #[derive(Serialize)]
+    struct OrderedInstallationEpoch {
+        installation: serde_json::Value,
+        lineage_id: serde_json::Value,
+        sequence: serde_json::Value,
+    }
+    #[derive(Serialize)]
+    struct OrderedStateFence {
+        authority_epoch: serde_json::Value,
+        resource_generation: serde_json::Value,
+        task_revision: serde_json::Value,
+        policy_revision: serde_json::Value,
+        integration_revision: serde_json::Value,
+    }
+    #[derive(Serialize)]
+    struct OrderedRuntimeStateRoots {
+        profile: serde_json::Value,
+        profile_anchor_root: serde_json::Value,
+        installation_root: serde_json::Value,
+        host_state_root: serde_json::Value,
+        kernel_ors_root: serde_json::Value,
+        kernel_work_root: serde_json::Value,
+        store_data_root: serde_json::Value,
+        store_work_root: serde_json::Value,
+        store_temp_root: serde_json::Value,
+        watchdog_state_root: serde_json::Value,
+        roots_digest: serde_json::Value,
+    }
+    #[derive(Serialize)]
+    struct OrderedRuntimeLaunch {
+        profile: serde_json::Value,
+        portable_root: serde_json::Value,
+        installation_epoch: OrderedInstallationEpoch,
+        generation: serde_json::Value,
+        authority_generation: serde_json::Value,
+        authority_state_fence: OrderedStateFence,
+        authority_descriptor_path: serde_json::Value,
+        authority_descriptor_digest: serde_json::Value,
+        runtime_state_roots: OrderedRuntimeStateRoots,
+        kernel_work_root: serde_json::Value,
+        kernel_artifact_digest: serde_json::Value,
+        eliotd_executable_path: serde_json::Value,
+        eliotd_artifact_digest: serde_json::Value,
+        eliotd_config_path: serde_json::Value,
+        eliotd_config_digest: serde_json::Value,
+        eliotd_descriptor_path: serde_json::Value,
+        eliotd_descriptor_digest: serde_json::Value,
+        eliotd_launch_nonce: serde_json::Value,
+        store_config_path: serde_json::Value,
+        store_credential_target: serde_json::Value,
+        store_bridge_executable_path: serde_json::Value,
+        store_bridge_artifact_digest: serde_json::Value,
+        store_bootstrap_descriptor_path: serde_json::Value,
+        store_bootstrap_descriptor_digest: serde_json::Value,
+        canonical_store_executable_path: serde_json::Value,
+        canonical_store_artifact_digest: serde_json::Value,
+        kernel_arguments: serde_json::Value,
+        store_bridge_arguments: serde_json::Value,
+        canonical_store_arguments: serde_json::Value,
+        host_executable_path: serde_json::Value,
+        host_artifact_digest: serde_json::Value,
+        watchdog_executable_path: serde_json::Value,
+        watchdog_artifact_digest: serde_json::Value,
+        descriptor_digest: serde_json::Value,
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered RuntimeLaunch projection mirrors the Store consumer field-by-field"
+    )]
+    fn ordered_runtime_launch(
+        value: &serde_json::Value,
+    ) -> Result<OrderedRuntimeLaunch, KernelServiceError> {
+        exact_object(
+            value,
+            &[
+                "profile",
+                "portable_root",
+                "installation_epoch",
+                "generation",
+                "authority_generation",
+                "authority_state_fence",
+                "authority_descriptor_path",
+                "authority_descriptor_digest",
+                "runtime_state_roots",
+                "kernel_work_root",
+                "kernel_artifact_digest",
+                "eliotd_executable_path",
+                "eliotd_artifact_digest",
+                "eliotd_config_path",
+                "eliotd_config_digest",
+                "eliotd_descriptor_path",
+                "eliotd_descriptor_digest",
+                "eliotd_launch_nonce",
+                "store_config_path",
+                "store_credential_target",
+                "store_bridge_executable_path",
+                "store_bridge_artifact_digest",
+                "store_bootstrap_descriptor_path",
+                "store_bootstrap_descriptor_digest",
+                "canonical_store_executable_path",
+                "canonical_store_artifact_digest",
+                "kernel_arguments",
+                "store_bridge_arguments",
+                "canonical_store_arguments",
+                "host_executable_path",
+                "host_artifact_digest",
+                "watchdog_executable_path",
+                "watchdog_artifact_digest",
+                "descriptor_digest",
+            ],
+        )?;
+        let epoch = required_field(value, "installation_epoch")?;
+        exact_object(&epoch, &["installation", "lineage_id", "sequence"])?;
+        let fence = required_field(value, "authority_state_fence")?;
+        exact_object(
+            &fence,
+            &[
+                "authority_epoch",
+                "resource_generation",
+                "task_revision",
+                "policy_revision",
+                "integration_revision",
+            ],
+        )?;
+        let roots = required_field(value, "runtime_state_roots")?;
+        exact_object(
+            &roots,
+            &[
+                "profile",
+                "profile_anchor_root",
+                "installation_root",
+                "host_state_root",
+                "kernel_ors_root",
+                "kernel_work_root",
+                "store_data_root",
+                "store_work_root",
+                "store_temp_root",
+                "watchdog_state_root",
+                "roots_digest",
+            ],
+        )?;
+        let field = |object: &serde_json::Value, name: &'static str| required_field(object, name);
+        Ok(OrderedRuntimeLaunch {
+            profile: field(value, "profile")?,
+            portable_root: field(value, "portable_root")?,
+            installation_epoch: OrderedInstallationEpoch {
+                installation: field(&epoch, "installation")?,
+                lineage_id: field(&epoch, "lineage_id")?,
+                sequence: field(&epoch, "sequence")?,
+            },
+            generation: field(value, "generation")?,
+            authority_generation: field(value, "authority_generation")?,
+            authority_state_fence: OrderedStateFence {
+                authority_epoch: field(&fence, "authority_epoch")?,
+                resource_generation: field(&fence, "resource_generation")?,
+                task_revision: field(&fence, "task_revision")?,
+                policy_revision: field(&fence, "policy_revision")?,
+                integration_revision: field(&fence, "integration_revision")?,
+            },
+            authority_descriptor_path: field(value, "authority_descriptor_path")?,
+            authority_descriptor_digest: field(value, "authority_descriptor_digest")?,
+            runtime_state_roots: OrderedRuntimeStateRoots {
+                profile: field(&roots, "profile")?,
+                profile_anchor_root: field(&roots, "profile_anchor_root")?,
+                installation_root: field(&roots, "installation_root")?,
+                host_state_root: field(&roots, "host_state_root")?,
+                kernel_ors_root: field(&roots, "kernel_ors_root")?,
+                kernel_work_root: field(&roots, "kernel_work_root")?,
+                store_data_root: field(&roots, "store_data_root")?,
+                store_work_root: field(&roots, "store_work_root")?,
+                store_temp_root: field(&roots, "store_temp_root")?,
+                watchdog_state_root: field(&roots, "watchdog_state_root")?,
+                roots_digest: field(&roots, "roots_digest")?,
+            },
+            kernel_work_root: field(value, "kernel_work_root")?,
+            kernel_artifact_digest: field(value, "kernel_artifact_digest")?,
+            eliotd_executable_path: field(value, "eliotd_executable_path")?,
+            eliotd_artifact_digest: field(value, "eliotd_artifact_digest")?,
+            eliotd_config_path: field(value, "eliotd_config_path")?,
+            eliotd_config_digest: field(value, "eliotd_config_digest")?,
+            eliotd_descriptor_path: field(value, "eliotd_descriptor_path")?,
+            eliotd_descriptor_digest: field(value, "eliotd_descriptor_digest")?,
+            eliotd_launch_nonce: field(value, "eliotd_launch_nonce")?,
+            store_config_path: field(value, "store_config_path")?,
+            store_credential_target: field(value, "store_credential_target")?,
+            store_bridge_executable_path: field(value, "store_bridge_executable_path")?,
+            store_bridge_artifact_digest: field(value, "store_bridge_artifact_digest")?,
+            store_bootstrap_descriptor_path: field(value, "store_bootstrap_descriptor_path")?,
+            store_bootstrap_descriptor_digest: field(value, "store_bootstrap_descriptor_digest")?,
+            canonical_store_executable_path: field(value, "canonical_store_executable_path")?,
+            canonical_store_artifact_digest: field(value, "canonical_store_artifact_digest")?,
+            kernel_arguments: field(value, "kernel_arguments")?,
+            store_bridge_arguments: field(value, "store_bridge_arguments")?,
+            canonical_store_arguments: field(value, "canonical_store_arguments")?,
+            host_executable_path: field(value, "host_executable_path")?,
+            host_artifact_digest: field(value, "host_artifact_digest")?,
+            watchdog_executable_path: field(value, "watchdog_executable_path")?,
+            watchdog_artifact_digest: field(value, "watchdog_artifact_digest")?,
+            descriptor_digest: field(value, "descriptor_digest")?,
+        })
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoreConfigWire {
+        store_pipe: String,
+        launch_nonce: String,
+        expected_client_sid: String,
+        expected_client_session_id: u32,
+        approved_artifact_hash: String,
+        #[allow(dead_code)]
+        approved_config_hash: String,
+        endpoint: String,
+        provider_bind_address: String,
+        namespace: String,
+        database: String,
+        username: String,
+        connect_timeout_ms: u64,
+        query_timeout_ms: u64,
+        schema_generation: String,
+        blob_root: String,
+        instance_id: String,
+        credential_ref: String,
+        runtime_launch: serde_json::Value,
+    }
+    #[derive(Serialize)]
+    struct OperationalConfig {
+        store_pipe: String,
+        launch_nonce: String,
+        expected_client_sid: String,
+        expected_client_session_id: u32,
+        approved_artifact_hash: String,
+        endpoint: String,
+        provider_bind_address: String,
+        namespace: String,
+        database: String,
+        username: String,
+        connect_timeout_ms: u64,
+        query_timeout_ms: u64,
+        schema_generation: String,
+        blob_root: String,
+        instance_id: String,
+        credential_ref: String,
+        runtime_launch: OrderedRuntimeLaunch,
+    }
+
+    let wire: StoreConfigWire =
+        serde_json::from_slice(bytes).map_err(|_error| KernelServiceError::InvalidField {
+            field: "store_config.json",
+            reason: "must be valid Store launch JSON",
+        })?;
+    let projection = OperationalConfig {
+        store_pipe: wire.store_pipe,
+        launch_nonce: wire.launch_nonce,
+        expected_client_sid: wire.expected_client_sid,
+        expected_client_session_id: wire.expected_client_session_id,
+        approved_artifact_hash: wire.approved_artifact_hash,
+        endpoint: wire.endpoint,
+        provider_bind_address: wire.provider_bind_address,
+        namespace: wire.namespace,
+        database: wire.database,
+        username: wire.username,
+        connect_timeout_ms: wire.connect_timeout_ms,
+        query_timeout_ms: wire.query_timeout_ms,
+        schema_generation: wire.schema_generation,
+        blob_root: wire.blob_root,
+        instance_id: wire.instance_id,
+        credential_ref: wire.credential_ref,
+        runtime_launch: ordered_runtime_launch(&wire.runtime_launch)?,
+    };
+    let canonical =
+        serde_json::to_vec(&projection).map_err(|_error| KernelServiceError::InvalidField {
+            field: "store_config.json",
+            reason: "Store launch projection could not be serialized",
+        })?;
+    PlatformHandle::new(sha256_hex(&canonical)).map_err(|_error| KernelServiceError::InvalidField {
+        field: "store_config.approved_config_hash",
+        reason: "Store semantic digest is invalid",
+    })
+}
+
 /// Closed Kernel process-execution operation set for authenticated clients.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "operation", content = "payload")]
@@ -2110,6 +2436,124 @@ mod tests {
         let mut wrong_digest = requirement();
         wrong_digest.approved_config_hash = handle_value(&"C".repeat(64));
         assert!(wrong_digest.validate().is_err());
+    }
+
+    fn semantic_store_config_value(endpoint: &str, provider: &str) -> serde_json::Value {
+        let mut value = serde_json::from_str::<serde_json::Value>(
+            r#"{
+            "store_pipe": "\\\\.\\pipe\\eliot\\store",
+            "launch_nonce": "nonce",
+            "expected_client_sid": "S-1-5-18",
+            "expected_client_session_id": 0,
+            "approved_artifact_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "approved_config_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "endpoint": "endpoint-placeholder",
+            "provider_bind_address": "provider-placeholder",
+            "namespace": "eliot",
+            "database": "runtime",
+            "username": "root",
+            "connect_timeout_ms": 1000,
+            "query_timeout_ms": 2000,
+            "schema_generation": "schema-1",
+            "blob_root": "C:/eliot/blob",
+            "instance_id": "instance-1",
+            "credential_ref": "credential-1",
+            "runtime_launch": {
+                "profile": "portable_dev",
+                "portable_root": null,
+                "installation_epoch": {
+                    "installation": "installation-1",
+                    "lineage_id": "lineage-1",
+                    "sequence": 1
+                },
+                "generation": "generation-1",
+                "authority_generation": 1,
+                "authority_state_fence": {
+                    "authority_epoch": 1,
+                    "resource_generation": 1,
+                    "task_revision": null,
+                    "policy_revision": null,
+                    "integration_revision": null
+                },
+                "authority_descriptor_path": "C:/eliot/authority.json",
+                "authority_descriptor_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "runtime_state_roots": {
+                    "profile": "portable_dev",
+                    "profile_anchor_root": "C:/eliot",
+                    "installation_root": "C:/eliot",
+                    "host_state_root": "C:/eliot/host",
+                    "kernel_ors_root": "C:/eliot/kernel/state",
+                    "kernel_work_root": "C:/eliot/kernel/work",
+                    "store_data_root": "C:/eliot/store/data",
+                    "store_work_root": "C:/eliot/store/work",
+                    "store_temp_root": "C:/eliot/store/tmp",
+                    "watchdog_state_root": "C:/eliot/watchdog",
+                    "roots_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                },
+                "kernel_work_root": "C:/eliot/kernel/work",
+                "kernel_artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "eliotd_executable_path": "C:/eliot/eliotd.exe",
+                "eliotd_artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "eliotd_config_path": "C:/eliot/eliotd-governor.json",
+                "eliotd_config_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "eliotd_descriptor_path": "C:/eliot/eliotd.json",
+                "eliotd_descriptor_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "eliotd_launch_nonce": "eliotd:nonce",
+                "store_config_path": "C:/eliot/generation.json",
+                "store_credential_target": "eliot/store/v1/credential",
+                "store_bridge_executable_path": "C:/eliot/eliot-store-surreal.exe",
+                "store_bridge_artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "store_bootstrap_descriptor_path": "C:/eliot/store-bootstrap.json",
+                "store_bootstrap_descriptor_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "canonical_store_executable_path": "C:/eliot/surreal.exe",
+                "canonical_store_artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "kernel_arguments": [],
+                "store_bridge_arguments": [],
+                "canonical_store_arguments": [],
+                "host_executable_path": "C:/eliot/eliot-host.exe",
+                "host_artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "watchdog_executable_path": "C:/eliot/eliot-watchdog.exe",
+                "watchdog_artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "descriptor_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }"#,
+        )
+        .expect("semantic Store config fixture");
+        value["endpoint"] = serde_json::Value::String(endpoint.to_owned());
+        value["provider_bind_address"] = serde_json::Value::String(provider.to_owned());
+        value
+    }
+
+    #[test]
+    fn semantic_store_config_hash_separates_physical_bytes_and_digest_field() {
+        let first_value = semantic_store_config_value("ws://127.0.0.1:8000/rpc", "127.0.0.1:8000");
+        let mut second_value = first_value.clone();
+        second_value["approved_config_hash"] =
+            serde_json::Value::String("different-but-ignored".to_owned());
+        let first = serde_json::to_vec_pretty(&first_value).expect("first bytes");
+        let second = serde_json::to_vec(&second_value).expect("second bytes");
+        let first_semantic = semantic_store_config_hash_from_json(&first).expect("semantic hash");
+        let second_semantic = semantic_store_config_hash_from_json(&second).expect("semantic hash");
+        assert_eq!(first_semantic, second_semantic);
+        assert_ne!(sha256_hex(&first), sha256_hex(&second));
+        assert_ne!(first_semantic.as_str(), sha256_hex(&first));
+    }
+
+    #[test]
+    fn semantic_store_config_hash_changes_for_operational_mutation() {
+        let first = serde_json::to_vec(&semantic_store_config_value(
+            "ws://127.0.0.1:8000/rpc",
+            "127.0.0.1:8000",
+        ))
+        .expect("first bytes");
+        let second = serde_json::to_vec(&semantic_store_config_value(
+            "ws://127.0.0.1:8001/rpc",
+            "127.0.0.1:8001",
+        ))
+        .expect("second bytes");
+        let first_semantic = semantic_store_config_hash_from_json(&first).expect("semantic hash");
+        let second_semantic = semantic_store_config_hash_from_json(&second).expect("semantic hash");
+        assert_ne!(first_semantic, second_semantic);
     }
 
     #[test]

@@ -35,6 +35,7 @@ pub use protocol::{
     StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
     StoreRebindReceipt, control_request_frame, control_response_frame,
     decode_control_request_frame, decode_control_response_frame,
+    semantic_store_config_hash_from_json,
 };
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 

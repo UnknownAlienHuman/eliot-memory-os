@@ -15,12 +15,10 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use std::time::Duration;
-#[cfg(all(test, windows))]
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
@@ -34,9 +32,10 @@ use eliot_host_state::{
     WakeDisposition, record_checksum,
 };
 use eliot_installation::{
-    ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest, InstallationError,
-    InstallationProfile, InstallerServiceRegistrationApproval, InstallerServiceRole,
-    PendingActivationState, RedbInstallationRegistry, RuntimeLaunchDescriptor,
+    ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest, InstallationEpoch,
+    InstallationError, InstallationProfile, InstallerServiceRegistrationApproval,
+    InstallerServiceRole, PHASE_B_PENDING_DIGEST, PHASE_B_PENDING_SCM_DIGEST,
+    PendingActivationState, PhaseBLiveBinding, RedbInstallationRegistry, RuntimeLaunchDescriptor,
     verify_approved_path, verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
 use eliot_kernel_service::{
@@ -46,11 +45,14 @@ use eliot_kernel_service::{
     KernelControlResponse, KernelReadyReceipt, KernelServiceState, RestartBudget,
     StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
     StoreRebindReceipt, control_request_frame, decode_control_response_frame,
+    ProcessAuthorityHandoffDescriptor, semantic_store_config_hash_from_json,
 };
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
 };
-use eliot_platform::{PlatformHandle, ServiceState};
+#[cfg(windows)]
+use eliot_platform::WorkScopePath;
+use eliot_platform::{HostProcessNonce, PlatformHandle, ServiceState};
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME,
     HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError, ProtectedPathLease,
@@ -58,6 +60,8 @@ use eliot_platform_windows::{
     ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection, ServiceStartMode,
     WindowsPlatform, fresh_kernel_activation_nonce,
 };
+#[cfg(windows)]
+use eliot_platform_windows::{FileIdentity, PublicationOutcome};
 use eliot_runtime_contracts::{
     HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
 };
@@ -78,6 +82,7 @@ pub const HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR: &str =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostStoreRebindProductionBoundary;
+const STORE_SEMANTIC_CONFIG_HASH_PENDING: &str = PHASE_B_PENDING_DIGEST;
 
 /// Exact launch authority supplied by the Runtime Live SCM registration.
 ///
@@ -586,7 +591,7 @@ use eliot_platform_windows::{
     observe_named_pipe_peer_process,
 };
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 use eliot_platform_windows::windows_paths_equal;
 
 #[cfg(windows)]
@@ -841,13 +846,22 @@ fn validate_eliotd_launch_descriptor(
     let bytes = lease.read_bounded(1024 * 1024).map_err(|error| {
         HostError::ProcessContour(format!("read eliotd launch descriptor: {error}"))
     })?;
-    let actual = Sha256::digest(&bytes);
+    validate_eliotd_launch_descriptor_bytes(&bytes, approved_digest, launch)
+}
+
+#[cfg(windows)]
+fn validate_eliotd_launch_descriptor_bytes(
+    bytes: &[u8],
+    approved_digest: &PlatformHandle,
+    launch: &RuntimeLaunchDescriptor,
+) -> Result<(), HostError> {
+    let actual = Sha256::digest(bytes);
     if format!("{actual:x}") != approved_digest.as_str() {
         return Err(HostError::ProcessContour(
             "eliotd launch descriptor digest changed before launch".to_owned(),
         ));
     }
-    let descriptor: EliotdLaunchDescriptor = serde_json::from_slice(&bytes).map_err(|error| {
+    let descriptor: EliotdLaunchDescriptor = serde_json::from_slice(bytes).map_err(|error| {
         HostError::ProcessContour(format!("parse eliotd launch descriptor: {error}"))
     })?;
     descriptor.validate().map_err(|error| {
@@ -868,6 +882,770 @@ fn validate_eliotd_launch_descriptor(
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn phase_b_manifest_digest(manifest: &CandidateManifest) -> Result<PlatformHandle, HostError> {
+    manifest
+        .compute_digest()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))
+}
+
+#[cfg(windows)]
+fn phase_b_authority_marker(
+    manifest_digest: &PlatformHandle,
+    host: &HostInstallationEpoch,
+    activation_generation: &EpochIdentity,
+    descriptor: &ProcessAuthorityHandoffDescriptor,
+) -> Result<PlatformHandle, HostError> {
+    let fields = [
+        host.installation.as_str().to_owned(),
+        host.epoch.current.lineage.as_str().to_owned(),
+        host.epoch.current.sequence.to_string(),
+        host.nonce.as_str().to_owned(),
+        manifest_digest.as_str().to_owned(),
+        activation_generation.lineage.as_str().to_owned(),
+        activation_generation.sequence.to_string(),
+        descriptor.generation.value().to_string(),
+    ];
+    let payload = serde_json::to_string(&fields)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    PlatformHandle::new(format!("phase-b-host-v1:{payload}"))
+        .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct PhaseBPreviousBinding {
+    host: HostInstallationEpoch,
+    authority: ProcessAuthorityHandoffDescriptor,
+    authority_digest: PlatformHandle,
+}
+
+#[cfg(windows)]
+fn phase_b_parse_authority_marker(
+    reference: &PlatformHandle,
+    manifest_digest: &PlatformHandle,
+    installation: &PlatformHandle,
+    generation: ResourceGeneration,
+) -> Option<(EpochIdentity, PlatformHandle, EpochIdentity)> {
+    let payload = reference.as_str().strip_prefix("phase-b-host-v1:")?;
+    let fields = serde_json::from_str::<Vec<String>>(payload).ok()?;
+    if fields.len() != 8
+        || fields[0] != installation.as_str()
+        || fields[4] != manifest_digest.as_str()
+        || fields[7].parse::<u64>().ok()? != generation.value()
+    {
+        return None;
+    }
+    let host_sequence = fields[2].parse::<u64>().ok().filter(|value| *value > 0)?;
+    let activation_sequence = fields[6].parse::<u64>().ok().filter(|value| *value > 0)?;
+    Some((
+        EpochIdentity {
+            lineage: PlatformHandle::new(fields[1].clone()).ok()?,
+            sequence: host_sequence,
+        },
+        PlatformHandle::new(fields[3].clone()).ok()?,
+        EpochIdentity {
+            lineage: PlatformHandle::new(fields[5].clone()).ok()?,
+            sequence: activation_sequence,
+        },
+    ))
+}
+
+#[cfg(windows)]
+fn phase_b_observe_previous_binding(
+    manifest: &CandidateManifest,
+    host: &HostInstallationEpoch,
+    activation_generation: &EpochIdentity,
+    portable_root: Option<&UserOwnedRootLease>,
+    authority_path: &Path,
+) -> Result<Option<PhaseBPreviousBinding>, HostError> {
+    let lease = match std::fs::symlink_metadata(authority_path) {
+        Ok(_) => phase_b_open_existing(
+            manifest.runtime_launch.profile,
+            portable_root,
+            authority_path,
+        )?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "Phase-B previous authority cannot be observed: {error}"
+            )));
+        }
+    };
+    lease.verify().map_err(HostError::RecoveryRequired)?;
+    let bytes = phase_b_lease_bytes(&lease)?;
+    let authority: ProcessAuthorityHandoffDescriptor =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Phase-B previous authority descriptor is not parseable: {error}"
+            ))
+        })?;
+    authority.validate_structure().map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "Phase-B previous authority descriptor failed exact ORS validation: {error}"
+        ))
+    })?;
+    let manifest_digest = phase_b_manifest_digest(manifest)?;
+    if authority.state_fence.resource_generation != authority.generation {
+        return Err(HostError::RecoveryRequired(
+            "Phase-B previous authority has an inconsistent live resource generation".to_owned(),
+        ));
+    }
+    let marker = authority.contour_refs.iter().find_map(|reference| {
+        phase_b_parse_authority_marker(
+            reference,
+            &manifest_digest,
+            &host.installation,
+            authority.generation,
+        )
+    });
+    let Some((previous_host_epoch, previous_nonce, previous_activation_generation)) = marker else {
+        return Err(HostError::RecoveryRequired(
+            "Phase-B previous authority has no exact prior Host binding".to_owned(),
+        ));
+    };
+    if previous_host_epoch == host.epoch.current
+        && previous_activation_generation == *activation_generation
+        && previous_nonce == host.nonce
+    {
+        return Ok(None);
+    }
+    let authority_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(&bytes)))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    Ok(Some(PhaseBPreviousBinding {
+        host: HostInstallationEpoch {
+            installation: host.installation.clone(),
+            epoch: EpochTransition {
+                current: previous_host_epoch,
+                parent: None,
+            },
+            nonce: previous_nonce,
+            recovery: None,
+        },
+        authority,
+        authority_digest,
+    }))
+}
+
+#[cfg(windows)]
+fn phase_b_validate_authority(
+    manifest: &CandidateManifest,
+    host: &HostInstallationEpoch,
+    activation_generation: &EpochIdentity,
+    bytes: &[u8],
+    allow_expired_exact_replay: bool,
+) -> Result<
+    (
+        ProcessAuthorityHandoffDescriptor,
+        PlatformHandle,
+        PlatformHandle,
+    ),
+    HostError,
+> {
+    let descriptor: ProcessAuthorityHandoffDescriptor =
+        serde_json::from_slice(bytes).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Phase-B authority descriptor is not parseable: {error}"
+            ))
+        })?;
+    descriptor.validate_structure().map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "Phase-B authority descriptor failed exact ORS validation: {error}"
+        ))
+    })?;
+    if !allow_expired_exact_replay {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "Phase-B authority freshness clock is before UNIX epoch: {error}"
+                ))
+            })?
+            .as_millis()
+            .try_into()
+            .map_err(|_| {
+                HostError::RecoveryRequired(
+                    "Phase-B authority freshness clock is outside the supported range".to_owned(),
+                )
+            })?;
+        descriptor.validate(now_ms).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Phase-B authority descriptor is not fresh for admission: {error}"
+            ))
+        })?;
+    }
+    if descriptor.state_fence.authority_epoch.value() != host.epoch.current.sequence
+        || descriptor.state_fence.resource_generation != descriptor.generation
+    {
+        return Err(HostError::RecoveryRequired(
+            "Phase-B authority descriptor is not bound to a consistent live generation and Host epoch"
+                .to_owned(),
+        ));
+    }
+    let manifest_digest = phase_b_manifest_digest(manifest)?;
+    let marker =
+        phase_b_authority_marker(&manifest_digest, host, activation_generation, &descriptor)?;
+    if !descriptor
+        .contour_refs
+        .iter()
+        .any(|reference| reference == &marker)
+    {
+        return Err(HostError::RecoveryRequired(
+            "Phase-B authority descriptor is missing the exact Host/activation binding".to_owned(),
+        ));
+    }
+    let descriptor_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    Ok((descriptor, manifest_digest, descriptor_digest))
+}
+
+#[cfg(windows)]
+fn phase_b_open_existing(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    path: &Path,
+) -> Result<LaunchLease, HostError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => open_launch_lease(profile, portable_root, path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(HostError::RecoveryRequired(
+            format!("Phase-B required file is missing: {}", path.display()),
+        )),
+        Err(error) => Err(HostError::RecoveryRequired(format!(
+            "Phase-B required file cannot be observed: {error}"
+        ))),
+    }
+}
+
+#[cfg(windows)]
+fn phase_b_authority_is_observable(manifest: &CandidateManifest) -> Result<bool, HostError> {
+    let path = Path::new(manifest.runtime_launch.authority_descriptor_path.as_str());
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(HostError::RecoveryRequired(format!(
+            "Phase-B authority destination cannot be observed: {error}"
+        ))),
+    }
+}
+
+#[cfg(windows)]
+fn phase_b_lease_identity(lease: &LaunchLease) -> FileIdentity {
+    match lease {
+        LaunchLease::Protected(lease) => lease.identity(),
+        LaunchLease::Portable(lease) => lease.identity(),
+    }
+}
+
+#[cfg(windows)]
+fn phase_b_lease_bytes(lease: &LaunchLease) -> Result<Vec<u8>, HostError> {
+    lease
+        .read_bounded(1024 * 1024)
+        .map_err(|error| HostError::RecoveryRequired(format!("read Phase-B file: {error}")))
+}
+
+#[cfg(windows)]
+fn phase_b_materialize_file(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    path: &Path,
+    desired: &[u8],
+    allowed_existing_digests: &[&PlatformHandle],
+    label: &str,
+) -> Result<(PlatformHandle, FileIdentity), HostError> {
+    let desired_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(desired)))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    if let Ok(lease) = open_launch_lease(profile, portable_root, path) {
+        lease.verify().map_err(HostError::RecoveryRequired)?;
+        let current = phase_b_lease_bytes(&lease)?;
+        let current_digest = format!("{:x}", Sha256::digest(&current));
+        if current == desired {
+            return Ok((desired_digest, phase_b_lease_identity(&lease)));
+        }
+        if !allowed_existing_digests
+            .iter()
+            .any(|digest| digest.as_str() == current_digest)
+        {
+            return Err(HostError::RecoveryRequired(format!(
+                "Phase-B {label} destination is neither the immutable template nor the exact live bytes"
+            )));
+        }
+    } else if std::fs::symlink_metadata(path).is_ok() {
+        return Err(HostError::RecoveryRequired(format!(
+            "Phase-B {label} destination exists but cannot be retained"
+        )));
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        HostError::RecoveryRequired(format!("Phase-B {label} destination has no parent"))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(format!("Phase-B {label} destination name is invalid"))
+        })?;
+    let adapter = WindowsPlatform::new(parent).map_err(|error| {
+        HostError::RecoveryRequired(format!("prepare Phase-B {label}: {error}"))
+    })?;
+    let relative = WorkScopePath::new(file_name)
+        .map_err(|error| HostError::RecoveryRequired(format!("Phase-B {label} path: {error}")))?;
+    match adapter
+        .publish_atomic(&relative, desired)
+        .map_err(|error| HostError::RecoveryRequired(format!("publish Phase-B {label}: {error}")))?
+    {
+        PublicationOutcome::Published(receipt) => {
+            if receipt.identity.file_index == 0 || receipt.identity.volume_serial_number == 0 {
+                return Err(HostError::RecoveryRequired(format!(
+                    "Phase-B {label} publication receipt has no retained OS identity"
+                )));
+            }
+        }
+        PublicationOutcome::Unknown(_) => {
+            // The replacement may already have committed. Reconcile the exact
+            // destination once; never resend bytes after an unknown outcome.
+            let lease = phase_b_open_existing(profile, portable_root, path)?;
+            lease.verify().map_err(HostError::RecoveryRequired)?;
+            if phase_b_lease_bytes(&lease)? != desired {
+                return Err(HostError::RecoveryRequired(format!(
+                    "Phase-B {label} publication outcome is unknown and readback is not exact"
+                )));
+            }
+        }
+    }
+    let lease = phase_b_open_existing(profile, portable_root, path)?;
+    lease.verify().map_err(HostError::RecoveryRequired)?;
+    if phase_b_lease_bytes(&lease)? != desired {
+        return Err(HostError::RecoveryRequired(format!(
+            "Phase-B {label} publication readback is not exact"
+        )));
+    }
+    Ok((desired_digest, phase_b_lease_identity(&lease)))
+}
+
+#[cfg(windows)]
+fn phase_b_template_path(destination: &Path, label: &str) -> Result<PathBuf, HostError> {
+    let parent = destination.parent().ok_or_else(|| {
+        HostError::RecoveryRequired(format!(
+            "Phase-B {label} template destination has no parent"
+        ))
+    })?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(format!(
+                "Phase-B {label} template destination name is invalid"
+            ))
+        })?;
+    let retained_name = format!("{file_name}.phase-a-template");
+    WorkScopePath::new(&retained_name).map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "Phase-B {label} template path is not within the protected scope: {error}"
+        ))
+    })?;
+    Ok(parent.join(retained_name))
+}
+
+#[cfg(windows)]
+fn phase_b_template_bytes(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    destination: &Path,
+    expected_digest: &PlatformHandle,
+    label: &str,
+) -> Result<Vec<u8>, HostError> {
+    // Phase A's destination is an immutable approved template until Host
+    // first publishes the live overlay. Retain the exact bytes in a Host
+    // scoped sidecar before that replacement so a fresh Host epoch can
+    // validate a later replay without reconstructing authority from JSON.
+    let retained_path = phase_b_template_path(destination, label)?;
+    let (source_bytes, retained_exists) = match std::fs::symlink_metadata(&retained_path) {
+        Ok(_) => {
+            let lease = phase_b_open_existing(profile, portable_root, &retained_path)?;
+            lease.verify().map_err(HostError::RecoveryRequired)?;
+            (phase_b_lease_bytes(&lease)?, true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let lease = phase_b_open_existing(profile, portable_root, destination)?;
+            lease.verify().map_err(HostError::RecoveryRequired)?;
+            (phase_b_lease_bytes(&lease)?, false)
+        }
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "Phase-B {label} template cannot be observed: {error}"
+            )));
+        }
+    };
+    let source_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(&source_bytes)))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    if source_digest != *expected_digest {
+        return Err(HostError::RecoveryRequired(format!(
+            "Phase-B {label} template digest is not the immutable Phase-A digest"
+        )));
+    }
+    if !retained_exists {
+        let retained_label = format!("{label} immutable template");
+        phase_b_materialize_file(
+            profile,
+            portable_root,
+            &retained_path,
+            &source_bytes,
+            &[expected_digest],
+            &retained_label,
+        )?;
+    }
+    let lease = phase_b_open_existing(profile, portable_root, &retained_path)?;
+    lease.verify().map_err(HostError::RecoveryRequired)?;
+    let retained_bytes = phase_b_lease_bytes(&lease)?;
+    if retained_bytes != source_bytes {
+        return Err(HostError::RecoveryRequired(format!(
+            "Phase-B {label} retained template readback is not exact"
+        )));
+    }
+    Ok(retained_bytes)
+}
+
+#[cfg(windows)]
+fn phase_b_live_installation_epoch(host: &HostInstallationEpoch) -> InstallationEpoch {
+    InstallationEpoch {
+        installation: host.installation.clone(),
+        lineage_id: host.epoch.current.lineage.clone(),
+        sequence: host.epoch.current.sequence,
+    }
+}
+
+#[cfg(windows)]
+fn phase_b_json_string(value: &serde_json::Value, field: &str) -> Result<String, HostError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(format!("Store config field {field} is missing"))
+        })
+}
+
+#[cfg(windows)]
+fn phase_b_json_u64(value: &serde_json::Value, field: &str) -> Result<u64, HostError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value != 0)
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(format!("Store config field {field} is missing"))
+        })
+}
+
+#[cfg(windows)]
+fn phase_b_previous_live_launch(
+    template: &RuntimeLaunchDescriptor,
+    previous: &PhaseBPreviousBinding,
+    previous_eliotd_digest: Option<&PlatformHandle>,
+) -> Result<RuntimeLaunchDescriptor, HostError> {
+    phase_b_live_launch(
+        template,
+        &previous.host,
+        &previous.authority,
+        &previous.authority_digest,
+        previous_eliotd_digest.unwrap_or(&template.eliotd_descriptor_digest),
+    )
+}
+
+#[cfg(windows)]
+fn phase_b_previous_config_value(
+    template_bytes: &[u8],
+    template: &RuntimeLaunchDescriptor,
+    previous: &PhaseBPreviousBinding,
+    previous_eliotd_digest: Option<&PlatformHandle>,
+) -> Result<serde_json::Value, HostError> {
+    let mut config =
+        serde_json::from_slice::<serde_json::Value>(template_bytes).map_err(|error| {
+            HostError::RecoveryRequired(format!("read prior Store config template: {error}"))
+        })?;
+    let launch = phase_b_previous_live_launch(template, previous, previous_eliotd_digest)?;
+    {
+        let object = config.as_object_mut().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "prior Store config template root is not an object".to_owned(),
+            )
+        })?;
+        object.insert(
+            "launch_nonce".to_owned(),
+            serde_json::Value::String(previous.host.nonce.as_str().to_owned()),
+        );
+        object.insert(
+            "runtime_launch".to_owned(),
+            serde_json::to_value(&launch)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        );
+        object.insert(
+            "approved_config_hash".to_owned(),
+            serde_json::Value::String(STORE_SEMANTIC_CONFIG_HASH_PENDING.to_owned()),
+        );
+    }
+    let without_hash = serde_json::to_vec(&config)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let semantic = semantic_store_config_hash_from_json(&without_hash)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    config
+        .as_object_mut()
+        .ok_or_else(|| {
+            HostError::RecoveryRequired("prior Store config root is not an object".to_owned())
+        })?
+        .insert(
+            "approved_config_hash".to_owned(),
+            serde_json::Value::String(semantic.as_str().to_owned()),
+        );
+    Ok(config)
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact prior-config readback binds each physical path, template, live epoch, and prior Host contour"
+)]
+fn phase_b_previous_config_digest(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    path: &Path,
+    desired: &[u8],
+    template_digest: &PlatformHandle,
+    template_bytes: &[u8],
+    template: &RuntimeLaunchDescriptor,
+    previous: Option<&PhaseBPreviousBinding>,
+    previous_eliotd_digest: Option<&PlatformHandle>,
+) -> Result<Option<PlatformHandle>, HostError> {
+    let lease = phase_b_open_existing(profile, portable_root, path)?;
+    lease.verify().map_err(HostError::RecoveryRequired)?;
+    let current = phase_b_lease_bytes(&lease)?;
+    if current == desired {
+        return Ok(None);
+    }
+    let digest = PlatformHandle::new(format!("{:x}", Sha256::digest(&current)))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    if &digest == template_digest {
+        return Ok(None);
+    }
+    let previous = previous.ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "Store config is neither the immutable Phase-A template nor an exact prior Phase-B contour"
+                .to_owned(),
+        )
+    })?;
+    let current_value = serde_json::from_slice::<serde_json::Value>(&current).map_err(|error| {
+        HostError::RecoveryRequired(format!("prior Store config is not valid JSON: {error}"))
+    })?;
+    if current_value
+        != phase_b_previous_config_value(
+            template_bytes,
+            template,
+            previous,
+            previous_eliotd_digest,
+        )?
+    {
+        return Err(HostError::RecoveryRequired(
+            "prior Store config is not the exact previous Host materialization".to_owned(),
+        ));
+    }
+    Ok(Some(digest))
+}
+
+#[cfg(windows)]
+fn phase_b_previous_eliotd_digest(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    path: &Path,
+    desired: &[u8],
+    template_digest: &PlatformHandle,
+    template_bytes: &[u8],
+    previous: Option<&PhaseBPreviousBinding>,
+) -> Result<Option<PlatformHandle>, HostError> {
+    let lease = phase_b_open_existing(profile, portable_root, path)?;
+    lease.verify().map_err(HostError::RecoveryRequired)?;
+    let current = phase_b_lease_bytes(&lease)?;
+    if current == desired {
+        return Ok(None);
+    }
+    let digest = PlatformHandle::new(format!("{:x}", Sha256::digest(&current)))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    if &digest == template_digest {
+        return Ok(None);
+    }
+    let previous = previous.ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "eliotd descriptor is neither the immutable Phase-A template nor an exact prior Phase-B contour"
+                .to_owned(),
+        )
+    })?;
+    let mut expected: EliotdLaunchDescriptor =
+        serde_json::from_slice(template_bytes).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "prior eliotd descriptor is not parseable: {error}"
+            ))
+        })?;
+    expected.authority_epoch = previous.authority.state_fence.authority_epoch;
+    expected.generation = previous.authority.generation;
+    let expected = expected
+        .with_computed_digest()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let current_descriptor: EliotdLaunchDescriptor =
+        serde_json::from_slice(&current).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "prior eliotd descriptor is not parseable: {error}"
+            ))
+        })?;
+    if current_descriptor != expected {
+        return Err(HostError::RecoveryRequired(
+            "prior eliotd descriptor is not the exact previous Host materialization".to_owned(),
+        ));
+    }
+    Ok(Some(digest))
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the exact prior-bootstrap readback keeps every physical path, config projection, launch, nonce, and prior Host contour explicit"
+)]
+fn phase_b_previous_bootstrap_digest(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    path: &Path,
+    desired: &[u8],
+    config: &serde_json::Value,
+    launch: &RuntimeLaunchDescriptor,
+    launch_nonce: &PlatformHandle,
+    previous: Option<&PhaseBPreviousBinding>,
+) -> Result<Option<PlatformHandle>, HostError> {
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    let lease = match phase_b_open_existing(profile, portable_root, path) {
+        Ok(lease) => lease,
+        Err(HostError::RecoveryRequired(reason)) if reason.contains("missing") => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    lease.verify().map_err(HostError::RecoveryRequired)?;
+    let current = phase_b_lease_bytes(&lease)?;
+    if current == desired {
+        return Ok(None);
+    }
+    let digest = PlatformHandle::new(format!("{:x}", Sha256::digest(&current)))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    let store_pipe = phase_b_json_string(config, "store_pipe")?;
+    let expected_peer_sid = phase_b_json_string(config, "expected_client_sid")?;
+    let instance_id = phase_b_json_string(config, "instance_id")?;
+    let connect_timeout_ms = phase_b_json_u64(config, "connect_timeout_ms")?;
+    let expected_client_session_id = config
+        .get("expected_client_session_id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "prior Store config field expected_client_session_id is missing".to_owned(),
+            )
+        })?;
+    let expected_client_session_id = u32::try_from(expected_client_session_id).map_err(|_| {
+        HostError::RecoveryRequired(
+            "prior Store config expected_client_session_id is out of range".to_owned(),
+        )
+    })?;
+    let semantic_config_hash = semantic_store_config_hash_from_json(
+        &serde_json::to_vec(config)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+    )
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let expected = HostStoreBootstrapRequirement {
+        route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        canonical_pipe_identity: PlatformHandle::new(store_pipe)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        store_generation: launch.authority_generation,
+        state_fence: launch.authority_state_fence.clone(),
+        launch_nonce: launch_nonce.clone(),
+        connection_id: PlatformHandle::new(format!(
+            "kernel-store:{}:{}",
+            instance_id,
+            launch_nonce.as_str()
+        ))
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        expected_peer_sid: PlatformHandle::new(expected_peer_sid)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        expected_peer_session_id: expected_client_session_id,
+        approved_artifact_hash: launch.store_bridge_artifact_digest.clone(),
+        approved_config_hash: semantic_config_hash,
+        timeout_ms: connect_timeout_ms,
+    };
+    expected
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let current_requirement: HostStoreBootstrapRequirement = serde_json::from_slice(&current)
+        .map_err(|error| {
+            HostError::RecoveryRequired(format!("prior Store bootstrap is not parseable: {error}"))
+        })?;
+    if current_requirement != expected
+        || expected.launch_nonce != previous.host.nonce
+        || expected.state_fence != previous.authority.state_fence
+        || expected.store_generation != previous.authority.generation
+    {
+        return Err(HostError::RecoveryRequired(
+            "prior Store bootstrap is not the exact previous Host materialization".to_owned(),
+        ));
+    }
+    Ok(Some(digest))
+}
+
+#[cfg(windows)]
+fn phase_b_live_launch(
+    template: &RuntimeLaunchDescriptor,
+    host: &HostInstallationEpoch,
+    descriptor: &ProcessAuthorityHandoffDescriptor,
+    authority_descriptor_digest: &PlatformHandle,
+    eliotd_descriptor_digest: &PlatformHandle,
+) -> Result<RuntimeLaunchDescriptor, HostError> {
+    let live = template
+        .with_phase_b_pending_bootstrap_overlay(
+            descriptor.generation,
+            descriptor.state_fence.clone(),
+            authority_descriptor_digest.clone(),
+            eliotd_descriptor_digest.clone(),
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let mut live = live;
+    live.installation_epoch = phase_b_live_installation_epoch(host);
+    live.with_computed_digest()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))
+}
+
+#[cfg(windows)]
+fn phase_b_activation_binding(
+    receipt: &HostPhaseBMaterialization,
+) -> Result<PlatformHandle, HostError> {
+    let digest = phase_b_receipt_digest(receipt)?;
+    PlatformHandle::new(format!("phase-b-materialized:{digest}"))
+        .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
+fn phase_b_receipt_digest(
+    receipt: &HostPhaseBMaterialization,
+) -> Result<PlatformHandle, HostError> {
+    let digest = sha256_json(&(
+        &receipt.manifest_digest,
+        &receipt.host_epoch,
+        &receipt.host_process_nonce,
+        &receipt.activation_generation,
+        &receipt.authority_descriptor_digest,
+        &receipt.store_bootstrap_descriptor_digest,
+        &receipt.config_file_digest,
+        &receipt.semantic_config_hash,
+        &receipt.eliotd_descriptor_digest,
+        &receipt.file_identities,
+    ))?;
+    PlatformHandle::new(digest).map_err(|error| HostError::Platform(error.to_string()))
 }
 
 #[cfg(windows)]
@@ -1306,6 +2084,7 @@ pub struct HostJobBranches {
     kernel_artifact_digest: Option<PlatformHandle>,
     store_artifact_digest: Option<PlatformHandle>,
     config_digest: Option<PlatformHandle>,
+    store_config_semantic_hash: Option<PlatformHandle>,
     approved_generation: Option<PlatformHandle>,
     kernel_candidate: Option<HostKernelCandidateBinding>,
     kernel_activation_receipt: Option<KernelActivationReceipt>,
@@ -1851,6 +2630,7 @@ impl HostJobBranches {
             kernel_artifact_digest: None,
             store_artifact_digest: None,
             config_digest: None,
+            store_config_semantic_hash: None,
             approved_generation: None,
             kernel_candidate: None,
             kernel_activation_receipt: None,
@@ -3213,6 +3993,9 @@ impl HostJobBranches {
         let requirement = self.store_bootstrap_requirement.as_ref().ok_or_else(|| {
             HostError::ProcessContour("retained Store bootstrap requirement is missing".to_owned())
         })?;
+        let semantic_config_hash = self.store_config_semantic_hash.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("retained Store semantic config hash is missing".to_owned())
+        })?;
         if self.approved_generation.as_ref() != Some(approved_generation)
             || self.kernel_artifact_digest.as_ref() != Some(approved_kernel_artifact)
             || self.store_artifact_digest.as_ref() != Some(approved_store_artifact)
@@ -3334,7 +4117,7 @@ impl HostJobBranches {
                 requirement,
                 &ready,
                 approved_store_artifact,
-                approved_config,
+                semantic_config_hash,
                 request.generation,
             )?;
             Ok(AuthenticatedKernelReadiness {
@@ -3571,6 +4354,9 @@ impl HostJobBranches {
             ));
         }
         launch
+            .require_phase_b_live()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        launch
             .validate_for_config(
                 &PlatformHandle::new(config_path.to_string_lossy().into_owned())
                     .map_err(|error| HostError::ProcessContour(error.to_string()))?,
@@ -3614,6 +4400,12 @@ impl HostJobBranches {
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let config_lease = open_launch_lease(launch.profile, portable_root.as_ref(), &config_path)?;
         verify_launch_digest(&config_lease, config_digest, "runtime.config")?;
+        let semantic_config_hash = semantic_store_config_hash_from_json(
+            &config_lease.read_bounded(1024 * 1024).map_err(|error| {
+                HostError::ProcessContour(format!("read Store config for semantic digest: {error}"))
+            })?,
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let store_bootstrap_path = approved_locator(
             Path::new(launch.store_bootstrap_descriptor_path.as_str()),
             &launch.store_bootstrap_descriptor_path,
@@ -3628,7 +4420,7 @@ impl HostJobBranches {
             &store_bootstrap_lease,
             &launch.store_bootstrap_descriptor_digest,
             store_artifact,
-            config_digest,
+            &semantic_config_hash,
             host.host_process_nonce().as_handle(),
         )?;
         let eliotd_config_path = approved_locator(
@@ -3765,6 +4557,7 @@ impl HostJobBranches {
                 self.kernel_artifact_digest = Some(kernel_artifact.clone());
                 self.store_artifact_digest = Some(store_artifact.clone());
                 self.config_digest = Some(config_digest.clone());
+                self.store_config_semantic_hash = Some(semantic_config_hash);
                 self.approved_generation = Some(generation.clone());
                 self.kernel_candidate = None;
                 self.kernel_activation_receipt = None;
@@ -4361,6 +5154,7 @@ impl HostJobBranches {
         self.kernel_artifact_digest = None;
         self.store_artifact_digest = None;
         self.config_digest = None;
+        self.store_config_semantic_hash = None;
         self.approved_generation = None;
         self.kernel_candidate = None;
         self.kernel_activation_receipt = None;
@@ -4439,10 +5233,18 @@ fn approved_service_registration_request(
             "SCM registration approval did not reconstruct a typed bootstrap".to_owned(),
         )
     })?;
+    let expected_descriptor_digest =
+        if launch.authority_descriptor_digest.as_str() == PHASE_B_PENDING_DIGEST {
+            PHASE_B_PENDING_SCM_DIGEST
+        } else {
+            launch.authority_descriptor_digest.as_str()
+        };
+    let descriptor_digest_matches_selector = bootstrap.config_descriptor_digest()
+        == expected_descriptor_digest
+        || bootstrap.config_descriptor_digest() == PHASE_B_PENDING_SCM_DIGEST;
     if bootstrap.config_descriptor_path() != Path::new(launch.authority_descriptor_path.as_str())
-        || bootstrap.config_descriptor_digest() != launch.authority_descriptor_digest.as_str()
+        || !descriptor_digest_matches_selector
         || bootstrap.installation_id() != launch.installation_epoch.installation.as_str()
-        || bootstrap.transaction_plan_generation() != launch.authority_generation.value()
         || bootstrap.host_state_root()
             != Some(Path::new(
                 launch.runtime_state_roots.host_state_root.as_str(),
@@ -4453,6 +5255,9 @@ fn approved_service_registration_request(
             "SCM registration approval bootstrap is not exact".to_owned(),
         ));
     }
+    // `transaction_plan_generation` is the immutable SCM selector minted in
+    // Phase A. The live ORS authority generation may advance in Phase B, so
+    // callers must bind that value through the Host receipt before admission.
     Ok(request)
 }
 
@@ -4534,6 +5339,13 @@ impl InstalledWatchdogControl for WindowsPlatform {
 }
 
 #[cfg(windows)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "read-only Watchdog inspection remains covered by the production-bound service tests"
+    )
+)]
 fn require_running_watchdog<C>(
     control: &mut C,
     registration: &ServiceRegistrationRequest,
@@ -4552,7 +5364,7 @@ where
             )),
         ),
         InstalledWatchdogRuntimeInspection::Absent => Err(HostError::Platform(
-            "canonical EliotWatchdog service is not installed; installer/SCM ordering requires Watchdog to be started before Host"
+            "canonical EliotWatchdog service is not registered; installer/SCM must register both LocalService siblings before starting Host"
                 .to_owned(),
         )),
         InstalledWatchdogRuntimeInspection::Mismatched => Err(HostError::Platform(
@@ -4566,7 +5378,7 @@ where
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 trait InstalledWatchdogStartControl: InstalledWatchdogControl {
     fn start(
         &mut self,
@@ -4574,19 +5386,29 @@ trait InstalledWatchdogStartControl: InstalledWatchdogControl {
     ) -> eliot_platform::PortOutcome<eliot_platform::ServiceObservation>;
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
+impl InstalledWatchdogStartControl for WindowsPlatform {
+    fn start(
+        &mut self,
+        request: &eliot_platform::ServiceRequest,
+    ) -> eliot_platform::PortOutcome<eliot_platform::ServiceObservation> {
+        eliot_platform::ServicePort::execute(self, request)
+    }
+}
+
+#[cfg(windows)]
 trait WatchdogStartClock {
     fn now_ms(&mut self) -> u64;
 
     fn sleep(&mut self, duration: Duration);
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 struct SystemWatchdogStartClock {
     origin: Instant,
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 impl SystemWatchdogStartClock {
     fn new() -> Self {
         Self {
@@ -4595,7 +5417,7 @@ impl SystemWatchdogStartClock {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 impl WatchdogStartClock for SystemWatchdogStartClock {
     fn now_ms(&mut self) -> u64 {
         u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -4606,31 +5428,31 @@ impl WatchdogStartClock for SystemWatchdogStartClock {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 const WATCHDOG_START_TIMEOUT_MS: u64 = 30_000;
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 const WATCHDOG_START_MIN_WAIT_MS: u64 = 25;
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 const WATCHDOG_START_MAX_WAIT_MS: u64 = 250;
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 const WATCHDOG_START_UNKNOWN_WAIT_MS: u64 = 50;
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 fn watchdog_start_wait(wait_hint_ms: u32) -> Duration {
     let wait_ms =
         u64::from(wait_hint_ms).clamp(WATCHDOG_START_MIN_WAIT_MS, WATCHDOG_START_MAX_WAIT_MS);
     Duration::from_millis(wait_ms)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 fn watchdog_unknown_wait() -> Duration {
     Duration::from_millis(WATCHDOG_START_UNKNOWN_WAIT_MS)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 fn bind_watchdog_process(
     registration: &ServiceRegistrationRequest,
     bound: &mut Option<ProcessIdentity>,
@@ -4672,7 +5494,7 @@ fn bind_watchdog_process(
     Ok(())
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 fn start_installed_watchdog<C>(
     control: &mut C,
     registration: &ServiceRegistrationRequest,
@@ -4685,7 +5507,7 @@ where
     start_installed_watchdog_with_clock(control, registration, context, &mut clock)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 #[allow(
     clippy::too_many_lines,
     reason = "the bounded SCM reconcile state machine keeps the one-start invariant and every terminal state in one reviewable contour"
@@ -5550,6 +6372,8 @@ pub struct HostComposition {
     jobs: HostJobBranches,
     #[cfg(windows)]
     readiness_gate: HostReadinessGate,
+    #[cfg(windows)]
+    phase_b: Option<HostPhaseBMaterialization>,
     owner_lease: HostOwnerLease,
     pending_record: Option<HostStateRecord>,
     durable_finalized: bool,
@@ -5562,6 +6386,85 @@ pub struct HostComposition {
 enum HostStartupBranch {
     Active,
     Pending,
+}
+
+/// Exact external authority bytes supplied for Host Phase B.
+///
+/// The installer never constructs this value. Host accepts it only after the
+/// real Host installation epoch is open and validates the descriptor's digest,
+/// ORS snapshot fence, and candidate/epoch binding before publication.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostPhaseBInput {
+    /// Canonical serialized [`ProcessAuthorityHandoffDescriptor`] bytes.
+    pub authority_descriptor_bytes: Vec<u8>,
+}
+
+/// Receipt for one complete Host Phase B materialization.
+///
+/// The manifest remains immutable. `file_identities` are post-publication OS
+/// observations and therefore are deliberately kept out of the manifest and
+/// its digest domain.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostPhaseBMaterialization {
+    manifest_digest: PlatformHandle,
+    host_epoch: EpochIdentity,
+    host_process_nonce: PlatformHandle,
+    activation_generation: EpochIdentity,
+    authority_descriptor_digest: PlatformHandle,
+    store_bootstrap_descriptor_digest: PlatformHandle,
+    config_file_digest: PlatformHandle,
+    semantic_config_hash: PlatformHandle,
+    eliotd_descriptor_digest: PlatformHandle,
+    file_identities: [FileIdentity; 4],
+    launch: RuntimeLaunchDescriptor,
+}
+
+#[cfg(windows)]
+impl HostPhaseBMaterialization {
+    /// Returns the immutable candidate manifest digest bound by this receipt.
+    #[must_use]
+    pub const fn manifest_digest(&self) -> &PlatformHandle {
+        &self.manifest_digest
+    }
+
+    /// Returns the exact Host epoch observed before Phase B publication.
+    #[must_use]
+    pub const fn host_epoch(&self) -> &EpochIdentity {
+        &self.host_epoch
+    }
+
+    /// Returns the fresh Host process nonce that owns this materialization.
+    #[must_use]
+    pub const fn host_process_nonce(&self) -> &PlatformHandle {
+        &self.host_process_nonce
+    }
+
+    /// Returns the live launch overlay consumed by Host process admission.
+    #[must_use]
+    pub const fn launch(&self) -> &RuntimeLaunchDescriptor {
+        &self.launch
+    }
+
+    /// Returns the physical SHA-256 of the materialized Store config bytes.
+    #[must_use]
+    pub const fn config_file_digest(&self) -> &PlatformHandle {
+        &self.config_file_digest
+    }
+
+    /// Returns the semantic Store approved-config hash.
+    #[must_use]
+    pub const fn semantic_config_hash(&self) -> &PlatformHandle {
+        &self.semantic_config_hash
+    }
+
+    /// Returns post-materialization identities in authority/config/bootstrap/
+    /// eliotd descriptor order.
+    #[must_use]
+    pub const fn file_identities(&self) -> &[FileIdentity; 4] {
+        &self.file_identities
+    }
 }
 
 #[cfg(windows)]
@@ -5615,8 +6518,14 @@ impl HostComposition {
         // be substituted by it.
         let manifest_descriptor_path = PathBuf::from(launch.authority_descriptor_path.as_str());
         let manifest_host_root = PathBuf::from(launch.runtime_state_roots.host_state_root.as_str());
+        let expected_descriptor_digest =
+            if launch.authority_descriptor_digest.as_str() == PHASE_B_PENDING_DIGEST {
+                PHASE_B_PENDING_SCM_DIGEST
+            } else {
+                launch.authority_descriptor_digest.as_str()
+            };
         if manifest_descriptor_path != options.config_descriptor_path
-            || launch.authority_descriptor_digest != *options.config_descriptor_digest()
+            || expected_descriptor_digest != options.config_descriptor_digest().as_str()
             || launch.installation_epoch.installation != *options.installation()
             || launch.authority_generation.value() != options.transaction_plan_generation()
             || manifest_host_root != options.host_state_root
@@ -5705,6 +6614,10 @@ impl HostComposition {
     ///
     /// Returns an error if installation identity, owner-lease acquisition,
     /// durable admission, recovery state, or approved process startup fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Host reopen keeps the epoch, registry, and Phase-B crash-recovery ordering in one boundary"
+    )]
     pub fn open(launch_options: HostLaunchOptions) -> Result<Self, HostError> {
         if launch_options.installation().as_str().trim().is_empty() {
             return Err(HostError::MissingInstallation);
@@ -5787,6 +6700,8 @@ impl HostComposition {
             jobs,
             #[cfg(windows)]
             readiness_gate: HostReadinessGate::with_cadence(ReadinessCadence::default()),
+            #[cfg(windows)]
+            phase_b: None,
             owner_lease,
             pending_record: None,
             durable_finalized: false,
@@ -5795,14 +6710,32 @@ impl HostComposition {
         };
         #[cfg(windows)]
         if let Some(pending) = composition.registry.pending_activation().cloned() {
-            composition.reconcile_pending_activation(&pending)?;
-        } else if let Some(active) = composition.registry.active().cloned() {
-            start_approved_manifest_contour(
-                &mut composition,
-                &active.manifest,
-                HostStartupBranch::Active,
-                None,
-            )?;
+            // Phase A deliberately has no authority descriptor. Keep this
+            // Host owner alive in a fenced, non-admissible state until the
+            // external ORS handoff reaches the Host-owned Phase-B method.
+            // Once a destination is observable, startup performs exact
+            // readback/reconciliation; an incomplete/stale Phase-B contour
+            // remains fenced and is resumable only with a fresh exact handoff.
+            if phase_b_authority_is_observable(&pending.manifest)? {
+                match composition.reconcile_phase_b_for_manifest(&pending.manifest) {
+                    Ok(_) => composition.reconcile_pending_activation(&pending)?,
+                    Err(HostError::RecoveryRequired(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        } else if let Some(active) = composition.registry.active().cloned()
+            && phase_b_authority_is_observable(&active.manifest)?
+        {
+            match composition.reconcile_phase_b_for_manifest(&active.manifest) {
+                Ok(_) => start_approved_manifest_contour(
+                    &mut composition,
+                    &active.manifest,
+                    HostStartupBranch::Active,
+                    None,
+                )?,
+                Err(HostError::RecoveryRequired(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(composition)
     }
@@ -5859,6 +6792,465 @@ impl HostComposition {
         &self.registry
     }
 
+    /// Materializes the Host-owned Phase-B authority, Store bootstrap, and
+    /// dynamic launch descriptors for one already-approved generation.
+    ///
+    /// Phase A contributes only immutable templates. This method requires the
+    /// live Host epoch opened by [`Self::open`], accepts authority bytes from
+    /// the external ORS handoff producer, publishes each destination through
+    /// the protected atomic path, and classifies every unknown publication by
+    /// exact readback. No authority bytes or OS destination identity are
+    /// synthesized or added to the immutable candidate manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the candidate, live Host epoch, external ORS
+    /// handoff, protected destinations, or exact post-publication readback do
+    /// not match the approved contour.
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::too_many_lines,
+        reason = "Phase-B materialization keeps the ordered authority/config/bootstrap publication and receipt binding auditable"
+    )]
+    #[cfg(windows)]
+    pub fn materialize_phase_b(
+        &mut self,
+        manifest: &CandidateManifest,
+        input: &HostPhaseBInput,
+    ) -> Result<HostPhaseBMaterialization, HostError> {
+        self.ensure_admission_open()?;
+        manifest
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if !self
+            .registry
+            .generations()
+            .iter()
+            .any(|generation| generation.manifest == *manifest)
+        {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B materialization target is not the exact approved registry manifest"
+                    .to_owned(),
+            ));
+        }
+        Self::validate_launch_options_for_manifest(&self.launch_options, manifest)?;
+        let launch_template = &manifest.runtime_launch;
+        let portable_root = if launch_template.profile == InstallationProfile::PortableDev {
+            Some(
+                UserOwnedRootLease::open_existing(Path::new(
+                    launch_template
+                        .portable_root
+                        .as_ref()
+                        .ok_or_else(|| {
+                            HostError::RecoveryRequired(
+                                "Phase-B portable root binding is missing".to_owned(),
+                            )
+                        })?
+                        .as_str(),
+                ))
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let profile = launch_template.profile;
+        let authority_path = approved_locator(
+            Path::new(launch_template.authority_descriptor_path.as_str()),
+            &launch_template.authority_descriptor_path,
+            profile,
+        )?;
+        let previous_binding = phase_b_observe_previous_binding(
+            manifest,
+            &self.host,
+            &self.activation_generation.current,
+            portable_root.as_ref(),
+            &authority_path,
+        )?;
+        let allow_expired_exact_replay = match std::fs::symlink_metadata(&authority_path) {
+            Ok(_) => {
+                let lease =
+                    phase_b_open_existing(profile, portable_root.as_ref(), &authority_path)?;
+                lease.verify().map_err(HostError::RecoveryRequired)?;
+                phase_b_lease_bytes(&lease)? == input.authority_descriptor_bytes
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "Phase-B authority destination cannot be observed: {error}"
+                )));
+            }
+        };
+        let (authority, manifest_digest, authority_descriptor_digest) = phase_b_validate_authority(
+            manifest,
+            &self.host,
+            &self.activation_generation.current,
+            &input.authority_descriptor_bytes,
+            allow_expired_exact_replay,
+        )?;
+        let previous_authority_digests = previous_binding
+            .as_ref()
+            .map(|binding| vec![&binding.authority_digest])
+            .unwrap_or_default();
+        let (authority_physical_digest, authority_identity) = phase_b_materialize_file(
+            profile,
+            portable_root.as_ref(),
+            &authority_path,
+            &input.authority_descriptor_bytes,
+            &previous_authority_digests,
+            "authority descriptor",
+        )?;
+        if authority_physical_digest != authority_descriptor_digest {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B authority descriptor digest changed during materialization".to_owned(),
+            ));
+        }
+
+        let config_path = approved_locator(
+            Path::new(manifest.config_path.as_str()),
+            &manifest.config_path,
+            profile,
+        )?;
+        let config_template_bytes = phase_b_template_bytes(
+            profile,
+            portable_root.as_ref(),
+            &config_path,
+            &manifest.config_digest,
+            "Store config",
+        )?;
+        let mut config = serde_json::from_slice::<serde_json::Value>(&config_template_bytes)
+            .map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "Phase-B Store config template is not valid JSON: {error}"
+                ))
+            })?;
+        let template_launch_value = config.get("runtime_launch").cloned().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Phase-B Store config template has no runtime_launch".to_owned(),
+            )
+        })?;
+        let template_launch: RuntimeLaunchDescriptor =
+            serde_json::from_value(template_launch_value).map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "Phase-B Store config runtime_launch is invalid: {error}"
+                ))
+            })?;
+        if template_launch != *launch_template {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B Store config template is not the exact approved launch descriptor"
+                    .to_owned(),
+            ));
+        }
+        let eliotd_descriptor_path = approved_locator(
+            Path::new(launch_template.eliotd_descriptor_path.as_str()),
+            &launch_template.eliotd_descriptor_path,
+            profile,
+        )?;
+        let eliotd_template_bytes = phase_b_template_bytes(
+            profile,
+            portable_root.as_ref(),
+            &eliotd_descriptor_path,
+            &launch_template.eliotd_descriptor_digest,
+            "eliotd descriptor",
+        )?;
+        validate_eliotd_launch_descriptor_bytes(
+            &eliotd_template_bytes,
+            &launch_template.eliotd_descriptor_digest,
+            launch_template,
+        )?;
+        let mut eliotd_descriptor: EliotdLaunchDescriptor =
+            serde_json::from_slice(&eliotd_template_bytes).map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "Phase-B eliotd descriptor is not parseable: {error}"
+                ))
+            })?;
+        let live_launch_template = phase_b_live_launch(
+            launch_template,
+            &self.host,
+            &authority,
+            &authority_descriptor_digest,
+            &launch_template.eliotd_descriptor_digest,
+        )?;
+        eliotd_descriptor.authority_epoch =
+            live_launch_template.authority_state_fence.authority_epoch;
+        eliotd_descriptor.generation = live_launch_template.authority_generation;
+        let eliotd_live_bytes = serde_json::to_vec(
+            &eliotd_descriptor
+                .with_computed_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let previous_eliotd_digest = phase_b_previous_eliotd_digest(
+            profile,
+            portable_root.as_ref(),
+            &eliotd_descriptor_path,
+            &eliotd_live_bytes,
+            &launch_template.eliotd_descriptor_digest,
+            &eliotd_template_bytes,
+            previous_binding.as_ref(),
+        )?;
+        let mut eliotd_allowed_digests = vec![&launch_template.eliotd_descriptor_digest];
+        if let Some(digest) = previous_eliotd_digest.as_ref() {
+            eliotd_allowed_digests.push(digest);
+        }
+        let (eliotd_descriptor_digest, eliotd_identity) = phase_b_materialize_file(
+            profile,
+            portable_root.as_ref(),
+            &eliotd_descriptor_path,
+            &eliotd_live_bytes,
+            &eliotd_allowed_digests,
+            "eliotd descriptor",
+        )?;
+        let live_launch_template = phase_b_live_launch(
+            launch_template,
+            &self.host,
+            &authority,
+            &authority_descriptor_digest,
+            &eliotd_descriptor_digest,
+        )?;
+
+        {
+            let config_object = config.as_object_mut().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Phase-B Store config root must be an object".to_owned(),
+                )
+            })?;
+            config_object.insert(
+                "launch_nonce".to_owned(),
+                serde_json::Value::String(
+                    self.host
+                        .host_process_nonce()
+                        .as_handle()
+                        .as_str()
+                        .to_owned(),
+                ),
+            );
+            config_object.insert(
+                "runtime_launch".to_owned(),
+                serde_json::to_value(&live_launch_template)
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            );
+            config_object.insert(
+                "approved_config_hash".to_owned(),
+                serde_json::Value::String(STORE_SEMANTIC_CONFIG_HASH_PENDING.to_owned()),
+            );
+        }
+        let config_without_semantic_hash = serde_json::to_vec(&config)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let semantic_config_hash =
+            semantic_store_config_hash_from_json(&config_without_semantic_hash)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        {
+            let config_object = config.as_object_mut().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Phase-B Store config root must be an object".to_owned(),
+                )
+            })?;
+            config_object.insert(
+                "approved_config_hash".to_owned(),
+                serde_json::Value::String(semantic_config_hash.as_str().to_owned()),
+            );
+        }
+        let config_live_bytes = serde_json::to_vec(&config)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let previous_config_digest = phase_b_previous_config_digest(
+            profile,
+            portable_root.as_ref(),
+            &config_path,
+            &config_live_bytes,
+            &manifest.config_digest,
+            &config_template_bytes,
+            launch_template,
+            previous_binding.as_ref(),
+            previous_eliotd_digest.as_ref(),
+        )?;
+        let mut config_allowed_digests = vec![&manifest.config_digest];
+        if let Some(digest) = previous_config_digest.as_ref() {
+            config_allowed_digests.push(digest);
+        }
+        let (config_file_digest, config_identity) = phase_b_materialize_file(
+            profile,
+            portable_root.as_ref(),
+            &config_path,
+            &config_live_bytes,
+            &config_allowed_digests,
+            "Store config",
+        )?;
+        if config_file_digest == semantic_config_hash {
+            return Err(HostError::RecoveryRequired(
+                "physical Store config digest unexpectedly equals semantic digest".to_owned(),
+            ));
+        }
+
+        let store_pipe = phase_b_json_string(&config, "store_pipe")?;
+        let expected_peer_sid = phase_b_json_string(&config, "expected_client_sid")?;
+        let instance_id = phase_b_json_string(&config, "instance_id")?;
+        let connect_timeout_ms = phase_b_json_u64(&config, "connect_timeout_ms")?;
+        let expected_client_session_id = config
+            .get("expected_client_session_id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Store config field expected_client_session_id is missing".to_owned(),
+                )
+            })?;
+        let expected_client_session_id =
+            u32::try_from(expected_client_session_id).map_err(|_| {
+                HostError::RecoveryRequired(
+                    "Store config expected_client_session_id is out of range".to_owned(),
+                )
+            })?;
+        let launch_nonce = self.host.host_process_nonce().as_handle().clone();
+        let connection_id = PlatformHandle::new(format!(
+            "kernel-store:{}:{}",
+            instance_id,
+            launch_nonce.as_str()
+        ))
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let requirement = HostStoreBootstrapRequirement {
+            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            canonical_pipe_identity: PlatformHandle::new(store_pipe)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            store_generation: live_launch_template.authority_generation,
+            state_fence: live_launch_template.authority_state_fence.clone(),
+            launch_nonce,
+            connection_id,
+            expected_peer_sid: PlatformHandle::new(expected_peer_sid)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            expected_peer_session_id: expected_client_session_id,
+            approved_artifact_hash: live_launch_template.store_bridge_artifact_digest.clone(),
+            approved_config_hash: semantic_config_hash.clone(),
+            timeout_ms: connect_timeout_ms,
+        };
+        requirement
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let bootstrap_bytes = serde_json::to_vec(&requirement)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let bootstrap_path = approved_locator(
+            Path::new(launch_template.store_bootstrap_descriptor_path.as_str()),
+            &launch_template.store_bootstrap_descriptor_path,
+            profile,
+        )?;
+        let previous_config_value = previous_binding
+            .as_ref()
+            .map(|previous| {
+                phase_b_previous_config_value(
+                    &config_template_bytes,
+                    launch_template,
+                    previous,
+                    previous_eliotd_digest.as_ref(),
+                )
+            })
+            .transpose()?;
+        let previous_live_launch = previous_binding
+            .as_ref()
+            .map(|previous| {
+                phase_b_previous_live_launch(
+                    launch_template,
+                    previous,
+                    previous_eliotd_digest.as_ref(),
+                )
+            })
+            .transpose()?;
+        let previous_launch_nonce = previous_binding.as_ref().map_or_else(
+            || self.host.host_process_nonce().as_handle().clone(),
+            |previous| previous.host.nonce.clone(),
+        );
+        let previous_bootstrap_digest = phase_b_previous_bootstrap_digest(
+            profile,
+            portable_root.as_ref(),
+            &bootstrap_path,
+            &bootstrap_bytes,
+            previous_config_value.as_ref().unwrap_or(&config),
+            previous_live_launch
+                .as_ref()
+                .unwrap_or(&live_launch_template),
+            &previous_launch_nonce,
+            previous_binding.as_ref(),
+        )?;
+        let mut bootstrap_allowed_digests = Vec::new();
+        if let Some(digest) = previous_bootstrap_digest.as_ref() {
+            bootstrap_allowed_digests.push(digest);
+        }
+        let (store_bootstrap_descriptor_digest, bootstrap_identity) = phase_b_materialize_file(
+            profile,
+            portable_root.as_ref(),
+            &bootstrap_path,
+            &bootstrap_bytes,
+            &bootstrap_allowed_digests,
+            "Store bootstrap descriptor",
+        )?;
+        let launch = live_launch_template
+            .with_phase_b_materialization(
+                authority.generation,
+                authority.state_fence.clone(),
+                authority_descriptor_digest.clone(),
+                store_bootstrap_descriptor_digest.clone(),
+                eliotd_descriptor_digest.clone(),
+            )
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let receipt = HostPhaseBMaterialization {
+            manifest_digest,
+            host_epoch: self.host.epoch.current.clone(),
+            host_process_nonce: self.host.host_process_nonce().as_handle().clone(),
+            activation_generation: self.activation_generation.current.clone(),
+            authority_descriptor_digest,
+            store_bootstrap_descriptor_digest,
+            config_file_digest,
+            semantic_config_hash,
+            eliotd_descriptor_digest,
+            file_identities: [
+                authority_identity,
+                config_identity,
+                bootstrap_identity,
+                eliotd_identity,
+            ],
+            launch,
+        };
+        self.phase_b = Some(receipt.clone());
+        Ok(receipt)
+    }
+
+    #[cfg(windows)]
+    fn reconcile_phase_b_for_manifest(
+        &mut self,
+        manifest: &CandidateManifest,
+    ) -> Result<HostPhaseBMaterialization, HostError> {
+        let launch = &manifest.runtime_launch;
+        let portable_root = if launch.profile == InstallationProfile::PortableDev {
+            Some(
+                UserOwnedRootLease::open_existing(Path::new(
+                    launch
+                        .portable_root
+                        .as_ref()
+                        .ok_or_else(|| {
+                            HostError::RecoveryRequired(
+                                "Phase-B recovery portable root is missing".to_owned(),
+                            )
+                        })?
+                        .as_str(),
+                ))
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let path = approved_locator(
+            Path::new(launch.authority_descriptor_path.as_str()),
+            &launch.authority_descriptor_path,
+            launch.profile,
+        )?;
+        let lease = phase_b_open_existing(launch.profile, portable_root.as_ref(), &path)?;
+        let bytes = phase_b_lease_bytes(&lease)?;
+        self.materialize_phase_b(
+            manifest,
+            &HostPhaseBInput {
+                authority_descriptor_bytes: bytes,
+            },
+        )
+    }
+
     fn resume_pending_record(&mut self) -> Result<(), HostError> {
         if let Some(pending) = self.pending_record.take()
             && let Err(error) = append_reconciled(&self.journal, pending.clone())
@@ -5896,10 +7288,23 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
-    fn inspect_watchdog(
-        launch: &RuntimeLaunchDescriptor,
+    fn start_watchdog(
+        phase_b: &HostPhaseBMaterialization,
         approval: &InstallerServiceRegistrationApproval,
+        context: RequestMetadata,
     ) -> Result<(), HostError> {
+        phase_b
+            .launch
+            .require_phase_b_live()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        if phase_b.authority_descriptor_digest.as_str() == PHASE_B_PENDING_DIGEST
+            || phase_b.authority_descriptor_digest != phase_b.launch.authority_descriptor_digest
+        {
+            return Err(HostError::RecoveryRequired(
+                "Watchdog admission lacks the exact Host-published authority digest".to_owned(),
+            ));
+        }
+        let launch = &phase_b.launch;
         if approval.role() != InstallerServiceRole::Watchdog
             || approval.generation() != &launch.generation
         {
@@ -5939,7 +7344,7 @@ impl HostComposition {
             &launch.watchdog_executable_path,
         )?;
         debug_assert_eq!(registration.binary_path(), image.as_path());
-        require_running_watchdog(&mut platform, &registration)
+        start_installed_watchdog(&mut platform, &registration, context)
     }
 
     #[cfg(windows)]
@@ -6073,7 +7478,38 @@ impl HostComposition {
         )
     }
 
+    /// Resumes one pending activation after Host Phase B has materialized its
+    /// exact live authority and Store descriptors. The pending registry record
+    /// remains non-admissible until this explicit Host-owned continuation
+    /// observes the fresh process/readiness contour and commits it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no pending activation exists, Phase B is absent or
+    /// stale, or the exact pending contour cannot be reconciled.
     #[cfg(windows)]
+    pub fn resume_pending_activation_after_phase_b(&mut self) -> Result<(), HostError> {
+        let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
+            HostError::ProcessContour("no pending activation requires Phase-B resume".to_owned())
+        })?;
+        let manifest_digest = phase_b_manifest_digest(&pending.manifest)?;
+        if self
+            .phase_b
+            .as_ref()
+            .is_none_or(|receipt| receipt.manifest_digest != manifest_digest)
+        {
+            return Err(HostError::RecoveryRequired(
+                "pending activation has no exact Phase-B materialization receipt".to_owned(),
+            ));
+        }
+        self.reconcile_pending_activation(&pending)
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ordered Phase-B receipt admission, sibling start, and child readiness remain one fenced lifecycle boundary"
+    )]
     fn start_manifest_contour(
         &mut self,
         manifest: &CandidateManifest,
@@ -6083,24 +7519,52 @@ impl HostComposition {
         pending: Option<&eliot_installation::PendingActivation>,
     ) -> Result<(), HostError> {
         Self::validate_launch_options_for_manifest(&self.launch_options, manifest)?;
+        let manifest_digest = phase_b_manifest_digest(manifest)?;
+        let phase_b = match self
+            .phase_b
+            .clone()
+            .filter(|receipt| receipt.manifest_digest == manifest_digest)
+        {
+            Some(receipt) => receipt,
+            None => self.reconcile_phase_b_for_manifest(manifest)?,
+        };
+        phase_b
+            .launch
+            .require_phase_b_live()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        if phase_b.host_epoch != self.host.epoch.current
+            || phase_b.host_process_nonce != self.host.nonce
+        {
+            return Err(HostError::RecoveryRequired(
+                "Host Phase-B receipt is not bound to the current Host epoch/nonce".to_owned(),
+            ));
+        }
         let watchdog_approval = select_watchdog_approval_for_inspection(&self.registry, manifest)?;
+        let current = self.journal.snapshot()?.activation.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        let mut next = transition_activation_record(
+            &current,
+            ActivationState::Starting,
+            if pending.is_some() {
+                "host-start-pending"
+            } else {
+                "host-start-approved"
+            },
+        )?;
         if let Some(pending) = pending {
-            let current = self.journal.snapshot()?.activation.ok_or_else(|| {
-                HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
-            })?;
-            let mut next = transition_activation_record(
-                &current,
-                ActivationState::Starting,
-                "host-start-pending",
-            )?;
             next.trigger_evidence
                 .push(pending_activation_binding(pending)?);
-            self.append_record(HostStateRecord::Activation(next))?;
-        } else {
-            self.transition_activation(ActivationState::Starting, "host-start-approved")?;
         }
+        next.trigger_evidence
+            .push(phase_b_activation_binding(&phase_b)?);
+        self.append_record(HostStateRecord::Activation(next))?;
         if let Some(watchdog_approval) = watchdog_approval.as_ref() {
-            Self::inspect_watchdog(&manifest.runtime_launch, watchdog_approval)?;
+            Self::start_watchdog(
+                &phase_b,
+                watchdog_approval,
+                lifecycle_context(&self.host, "watchdog-start")?,
+            )?;
         }
         let (kernel_artifact, approved_store_artifact) = manifest
             .host_child_artifact_digests()
@@ -6114,17 +7578,12 @@ impl HostComposition {
             manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
         let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
-            .next_kernel_activation_context(
-                manifest
-                    .runtime_launch
-                    .authority_state_fence
-                    .authority_epoch,
-            )?;
+            .next_kernel_activation_context(phase_b.launch.authority_state_fence.authority_epoch)?;
         self.jobs.start_approved(
             kernel_executable,
             store_executable,
             &manifest.generation,
-            &manifest.config_digest,
+            &phase_b.config_file_digest,
             &config_path,
             approved_kernel_path,
             approved_store_path,
@@ -6132,7 +7591,7 @@ impl HostComposition {
             kernel_artifact,
             store_artifact,
             &self.host,
-            &manifest.runtime_launch,
+            &phase_b.launch,
         )?;
         let (_activation_receipt, receipt) = match self.jobs.complete_kernel_control(
             &manifest.generation,
@@ -6322,6 +7781,10 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "fresh commit fence construction keeps the final journal/readiness/Phase-B CAS proof together"
+    )]
     fn fresh_pending_commit_fence(
         &mut self,
         pending: &eliot_installation::PendingActivation,
@@ -6351,11 +7814,33 @@ impl HostComposition {
             .manifest
             .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let pending_manifest_digest = phase_b_manifest_digest(&pending.manifest)?;
+        let phase_b = self
+            .phase_b
+            .as_ref()
+            .filter(|receipt| receipt.manifest_digest == pending_manifest_digest)
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "activation commit has no exact Phase-B materialization receipt".to_owned(),
+                )
+            })?;
+        if phase_b.host_epoch != self.host.epoch.current
+            || phase_b.host_process_nonce != self.host.nonce
+        {
+            return Err(HostError::RecoveryRequired(
+                "activation commit Phase-B receipt is not bound to the current Host epoch/nonce"
+                    .to_owned(),
+            ));
+        }
+        phase_b
+            .launch
+            .require_phase_b_live()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
         let contour = self.current_readiness_contour(
             &pending.manifest.generation,
             kernel_artifact,
             store_artifact,
-            &pending.manifest.config_digest,
+            &phase_b.config_file_digest,
         )?;
         let store_proof_fence = contour.store_proof_fence.clone().ok_or_else(|| {
             HostError::RecoveryRequired(
@@ -6388,15 +7873,10 @@ impl HostComposition {
             ));
         }
         let active_checksum = record_checksum(&HostStateRecord::Kernel(active.clone()))?;
-        let expected_authority = pending
-            .manifest
-            .runtime_launch
-            .authority_state_fence
-            .authority_epoch
-            .value();
+        let expected_authority = phase_b.launch.authority_state_fence.authority_epoch.value();
         if observation.active_kernel_record_checksum.as_str() != active_checksum
             || observation.fence != active.fence
-            || observation.config_digest != pending.manifest.config_digest
+            || observation.config_digest != phase_b.config_file_digest
             || observation.store_fence != store_proof_fence
             || observation.authority_epoch != expected_authority
         {
@@ -6407,12 +7887,22 @@ impl HostComposition {
         let fence = ActivationCommitFence {
             generation: pending.manifest.generation.clone(),
             config_digest: pending.manifest.config_digest.clone(),
-            authority_generation: pending.manifest.runtime_launch.authority_generation,
-            authority_state_fence: pending
-                .manifest
-                .runtime_launch
-                .authority_state_fence
-                .clone(),
+            materialized_config_digest: phase_b.config_file_digest.clone(),
+            phase_b_live_binding: Some(PhaseBLiveBinding {
+                manifest_digest: phase_b.manifest_digest.clone(),
+                authority_descriptor_digest: phase_b.authority_descriptor_digest.clone(),
+                store_bootstrap_descriptor_digest: phase_b
+                    .store_bootstrap_descriptor_digest
+                    .clone(),
+                config_file_digest: phase_b.config_file_digest.clone(),
+                semantic_config_hash: phase_b.semantic_config_hash.clone(),
+                host_epoch_lineage: phase_b.host_epoch.lineage.clone(),
+                host_epoch_sequence: phase_b.host_epoch.sequence,
+                host_process_nonce: HostProcessNonce::new(phase_b.host_process_nonce.clone()),
+                receipt_digest: phase_b_receipt_digest(phase_b)?,
+            }),
+            authority_generation: phase_b.launch.authority_generation,
+            authority_state_fence: phase_b.launch.authority_state_fence.clone(),
             active_kernel_record_checksum: observation.active_kernel_record_checksum.clone(),
             probe_request_digest: observation.probe_request_digest.clone(),
             ready_receipt_digest: observation.ready_receipt_digest.clone(),
@@ -6832,6 +8322,16 @@ impl HostComposition {
         let (approved_kernel_path, approved_store_path, approved_config_path) =
             active.manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
+        let materialized_config_digest = self.jobs.config_digest.clone().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "approved reconciliation has no Phase-B materialized config".to_owned(),
+            )
+        })?;
+        let live_launch = self.jobs.launch.clone().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "approved reconciliation has no Phase-B live launch".to_owned(),
+            )
+        })?;
         let kernel_requires_activation = matches!(
             HostJobBranches::branch_state(self.jobs.kernel.as_ref()),
             Ok(BranchLiveness::Dead)
@@ -6854,7 +8354,7 @@ impl HostComposition {
         }
         let disposition = self.jobs.reconcile(
             &active.manifest.generation,
-            &active.manifest.config_digest,
+            &materialized_config_digest,
             &config_path,
             approved_kernel_path,
             approved_store_path,
@@ -6866,11 +8366,7 @@ impl HostComposition {
         if kernel_requires_activation && self.jobs.kernel.is_some() {
             let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
                 .next_kernel_activation_context(
-                    active
-                        .manifest
-                        .runtime_launch
-                        .authority_state_fence
-                        .authority_epoch,
+                    live_launch.authority_state_fence.authority_epoch,
                 )?;
             if let Err(error) = self.jobs.complete_kernel_control(
                 &active.manifest.generation,
@@ -6939,7 +8435,7 @@ impl HostComposition {
             &active.manifest.generation,
             kernel_artifact,
             store_artifact,
-            &active.manifest.config_digest,
+            &materialized_config_digest,
             disposition,
             std::time::Instant::now(),
         ))
@@ -6998,6 +8494,10 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "readiness contour validates the retained Kernel, Store, semantic-config, Job, and journal identities as one fence"
+    )]
     fn current_readiness_contour(
         &self,
         generation: &PlatformHandle,
@@ -7029,10 +8529,19 @@ impl HostComposition {
         requirement
             .validate()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let semantic_config_hash =
+            self.jobs
+                .store_config_semantic_hash
+                .as_ref()
+                .ok_or_else(|| {
+                    HostError::ProcessContour(
+                        "retained Store semantic config hash is missing".to_owned(),
+                    )
+                })?;
         if candidate.artifact_hash != *kernel_artifact
             || candidate.config_hash != *config
             || requirement.approved_artifact_hash != *store_artifact
-            || requirement.approved_config_hash != *config
+            || requirement.approved_config_hash != *semantic_config_hash
             || requirement.state_fence.authority_epoch != candidate.kernel_epoch
         {
             return Err(HostError::ProcessContour(
@@ -7131,29 +8640,34 @@ impl HostComposition {
             .manifest
             .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let materialized_config_digest = self.jobs.config_digest.as_ref().ok_or_else(|| {
+            HostError::ProcessContour(
+                "readiness probe has no materialized Store config digest".to_owned(),
+            )
+        })?;
         let contour = self.current_readiness_contour(
             generation,
             kernel_artifact,
             store_artifact,
-            &active.manifest.config_digest,
+            materialized_config_digest,
         )?;
         let proof = self.jobs.probe_kernel_readiness(
             generation,
             kernel_artifact,
             store_artifact,
-            &active.manifest.config_digest,
+            materialized_config_digest,
         )?;
         append_authenticated_kernel_readiness(
             &self.journal,
             &proof,
             kernel_artifact,
-            &active.manifest.config_digest,
+            materialized_config_digest,
         )?;
         let confirmed = self.current_readiness_contour(
             generation,
             kernel_artifact,
             store_artifact,
-            &active.manifest.config_digest,
+            materialized_config_digest,
         )?;
         if !confirmed.same_authority_contour(&contour)
             || confirmed.store_proof_fence.as_ref() != Some(&proof.store_fence)
@@ -7455,7 +8969,7 @@ impl ApprovedHostStartupPort for HostComposition {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 fn lifecycle_context(
     host: &HostInstallationEpoch,
     operation: &str,
@@ -8029,6 +9543,21 @@ mod watchdog_service_tests {
         .unwrap_or_else(|_| unreachable!());
         assert_eq!(host_request, host_approved_request);
         assert_eq!(watchdog_request, watchdog_approved_request);
+        let mut live_generation_launch = launch.clone();
+        let live_generation = ResourceGeneration::new(9).unwrap_or_else(|_| unreachable!());
+        live_generation_launch.authority_generation = live_generation;
+        live_generation_launch
+            .authority_state_fence
+            .resource_generation = live_generation;
+        assert!(
+            approved_service_registration_request(
+                &live_generation_launch,
+                &watchdog,
+                InstallerServiceRole::Watchdog,
+                &watchdog_image,
+            )
+            .is_ok()
+        );
         assert_eq!(host_request.service_name(), ELIOT_HOST_SERVICE_NAME);
         assert_eq!(watchdog_request.service_name(), ELIOT_WATCHDOG_SERVICE_NAME);
         assert_eq!(host_request.binary_path(), Path::new(host_image.as_str()));
@@ -8807,6 +10336,142 @@ mod journal_tests {
 
     #[cfg(windows)]
     #[test]
+    fn phase_b_materialization_reuses_exact_bytes_and_rejects_substitution() {
+        let (_manifest, root) = liveness_manifest_with_distinct_store_digests();
+        let portable = root.join("portable");
+        let portable_lease = UserOwnedRootLease::open_existing(&portable)
+            .expect("portable root lease for Phase-B publication");
+        let destination = portable.join("phase-b-recovery.json");
+        let desired = br#"{"host_epoch":1,"nonce":"fresh"}"#;
+        let (digest, identity) = phase_b_materialize_file(
+            InstallationProfile::PortableDev,
+            Some(&portable_lease),
+            &destination,
+            desired,
+            &[],
+            "Phase-B recovery fixture",
+        )
+        .expect("initial Phase-B publication");
+        assert_ne!(identity.file_index, 0);
+        assert_ne!(identity.volume_serial_number, 0);
+        assert_eq!(
+            std::fs::read(&destination).expect("published bytes"),
+            desired
+        );
+
+        let (replayed_digest, replayed_identity) = phase_b_materialize_file(
+            InstallationProfile::PortableDev,
+            Some(&portable_lease),
+            &destination,
+            desired,
+            &[&digest],
+            "Phase-B recovery fixture",
+        )
+        .expect("exact crash/resume replay");
+        assert_eq!(replayed_digest, digest);
+        assert_eq!(replayed_identity, identity);
+
+        std::fs::write(&destination, b"substituted").expect("substitute fixture bytes");
+        let error = phase_b_materialize_file(
+            InstallationProfile::PortableDev,
+            Some(&portable_lease),
+            &destination,
+            desired,
+            &[&digest],
+            "Phase-B recovery fixture",
+        )
+        .expect_err("substituted bytes must not be overwritten");
+        assert!(error.to_string().contains("neither the immutable template"));
+        drop(portable_lease);
+        std::fs::remove_dir_all(root).expect("remove Phase-B fixture root");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_retains_immutable_template_across_live_replacement() {
+        let (_manifest, root) = liveness_manifest_with_distinct_store_digests();
+        let portable = root.join("portable");
+        let portable_lease = UserOwnedRootLease::open_existing(&portable)
+            .expect("portable root lease for template retention");
+        let destination = portable.join("generation.json");
+        let template = br#"{"runtime_launch":{"phase":"template"}}"#;
+        std::fs::write(&destination, template).expect("write Phase-A template");
+        let template_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(template)))
+            .expect("template digest");
+        assert_eq!(
+            phase_b_template_bytes(
+                InstallationProfile::PortableDev,
+                Some(&portable_lease),
+                &destination,
+                &template_digest,
+                "Store config",
+            )
+            .expect("retain Phase-A template"),
+            template
+        );
+
+        let live = br#"{"runtime_launch":{"phase":"live"}}"#;
+        phase_b_materialize_file(
+            InstallationProfile::PortableDev,
+            Some(&portable_lease),
+            &destination,
+            live,
+            &[&template_digest],
+            "Store config",
+        )
+        .expect("publish live replacement");
+        assert_eq!(
+            phase_b_template_bytes(
+                InstallationProfile::PortableDev,
+                Some(&portable_lease),
+                &destination,
+                &template_digest,
+                "Store config",
+            )
+            .expect("replay retained Phase-A template"),
+            template
+        );
+
+        let retained_path =
+            phase_b_template_path(&destination, "Store config").expect("retained template path");
+        std::fs::write(&retained_path, b"substituted-template")
+            .expect("substitute retained template");
+        assert!(
+            phase_b_template_bytes(
+                InstallationProfile::PortableDev,
+                Some(&portable_lease),
+                &destination,
+                &template_digest,
+                "Store config",
+            )
+            .is_err()
+        );
+        drop(portable_lease);
+        std::fs::remove_dir_all(root).expect("remove template retention fixture root");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_live_epoch_and_manifest_digest_are_observed_not_synthesized() {
+        let host = test_host();
+        let live = phase_b_live_installation_epoch(&host);
+        assert_eq!(live.installation, host.installation);
+        assert_eq!(live.lineage_id, host.epoch.current.lineage);
+        assert_eq!(live.sequence, host.epoch.current.sequence);
+
+        let (manifest, root) = liveness_manifest_with_distinct_store_digests();
+        let expected = manifest
+            .compute_digest()
+            .expect("immutable manifest digest");
+        assert_eq!(
+            phase_b_manifest_digest(&manifest).expect("Phase-B manifest digest"),
+            expected
+        );
+        std::fs::remove_dir_all(root).expect("remove Phase-B manifest fixture root");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn approved_host_artifact_path_and_digest_fail_closed() {
         let (mut manifest, root) = liveness_manifest_with_distinct_store_digests();
         let approved_path = PathBuf::from(manifest.host_executable_path.as_str());
@@ -8839,6 +10504,10 @@ mod journal_tests {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture keeps the full Phase-B descriptor/config/bootstrap binding explicit"
+    )]
     fn materialize_descriptor_bound_host_fixture(
         manifest: &mut CandidateManifest,
         host: &HostInstallationEpoch,
@@ -8867,10 +10536,6 @@ mod journal_tests {
             Path::new(manifest.store_bridge_executable_path.as_str()),
             b"store-fixture",
         );
-        let store_config_digest = write_digest(
-            Path::new(manifest.config_path.as_str()),
-            b"store-config-fixture",
-        );
         let eliotd_digest = write_digest(
             Path::new(launch.eliotd_executable_path.as_str()),
             b"eliotd-fixture",
@@ -8881,12 +10546,53 @@ mod journal_tests {
         );
         manifest.kernel_artifact_digest = kernel_digest.clone();
         manifest.store_bridge_artifact_digest = store_digest.clone();
-        manifest.config_digest = store_config_digest.clone();
         launch.kernel_artifact_digest = kernel_digest.clone();
         launch.store_bridge_artifact_digest = store_digest.clone();
         launch.eliotd_artifact_digest = eliotd_digest.clone();
         launch.eliotd_config_digest = eliotd_config_digest.clone();
         launch.kernel_arguments[11] = kernel_digest;
+
+        // The persisted Phase-B config intentionally carries the explicit
+        // pending bootstrap marker to avoid a self-referential semantic hash.
+        // Host's in-memory live launch overlays the exact published bootstrap
+        // digest before process admission.
+        let pending_digest =
+            PlatformHandle::new(PHASE_B_PENDING_DIGEST).expect("Phase-B pending digest");
+        launch.store_bootstrap_descriptor_digest = pending_digest.clone();
+        launch.kernel_arguments[5] = pending_digest;
+
+        let nonce = host.host_process_nonce().as_handle().clone();
+        let config_without_hash = serde_json::json!({
+            "store_pipe": r"\\.\pipe\eliot\store",
+            "launch_nonce": nonce.as_str(),
+            "expected_client_sid": "S-1-5-19",
+            "expected_client_session_id": 0,
+            "approved_artifact_hash": store_digest.as_str(),
+            "approved_config_hash": STORE_SEMANTIC_CONFIG_HASH_PENDING,
+            "endpoint": "ws://127.0.0.1:8000/rpc",
+            "provider_bind_address": "127.0.0.1:8000",
+            "namespace": "eliot",
+            "database": "runtime",
+            "username": "root",
+            "connect_timeout_ms": 5_000,
+            "query_timeout_ms": 5_000,
+            "schema_generation": "schema:test",
+            "blob_root": launch.runtime_state_roots.store_data_root.as_str(),
+            "instance_id": "host-descriptor-test-store",
+            "credential_ref": launch.store_credential_target.as_str(),
+            "runtime_launch": launch,
+        });
+        let semantic_config_hash = semantic_store_config_hash_from_json(
+            &serde_json::to_vec(&config_without_hash).expect("config without hash"),
+        )
+        .expect("semantic config hash");
+        let mut config = config_without_hash;
+        config["approved_config_hash"] =
+            serde_json::Value::String(semantic_config_hash.as_str().to_owned());
+        let config_bytes = serde_json::to_vec(&config).expect("config bytes");
+        let store_config_digest =
+            write_digest(Path::new(manifest.config_path.as_str()), &config_bytes);
+        manifest.config_digest = store_config_digest;
 
         let requirement = HostStoreBootstrapRequirement {
             route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)
@@ -8895,12 +10601,12 @@ mod journal_tests {
                 .expect("store pipe"),
             store_generation: launch.authority_generation,
             state_fence: launch.authority_state_fence.clone(),
-            launch_nonce: host.host_process_nonce().as_handle().clone(),
+            launch_nonce: nonce,
             connection_id: PlatformHandle::new("host-descriptor-test-store").expect("connection"),
             expected_peer_sid: PlatformHandle::new("S-1-5-19").expect("peer sid"),
             expected_peer_session_id: 0,
             approved_artifact_hash: store_digest,
-            approved_config_hash: store_config_digest,
+            approved_config_hash: semantic_config_hash,
             timeout_ms: 5_000,
         };
         let bootstrap_bytes = serde_json::to_vec(&requirement).expect("bootstrap bytes");
@@ -8911,7 +10617,7 @@ mod journal_tests {
         launch.store_bootstrap_descriptor_digest = bootstrap_digest.clone();
         launch.kernel_arguments[5] = bootstrap_digest;
 
-        let nonce = launch.eliotd_launch_nonce.clone();
+        let eliotd_nonce = launch.eliotd_launch_nonce.clone();
         let descriptor = EliotdLaunchDescriptor {
             wire_id: "eliot.kernel.eliotd-launch".to_owned(),
             wire_version: EliotdLaunchDescriptor::CONTRACT_VERSION,
@@ -8923,14 +10629,14 @@ mod journal_tests {
                 PlatformHandle::new("--config-descriptor-sha256").expect("argument"),
                 eliotd_config_digest,
                 PlatformHandle::new("--launch-nonce").expect("argument"),
-                nonce.clone(),
+                eliotd_nonce.clone(),
                 PlatformHandle::new("--executable-sha256").expect("argument"),
                 eliotd_digest,
             ],
             working_directory: launch.kernel_work_root.clone(),
             config_descriptor: launch.eliotd_config_path.clone(),
             config_descriptor_sha256: launch.eliotd_config_digest.as_str().to_owned(),
-            launch_nonce: nonce,
+            launch_nonce: eliotd_nonce,
             authority_epoch: launch.authority_state_fence.authority_epoch,
             generation: descriptor_generation,
             descriptor_sha256: String::new(),

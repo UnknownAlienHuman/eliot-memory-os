@@ -17,7 +17,7 @@ use eliot_contracts::{
     ContractIdentity, ContractVersion, contract_identity as make_contract_identity, sha256_hex,
 };
 use eliot_ipc::{NamedPipeTransport, TransportLimits};
-pub use eliot_platform::PlatformHandle;
+pub use eliot_platform::{HostProcessNonce, PlatformHandle};
 use eliot_platform::{
     InstallationObservation, InstallationPort, InstallationRequest, PortError, PortOutcome,
     ProviderError, ProviderErrorCode, UnknownReason,
@@ -69,6 +69,19 @@ pub use redb_state::RedbInstallationTransactionStore;
 
 /// Stable wire name for the installation contract.
 pub const CONTRACT_NAME: &str = "eliot.kernel.installation";
+/// Explicit Phase-A marker for Host-owned Phase-B physical digests.
+///
+/// The wire value is a reserved SHA-256-shaped label solely because the
+/// existing SCM bootstrap constructor and the read-only Watchdog selector
+/// require a digest-shaped string. Runtime validation classifies this exact
+/// value as [`PhaseBDigestState::Pending`], never as a live physical digest;
+/// Host must replace it with exact Phase-B readback before child admission.
+pub const PHASE_B_PENDING_SCM_DIGEST: &str =
+    "287ddc2779dd75cc92d2dadd6f06b4dba2eefa5d63538db7be11523687f7ba8c";
+/// Compatibility name for the reserved Phase-A pending state.
+pub const PHASE_B_PENDING_DIGEST: &str = PHASE_B_PENDING_SCM_DIGEST;
+const LEGACY_PHASE_B_ZERO_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 /// Current installation contract revision.
 ///
 /// Version 3 makes the approved Host executable path and content digest
@@ -226,6 +239,49 @@ fn sha256_handle(value: &PlatformHandle, field: &str) -> Result<(), Installation
         });
     }
     Ok(())
+}
+
+/// Wire-level state of a Host-owned Phase-B physical digest.
+///
+/// The durable candidate uses [`PhaseBDigestState::Pending`] until Host has
+/// observed the exact published bytes. A live process contour must first
+/// prove [`PhaseBDigestState::Live`]; the pending marker is never accepted by
+/// a generic SHA-256 validator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhaseBDigestState {
+    /// Phase A has declared the destination but Host has not published it.
+    Pending,
+    /// Host has an exact physical SHA-256 for the published destination.
+    Live,
+}
+
+/// Classifies one Phase-B digest without treating the pending marker as a
+/// syntactically valid SHA-256.
+pub fn phase_b_digest_state(
+    value: &PlatformHandle,
+    field: &str,
+) -> Result<PhaseBDigestState, InstallationError> {
+    if value.as_str() == PHASE_B_PENDING_DIGEST {
+        handle(value, field)?;
+        return Ok(PhaseBDigestState::Pending);
+    }
+    if value.as_str() == LEGACY_PHASE_B_ZERO_DIGEST {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "reserved Phase-B pending marker cannot be used as a live physical digest"
+                .to_owned(),
+        });
+    }
+    sha256_handle(value, field)?;
+    Ok(PhaseBDigestState::Live)
+}
+
+fn phase_b_scm_digest(value: &PlatformHandle) -> PlatformHandle {
+    if value.as_str() == PHASE_B_PENDING_DIGEST {
+        PlatformHandle::new(PHASE_B_PENDING_SCM_DIGEST).unwrap_or_else(|_| unreachable!())
+    } else {
+        value.clone()
+    }
 }
 
 fn validate_eliotd_launch_nonce(
@@ -1579,7 +1635,7 @@ pub struct CandidateManifest {
     /// Runtime Live canary artifact-set evidence reference.
     ///
     /// This is a content-addressed, domain-separated SHA-256 over the
-    /// canonical generation and exact ordered eleven-file facts.  It is not a
+    /// canonical generation and exact ordered nine-file Phase-A facts. It is not a
     /// production release signature; production signing remains unclaimed.
     pub signature_ref: PlatformHandle,
     /// Digest of the exact mutable root topology approved by this manifest.
@@ -1607,6 +1663,10 @@ pub struct RuntimeLaunchDescriptor {
     /// Absolute, installation-approved `ProcessAuthorityHandoffDescriptor` path.
     pub authority_descriptor_path: PlatformHandle,
     /// Independent lowercase SHA-256 digest of the authority descriptor bytes.
+    ///
+    /// A Phase-A candidate carries [`PHASE_B_PENDING_DIGEST`] here. Host
+    /// replaces that typed pending state only with the digest of exact
+    /// published authority bytes before child admission.
     pub authority_descriptor_digest: PlatformHandle,
     /// Explicit profile-bound mutable runtime root topology.
     pub runtime_state_roots: RuntimeStateRoots,
@@ -1653,6 +1713,10 @@ pub struct RuntimeLaunchDescriptor {
     /// Neutral Store bootstrap descriptor consumed by Kernel.
     pub store_bootstrap_descriptor_path: PlatformHandle,
     /// SHA-256 digest of the neutral Store bootstrap descriptor.
+    ///
+    /// A Phase-A candidate carries [`PHASE_B_PENDING_DIGEST`] here. Host
+    /// replaces that typed pending state only with the digest of exact
+    /// published Store bootstrap bytes before child admission.
     pub store_bootstrap_descriptor_digest: PlatformHandle,
     /// Approved canonical Surreal engine artifact path.
     pub canonical_store_executable_path: PlatformHandle,
@@ -1695,6 +1759,180 @@ impl RuntimeLaunchDescriptor {
             })?;
         self.validate()?;
         Ok(self)
+    }
+
+    /// Returns the Host Phase-B overlay for one already approved launch
+    /// template.
+    ///
+    /// Phase A intentionally carries only template digests for the authority
+    /// and Store bootstrap files. Host calls this method after opening its
+    /// real installation epoch and after exact publication/readback of the
+    /// live handoff files. The candidate manifest and installer approval are
+    /// never rewritten; this is an in-memory launch overlay whose self-digest
+    /// is recomputed for the exact bytes consumed by the children.
+    pub fn with_phase_b_materialization(
+        &self,
+        authority_generation: ResourceGeneration,
+        authority_state_fence: StateFence,
+        authority_descriptor_digest: PlatformHandle,
+        store_bootstrap_descriptor_digest: PlatformHandle,
+        eliotd_descriptor_digest: PlatformHandle,
+    ) -> Result<Self, InstallationError> {
+        if self.phase_b_digest_state()? != (PhaseBDigestState::Live, PhaseBDigestState::Pending) {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.phase_b_digest_state".to_owned(),
+                reason: "Phase-B finalization must consume the Host live-authority/pending-bootstrap intermediate"
+                    .to_owned(),
+            });
+        }
+        self.with_phase_b_overlay(
+            authority_generation,
+            authority_state_fence,
+            authority_descriptor_digest,
+            store_bootstrap_descriptor_digest,
+            eliotd_descriptor_digest,
+            false,
+        )
+    }
+
+    /// Returns a non-admissible intermediate overlay used to break the
+    /// Store-config/bootstrap self-digest cycle.
+    ///
+    /// The authority and eliotd descriptor digests must already be live, but
+    /// the bootstrap digest remains explicitly [`PhaseBDigestState::Pending`]
+    /// until the bootstrap bytes include the final semantic Store hash. The
+    /// returned launch must not be used to start a child; callers must finish
+    /// with [`Self::with_phase_b_materialization`] and
+    /// [`Self::require_phase_b_live`].
+    pub fn with_phase_b_pending_bootstrap_overlay(
+        &self,
+        authority_generation: ResourceGeneration,
+        authority_state_fence: StateFence,
+        authority_descriptor_digest: PlatformHandle,
+        eliotd_descriptor_digest: PlatformHandle,
+    ) -> Result<Self, InstallationError> {
+        if self.phase_b_digest_state()? != (PhaseBDigestState::Pending, PhaseBDigestState::Pending)
+        {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.phase_b_digest_state".to_owned(),
+                reason: "Phase-B intermediate overlay must start from an immutable pending pair"
+                    .to_owned(),
+            });
+        }
+        let pending_bootstrap = PlatformHandle::new(PHASE_B_PENDING_DIGEST).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "runtime_launch.store_bootstrap_descriptor_digest".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        self.with_phase_b_overlay(
+            authority_generation,
+            authority_state_fence,
+            authority_descriptor_digest,
+            pending_bootstrap,
+            eliotd_descriptor_digest,
+            true,
+        )
+    }
+
+    /// Returns the explicit state of the authority and Store bootstrap
+    /// physical digest fields.
+    pub fn phase_b_digest_state(
+        &self,
+    ) -> Result<(PhaseBDigestState, PhaseBDigestState), InstallationError> {
+        Ok((
+            phase_b_digest_state(
+                &self.authority_descriptor_digest,
+                "runtime_launch.authority_descriptor_digest",
+            )?,
+            phase_b_digest_state(
+                &self.store_bootstrap_descriptor_digest,
+                "runtime_launch.store_bootstrap_descriptor_digest",
+            )?,
+        ))
+    }
+
+    /// Requires both Host-owned Phase-B destinations to be live physical
+    /// publications before a child process can be admitted.
+    pub fn require_phase_b_live(&self) -> Result<(), InstallationError> {
+        if self.phase_b_digest_state()? == (PhaseBDigestState::Live, PhaseBDigestState::Live) {
+            return Ok(());
+        }
+        Err(InstallationError::InvalidField {
+            field: "runtime_launch.phase_b_digest_state".to_owned(),
+            reason:
+                "live child admission requires exact Phase-B authority and Store bootstrap readback"
+                    .to_owned(),
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the overlay keeps each independent Phase-B digest and fence binding explicit"
+    )]
+    fn with_phase_b_overlay(
+        &self,
+        authority_generation: ResourceGeneration,
+        authority_state_fence: StateFence,
+        authority_descriptor_digest: PlatformHandle,
+        store_bootstrap_descriptor_digest: PlatformHandle,
+        eliotd_descriptor_digest: PlatformHandle,
+        allow_pending_bootstrap: bool,
+    ) -> Result<Self, InstallationError> {
+        for (digest, field) in [
+            (
+                &authority_descriptor_digest,
+                "runtime_launch.authority_descriptor_digest",
+            ),
+            (
+                &eliotd_descriptor_digest,
+                "runtime_launch.eliotd_descriptor_digest",
+            ),
+        ] {
+            if phase_b_digest_state(digest, field)? == PhaseBDigestState::Pending {
+                return Err(InstallationError::InvalidField {
+                    field: field.to_owned(),
+                    reason:
+                        "Phase-B authority and eliotd overlays require observed physical digests"
+                            .to_owned(),
+                });
+            }
+        }
+        let bootstrap_state = phase_b_digest_state(
+            &store_bootstrap_descriptor_digest,
+            "runtime_launch.store_bootstrap_descriptor_digest",
+        )?;
+        if bootstrap_state == PhaseBDigestState::Pending && !allow_pending_bootstrap {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.store_bootstrap_descriptor_digest".to_owned(),
+                reason:
+                    "live Phase-B materialization requires an observed bootstrap physical digest"
+                        .to_owned(),
+            });
+        }
+        let mut overlay = self.clone();
+        overlay.authority_generation = authority_generation;
+        overlay.authority_state_fence = authority_state_fence;
+        overlay.authority_descriptor_digest = authority_descriptor_digest;
+        overlay.store_bootstrap_descriptor_digest = store_bootstrap_descriptor_digest;
+        overlay.eliotd_descriptor_digest = eliotd_descriptor_digest;
+        overlay.kernel_arguments = overlay
+            .expected_kernel_arguments(&overlay.store_config_path)
+            .into_iter()
+            .map(|value| {
+                PlatformHandle::new(value).map_err(|error| InstallationError::InvalidField {
+                    field: "runtime_launch.kernel_arguments".to_owned(),
+                    reason: error.to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        overlay.descriptor_digest = PlatformHandle::new("0".repeat(64)).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "runtime_launch.descriptor_digest".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        overlay.with_computed_digest()
     }
 
     fn expected_store_bridge_arguments(&self, config_path: &PlatformHandle) -> Vec<String> {
@@ -1953,7 +2191,7 @@ impl RuntimeLaunchDescriptor {
             &self.authority_descriptor_path,
             "runtime_launch.authority_descriptor_path",
         )?;
-        sha256_handle(
+        phase_b_digest_state(
             &self.authority_descriptor_digest,
             "runtime_launch.authority_descriptor_digest",
         )?;
@@ -2032,7 +2270,7 @@ impl RuntimeLaunchDescriptor {
             &self.store_bootstrap_descriptor_path,
             "runtime_launch.store_bootstrap_descriptor_path",
         )?;
-        sha256_handle(
+        phase_b_digest_state(
             &self.store_bootstrap_descriptor_digest,
             "runtime_launch.store_bootstrap_descriptor_digest",
         )?;
@@ -2243,6 +2481,15 @@ impl RuntimeLaunchDescriptor {
 }
 
 impl CandidateManifest {
+    /// Computes the canonical digest of this immutable candidate manifest.
+    ///
+    /// The digest covers only manifest bytes. Host materialization receipts,
+    /// including destination file identities, are observed after publication
+    /// and are never folded into this immutable value.
+    pub fn compute_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        candidate_manifest_digest(self)
+    }
+
     /// Validates candidate identity and complete assurance references.
     #[allow(
         clippy::too_many_lines,
@@ -2602,7 +2849,7 @@ impl InstallationActivationApproval {
             &self.authority_descriptor_path,
             "activation_approval.authority_descriptor_path",
         )?;
-        sha256_handle(
+        phase_b_digest_state(
             &self.authority_descriptor_digest,
             "activation_approval.authority_descriptor_digest",
         )?;
@@ -2671,6 +2918,78 @@ pub struct ApprovedGeneration {
     pub last_known_good: bool,
 }
 
+/// Exact Host-owned Phase-B proof carried into the pending-to-active CAS.
+///
+/// The candidate manifest remains immutable and may legitimately retain its
+/// Phase-A pending markers. This binding is the separate, post-materialization
+/// proof: both physical Phase-B destinations must classify as `Live`, and the
+/// Host epoch/nonce and receipt digest must be carried with that readback. The
+/// registry validates this proof at the CAS boundary rather than trusting a
+/// Host call-site convention.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseBLiveBinding {
+    /// Candidate manifest digest whose Phase-B receipt was observed.
+    pub manifest_digest: PlatformHandle,
+    /// Exact physical SHA-256 read back for the published authority bytes.
+    pub authority_descriptor_digest: PlatformHandle,
+    /// Exact physical SHA-256 read back for the published Store bootstrap.
+    pub store_bootstrap_descriptor_digest: PlatformHandle,
+    /// Physical SHA-256 of the materialized Store config bytes.
+    pub config_file_digest: PlatformHandle,
+    /// Semantic Store approved-config hash carried by the bootstrap.
+    pub semantic_config_hash: PlatformHandle,
+    /// Host epoch lineage observed before publication.
+    pub host_epoch_lineage: PlatformHandle,
+    /// Host epoch sequence observed before publication.
+    pub host_epoch_sequence: u64,
+    /// Fresh Host process nonce that owns this materialization.
+    pub host_process_nonce: HostProcessNonce,
+    /// Digest of the complete Host Phase-B receipt/journal binding.
+    pub receipt_digest: PlatformHandle,
+}
+
+impl PhaseBLiveBinding {
+    fn validate(&self) -> Result<(), InstallationError> {
+        sha256_handle(&self.manifest_digest, "phase_b.manifest_digest")?;
+        if phase_b_digest_state(
+            &self.authority_descriptor_digest,
+            "phase_b.authority_descriptor_digest",
+        )? != PhaseBDigestState::Live
+        {
+            return Err(InstallationError::InvalidField {
+                field: "phase_b.authority_descriptor_digest".to_owned(),
+                reason: "Phase-B CAS proof must carry an exact live authority readback".to_owned(),
+            });
+        }
+        if phase_b_digest_state(
+            &self.store_bootstrap_descriptor_digest,
+            "phase_b.store_bootstrap_descriptor_digest",
+        )? != PhaseBDigestState::Live
+        {
+            return Err(InstallationError::InvalidField {
+                field: "phase_b.store_bootstrap_descriptor_digest".to_owned(),
+                reason: "Phase-B CAS proof must carry an exact live Store bootstrap readback"
+                    .to_owned(),
+            });
+        }
+        sha256_handle(&self.config_file_digest, "phase_b.config_file_digest")?;
+        sha256_handle(&self.semantic_config_hash, "phase_b.semantic_config_hash")?;
+        handle(&self.host_epoch_lineage, "phase_b.host_epoch_lineage")?;
+        if self.host_epoch_sequence == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "phase_b.host_epoch_sequence".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        handle(
+            self.host_process_nonce.as_handle(),
+            "phase_b.host_process_nonce",
+        )?;
+        sha256_handle(&self.receipt_digest, "phase_b.receipt_digest")
+    }
+}
+
 /// Typed readiness fence that Host must present at the pending-to-active CAS.
 ///
 /// The fence is an observation binding, not a claim that process liveness is
@@ -2685,6 +3004,15 @@ pub struct ActivationCommitFence {
     pub generation: PlatformHandle,
     /// Exact approved configuration digest being committed.
     pub config_digest: PlatformHandle,
+    /// Physical SHA-256 of the Host Phase-B Store config bytes observed during
+    /// readiness. This is intentionally distinct from the immutable Phase-A
+    /// template digest above and from Store's semantic approved-config hash.
+    pub materialized_config_digest: PlatformHandle,
+    /// Exact Host-owned Phase-B authority/bootstrap/epoch proof. This is
+    /// separate from the immutable candidate manifest and is mandatory for
+    /// every committed activation.
+    #[serde(default)]
+    pub phase_b_live_binding: Option<PhaseBLiveBinding>,
     /// Runtime authority resource generation.
     pub authority_generation: ResourceGeneration,
     /// Runtime authority state fence.
@@ -2719,6 +3047,25 @@ impl ActivationCommitFence {
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.generation, "activation_commit_fence.generation")?;
         sha256_handle(&self.config_digest, "activation_commit_fence.config_digest")?;
+        sha256_handle(
+            &self.materialized_config_digest,
+            "activation_commit_fence.materialized_config_digest",
+        )?;
+        self.phase_b_live_binding
+            .as_ref()
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "activation commit fence is missing the exact Phase-B live binding".to_owned(),
+                )
+            })?
+            .validate()?;
+        if self
+            .phase_b_live_binding
+            .as_ref()
+            .is_some_and(|binding| binding.config_file_digest != self.materialized_config_digest)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
         if self.authority_generation.value() == 0 {
             return Err(InstallationError::InvalidField {
                 field: "activation_commit_fence.authority_generation".to_owned(),
@@ -2787,12 +3134,16 @@ impl ActivationCommitFence {
         // registry still validates their SHA-256 shape and persists them for
         // exact terminal idempotency comparison.
         self.validate()?;
-        let runtime = &manifest.runtime_launch;
-        if self.generation != manifest.generation
-            || self.config_digest != manifest.config_digest
-            || self.authority_generation != runtime.authority_generation
-            || self.authority_state_fence != runtime.authority_state_fence
-        {
+        let expected_manifest_digest = candidate_manifest_digest(manifest)?;
+        let phase_b = self.phase_b_live_binding.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "activation commit fence is missing the exact Phase-B live binding".to_owned(),
+            )
+        })?;
+        if phase_b.manifest_digest != expected_manifest_digest {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.generation != manifest.generation || self.config_digest != manifest.config_digest {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(())
@@ -6901,11 +7252,12 @@ impl InstallationTransaction {
                         .runtime_launch
                         .authority_descriptor_path
                         .clone(),
-                    descriptor_digest: self
-                        .candidate_manifest
-                        .runtime_launch
-                        .authority_descriptor_digest
-                        .clone(),
+                    descriptor_digest: phase_b_scm_digest(
+                        &self
+                            .candidate_manifest
+                            .runtime_launch
+                            .authority_descriptor_digest,
+                    ),
                     installation_id: self
                         .candidate_manifest
                         .runtime_launch
@@ -8134,7 +8486,11 @@ pub struct InstallationServiceBootstrap {
 impl InstallationServiceBootstrap {
     fn validate(&self) -> Result<(), InstallationError> {
         approved_path(&self.descriptor_path, "service_bootstrap.descriptor_path")?;
-        sha256_handle(
+        // SCM carries this value only as a stable generation selector. A
+        // Phase-A selector is explicitly `Pending`; it is never a live
+        // authority readback and Host must bind the actual Phase-B digest
+        // before starting either child.
+        phase_b_digest_state(
             &self.descriptor_digest,
             "service_bootstrap.descriptor_digest",
         )?;
@@ -12198,11 +12554,12 @@ fn effect_request(
                 .runtime_launch
                 .authority_descriptor_path
                 .clone(),
-            descriptor_digest: transaction
-                .candidate_manifest
-                .runtime_launch
-                .authority_descriptor_digest
-                .clone(),
+            descriptor_digest: phase_b_scm_digest(
+                &transaction
+                    .candidate_manifest
+                    .runtime_launch
+                    .authority_descriptor_digest,
+            ),
             installation_id: transaction
                 .candidate_manifest
                 .runtime_launch
@@ -12733,6 +13090,18 @@ mod tests {
         ActivationCommitFence {
             generation: manifest.generation.clone(),
             config_digest: manifest.config_digest.clone(),
+            materialized_config_digest: manifest.config_digest.clone(),
+            phase_b_live_binding: Some(PhaseBLiveBinding {
+                manifest_digest: must(candidate_manifest_digest(manifest)),
+                authority_descriptor_digest: test_handle("1".repeat(64)),
+                store_bootstrap_descriptor_digest: test_handle("2".repeat(64)),
+                config_file_digest: manifest.config_digest.clone(),
+                semantic_config_hash: test_handle("5".repeat(64)),
+                host_epoch_lineage: test_handle("lineage:test"),
+                host_epoch_sequence: 1,
+                host_process_nonce: HostProcessNonce::new(test_handle("host-process-nonce-test")),
+                receipt_digest: test_handle("4".repeat(64)),
+            }),
             authority_generation: runtime.authority_generation,
             authority_state_fence: runtime.authority_state_fence.clone(),
             active_kernel_record_checksum: test_handle("a".repeat(64)),
@@ -16849,6 +17218,66 @@ mod tests {
     }
 
     #[test]
+    fn registry_commit_rejects_pending_manifest_without_phase_b_live_binding() {
+        let transaction = registering_transaction();
+        let host = host_capability();
+        let mut registry = ApprovedGenerationRegistry::new();
+        must(registry.stage_pending_activation(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            transaction.candidate_manifest.clone(),
+            test_handle("approval:phase-b-required"),
+        ));
+        let mut fence = test_commit_fence(&transaction.candidate_manifest);
+        fence.phase_b_live_binding = None;
+        assert!(
+            registry
+                .commit_pending_activation(
+                    &host,
+                    &transaction.transaction_id,
+                    &transaction.installer_plan_digest,
+                    &transaction.candidate_manifest.generation,
+                    &fence,
+                )
+                .is_err()
+        );
+        assert!(registry.active().is_none());
+        assert!(registry.pending_activation().is_some());
+    }
+
+    #[test]
+    fn registry_commit_rejects_pending_phase_b_digest_even_with_a_binding() {
+        let transaction = registering_transaction();
+        let host = host_capability();
+        let mut registry = ApprovedGenerationRegistry::new();
+        must(registry.stage_pending_activation(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            transaction.candidate_manifest.clone(),
+            test_handle("approval:phase-b-pending-digest"),
+        ));
+        let mut fence = test_commit_fence(&transaction.candidate_manifest);
+        let binding = fence
+            .phase_b_live_binding
+            .as_mut()
+            .unwrap_or_else(|| unreachable!());
+        binding.authority_descriptor_digest = test_handle(PHASE_B_PENDING_DIGEST);
+        assert!(
+            registry
+                .commit_pending_activation(
+                    &host,
+                    &transaction.transaction_id,
+                    &transaction.installer_plan_digest,
+                    &transaction.candidate_manifest.generation,
+                    &fence,
+                )
+                .is_err()
+        );
+        assert!(registry.active().is_none());
+        assert!(registry.pending_activation().is_some());
+    }
+
+    #[test]
     fn pending_activation_is_not_active_until_host_commit_and_retries_by_digest() {
         let transaction = registering_transaction();
         let host = host_capability();
@@ -17107,6 +17536,66 @@ mod tests {
         assert!(registry.active_generation().is_none());
         assert!(registry.last_known_good_generation().is_none());
         assert!(registry.pending_activation().is_none());
+    }
+
+    #[test]
+    fn phase_b_digest_state_transitions_are_ordered_and_non_admissible_until_live() {
+        let transaction = registering_transaction();
+        let mut phase_a = transaction.candidate_manifest.runtime_launch.clone();
+        let pending = test_handle(PHASE_B_PENDING_DIGEST);
+        phase_a.authority_descriptor_digest = pending.clone();
+        phase_a.store_bootstrap_descriptor_digest = pending.clone();
+        phase_a.kernel_arguments[5] = pending.clone();
+        phase_a.kernel_arguments[9] = pending;
+        let phase_a = must(phase_a.with_computed_digest());
+        assert_eq!(
+            must(phase_a.phase_b_digest_state()),
+            (PhaseBDigestState::Pending, PhaseBDigestState::Pending)
+        );
+        assert!(phase_a.require_phase_b_live().is_err());
+
+        let authority_digest = test_handle("a".repeat(64));
+        let eliotd_digest = test_handle("b".repeat(64));
+        let bootstrap_digest = test_handle("c".repeat(64));
+        let intermediate = must(phase_a.with_phase_b_pending_bootstrap_overlay(
+            phase_a.authority_generation,
+            phase_a.authority_state_fence.clone(),
+            authority_digest.clone(),
+            eliotd_digest.clone(),
+        ));
+        assert_eq!(
+            must(intermediate.phase_b_digest_state()),
+            (PhaseBDigestState::Live, PhaseBDigestState::Pending)
+        );
+        assert!(intermediate.require_phase_b_live().is_err());
+        assert!(
+            phase_a
+                .with_phase_b_materialization(
+                    phase_a.authority_generation,
+                    phase_a.authority_state_fence.clone(),
+                    authority_digest.clone(),
+                    bootstrap_digest.clone(),
+                    eliotd_digest.clone(),
+                )
+                .is_err()
+        );
+
+        let live = must(intermediate.with_phase_b_materialization(
+            intermediate.authority_generation,
+            intermediate.authority_state_fence.clone(),
+            authority_digest,
+            bootstrap_digest,
+            eliotd_digest,
+        ));
+        assert_eq!(
+            must(live.phase_b_digest_state()),
+            (PhaseBDigestState::Live, PhaseBDigestState::Live)
+        );
+        assert!(live.require_phase_b_live().is_ok());
+
+        let mut legacy_zero = phase_a;
+        legacy_zero.authority_descriptor_digest = test_handle("0".repeat(64));
+        assert!(legacy_zero.phase_b_digest_state().is_err());
     }
 
     #[test]

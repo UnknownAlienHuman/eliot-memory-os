@@ -13,9 +13,9 @@ use crate::{
     AuthorityEpoch, CandidateManifest, InstallationEpoch, InstallationError, InstallationProfile,
     InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, InstallerServiceAccount,
     InstallerServiceRole, LOCAL_SERVICE_SID, ManagedEnvironmentAction,
-    ManagedEnvironmentChangeRequest, PackageArtifactDigest, PlannedChange, ResourceGeneration,
-    RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, StoreCredentialProvider,
-    StoreCredentialProvisionPlan, StoreCredentialScope,
+    ManagedEnvironmentChangeRequest, PHASE_B_PENDING_DIGEST, PackageArtifactDigest, PlannedChange,
+    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
+    StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
     candidate_manifest_digest as candidate_digest_fn, handle,
 };
 
@@ -24,7 +24,13 @@ use crate::{
 /// The role names deliberately live in one place.  A caller cannot provide a
 /// partial candidate and ask the stager to infer the missing Host, Watchdog,
 /// Kernel, Store or daemon contour.
-const REQUIRED_PACKAGE_ROLES: [(&str, bool); 11] = [
+/// Files which the installer is allowed to copy during Phase A.
+///
+/// `authority.json` and `store-bootstrap.json` are deliberately absent. They
+/// are live Host-owned handoff material and cannot be represented by an
+/// installer candidate. Destination file identities are observed after
+/// Phase B materialization and are not part of this immutable inventory.
+const REQUIRED_PACKAGE_ROLES: [(&str, bool); 9] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
@@ -34,8 +40,6 @@ const REQUIRED_PACKAGE_ROLES: [(&str, bool); 11] = [
     ("generation.json", false),
     ("eliotd-governor.json", false),
     ("eliotd.json", false),
-    ("store-bootstrap.json", false),
-    ("authority.json", false),
 ];
 
 fn package_plan_error(error: &PackageStagingError) -> InstallationError {
@@ -81,7 +85,7 @@ fn append_evidence_text(bytes: &mut Vec<u8>, value: &str) {
 /// Derive the Runtime Live canary artifact-set evidence reference.
 ///
 /// The reference is a domain-separated SHA-256 over the canonical generation
-/// and the complete, fixed-order eleven-file inventory.  Each fact contains
+/// and the complete, fixed-order nine-file Phase-A inventory.  Each fact contains
 /// the validated relative path, executable bit, exact byte size, and lowercase
 /// SHA-256.  Source identities and other volatile filesystem observations are
 /// deliberately excluded; the retained-source and destination receipt gates
@@ -94,7 +98,7 @@ pub(crate) fn artifact_set_evidence_digest(
         || expected.len() != REQUIRED_PACKAGE_ROLES.len()
     {
         return Err(InstallationError::IncompleteObservation(
-            "canary artifact evidence requires the complete eleven-file runtime inventory"
+            "canary artifact evidence requires the complete nine-file Phase-A runtime inventory"
                 .to_owned(),
         ));
     }
@@ -216,11 +220,6 @@ fn expected_role_map(candidate: &CandidateManifest) -> Vec<(String, bool, String
             rt.eliotd_artifact_digest.as_str().to_owned(),
         ),
         (
-            file_name(&rt.authority_descriptor_path),
-            false,
-            rt.authority_descriptor_digest.as_str().to_owned(),
-        ),
-        (
             file_name(&candidate.config_path),
             false,
             candidate.config_digest.as_str().to_owned(),
@@ -234,11 +233,6 @@ fn expected_role_map(candidate: &CandidateManifest) -> Vec<(String, bool, String
             file_name(&rt.eliotd_descriptor_path),
             false,
             rt.eliotd_descriptor_digest.as_str().to_owned(),
-        ),
-        (
-            file_name(&rt.store_bootstrap_descriptor_path),
-            false,
-            rt.store_bootstrap_descriptor_digest.as_str().to_owned(),
         ),
     ]
 }
@@ -351,7 +345,7 @@ fn validate_candidate_package_binding(
 
 pub(crate) fn strict_role_bindings(
     candidate: &CandidateManifest,
-) -> [(&'static str, bool, &PlatformHandle, &PlatformHandle); 11] {
+) -> [(&'static str, bool, &PlatformHandle, &PlatformHandle); 9] {
     let runtime = &candidate.runtime_launch;
     [
         (
@@ -408,25 +402,13 @@ pub(crate) fn strict_role_bindings(
             &runtime.eliotd_descriptor_path,
             &runtime.eliotd_descriptor_digest,
         ),
-        (
-            "store-bootstrap.json",
-            false,
-            &runtime.store_bootstrap_descriptor_path,
-            &runtime.store_bootstrap_descriptor_digest,
-        ),
-        (
-            "authority.json",
-            false,
-            &runtime.authority_descriptor_path,
-            &runtime.authority_descriptor_digest,
-        ),
     ]
 }
 
 /// Validate the complete production package bijection.
 ///
 /// This boundary is intentionally independent of the caller's manifest and
-/// expected-digest vectors.  It binds all eleven canonical role names and
+/// expected-digest vectors. It binds all nine canonical Phase-A role names and
 /// requires every `CandidateManifest` path/digest to participate exactly once.
 pub(crate) fn validate_exact_candidate_package_binding(
     candidate: &CandidateManifest,
@@ -437,7 +419,8 @@ pub(crate) fn validate_exact_candidate_package_binding(
     }
     if manifest.files.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "package manifest must contain the complete eleven-file runtime inventory".to_owned(),
+            "package manifest must contain the complete nine-file Phase-A runtime inventory"
+                .to_owned(),
         ));
     }
     let bindings = strict_role_bindings(candidate);
@@ -515,7 +498,7 @@ pub(crate) fn validate_exact_expected_file_digests(
     validate_exact_candidate_package_binding(candidate, manifest)?;
     if expected.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "expected package digest set must contain all eleven runtime files".to_owned(),
+            "expected package digest set must contain all nine Phase-A runtime files".to_owned(),
         ));
     }
     let bindings = strict_role_bindings(candidate);
@@ -667,8 +650,8 @@ impl GenerationPackagePlanner {
     /// immutable `PLANNED` transaction.
     ///
     /// The source is opened and observed independently of every manifest claim.
-    /// The exact eleven-file inventory is then used to construct all canonical
-    /// destination paths, descriptor/config bindings, argv and artifact
+    /// The exact nine-file Phase-A inventory is then used to construct all
+    /// canonical destination paths, descriptor/config bindings and artifact
     /// digests before the single transaction constructor is called.
     #[allow(
         clippy::too_many_lines,
@@ -736,21 +719,16 @@ impl GenerationPackagePlanner {
         })?;
         validate_exact_source_inventory(&observed)?;
 
-        let files = observed
-            .files
+        let files = REQUIRED_PACKAGE_ROLES
             .iter()
-            .map(|entry| {
-                let executable = REQUIRED_PACKAGE_ROLES
+            .map(|(name, executable)| {
+                let entry = observed
+                    .files
                     .iter()
-                    .find(|(name, _)| *name == entry.relative_path)
-                    .map(|(_, executable)| *executable)
+                    .find(|entry| entry.relative_path == *name)
                     .ok_or(InstallationError::IdentityConflict)?;
-                eliot_platform_windows::PackageFileSpec::new(
-                    &entry.relative_path,
-                    executable,
-                    entry.size,
-                )
-                .map_err(|error| package_plan_error(&error))
+                eliot_platform_windows::PackageFileSpec::new(name, *executable, entry.size)
+                    .map_err(|error| package_plan_error(&error))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let package_manifest = PackageManifest::new(input.generation.as_str(), files)
@@ -787,6 +765,9 @@ impl GenerationPackagePlanner {
             (&config_path, "generation.config_path"),
             (&eliotd_config_path, "generation.eliotd_config_path"),
             (&eliotd_descriptor_path, "generation.eliotd_descriptor_path"),
+            // These paths are intentionally declared for the later Host
+            // Phase-B overlay, but no Phase-A source file is admitted for
+            // either destination.
             (&store_bootstrap_path, "generation.store_bootstrap_path"),
             (&authority_path, "generation.authority_path"),
         ] {
@@ -815,28 +796,35 @@ impl GenerationPackagePlanner {
         let config_digest = digest_for("generation.json")?;
         let eliotd_config_digest = digest_for("eliotd-governor.json")?;
         let eliotd_descriptor_digest = digest_for("eliotd.json")?;
-        let store_bootstrap_digest = digest_for("store-bootstrap.json")?;
-        let authority_digest = digest_for("authority.json")?;
-
-        let authority_generation = ResourceGeneration::new(input.installation_epoch.sequence)
-            .map_err(|error| InstallationError::InvalidField {
+        let phase_a_content_digest = hex_digest(
+            &serde_json::to_vec(&expected_file_digests).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "generation.phase_a_content_digest".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+        );
+        // Phase A carries only a valid descriptor template fence. It is not a
+        // live authority and is deliberately independent of the installer
+        // sequence. Host replaces the fence after opening a real
+        // HostInstallationEpoch in Phase B.
+        let authority_generation =
+            ResourceGeneration::new(1).map_err(|error| InstallationError::InvalidField {
                 field: "generation.authority_generation".to_owned(),
                 reason: error.to_string(),
             })?;
         let authority_epoch =
-            AuthorityEpoch::new(input.installation_epoch.sequence).map_err(|error| {
-                InstallationError::InvalidField {
-                    field: "generation.authority_epoch".to_owned(),
-                    reason: error.to_string(),
-                }
+            AuthorityEpoch::new(1).map_err(|error| InstallationError::InvalidField {
+                field: "generation.authority_epoch".to_owned(),
+                reason: error.to_string(),
             })?;
         let authority_state_fence = StateFence::new(authority_epoch, authority_generation);
         let nonce_seed = format!(
-            "eliotd:{}:{}:{}:{}",
+            "eliotd:phase-a-template:{}:{}:{}:{}",
             input.transaction_id,
             input.installation_epoch.installation,
             input.generation,
-            source_identity.file_index
+            phase_a_content_digest,
         );
         let eliotd_launch_nonce =
             PlatformHandle::new(format!("eliotd:{}", hex_digest(nonce_seed.as_bytes()))).map_err(
@@ -847,11 +835,19 @@ impl GenerationPackagePlanner {
             )?;
         let credential_token = hex_digest(
             format!(
-                "eliot-store-credential:{}:{}:{}",
-                input.installation_epoch.installation, input.generation, source_identity.file_index
+                "eliot-store-credential:phase-a-template:{}:{}:{}",
+                input.installation_epoch.installation, input.generation, phase_a_content_digest
             )
             .as_bytes(),
         );
+        // This is a typed pending marker, never a physical digest. Host must
+        // replace it after exact Phase-B publication/readback.
+        let phase_b_digest = PlatformHandle::new(PHASE_B_PENDING_DIGEST).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "generation.phase_b_digest".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
         let store_credential_target =
             PlatformHandle::new(format!("eliot/store/v1/{}", &credential_token[..32])).map_err(
                 |error| InstallationError::InvalidField {
@@ -876,11 +872,11 @@ impl GenerationPackagePlanner {
             "--store-bootstrap".to_owned(),
             store_bootstrap_path.as_str().to_owned(),
             "--store-bootstrap-sha256".to_owned(),
-            store_bootstrap_digest.as_str().to_owned(),
+            phase_b_digest.as_str().to_owned(),
             "--authority-descriptor".to_owned(),
             authority_path.as_str().to_owned(),
             "--authority-descriptor-sha256".to_owned(),
-            authority_digest.as_str().to_owned(),
+            phase_b_digest.as_str().to_owned(),
             "--kernel-artifact-sha256".to_owned(),
             kernel_digest.as_str().to_owned(),
             "--eliotd-descriptor".to_owned(),
@@ -925,7 +921,7 @@ impl GenerationPackagePlanner {
             authority_generation,
             authority_state_fence,
             authority_descriptor_path: authority_path,
-            authority_descriptor_digest: authority_digest,
+            authority_descriptor_digest: phase_b_digest.clone(),
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
             kernel_artifact_digest: kernel_digest.clone(),
@@ -941,7 +937,7 @@ impl GenerationPackagePlanner {
             store_bridge_executable_path: store_bridge_path.clone(),
             store_bridge_artifact_digest: store_bridge_digest.clone(),
             store_bootstrap_descriptor_path: store_bootstrap_path,
-            store_bootstrap_descriptor_digest: store_bootstrap_digest,
+            store_bootstrap_descriptor_digest: phase_b_digest,
             canonical_store_executable_path: canonical_store_path.clone(),
             canonical_store_artifact_digest: canonical_store_digest.clone(),
             kernel_arguments,
@@ -984,11 +980,11 @@ impl GenerationPackagePlanner {
             host_executable_path: host_path,
             config_path,
             dependency_closure_refs: vec![
-                PlatformHandle::new(format!("evidence:source:{}", source_identity.file_index))
+                PlatformHandle::new(format!("evidence:phase-a-content:{phase_a_content_digest}"))
                     .map_err(|error| InstallationError::InvalidField {
-                        field: "generation.dependency_closure_refs".to_owned(),
-                        reason: error.to_string(),
-                    })?,
+                    field: "generation.dependency_closure_refs".to_owned(),
+                    reason: error.to_string(),
+                })?,
             ],
             license_refs: vec![
                 PlatformHandle::new("evidence:license:eliot-runtime").map_err(|error| {
@@ -1220,7 +1216,7 @@ fn validate_exact_source_inventory(
 ) -> Result<(), InstallationError> {
     if observed.files.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "trusted source must contain exactly eleven runtime files".to_owned(),
+            "trusted source must contain exactly nine Phase-A runtime files".to_owned(),
         ));
     }
     let expected = REQUIRED_PACKAGE_ROLES
@@ -2116,8 +2112,6 @@ mod tests {
         base.runtime_launch.eliotd_artifact_digest = h(get("eliotd.exe"));
         base.runtime_launch.eliotd_config_digest = h(get("eliotd-governor.json"));
         base.runtime_launch.eliotd_descriptor_digest = h(get("eliotd.json"));
-        base.runtime_launch.store_bootstrap_descriptor_digest = h(get("store-bootstrap.json"));
-        base.runtime_launch.authority_descriptor_digest = h(get("authority.json"));
         base.runtime_launch.kernel_arguments = base
             .runtime_launch
             .expected_kernel_arguments(&base.runtime_launch.store_config_path.clone())
@@ -2145,11 +2139,9 @@ mod tests {
             ("eliot-store-surreal.exe", true),
             ("surreal.exe", true),
             ("eliotd.exe", true),
-            ("authority.json", false),
             ("generation.json", false),
             ("eliotd-governor.json", false),
             ("eliotd.json", false),
-            ("store-bootstrap.json", false),
         ];
         let mut map = std::collections::BTreeMap::new();
         for (name, exe) in roles {
@@ -2228,6 +2220,78 @@ mod tests {
                 .iter()
                 .map(|(name, _)| *name)
                 .collect::<BTreeSet<_>>()
+        );
+        assert!(!package.files.iter().any(|file| matches!(
+            file.relative_path.as_str(),
+            "authority.json" | "store-bootstrap.json"
+        )));
+        let staged_digest_paths = transaction
+            .installer_effects
+            .iter()
+            .find_map(|effect| match effect {
+                InstallerEffectPlan::StagePackage {
+                    expected_file_digests,
+                    ..
+                } => Some(
+                    expected_file_digests
+                        .iter()
+                        .map(|digest| digest.relative_path.as_str())
+                        .collect::<BTreeSet<_>>(),
+                ),
+                _ => None,
+            })
+            .expect("generated transaction has staged digest paths");
+        assert!(!staged_digest_paths.contains("authority.json"));
+        assert!(!staged_digest_paths.contains("store-bootstrap.json"));
+        assert_eq!(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .authority_descriptor_digest
+                .as_str(),
+            PHASE_B_PENDING_DIGEST
+        );
+        assert_eq!(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .store_bootstrap_descriptor_digest
+                .as_str(),
+            PHASE_B_PENDING_DIGEST
+        );
+        assert_eq!(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .kernel_arguments[5]
+                .as_str(),
+            PHASE_B_PENDING_DIGEST
+        );
+        assert_eq!(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .kernel_arguments[9]
+                .as_str(),
+            PHASE_B_PENDING_DIGEST
+        );
+        assert_eq!(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .phase_b_digest_state()
+                .expect("Phase-B state classification"),
+            (
+                crate::PhaseBDigestState::Pending,
+                crate::PhaseBDigestState::Pending
+            )
+        );
+        assert!(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .require_phase_b_live()
+                .is_err()
         );
         assert!(
             transaction
@@ -2399,12 +2463,12 @@ mod tests {
             populate_source_with_roles(source_dir.path());
             match mutation {
                 "missing" => {
-                    std::fs::remove_file(source_dir.path().join("authority.json")).unwrap()
+                    std::fs::remove_file(source_dir.path().join("generation.json")).unwrap()
                 }
                 "extra" => std::fs::write(source_dir.path().join("extra.bin"), b"extra").unwrap(),
                 "alias" => {
-                    std::fs::remove_file(source_dir.path().join("authority.json")).unwrap();
-                    std::fs::write(source_dir.path().join("authority-copy.json"), b"alias")
+                    std::fs::remove_file(source_dir.path().join("generation.json")).unwrap();
+                    std::fs::write(source_dir.path().join("generation-copy.json"), b"alias")
                         .unwrap();
                 }
                 _ => unreachable!(),
@@ -2459,7 +2523,7 @@ mod tests {
             if s.relative_path == "eliot-host.exe" {
                 s.executable = false;
             }
-            if s.relative_path == "authority.json" {
+            if s.relative_path == "generation.json" {
                 s.executable = true;
             }
         }
