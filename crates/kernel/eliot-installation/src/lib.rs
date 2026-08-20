@@ -12731,6 +12731,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::expect_used,
+        clippy::map_identity,
+        clippy::needless_pass_by_value,
+        clippy::redundant_closure,
+        clippy::semicolon_if_nothing_returned,
+        clippy::too_many_lines,
+        clippy::unwrap_used,
+        reason = "installation fixtures use deliberate panic-on-invalid-test-data assertions"
+    )]
+
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier, Mutex};

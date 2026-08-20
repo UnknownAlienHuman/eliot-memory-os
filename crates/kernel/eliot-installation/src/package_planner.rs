@@ -1575,6 +1575,18 @@ impl SealedPackagePlanner {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::expect_used,
+        clippy::map_identity,
+        clippy::needless_pass_by_value,
+        clippy::redundant_closure,
+        clippy::semicolon_if_nothing_returned,
+        clippy::too_many_lines,
+        clippy::unwrap_used,
+        reason = "package-planner fixtures use deliberate panic-on-invalid-test-data assertions"
+    )]
+
     use super::*;
     use crate::InstallationTransactionStore;
     use eliot_platform::PlatformHandle;
