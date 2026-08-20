@@ -18,12 +18,15 @@ use eliot_runtime_contracts::{
 };
 
 use super::{
-    FileIdentity, WindowsAdapterError, file_identity_from_handle, final_windows_path_from_handle,
-    protected_program_data_path, verify_exact_file_security, windows_paths_equal,
+    FileIdentity, ProtectedPathError, ProtectedRootLease, WindowsAdapterError,
+    file_identity_from_handle, final_windows_path_from_handle, protected_program_data_path,
+    verify_exact_file_security, windows_paths_equal,
 };
 
 #[cfg(windows)]
 use super::{OwnedKernelHandle, OwnedSecurityDescriptor, fill_system_random, is_reparse_point};
+#[cfg(windows)]
+use std::sync::Arc;
 
 /// Stable signer identity used by the Windows installer authority primitive.
 pub const INSTALLATION_AUTHORITY_SIGNER_ID: &str = "installer-authority";
@@ -195,7 +198,11 @@ pub struct InstallationAuthorityKeySigner {
     metadata: InstallationAuthorityKeyMetadata,
     signer: Ed25519InstallationActivationApprovalSigner,
     #[cfg(windows)]
-    _slot: std::fs::File,
+    slot_handle: std::fs::File,
+    #[cfg(windows)]
+    contour: Arc<ProtectedRootLease>,
+    #[cfg(windows)]
+    root_identity: FileIdentity,
 }
 
 impl fmt::Debug for InstallationAuthorityKeySigner {
@@ -205,8 +212,10 @@ impl fmt::Debug for InstallationAuthorityKeySigner {
             .field("metadata", &self.metadata)
             .field("signing_seed", &"<redacted>")
             .field("signer", &"<redacted>")
-            .field("_slot", &"<retained>")
-            .finish()
+            .field("slot_handle", &"<retained>")
+            .field("contour", &"<retained>")
+            .field("root_identity", &self.root_identity)
+            .finish_non_exhaustive()
     }
 }
 
@@ -273,7 +282,20 @@ impl InstallationActivationApprovalSigner for InstallationAuthorityKeySigner {
     }
 
     fn sign(&self, canonical_payload: &[u8]) -> Result<Vec<u8>, InstallationActivationError> {
-        self.signer.sign(canonical_payload)
+        #[cfg(windows)]
+        {
+            validate_signer_contour(&self.contour, &self.metadata.slot_path, self.root_identity)
+                .map_err(signing_error)?;
+            validate_signer_slot(self).map_err(signing_error)?;
+        }
+        let signature = self.signer.sign(canonical_payload)?;
+        #[cfg(windows)]
+        {
+            validate_signer_contour(&self.contour, &self.metadata.slot_path, self.root_identity)
+                .map_err(signing_error)?;
+            validate_signer_slot(self).map_err(signing_error)?;
+        }
+        Ok(signature)
     }
 }
 
@@ -282,9 +304,9 @@ impl InstallationActivationApprovalSigner for InstallationAuthorityKeySigner {
 pub struct WindowsInstallationAuthorityKeyStore {
     key_root: PathBuf,
     #[cfg(windows)]
-    _root: std::fs::File,
-    #[cfg(windows)]
     root_identity: FileIdentity,
+    #[cfg(windows)]
+    contour: Arc<ProtectedRootLease>,
 }
 
 impl WindowsInstallationAuthorityKeyStore {
@@ -300,16 +322,19 @@ impl WindowsInstallationAuthorityKeyStore {
     /// existing root cannot be proven to be the approved protected contour.
     pub fn new(key_root: impl Into<PathBuf>) -> Result<Self, InstallationAuthorityKeyError> {
         let key_root = key_root.into();
-        validate_existing_key_root(&key_root)?;
         #[cfg(windows)]
         {
-            let root = open_directory_no_follow(&key_root)?;
-            let root_identity = file_identity_from_handle(&root)
-                .map_err(|_| InstallationAuthorityKeyError::IdentityMismatch)?;
+            let contour = Arc::new(
+                ProtectedRootLease::open_existing(&key_root).map_err(map_protected_path_error)?,
+            );
+            let root_identity = validate_existing_key_root(&key_root)?;
+            if contour.identity() != root_identity {
+                return Err(InstallationAuthorityKeyError::IdentityMismatch);
+            }
             Ok(Self {
                 key_root,
-                _root: root,
                 root_identity,
+                contour,
             })
         }
         #[cfg(not(windows))]
@@ -333,10 +358,9 @@ impl WindowsInstallationAuthorityKeyStore {
     pub fn create_new(
         &self,
     ) -> Result<InstallationAuthorityKeySigner, InstallationAuthorityKeyError> {
-        let mut random = [0_u8; 16];
-        fill_random(&mut random)?;
-        let key_id = format!("key-{}", hex_lower(&random));
-        random.fill(0);
+        let mut random = SecretRandom([0_u8; 16]);
+        fill_random(&mut random.0)?;
+        let key_id = format!("key-{}", hex_lower(&random.0));
         self.create_new_with_key_id(&key_id)
     }
 
@@ -365,8 +389,19 @@ impl WindowsInstallationAuthorityKeyStore {
             let created = create_new_slot(&path)?;
             (|| {
                 write_new_slot(&created, &seed.0)?;
+                flush_parent_directory(&self.key_root);
                 let reopened = reopen_slot(&path)?;
-                build_signer(&path, reopened, key_id, None)
+                let signer = build_signer(
+                    &path,
+                    reopened,
+                    key_id,
+                    None,
+                    Arc::clone(&self.contour),
+                    self.root_identity,
+                )?;
+                self.validate_root()?;
+                validate_signer_slot(&signer)?;
+                Ok(signer)
             })()
         }
         #[cfg(not(windows))]
@@ -396,7 +431,17 @@ impl WindowsInstallationAuthorityKeyStore {
         {
             let path = self.slot_path(&expected.key_id);
             let reopened = reopen_slot(&path)?;
-            build_signer(&path, reopened, &expected.key_id, Some(expected))
+            let signer = build_signer(
+                &path,
+                reopened,
+                &expected.key_id,
+                Some(expected),
+                Arc::clone(&self.contour),
+                self.root_identity,
+            )?;
+            self.validate_root()?;
+            validate_signer_slot(&signer)?;
+            Ok(signer)
         }
         #[cfg(not(windows))]
         {
@@ -409,15 +454,9 @@ impl WindowsInstallationAuthorityKeyStore {
     }
 
     fn validate_root(&self) -> Result<(), InstallationAuthorityKeyError> {
-        validate_existing_key_root(&self.key_root)?;
         #[cfg(windows)]
         {
-            let current = open_directory_no_follow(&self.key_root)?;
-            let identity = file_identity_from_handle(&current)
-                .map_err(|_| InstallationAuthorityKeyError::IdentityMismatch)?;
-            if identity != self.root_identity {
-                return Err(InstallationAuthorityKeyError::IdentityMismatch);
-            }
+            validate_signer_contour(&self.contour, &self.key_root, self.root_identity)?;
         }
         Ok(())
     }
@@ -430,7 +469,7 @@ struct SecretSeed([u8; 32]);
 
 impl Drop for SecretSeed {
     fn drop(&mut self) {
-        self.0.fill(0);
+        clear_secret(&mut self.0);
     }
 }
 
@@ -438,8 +477,25 @@ struct SecretFileBytes([u8; INSTALLATION_AUTHORITY_KEY_FILE_BYTES]);
 
 impl Drop for SecretFileBytes {
     fn drop(&mut self) {
-        self.0.fill(0);
+        clear_secret(&mut self.0);
     }
+}
+
+struct SecretRandom([u8; 16]);
+
+impl Drop for SecretRandom {
+    fn drop(&mut self) {
+        clear_secret(&mut self.0);
+    }
+}
+
+fn clear_secret(bytes: &mut [u8]) {
+    for byte in bytes {
+        // SAFETY: every pointer is derived from a live mutable slice element;
+        // volatile stores prevent the optimizer from eliding the wipe.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 fn validate_key_id(key_id: &str) -> Result<(), InstallationAuthorityKeyError> {
@@ -490,7 +546,7 @@ fn fill_random(_bytes: &mut [u8]) -> Result<(), InstallationAuthorityKeyError> {
 }
 
 #[cfg(windows)]
-fn validate_existing_key_root(path: &Path) -> Result<(), InstallationAuthorityKeyError> {
+fn validate_existing_key_root(path: &Path) -> Result<FileIdentity, InstallationAuthorityKeyError> {
     if !path.is_absolute()
         || path.components().any(|component| {
             matches!(
@@ -503,24 +559,67 @@ fn validate_existing_key_root(path: &Path) -> Result<(), InstallationAuthorityKe
     }
     let contour = protected_program_data_path("Eliot")
         .map_err(|_| InstallationAuthorityKeyError::InvalidPath)?;
-    if !path_within(path, &contour) {
+    let expected = contour.join(Path::new(INSTALLATION_AUTHORITY_KEY_ROOT_RELATIVE));
+    if !equivalent_windows_paths(path, &expected) || !path_within(path, &contour) {
         return Err(InstallationAuthorityKeyError::InvalidPath);
     }
     reject_reparse_chain(path)?;
     let directory = open_directory_no_follow(path)?;
     let canonical = final_windows_path_from_handle(&directory)
         .map_err(|_| InstallationAuthorityKeyError::IdentityMismatch)?;
-    if !windows_paths_equal(&canonical, path) {
+    if !equivalent_windows_paths(&canonical, path) {
         return Err(InstallationAuthorityKeyError::IdentityMismatch);
     }
     let expected = OwnedSecurityDescriptor::for_installer_authority_key()
         .map_err(|_| InstallationAuthorityKeyError::AclMismatch)?;
-    verify_exact_file_security(&directory, &expected, EXPECTED_OWNER_SID).map_err(map_windows_error)
+    verify_exact_file_security(&directory, &expected, EXPECTED_OWNER_SID)
+        .map_err(map_windows_error)?;
+    file_identity_from_handle(&directory)
+        .map_err(|_| InstallationAuthorityKeyError::IdentityMismatch)
 }
 
 #[cfg(not(windows))]
-fn validate_existing_key_root(_path: &Path) -> Result<(), InstallationAuthorityKeyError> {
+fn validate_existing_key_root(_path: &Path) -> Result<FileIdentity, InstallationAuthorityKeyError> {
     Err(InstallationAuthorityKeyError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
+fn map_protected_path_error(error: ProtectedPathError) -> InstallationAuthorityKeyError {
+    match error {
+        ProtectedPathError::InvalidRoot => InstallationAuthorityKeyError::MissingRoot,
+        ProtectedPathError::InvalidPath => InstallationAuthorityKeyError::InvalidPath,
+        ProtectedPathError::ReparsePoint => InstallationAuthorityKeyError::ReparsePoint,
+        ProtectedPathError::AclMismatch => InstallationAuthorityKeyError::AclMismatch,
+        ProtectedPathError::Io | ProtectedPathError::SizeExceeded => {
+            InstallationAuthorityKeyError::Io
+        }
+        ProtectedPathError::UnsupportedPlatform => {
+            InstallationAuthorityKeyError::UnsupportedPlatform
+        }
+    }
+}
+
+#[cfg(windows)]
+fn validate_signer_contour(
+    contour: &ProtectedRootLease,
+    key_root: &Path,
+    root_identity: FileIdentity,
+) -> Result<(), InstallationAuthorityKeyError> {
+    let current_identity = validate_existing_key_root(key_root)?;
+    if current_identity != root_identity {
+        return Err(InstallationAuthorityKeyError::IdentityMismatch);
+    }
+    contour
+        .verify_stable_identity()
+        .map_err(map_protected_path_error)?;
+    if contour.identity() != root_identity {
+        return Err(InstallationAuthorityKeyError::IdentityMismatch);
+    }
+    let canonical = contour.canonical_path().map_err(map_protected_path_error)?;
+    if !equivalent_windows_paths(&canonical, key_root) {
+        return Err(InstallationAuthorityKeyError::IdentityMismatch);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -534,6 +633,11 @@ fn path_within(path: &Path, contour: &Path) -> bool {
             .all(|(left, right)| {
                 windows_paths_equal(Path::new(left.as_os_str()), Path::new(right.as_os_str()))
             })
+}
+
+#[cfg(windows)]
+fn equivalent_windows_paths(left: &Path, right: &Path) -> bool {
+    windows_paths_equal(left, right) || (path_within(left, right) && path_within(right, left))
 }
 
 #[cfg(windows)]
@@ -588,6 +692,121 @@ fn open_directory_no_follow(path: &Path) -> Result<std::fs::File, InstallationAu
 }
 
 #[cfg(windows)]
+fn ensure_single_link(file: &std::fs::File) -> Result<(), InstallationAuthorityKeyError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let ok = unsafe {
+        // SAFETY: file owns a live handle and the output points to initialized
+        // storage of the exact documented structure.
+        GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut information)
+    };
+    if ok == 0 {
+        return Err(InstallationAuthorityKeyError::Io);
+    }
+    if information.nNumberOfLinks != 1 {
+        return Err(InstallationAuthorityKeyError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_live_slot(
+    path: &Path,
+    file: &std::fs::File,
+    key_id: &str,
+    expected_identity: Option<FileIdentity>,
+) -> Result<FileIdentity, InstallationAuthorityKeyError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| InstallationAuthorityKeyError::Io)?;
+    if !metadata.is_file() || is_reparse_point(&metadata) {
+        return Err(InstallationAuthorityKeyError::ReparsePoint);
+    }
+    if usize::try_from(metadata.len()).map_err(|_| InstallationAuthorityKeyError::Io)?
+        != INSTALLATION_AUTHORITY_KEY_FILE_BYTES
+    {
+        return Err(InstallationAuthorityKeyError::MissingOrMalformed);
+    }
+    let expected_name = format!("{key_id}{KEY_FILE_EXTENSION}");
+    if path
+        .file_name()
+        .is_none_or(|name| name != std::ffi::OsStr::new(&expected_name))
+    {
+        return Err(InstallationAuthorityKeyError::IdentityMismatch);
+    }
+    let canonical = final_windows_path_from_handle(file)
+        .map_err(|_| InstallationAuthorityKeyError::IdentityMismatch)?;
+    if !equivalent_windows_paths(&canonical, path) {
+        return Err(InstallationAuthorityKeyError::IdentityMismatch);
+    }
+    let identity = file_identity_from_handle(file)
+        .map_err(|_| InstallationAuthorityKeyError::IdentityMismatch)?;
+    if expected_identity.is_some_and(|expected| expected != identity) {
+        return Err(InstallationAuthorityKeyError::IdentityMismatch);
+    }
+    ensure_single_link(file)?;
+    let descriptor = OwnedSecurityDescriptor::for_installer_authority_key()
+        .map_err(|_| InstallationAuthorityKeyError::AclMismatch)?;
+    verify_exact_file_security(file, &descriptor, EXPECTED_OWNER_SID).map_err(map_windows_error)?;
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn validate_signer_slot(
+    signer: &InstallationAuthorityKeySigner,
+) -> Result<(), InstallationAuthorityKeyError> {
+    let identity = validate_live_slot(
+        &signer.metadata.slot_path,
+        &signer.slot_handle,
+        &signer.metadata.key_id,
+        Some(signer.metadata.file_identity),
+    )?;
+    if identity != signer.metadata.file_identity {
+        return Err(InstallationAuthorityKeyError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn signing_error(error: InstallationAuthorityKeyError) -> InstallationActivationError {
+    InstallationActivationError::InvalidField {
+        field: "installation_authority_key.contour".to_owned(),
+        reason: error.to_string(),
+    }
+}
+
+#[cfg(windows)]
+fn flush_parent_directory(path: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    if let Ok(directory) = options.open(path)
+        && directory.metadata().is_ok_and(|metadata| {
+            metadata.is_dir() && {
+                use std::os::windows::fs::MetadataExt;
+                metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+            }
+        })
+    {
+        // Directory flush is not supported by every Windows filesystem.  The
+        // file flush remains mandatory; this best-effort metadata flush is used
+        // whenever the filesystem accepts it and never invents a destructive
+        // recovery path after CREATE_NEW has committed.
+        let _ = directory.sync_all();
+    }
+}
+
+#[cfg(windows)]
 fn create_new_slot(path: &Path) -> Result<std::fs::File, InstallationAuthorityKeyError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError};
@@ -632,9 +851,11 @@ fn create_new_slot(path: &Path) -> Result<std::fs::File, InstallationAuthorityKe
             map_windows_error(WindowsAdapterError::Failed)
         });
     }
-    OwnedKernelHandle::new(handle)
+    let file = OwnedKernelHandle::new(handle)
         .map_err(map_windows_error)
-        .map(OwnedKernelHandle::into_file)
+        .map(OwnedKernelHandle::into_file)?;
+    ensure_single_link(&file)?;
+    Ok(file)
 }
 
 #[cfg(windows)]
@@ -675,9 +896,11 @@ fn reopen_slot(path: &Path) -> Result<std::fs::File, InstallationAuthorityKeyErr
             },
         );
     }
-    OwnedKernelHandle::new(handle)
+    let file = OwnedKernelHandle::new(handle)
         .map_err(map_windows_error)
-        .map(OwnedKernelHandle::into_file)
+        .map(OwnedKernelHandle::into_file)?;
+    ensure_single_link(&file)?;
+    Ok(file)
 }
 
 #[cfg(windows)]
@@ -716,34 +939,20 @@ fn build_signer(
     mut file: std::fs::File,
     key_id: &str,
     expected: Option<&InstallationAuthorityKeyExpectation>,
+    contour: Arc<ProtectedRootLease>,
+    root_identity: FileIdentity,
 ) -> Result<InstallationAuthorityKeySigner, InstallationAuthorityKeyError> {
-    let metadata = file
-        .metadata()
-        .map_err(|_| InstallationAuthorityKeyError::Io)?;
-    if !metadata.is_file() || is_reparse_point(&metadata) {
-        return Err(InstallationAuthorityKeyError::ReparsePoint);
-    }
-    if usize::try_from(metadata.len()).map_err(|_| InstallationAuthorityKeyError::Io)?
-        != INSTALLATION_AUTHORITY_KEY_FILE_BYTES
-    {
-        return Err(InstallationAuthorityKeyError::MissingOrMalformed);
-    }
-    let canonical = final_windows_path_from_handle(&file)
-        .map_err(|_| InstallationAuthorityKeyError::IdentityMismatch)?;
-    if !windows_paths_equal(&canonical, path) {
-        return Err(InstallationAuthorityKeyError::IdentityMismatch);
-    }
-    let identity = file_identity_from_handle(&file)
-        .map_err(|_| InstallationAuthorityKeyError::IdentityMismatch)?;
+    let identity = validate_live_slot(
+        path,
+        &file,
+        key_id,
+        expected.map(|expected| expected.file_identity),
+    )?;
     if let Some(expected) = expected
         && expected.file_identity != identity
     {
         return Err(InstallationAuthorityKeyError::IdentityMismatch);
     }
-    let descriptor = OwnedSecurityDescriptor::for_installer_authority_key()
-        .map_err(|_| InstallationAuthorityKeyError::AclMismatch)?;
-    verify_exact_file_security(&file, &descriptor, EXPECTED_OWNER_SID)
-        .map_err(map_windows_error)?;
 
     file.seek(SeekFrom::Start(0))
         .map_err(|_| InstallationAuthorityKeyError::Io)?;
@@ -792,7 +1001,9 @@ fn build_signer(
             file_identity: identity,
         },
         signer,
-        _slot: file,
+        slot_handle: file,
+        contour,
+        root_identity,
     })
 }
 
@@ -836,6 +1047,153 @@ mod tests {
         assert_eq!(INSTALLATION_AUTHORITY_KEY_FILE_VERSION, 1);
     }
 
+    #[test]
+    fn temporary_secret_buffers_are_explicitly_wiped() {
+        let mut random = SecretRandom([0xa5_u8; 16]);
+        let mut seed = SecretSeed([0xa5_u8; 32]);
+        let mut encoded = SecretFileBytes([0xa5_u8; INSTALLATION_AUTHORITY_KEY_FILE_BYTES]);
+        clear_secret(&mut random.0);
+        clear_secret(&mut seed.0);
+        clear_secret(&mut encoded.0);
+        assert!(random.0.iter().all(|byte| *byte == 0));
+        assert!(seed.0.iter().all(|byte| *byte == 0));
+        assert!(encoded.0.iter().all(|byte| *byte == 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn every_authority_contour_ancestor_reparse_is_rejected() {
+        use std::os::windows::fs::MetadataExt;
+        use std::process::Command;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        for component in ["Eliot", "host", "authority-keys"] {
+            let suffix = super::super::unique_suffix();
+            let root =
+                std::env::temp_dir().join(format!("eliot-authority-reparse-{component}-{suffix}"));
+            let outside =
+                std::env::temp_dir().join(format!("eliot-authority-reparse-outside-{suffix}"));
+            std::fs::create_dir_all(&root).unwrap_or_else(|_| unreachable!());
+            std::fs::create_dir_all(outside.join("authority-keys"))
+                .unwrap_or_else(|_| unreachable!());
+            std::fs::create_dir_all(outside.join("host/authority-keys"))
+                .unwrap_or_else(|_| unreachable!());
+            let victim = match component {
+                "Eliot" => root.join("Eliot"),
+                "host" => root.join("Eliot").join("host"),
+                "authority-keys" => root.join("Eliot").join("host").join("authority-keys"),
+                _ => unreachable!(),
+            };
+            if let Some(parent) = victim.parent() {
+                std::fs::create_dir_all(parent).unwrap_or_else(|_| unreachable!());
+            }
+            let output = Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(&victim)
+                .arg(&outside)
+                .output()
+                .unwrap_or_else(|_| unreachable!());
+            assert!(
+                output.status.success(),
+                "mklink /J was not exercised for {component} (victim={victim:?}, target={outside:?}): stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let metadata = std::fs::symlink_metadata(&victim).unwrap_or_else(|_| unreachable!());
+            assert_ne!(
+                metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT,
+                0,
+                "junction fixture did not produce a reparse point"
+            );
+            let path = root.join("Eliot").join("host").join("authority-keys");
+            assert_eq!(
+                reject_reparse_chain(&path),
+                Err(InstallationAuthorityKeyError::ReparsePoint),
+                "ancestor {component} was not rejected for {path:?}"
+            );
+            std::fs::remove_dir(&victim).unwrap_or_else(|_| unreachable!());
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardlink_alias_is_rejected_by_single_link_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-authority-hardlink-{}",
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).unwrap_or_else(|_| unreachable!());
+        let path = root.join("key-hardlink.key");
+        let alias = root.join("key-hardlink-alias.key");
+        std::fs::write(&path, [0_u8; INSTALLATION_AUTHORITY_KEY_FILE_BYTES])
+            .unwrap_or_else(|_| unreachable!());
+        std::fs::hard_link(&path, &alias).unwrap_or_else(|_| unreachable!());
+        let file = std::fs::File::open(&path).unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            ensure_single_link(&file),
+            Err(InstallationAuthorityKeyError::IdentityMismatch)
+        );
+        drop(file);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malformed_partial_slot_is_terminal_and_not_adopted() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-authority-partial-{}",
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).unwrap_or_else(|_| unreachable!());
+        let path = root.join("key-crash.key");
+        std::fs::File::create(&path).unwrap_or_else(|_| unreachable!());
+        let file = reopen_slot(&path).unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            validate_live_slot(&path, &file, "key-crash", None),
+            Err(InstallationAuthorityKeyError::MissingOrMalformed)
+        );
+        drop(file);
+        assert!(
+            path.exists(),
+            "partial state must remain classified, not deleted"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wrong_identity_and_default_acl_are_fail_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-authority-identity-{}",
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).unwrap_or_else(|_| unreachable!());
+        let path = root.join("key-identity.key");
+        let other = root.join("other.key");
+        std::fs::write(&path, [0_u8; INSTALLATION_AUTHORITY_KEY_FILE_BYTES])
+            .unwrap_or_else(|_| unreachable!());
+        std::fs::write(&other, [0_u8; INSTALLATION_AUTHORITY_KEY_FILE_BYTES])
+            .unwrap_or_else(|_| unreachable!());
+        let file = reopen_slot(&path).unwrap_or_else(|_| unreachable!());
+        let other_file = reopen_slot(&other).unwrap_or_else(|_| unreachable!());
+        let other_identity =
+            file_identity_from_handle(&other_file).unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            validate_live_slot(&path, &file, "key-identity", Some(other_identity)),
+            Err(InstallationAuthorityKeyError::IdentityMismatch)
+        );
+        assert!(matches!(
+            validate_live_slot(&path, &file, "key-identity", None),
+            Err(InstallationAuthorityKeyError::AclMismatch
+                | InstallationAuthorityKeyError::IdentityMismatch)
+        ));
+        drop(other_file);
+        drop(file);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(windows)]
     #[test]
     fn signer_debug_does_not_contain_seed() {
@@ -857,13 +1215,28 @@ mod tests {
                 file_index: 2,
             },
         };
-        let path =
-            std::env::temp_dir().join(format!("eliot-authority-debug-{}", std::process::id()));
+        let suffix = super::super::unique_suffix();
+        let path = std::env::temp_dir().join(format!("eliot-authority-debug-{suffix}"));
         let slot = std::fs::File::create(&path).unwrap_or_else(|_| unreachable!());
+        let contour_root =
+            std::env::temp_dir().join(format!("eliot-authority-debug-contour-{suffix}"));
+        std::fs::create_dir_all(&contour_root).unwrap_or_else(|_| unreachable!());
+        let directories =
+            vec![super::super::pin_directory(&contour_root).unwrap_or_else(|_| unreachable!())];
+        let root_identity = super::super::file_identity_from_handle(
+            directories.last().unwrap_or_else(|| unreachable!()),
+        )
+        .unwrap_or_else(|_| unreachable!());
         let signer = InstallationAuthorityKeySigner {
             metadata,
             signer: inner,
-            _slot: slot,
+            slot_handle: slot,
+            contour: Arc::new(ProtectedRootLease {
+                path: contour_root.clone(),
+                identity: root_identity,
+                directories,
+            }),
+            root_identity,
         };
         let debug = format!("{signer:?}");
         let secret_hex = hex_lower(&secret);
@@ -873,5 +1246,6 @@ mod tests {
         assert!(!metadata_json.contains(&secret_hex));
         drop(signer);
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(contour_root);
     }
 }
