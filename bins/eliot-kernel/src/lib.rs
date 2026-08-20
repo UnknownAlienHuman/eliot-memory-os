@@ -2971,6 +2971,10 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "recovery closure keeps exact disposition inspection and terminal proof ordered"
+    )]
     async fn close_previous_daemon_process(
         &self,
         launch: &EliotdLaunchDescriptor,
@@ -3050,10 +3054,20 @@ impl KernelComposition {
                     .cancel(&owner, receipt.operation_id().clone())
                     .await
                     .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-                if cancellation.binding() != receipt.binding()
-                    || cancellation.status() != CancellationStatus::Completed
-                    || cancellation.lifecycle() != ProcessLifecycle::Exited
-                    || !cancellation.descendants().is_some_and(|descendants| {
+                if cancellation.binding() != receipt.binding() {
+                    return Err(KernelBuildError::Service(
+                        "eliotd previous process cancellation binding changed".to_owned(),
+                    ));
+                }
+                let closed = gateway
+                    .inspect(&owner, receipt.operation_id().clone())
+                    .await
+                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+                if closed.binding() != receipt.binding()
+                    || closed.identity() != Some(receipt.identity())
+                    || closed.lifecycle() != ProcessLifecycle::Exited
+                    || closed.cancellation() != CancellationStatus::Completed
+                    || !closed.descendants().is_some_and(|descendants| {
                         descendants.complete() && descendants.tree_terminated()
                     })
                 {
@@ -6793,6 +6807,117 @@ mod tests {
                 .status,
             DaemonRuntimeStatus::Failed(_)
         ));
+        drop(gateway);
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the production-bound recovery proof retains one real Job, receipt, stale rejection, and cleanup path"
+    )]
+    async fn daemon_recovery_closes_exact_prior_tree_and_rejects_stale_receipt() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-daemon-recovery-proof-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        std::fs::create_dir_all(root.join("kernel")).expect("kernel work root");
+        let executable = std::env::current_exe().expect("test executable");
+        let executable_sha256 =
+            sha256_hex(&std::fs::read(&executable).expect("read test executable"));
+        let containment_root = executable.parent().expect("test executable parent");
+        let mut launch = test_daemon_launch(&root);
+        launch.executable =
+            PlatformHandle::new(executable.to_string_lossy()).expect("test executable handle");
+        launch.executable_sha256.clone_from(&executable_sha256);
+        launch.working_directory = PlatformHandle::new(containment_root.to_string_lossy())
+            .expect("working directory handle");
+        launch.arguments[7] =
+            PlatformHandle::new(launch.executable_sha256.clone()).expect("executable digest");
+        launch.descriptor_sha256.clear();
+        launch = launch.with_computed_digest().expect("test launch digest");
+        let mut kernel = KernelComposition::new(
+            KernelConfig::new(root.join("kernel"))
+                .with_daemon_launch(launch.clone())
+                .with_kernel_artifact_sha256("c".repeat(64)),
+        )
+        .expect("kernel composition");
+        let kernel_process =
+            observe_named_pipe_peer_process(std::process::id()).expect("Kernel identity");
+        let generation = Generation::new(launch.generation.value()).expect("generation");
+        let attempt = eliotd_launch_attempt_identity(
+            &launch,
+            kernel_process.process_id(),
+            kernel_process.start_time_100ns(),
+            kernel_process.image_path(),
+        )
+        .expect("launch attempt");
+        let operation = eliotd_operation_id(generation, &attempt).expect("operation");
+        let admission = real_executor_admission(
+            &executable,
+            &executable_sha256,
+            operation.as_str(),
+            "tests::real_executor_receipt_child",
+            BTreeMap::from([(REAL_EXECUTOR_CHILD_ENV.to_owned(), "1".to_owned())]),
+        );
+        let (gateway, platform, authority) =
+            real_process_gateway(&root.join("real-executor"), containment_root);
+        let gateway = Arc::new(gateway);
+        let expectation = current_process_named_pipe_expectation().expect("Kernel expectation");
+        let owner = ProcessOwnerBinding::new(
+            ACTIVE_DAEMON_CALLER,
+            stable_owner_principal_digest(
+                expectation.expected_sid(),
+                ACTIVE_DAEMON_CALLER,
+                launch.authority_epoch.value(),
+                generation,
+            ),
+            launch.authority_epoch.value(),
+            generation,
+        )
+        .expect("daemon owner");
+        let receipt =
+            start_real_executor_child(&gateway, &platform, &authority, &admission, &owner).await;
+        gateway
+            .persist_completed(
+                receipt.operation_id(),
+                &process_admission_digest(&admission).expect("admission digest"),
+                &owner,
+                receipt.clone(),
+            )
+            .expect("persist exact completed receipt");
+        kernel.process_gateway = Some(Arc::clone(&gateway));
+        {
+            let mut state = kernel.daemon_runtime.lock().expect("daemon runtime lock");
+            state.status = DaemonRuntimeStatus::Failed("daemon timeout".to_owned());
+            state.receipt = Some(receipt.clone());
+        }
+        kernel
+            .close_previous_daemon_process(&launch, &receipt)
+            .await
+            .expect("exact prior process tree closure");
+        let closed = gateway
+            .inspect(&owner, receipt.operation_id().clone())
+            .await
+            .expect("closed prior operation inspection");
+        assert_eq!(closed.lifecycle(), ProcessLifecycle::Exited);
+
+        let stale = test_process_start_receipt(41_002);
+        assert!(
+            kernel
+                .close_previous_daemon_process(&launch, &stale)
+                .await
+                .is_err(),
+            "a stale completed receipt must not be adopted for recovery"
+        );
+        gateway
+            .executor
+            .shutdown()
+            .expect("shutdown recovery proof executor");
         drop(gateway);
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
