@@ -3618,9 +3618,11 @@ impl ApprovedGenerationRegistry {
             .find(|approval| approval.generation == *generation && approval.role == role)
     }
 
-    /// Persists an installer-approved candidate as pending.  This is the only
-    /// installer admission operation; it never changes `active_generation`.
-    pub fn stage_pending_activation(
+    /// Test-only fixture seam for registry state-machine tests that do not
+    /// exercise the production installer transaction. Production admission
+    /// is available only through the transaction-bound all-effects gate.
+    #[cfg(test)]
+    fn stage_pending_activation(
         &mut self,
         transaction_id: PlatformHandle,
         plan_digest: PlatformHandle,
@@ -3712,7 +3714,7 @@ impl ApprovedGenerationRegistry {
         transaction: &InstallationTransaction,
         approval_ref: PlatformHandle,
     ) -> Result<(), InstallationError> {
-        transaction.validate()?;
+        transaction.require_all_effects_applied()?;
         let approvals = transaction.service_registration_approvals()?;
         if transaction.profile == InstallationProfile::SystemService && approvals.len() != 2 {
             return Err(InstallationError::IncompleteObservation(
@@ -5322,6 +5324,27 @@ impl InstallationTransaction {
     #[must_use]
     pub fn effect_progress(&self) -> &[InstallationEffectProgress] {
         &self.effect_progress
+    }
+
+    /// Requires authoritative readback for every immutable installer effect.
+    ///
+    /// This is the core admission gate for any registry or approval
+    /// projection.  A transaction with a pending intent, unknown outcome, or
+    /// merely planned effect must not become an approved generation.
+    pub fn require_all_effects_applied(&self) -> Result<(), InstallationError> {
+        self.validate()?;
+        if self.effect_progress.iter().any(|progress| {
+            !matches!(
+                progress.state,
+                InstallationEffectProgressState::Applied { .. }
+            )
+        }) {
+            return Err(InstallationError::IncompleteObservation(
+                "all installer effects require authoritative applied readback before registry staging or approval projection"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Projects the two installer-owned SCM approvals from authoritative
@@ -8792,6 +8815,63 @@ where
         }
     }
 
+    /// Drives the immutable effect plan until it is complete or reaches a
+    /// durable blocked outcome.
+    ///
+    /// The loop is deliberately finite: at most one call per planned effect
+    /// plus one reconciliation pass.  `Rejected`, `RollbackRequired`, and
+    /// `Quarantined` are returned immediately, while compare-and-save
+    /// conflicts and all other errors are propagated without retry.
+    pub fn drive_all_effects_until_blocked(
+        &mut self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let transaction = self.store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let max_steps = transaction
+            .installer_effects
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "installer_effects".to_owned(),
+                reason: "bounded drive limit overflow".to_owned(),
+            })?;
+
+        for _ in 0..max_steps {
+            let outcome = self.drive_effect(transaction_id)?;
+            match outcome {
+                InstallationStepOutcome::Applied { .. } => {
+                    let current = self.store.load(transaction_id)?.ok_or_else(|| {
+                        InstallationError::TransactionNotFound {
+                            transaction_id: transaction_id.as_str().to_owned(),
+                        }
+                    })?;
+                    if current.effect_progress.iter().all(|progress| {
+                        matches!(
+                            progress.state,
+                            InstallationEffectProgressState::Applied { .. }
+                        )
+                    }) {
+                        current.require_all_effects_applied()?;
+                        return Ok(outcome);
+                    }
+                }
+                InstallationStepOutcome::Rejected
+                | InstallationStepOutcome::RollbackRequired { .. }
+                | InstallationStepOutcome::Quarantined { .. } => return Ok(outcome),
+            }
+        }
+
+        Err(InstallationError::IncompleteObservation(
+            "bounded installation effect drive exhausted before all effects were applied"
+                .to_owned(),
+        ))
+    }
+
     /// Rolls back only exact identities proven `CreatedByTransaction`.
     #[allow(
         clippy::needless_continue,
@@ -9220,6 +9300,14 @@ where
         transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         self.inner.drive_effect(transaction_id)
+    }
+
+    /// Drives all immutable effects through the bounded installer-core loop.
+    pub fn drive_all_effects_until_blocked(
+        &mut self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.inner.drive_all_effects_until_blocked(transaction_id)
     }
 
     /// Rolls back exact transaction-created roots and terminally retires keys.
@@ -10260,6 +10348,109 @@ mod tests {
         transaction
     }
 
+    #[cfg(windows)]
+    fn fully_applied_system_registration_transaction() -> InstallationTransaction {
+        let mut transaction = system_registration_transaction();
+        for index in 0..transaction.installer_effects.len() {
+            let effect = transaction.installer_effects[index].clone();
+            match effect {
+                InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
+                    let change = transaction
+                        .planned_changes
+                        .iter()
+                        .find(|change| {
+                            change.change_id == transaction.effect_progress[index].effect_id
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| unreachable!());
+                    let marker = CredentialOwnershipMarkerIdentity {
+                        canonical_path_digest: test_handle("a".repeat(64)),
+                        volume_serial_number: 1,
+                        file_index: 1,
+                        security_descriptor_digest: test_handle("b".repeat(64)),
+                    };
+                    let host_owner_epoch = test_handle("host-owner:system");
+                    let host_process_identity = test_handle("c".repeat(64));
+                    let request_digest = test_handle("d".repeat(64));
+                    let credential_envelope_digest = test_handle("e".repeat(64));
+                    let response_digest = must(credential_matching_response_digest(
+                        &request_digest,
+                        &host_owner_epoch,
+                        &host_process_identity,
+                        &marker,
+                        &credential_envelope_digest,
+                    ));
+                    let snapshot = StoreCredentialAbsentSnapshot {
+                        host_owner_epoch: host_owner_epoch.clone(),
+                        host_process_identity: host_process_identity.clone(),
+                        host_state_root: marker.clone(),
+                        marker_path_digest: test_handle("f".repeat(64)),
+                        marker_absent: true,
+                        target_absent: true,
+                    };
+                    let precondition = must(
+                        must(InstallationEffectPrecondition::from_change(&change))
+                            .with_credential_snapshot(snapshot),
+                    );
+                    let reference = InstallationSecretReference {
+                        target: test_handle(
+                            "eliot/installer-root/v1/0123456789abcdef0123456789abcdef",
+                        ),
+                        expected_principal_sid: test_handle(LOCAL_SERVICE_SID),
+                        scope: InstallationSecretScope::WindowsCredentialManagerCurrentUser,
+                    };
+                    let receipt = CredentialAccessReceipt {
+                        transaction_id: transaction.transaction_id.clone(),
+                        effect_id: transaction.effect_progress[index].effect_id.clone(),
+                        generation: provision.generation,
+                        config_digest: provision.config_digest.clone(),
+                        target: provision.target.clone(),
+                        provider: provision.provider,
+                        scope: provision.scope,
+                        principal_sid: provision.expected_principal_sid.clone(),
+                        host_owner_epoch,
+                        host_process_identity,
+                        marker,
+                        credential_envelope_digest,
+                        request_digest,
+                        response_digest,
+                    };
+                    transaction.effect_progress[index].admitted_precondition = Some(precondition);
+                    transaction.effect_progress[index].ownership_secret =
+                        Some(InstallationOwnershipSecret {
+                            reference,
+                            create_disposition: InstallationCreateDisposition::Created,
+                            lifecycle: InstallationSecretLifecycle::Active,
+                        });
+                    transaction.effect_progress[index].store_credential =
+                        Some(StoreCredentialProgress {
+                            lifecycle: StoreCredentialLifecycle::Active,
+                            receipt: Some(receipt),
+                        });
+                    transaction.effect_progress[index].state =
+                        InstallationEffectProgressState::Applied {
+                            disposition: InstallationEffectDisposition::CreatedByTransaction,
+                            external_identity: test_handle("external:credential"),
+                            evidence: vec![test_handle("evidence:credential")],
+                            postcondition_digest: test_handle("1".repeat(64)),
+                        };
+                }
+                InstallerEffectPlan::CreateRoot { .. } | InstallerEffectPlan::ApplyAcl { .. } => {
+                    transaction.effect_progress[index].state =
+                        InstallationEffectProgressState::Applied {
+                            disposition: InstallationEffectDisposition::PreexistingMatching,
+                            external_identity: test_handle(format!("external:root-{index}")),
+                            evidence: vec![test_handle(format!("evidence:root-{index}"))],
+                            postcondition_digest: test_handle(format!("{index:064x}")),
+                        };
+                }
+                InstallerEffectPlan::RegisterService { .. } => {}
+            }
+        }
+        must(transaction.validate());
+        transaction
+    }
+
     fn planned_transaction() -> InstallationTransaction {
         let transaction = registering_transaction();
         must(InstallationTransaction::new(
@@ -10367,6 +10558,19 @@ mod tests {
             external_identity: test_handle("external:effect-0"),
             evidence: vec![test_handle("evidence:matching")],
             postcondition_digest: test_handle("a".repeat(64)),
+            credential_receipt: None,
+        }
+    }
+
+    fn matching_for(
+        index: usize,
+        disposition: InstallationEffectDisposition,
+    ) -> InstallationEffectObservation {
+        InstallationEffectObservation::Matching {
+            disposition,
+            external_identity: test_handle(format!("external:matching-{index}")),
+            evidence: vec![test_handle(format!("evidence:matching-{index}"))],
+            postcondition_digest: test_handle(format!("{index:064x}")),
             credential_receipt: None,
         }
     }
@@ -11257,6 +11461,111 @@ mod tests {
     }
 
     #[test]
+    fn all_effects_gate_blocks_registry_projection_until_authoritative_readback() {
+        let transaction = planned_transaction();
+        assert!(matches!(
+            transaction.require_all_effects_applied(),
+            Err(InstallationError::IncompleteObservation(_))
+        ));
+
+        let mut registry = ApprovedGenerationRegistry::new();
+        assert!(matches!(
+            registry.stage_pending_activation_from_transaction(
+                &transaction,
+                test_handle("approval:blocked"),
+            ),
+            Err(InstallationError::IncompleteObservation(_))
+        ));
+        assert!(registry.pending_activation().is_none());
+    }
+
+    #[test]
+    fn bounded_effect_driver_stops_on_rejected_without_retry() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            vec![PortOutcome::Known(absent(&transaction))],
+            execute_count.clone(),
+        );
+        let mut coordinator = InstallationCoordinator::new(port, store.clone());
+
+        assert_eq!(
+            must(coordinator.drive_all_effects_until_blocked(&transaction_id)),
+            InstallationStepOutcome::Rejected
+        );
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert!(matches!(
+            saved.effect_progress[0].state,
+            InstallationEffectProgressState::IntentCommitted { .. }
+        ));
+    }
+
+    #[test]
+    fn bounded_effect_driver_completes_all_effects_and_rechecks_authority() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let effect_count = transaction.effect_progress.len();
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(
+            store.clone(),
+            (0..effect_count)
+                .map(|index| {
+                    PortOutcome::Known(matching_for(
+                        index,
+                        InstallationEffectDisposition::PreexistingMatching,
+                    ))
+                })
+                .collect(),
+            Vec::new(),
+            execute_count.clone(),
+        );
+        let mut coordinator = InstallationCoordinator::new(port, store.clone());
+
+        assert!(matches!(
+            must(coordinator.drive_all_effects_until_blocked(&transaction_id)),
+            InstallationStepOutcome::Applied { .. }
+        ));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert!(saved.require_all_effects_applied().is_ok());
+    }
+
+    #[test]
+    fn bounded_effect_driver_propagates_cas_conflict_without_external_retry() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        *store
+            .conflict_next
+            .lock()
+            .unwrap_or_else(|_| unreachable!()) = true;
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            Vec::new(),
+            execute_count.clone(),
+        );
+        let mut coordinator = InstallationCoordinator::new(port, store);
+
+        let result = coordinator.drive_all_effects_until_blocked(&transaction_id);
+        assert!(matches!(
+            result,
+            Err(InstallationError::CompareAndSaveConflict { .. })
+        ));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+    }
+
+    #[test]
     fn cas_conflict_happens_before_external_effect() {
         let transaction = planned_transaction();
         let transaction_id = transaction.transaction_id.clone();
@@ -11903,7 +12212,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn service_registration_projection_is_durable_and_exact() {
-        let transaction = system_registration_transaction();
+        let transaction = fully_applied_system_registration_transaction();
         let approvals = must(transaction.service_registration_approvals());
         assert_eq!(approvals.len(), 2);
         assert_eq!(approvals[0].role, InstallerServiceRole::Host);
