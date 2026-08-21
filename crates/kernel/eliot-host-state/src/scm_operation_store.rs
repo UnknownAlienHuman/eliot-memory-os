@@ -1,9 +1,12 @@
 #![allow(dead_code)]
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eliot_platform::PlatformHandle;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, TableHandle,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -96,6 +99,11 @@ struct StoreMeta {
 struct ScmOperationHistoryLink {
     revision: u64,
     checksum: String,
+    /// A deterministic commitment to this predecessor and the complete
+    /// chain before it.  `None` is retained only for records written by the
+    /// original v1 implementation; new records always carry the anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -293,6 +301,8 @@ impl ScmOperationRecord {
                 return Err(ScmOperationStoreError::Corrupt);
             }
         } else {
+            let mut previous_anchor = "GENESIS".to_owned();
+            let mut anchored_links = 0usize;
             for (index, link) in self.history.iter().enumerate() {
                 let expected_revision = u64::try_from(index)
                     .ok()
@@ -301,6 +311,22 @@ impl ScmOperationRecord {
                 if link.revision != expected_revision || !is_sha256(&link.checksum) {
                     return Err(ScmOperationStoreError::Corrupt);
                 }
+                if let Some(anchor) = &link.chain_sha256 {
+                    if !is_sha256(anchor)
+                        || history_link_anchor(link.revision, &link.checksum, &previous_anchor)?
+                            != *anchor
+                    {
+                        return Err(ScmOperationStoreError::Corrupt);
+                    }
+                    previous_anchor.clone_from(anchor);
+                    anchored_links += 1;
+                }
+            }
+            // A v1 record may contain the original unanchored history shape,
+            // but a record cannot mix legacy and anchored links.  All newly
+            // written revisions are fully anchored.
+            if anchored_links != 0 && anchored_links != self.history.len() {
+                return Err(ScmOperationStoreError::Corrupt);
             }
             if self
                 .history
@@ -352,6 +378,50 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn history_link_anchor(
+    revision: u64,
+    checksum: &str,
+    previous_anchor: &str,
+) -> Result<String, ScmOperationStoreError> {
+    let bytes = serde_json::to_vec(&(revision, checksum, previous_anchor))
+        .map_err(|_| ScmOperationStoreError::Corrupt)?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn anchored_history(
+    history: &[ScmOperationHistoryLink],
+) -> Result<Vec<ScmOperationHistoryLink>, ScmOperationStoreError> {
+    let mut previous_anchor = "GENESIS".to_owned();
+    let mut result = Vec::with_capacity(history.len());
+    for link in history {
+        let anchor = history_link_anchor(link.revision, &link.checksum, &previous_anchor)?;
+        result.push(ScmOperationHistoryLink {
+            revision: link.revision,
+            checksum: link.checksum.clone(),
+            chain_sha256: Some(anchor.clone()),
+        });
+        previous_anchor = anchor;
+    }
+    Ok(result)
+}
+
+fn append_history_link(
+    stored: &ScmOperationRecord,
+) -> Result<Vec<ScmOperationHistoryLink>, ScmOperationStoreError> {
+    let mut history = anchored_history(&stored.history)?;
+    let previous_anchor = history
+        .last()
+        .and_then(|link| link.chain_sha256.as_deref())
+        .unwrap_or("GENESIS");
+    let anchor = history_link_anchor(stored.revision, &stored.checksum, previous_anchor)?;
+    history.push(ScmOperationHistoryLink {
+        revision: stored.revision,
+        checksum: stored.checksum.clone(),
+        chain_sha256: Some(anchor),
+    });
+    Ok(history)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -474,6 +544,40 @@ fn decode_index(bytes: &[u8]) -> Result<ScmOperationIndexEntry, ScmOperationStor
     Ok(entry)
 }
 
+/// Validate every durable operation key and stable-identity index candidate
+/// in one snapshot.  The secondary index is an optimization, not an
+/// integrity boundary: a second full-key record with the same stable identity
+/// is corruption even when the index points at one of them.
+fn scan_operation_records<T>(
+    operations: &T,
+    target_stable: Option<&str>,
+) -> Result<Option<ScmOperationRecord>, ScmOperationStoreError>
+where
+    T: ReadableTable<&'static str, &'static [u8]>,
+{
+    let mut stable_keys = BTreeMap::<String, String>::new();
+    let mut target = None;
+    for item in operations
+        .iter()
+        .map_err(|_| ScmOperationStoreError::Corrupt)?
+    {
+        let (record_key, value) = item.map_err(|_| ScmOperationStoreError::Corrupt)?;
+        let record_key = record_key.value().to_owned();
+        let record = decode_record(value.value())?;
+        if record.key() != record_key {
+            return Err(ScmOperationStoreError::Corrupt);
+        }
+        let stable_key = record.stable_key();
+        if stable_keys.insert(stable_key.clone(), record_key).is_some() {
+            return Err(ScmOperationStoreError::Corrupt);
+        }
+        if target_stable == Some(stable_key.as_str()) {
+            target = Some(record);
+        }
+    }
+    Ok(target)
+}
+
 mod sealed {
     pub trait Sealed {}
 }
@@ -505,7 +609,6 @@ impl ScmOperationCoordinator {
 
 #[derive(Debug)]
 pub struct ScmOperationStore {
-    database: Database,
     path: PathBuf,
     owner: Arc<ScmOperationStoreOwner>,
 }
@@ -518,11 +621,11 @@ impl ScmOperationStore {
         }
         let database = Database::create(&path).map_err(|_| ScmOperationStoreError::Unavailable)?;
         let store = Self {
-            database,
             path,
             owner: Arc::new(ScmOperationStoreOwner),
         };
-        store.ensure_schema()?;
+        Self::ensure_schema(&database)?;
+        drop(database);
         Ok(store)
     }
 
@@ -535,16 +638,16 @@ impl ScmOperationStore {
             }
             Err(_) => return Err(ScmOperationStoreError::Unavailable),
         }
-        let database = Database::open(&path).map_err(map_database_open_error)?;
+        let database = ReadOnlyDatabase::open(&path).map_err(map_database_open_error)?;
         let store = Self {
-            database,
             path,
             owner: Arc::new(ScmOperationStoreOwner),
         };
         // Opening an existing store is deliberately read-only with respect to
         // the schema. In particular, a blank/partial file must not be turned
         // into a usable store as a side effect of a query or status read.
-        store.validate_existing_schema()?;
+        Self::validate_existing_schema(&database)?;
+        drop(database);
         Ok(store)
     }
 
@@ -559,6 +662,14 @@ impl ScmOperationStore {
         ScmOperationCoordinator::new(Arc::clone(&self.owner))
     }
 
+    fn open_write_database(&self) -> Result<Database, ScmOperationStoreError> {
+        Database::open(&self.path).map_err(|_| ScmOperationStoreError::Unavailable)
+    }
+
+    fn open_read_only_database(&self) -> Result<ReadOnlyDatabase, ScmOperationStoreError> {
+        ReadOnlyDatabase::open(&self.path).map_err(map_database_open_error)
+    }
+
     fn authorize(
         &self,
         coordinator: &ScmOperationCoordinator,
@@ -570,9 +681,8 @@ impl ScmOperationStore {
         }
     }
 
-    fn ensure_schema(&self) -> Result<(), ScmOperationStoreError> {
-        let read = self
-            .database
+    fn ensure_schema(database: &Database) -> Result<(), ScmOperationStoreError> {
+        let read = database
             .begin_read()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
         let has_meta = match read.open_table(META_TABLE) {
@@ -592,8 +702,7 @@ impl ScmOperationStore {
         };
         if !has_meta && !has_ops && !has_index {
             drop(read);
-            let write = self
-                .database
+            let write = database
                 .begin_write()
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
             {
@@ -653,9 +762,10 @@ impl ScmOperationStore {
         Ok(())
     }
 
-    fn validate_existing_schema(&self) -> Result<(), ScmOperationStoreError> {
-        let read = self
-            .database
+    fn validate_existing_schema<D: ReadableDatabase>(
+        database: &D,
+    ) -> Result<(), ScmOperationStoreError> {
+        let read = database
             .begin_read()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
         for table in [META_TABLE.name(), OPS_TABLE.name(), INDEX_TABLE.name()] {
@@ -710,16 +820,23 @@ impl ScmOperationStore {
     #[allow(clippy::too_many_lines)]
     pub fn create_operation(
         &self,
+        coordinator: &ScmOperationCoordinator,
         identity: ScmOperationIdentity,
     ) -> Result<ScmOperationRecord, ScmOperationStoreError> {
+        self.authorize(coordinator)?;
         identity.validate()?;
         let key = identity.key();
         let stable = identity.stable_key();
-        let write = self
-            .database
+        let database = self.open_write_database()?;
+        let write = database
             .begin_write()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
         let existing: Option<ScmOperationRecord> = {
+            let ops = write
+                .open_table(OPS_TABLE)
+                .map_err(|_| ScmOperationStoreError::Unavailable)?;
+            let scanned = scan_operation_records(&ops, Some(&stable))?;
+            drop(ops);
             let index = write
                 .open_table(INDEX_TABLE)
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
@@ -736,7 +853,7 @@ impl ScmOperationStore {
                 let ops = write
                     .open_table(OPS_TABLE)
                     .map_err(|_| ScmOperationStoreError::Unavailable)?;
-                match ops
+                let record = match ops
                     .get(entry.record_key.as_str())
                     .map_err(|_| ScmOperationStoreError::Corrupt)?
                 {
@@ -745,26 +862,23 @@ impl ScmOperationStore {
                         if rec.key() != entry.record_key || rec.stable_key() != stable {
                             return Err(ScmOperationStoreError::Corrupt);
                         }
-                        Some(rec)
+                        rec
                     }
                     None => return Err(ScmOperationStoreError::Corrupt),
+                };
+                if scanned
+                    .as_ref()
+                    .is_none_or(|record| record.key() != entry.record_key)
+                {
+                    return Err(ScmOperationStoreError::Corrupt);
                 }
+                Some(record)
             } else {
                 // Never repair a missing index during create. If the record
                 // exists, the index is corrupt and must be rebuilt by an
                 // explicit migration/recovery operation.
-                let ops = write
-                    .open_table(OPS_TABLE)
-                    .map_err(|_| ScmOperationStoreError::Unavailable)?;
-                for item in ops.iter().map_err(|_| ScmOperationStoreError::Corrupt)? {
-                    let (record_key, value) = item.map_err(|_| ScmOperationStoreError::Corrupt)?;
-                    let rec = decode_record(value.value())?;
-                    if rec.key() != record_key.value() {
-                        return Err(ScmOperationStoreError::Corrupt);
-                    }
-                    if rec.stable_key() == stable {
-                        return Err(ScmOperationStoreError::Corrupt);
-                    }
+                if scanned.is_some() {
+                    return Err(ScmOperationStoreError::Corrupt);
                 }
                 None
             }
@@ -816,6 +930,7 @@ impl ScmOperationStore {
         write
             .commit()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
+        drop(database);
         Ok(record)
     }
 
@@ -824,7 +939,10 @@ impl ScmOperationStore {
         identity: &ScmOperationIdentity,
     ) -> Result<Option<ScmOperationRecord>, ScmOperationStoreError> {
         identity.validate()?;
-        self.load_by_stable(&identity.stable_key(), identity)
+        let database = self.open_read_only_database()?;
+        let result = Self::load_by_stable(&database, &identity.stable_key(), identity);
+        drop(database);
+        result
     }
 
     pub fn query_operation(
@@ -834,15 +952,18 @@ impl ScmOperationStore {
         self.load_operation(identity)
     }
 
-    fn load_by_key(&self, key: &str) -> Result<Option<ScmOperationRecord>, ScmOperationStoreError> {
-        self.validate_existing_schema()?;
-        let read = self
-            .database
+    fn load_by_key<D: ReadableDatabase>(
+        database: &D,
+        key: &str,
+    ) -> Result<Option<ScmOperationRecord>, ScmOperationStoreError> {
+        Self::validate_existing_schema(database)?;
+        let read = database
             .begin_read()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
         let table = read
             .open_table(OPS_TABLE)
             .map_err(|_| ScmOperationStoreError::MissingTable)?;
+        let _ = scan_operation_records(&table, None)?;
         let Some(v) = table
             .get(key)
             .map_err(|_| ScmOperationStoreError::Corrupt)?
@@ -857,13 +978,12 @@ impl ScmOperationStore {
     }
 
     fn load_by_stable(
-        &self,
+        database: &impl ReadableDatabase,
         stable: &str,
         identity: &ScmOperationIdentity,
     ) -> Result<Option<ScmOperationRecord>, ScmOperationStoreError> {
-        self.validate_existing_schema()?;
-        let read = self
-            .database
+        Self::validate_existing_schema(database)?;
+        let read = database
             .begin_read()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
         let index = read
@@ -877,19 +997,13 @@ impl ScmOperationStore {
         let ops = read
             .open_table(OPS_TABLE)
             .map_err(|_| ScmOperationStoreError::MissingTable)?;
+        let scanned = scan_operation_records(&ops, Some(stable))?;
         let Some(index_bytes) = index_bytes else {
             // An index miss is only a legitimate absence when no durable
             // operation with this stable identity exists. Do not turn a
             // damaged index into a fresh operation by returning `None`.
-            for item in ops.iter().map_err(|_| ScmOperationStoreError::Corrupt)? {
-                let (record_key, value) = item.map_err(|_| ScmOperationStoreError::Corrupt)?;
-                let rec = decode_record(value.value())?;
-                if rec.key() != record_key.value() {
-                    return Err(ScmOperationStoreError::Corrupt);
-                }
-                if rec.stable_key() == stable {
-                    return Err(ScmOperationStoreError::Corrupt);
-                }
+            if scanned.is_some() {
+                return Err(ScmOperationStoreError::Corrupt);
             }
             return Ok(None);
         };
@@ -905,6 +1019,12 @@ impl ScmOperationStore {
         };
         let rec = decode_record(v.value())?;
         if rec.key() != entry.record_key || rec.stable_key() != stable {
+            return Err(ScmOperationStoreError::Corrupt);
+        }
+        if scanned
+            .as_ref()
+            .is_none_or(|record| record.key() != entry.record_key)
+        {
             return Err(ScmOperationStoreError::Corrupt);
         }
         if rec.installation != identity.installation
@@ -933,8 +1053,8 @@ impl ScmOperationStore {
     ) -> Result<ScmOperationRecord, ScmOperationStoreError> {
         self.authorize(coordinator)?;
         identity.validate()?;
-        let write = self
-            .database
+        let database = self.open_write_database()?;
+        let write = database
             .begin_write()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
         let stored: ScmOperationRecord = {
@@ -956,6 +1076,7 @@ impl ScmOperationStore {
             let ops = write
                 .open_table(OPS_TABLE)
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
+            let scanned = scan_operation_records(&ops, Some(&stable))?;
             let Some(v) = ops
                 .get(entry.record_key.as_str())
                 .map_err(|_| ScmOperationStoreError::Corrupt)?
@@ -964,6 +1085,12 @@ impl ScmOperationStore {
             };
             let rec = decode_record(v.value())?;
             if rec.key() != entry.record_key || rec.stable_key() != stable {
+                return Err(ScmOperationStoreError::Corrupt);
+            }
+            if scanned
+                .as_ref()
+                .is_none_or(|record| record.key() != entry.record_key)
+            {
                 return Err(ScmOperationStoreError::Corrupt);
             }
             if rec.installation != identity.installation
@@ -1026,11 +1153,7 @@ impl ScmOperationStore {
             .revision
             .checked_add(1)
             .ok_or(ScmOperationStoreError::Conflict)?;
-        let mut history = stored.history.clone();
-        history.push(ScmOperationHistoryLink {
-            revision: stored.revision,
-            checksum: stored.checksum.clone(),
-        });
+        let history = append_history_link(&stored)?;
         let mut next = ScmOperationRecord {
             magic: SCM_STORE_MAGIC.to_owned(),
             version: SCM_STORE_VERSION,
@@ -1060,6 +1183,7 @@ impl ScmOperationStore {
         write
             .commit()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
+        drop(database);
         Ok(next)
     }
 
@@ -1099,8 +1223,8 @@ impl ScmOperationStore {
     ) -> Result<ScmOperationRecord, ScmOperationStoreError> {
         self.authorize(coordinator)?;
         identity.validate()?;
-        let write = self
-            .database
+        let database = self.open_write_database()?;
+        let write = database
             .begin_write()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
         let stored: ScmOperationRecord = {
@@ -1122,6 +1246,7 @@ impl ScmOperationStore {
             let ops = write
                 .open_table(OPS_TABLE)
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
+            let scanned = scan_operation_records(&ops, Some(&stable))?;
             let Some(v) = ops
                 .get(entry.record_key.as_str())
                 .map_err(|_| ScmOperationStoreError::Corrupt)?
@@ -1130,6 +1255,12 @@ impl ScmOperationStore {
             };
             let rec = decode_record(v.value())?;
             if rec.key() != entry.record_key || rec.stable_key() != stable {
+                return Err(ScmOperationStoreError::Corrupt);
+            }
+            if scanned
+                .as_ref()
+                .is_none_or(|record| record.key() != entry.record_key)
+            {
                 return Err(ScmOperationStoreError::Corrupt);
             }
             if rec.installation != identity.installation
@@ -1174,11 +1305,7 @@ impl ScmOperationStore {
             .revision
             .checked_add(1)
             .ok_or(ScmOperationStoreError::Conflict)?;
-        let mut history = stored.history.clone();
-        history.push(ScmOperationHistoryLink {
-            revision: stored.revision,
-            checksum: stored.checksum.clone(),
-        });
+        let history = append_history_link(&stored)?;
         let mut next = ScmOperationRecord {
             magic: SCM_STORE_MAGIC.to_owned(),
             version: SCM_STORE_VERSION,
@@ -1208,6 +1335,7 @@ impl ScmOperationStore {
         write
             .commit()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
+        drop(database);
         Ok(next)
     }
 
@@ -1250,8 +1378,18 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!("scm-op-{label}-{pid}-{nanos}-{n}.redb"))
     }
+    fn fingerprint(path: &Path) -> (Vec<u8>, std::time::SystemTime) {
+        (
+            std::fs::read(path).unwrap(),
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    }
     fn sha_of(rec: &ScmOperationRecord) -> String {
         normalized_sha(rec).unwrap()
+    }
+    fn create(store: &ScmOperationStore, identity: ScmOperationIdentity) -> ScmOperationRecord {
+        let coordinator = store.coordinator();
+        store.create_operation(&coordinator, identity).unwrap()
     }
 
     #[test]
@@ -1259,7 +1397,7 @@ mod tests {
         let path = temp_path("mono");
         let store = ScmOperationStore::open(&path).unwrap();
         let id = identity("op-mono");
-        let r1 = store.create_operation(id.clone()).unwrap();
+        let r1 = create(&store, id.clone());
         assert_eq!(r1.state(), ScmOperationState::StopIntentCommitted);
         let coord = store.coordinator();
         let s1 = sha_of(&r1);
@@ -1326,8 +1464,8 @@ mod tests {
         let path = temp_path("replay");
         let store = ScmOperationStore::open(&path).unwrap();
         let id = identity("op-replay");
-        let r1 = store.create_operation(id.clone()).unwrap();
-        let r1b = store.create_operation(id.clone()).unwrap();
+        let r1 = create(&store, id.clone());
+        let r1b = create(&store, id.clone());
         assert_eq!(r1, r1b);
         let coord = store.coordinator();
         let s1 = sha_of(&r1);
@@ -1358,7 +1496,7 @@ mod tests {
         let path = temp_path("digest");
         let store = ScmOperationStore::open(&path).unwrap();
         let id = identity("op-digest");
-        let r1 = store.create_operation(id.clone()).unwrap();
+        let r1 = create(&store, id.clone());
         let mut bad = id.clone();
         bad.approval_digest = digest_handle('d');
         let coord = store.coordinator();
@@ -1381,7 +1519,7 @@ mod tests {
         let path = temp_path("drift");
         let store = ScmOperationStore::open(&path).unwrap();
         let id = identity("op-drift");
-        let r1 = store.create_operation(id.clone()).unwrap();
+        let r1 = create(&store, id.clone());
         let coord = store.coordinator();
         let s1 = sha_of(&r1);
         let mut bad_sha = s1.clone();
@@ -1415,7 +1553,7 @@ mod tests {
         let id = identity("op-crash");
         let (rev, sha) = {
             let store = ScmOperationStore::open(&path).unwrap();
-            let r1 = store.create_operation(id.clone()).unwrap();
+            let r1 = create(&store, id.clone());
             let coord = store.coordinator();
             let s1 = sha_of(&r1);
             let r2 = store
@@ -1452,7 +1590,7 @@ mod tests {
         let path = temp_path("unknown");
         let store = ScmOperationStore::open(&path).unwrap();
         let id = identity("op-unknown");
-        let r1 = store.create_operation(id.clone()).unwrap();
+        let r1 = create(&store, id.clone());
         let coord = store.coordinator();
         let s1 = sha_of(&r1);
         let u = store
@@ -1480,7 +1618,7 @@ mod tests {
         let path = temp_path("resend");
         let id = identity("op-resend");
         let store = ScmOperationStore::open(&path).unwrap();
-        let r1 = store.create_operation(id.clone()).unwrap();
+        let r1 = create(&store, id.clone());
         let q = store.query_operation(&id).unwrap().unwrap();
         assert_eq!(q.state(), ScmOperationState::StopIntentCommitted);
         assert_eq!(r1, q);
@@ -1498,7 +1636,7 @@ mod tests {
         let id = identity("op-corrupt");
         {
             let store = ScmOperationStore::open(&path).unwrap();
-            store.create_operation(id.clone()).unwrap();
+            create(&store, id.clone());
         }
         {
             let db = Database::open(&path).unwrap();
@@ -1522,7 +1660,7 @@ mod tests {
         let path = temp_path("legacy");
         {
             let store = ScmOperationStore::open(&path).unwrap();
-            store.create_operation(identity("op-legacy")).unwrap();
+            create(&store, identity("op-legacy"));
             drop(store);
             let db = Database::open(&path).unwrap();
             let w = db.begin_write().unwrap();
@@ -1591,12 +1729,35 @@ mod tests {
     }
 
     #[test]
+    fn open_existing_and_query_leave_bytes_and_mtime_unchanged() {
+        let path = temp_path("read-only-fingerprint");
+        let id = identity("op-read-only-fingerprint");
+        {
+            let store = ScmOperationStore::open(&path).unwrap();
+            create(&store, id.clone());
+        }
+        let before = fingerprint(&path);
+        let existing = ScmOperationStore::open_existing(&path).unwrap();
+        assert_eq!(
+            existing
+                .query_operation(&id)
+                .unwrap()
+                .unwrap()
+                .operation_id(),
+            &id.operation_id
+        );
+        drop(existing);
+        assert_eq!(fingerprint(&path), before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn missing_index_with_existing_record_is_corrupt() {
         let path = temp_path("missing-index");
         let id = identity("op-missing-index");
         {
             let store = ScmOperationStore::open(&path).unwrap();
-            store.create_operation(id.clone()).unwrap();
+            create(&store, id.clone());
         }
         {
             let database = Database::open(&path).unwrap();
@@ -1621,7 +1782,7 @@ mod tests {
         let id = identity("op-index-binding");
         {
             let store = ScmOperationStore::open(&path).unwrap();
-            store.create_operation(id.clone()).unwrap();
+            create(&store, id.clone());
         }
         {
             let database = Database::open(&path).unwrap();
@@ -1650,12 +1811,47 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_stable_identity_is_corrupt_even_when_index_points_to_one_record() {
+        let path = temp_path("duplicate-stable");
+        let id = identity("op-duplicate-stable");
+        {
+            let store = ScmOperationStore::open(&path).unwrap();
+            create(&store, id.clone());
+        }
+        {
+            let database = Database::open(&path).unwrap();
+            let write = database.begin_write().unwrap();
+            {
+                let mut operations = write.open_table(OPS_TABLE).unwrap();
+                let mut envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
+                    operations.get(id.key().as_str()).unwrap().unwrap().value(),
+                )
+                .unwrap();
+                envelope.record.request_digest = digest_handle('d');
+                envelope.record.checksum = normalized_sha(&envelope.record).unwrap();
+                let duplicate_key = envelope.record.key();
+                let bytes = serde_json::to_vec(&envelope).unwrap();
+                operations
+                    .insert(duplicate_key.as_str(), bytes.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let store = ScmOperationStore::open_existing(&path).unwrap();
+        assert_eq!(
+            store.query_operation(&id).unwrap_err(),
+            ScmOperationStoreError::Corrupt
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn current_checksum_and_predecessor_history_are_verified() {
         let path = temp_path("checksum-history");
         let id = identity("op-checksum-history");
         let record = {
             let store = ScmOperationStore::open(&path).unwrap();
-            let first = store.create_operation(id.clone()).unwrap();
+            let first = create(&store, id.clone());
             let coordinator = store.coordinator();
             store
                 .advance_to(
@@ -1721,13 +1917,70 @@ mod tests {
     }
 
     #[test]
+    fn tampered_middle_history_link_is_rejected_after_current_checksum_recomputed() {
+        let path = temp_path("history-anchor-tamper");
+        let id = identity("op-history-anchor-tamper");
+        {
+            let store = ScmOperationStore::open(&path).unwrap();
+            let first = create(&store, id.clone());
+            let coordinator = store.coordinator();
+            let second = store
+                .advance_to(
+                    &coordinator,
+                    &id,
+                    first.revision(),
+                    first.checksum(),
+                    ScmOperationState::StopObserved,
+                )
+                .unwrap();
+            store
+                .advance_to(
+                    &coordinator,
+                    &id,
+                    second.revision(),
+                    second.checksum(),
+                    ScmOperationState::StartIntentCommitted,
+                )
+                .unwrap();
+        }
+        {
+            let database = Database::open(&path).unwrap();
+            let write = database.begin_write().unwrap();
+            {
+                let mut operations = write.open_table(OPS_TABLE).unwrap();
+                let mut envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
+                    operations.get(id.key().as_str()).unwrap().unwrap().value(),
+                )
+                .unwrap();
+                assert_eq!(envelope.record.history.len(), 2);
+                envelope.record.history[0].checksum = "d".repeat(64);
+                // Recompute the current checksum to prove the independent
+                // history anchor, rather than only the current-record digest,
+                // catches this tamper.
+                envelope.record.checksum = normalized_sha(&envelope.record).unwrap();
+                let bytes = serde_json::to_vec(&envelope).unwrap();
+                operations
+                    .insert(id.key().as_str(), bytes.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let store = ScmOperationStore::open_existing(&path).unwrap();
+        assert_eq!(
+            store.query_operation(&id).unwrap_err(),
+            ScmOperationStoreError::Corrupt
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn coordinator_is_bound_to_its_store() {
         let path = temp_path("owner-a");
         let other_path = temp_path("owner-b");
         let store = ScmOperationStore::open(&path).unwrap();
         let other = ScmOperationStore::open(&other_path).unwrap();
         let id = identity("op-owner");
-        let record = store.create_operation(id.clone()).unwrap();
+        let record = create(&store, id.clone());
         let coordinator = store.coordinator();
         assert_eq!(
             other.advance_to(
@@ -1744,12 +1997,30 @@ mod tests {
     }
 
     #[test]
+    fn create_requires_the_store_bound_coordinator() {
+        let path = temp_path("create-owner-a");
+        let other_path = temp_path("create-owner-b");
+        let store = ScmOperationStore::open(&path).unwrap();
+        let other = ScmOperationStore::open(&other_path).unwrap();
+        let id = identity("op-create-owner");
+        let other_coordinator = other.coordinator();
+        assert_eq!(
+            store.create_operation(&other_coordinator, id.clone()),
+            Err(ScmOperationStoreError::NotOwner)
+        );
+        let coordinator = store.coordinator();
+        assert!(store.create_operation(&coordinator, id).is_ok());
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(other_path);
+    }
+
+    #[test]
     fn record_envelope_rejects_unversioned_legacy_payload() {
         let path = temp_path("record-envelope");
         let id = identity("op-record-envelope");
         {
             let store = ScmOperationStore::open(&path).unwrap();
-            store.create_operation(id.clone()).unwrap();
+            create(&store, id.clone());
         }
         {
             let database = Database::open(&path).unwrap();
