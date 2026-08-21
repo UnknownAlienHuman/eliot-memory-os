@@ -11,13 +11,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const SCM_STORE_MAGIC: &str = "ELIOT-SCM-OP-STORE-V1";
-const SCM_STORE_VERSION: u16 = 1;
-const SCM_RECORD_ENVELOPE_MAGIC: &str = "ELIOT-SCM-OP-RECORD-V1";
-const SCM_RECORD_ENVELOPE_VERSION: u16 = 1;
+const LEGACY_SCM_STORE_MAGIC_V1: &str = "ELIOT-SCM-OP-STORE-V1";
+const SCM_STORE_MAGIC: &str = "ELIOT-SCM-OP-STORE-V2";
+const SCM_STORE_VERSION: u16 = 2;
+const LEGACY_SCM_RECORD_ENVELOPE_MAGIC_V1: &str = "ELIOT-SCM-OP-RECORD-V1";
+const SCM_RECORD_ENVELOPE_MAGIC: &str = "ELIOT-SCM-OP-RECORD-V2";
+const SCM_RECORD_ENVELOPE_VERSION: u16 = 2;
+const SCM_RECORD_VERSION: u16 = 2;
 const SCM_INDEX_MAGIC: &str = "ELIOT-SCM-OP-INDEX-V1";
 const SCM_INDEX_VERSION: u16 = 1;
 const MAX_HISTORY_ENTRIES: usize = 4096;
+// Physical v1 table names are retained deliberately: opening an old file must
+// reach the metadata/version classifier, never appear to be an empty new store.
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("eliot_scm_store_meta_v1");
 const OPS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("eliot_scm_operations_v1");
 const INDEX_TABLE: TableDefinition<&str, &[u8]> =
@@ -99,11 +104,15 @@ struct StoreMeta {
 struct ScmOperationHistoryLink {
     revision: u64,
     checksum: String,
-    /// A deterministic commitment to this predecessor and the complete
-    /// chain before it.  `None` is retained only for records written by the
-    /// original v1 implementation; new records always carry the anchor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    chain_sha256: Option<String>,
+    /// A deterministic commitment to this predecessor and the complete chain
+    /// before it. Current-wire records cannot deserialize without it.
+    chain_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+enum ScmOperationHistoryFormat {
+    AnchoredV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -196,6 +205,7 @@ struct ScmOperationIndexEntry {
 pub struct ScmOperationRecord {
     magic: String,
     version: u16,
+    history_format: ScmOperationHistoryFormat,
     installation: PlatformHandle,
     service: PlatformHandle,
     approval_digest: PlatformHandle,
@@ -261,10 +271,13 @@ impl ScmOperationRecord {
     }
 
     fn validate(&self) -> Result<(), ScmOperationStoreError> {
+        if self.magic == LEGACY_SCM_STORE_MAGIC_V1 && self.version == 1 {
+            return Err(ScmOperationStoreError::Legacy { version: 1 });
+        }
         if self.magic != SCM_STORE_MAGIC {
             return Err(ScmOperationStoreError::Corrupt);
         }
-        if self.version != SCM_STORE_VERSION {
+        if self.version != SCM_RECORD_VERSION {
             return Err(ScmOperationStoreError::Legacy {
                 version: self.version,
             });
@@ -302,7 +315,6 @@ impl ScmOperationRecord {
             }
         } else {
             let mut previous_anchor = "GENESIS".to_owned();
-            let mut anchored_links = 0usize;
             for (index, link) in self.history.iter().enumerate() {
                 let expected_revision = u64::try_from(index)
                     .ok()
@@ -311,22 +323,13 @@ impl ScmOperationRecord {
                 if link.revision != expected_revision || !is_sha256(&link.checksum) {
                     return Err(ScmOperationStoreError::Corrupt);
                 }
-                if let Some(anchor) = &link.chain_sha256 {
-                    if !is_sha256(anchor)
-                        || history_link_anchor(link.revision, &link.checksum, &previous_anchor)?
-                            != *anchor
-                    {
-                        return Err(ScmOperationStoreError::Corrupt);
-                    }
-                    previous_anchor.clone_from(anchor);
-                    anchored_links += 1;
+                if !is_sha256(&link.chain_sha256)
+                    || history_link_anchor(link.revision, &link.checksum, &previous_anchor)?
+                        != link.chain_sha256
+                {
+                    return Err(ScmOperationStoreError::Corrupt);
                 }
-            }
-            // A v1 record may contain the original unanchored history shape,
-            // but a record cannot mix legacy and anchored links.  All newly
-            // written revisions are fully anchored.
-            if anchored_links != 0 && anchored_links != self.history.len() {
-                return Err(ScmOperationStoreError::Corrupt);
+                previous_anchor.clone_from(&link.chain_sha256);
             }
             if self
                 .history
@@ -400,7 +403,7 @@ fn anchored_history(
         result.push(ScmOperationHistoryLink {
             revision: link.revision,
             checksum: link.checksum.clone(),
-            chain_sha256: Some(anchor.clone()),
+            chain_sha256: anchor.clone(),
         });
         previous_anchor = anchor;
     }
@@ -413,13 +416,12 @@ fn append_history_link(
     let mut history = anchored_history(&stored.history)?;
     let previous_anchor = history
         .last()
-        .and_then(|link| link.chain_sha256.as_deref())
-        .unwrap_or("GENESIS");
+        .map_or("GENESIS", |link| link.chain_sha256.as_str());
     let anchor = history_link_anchor(stored.revision, &stored.checksum, previous_anchor)?;
     history.push(ScmOperationHistoryLink {
         revision: stored.revision,
         checksum: stored.checksum.clone(),
-        chain_sha256: Some(anchor),
+        chain_sha256: anchor,
     });
     Ok(history)
 }
@@ -449,6 +451,7 @@ fn map_database_open_error(error: redb::DatabaseError) -> ScmOperationStoreError
 struct ScmOperationRecordDigest<'a> {
     magic: &'a str,
     version: u16,
+    history_format: ScmOperationHistoryFormat,
     installation: &'a PlatformHandle,
     service: &'a PlatformHandle,
     approval_digest: &'a PlatformHandle,
@@ -465,6 +468,7 @@ fn normalized_sha(record: &ScmOperationRecord) -> Result<String, ScmOperationSto
     let digest_input = ScmOperationRecordDigest {
         magic: &record.magic,
         version: record.version,
+        history_format: record.history_format,
         installation: &record.installation,
         service: &record.service,
         approval_digest: &record.approval_digest,
@@ -492,27 +496,52 @@ fn encode_record(record: &ScmOperationRecord) -> Result<Vec<u8>, ScmOperationSto
 fn decode_record(bytes: &[u8]) -> Result<ScmOperationRecord, ScmOperationStoreError> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| ScmOperationStoreError::Corrupt)?;
-    let envelope: ScmOperationRecordEnvelope =
-        if let Ok(envelope) = serde_json::from_value(value.clone()) {
-            envelope
-        } else {
-            // The pre-envelope representation is never silently adopted. It
-            // must be explicitly restaged by a future migration tool.
-            if let Some(version) = value.get("version").and_then(serde_json::Value::as_u64)
-                && let Ok(version) = u16::try_from(version)
-            {
-                return Err(ScmOperationStoreError::Legacy { version });
-            }
-            return Err(ScmOperationStoreError::Corrupt);
-        };
-    if envelope.magic != SCM_RECORD_ENVELOPE_MAGIC {
+    let object = value.as_object().ok_or(ScmOperationStoreError::Corrupt)?;
+
+    // The pre-envelope v1 representation is migration input only. It is
+    // classified without deserializing or synthesizing the now-mandatory
+    // history provenance.
+    if !object.contains_key("record") {
+        let magic = object
+            .get("magic")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ScmOperationStoreError::Corrupt)?;
+        let version = object
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u16::try_from(version).ok())
+            .ok_or(ScmOperationStoreError::Corrupt)?;
+        if (magic == LEGACY_SCM_STORE_MAGIC_V1 && version == 1)
+            || (magic == SCM_STORE_MAGIC && version != SCM_RECORD_VERSION)
+        {
+            return Err(ScmOperationStoreError::Legacy { version });
+        }
         return Err(ScmOperationStoreError::Corrupt);
     }
-    if envelope.version != SCM_RECORD_ENVELOPE_VERSION {
-        return Err(ScmOperationStoreError::Legacy {
-            version: envelope.version,
-        });
+
+    let magic = object
+        .get("magic")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ScmOperationStoreError::Corrupt)?;
+    let version = object
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .ok_or(ScmOperationStoreError::Corrupt)?;
+    if magic == LEGACY_SCM_RECORD_ENVELOPE_MAGIC_V1 && version == 1 {
+        return Err(ScmOperationStoreError::Legacy { version });
     }
+    if magic != SCM_RECORD_ENVELOPE_MAGIC {
+        return Err(ScmOperationStoreError::Corrupt);
+    }
+    if version != SCM_RECORD_ENVELOPE_VERSION {
+        return Err(ScmOperationStoreError::Legacy { version });
+    }
+    // A current envelope is parsed strictly only after its wire version has
+    // been authenticated as current. Missing provenance/anchors are corrupt,
+    // never reclassified as a trusted legacy shape.
+    let envelope: ScmOperationRecordEnvelope =
+        serde_json::from_value(value).map_err(|_| ScmOperationStoreError::Corrupt)?;
     envelope.record.validate()?;
     Ok(envelope.record)
 }
@@ -751,6 +780,9 @@ impl ScmOperationStore {
             return Err(ScmOperationStoreError::Corrupt);
         }
         let meta = found.ok_or(ScmOperationStoreError::Corrupt)?;
+        if meta.magic == LEGACY_SCM_STORE_MAGIC_V1 && meta.version == 1 {
+            return Err(ScmOperationStoreError::Legacy { version: 1 });
+        }
         if meta.magic != SCM_STORE_MAGIC {
             return Err(ScmOperationStoreError::Corrupt);
         }
@@ -806,6 +838,9 @@ impl ScmOperationStore {
             return Err(ScmOperationStoreError::Corrupt);
         }
         let meta = found.ok_or(ScmOperationStoreError::Corrupt)?;
+        if meta.magic == LEGACY_SCM_STORE_MAGIC_V1 && meta.version == 1 {
+            return Err(ScmOperationStoreError::Legacy { version: 1 });
+        }
         if meta.magic != SCM_STORE_MAGIC {
             return Err(ScmOperationStoreError::Corrupt);
         }
@@ -897,7 +932,8 @@ impl ScmOperationStore {
         }
         let mut record = ScmOperationRecord {
             magic: SCM_STORE_MAGIC.to_owned(),
-            version: SCM_STORE_VERSION,
+            version: SCM_RECORD_VERSION,
+            history_format: ScmOperationHistoryFormat::AnchoredV1,
             installation: identity.installation,
             service: identity.service,
             approval_digest: identity.approval_digest,
@@ -1156,7 +1192,8 @@ impl ScmOperationStore {
         let history = append_history_link(&stored)?;
         let mut next = ScmOperationRecord {
             magic: SCM_STORE_MAGIC.to_owned(),
-            version: SCM_STORE_VERSION,
+            version: SCM_RECORD_VERSION,
+            history_format: ScmOperationHistoryFormat::AnchoredV1,
             installation: stored.installation.clone(),
             service: stored.service.clone(),
             approval_digest: stored.approval_digest.clone(),
@@ -1308,7 +1345,8 @@ impl ScmOperationStore {
         let history = append_history_link(&stored)?;
         let mut next = ScmOperationRecord {
             magic: SCM_STORE_MAGIC.to_owned(),
-            version: SCM_STORE_VERSION,
+            version: SCM_RECORD_VERSION,
+            history_format: ScmOperationHistoryFormat::AnchoredV1,
             installation: stored.installation.clone(),
             service: stored.service.clone(),
             approval_digest: stored.approval_digest.clone(),
@@ -1387,6 +1425,94 @@ mod tests {
     fn sha_of(rec: &ScmOperationRecord) -> String {
         normalized_sha(rec).unwrap()
     }
+
+    #[derive(Serialize)]
+    struct UnanchoredHistoryLinkDigest<'a> {
+        revision: u64,
+        checksum: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct UnanchoredCurrentRecordDigest<'a> {
+        magic: &'a str,
+        version: u16,
+        history_format: ScmOperationHistoryFormat,
+        installation: &'a PlatformHandle,
+        service: &'a PlatformHandle,
+        approval_digest: &'a PlatformHandle,
+        config_digest: &'a PlatformHandle,
+        operation_id: &'a PlatformHandle,
+        request_digest: &'a PlatformHandle,
+        state: ScmOperationState,
+        revision: u64,
+        prior_sha256: &'a str,
+        history: Vec<UnanchoredHistoryLinkDigest<'a>>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyV1RecordDigest<'a> {
+        magic: &'a str,
+        version: u16,
+        installation: &'a PlatformHandle,
+        service: &'a PlatformHandle,
+        approval_digest: &'a PlatformHandle,
+        config_digest: &'a PlatformHandle,
+        operation_id: &'a PlatformHandle,
+        request_digest: &'a PlatformHandle,
+        state: ScmOperationState,
+        revision: u64,
+        prior_sha256: &'a str,
+        history: Vec<UnanchoredHistoryLinkDigest<'a>>,
+    }
+
+    fn unanchored_history(record: &ScmOperationRecord) -> Vec<UnanchoredHistoryLinkDigest<'_>> {
+        record
+            .history
+            .iter()
+            .map(|link| UnanchoredHistoryLinkDigest {
+                revision: link.revision,
+                checksum: &link.checksum,
+            })
+            .collect()
+    }
+
+    fn unanchored_current_sha(record: &ScmOperationRecord) -> String {
+        let digest = UnanchoredCurrentRecordDigest {
+            magic: &record.magic,
+            version: record.version,
+            history_format: record.history_format,
+            installation: &record.installation,
+            service: &record.service,
+            approval_digest: &record.approval_digest,
+            config_digest: &record.config_digest,
+            operation_id: &record.operation_id,
+            request_digest: &record.request_digest,
+            state: record.state,
+            revision: record.revision,
+            prior_sha256: &record.prior_sha256,
+            history: unanchored_history(record),
+        };
+        sha256_hex(&serde_json::to_vec(&digest).unwrap())
+    }
+
+    fn legacy_v1_sha(record: &ScmOperationRecord) -> String {
+        let digest = LegacyV1RecordDigest {
+            magic: LEGACY_SCM_STORE_MAGIC_V1,
+            version: 1,
+            installation: &record.installation,
+            service: &record.service,
+            approval_digest: &record.approval_digest,
+            config_digest: &record.config_digest,
+            operation_id: &record.operation_id,
+            request_digest: &record.request_digest,
+            state: record.state,
+            revision: record.revision,
+            prior_sha256: &record.prior_sha256,
+            history: unanchored_history(record),
+        };
+        sha256_hex(&serde_json::to_vec(&digest).unwrap())
+    }
+
     fn create(store: &ScmOperationStore, identity: ScmOperationIdentity) -> ScmOperationRecord {
         let coordinator = store.coordinator();
         store.create_operation(&coordinator, identity).unwrap()
@@ -1677,6 +1803,34 @@ mod tests {
         }
         let err = ScmOperationStore::open(&path).unwrap_err();
         assert_eq!(err, ScmOperationStoreError::Legacy { version: 99 });
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v1_store_requires_explicit_migration() {
+        let path = temp_path("legacy-v1-store");
+        {
+            let store = ScmOperationStore::open(&path).unwrap();
+            create(&store, identity("op-legacy-v1-store"));
+        }
+        {
+            let database = Database::open(&path).unwrap();
+            let write = database.begin_write().unwrap();
+            {
+                let mut table = write.open_table(META_TABLE).unwrap();
+                let meta = StoreMeta {
+                    magic: LEGACY_SCM_STORE_MAGIC_V1.to_owned(),
+                    version: 1,
+                };
+                let bytes = serde_json::to_vec(&meta).unwrap();
+                table.insert(META_KEY, bytes.as_slice()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+        assert_eq!(
+            ScmOperationStore::open_existing(&path).unwrap_err(),
+            ScmOperationStoreError::Legacy { version: 1 }
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1974,6 +2128,150 @@ mod tests {
     }
 
     #[test]
+    fn stripping_all_anchors_and_recomputing_current_checksum_is_rejected() {
+        let path = temp_path("history-anchor-strip");
+        let id = identity("op-history-anchor-strip");
+        let record = {
+            let store = ScmOperationStore::open(&path).unwrap();
+            let first = create(&store, id.clone());
+            let coordinator = store.coordinator();
+            let second = store
+                .advance_to(
+                    &coordinator,
+                    &id,
+                    first.revision(),
+                    first.checksum(),
+                    ScmOperationState::StopObserved,
+                )
+                .unwrap();
+            store
+                .advance_to(
+                    &coordinator,
+                    &id,
+                    second.revision(),
+                    second.checksum(),
+                    ScmOperationState::StartIntentCommitted,
+                )
+                .unwrap()
+        };
+        assert_eq!(record.history.len(), 2);
+
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&encode_record(&record).unwrap()).unwrap();
+        let record_object = value["record"].as_object_mut().unwrap();
+        for link in record_object["history"].as_array_mut().unwrap() {
+            assert!(
+                link.as_object_mut()
+                    .unwrap()
+                    .remove("chain_sha256")
+                    .is_some()
+            );
+        }
+        record_object.insert(
+            "checksum".to_owned(),
+            serde_json::Value::String(unanchored_current_sha(&record)),
+        );
+        let tampered = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            decode_record(&tampered),
+            Err(ScmOperationStoreError::Corrupt)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_record_roundtrip_requires_explicit_anchored_provenance() {
+        let path = temp_path("history-v2-roundtrip");
+        let id = identity("op-history-v2-roundtrip");
+        let record = {
+            let store = ScmOperationStore::open(&path).unwrap();
+            let first = create(&store, id.clone());
+            let coordinator = store.coordinator();
+            store
+                .advance_to(
+                    &coordinator,
+                    &id,
+                    first.revision(),
+                    first.checksum(),
+                    ScmOperationState::StopObserved,
+                )
+                .unwrap()
+        };
+        let encoded = encode_record(&record).unwrap();
+        let envelope: ScmOperationRecordEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(envelope.version, SCM_RECORD_ENVELOPE_VERSION);
+        assert_eq!(envelope.record.version, SCM_RECORD_VERSION);
+        assert_eq!(
+            envelope.record.history_format,
+            ScmOperationHistoryFormat::AnchoredV1
+        );
+        assert!(
+            envelope
+                .record
+                .history
+                .iter()
+                .all(|link| is_sha256(&link.chain_sha256))
+        );
+        assert_eq!(decode_record(&encoded).unwrap(), record);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn downgraded_unanchored_v1_record_is_migration_input_not_current_truth() {
+        let path = temp_path("history-v1-migration");
+        let id = identity("op-history-v1-migration");
+        let record = {
+            let store = ScmOperationStore::open(&path).unwrap();
+            let first = create(&store, id.clone());
+            let coordinator = store.coordinator();
+            store
+                .advance_to(
+                    &coordinator,
+                    &id,
+                    first.revision(),
+                    first.checksum(),
+                    ScmOperationState::StopObserved,
+                )
+                .unwrap()
+        };
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&encode_record(&record).unwrap()).unwrap();
+        value["magic"] = serde_json::json!(LEGACY_SCM_RECORD_ENVELOPE_MAGIC_V1);
+        value["version"] = serde_json::json!(1);
+        let record_object = value["record"].as_object_mut().unwrap();
+        record_object.insert(
+            "magic".to_owned(),
+            serde_json::json!(LEGACY_SCM_STORE_MAGIC_V1),
+        );
+        record_object.insert("version".to_owned(), serde_json::json!(1));
+        assert!(record_object.remove("history_format").is_some());
+        for link in record_object["history"].as_array_mut().unwrap() {
+            assert!(
+                link.as_object_mut()
+                    .unwrap()
+                    .remove("chain_sha256")
+                    .is_some()
+            );
+        }
+        record_object.insert(
+            "checksum".to_owned(),
+            serde_json::Value::String(legacy_v1_sha(&record)),
+        );
+        let legacy_envelope = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            decode_record(&legacy_envelope),
+            Err(ScmOperationStoreError::Legacy { version: 1 })
+        );
+
+        let legacy_record = serde_json::to_vec(&value["record"]).unwrap();
+        assert_eq!(
+            decode_record(&legacy_record),
+            Err(ScmOperationStoreError::Legacy { version: 1 })
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn coordinator_is_bound_to_its_store() {
         let path = temp_path("owner-a");
         let other_path = temp_path("owner-b");
@@ -2031,7 +2329,19 @@ mod tests {
                     operations.get(id.key().as_str()).unwrap().unwrap().value(),
                 )
                 .unwrap();
-                let bytes = serde_json::to_vec(&envelope.record).unwrap();
+                let mut legacy = serde_json::to_value(&envelope.record).unwrap();
+                let legacy_object = legacy.as_object_mut().unwrap();
+                legacy_object.insert(
+                    "magic".to_owned(),
+                    serde_json::json!(LEGACY_SCM_STORE_MAGIC_V1),
+                );
+                legacy_object.insert("version".to_owned(), serde_json::json!(1));
+                assert!(legacy_object.remove("history_format").is_some());
+                legacy_object.insert(
+                    "checksum".to_owned(),
+                    serde_json::Value::String(legacy_v1_sha(&envelope.record)),
+                );
+                let bytes = serde_json::to_vec(&legacy).unwrap();
                 operations
                     .insert(id.key().as_str(), bytes.as_slice())
                     .unwrap();
@@ -2050,7 +2360,7 @@ mod tests {
     fn strict_serde_no_defaults() {
         let v = serde_json::json!({
             "magic": SCM_STORE_MAGIC,
-            "version": SCM_STORE_VERSION,
+            "version": SCM_RECORD_VERSION,
             "installation": "test-installation",
             "service": CANONICAL_SERVICE,
             "approval_digest": "a".repeat(64),
@@ -2065,7 +2375,7 @@ mod tests {
         assert!(serde_json::from_value::<ScmOperationRecord>(v).is_err());
         let missing = serde_json::json!({
             "magic": SCM_STORE_MAGIC,
-            "version": SCM_STORE_VERSION,
+            "version": SCM_RECORD_VERSION,
             "installation": "test-installation",
             "service": CANONICAL_SERVICE,
             "approval_digest": "a".repeat(64),
