@@ -9397,18 +9397,65 @@ impl InstallationTransaction {
 
     /// Requires the first-install bootstrap prefix to be durable.
     ///
-    /// Both Watchdog and Host `StartService` effects remain `Pending` through
-    /// the signed activation projection.  Every earlier root, package, and
-    /// service-registration effect must have authoritative readback, and the
-    /// transaction-owned credential remains after the ordered `Watchdog` then
-    /// `Host` starts so the Host can authenticate its epoch/process challenge
-    /// before `LocalService` secrets are generated.
+    /// The Host registration and every earlier root/package effect must have
+    /// authoritative readback.  Exactly one Host `StartService` effect remains
+    /// pending; credential provisioning is intentionally later so the Host can
+    /// authenticate its opaque epoch/process challenge before `LocalService`
+    /// secrets are generated.
     pub(crate) fn require_bootstrap_effects_ready(&self) -> Result<(), InstallationError> {
-        self.require_pre_activation_effects_ready()?;
-        if !self
+        self.validate()?;
+        if self.stage != InstallationStage::Registering {
+            return Err(InstallationError::IncompleteObservation(
+                "first-install bootstrap requires the Registering transaction boundary".to_owned(),
+            ));
+        }
+        let mut host_start = None;
+        for (index, (effect, progress)) in self
             .installer_effects
             .iter()
-            .any(|effect| matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. }))
+            .zip(&self.effect_progress)
+            .enumerate()
+        {
+            match effect {
+                InstallerEffectPlan::StartService {
+                    role: InstallerServiceRole::Host,
+                    ..
+                } => {
+                    if host_start.replace(index).is_some()
+                        || !matches!(progress.state, InstallationEffectProgressState::Pending)
+                    {
+                        return Err(InstallationError::IncompleteObservation(
+                            "first-install bootstrap requires one pending Host start".to_owned(),
+                        ));
+                    }
+                }
+                InstallerEffectPlan::StartService { .. } => {
+                    return Err(InstallationError::IncompleteObservation(
+                        "first-install bootstrap cannot start Watchdog before Host admission"
+                            .to_owned(),
+                    ));
+                }
+                _ if host_start.is_none()
+                    && !matches!(
+                        progress.state,
+                        InstallationEffectProgressState::Applied { .. }
+                    ) =>
+                {
+                    return Err(InstallationError::IncompleteObservation(
+                        "all effects before Host bootstrap must be applied".to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let Some(host_start) = host_start else {
+            return Err(InstallationError::IncompleteObservation(
+                "first-install bootstrap is missing the Host start effect".to_owned(),
+            ));
+        };
+        if self.installer_effects[host_start + 1..]
+            .iter()
+            .all(|effect| !matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. }))
         {
             return Err(InstallationError::IncompleteObservation(
                 "Host bootstrap must be followed by transaction-owned credential provisioning"
@@ -18190,151 +18237,6 @@ mod tests {
         );
         assert_eq!(saved.stage(), InstallationStage::Registering);
         must(saved.require_pre_activation_effects_ready());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn first_install_bootstrap_handoff_keeps_both_starts_pending_through_projection() {
-        let _lock = PRODUCTION_INSTALLER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|_| unreachable!());
-        let registering = registering_system_service_start_transaction();
-        must(registering.require_pre_activation_effects_ready());
-        must(registering.require_bootstrap_effects_ready());
-        let planned = must(InstallationTransaction::new(
-            registering.transaction_id.clone(),
-            registering.installation_epoch.clone(),
-            registering.profile,
-            registering.request.clone(),
-            registering.current_active_manifest.clone(),
-            registering.candidate_manifest.clone(),
-            registering.staging_root.clone(),
-            registering.planned_changes.clone(),
-            registering.installer_effects.clone(),
-            registering.minimum_store_available_bytes,
-            registering.precondition_evidence.clone(),
-            registering.recovery_command.clone(),
-        ));
-        let transaction_path = std::env::temp_dir().join(format!(
-            "eliot-bootstrap-handoff-transaction-{}-{}.redb",
-            std::process::id(),
-            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let registry_path = std::env::temp_dir().join(format!(
-            "eliot-bootstrap-handoff-registry-{}-{}.redb",
-            std::process::id(),
-            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_file(&transaction_path);
-        let _ = std::fs::remove_file(&registry_path);
-        let mut transaction_store = must(
-            RedbInstallationTransactionStore::create_planned_at_exact_path(
-                &transaction_path,
-                &planned,
-            ),
-        );
-        let expected = must(TransactionVersion::of(&planned));
-        let mut persisted = registering.clone();
-        persisted.revision = expected.revision + 1;
-        must(<RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
-            &mut transaction_store,
-            expected,
-            &persisted,
-        ));
-        let registry = RedbInstallationRegistry::from_database_for_test(must(Database::create(
-            &registry_path,
-        )));
-        let revision = must(registry.load()).revision();
-        must(registry.stage_pending_activation_bootstrap(
-            &mut transaction_store,
-            &registering.transaction_id,
-            revision,
-        ));
-        let saved = must(transaction_store.load(&registering.transaction_id))
-            .unwrap_or_else(|| unreachable!());
-        assert_eq!(saved.stage(), InstallationStage::Activating);
-        assert!(saved.activation_projection_intent().is_some());
-        let pending = saved
-            .installer_effects
-            .iter()
-            .zip(saved.effect_progress())
-            .filter_map(|(effect, progress)| {
-                if let InstallerEffectPlan::StartService { role, .. } = effect {
-                    assert!(matches!(
-                        progress.state,
-                        InstallationEffectProgressState::Pending
-                    ));
-                    Some(*role)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            pending,
-            vec![InstallerServiceRole::Watchdog, InstallerServiceRole::Host]
-        );
-        assert_eq!(must(registry.load()).revision(), 2);
-        let activating_revision = saved.revision;
-        must(registry.stage_pending_activation_bootstrap(
-            &mut transaction_store,
-            &registering.transaction_id,
-            revision,
-        ));
-        assert_eq!(
-            must(transaction_store.load(&registering.transaction_id))
-                .unwrap_or_else(|| unreachable!())
-                .revision,
-            activating_revision
-        );
-        assert_eq!(must(registry.load()).revision(), 2);
-        drop(registry);
-        drop(transaction_store);
-        let _ = std::fs::remove_file(registry_path);
-        let _ = std::fs::remove_file(transaction_path);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn first_install_bootstrap_rejects_partial_start_and_crash_replays_without_second_owner() {
-        let mut partial = registering_system_service_start_transaction();
-        let watchdog_index = partial
-            .installer_effects
-            .iter()
-            .position(|effect| {
-                matches!(
-                    effect,
-                    InstallerEffectPlan::StartService {
-                        role: InstallerServiceRole::Watchdog,
-                        ..
-                    }
-                )
-            })
-            .unwrap_or_else(|| unreachable!());
-        partial.effect_progress[watchdog_index].state = InstallationEffectProgressState::Applied {
-            disposition: InstallationEffectDisposition::CreatedByTransaction,
-            external_identity: test_handle("external:watchdog"),
-            evidence: vec![test_handle("evidence:watchdog")],
-            postcondition_digest: test_handle("a".repeat(64)),
-        };
-        partial.effect_progress[watchdog_index].service_start_deadline_ms = Some(30_000);
-        partial.effect_progress[watchdog_index].service_start_proof =
-            Some(InstallationServiceStartProof {
-                intent_digest: test_handle("b".repeat(64)),
-                process_lineage: Some(InstallationServiceProcessLineage {
-                    process_id: 1,
-                    start_time_100ns: 2,
-                    image_path: test_handle(r"C:\Eliot\host.exe"),
-                }),
-            });
-        assert!(matches!(
-            partial.require_bootstrap_effects_ready(),
-            Err(InstallationError::IncompleteObservation(_))
-        ));
-        assert!(matches!(
-            partial.require_pre_activation_effects_ready(),
-            Err(InstallationError::IncompleteObservation(_))
-        ));
     }
 
     #[cfg(windows)]
