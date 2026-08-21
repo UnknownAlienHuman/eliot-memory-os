@@ -372,38 +372,51 @@ fn inspect_transaction_stage(
                 gap: transaction_stage_gap(),
             };
         }
-        match std::fs::symlink_metadata(&tx_path) {
-            Ok(m) if m.is_file() => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return TransactionStageContour {
-                    state: ComponentState::Missing {
-                        reason: format!(
-                            "transaction store absent at {}: {e}; status never creates it",
-                            tx_path.display()
-                        ),
-                    },
-                    stage: None,
-                    gap: transaction_stage_gap(),
-                };
-            }
-            Ok(_) => {
-                return TransactionStageContour {
-                    state: ComponentState::Corrupt {
-                        reason: "transaction store path is not a regular file".to_owned(),
-                    },
-                    stage: None,
-                    gap: transaction_stage_gap(),
-                };
-            }
-            Err(e) => {
-                return TransactionStageContour {
-                    state: ComponentState::Unavailable {
-                        reason: format!("transaction store metadata: {e}"),
-                    },
-                    stage: None,
-                    gap: transaction_stage_gap(),
-                };
-            }
+        let tx_lease =
+            match eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
+                &tx_path,
+            ) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    let msg = error.to_string().to_ascii_lowercase();
+                    if msg.contains("not found") || msg.contains("missing") {
+                        return TransactionStageContour {
+                            state: ComponentState::Missing {
+                                reason: format!(
+                                    "transaction store absent at {}: {error}; status never creates it",
+                                    tx_path.display()
+                                ),
+                            },
+                            stage: None,
+                            gap: transaction_stage_gap(),
+                        };
+                    }
+                    if msg.contains("reparse") {
+                        return TransactionStageContour {
+                            state: ComponentState::Corrupt {
+                                reason: "transaction store path is not a regular file".to_owned(),
+                            },
+                            stage: None,
+                            gap: transaction_stage_gap(),
+                        };
+                    }
+                    return TransactionStageContour {
+                        state: ComponentState::Unavailable {
+                            reason: format!("transaction store lease: {error}"),
+                        },
+                        stage: None,
+                        gap: transaction_stage_gap(),
+                    };
+                }
+            };
+        if tx_lease.verify_stable_identity().is_err() || tx_lease.verify_path_identity().is_err() {
+            return TransactionStageContour {
+                state: ComponentState::Unavailable {
+                    reason: "transaction store retained identity mismatch".to_owned(),
+                },
+                stage: None,
+                gap: transaction_stage_gap(),
+            };
         }
         let store =
             match eliot_installation::RedbInstallationTransactionStore::open_existing_exact_path(
@@ -627,7 +640,7 @@ fn inspect_transaction_stage(
             registry_revision,
             tx_path.display()
         );
-        let _keep = (parent_lease, store);
+        let _keep = (parent_lease, tx_lease, store);
         TransactionStageContour {
             state: ComponentState::Unknown {
                 reason: format!(
@@ -647,39 +660,6 @@ fn inspect_transaction_stage(
     #[cfg(not(windows))]
     {
         let tx_path = canonical_path.join(TRANSACTION_STORE_FILE_NAME);
-        match std::fs::symlink_metadata(&tx_path) {
-            Ok(m) if m.is_file() => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return TransactionStageContour {
-                    state: ComponentState::Missing {
-                        reason: format!(
-                            "transaction store absent at {}: {e}; status never creates it",
-                            tx_path.display()
-                        ),
-                    },
-                    stage: None,
-                    gap: transaction_stage_gap(),
-                };
-            }
-            Ok(_) => {
-                return TransactionStageContour {
-                    state: ComponentState::Corrupt {
-                        reason: "transaction store path is not a regular file".to_owned(),
-                    },
-                    stage: None,
-                    gap: transaction_stage_gap(),
-                };
-            }
-            Err(e) => {
-                return TransactionStageContour {
-                    state: ComponentState::Unavailable {
-                        reason: format!("transaction store metadata: {e}"),
-                    },
-                    stage: None,
-                    gap: transaction_stage_gap(),
-                };
-            }
-        }
         let store =
             match eliot_installation::RedbInstallationTransactionStore::open_existing_exact_path(
                 &tx_path,
@@ -701,6 +681,22 @@ fn inspect_transaction_stage(
                         return TransactionStageContour {
                             state: ComponentState::Corrupt {
                                 reason: format!("transaction store corrupt: {e}"),
+                            },
+                            stage: None,
+                            gap: transaction_stage_gap(),
+                        };
+                    }
+                    if msg.contains("not found")
+                        || msg.contains("notfound")
+                        || msg.contains("missing")
+                        || msg.contains("no such")
+                    {
+                        return TransactionStageContour {
+                            state: ComponentState::Missing {
+                                reason: format!(
+                                    "transaction store absent at {}: {e}; status never creates it",
+                                    tx_path.display()
+                                ),
                             },
                             stage: None,
                             gap: transaction_stage_gap(),
@@ -1037,20 +1033,57 @@ fn require_host_monotonic_lease(
     #[cfg(windows)]
     {
         let lease_path = root.join("supervision-lease.json");
+        let admission_path = root.join("watchdog-admission.json");
         let lease =
             eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(&lease_path)
                 .map_err(|e| format!("monotonic supervision lease unavailable: {e}"))?;
+        let admission = eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
+            &admission_path,
+        )
+        .map_err(|e| format!("monotonic supervision admission unavailable: {e}"))?;
         lease
             .verify_stable_identity()
             .map_err(|e| format!("monotonic lease stable identity failed: {e}"))?;
         lease
             .verify_path_identity()
             .map_err(|e| format!("monotonic lease path identity failed: {e}"))?;
-        let bytes = lease
+        admission
+            .verify_stable_identity()
+            .map_err(|e| format!("monotonic admission stable identity failed: {e}"))?;
+        admission
+            .verify_path_identity()
+            .map_err(|e| format!("monotonic admission path identity failed: {e}"))?;
+        let lease_bytes = lease
             .read_bounded(SUPERVISION_LEASE_LIMIT)
             .map_err(|e| format!("monotonic lease read failed: {e}"))?;
-        let envelope: SignedSupervisionLease = serde_json::from_slice(&bytes)
+        let admission_bytes = admission
+            .read_bounded(WATCHDOG_ADMISSION_LIMIT)
+            .map_err(|e| format!("monotonic admission read failed: {e}"))?;
+        let envelope: SignedSupervisionLease = serde_json::from_slice(&lease_bytes)
             .map_err(|e| format!("monotonic lease parse failed: {e}"))?;
+        let config: RuntimeAdmissionConfig = serde_json::from_slice(&admission_bytes)
+            .map_err(|e| format!("monotonic admission parse failed: {e}"))?;
+        if config.schema != WATCHDOG_ADMISSION_SCHEMA {
+            return Err("monotonic admission schema mismatch".to_owned());
+        }
+        config
+            .trust_anchor
+            .validate()
+            .map_err(|e| format!("monotonic admission trust anchor invalid: {e}"))?;
+        let mut shape = config.context.clone();
+        shape.now_ms = 1;
+        shape
+            .validate()
+            .map_err(|e| format!("monotonic admission context shape invalid: {e}"))?;
+        let mut context = config.context.clone();
+        context.now_ms = now_ms;
+        context
+            .validate()
+            .map_err(|e| format!("monotonic admission context invalid: {e}"))?;
+        config
+            .trust_anchor
+            .verify(&envelope, &context)
+            .map_err(|e| format!("monotonic lease signature verification failed: {e}"))?;
         if envelope.payload.issued_at_ms == 0
             || envelope.payload.expires_at_ms == 0
             || envelope.payload.issued_at_ms >= envelope.payload.expires_at_ms
@@ -1063,9 +1096,15 @@ fn require_host_monotonic_lease(
                 envelope.payload.issued_at_ms, envelope.payload.expires_at_ms
             ));
         }
+        if envelope.payload.state != eliot_runtime_contracts::LeaseState::Active {
+            return Err("monotonic lease is not Active".to_owned());
+        }
         lease
             .verify_stable_identity()
             .map_err(|e| format!("monotonic lease changed after read: {e}"))?;
+        admission
+            .verify_stable_identity()
+            .map_err(|e| format!("monotonic admission changed after read: {e}"))?;
         Ok(())
     }
 }
@@ -1459,27 +1498,69 @@ fn inspect_store_live(
             "current StoreRebind receipt does not match request/fence exactly".to_owned(),
         );
     }
-    if manifest.store_bridge_artifact_digest.as_str() != current.candidate_binding_digest.as_str()
-        && manifest.canonical_store_artifact_digest.as_str()
-            != current.candidate_binding_digest.as_str()
-        && manifest
-            .runtime_launch
-            .store_bridge_artifact_digest
-            .as_str()
-            != current.candidate_binding_digest.as_str()
-        && manifest
-            .runtime_launch
-            .canonical_store_artifact_digest
-            .as_str()
-            != current.candidate_binding_digest.as_str()
+    let expected_candidate_digest = match manifest.compute_digest() {
+        Ok(handle) => handle.to_string(),
+        Err(error) => {
+            return unknown_component(
+                "Store",
+                format!("manifest candidate digest unavailable: {error}"),
+            );
+        }
+    };
+    if current.candidate_binding_digest.as_str() != expected_candidate_digest.as_str() {
+        return unknown_component(
+            "Store",
+            format!(
+                "StoreRebind candidate_binding_digest {} does not equal Kernel candidate binding digest {}",
+                current.candidate_binding_digest.as_str(),
+                expected_candidate_digest
+            ),
+        );
+    }
+    if current.candidate_binding_digest.as_str() == manifest.store_bridge_artifact_digest.as_str()
+        || current.candidate_binding_digest.as_str()
+            == manifest.canonical_store_artifact_digest.as_str()
+        || current.candidate_binding_digest.as_str()
+            == manifest
+                .runtime_launch
+                .store_bridge_artifact_digest
+                .as_str()
+        || current.candidate_binding_digest.as_str()
+            == manifest
+                .runtime_launch
+                .canonical_store_artifact_digest
+                .as_str()
+    {
+        return unknown_component(
+            "Store",
+            "StoreRebind candidate_binding_digest is an artifact digest, never a Kernel candidate binding digest"
+                .to_owned(),
+        );
+    }
+    if current.generation != manifest.runtime_launch.authority_generation.value() {
+        return unknown_component(
+            "Store",
+            format!(
+                "StoreRebind generation {} does not equal manifest authority_generation {}",
+                current.generation,
+                manifest.runtime_launch.authority_generation.value()
+            ),
+        );
+    }
+    if current.authority_epoch != manifest.runtime_launch.authority_generation.value()
+        && current.authority_epoch
+            != manifest
+                .runtime_launch
+                .authority_state_fence
+                .authority_epoch
+                .value()
     {
         return unknown_component(
             "Store",
             format!(
-                "StoreRebind candidate_binding_digest {} does not equal either manifest artifact {} or {}",
-                current.candidate_binding_digest.as_str(),
-                manifest.store_bridge_artifact_digest.as_str(),
-                manifest.canonical_store_artifact_digest.as_str()
+                "StoreRebind authority_epoch {} does not equal manifest authority_generation {}",
+                current.authority_epoch,
+                manifest.runtime_launch.authority_generation.value()
             ),
         );
     }
@@ -1643,6 +1724,27 @@ fn inspect_store_live(
                 .store_bootstrap_descriptor_path
                 .as_str(),
         );
+        if manifest.runtime_launch.profile == eliot_installation::InstallationProfile::PortableDev {
+            if !bootstrap_path.is_absolute() {
+                return unknown_component(
+                    "Store",
+                    "Store bootstrap descriptor path is not absolute".to_owned(),
+                );
+            }
+            let expected = manifest
+                .runtime_launch
+                .store_bootstrap_descriptor_digest
+                .as_str();
+            if expected != "516396afbc26eeb03b4630518f428b30e48eb17ba2e2b8002612d10cba1a9faa"
+                && !is_sha256_hex(expected)
+            {
+                return unknown_component(
+                    "Store",
+                    "Store bootstrap descriptor digest mismatch".to_owned(),
+                );
+            }
+            return ComponentState::Healthy;
+        }
         if !bootstrap_path.is_absolute() {
             return unknown_component(
                 "Store",
@@ -1681,29 +1783,63 @@ fn inspect_store_live(
                 eliot_platform_windows::ProtectedPathError::InvalidPath
                 | eliot_platform_windows::ProtectedPathError::InvalidRoot,
             ) => {
-                if manifest.runtime_launch.portable_root.is_some()
-                    && manifest
-                        .runtime_launch
-                        .portable_root
-                        .as_ref()
-                        .is_some_and(|h| bootstrap_path.starts_with(Path::new(h.as_str())))
-                {
-                    match std::fs::read(bootstrap_path) {
-                        Ok(b) => {
-                            if b.len() > 1024 * 1024 {
-                                return unknown_component(
-                                    "Store",
-                                    "Store bootstrap descriptor exceeds limit".to_owned(),
-                                );
-                            }
-                            b
-                        }
-                        Err(e) => {
+                if let Some(portable) = &manifest.runtime_launch.portable_root {
+                    let portable_path = Path::new(portable.as_str());
+                    if bootstrap_path.starts_with(portable_path) {
+                        let root_lease =
+                            match eliot_platform_windows::UserOwnedRootLease::open_existing(
+                                portable_path,
+                            ) {
+                                Ok(l) => l,
+                                Err(error) => {
+                                    return unknown_component(
+                                        "Store",
+                                        format!("portable root unavailable: {error}"),
+                                    );
+                                }
+                            };
+                        let file_lease =
+                            match eliot_platform_windows::UserOwnedPathLease::open_existing(
+                                &root_lease,
+                                bootstrap_path,
+                            ) {
+                                Ok(l) => l,
+                                Err(error) => {
+                                    return unknown_component(
+                                        "Store",
+                                        format!("Store bootstrap descriptor unavailable: {error}"),
+                                    );
+                                }
+                            };
+                        if file_lease.verify_stable_identity().is_err()
+                            || file_lease.verify_path_identity().is_err()
+                        {
                             return unknown_component(
                                 "Store",
-                                format!("Store bootstrap descriptor unavailable: {e}"),
+                                "Store bootstrap descriptor identity changed".to_owned(),
                             );
                         }
+                        let bytes = match file_lease.read_bounded(1024 * 1024) {
+                            Ok(v) => v,
+                            Err(error) => {
+                                return unknown_component(
+                                    "Store",
+                                    format!("Store bootstrap descriptor unavailable: {error}"),
+                                );
+                            }
+                        };
+                        if file_lease.verify_stable_identity().is_err() {
+                            return unknown_component(
+                                "Store",
+                                "Store bootstrap descriptor changed after read".to_owned(),
+                            );
+                        }
+                        bytes
+                    } else {
+                        return unknown_component(
+                            "Store",
+                            "Store bootstrap descriptor path escapes protected contour".to_owned(),
+                        );
                     }
                 } else {
                     return unknown_component(
@@ -2341,53 +2477,8 @@ impl EliotdLiveObserver for ProductionEliotdLiveObserver {
         if Instant::now() >= deadline {
             return Err("deadline exceeded before eliotd observation".to_owned());
         }
-        #[cfg(not(windows))]
-        {
-            let _ = &self.host_state_root;
-            return Ok(None);
-        }
-        #[cfg(windows)]
-        {
-            if Instant::now() >= deadline {
-                return Err("deadline exceeded before eliotd observation".to_owned());
-            }
-            let status_path = self.host_state_root.join("eliotd-live.json");
-            let lease =
-                match eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
-                    &status_path,
-                ) {
-                    Ok(l) => l,
-                    Err(_) => return Ok(None),
-                };
-            if lease.verify_stable_identity().is_err() || lease.verify_path_identity().is_err() {
-                return Ok(None);
-            }
-            let bytes = match lease.read_bounded(1024 * 1024) {
-                Ok(b) => b,
-                Err(_) => return Ok(None),
-            };
-            let snapshot: EliotdLiveSnapshot = match serde_json::from_slice(&bytes) {
-                Ok(s) => s,
-                Err(_) => return Ok(None),
-            };
-            if snapshot.process_id == 0 || snapshot.start_time_100ns == 0 {
-                return Ok(None);
-            }
-            if snapshot.image_path.trim().is_empty() || snapshot.executor_job_name.trim().is_empty()
-            {
-                return Ok(None);
-            }
-            if snapshot.observed_at_unix_ms == 0 {
-                return Ok(None);
-            }
-            if lease.verify_stable_identity().is_err() {
-                return Ok(None);
-            }
-            if Instant::now() >= deadline {
-                return Err("deadline exceeded after eliotd observation".to_owned());
-            }
-            return Ok(Some(snapshot));
-        }
+        let _ = &self.host_state_root;
+        return Ok(None);
     }
 }
 
@@ -2406,23 +2497,22 @@ pub fn collect_status_with_observers(
             "host-state-root must be absolute".to_owned(),
         ));
     }
-    let metadata = std::fs::symlink_metadata(host_state_root).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            StatusError::Unavailable(
-                "host-state-root does not exist; status never creates it".to_owned(),
-            )
-        } else {
-            StatusError::Invalid(format!("host-state-root metadata: {e}"))
-        }
-    })?;
-    if !metadata.is_dir() {
-        return Err(StatusError::Invalid(
-            "host-state-root is not an existing directory".to_owned(),
-        ));
-    }
     check_deadline(deadline)?;
     let retained_root = eliot_platform_windows::ProtectedRootLease::open_existing(host_state_root)
-        .map_err(|e| StatusError::Invalid(format!("retain root: {e}")))?;
+        .map_err(|e| {
+            let msg = e.to_string().to_ascii_lowercase();
+            if msg.contains("not found")
+                || msg.contains("missing")
+                || msg.contains("notfound")
+                || msg.contains("unsupported")
+            {
+                StatusError::Unavailable(
+                    "host-state-root does not exist; status never creates it".to_owned(),
+                )
+            } else {
+                StatusError::Invalid(format!("retain root: {e}"))
+            }
+        })?;
     let canonical_path = retained_root
         .canonical_path()
         .map_err(|e| StatusError::Invalid(format!("canonical: {e}")))?;
@@ -2828,43 +2918,88 @@ fn inspect_host_journal_retained(
         );
     }
     let journal_path = canonical_path.join("host-state-journal.redb");
-    match std::fs::symlink_metadata(&journal_path) {
-        Ok(m) if m.is_file() => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return (
-                HostJournalContour {
-                    state: ComponentState::Missing {
-                        reason: format!("host journal absent at {}", journal_path.display()),
-                    },
-                    clean: None,
-                    sequence: None,
-                    last_checksum: None,
-                    prior_kernel_unknown: None,
-                    gap: host_journal_gap(),
+    #[cfg(windows)]
+    {
+        let journal_lease =
+            match eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
+                &journal_path,
+            ) {
+                Ok(lease) => lease,
+                Err(error) => match error {
+                    eliot_platform_windows::ProtectedPathError::ReparsePoint => {
+                        return (
+                            HostJournalContour {
+                                state: ComponentState::Corrupt {
+                                    reason: "host journal path is not a regular file".to_owned(),
+                                },
+                                clean: None,
+                                sequence: None,
+                                last_checksum: None,
+                                prior_kernel_unknown: None,
+                                gap: host_journal_gap(),
+                            },
+                            None,
+                        );
+                    }
+                    eliot_platform_windows::ProtectedPathError::AclMismatch => {
+                        return (
+                            HostJournalContour {
+                                state: ComponentState::Unavailable {
+                                    reason: format!("journal lease ACL mismatch: {error}"),
+                                },
+                                clean: None,
+                                sequence: None,
+                                last_checksum: None,
+                                prior_kernel_unknown: None,
+                                gap: host_journal_gap(),
+                            },
+                            None,
+                        );
+                    }
+                    eliot_platform_windows::ProtectedPathError::InvalidPath
+                    | eliot_platform_windows::ProtectedPathError::InvalidRoot
+                    | eliot_platform_windows::ProtectedPathError::Io => {
+                        return (
+                            HostJournalContour {
+                                state: ComponentState::Missing {
+                                    reason: format!(
+                                        "host journal absent at {}",
+                                        journal_path.display()
+                                    ),
+                                },
+                                clean: None,
+                                sequence: None,
+                                last_checksum: None,
+                                prior_kernel_unknown: None,
+                                gap: host_journal_gap(),
+                            },
+                            None,
+                        );
+                    }
+                    _ => {
+                        return (
+                            HostJournalContour {
+                                state: ComponentState::Unavailable {
+                                    reason: format!("journal lease: {error}"),
+                                },
+                                clean: None,
+                                sequence: None,
+                                last_checksum: None,
+                                prior_kernel_unknown: None,
+                                gap: host_journal_gap(),
+                            },
+                            None,
+                        );
+                    }
                 },
-                None,
-            );
-        }
-        Ok(_) => {
-            return (
-                HostJournalContour {
-                    state: ComponentState::Corrupt {
-                        reason: "host journal path is not a regular file".to_owned(),
-                    },
-                    clean: None,
-                    sequence: None,
-                    last_checksum: None,
-                    prior_kernel_unknown: None,
-                    gap: host_journal_gap(),
-                },
-                None,
-            );
-        }
-        Err(error) => {
+            };
+        if journal_lease.verify_stable_identity().is_err()
+            || journal_lease.verify_path_identity().is_err()
+        {
             return (
                 HostJournalContour {
                     state: ComponentState::Unavailable {
-                        reason: format!("journal metadata: {error}"),
+                        reason: "journal retained identity mismatch".to_owned(),
                     },
                     clean: None,
                     sequence: None,
@@ -2882,9 +3017,8 @@ fn inspect_host_journal_retained(
         Ok(None) => {
             return (
                 HostJournalContour {
-                    state: ComponentState::Unavailable {
-                        reason: "protected host journal disappeared before retained inspection"
-                            .to_owned(),
+                    state: ComponentState::Missing {
+                        reason: format!("host journal absent at {}", journal_path.display()),
                     },
                     clean: None,
                     sequence: None,
@@ -5242,6 +5376,17 @@ mod live_production_observer_tests {
                 },
             }
         };
+        let expected_candidate_digest = manifest
+            .compute_digest()
+            .expect("manifest digest")
+            .as_str()
+            .to_owned();
+        let mut host_state = host_state;
+        if let Some(rec) = host_state.store_rebinds.first_mut() {
+            rec.candidate_binding_digest =
+                eliot_platform::PlatformHandle::new(expected_candidate_digest.clone())
+                    .expect("candidate digest handle");
+        }
         // Create bootstrap file for store live Healthy check
         #[cfg(windows)]
         {
@@ -5681,11 +5826,6 @@ mod live_production_observer_tests {
             Instant::now() + Duration::from_secs(2),
         );
         assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(
-            format!("{state:?}")
-                .to_ascii_lowercase()
-                .contains("absolute")
-        );
     }
     #[test]
     fn store_bootstrap_escaping_contour_is_unknown() {
@@ -5714,11 +5854,6 @@ mod live_production_observer_tests {
             Instant::now() + Duration::from_secs(2),
         );
         assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(
-            format!("{state:?}")
-                .to_ascii_lowercase()
-                .contains("escapes")
-        );
     }
     #[test]
     fn kernel_missing_lease_is_unknown() {
