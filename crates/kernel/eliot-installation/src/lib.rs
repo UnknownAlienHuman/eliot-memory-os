@@ -10554,6 +10554,18 @@ impl InstallationTransaction {
                 to: InstallationStage::RollbackRequired,
             });
         }
+        if self.stage == InstallationStage::Activating {
+            return Err(InstallationError::IllegalTransition {
+                from: self.stage,
+                to: InstallationStage::RollbackRequired,
+            });
+        }
+        if self.activation_projection_intent.is_some() {
+            return Err(InstallationError::IllegalTransition {
+                from: self.stage,
+                to: InstallationStage::RollbackRequired,
+            });
+        }
         self.pending_external_changes = pending;
         self.stage = InstallationStage::RollbackRequired;
         self.revision =
@@ -15603,11 +15615,62 @@ where
             }
         })?;
         transaction.validate()?;
-        if transaction.stage != InstallationStage::RollbackRequired {
+        if transaction.activation_projection_intent.is_some() {
             return Err(InstallationError::IllegalTransition {
                 from: transaction.stage,
                 to: InstallationStage::RolledBack,
             });
+        }
+        if transaction.stage != InstallationStage::RollbackRequired {
+            if transaction.stage != InstallationStage::Registering {
+                return Err(InstallationError::IllegalTransition {
+                    from: transaction.stage,
+                    to: InstallationStage::RolledBack,
+                });
+            }
+            let has_durable_rejection = !transaction.pending_external_changes.is_empty()
+                || transaction.effect_progress.iter().any(|progress| {
+                    matches!(
+                        progress.state,
+                        InstallationEffectProgressState::Unknown { .. }
+                            | InstallationEffectProgressState::IntentCommitted { .. }
+                    )
+                });
+            if !has_durable_rejection {
+                return Err(InstallationError::IllegalTransition {
+                    from: transaction.stage,
+                    to: InstallationStage::RolledBack,
+                });
+            }
+            let expected = TransactionVersion::of(&transaction)?;
+            let pending = if transaction.pending_external_changes.is_empty() {
+                transaction
+                    .effect_progress
+                    .iter()
+                    .filter_map(|progress| match &progress.state {
+                        InstallationEffectProgressState::Unknown { pending_ref } => {
+                            Some(pending_ref.clone())
+                        }
+                        InstallationEffectProgressState::IntentCommitted {
+                            intent_digest, ..
+                        } => Some(intent_digest.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                transaction.pending_external_changes.clone()
+            };
+            if pending.is_empty() {
+                return Err(InstallationError::IllegalTransition {
+                    from: transaction.stage,
+                    to: InstallationStage::RolledBack,
+                });
+            }
+            transaction.pending_external_changes = pending;
+            transaction.stage = InstallationStage::RollbackRequired;
+            increment_revision(&mut transaction)?;
+            transaction.validate()?;
+            self.store.compare_and_save(expected, &transaction)?;
         }
         let unreconciled = transaction
             .effect_progress
@@ -24888,5 +24951,482 @@ mod tests {
         swapped.canonical_store_executable_path =
             test_path(&std::env::temp_dir(), "wrong-canonical-engine.exe");
         assert!(swapped.validate().is_err());
+    }
+
+    #[test]
+    fn mark_unknown_activating_is_rejected_without_mutation() {
+        let mut transaction = registering_transaction();
+        transaction.stage = InstallationStage::Activating;
+        transaction.pending_external_changes.clear();
+        transaction.revision = 5;
+        must(transaction.validate());
+        let before = transaction.clone();
+        let err = transaction
+            .mark_unknown(vec![test_handle("pending:activating-unknown")])
+            .expect_err("Activating must not become RollbackRequired");
+        assert!(matches!(err, InstallationError::IllegalTransition { .. }));
+        assert_eq!(transaction, before);
+    }
+
+    #[test]
+    fn rollback_registering_with_durable_pending_evidence_succeeds() {
+        let mut transaction = planned_transaction();
+        transaction.effect_progress[0].admitted_precondition =
+            Some(admitted_precondition(&transaction));
+        transaction.effect_progress[0].ownership_secret = Some(test_ownership_secret(
+            InstallationCreateDisposition::Created,
+            InstallationSecretLifecycle::Active,
+        ));
+        transaction.effect_progress[0].state = InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity: test_handle("external:effect-0"),
+            evidence: vec![test_handle("evidence:recover-registering")],
+            postcondition_digest: test_handle("a".repeat(64)),
+        };
+        transaction.stage = InstallationStage::Registering;
+        transaction.pending_external_changes = vec![test_handle("pending:registering-durable")];
+        transaction.revision = 4;
+        must(transaction.validate());
+        let transaction_id = transaction.transaction_id.clone();
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(transaction.clone()))),
+            ..SharedStore::default()
+        };
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let mut port = fake_port(
+            store.clone(),
+            Vec::new(),
+            vec![
+                PortOutcome::Known(matching(
+                    InstallationEffectDisposition::CreatedByTransaction,
+                )),
+                PortOutcome::Known(absent(&transaction)),
+            ],
+            execute_count.clone(),
+        );
+        port.secret_absence = vec![PortOutcome::Known(true)].into();
+        let mut coordinator = InstallationCoordinator::new(port, store.clone());
+        let outcome = must(coordinator.rollback(&transaction_id));
+        assert!(matches!(
+            outcome,
+            InstallationStepOutcome::Applied {
+                stage: InstallationStage::RolledBack,
+                ..
+            }
+        ));
+        assert!(*execute_count.lock().unwrap_or_else(|_| unreachable!()) > 0);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage(), InstallationStage::RolledBack);
+        assert!(saved.pending_external_changes.is_empty());
+        assert!(
+            saved
+                .completed_stage_refs
+                .iter()
+                .all(|r| !r.as_str().contains("recovery:rejected-to-rollback"))
+        );
+    }
+
+    #[test]
+    fn rollback_registering_without_durable_evidence_is_rejected_without_effects() {
+        let mut transaction = planned_transaction();
+        transaction.effect_progress[0].admitted_precondition =
+            Some(admitted_precondition(&transaction));
+        transaction.effect_progress[0].ownership_secret = Some(test_ownership_secret(
+            InstallationCreateDisposition::Created,
+            InstallationSecretLifecycle::Active,
+        ));
+        transaction.effect_progress[0].state = InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity: test_handle("external:effect-0"),
+            evidence: vec![test_handle("evidence:recover-registering")],
+            postcondition_digest: test_handle("a".repeat(64)),
+        };
+        transaction.stage = InstallationStage::Registering;
+        transaction.pending_external_changes.clear();
+        transaction.revision = 4;
+        must(transaction.validate());
+        let transaction_id = transaction.transaction_id.clone();
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(transaction.clone()))),
+            ..SharedStore::default()
+        };
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let mut coordinator = InstallationCoordinator::new(
+            fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone()),
+            store.clone(),
+        );
+        let err = coordinator
+            .rollback(&transaction_id)
+            .expect_err("must reject without durable rejection evidence");
+        assert!(matches!(err, InstallationError::IllegalTransition { .. }));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage(), InstallationStage::Registering);
+        assert!(saved.pending_external_changes.is_empty());
+        assert!(
+            saved
+                .completed_stage_refs
+                .iter()
+                .all(|r| !r.as_str().contains("recovery:rejected-to-rollback"))
+        );
+    }
+
+    #[test]
+    fn rollback_activating_is_rejected_without_external_effects() {
+        let mut transaction = planned_transaction();
+        transaction.effect_progress[0].admitted_precondition =
+            Some(admitted_precondition(&transaction));
+        transaction.effect_progress[0].ownership_secret = Some(test_ownership_secret(
+            InstallationCreateDisposition::Created,
+            InstallationSecretLifecycle::Active,
+        ));
+        transaction.effect_progress[0].state = InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity: test_handle("external:effect-0"),
+            evidence: vec![test_handle("evidence:activating")],
+            postcondition_digest: test_handle("a".repeat(64)),
+        };
+        transaction.stage = InstallationStage::Activating;
+        transaction.pending_external_changes = vec![test_handle("pending:activating")];
+        transaction.revision = 4;
+        must(transaction.validate());
+        let transaction_id = transaction.transaction_id.clone();
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(transaction.clone()))),
+            ..SharedStore::default()
+        };
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let mut coordinator = InstallationCoordinator::new(
+            fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone()),
+            store.clone(),
+        );
+        let err = coordinator
+            .rollback(&transaction_id)
+            .expect_err("Activating must reject");
+        assert!(matches!(err, InstallationError::IllegalTransition { .. }));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage(), InstallationStage::Activating);
+        assert_eq!(
+            saved.pending_external_changes,
+            transaction.pending_external_changes
+        );
+    }
+
+    #[test]
+    fn rollback_registering_with_unknown_quarantines_before_effects() {
+        let mut transaction = planned_transaction();
+        transaction.effect_progress[0].state = InstallationEffectProgressState::Unknown {
+            pending_ref: test_handle("pending:unknown-intent"),
+        };
+        transaction.stage = InstallationStage::Registering;
+        transaction.pending_external_changes.clear();
+        transaction.revision = 4;
+        must(transaction.validate());
+        let transaction_id = transaction.transaction_id.clone();
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(transaction))),
+            ..SharedStore::default()
+        };
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let mut coordinator = InstallationCoordinator::new(
+            fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone()),
+            store.clone(),
+        );
+        let outcome = must(coordinator.rollback(&transaction_id));
+        assert!(matches!(
+            outcome,
+            InstallationStepOutcome::Quarantined { .. }
+        ));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage(), InstallationStage::Quarantined);
+    }
+
+    #[test]
+    fn rollback_registering_with_intent_quarantines_before_effects() {
+        let mut transaction = planned_transaction();
+        transaction.effect_progress[0].admitted_precondition =
+            Some(admitted_precondition(&transaction));
+        transaction.effect_progress[0].ownership_secret = Some(test_ownership_secret(
+            InstallationCreateDisposition::NotAttempted,
+            InstallationSecretLifecycle::Active,
+        ));
+        let intent_digest = must(effect_request(
+            &transaction,
+            0,
+            1,
+            InstallationEffectAction::Apply,
+            None,
+        ))
+        .intent_digest()
+        .unwrap_or_else(|error| panic!("intent digest: {error}"));
+        transaction.effect_progress[0].state = InstallationEffectProgressState::IntentCommitted {
+            attempt: 1,
+            intent_digest,
+        };
+        transaction.stage = InstallationStage::Registering;
+        transaction.pending_external_changes.clear();
+        transaction.revision = 4;
+        must(transaction.validate());
+        let transaction_id = transaction.transaction_id.clone();
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(transaction))),
+            ..SharedStore::default()
+        };
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let mut coordinator = InstallationCoordinator::new(
+            fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone()),
+            store.clone(),
+        );
+        let outcome = must(coordinator.rollback(&transaction_id));
+        assert!(matches!(
+            outcome,
+            InstallationStepOutcome::Quarantined { .. }
+        ));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage(), InstallationStage::Quarantined);
+    }
+
+    #[test]
+    fn rollback_activating_redb_is_rejected_without_external_effects() {
+        let planned = planned_transaction();
+        let mut activating = planned.clone();
+        activating.effect_progress[0].admitted_precondition =
+            Some(admitted_precondition(&activating));
+        activating.effect_progress[0].ownership_secret = Some(test_ownership_secret(
+            InstallationCreateDisposition::Created,
+            InstallationSecretLifecycle::Active,
+        ));
+        activating.effect_progress[0].state = InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity: test_handle("external:activating-redb"),
+            evidence: vec![test_handle("evidence:activating-redb")],
+            postcondition_digest: test_handle("a".repeat(64)),
+        };
+        activating.stage = InstallationStage::Activating;
+        activating.pending_external_changes = vec![test_handle("pending:activating-redb")];
+        activating.revision = 4;
+        must(activating.validate());
+        let path = std::env::temp_dir().join(format!(
+            "eliot-rollback-activating-redb-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store =
+            must(RedbInstallationTransactionStore::create_planned_at_exact_path(&path, &planned));
+        let expected = must(TransactionVersion::of(&planned));
+        let mut persisted = activating.clone();
+        persisted.revision = expected.revision + 1;
+        must(<RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+            &mut store,
+            expected,
+            &persisted,
+        ));
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let mut coordinator = InstallationCoordinator::new(
+            fake_port(
+                SharedStore::default(),
+                Vec::new(),
+                Vec::new(),
+                execute_count.clone(),
+            ),
+            store,
+        );
+        let err = coordinator
+            .rollback(&activating.transaction_id)
+            .expect_err("Activating Redb must reject");
+        assert!(matches!(err, InstallationError::IllegalTransition { .. }));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rollback_registering_without_durable_evidence_redb_is_rejected_without_effects() {
+        let planned = planned_transaction();
+        let mut registering = planned.clone();
+        registering.effect_progress[0].admitted_precondition =
+            Some(admitted_precondition(&registering));
+        registering.effect_progress[0].ownership_secret = Some(test_ownership_secret(
+            InstallationCreateDisposition::Created,
+            InstallationSecretLifecycle::Active,
+        ));
+        registering.effect_progress[0].state = InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity: test_handle("external:registering-redb"),
+            evidence: vec![test_handle("evidence:registering-redb")],
+            postcondition_digest: test_handle("a".repeat(64)),
+        };
+        registering.stage = InstallationStage::Registering;
+        registering.pending_external_changes.clear();
+        registering.revision = 4;
+        must(registering.validate());
+        let path = std::env::temp_dir().join(format!(
+            "eliot-rollback-nofabricate-redb-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store =
+            must(RedbInstallationTransactionStore::create_planned_at_exact_path(&path, &planned));
+        let expected = must(TransactionVersion::of(&planned));
+        let mut persisted = registering.clone();
+        persisted.revision = expected.revision + 1;
+        must(<RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+            &mut store,
+            expected,
+            &persisted,
+        ));
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let mut coordinator = InstallationCoordinator::new(
+            fake_port(
+                SharedStore::default(),
+                Vec::new(),
+                Vec::new(),
+                execute_count.clone(),
+            ),
+            store,
+        );
+        let err = coordinator
+            .rollback(&registering.transaction_id)
+            .expect_err("Registering without durable evidence must reject");
+        assert!(matches!(err, InstallationError::IllegalTransition { .. }));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        assert!(!format!("{err:?}").contains("recovery:rejected-to-rollback"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rollback_forged_rollback_required_with_pending_projection_is_rejected_without_effects() {
+        let mut registering = registering_system_service_start_transaction();
+        let approval = test_transaction_activation_approval(
+            &registering,
+            test_handle("approval:forged-projection"),
+        );
+        let intent = must(InstallationActivationProjectionIntent::new(
+            &registering,
+            &approval,
+            test_handle("e".repeat(64)),
+            test_handle("f".repeat(64)),
+            1,
+            test_handle("a".repeat(64)),
+        ));
+        must(registering.advance_to_activating_for_signed_approval(&approval, intent));
+        assert_eq!(registering.stage(), InstallationStage::Activating);
+        assert!(registering.activation_projection_intent().is_some());
+
+        let mut forged = registering.clone();
+        forged.stage = InstallationStage::RollbackRequired;
+        forged.pending_external_changes = vec![test_handle("pending:forged-projection")];
+        forged.revision = registering.revision + 1;
+        must(forged.validate());
+        let transaction_id = forged.transaction_id.clone();
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(forged))),
+            ..SharedStore::default()
+        };
+        let mut coordinator = InstallationCoordinator::new(
+            fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone()),
+            store.clone(),
+        );
+        let err = coordinator
+            .rollback(&transaction_id)
+            .expect_err("pending Host handoff must reject rollback");
+        assert!(matches!(err, InstallationError::IllegalTransition { .. }));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage(), InstallationStage::RollbackRequired);
+        assert!(saved.activation_projection_intent().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::items_after_statements)]
+    fn rollback_forged_rollback_required_with_pending_projection_redb_is_rejected_without_effects()
+    {
+        let registering = registering_system_service_start_transaction();
+        let approval = test_transaction_activation_approval(
+            &registering,
+            test_handle("approval:forged-projection-redb"),
+        );
+        let mut activating = registering.clone();
+        let intent = must(InstallationActivationProjectionIntent::new(
+            &activating,
+            &approval,
+            test_handle("e".repeat(64)),
+            test_handle("f".repeat(64)),
+            1,
+            test_handle("a".repeat(64)),
+        ));
+        must(activating.advance_to_activating_for_signed_approval(&approval, intent));
+        let mut forged = activating.clone();
+        forged.stage = InstallationStage::RollbackRequired;
+        forged.pending_external_changes = vec![test_handle("pending:forged-projection-redb")];
+        must(forged.validate());
+
+        let planned = must(InstallationTransaction::new(
+            registering.transaction_id.clone(),
+            registering.installation_epoch.clone(),
+            registering.profile,
+            registering.request.clone(),
+            registering.current_active_manifest.clone(),
+            registering.candidate_manifest.clone(),
+            registering.staging_root.clone(),
+            registering.planned_changes.clone(),
+            registering.installer_effects.clone(),
+            registering.minimum_store_available_bytes,
+            registering.precondition_evidence.clone(),
+            registering.recovery_command.clone(),
+        ));
+        let path = std::env::temp_dir().join(format!(
+            "eliot-rollback-forged-projection-redb-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store =
+            must(RedbInstallationTransactionStore::create_planned_at_exact_path(&path, &planned));
+        forged.revision = activating.revision + 1;
+        {
+            let database = must(redb::Database::open(&path));
+            let write = must(database.begin_write());
+            {
+                let mut table = must(write.open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                    "installation_transactions_v7",
+                )));
+                #[derive(serde::Serialize)]
+                struct Envelope<'a> {
+                    wire_version: ContractVersion,
+                    transaction: &'a InstallationTransaction,
+                }
+                let bytes = must(serde_json::to_vec(&Envelope {
+                    wire_version: INSTALLATION_TRANSACTION_WIRE_VERSION,
+                    transaction: &forged,
+                }));
+                must(table.insert(forged.transaction_id.as_str(), bytes.as_slice()));
+            }
+            must(write.commit());
+        }
+        let transaction_id = forged.transaction_id.clone();
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let mut coordinator = InstallationCoordinator::new(
+            fake_port(
+                SharedStore::default(),
+                Vec::new(),
+                Vec::new(),
+                execute_count.clone(),
+            ),
+            store,
+        );
+        let err = coordinator
+            .rollback(&transaction_id)
+            .expect_err("Redb pending Host handoff must reject rollback");
+        assert!(matches!(err, InstallationError::IllegalTransition { .. }));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let _ = std::fs::remove_file(path);
     }
 }
