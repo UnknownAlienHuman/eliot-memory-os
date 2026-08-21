@@ -6,6 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use eliot_contracts::sha256_hex;
 use eliot_installation::InstallationError;
 use eliot_installation::InstallationTransactionStore;
+use eliot_installation::{ApprovedGenerationRegistry, CandidateManifest, InstallerServiceRole};
 use eliot_runtime_contracts::{
     HealthDimension, SignedSupervisionLease, SupervisionLeaseVerificationContext,
     SupervisionLeaseVerifier, SupervisionTrustAnchor,
@@ -103,8 +104,29 @@ pub struct ServiceContours {
 pub struct ServiceRegistrationState {
     pub registration: String,
     pub state: String,
+    /// Kept for wire compatibility with the first Runtime Live projection.
+    /// It is intentionally never populated from a configured image path:
+    /// configured SCM data is not a live process observation.
     pub observed_process: Option<String>,
+    /// Handle-bound process identity observed by SCM, when the canonical
+    /// registration and live process can be read back together.
+    #[serde(default)]
+    pub observed_runtime: Option<ServiceRuntimeIdentity>,
     pub gap: String,
+}
+
+/// Typed, read-only identity of a live Runtime Live SCM process.
+///
+/// PID is only a lookup key. The start time and image path come from the same
+/// process handle, and the digest binds those values to the exact approved SCM
+/// configuration read back by `eliot-platform-windows`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceRuntimeIdentity {
+    pub process_id: u32,
+    pub start_time_100ns: u64,
+    pub image_path: String,
+    pub runtime_identity_digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1008,8 +1030,20 @@ pub fn collect_status(
     );
     check_deadline(deadline)?;
 
-    let host_service = inspect_service_registration("eliot-host", deadline);
-    let watchdog_service = inspect_service_registration("eliot-watchdog", deadline);
+    let host_service = inspect_approved_service_registration(
+        registry_opt.as_ref(),
+        active_manifest.as_ref(),
+        InstallerServiceRole::Host,
+        &canonical_path,
+        deadline,
+    );
+    let watchdog_service = inspect_approved_service_registration(
+        registry_opt.as_ref(),
+        active_manifest.as_ref(),
+        InstallerServiceRole::Watchdog,
+        &canonical_path,
+        deadline,
+    );
     check_deadline(deadline)?;
 
     let transaction_stage_contour = inspect_transaction_stage(
@@ -1056,6 +1090,16 @@ pub fn collect_status(
                 _ => "unknown".to_owned(),
             },
             transaction_stage_contour.gap
+        ));
+        g.push(format!(
+            "SCM {}: {}",
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+            host_service.gap
+        ));
+        g.push(format!(
+            "SCM {}: {}",
+            eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_NAME,
+            watchdog_service.gap
         ));
         g
     };
@@ -1847,102 +1891,227 @@ fn inspect_ors_retained(
     }
 }
 
-fn inspect_service_registration(name: &str, deadline: Instant) -> ServiceRegistrationState {
-    if Instant::now() >= deadline {
-        return ServiceRegistrationState {
-            registration: "Unknown".to_owned(),
-            state: "Unknown".to_owned(),
-            observed_process: None,
-            gap: "deadline exceeded before service inspection".to_owned(),
-        };
+fn canonical_service_name(role: InstallerServiceRole) -> &'static str {
+    match role {
+        InstallerServiceRole::Host => eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+        InstallerServiceRole::Watchdog => eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_NAME,
     }
-    #[cfg(windows)]
-    {
-        read_service_registration_windows(name)
+}
+
+fn expected_service_image(manifest: &CandidateManifest, role: InstallerServiceRole) -> &str {
+    match role {
+        InstallerServiceRole::Host => manifest.runtime_launch.host_executable_path.as_str(),
+        InstallerServiceRole::Watchdog => manifest.runtime_launch.watchdog_executable_path.as_str(),
     }
-    #[cfg(not(windows))]
+}
+
+/// Reconstructs the exact inert SCM request from the installer-owned active
+/// approval, then binds it back to the active manifest before any OS read.
+///
+/// The registry approval is the only source for the registration nonce and
+/// authoritative configuration digest. The active manifest independently
+/// constrains the role image and bootstrap descriptor/root, so a substituted
+/// approval cannot silently turn into a status observation.
+fn approved_service_registration_request(
+    registry: &ApprovedGenerationRegistry,
+    manifest: &CandidateManifest,
+    role: InstallerServiceRole,
+) -> Result<eliot_platform_windows::ServiceRegistrationRequest, String> {
+    let approval = registry
+        .service_registration_approval(&manifest.generation, role)
+        .ok_or_else(|| {
+            format!(
+                "active manifest has no installer-owned {} SCM approval",
+                canonical_service_name(role)
+            )
+        })?;
+    let request = approval.service_registration_request().map_err(|error| {
+        format!(
+            "active {} SCM approval is invalid: {error}",
+            canonical_service_name(role)
+        )
+    })?;
+    if request.service_name() != canonical_service_name(role) {
+        return Err(format!(
+            "active {} SCM approval selected a non-canonical service name",
+            canonical_service_name(role)
+        ));
+    }
+    if !eliot_platform_windows::windows_paths_equal(
+        request.binary_path(),
+        Path::new(expected_service_image(manifest, role)),
+    ) {
+        return Err(format!(
+            "active {} SCM approval image differs from the approved manifest",
+            canonical_service_name(role)
+        ));
+    }
+    let Some(bootstrap) = request.bootstrap() else {
+        return Err(format!(
+            "active {} SCM approval has no typed bootstrap",
+            canonical_service_name(role)
+        ));
+    };
+    let runtime = &manifest.runtime_launch;
+    let bootstrap_root = bootstrap.host_state_root().ok_or_else(|| {
+        format!(
+            "active {} SCM approval has no Host state-root binding",
+            canonical_service_name(role)
+        )
+    })?;
+    if !eliot_platform_windows::windows_paths_equal(
+        bootstrap_root,
+        Path::new(runtime.runtime_state_roots.host_state_root.as_str()),
+    ) || !eliot_platform_windows::windows_paths_equal(
+        bootstrap.config_descriptor_path(),
+        Path::new(runtime.authority_descriptor_path.as_str()),
+    ) || bootstrap.config_descriptor_digest() != runtime.authority_descriptor_digest.as_str()
+        || bootstrap.installation_id() != runtime.installation_epoch.installation.as_str()
+        || bootstrap.transaction_plan_generation() != runtime.authority_generation.value()
     {
-        let _ = name;
-        ServiceRegistrationState {
-            registration: "Unknown".to_owned(),
-            state: "Unknown".to_owned(),
-            observed_process: None,
-            gap: service_gap(name),
+        return Err(format!(
+            "active {} SCM approval bootstrap differs from the approved manifest",
+            canonical_service_name(role)
+        ));
+    }
+    Ok(request)
+}
+
+fn unknown_service_registration(name: &str, gap: impl Into<String>) -> ServiceRegistrationState {
+    ServiceRegistrationState {
+        registration: "Unknown".to_owned(),
+        state: "Unknown".to_owned(),
+        observed_process: None,
+        observed_runtime: None,
+        gap: gap.into().replace("{name}", name),
+    }
+}
+
+fn project_service_runtime_identity(
+    observation: &eliot_platform_windows::ServiceRuntimeObservation,
+) -> Option<ServiceRuntimeIdentity> {
+    let process = observation.process()?;
+    let runtime_identity_digest = observation.runtime_identity_digest()?;
+    Some(ServiceRuntimeIdentity {
+        process_id: process.process_id,
+        start_time_100ns: process.start_time_100ns,
+        image_path: process.image_path.clone(),
+        runtime_identity_digest,
+    })
+}
+
+fn project_matching_service_registration(
+    observation: &eliot_platform_windows::ServiceRuntimeObservation,
+) -> ServiceRegistrationState {
+    let name = observation.service_name().to_owned();
+    let state = format!("{:?}", observation.state());
+    let observed_runtime = project_service_runtime_identity(observation);
+    let gap = if observation.is_running() {
+        format!(
+            "SCM {name} Running and handle-bound process identity observed; Running/liveness alone does not prove semantic readiness"
+        )
+    } else if observed_runtime.is_some() {
+        format!(
+            "SCM {name} {state} with handle-bound process identity; service semantic readiness remains unproven"
+        )
+    } else {
+        format!(
+            "SCM {name} {state} observed without a live process identity; service semantic readiness remains unproven"
+        )
+    };
+    ServiceRegistrationState {
+        registration: "Matching".to_owned(),
+        state,
+        // This legacy field must not become a configured-image alias again.
+        observed_process: None,
+        observed_runtime,
+        gap,
+    }
+}
+
+fn project_service_registration_inspection(
+    name: &str,
+    inspection: eliot_platform_windows::ServiceRegistrationRuntimeInspection,
+) -> ServiceRegistrationState {
+    match inspection {
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Matching { observation } => {
+            project_matching_service_registration(&observation)
+        }
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Absent => {
+            ServiceRegistrationState {
+                registration: "Absent".to_owned(),
+                state: "Absent".to_owned(),
+                observed_process: None,
+                observed_runtime: None,
+                gap: format!("service {name} is not registered in SCM"),
+            }
+        }
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Mismatched => {
+            ServiceRegistrationState {
+                registration: "Mismatched".to_owned(),
+                state: "Unknown".to_owned(),
+                observed_process: None,
+                observed_runtime: None,
+                gap: format!(
+                    "SCM {name} registration or live image differs from the exact approved request"
+                ),
+            }
+        }
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Unknown => {
+            unknown_service_registration(
+                name,
+                "authoritative SCM {name} configuration or live process observation is indeterminate",
+            )
         }
     }
 }
 
-#[cfg(windows)]
-fn read_service_registration_windows(name: &str) -> ServiceRegistrationState {
-    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-    let manager = match ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CONNECT | ServiceManagerAccess::ENUMERATE_SERVICE,
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            return ServiceRegistrationState {
-                registration: "Unknown".to_owned(),
-                state: "Unknown".to_owned(),
-                observed_process: None,
-                gap: format!("SCM connect failed for {name}: {e}"),
-            };
-        }
-    };
-    let service = match manager.open_service(
-        name,
-        windows_service::service::ServiceAccess::QUERY_STATUS
-            | windows_service::service::ServiceAccess::QUERY_CONFIG,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = e.to_string().to_ascii_lowercase();
-            if msg.contains("does not exist") || msg.contains("not found") {
-                return ServiceRegistrationState {
-                    registration: "Absent".to_owned(),
-                    state: "Absent".to_owned(),
-                    observed_process: None,
-                    gap: format!("service {name} not registered"),
-                };
-            }
-            return ServiceRegistrationState {
-                registration: "Unknown".to_owned(),
-                state: "Unknown".to_owned(),
-                observed_process: None,
-                gap: format!("open service {name} failed: {e}"),
-            };
-        }
-    };
-    let config = match service.query_config() {
-        Ok(c) => c,
-        Err(e) => {
-            return ServiceRegistrationState {
-                registration: "Unknown".to_owned(),
-                state: "Unknown".to_owned(),
-                observed_process: None,
-                gap: format!("query config {name} failed: {e}"),
-            };
-        }
-    };
-    let status = match service.query_status() {
-        Ok(s) => s,
-        Err(e) => {
-            return ServiceRegistrationState {
-                registration: "Unknown".to_owned(),
-                state: "Unknown".to_owned(),
-                observed_process: None,
-                gap: format!("query status {name} failed: {e}"),
-            };
-        }
-    };
-    let state_str = format!("{:?}", status.current_state);
-    let binary = config.executable_path.to_string_lossy().into_owned();
-    ServiceRegistrationState {
-        registration: "Present".to_owned(),
-        state: state_str,
-        observed_process: Some(binary),
-        gap: service_gap(name),
+fn inspect_approved_service_registration(
+    registry: Option<&ApprovedGenerationRegistry>,
+    manifest: Option<&CandidateManifest>,
+    role: InstallerServiceRole,
+    canonical_root: &Path,
+    deadline: Instant,
+) -> ServiceRegistrationState {
+    let name = canonical_service_name(role);
+    if Instant::now() >= deadline {
+        return unknown_service_registration(
+            name,
+            "deadline exceeded before SCM {name} inspection",
+        );
     }
+    let Some(registry) = registry else {
+        return unknown_service_registration(
+            name,
+            "active approved registry is unavailable; SCM {name} request cannot be reconstructed",
+        );
+    };
+    let Some(manifest) = manifest else {
+        return unknown_service_registration(
+            name,
+            "active approved manifest is unavailable; SCM {name} request cannot be reconstructed",
+        );
+    };
+    let request = match approved_service_registration_request(registry, manifest, role) {
+        Ok(request) => request,
+        Err(gap) => return unknown_service_registration(name, gap),
+    };
+    if Instant::now() >= deadline {
+        return unknown_service_registration(name, "deadline exceeded before SCM {name} readback");
+    }
+    let platform = match eliot_platform_windows::WindowsPlatform::new(canonical_root) {
+        Ok(platform) => platform,
+        Err(error) => {
+            return unknown_service_registration(
+                name,
+                format!("SCM {name} read-only adapter root unavailable: {error}"),
+            );
+        }
+    };
+    project_service_registration_inspection(
+        name,
+        platform.inspect_service_registration_runtime(&request),
+    )
 }
 
 pub fn service_gap_for(name: &str) -> String {
@@ -2100,6 +2269,63 @@ mod honest_tests {
         let gaps_text = report.gaps.join(" ").to_ascii_lowercase();
         assert!(gaps_text.contains("trust anchor") || gaps_text.contains("ors"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn service_status_exposes_typed_runtime_identity_without_legacy_image_alias() {
+        let identity = ServiceRuntimeIdentity {
+            process_id: 4242,
+            start_time_100ns: 1_777_777_777_777,
+            image_path: r"C:\Eliot\eliot-host.exe".to_owned(),
+            runtime_identity_digest: "a".repeat(64),
+        };
+        let state = ServiceRegistrationState {
+            registration: "Matching".to_owned(),
+            state: "Running".to_owned(),
+            observed_process: None,
+            observed_runtime: Some(identity),
+            gap: "SCM Running is not semantic readiness".to_owned(),
+        };
+        let json = serde_json::to_value(state).expect("service status JSON");
+        assert_eq!(json["observed_process"], serde_json::Value::Null);
+        assert_eq!(json["observed_runtime"]["process_id"], 4242);
+        assert_eq!(
+            json["observed_runtime"]["start_time_100ns"],
+            1_777_777_777_777_u64
+        );
+        assert_eq!(
+            json["observed_runtime"]["image_path"],
+            r"C:\Eliot\eliot-host.exe"
+        );
+        assert_eq!(
+            json["observed_runtime"]["runtime_identity_digest"],
+            "a".repeat(64)
+        );
+    }
+
+    #[test]
+    fn service_status_substitution_fails_closed_without_process_identity() {
+        let state = project_service_registration_inspection(
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+            eliot_platform_windows::ServiceRegistrationRuntimeInspection::Mismatched,
+        );
+        assert_eq!(state.registration, "Mismatched");
+        assert_eq!(state.state, "Unknown");
+        assert!(state.observed_runtime.is_none());
+        assert!(state.gap.contains("exact approved request"));
+    }
+
+    #[test]
+    fn service_status_indeterminate_fails_closed_without_liveness_claim() {
+        let state = project_service_registration_inspection(
+            eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_NAME,
+            eliot_platform_windows::ServiceRegistrationRuntimeInspection::Unknown,
+        );
+        assert_eq!(state.registration, "Unknown");
+        assert_eq!(state.state, "Unknown");
+        assert!(state.observed_runtime.is_none());
+        assert!(state.gap.contains("indeterminate"));
+        assert!(!state.gap.contains("Running"));
     }
 
     #[test]
