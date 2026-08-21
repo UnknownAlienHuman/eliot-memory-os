@@ -1377,6 +1377,25 @@ fn phase_b_observe_previous_binding(
 }
 
 #[cfg(windows)]
+fn phase_b_validate_durable_previous_binding(
+    observed: &PhaseBPreviousBinding,
+    durable: &PhaseBLiveBinding,
+) -> Result<(), HostError> {
+    let observed_nonce_digest = phase_b_bytes_digest(observed.host.nonce.as_str().as_bytes())?;
+    if observed.authority_digest != durable.authority_descriptor_digest
+        || observed.host.epoch.current.lineage != durable.host_epoch_lineage
+        || observed.host.epoch.current.sequence != durable.host_epoch_sequence
+        || observed_nonce_digest != durable.host_process_nonce_digest
+    {
+        return Err(HostError::RecoveryRequired(
+            "Phase-B destination marker does not match the durable committed Phase-B binding"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn phase_b_validate_authority(
     manifest: &CandidateManifest,
     host: &HostInstallationEpoch,
@@ -6794,6 +6813,7 @@ fn reopen_existing_epoch<B: JournalBackend>(
     last_host: &HostInstallationEpoch,
     installation: &PlatformHandle,
     pending: Option<&eliot_installation::PendingActivation>,
+    active_phase_b_rebind: Option<&eliot_installation::ActivePhaseBRebind>,
 ) -> Result<
     (
         HostStateJournalService<B>,
@@ -6818,7 +6838,7 @@ fn reopen_existing_epoch<B: JournalBackend>(
         }
     }
     let replayed = current.snapshot()?;
-    if pending.is_none() && replayed.clean_marker.is_none() {
+    if pending.is_none() && active_phase_b_rebind.is_none() && replayed.clean_marker.is_none() {
         return Err(HostError::OwnerLeaseRecovery(
             "current Host journal epoch is unclean; explicit new-lineage recovery is required"
                 .to_owned(),
@@ -6913,6 +6933,7 @@ fn open_production_epoch(
     path: &Path,
     installation: PlatformHandle,
     pending: Option<&eliot_installation::PendingActivation>,
+    active_phase_b_rebind: Option<&eliot_installation::ActivePhaseBRebind>,
 ) -> Result<
     (
         ProductionHostStateJournal,
@@ -6932,8 +6953,13 @@ fn open_production_epoch(
 
     let (journal, host, activation_generation) = if let Some(last_host) = last_host {
         let current = HostStateJournalService::from_backend(backend, last_host.clone())?;
-        let (journal, host, activation_generation) =
-            reopen_existing_epoch(current, &last_host, &installation, pending)?;
+        let (journal, host, activation_generation) = reopen_existing_epoch(
+            current,
+            &last_host,
+            &installation,
+            pending,
+            active_phase_b_rebind,
+        )?;
         (journal, host, activation_generation)
     } else {
         let host = fresh_host_epoch(installation, None)?;
@@ -7770,8 +7796,12 @@ impl HostComposition {
             }
         };
         let journal_path = host_state_root.join(HOST_JOURNAL_FILE_NAME);
-        let (journal, host, activation_generation, activation_id) =
-            open_production_epoch(&journal_path, installation, pending_for_reopen.as_ref())?;
+        let (journal, host, activation_generation, activation_id) = open_production_epoch(
+            &journal_path,
+            installation,
+            pending_for_reopen.as_ref(),
+            registry.active_phase_b_rebind(),
+        )?;
         #[cfg(windows)]
         let jobs =
             HostJobBranches::new(&host).map_err(|error| HostError::Platform(error.to_string()))?;
@@ -7984,6 +8014,7 @@ impl HostComposition {
                 &HostPhaseBInput {
                     authority_descriptor_bytes,
                 },
+                None,
             )?;
             materialization.transaction_id = Some(intent.transaction_id.clone());
             materialization.effect_id = Some(intent.effect_id.clone());
@@ -8146,11 +8177,11 @@ impl HostComposition {
                         "pending Phase-B receipt is not bound to the exact query".to_owned(),
                     ));
                 }
-                // The receipt CAS can be durable while the activation
-                // continuation was interrupted. Rehydrate the exact
-                // prepared contour and resume that continuation; no Phase-B
-                // destination is published again.
-                self.resume_pending_phase_b_receipt()?;
+                // ReconcilePhaseB is query-only.  The receipt CAS may be
+                // durable while activation continuation was interrupted, but
+                // this operation must not rehydrate, start children, append
+                // journal records, or advance the registry.  The mutable
+                // continuation is owned by the Host startup/worker contour.
                 return Ok(receipt.clone());
             }
             if pending_intent.is_some() && pending_prepared.is_none() {
@@ -8639,6 +8670,11 @@ impl HostComposition {
     /// Returns an error when the candidate, live Host epoch, external ORS
     /// handoff, protected destinations, or exact post-publication readback do
     /// not match the approved contour.
+    ///
+    /// `durable_prior_binding` is required for an `ActiveVerified` rebind.  Any
+    /// destination marker is treated only as physical continuity evidence and
+    /// is accepted there after exact comparison with the committed registry
+    /// binding; it never establishes prior ownership.
     #[allow(
         clippy::needless_pass_by_value,
         clippy::too_many_lines,
@@ -8649,6 +8685,7 @@ impl HostComposition {
         &mut self,
         manifest: &CandidateManifest,
         input: &HostPhaseBInput,
+        durable_prior_binding: Option<&PhaseBLiveBinding>,
     ) -> Result<HostPhaseBMaterialization, HostError> {
         self.ensure_admission_open()?;
         manifest
@@ -8691,13 +8728,31 @@ impl HostComposition {
             &launch_template.authority_descriptor_path,
             profile,
         )?;
-        let previous_binding = phase_b_observe_previous_binding(
+        let observed_previous_binding = phase_b_observe_previous_binding(
             manifest,
             &self.host,
             &self.activation_generation.current,
             portable_root.as_ref(),
             &authority_path,
         )?;
+        let durable_manifest_digest = phase_b_manifest_digest(manifest)?;
+        let previous_binding = if let Some(durable) = durable_prior_binding {
+            if durable.manifest_digest != durable_manifest_digest {
+                return Err(HostError::RecoveryRequired(
+                    "durable committed Phase-B binding is not bound to the exact manifest"
+                        .to_owned(),
+                ));
+            }
+            match observed_previous_binding {
+                Some(observed) => {
+                    phase_b_validate_durable_previous_binding(&observed, durable)?;
+                    Some(observed)
+                }
+                None => None,
+            }
+        } else {
+            observed_previous_binding
+        };
         let allow_expired_exact_replay = match std::fs::symlink_metadata(&authority_path) {
             Ok(_) => {
                 let lease =
@@ -8813,6 +8868,16 @@ impl HostComposition {
             &eliotd_template_bytes,
             previous_binding.as_ref(),
         )?;
+        if let Some(durable) = durable_prior_binding
+            && previous_eliotd_digest
+                .as_ref()
+                .is_some_and(|observed| observed != &durable.eliotd_descriptor_digest)
+        {
+            return Err(HostError::RecoveryRequired(
+                "prior eliotd digest does not match the durable committed Phase-B binding"
+                    .to_owned(),
+            ));
+        }
         let mut eliotd_allowed_digests = vec![&launch_template.eliotd_descriptor_digest];
         if let Some(digest) = previous_eliotd_digest.as_ref() {
             eliotd_allowed_digests.push(digest);
@@ -8881,6 +8946,16 @@ impl HostComposition {
             previous_binding.as_ref(),
             previous_eliotd_digest.as_ref(),
         )?;
+        if let Some(durable) = durable_prior_binding
+            && previous_config_digest
+                .as_ref()
+                .is_some_and(|observed| observed != &durable.config_file_digest)
+        {
+            return Err(HostError::RecoveryRequired(
+                "prior Store config digest does not match the durable committed Phase-B binding"
+                    .to_owned(),
+            ));
+        }
         let mut config_allowed_digests = vec![&manifest.config_digest];
         if let Some(digest) = previous_config_digest.as_ref() {
             config_allowed_digests.push(digest);
@@ -8980,6 +9055,16 @@ impl HostComposition {
             &previous_launch_nonce,
             previous_binding.as_ref(),
         )?;
+        if let Some(durable) = durable_prior_binding
+            && previous_bootstrap_digest
+                .as_ref()
+                .is_some_and(|observed| observed != &durable.store_bootstrap_descriptor_digest)
+        {
+            return Err(HostError::RecoveryRequired(
+                "prior Store bootstrap digest does not match the durable committed Phase-B binding"
+                    .to_owned(),
+            ));
+        }
         let mut bootstrap_allowed_digests = Vec::new();
         if let Some(digest) = previous_bootstrap_digest.as_ref() {
             bootstrap_allowed_digests.push(digest);
@@ -9096,6 +9181,11 @@ impl HostComposition {
         } else {
             None
         };
+        if prepared.is_none() {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B four-file publication requires a durable prepared capability".to_owned(),
+            ));
+        }
         let (authority_readback_digest, authority_identity) =
             phase_b_materialize_file_with_rollback(
                 profile,
@@ -9310,6 +9400,7 @@ impl HostComposition {
             &HostPhaseBInput {
                 authority_descriptor_bytes,
             },
+            Some(&prior_binding),
         )?;
         materialization.transaction_id = Some(intent.transaction_id.clone());
         materialization.effect_id = Some(intent.effect_id.clone());
@@ -14370,7 +14461,7 @@ mod journal_tests {
             .activation_generation
             .clone();
         let (reopened, reopened_host, reopened_generation) =
-            reopen_existing_epoch(fixture.journal, &last_host, &installation, None).unwrap();
+            reopen_existing_epoch(fixture.journal, &last_host, &installation, None, None).unwrap();
         assert_ne!(reopened_host, last_host);
         assert_eq!(
             reopened_host.epoch.parent,
@@ -14410,9 +14501,164 @@ mod journal_tests {
             "unexpected fault result: {append_result:?}"
         );
         assert!(matches!(
-            reopen_existing_epoch(journal, &host, &host.installation, None,),
+            reopen_existing_epoch(journal, &host, &host.installation, None, None,),
             Err(HostError::Journal(JournalError::OutcomeUnknown { .. }))
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unclean_reopen_allows_durable_active_rebind_retry_before_clean_marker() {
+        let fixture = active_readiness_fixture();
+        let durable = fixture.journal.snapshot().unwrap();
+        let last_host = durable.host;
+        let installation = last_host.installation.clone();
+        let handle = |value: &str| PlatformHandle::new(value).unwrap();
+        let static_template = eliot_installation::HostPhaseBStaticTemplate {
+            wire: handle("eliot.host.phase-b-template.v1"),
+            authority_id: handle("authority"),
+            record_id: handle("record"),
+            revision_policy_binding: handle("revision"),
+            contour_refs: vec![handle("contour")],
+        };
+        let rebind = eliot_installation::ActivePhaseBRebind {
+            intent: ActivePhaseBRebindIntent {
+                wire: handle("eliot.host.phase-b-rebind.v1"),
+                transaction_id: handle("transaction"),
+                plan_digest: handle("plan"),
+                effect_id: handle("effect"),
+                manifest_digest: handle("manifest"),
+                prior_terminal_digest: handle("terminal"),
+                prior_phase_b_receipt_digest: handle("receipt"),
+                prior_host_epoch_lineage: handle("prior-lineage"),
+                prior_host_epoch_sequence: 1,
+                prior_host_process_nonce_digest: handle(&"0".repeat(64)),
+                prior_host_owner_epoch: handle("prior-owner"),
+                prior_host_process_identity: handle(&"1".repeat(64)),
+                host_owner_epoch: handle("current-owner"),
+                host_process_identity: handle(&"2".repeat(64)),
+                host_process_nonce_digest: handle(&"3".repeat(64)),
+                host_epoch_lineage: handle("current-lineage"),
+                host_epoch_sequence: 2,
+                activation_generation_lineage: handle("activation-lineage"),
+                activation_generation_sequence: 2,
+                static_template,
+                static_template_digest: handle("static-digest"),
+                request_digest: handle("request"),
+            },
+            prepared: None,
+            receipt: None,
+        };
+        let (_, reopened_host, _) = reopen_existing_epoch(
+            fixture.journal,
+            &last_host,
+            &installation,
+            None,
+            Some(&rebind),
+        )
+        .unwrap();
+        assert_ne!(reopened_host, last_host);
+        assert_eq!(
+            reopened_host.epoch.parent,
+            Some(last_host.epoch.current.clone())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_host_journal_crash_retry_substitution_and_reset_negatives() {
+        let production_path = std::env::temp_dir()
+            .join(format!(
+                "eliot-host-prod-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+            .join(HOST_JOURNAL_FILE_NAME);
+        assert!(
+            production_path
+                .to_string_lossy()
+                .contains(HOST_JOURNAL_FILE_NAME)
+        );
+        assert!(!HOST_JOURNAL_FILE_NAME.is_empty());
+        let handle = |value: &str| PlatformHandle::new(value).unwrap();
+        let static_template = eliot_installation::HostPhaseBStaticTemplate {
+            wire: handle("eliot.host.phase-b-template.v1"),
+            authority_id: handle("authority"),
+            record_id: handle("record"),
+            revision_policy_binding: handle("revision"),
+            contour_refs: vec![handle("contour")],
+        };
+        let prior = eliot_installation::PhaseBLiveBinding {
+            manifest_digest: handle(&"f".repeat(64)),
+            authority_descriptor_digest: handle(&"a".repeat(64)),
+            store_bootstrap_descriptor_digest: handle(&"b".repeat(64)),
+            config_file_digest: handle(&"c".repeat(64)),
+            eliotd_descriptor_digest: handle(&"d".repeat(64)),
+            semantic_config_hash: handle(&"0".repeat(64)),
+            host_epoch_lineage: handle("prior-lineage"),
+            host_epoch_sequence: 1,
+            host_process_nonce_digest: handle(&"0".repeat(64)),
+            receipt_digest: handle(&"1".repeat(64)),
+            effect_id: handle("effect"),
+            credential_receipt_digest: handle(&"2".repeat(64)),
+            request_digest: handle(&"3".repeat(64)),
+            host_owner_epoch: handle("prior-owner"),
+            host_process_identity: handle(&"4".repeat(64)),
+            public_receipt_digest: handle(&"e".repeat(64)),
+        };
+        let fresh_intent = ActivePhaseBRebindIntent::new(
+            handle(&"b".repeat(64)),
+            handle(&"c".repeat(64)),
+            handle("effect"),
+            handle(&"f".repeat(64)),
+            handle(&"a".repeat(64)),
+            &prior,
+            handle("current-owner"),
+            handle(&"2".repeat(64)),
+            handle(&"3".repeat(64)),
+            handle("current-lineage"),
+            2,
+            handle("activation-lineage"),
+            2,
+            static_template.clone(),
+        )
+        .unwrap();
+        assert!(fresh_intent.validate().is_ok());
+        let stale_intent = ActivePhaseBRebindIntent::new(
+            handle(&"b".repeat(64)),
+            handle(&"c".repeat(64)),
+            handle("effect"),
+            handle(&"f".repeat(64)),
+            handle(&"a".repeat(64)),
+            &prior,
+            handle("current-owner"),
+            handle(&"2".repeat(64)),
+            handle(&"3".repeat(64)),
+            handle("current-lineage"),
+            1,
+            handle("activation-lineage"),
+            2,
+            static_template.clone(),
+        );
+        assert!(stale_intent.is_err());
+        let reused = ActivePhaseBRebindIntent::new(
+            handle(&"b".repeat(64)),
+            handle(&"c".repeat(64)),
+            handle("effect"),
+            handle(&"f".repeat(64)),
+            handle(&"a".repeat(64)),
+            &prior,
+            handle("prior-owner"),
+            handle(&"2".repeat(64)),
+            handle(&"3".repeat(64)),
+            handle("current-lineage"),
+            2,
+            handle("activation-lineage"),
+            2,
+            static_template,
+        );
+        assert!(reused.is_err());
+        let _ = production_path;
     }
 
     #[test]

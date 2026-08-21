@@ -3867,6 +3867,18 @@ impl ActivePhaseBRebindIntent {
                 reason: "must be non-zero".to_owned(),
             });
         }
+        if self.host_epoch_sequence <= self.prior_host_epoch_sequence {
+            return Err(InstallationError::InvalidField {
+                field: "active_phase_b_rebind.host_epoch_sequence".to_owned(),
+                reason: "must be strictly newer than the committed prior Host epoch".to_owned(),
+            });
+        }
+        if self.host_owner_epoch == self.prior_host_owner_epoch
+            || self.host_process_identity == self.prior_host_process_identity
+            || self.host_process_nonce_digest == self.prior_host_process_nonce_digest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
         self.static_template.validate()?;
         if self.static_template_digest != self.static_template.digest()? {
             return Err(InstallationError::IdentityConflict);
@@ -3891,6 +3903,13 @@ impl ActivePhaseBRebindIntent {
             || self.prior_host_process_nonce_digest != prior.host_process_nonce_digest
             || self.prior_host_owner_epoch != prior.host_owner_epoch
             || self.prior_host_process_identity != prior.host_process_identity
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.host_epoch_sequence <= prior.host_epoch_sequence
+            || self.host_owner_epoch == prior.host_owner_epoch
+            || self.host_process_identity == prior.host_process_identity
+            || self.host_process_nonce_digest == prior.host_process_nonce_digest
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -6568,6 +6587,14 @@ impl ApprovedGenerationRegistry {
         approval: InstallationActivationApproval,
         service_registration_approvals: &[InstallerServiceRegistrationApproval],
     ) -> Result<(), InstallationError> {
+        self.validate()?;
+        if self
+            .active_phase_b_rebind
+            .as_ref()
+            .is_some_and(|rebind| rebind.receipt.is_none())
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
         manifest.validate()?;
         approval.validate()?;
         validate_approval_against_manifest(&approval, &manifest, "pending_activation")?;
@@ -6619,10 +6646,11 @@ impl ApprovedGenerationRegistry {
         self.service_registration_approvals
             .extend(service_registration_approvals.iter().cloned());
         self.last_terminal_activation = None;
-        // A new candidate supersedes the one-slot ActiveVerified rebind
-        // projection. Its source terminal is the prior committed generation;
-        // staging clears that terminal, so retaining the rebind would leave a
-        // stale owner operation that cannot authorize the new generation.
+        // A fully receipted ActiveVerified rebind is terminal evidence for the
+        // generation that is being superseded. Clear that one-slot projection
+        // only after the replacement candidate has passed every staging check.
+        // Intent-only or Prepared rebinds remain fail-closed above and cannot
+        // be discarded by staging a different generation.
         self.active_phase_b_rebind = None;
         self.validate()
     }
@@ -6816,6 +6844,9 @@ impl ApprovedGenerationRegistry {
         intent: &ActivePhaseBRebindIntent,
     ) -> Result<ActivePhaseBRebindIntent, InstallationError> {
         self.validate()?;
+        if self.pending_activation.is_some() {
+            return Err(InstallationError::IdentityConflict);
+        }
         let active = self.active().ok_or_else(|| {
             InstallationError::IncompleteObservation(
                 "active Phase-B rebind requires an active generation".to_owned(),
@@ -6869,10 +6900,15 @@ impl ApprovedGenerationRegistry {
                     && existing.intent.prior_phase_b_receipt_digest
                         == intent.prior_phase_b_receipt_digest =>
             {
+                if existing.prepared.is_some() {
+                    return Err(InstallationError::IdentityConflict);
+                }
                 // A fresh Host owner may resume the same operation after a
-                // crash.  The old attempt remains source evidence in the
-                // committed fence; only its current-owner preparation/receipt
-                // is replaced, never adopted from destination bytes.
+                // crash only if no durable preparation exists. The old attempt
+                // remains source evidence in the committed fence; only its
+                // current-owner preparation/receipt is replaced, never adopted
+                // from destination bytes. An unresolved prepared must be
+                // completed or rolled back by its owner, never silently reset.
                 self.active_phase_b_rebind = Some(ActivePhaseBRebind {
                     intent: intent.clone(),
                     prepared: None,
@@ -7487,6 +7523,9 @@ impl ApprovedGenerationRegistry {
         }
         if let Some(terminal) = &self.last_terminal_activation {
             self.validate_terminal_activation(terminal)?;
+        }
+        if self.pending_activation.is_some() && self.active_phase_b_rebind.is_some() {
+            return Err(InstallationError::IdentityConflict);
         }
         if let Some(pending) = &self.pending_activation {
             pending.validate(self.active_generation.as_ref())?;
@@ -24071,6 +24110,152 @@ mod tests {
             substituted_process.validate_against_prior_binding(prior),
             Err(InstallationError::IdentityConflict)
         ));
+
+        let mut reused_owner = decoded.clone();
+        reused_owner.host_owner_epoch = prior.host_owner_epoch.clone();
+        reused_owner.request_digest = must(active_phase_b_rebind_intent_digest(&reused_owner));
+        assert!(matches!(
+            reused_owner.validate(),
+            Err(InstallationError::IdentityConflict)
+        ));
+
+        let mut reused_nonce = decoded.clone();
+        reused_nonce.host_process_nonce_digest = prior.host_process_nonce_digest.clone();
+        reused_nonce.request_digest = must(active_phase_b_rebind_intent_digest(&reused_nonce));
+        assert!(matches!(
+            reused_nonce.validate(),
+            Err(InstallationError::IdentityConflict)
+        ));
+
+        let mut reused_process = decoded.clone();
+        reused_process.host_process_identity = prior.host_process_identity.clone();
+        reused_process.request_digest = must(active_phase_b_rebind_intent_digest(&reused_process));
+        assert!(matches!(
+            reused_process.validate(),
+            Err(InstallationError::IdentityConflict)
+        ));
+
+        let mut stale_epoch = decoded;
+        stale_epoch.host_epoch_sequence = prior.host_epoch_sequence;
+        stale_epoch.request_digest = must(active_phase_b_rebind_intent_digest(&stale_epoch));
+        assert!(matches!(
+            stale_epoch.validate(),
+            Err(InstallationError::InvalidField { field, .. })
+                if field == "active_phase_b_rebind.host_epoch_sequence"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_phase_b_rebind_prepared_cannot_be_reset_by_same_operation_fresh_owner_production_path()
+     {
+        let transaction = fully_applied_system_registration_transaction();
+        let approval = test_transaction_activation_approval(
+            &transaction,
+            test_handle("approval:active-phase-b-rebind-reset"),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "eliot-active-phase-b-rebind-reset-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let registry =
+            RedbInstallationRegistry::from_database_for_test(must(Database::create(&path)));
+        let host = host_capability();
+        let transaction_store = SharedStore::default();
+        *transaction_store.state.lock().unwrap() = Some(transaction.clone());
+        must(registry.stage_pending_activation_from_transaction_store(
+            &transaction_store,
+            &transaction.transaction_id,
+            approval.clone(),
+            must(registry.load()).revision(),
+        ));
+        must(registry.commit_pending_activation(
+            &host,
+            must(registry.load()).revision(),
+            &approval,
+            &test_commit_fence(&transaction.candidate_manifest),
+        ));
+        let committed = must(registry.load());
+        let terminal = committed.last_terminal_activation.as_ref().unwrap();
+        let prior = terminal
+            .commit_fence
+            .as_ref()
+            .unwrap()
+            .phase_b_live_binding
+            .as_ref()
+            .unwrap();
+        let static_template = must(phase_b_static_template_for_candidate(
+            &transaction.candidate_manifest,
+        ));
+        let intent = must(ActivePhaseBRebindIntent::new(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("active-phase-b-rebind-reset"),
+            must(candidate_manifest_digest(&transaction.candidate_manifest)),
+            must(activation_terminal_digest(terminal)),
+            prior,
+            test_handle("host-owner:reset-1"),
+            test_handle("a".repeat(64)),
+            test_handle("b".repeat(64)),
+            test_handle("host-lineage:reset-1"),
+            2,
+            test_handle("activation-lineage:reset-1"),
+            2,
+            static_template.clone(),
+        ));
+        must(registry.record_active_phase_b_rebind_intent(
+            &host,
+            must(registry.load()).revision(),
+            &intent,
+        ));
+        let launch = transaction.candidate_manifest.runtime_launch.clone();
+        let prepared = HostPhaseBPreparedMaterialization {
+            wire: test_handle(HostPhaseBPreparedMaterialization::WIRE),
+            transaction_id: intent.transaction_id.clone(),
+            effect_id: intent.effect_id.clone(),
+            credential_effect_id: intent.effect_id.clone(),
+            manifest_digest: intent.manifest_digest.clone(),
+            request_digest: intent.request_digest.clone(),
+            credential_receipt_digest: intent.prior_phase_b_receipt_digest.clone(),
+            host_owner_epoch: intent.host_owner_epoch.clone(),
+            host_process_identity: intent.host_process_identity.clone(),
+            host_process_nonce_digest: intent.host_process_nonce_digest.clone(),
+            host_epoch_lineage: intent.host_epoch_lineage.clone(),
+            host_epoch_sequence: intent.host_epoch_sequence,
+            activation_generation_lineage: intent.activation_generation_lineage.clone(),
+            activation_generation_sequence: intent.activation_generation_sequence,
+            authority_descriptor_digest: launch.authority_descriptor_digest.clone(),
+            config_file_digest: transaction.candidate_manifest.config_digest.clone(),
+            store_bootstrap_descriptor_digest: launch.store_bootstrap_descriptor_digest.clone(),
+            eliotd_descriptor_digest: launch.eliotd_descriptor_digest.clone(),
+            semantic_config_hash: test_handle("c".repeat(64)),
+            launch,
+            prepared_digest: test_handle("pending"),
+        };
+        let mut prepared = prepared;
+        prepared.prepared_digest = must(prepared.computed_digest());
+        must(registry.record_active_phase_b_rebind_prepared(
+            &host,
+            must(registry.load()).revision(),
+            &prepared,
+        ));
+        let mut fresh_intent = intent.clone();
+        fresh_intent.host_owner_epoch = test_handle("host-owner:reset-2");
+        fresh_intent.host_process_identity = test_handle("b".repeat(64));
+        fresh_intent.host_process_nonce_digest = test_handle("c".repeat(64));
+        fresh_intent.host_epoch_lineage = test_handle("host-lineage:reset-2");
+        fresh_intent.request_digest = must(active_phase_b_rebind_intent_digest(&fresh_intent));
+        assert!(matches!(
+            registry.record_active_phase_b_rebind_intent(
+                &host,
+                must(registry.load()).revision(),
+                &fresh_intent
+            ),
+            Err(InstallationError::IdentityConflict)
+        ));
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(windows)]
@@ -24249,8 +24434,6 @@ mod tests {
             upgrade.clone(),
             test_handle("approval:after-active-rebind"),
         ));
-        // The one-slot rebind belongs only to the prior active terminal. It
-        // must not survive as authority for the newly staged generation.
         assert!(registry.active_phase_b_rebind().is_none());
         must(registry.validate());
         must(registry.commit_pending_activation(
@@ -24262,6 +24445,304 @@ mod tests {
         ));
         assert_eq!(registry.active_generation(), Some(&upgrade.generation));
         must(registry.validate());
+    }
+
+    #[test]
+    fn registry_rejects_pending_and_active_coexistence_via_validate_and_both_orders() {
+        let first = registering_transaction();
+        let host = host_capability();
+        let mut registry = ApprovedGenerationRegistry::new();
+        must(registry.stage_pending_activation(
+            first.transaction_id.clone(),
+            first.installer_plan_digest.clone(),
+            first.candidate_manifest.clone(),
+            test_handle("approval:coexist-pending"),
+        ));
+        must(registry.commit_pending_activation(
+            &host,
+            &first.transaction_id,
+            &first.installer_plan_digest,
+            &first.candidate_manifest.generation,
+            &test_commit_fence(&first.candidate_manifest),
+        ));
+        let committed = registry
+            .last_terminal_activation
+            .clone()
+            .unwrap_or_else(|| unreachable!());
+        let prior = committed
+            .commit_fence
+            .clone()
+            .and_then(|fence| fence.phase_b_live_binding.clone())
+            .unwrap_or_else(|| unreachable!());
+        let mut upgrade = first.candidate_manifest.clone();
+        upgrade.generation = test_handle("generation:coexist-pending-upgrade");
+        upgrade.runtime_launch.generation = upgrade.generation.clone();
+        upgrade.runtime_launch.descriptor_digest =
+            test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
+        must(upgrade.validate());
+        let prior_terminal_digest = must(activation_terminal_digest(&committed));
+        must(registry.stage_pending_activation(
+            test_handle("transaction:coexist-upgrade"),
+            test_handle("b".repeat(64)),
+            upgrade.clone(),
+            test_handle("approval:coexist-upgrade"),
+        ));
+        let mut pending_plus_active = registry.clone();
+        pending_plus_active.active_phase_b_rebind = Some(ActivePhaseBRebind {
+            intent: must(ActivePhaseBRebindIntent::new(
+                first.transaction_id.clone(),
+                first.installer_plan_digest.clone(),
+                test_handle("coexist-active"),
+                must(candidate_manifest_digest(&first.candidate_manifest)),
+                prior_terminal_digest,
+                &prior,
+                test_handle("host-owner:coexist"),
+                test_handle("b".repeat(64)),
+                test_handle("c".repeat(64)),
+                test_handle("host-lineage:coexist"),
+                2,
+                test_handle("activation-lineage:coexist"),
+                2,
+                must(phase_b_static_template_for_candidate(
+                    &first.candidate_manifest,
+                )),
+            )),
+            prepared: None,
+            receipt: None,
+        });
+        assert!(matches!(
+            pending_plus_active.validate(),
+            Err(InstallationError::IdentityConflict)
+        ));
+        let bytes = must(serde_json::to_vec(&pending_plus_active));
+        let decoded = decode_registry_bytes(&bytes);
+        assert!(
+            matches!(decoded, Err(InstallationError::CorruptRegistry { .. })),
+            "expected CorruptRegistry for decode, got {decoded:?}"
+        );
+        let _ = prior;
+    }
+
+    #[test]
+    fn registry_rejects_active_rebind_while_pending_is_active() {
+        let transaction = registering_transaction();
+        let host = host_capability();
+        let mut registry = ApprovedGenerationRegistry::new();
+        must(registry.stage_pending_activation(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            transaction.candidate_manifest.clone(),
+            test_handle("approval:pending-blocks-active"),
+        ));
+        must(registry.commit_pending_activation(
+            &host,
+            &transaction.transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest.generation,
+            &test_commit_fence(&transaction.candidate_manifest),
+        ));
+        let mut pending = registering_transaction();
+        pending.candidate_manifest.generation = test_handle("generation:pending-blocks-active");
+        pending.candidate_manifest.runtime_launch.generation =
+            pending.candidate_manifest.generation.clone();
+        pending.candidate_manifest.runtime_launch.descriptor_digest = test_handle(sha256_hex(
+            &must(pending.candidate_manifest.runtime_launch.unsigned_bytes()),
+        ));
+        must(pending.candidate_manifest.validate());
+        let mut pending_registry = registry.clone();
+        must(pending_registry.stage_pending_activation(
+            pending.transaction_id.clone(),
+            pending.installer_plan_digest.clone(),
+            pending.candidate_manifest.clone(),
+            test_handle("approval:pending-blocks-active-2"),
+        ));
+        let terminal = registry
+            .last_terminal_activation
+            .as_ref()
+            .unwrap_or_else(|| unreachable!());
+        let prior = terminal
+            .commit_fence
+            .as_ref()
+            .and_then(|fence| fence.phase_b_live_binding.as_ref())
+            .unwrap_or_else(|| unreachable!());
+        let intent = must(ActivePhaseBRebindIntent::new(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("pending-blocks-active-intent"),
+            must(candidate_manifest_digest(&transaction.candidate_manifest)),
+            must(activation_terminal_digest(terminal)),
+            prior,
+            test_handle("host-owner:pending-blocks"),
+            test_handle("d".repeat(64)),
+            test_handle("e".repeat(64)),
+            test_handle("host-lineage:pending-blocks"),
+            2,
+            test_handle("activation-lineage:pending-blocks"),
+            2,
+            must(phase_b_static_template_for_candidate(
+                &transaction.candidate_manifest,
+            )),
+        ));
+        assert!(matches!(
+            pending_registry.record_active_phase_b_rebind_intent_unchecked(&intent),
+            Err(InstallationError::IdentityConflict)
+        ));
+        must(pending_registry.validate());
+        assert!(pending_registry.active_phase_b_rebind().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_rejects_pending_while_active_rebind_is_active() {
+        let transaction = fully_applied_system_registration_transaction();
+        let approval = test_transaction_activation_approval(
+            &transaction,
+            test_handle("approval:active-blocks-pending"),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "eliot-pending-blocked-by-active-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let registry =
+            RedbInstallationRegistry::from_database_for_test(must(Database::create(&path)));
+        let host = host_capability();
+        let transaction_store = SharedStore::default();
+        *transaction_store.state.lock().unwrap() = Some(transaction.clone());
+        must(registry.stage_pending_activation_from_transaction_store(
+            &transaction_store,
+            &transaction.transaction_id,
+            approval.clone(),
+            must(registry.load()).revision(),
+        ));
+        must(registry.commit_pending_activation(
+            &host,
+            must(registry.load()).revision(),
+            &approval,
+            &test_commit_fence(&transaction.candidate_manifest),
+        ));
+        let committed = must(registry.load());
+        let terminal = committed.last_terminal_activation.as_ref().unwrap();
+        let prior = terminal
+            .commit_fence
+            .as_ref()
+            .unwrap()
+            .phase_b_live_binding
+            .as_ref()
+            .unwrap();
+        let intent = must(ActivePhaseBRebindIntent::new(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("active-blocks-pending"),
+            must(candidate_manifest_digest(&transaction.candidate_manifest)),
+            must(activation_terminal_digest(terminal)),
+            prior,
+            test_handle("host-owner:active-blocks"),
+            test_handle("a".repeat(64)),
+            test_handle("b".repeat(64)),
+            test_handle("host-lineage:active-blocks"),
+            2,
+            test_handle("activation-lineage:active-blocks"),
+            2,
+            must(phase_b_static_template_for_candidate(
+                &transaction.candidate_manifest,
+            )),
+        ));
+        must(registry.record_active_phase_b_rebind_intent(
+            &host,
+            must(registry.load()).revision(),
+            &intent,
+        ));
+        let mut upgrade = transaction.candidate_manifest.clone();
+        upgrade.generation = test_handle("generation:active-blocks-pending");
+        upgrade.runtime_launch.generation = upgrade.generation.clone();
+        upgrade.runtime_launch.descriptor_digest =
+            test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
+        must(upgrade.validate());
+        let upgrade_tx = test_handle("transaction:active-blocks-pending");
+        let upgrade_plan = test_handle("f".repeat(64));
+        let upgrade_approval = InstallationActivationApproval {
+            approval_ref: test_handle("approval:active-blocks-pending-2"),
+            transaction_id: upgrade_tx.clone(),
+            installer_plan_digest: upgrade_plan.clone(),
+            generation: upgrade.generation.clone(),
+            candidate_manifest_digest: must(candidate_manifest_digest(&upgrade)),
+            runtime_descriptor_digest: upgrade.runtime_launch.descriptor_digest.clone(),
+            required_owner: test_handle("owner:test"),
+            signature_ref: upgrade.signature_ref.clone(),
+            authority_descriptor_path: upgrade.runtime_launch.authority_descriptor_path.clone(),
+            authority_descriptor_digest: upgrade.runtime_launch.authority_descriptor_digest.clone(),
+            authority_generation: upgrade.runtime_launch.authority_generation,
+            authority_state_fence: upgrade.runtime_launch.authority_state_fence.clone(),
+        };
+        let mut direct = must(registry.load());
+        direct.revision = must(registry.load()).revision();
+        assert!(matches!(
+            direct.stage_pending_activation_unchecked(upgrade.clone(), upgrade_approval, &[]),
+            Err(InstallationError::IdentityConflict)
+        ));
+        must(direct.validate());
+        assert!(direct.pending_activation.is_none());
+        assert!(direct.active_phase_b_rebind.is_some());
+        let mut both = must(registry.load());
+        let pending_manifest = upgrade.clone();
+        let pending_approval = InstallationActivationApproval {
+            approval_ref: test_handle("approval:dummy-both"),
+            transaction_id: test_handle("transaction:dummy-both"),
+            installer_plan_digest: test_handle("b".repeat(64)),
+            generation: pending_manifest.generation.clone(),
+            candidate_manifest_digest: must(candidate_manifest_digest(&pending_manifest)),
+            runtime_descriptor_digest: pending_manifest.runtime_launch.descriptor_digest.clone(),
+            required_owner: test_handle("owner:test"),
+            signature_ref: pending_manifest.signature_ref.clone(),
+            authority_descriptor_path: pending_manifest
+                .runtime_launch
+                .authority_descriptor_path
+                .clone(),
+            authority_descriptor_digest: pending_manifest
+                .runtime_launch
+                .authority_descriptor_digest
+                .clone(),
+            authority_generation: pending_manifest.runtime_launch.authority_generation,
+            authority_state_fence: pending_manifest
+                .runtime_launch
+                .authority_state_fence
+                .clone(),
+        };
+        let pending_activation = PendingActivation {
+            transaction_id: pending_approval.transaction_id.clone(),
+            plan_digest: pending_approval.installer_plan_digest.clone(),
+            config_digest: pending_manifest.config_digest.clone(),
+            kernel_artifact_digest: pending_manifest.kernel_artifact_digest.clone(),
+            store_bridge_artifact_digest: pending_manifest.store_bridge_artifact_digest.clone(),
+            canonical_store_artifact_digest: pending_manifest
+                .canonical_store_artifact_digest
+                .clone(),
+            host_executable_path: pending_manifest.host_executable_path.clone(),
+            host_artifact_digest: pending_manifest.host_artifact_digest.clone(),
+            runtime_state_roots_digest: pending_manifest.runtime_state_roots_digest.clone(),
+            manifest: pending_manifest.clone(),
+            manifest_digest: must(candidate_manifest_digest(&pending_manifest)),
+            prior_active_generation: both.active_generation.clone(),
+            approval: pending_approval,
+            phase_b_intent: None,
+            phase_b_prepared: None,
+            phase_b_receipt: None,
+            state: PendingActivationState::Pending,
+        };
+        both.pending_activation = Some(pending_activation);
+        assert!(both.pending_activation.is_some() && both.active_phase_b_rebind.is_some());
+        assert!(matches!(
+            both.validate(),
+            Err(InstallationError::IdentityConflict)
+        ));
+        let bytes = must(serde_json::to_vec(&both));
+        assert!(matches!(
+            decode_registry_bytes(&bytes),
+            Err(InstallationError::CorruptRegistry { .. })
+        ));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
