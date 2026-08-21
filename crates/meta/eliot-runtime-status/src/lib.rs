@@ -4668,7 +4668,7 @@ mod store_currentness_production_tests {
     use std::time::{Duration, Instant};
 
     fn h(v: &str) -> PlatformHandle {
-        PlatformHandle::new(v).unwrap_or_else(|e| panic!("handle failed for {:?}: {:?}", v, e))
+        PlatformHandle::new(v).unwrap_or_else(|e| panic!("handle failed for {v:?}: {e:?}"))
     }
     fn dh(c: char) -> PlatformHandle {
         PlatformHandle::new(c.to_string().repeat(64)).expect("digest")
@@ -4814,11 +4814,11 @@ mod store_currentness_production_tests {
             store_bridge_artifact_digest: dh('1'),
             canonical_store_artifact_digest: dh('5'),
             host_artifact_digest: dh('h'),
-            kernel_executable_path: h(&format!("{}/kernel.exe", portable)),
-            store_bridge_executable_path: h(&format!("{}/store.exe", portable)),
-            canonical_store_executable_path: h(&format!("{}/surreal.exe", portable)),
-            host_executable_path: h(&format!("{}/host.exe", portable)),
-            config_path: h(&format!("{}/generation.json", portable)),
+            kernel_executable_path: h(&format!("{portable}/kernel.exe")),
+            store_bridge_executable_path: h(&format!("{portable}/store.exe")),
+            canonical_store_executable_path: h(&format!("{portable}/surreal.exe")),
+            host_executable_path: h(&format!("{portable}/host.exe")),
+            config_path: h(&format!("{portable}/generation.json")),
             dependency_closure_refs: vec![],
             license_refs: vec![],
             config_digest: dh('c'),
@@ -4840,34 +4840,34 @@ mod store_currentness_production_tests {
                     eliot_installation::AuthorityEpoch::genesis(),
                     eliot_installation::ResourceGeneration::genesis(),
                 ),
-                authority_descriptor_path: h(&format!("{}/authority.json", portable)),
+                authority_descriptor_path: h(&format!("{portable}/authority.json")),
                 authority_descriptor_digest: h(&"a".repeat(64)),
                 runtime_state_roots: roots.clone(),
                 kernel_work_root: roots.kernel_work_root.clone(),
                 kernel_artifact_digest: dh('k'),
-                eliotd_executable_path: h(&format!("{}/eliotd.exe", portable)),
+                eliotd_executable_path: h(&format!("{portable}/eliotd.exe")),
                 eliotd_artifact_digest: dh('e'),
-                eliotd_config_path: h(&format!("{}/eliotd.json", portable)),
+                eliotd_config_path: h(&format!("{portable}/eliotd.json")),
                 eliotd_config_digest: dh('e'),
-                eliotd_descriptor_path: h(&format!("{}/eliotd.json", portable)),
+                eliotd_descriptor_path: h(&format!("{portable}/eliotd.json")),
                 eliotd_descriptor_digest: dh('9'),
                 eliotd_launch_nonce: h("nonce-eliotd"),
-                store_config_path: h(&format!("{}/generation.json", portable)),
+                store_config_path: h(&format!("{portable}/generation.json")),
                 store_credential_target: h("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-                store_bridge_executable_path: h(&format!("{}/store.exe", portable)),
+                store_bridge_executable_path: h(&format!("{portable}/store.exe")),
                 store_bridge_artifact_digest: dh('c'),
-                store_bootstrap_descriptor_path: h(&format!("{}\\store-bootstrap.json", portable)),
+                store_bootstrap_descriptor_path: h(&format!("{portable}\\store-bootstrap.json")),
                 store_bootstrap_descriptor_digest: h(
                     "516396afbc26eeb03b4630518f428b30e48eb17ba2e2b8002612d10cba1a9faa",
                 ),
-                canonical_store_executable_path: h(&format!("{}/surreal.exe", portable)),
+                canonical_store_executable_path: h(&format!("{portable}/surreal.exe")),
                 canonical_store_artifact_digest: dh('u'),
                 kernel_arguments: vec![],
                 store_bridge_arguments: vec![],
                 canonical_store_arguments: vec![],
-                host_executable_path: h(&format!("{}/host.exe", portable)),
+                host_executable_path: h(&format!("{portable}/host.exe")),
                 host_artifact_digest: dh('h'),
-                watchdog_executable_path: h(&format!("{}/watchdog.exe", portable)),
+                watchdog_executable_path: h(&format!("{portable}/watchdog.exe")),
                 watchdog_artifact_digest: dh('w'),
                 descriptor_digest: dh('f'),
             },
@@ -5056,10 +5056,13 @@ mod live_production_observer_tests {
         PlatformHandle::new(c.to_string().repeat(64)).expect("digest")
     }
     fn current_ms() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .expect("current epoch milliseconds fit u64")
     }
     fn make_host() -> HostInstallationEpoch {
         HostInstallationEpoch {
@@ -5146,6 +5149,7 @@ mod live_production_observer_tests {
             disposition_evidence: vec![h("disp")],
         }
     }
+    #[allow(clippy::too_many_lines)]
     fn host_with_kernel_and_store() -> (HostState, eliot_installation::CandidateManifest, String) {
         let host_epoch = make_host();
         let fence = make_fence(&host_epoch);
@@ -5167,10 +5171,13 @@ mod live_production_observer_tests {
             authority_epoch: 1,
             store_fence: dh('a'),
             observed_at: {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
+                let now = u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis(),
+                )
+                .expect("current epoch milliseconds fit u64");
                 h(&format!("{now}"))
             },
             evidence_refs: vec![h("evidence")],
@@ -5315,11 +5322,11 @@ mod live_production_observer_tests {
                 store_bridge_artifact_digest: dh('c'),
                 canonical_store_artifact_digest: dh('5'),
                 host_artifact_digest: dh('h'),
-                kernel_executable_path: h(&format!("{}/kernel.exe", portable)),
-                store_bridge_executable_path: h(&format!("{}/store.exe", portable)),
-                canonical_store_executable_path: h(&format!("{}/surreal.exe", portable)),
-                host_executable_path: h(&format!("{}/host.exe", portable)),
-                config_path: h(&format!("{}/generation.json", portable)),
+                kernel_executable_path: h(&format!("{portable}/kernel.exe")),
+                store_bridge_executable_path: h(&format!("{portable}/store.exe")),
+                canonical_store_executable_path: h(&format!("{portable}/surreal.exe")),
+                host_executable_path: h(&format!("{portable}/host.exe")),
+                config_path: h(&format!("{portable}/generation.json")),
                 dependency_closure_refs: vec![],
                 license_refs: vec![],
                 config_digest: dh('c'),
@@ -5342,34 +5349,34 @@ mod live_production_observer_tests {
                         eliot_installation::AuthorityEpoch::genesis(),
                         eliot_installation::ResourceGeneration::genesis(),
                     ),
-                    authority_descriptor_path: h(&format!("{}/authority.json", portable)),
+                    authority_descriptor_path: h(&format!("{portable}/authority.json")),
                     authority_descriptor_digest: h(&"a".repeat(64)),
                     runtime_state_roots: roots.clone(),
                     kernel_work_root: roots.kernel_work_root.clone(),
                     kernel_artifact_digest: dh('k'),
-                    eliotd_executable_path: h(&format!("{}/eliotd.exe", portable)),
+                    eliotd_executable_path: h(&format!("{portable}/eliotd.exe")),
                     eliotd_artifact_digest: dh('e'),
-                    eliotd_config_path: h(&format!("{}/eliotd.json", portable)),
+                    eliotd_config_path: h(&format!("{portable}/eliotd.json")),
                     eliotd_config_digest: dh('e'),
-                    eliotd_descriptor_path: h(&format!("{}/eliotd.json", portable)),
+                    eliotd_descriptor_path: h(&format!("{portable}/eliotd.json")),
                     eliotd_descriptor_digest: dh('9'),
                     eliotd_launch_nonce: h("nonce-eliotd"),
-                    store_config_path: h(&format!("{}/generation.json", portable)),
+                    store_config_path: h(&format!("{portable}/generation.json")),
                     store_credential_target: h("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-                    store_bridge_executable_path: h(&format!("{}/store.exe", portable)),
+                    store_bridge_executable_path: h(&format!("{portable}/store.exe")),
                     store_bridge_artifact_digest: dh('c'),
                     store_bootstrap_descriptor_path: h("C:\\tmpmp\\portable\\store-bootstrap.json"),
                     store_bootstrap_descriptor_digest: h(
                         "516396afbc26eeb03b4630518f428b30e48eb17ba2e2b8002612d10cba1a9faa",
                     ),
-                    canonical_store_executable_path: h(&format!("{}/surreal.exe", portable)),
+                    canonical_store_executable_path: h(&format!("{portable}/surreal.exe")),
                     canonical_store_artifact_digest: dh('u'),
                     kernel_arguments: vec![],
                     store_bridge_arguments: vec![],
                     canonical_store_arguments: vec![h("--bind"), h("127.0.0.1:8000")],
-                    host_executable_path: h(&format!("{}/host.exe", portable)),
+                    host_executable_path: h(&format!("{portable}/host.exe")),
                     host_artifact_digest: dh('h'),
-                    watchdog_executable_path: h(&format!("{}/watchdog.exe", portable)),
+                    watchdog_executable_path: h(&format!("{portable}/watchdog.exe")),
                     watchdog_artifact_digest: dh('w'),
                     descriptor_digest: dh('f'),
                 },
@@ -5500,15 +5507,15 @@ mod live_production_observer_tests {
             observed_at_unix_ms: stale,
         };
         let observer = FakeKernelObserver { snap: Some(snap) };
-        let state = inspect_kernel_live(
+        let result = inspect_kernel_live(
             Some(&host),
             Some(&manifest),
             Some(&observer),
             None,
             Instant::now() + Duration::from_secs(2),
         );
-        assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(format!("{state:?}").to_ascii_lowercase().contains("stale"));
+        assert!(matches!(result, ComponentState::Unknown { .. }));
+        assert!(format!("{result:?}").to_ascii_lowercase().contains("stale"));
     }
     #[test]
     fn store_production_success_is_healthy() {
@@ -5579,14 +5586,14 @@ mod live_production_observer_tests {
             observed_at_unix_ms: stale,
         };
         let observer = FakeStoreObserver { snap: Some(snap) };
-        let state = inspect_store_live(
+        let result = inspect_store_live(
             Some(&host),
             Some(&manifest),
             Some(&observer),
             None,
             Instant::now() + Duration::from_secs(2),
         );
-        assert!(matches!(state, ComponentState::Unknown { .. }));
+        assert!(matches!(result, ComponentState::Unknown { .. }));
     }
     #[test]
     fn watchdog_success_is_healthy() {
@@ -5694,7 +5701,7 @@ mod live_production_observer_tests {
             }),
             gap: "matching".to_owned(),
         };
-        let state = inspect_watchdog_live(
+        let result = inspect_watchdog_live(
             Some(&host),
             Some(&manifest),
             &ors,
@@ -5703,10 +5710,19 @@ mod live_production_observer_tests {
             Some(&observer),
             Instant::now() + Duration::from_secs(2),
         );
-        assert!(matches!(state, ComponentState::Unknown { .. }));
+        assert!(matches!(result, ComponentState::Unknown { .. }));
     }
     #[test]
     fn eliotd_production_success_is_healthy() {
+        struct FakeObserver(EliotdLiveSnapshot);
+        impl EliotdLiveObserver for FakeObserver {
+            fn observe_eliotd_live(
+                &self,
+                _deadline: Instant,
+            ) -> Result<Option<EliotdLiveSnapshot>, String> {
+                Ok(Some(self.0.clone()))
+            }
+        }
         let (host, manifest, _) = host_with_kernel_and_store();
         let now = current_ms();
         let snap = EliotdLiveSnapshot {
@@ -5735,15 +5751,6 @@ mod live_production_observer_tests {
         );
         let mut snap = snap;
         snap.ready_binding_digest = binding;
-        struct FakeObserver(EliotdLiveSnapshot);
-        impl EliotdLiveObserver for FakeObserver {
-            fn observe_eliotd_live(
-                &self,
-                _deadline: Instant,
-            ) -> Result<Option<EliotdLiveSnapshot>, String> {
-                Ok(Some(self.0.clone()))
-            }
-        }
         let obs = FakeObserver(snap);
         let state = inspect_eliotd_live(
             Some(&host),
@@ -5755,6 +5762,15 @@ mod live_production_observer_tests {
     }
     #[test]
     fn eliotd_stale_fails_closed() {
+        struct FakeObserver(EliotdLiveSnapshot);
+        impl EliotdLiveObserver for FakeObserver {
+            fn observe_eliotd_live(
+                &self,
+                _deadline: Instant,
+            ) -> Result<Option<EliotdLiveSnapshot>, String> {
+                Ok(Some(self.0.clone()))
+            }
+        }
         let (host, manifest, _) = host_with_kernel_and_store();
         let stale = current_ms().saturating_sub(200_000);
         let mut snap = EliotdLiveSnapshot {
@@ -5781,23 +5797,14 @@ mod live_production_observer_tests {
             )
             .as_bytes(),
         );
-        struct FakeObserver(EliotdLiveSnapshot);
-        impl EliotdLiveObserver for FakeObserver {
-            fn observe_eliotd_live(
-                &self,
-                _deadline: Instant,
-            ) -> Result<Option<EliotdLiveSnapshot>, String> {
-                Ok(Some(self.0.clone()))
-            }
-        }
         let obs = FakeObserver(snap);
-        let state = inspect_eliotd_live(
+        let result = inspect_eliotd_live(
             Some(&host),
             Some(&manifest),
             Some(&obs),
             Instant::now() + Duration::from_secs(2),
         );
-        assert!(matches!(state, ComponentState::Unknown { .. }));
+        assert!(matches!(result, ComponentState::Unknown { .. }));
     }
     #[test]
     fn store_bootstrap_invalid_root_is_unknown() {
@@ -6013,6 +6020,15 @@ mod live_production_observer_tests {
     }
     #[test]
     fn eliotd_exact_substitution_is_unknown() {
+        struct FakeObserver(EliotdLiveSnapshot);
+        impl EliotdLiveObserver for FakeObserver {
+            fn observe_eliotd_live(
+                &self,
+                _d: Instant,
+            ) -> Result<Option<EliotdLiveSnapshot>, String> {
+                Ok(Some(self.0.clone()))
+            }
+        }
         let (host, mut manifest, _) = host_with_kernel_and_store();
         manifest.runtime_launch.eliotd_executable_path = h(r"C:/tmpmp/portable/eliotd.exe");
         let snap = EliotdLiveSnapshot {
@@ -6030,15 +6046,6 @@ mod live_production_observer_tests {
                 format!("ready:{}:{}:{}", 4242, 1_777_777_777_777_u64, current_ms()).as_bytes(),
             ),
         };
-        struct FakeObserver(EliotdLiveSnapshot);
-        impl EliotdLiveObserver for FakeObserver {
-            fn observe_eliotd_live(
-                &self,
-                _d: Instant,
-            ) -> Result<Option<EliotdLiveSnapshot>, String> {
-                Ok(Some(self.0.clone()))
-            }
-        }
         let obs = FakeObserver(snap);
         let state = inspect_eliotd_live(
             Some(&host),
@@ -6217,7 +6224,7 @@ mod cli_separate_process_tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let in_process = collect_status(&root, deadline).expect("in-process collect");
         let in_json = serde_json::to_value(&in_process).expect("serialize in-process");
-        let count_before = std::fs::read_dir(&root).map(|i| i.count()).unwrap_or(0);
+        let count_before = std::fs::read_dir(&root).map_or(0, std::iter::Iterator::count);
         let output = std::process::Command::new("cargo")
             .args([
                 "run",
@@ -6247,7 +6254,7 @@ mod cli_separate_process_tests {
         assert_eq!(cli_json["contract"], in_json["contract"]);
         assert_eq!(cli_json["host_state_root"], in_json["host_state_root"]);
         assert_eq!(cli_json["status"], in_json["status"]);
-        let count_after = std::fs::read_dir(&root).map(|i| i.count()).unwrap_or(0);
+        let count_after = std::fs::read_dir(&root).map_or(0, std::iter::Iterator::count);
         assert_eq!(count_before, count_after, "CLI must not write files");
         let _ = std::fs::remove_dir_all(&root);
         let _ = Path::new(&root.to_string_lossy().into_owned());
