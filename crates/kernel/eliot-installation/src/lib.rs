@@ -16131,9 +16131,9 @@ where
         self.inner.reconcile_active_verified(receipt, evidence)
     }
 
-    /// Drives the durable prefix up to, but not through, the first-install
-    /// Host bootstrap start.  The caller must project the exact pending
-    /// registry record before resuming the coordinator; no SCM start is
+    /// Drives the durable prefix up to, but not through, the first ordered SCM
+    /// service start.  Both Watchdog and Host starts must remain pending while
+    /// the caller projects the exact signed activation record; no SCM start is
     /// attempted by this prefix method.
     pub fn drive_until_host_bootstrap(
         &mut self,
@@ -16171,10 +16171,7 @@ where
             };
             if matches!(
                 current.installer_effects[index],
-                InstallerEffectPlan::StartService {
-                    role: InstallerServiceRole::Host,
-                    ..
-                }
+                InstallerEffectPlan::StartService { .. }
             ) {
                 return Ok(InstallationStepOutcome::Applied {
                     stage: current.stage,
@@ -18196,6 +18193,50 @@ mod tests {
         let registering = registering_system_service_start_transaction();
         assert_eq!(registering.stage(), InstallationStage::Registering);
         must(registering.require_pre_activation_effects_ready());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn first_install_prefix_stops_before_watchdog_and_host_service_starts() {
+        let transaction = registering_system_service_start_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(transaction))),
+            ..SharedStore::default()
+        };
+        let mut coordinator = WindowsInstallationCoordinator::new(store.clone());
+
+        assert!(matches!(
+            must(coordinator.drive_until_host_bootstrap(&transaction_id)),
+            InstallationStepOutcome::Applied {
+                stage: InstallationStage::Registering,
+                ..
+            }
+        ));
+
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        let pending_start_roles = saved
+            .installer_effects
+            .iter()
+            .zip(saved.effect_progress())
+            .filter_map(|(effect, progress)| {
+                if let InstallerEffectPlan::StartService { role, .. } = effect {
+                    assert!(matches!(
+                        progress.state,
+                        InstallationEffectProgressState::Pending
+                    ));
+                    Some(*role)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending_start_roles,
+            vec![InstallerServiceRole::Watchdog, InstallerServiceRole::Host]
+        );
+        assert_eq!(saved.stage(), InstallationStage::Registering);
+        must(saved.require_pre_activation_effects_ready());
     }
 
     #[cfg(windows)]
