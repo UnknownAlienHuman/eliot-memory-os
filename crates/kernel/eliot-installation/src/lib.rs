@@ -109,12 +109,10 @@ pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersi
 
 /// Current durable approved-generation registry wire revision.
 ///
-/// Registry wire version 8 adds the Host-owned, secret-free Phase-B receipt
-/// to the pending activation projection and stores only a digest of the Host
-/// process nonce in the terminal binding. Older projections are never
-/// defaulted into the current activation authority; they require explicit
-/// re-stage.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(9, 0, 0);
+/// Registry wire version 10 adds the Host-owned `ActiveVerified` Phase-B rebind
+/// lifecycle. Older projections are never defaulted into the current
+/// activation authority; they require explicit re-stage.
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(10, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -3665,6 +3663,538 @@ impl PhaseBLiveBinding {
     }
 }
 
+/// Durable intent for rebinding a committed Phase-B contour to a fresh Host
+/// owner epoch after a Host restart.
+///
+/// The prior binding is retained as source evidence only.  The current owner
+/// and Host epoch fields are the authority for the new publication attempt;
+/// destination bytes never participate in constructing this record.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivePhaseBRebindIntent {
+    /// Explicit active-rebind operation wire.
+    pub wire: PlatformHandle,
+    /// Sole installation transaction identity.
+    pub transaction_id: PlatformHandle,
+    /// Immutable installer plan digest.
+    pub plan_digest: PlatformHandle,
+    /// Stable operation identity reused across unknown/restart outcomes.
+    pub effect_id: PlatformHandle,
+    /// Exact approved candidate manifest digest.
+    pub manifest_digest: PlatformHandle,
+    /// Terminal registry digest for the prior committed activation.
+    pub prior_terminal_digest: PlatformHandle,
+    /// Prior committed Phase-B public receipt digest, retained as evidence.
+    pub prior_phase_b_receipt_digest: PlatformHandle,
+    /// Prior Host epoch lineage, retained as evidence only.
+    pub prior_host_epoch_lineage: PlatformHandle,
+    /// Prior Host epoch sequence, retained as evidence only.
+    pub prior_host_epoch_sequence: u64,
+    /// Prior Host process nonce digest, retained as evidence only.
+    pub prior_host_process_nonce_digest: PlatformHandle,
+    /// Prior Host owner epoch digest, retained as evidence only.
+    pub prior_host_owner_epoch: PlatformHandle,
+    /// Prior Host process identity digest, retained as evidence only.
+    pub prior_host_process_identity: PlatformHandle,
+    /// Current Host owner epoch capability digest.
+    pub host_owner_epoch: PlatformHandle,
+    /// Current Host process identity digest.
+    pub host_process_identity: PlatformHandle,
+    /// Digest of the current Host process nonce.
+    pub host_process_nonce_digest: PlatformHandle,
+    /// Current Host epoch lineage.
+    pub host_epoch_lineage: PlatformHandle,
+    /// Current Host epoch sequence.
+    pub host_epoch_sequence: u64,
+    /// Activation generation lineage for the new live overlay.
+    pub activation_generation_lineage: PlatformHandle,
+    /// Activation generation sequence for the new live overlay.
+    pub activation_generation_sequence: u64,
+    /// Immutable Phase-B authority constraint.
+    pub static_template: HostPhaseBStaticTemplate,
+    /// Digest of the immutable Phase-B authority constraint.
+    pub static_template_digest: PlatformHandle,
+    /// Digest of all intent fields except this digest.
+    pub request_digest: PlatformHandle,
+}
+
+impl ActivePhaseBRebindIntent {
+    /// Current active-rebind wire discriminator.
+    pub const WIRE: &'static str = "eliot.host.phase-b-rebind.v1";
+
+    /// Constructs and validates one current-Host rebind intent from the prior
+    /// committed Phase-B binding and the fresh Host owner/epoch evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        transaction_id: PlatformHandle,
+        plan_digest: PlatformHandle,
+        effect_id: PlatformHandle,
+        manifest_digest: PlatformHandle,
+        prior_terminal_digest: PlatformHandle,
+        prior_binding: &PhaseBLiveBinding,
+        host_owner_epoch: PlatformHandle,
+        host_process_identity: PlatformHandle,
+        host_process_nonce_digest: PlatformHandle,
+        host_epoch_lineage: PlatformHandle,
+        host_epoch_sequence: u64,
+        activation_generation_lineage: PlatformHandle,
+        activation_generation_sequence: u64,
+        static_template: HostPhaseBStaticTemplate,
+    ) -> Result<Self, InstallationError> {
+        let static_template_digest = static_template.digest()?;
+        let mut value = Self {
+            wire: PlatformHandle::new(Self::WIRE).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "active_phase_b_rebind.wire".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            transaction_id,
+            plan_digest,
+            effect_id,
+            manifest_digest,
+            prior_terminal_digest,
+            prior_phase_b_receipt_digest: prior_binding.public_receipt_digest.clone(),
+            prior_host_epoch_lineage: prior_binding.host_epoch_lineage.clone(),
+            prior_host_epoch_sequence: prior_binding.host_epoch_sequence,
+            prior_host_process_nonce_digest: prior_binding.host_process_nonce_digest.clone(),
+            prior_host_owner_epoch: prior_binding.host_owner_epoch.clone(),
+            prior_host_process_identity: prior_binding.host_process_identity.clone(),
+            host_owner_epoch,
+            host_process_identity,
+            host_process_nonce_digest,
+            host_epoch_lineage,
+            host_epoch_sequence,
+            activation_generation_lineage,
+            activation_generation_sequence,
+            static_template,
+            static_template_digest,
+            request_digest: PlatformHandle::new("pending").map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "active_phase_b_rebind.request_digest".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+        };
+        value.request_digest = active_phase_b_rebind_intent_digest(&value)?;
+        value.validate()?;
+        value.validate_against_prior_binding(prior_binding)?;
+        Ok(value)
+    }
+
+    /// Validates the intent's digest and current/prior owner identity domains.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.wire.as_str() != Self::WIRE {
+            return Err(InstallationError::InvalidField {
+                field: "active_phase_b_rebind.wire".to_owned(),
+                reason: "unsupported active Phase-B rebind wire".to_owned(),
+            });
+        }
+        for (value, field) in [
+            (&self.transaction_id, "active_phase_b_rebind.transaction_id"),
+            (&self.effect_id, "active_phase_b_rebind.effect_id"),
+            (
+                &self.prior_host_epoch_lineage,
+                "active_phase_b_rebind.prior_host_epoch_lineage",
+            ),
+            (
+                &self.prior_host_owner_epoch,
+                "active_phase_b_rebind.prior_host_owner_epoch",
+            ),
+            (
+                &self.prior_host_process_identity,
+                "active_phase_b_rebind.prior_host_process_identity",
+            ),
+            (
+                &self.host_owner_epoch,
+                "active_phase_b_rebind.host_owner_epoch",
+            ),
+            (
+                &self.host_epoch_lineage,
+                "active_phase_b_rebind.host_epoch_lineage",
+            ),
+            (
+                &self.activation_generation_lineage,
+                "active_phase_b_rebind.activation_generation_lineage",
+            ),
+        ] {
+            handle(value, field)?;
+        }
+        for (value, field) in [
+            (&self.plan_digest, "active_phase_b_rebind.plan_digest"),
+            (
+                &self.manifest_digest,
+                "active_phase_b_rebind.manifest_digest",
+            ),
+            (
+                &self.prior_terminal_digest,
+                "active_phase_b_rebind.prior_terminal_digest",
+            ),
+            (
+                &self.prior_phase_b_receipt_digest,
+                "active_phase_b_rebind.prior_phase_b_receipt_digest",
+            ),
+            (
+                &self.prior_host_process_nonce_digest,
+                "active_phase_b_rebind.prior_host_process_nonce_digest",
+            ),
+            (
+                &self.host_process_identity,
+                "active_phase_b_rebind.host_process_identity",
+            ),
+            (
+                &self.host_process_nonce_digest,
+                "active_phase_b_rebind.host_process_nonce_digest",
+            ),
+            (
+                &self.static_template_digest,
+                "active_phase_b_rebind.static_template_digest",
+            ),
+            (&self.request_digest, "active_phase_b_rebind.request_digest"),
+        ] {
+            sha256_handle(value, field)?;
+        }
+        if self.prior_host_epoch_sequence == 0
+            || self.host_epoch_sequence == 0
+            || self.activation_generation_sequence == 0
+        {
+            return Err(InstallationError::InvalidField {
+                field: "active_phase_b_rebind.epoch_sequence".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        self.static_template.validate()?;
+        if self.static_template_digest != self.static_template.digest()? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.request_digest != active_phase_b_rebind_intent_digest(self)? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Verifies that prior Host/Phase-B fields match the committed source
+    /// binding.  In particular, substituting an old nonce or process identity
+    /// is rejected before any destination mutation.
+    pub fn validate_against_prior_binding(
+        &self,
+        prior: &PhaseBLiveBinding,
+    ) -> Result<(), InstallationError> {
+        if self.manifest_digest != prior.manifest_digest
+            || self.prior_phase_b_receipt_digest != prior.public_receipt_digest
+            || self.prior_host_epoch_lineage != prior.host_epoch_lineage
+            || self.prior_host_epoch_sequence != prior.host_epoch_sequence
+            || self.prior_host_process_nonce_digest != prior.host_process_nonce_digest
+            || self.prior_host_owner_epoch != prior.host_owner_epoch
+            || self.prior_host_process_identity != prior.host_process_identity
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+fn active_phase_b_rebind_intent_digest(
+    value: &ActivePhaseBRebindIntent,
+) -> Result<PlatformHandle, InstallationError> {
+    let bytes = serde_json::to_vec(&(
+        (
+            value.wire.as_str(),
+            value.transaction_id.as_str(),
+            value.plan_digest.as_str(),
+            value.effect_id.as_str(),
+            value.manifest_digest.as_str(),
+            value.prior_terminal_digest.as_str(),
+            value.prior_phase_b_receipt_digest.as_str(),
+        ),
+        (
+            value.prior_host_epoch_lineage.as_str(),
+            value.prior_host_epoch_sequence,
+            value.prior_host_process_nonce_digest.as_str(),
+            value.prior_host_owner_epoch.as_str(),
+            value.prior_host_process_identity.as_str(),
+            value.host_owner_epoch.as_str(),
+            value.host_process_identity.as_str(),
+        ),
+        (
+            value.host_process_nonce_digest.as_str(),
+            value.host_epoch_lineage.as_str(),
+            value.host_epoch_sequence,
+            value.activation_generation_lineage.as_str(),
+            value.activation_generation_sequence,
+            &value.static_template,
+            value.static_template_digest.as_str(),
+        ),
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "active_phase_b_rebind.request_digest".to_owned(),
+        reason: error.to_string(),
+    })?;
+    PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+        field: "active_phase_b_rebind.request_digest".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+/// Exact receipt written after all four Phase-B destinations are republished
+/// under the current Host epoch and read back through no-follow leases.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivePhaseBRebindReceipt {
+    /// Explicit receipt wire discriminator.
+    pub wire: PlatformHandle,
+    /// Sole installation transaction identity.
+    pub transaction_id: PlatformHandle,
+    /// Stable rebind operation identity.
+    pub effect_id: PlatformHandle,
+    /// Exact approved candidate manifest digest.
+    pub manifest_digest: PlatformHandle,
+    /// Exact intent digest that authorized publication.
+    pub request_digest: PlatformHandle,
+    /// Current Host owner epoch digest.
+    pub host_owner_epoch: PlatformHandle,
+    /// Current Host process identity digest.
+    pub host_process_identity: PlatformHandle,
+    /// Current Host process nonce digest.
+    pub host_process_nonce_digest: PlatformHandle,
+    /// Current Host epoch lineage.
+    pub host_epoch_lineage: PlatformHandle,
+    /// Current Host epoch sequence.
+    pub host_epoch_sequence: u64,
+    /// Exact authority descriptor readback digest.
+    pub authority_descriptor_digest: PlatformHandle,
+    /// Exact Store config readback digest.
+    pub config_file_digest: PlatformHandle,
+    /// Exact Store bootstrap readback digest.
+    pub store_bootstrap_descriptor_digest: PlatformHandle,
+    /// Exact eliotd descriptor readback digest.
+    pub eliotd_descriptor_digest: PlatformHandle,
+    /// Digest of all receipt fields except this digest.
+    pub receipt_digest: PlatformHandle,
+}
+
+impl ActivePhaseBRebindReceipt {
+    /// Current active-rebind receipt wire discriminator.
+    pub const WIRE: &'static str = "eliot.host.phase-b-rebind-receipt.v1";
+
+    /// Constructs an exact receipt from the durable prepared materialization.
+    pub fn from_prepared(
+        intent: &ActivePhaseBRebindIntent,
+        prepared: &HostPhaseBPreparedMaterialization,
+    ) -> Result<Self, InstallationError> {
+        let mut value = Self {
+            wire: PlatformHandle::new(Self::WIRE).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "active_phase_b_rebind.receipt.wire".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            transaction_id: prepared.transaction_id.clone(),
+            effect_id: prepared.effect_id.clone(),
+            manifest_digest: prepared.manifest_digest.clone(),
+            request_digest: prepared.request_digest.clone(),
+            host_owner_epoch: prepared.host_owner_epoch.clone(),
+            host_process_identity: prepared.host_process_identity.clone(),
+            host_process_nonce_digest: prepared.host_process_nonce_digest.clone(),
+            host_epoch_lineage: prepared.host_epoch_lineage.clone(),
+            host_epoch_sequence: prepared.host_epoch_sequence,
+            authority_descriptor_digest: prepared.authority_descriptor_digest.clone(),
+            config_file_digest: prepared.config_file_digest.clone(),
+            store_bootstrap_descriptor_digest: prepared.store_bootstrap_descriptor_digest.clone(),
+            eliotd_descriptor_digest: prepared.eliotd_descriptor_digest.clone(),
+            receipt_digest: PlatformHandle::new("pending").map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "active_phase_b_rebind.receipt.receipt_digest".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+        };
+        value.receipt_digest = active_phase_b_rebind_receipt_digest(&value)?;
+        value.validate_against(intent, prepared)?;
+        Ok(value)
+    }
+
+    /// Validates the exact receipt digest and its prepared/current owner bind.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.wire.as_str() != Self::WIRE {
+            return Err(InstallationError::InvalidField {
+                field: "active_phase_b_rebind.receipt.wire".to_owned(),
+                reason: "unsupported active Phase-B rebind receipt wire".to_owned(),
+            });
+        }
+        for (value, field) in [
+            (
+                &self.transaction_id,
+                "active_phase_b_rebind.receipt.transaction_id",
+            ),
+            (&self.effect_id, "active_phase_b_rebind.receipt.effect_id"),
+            (
+                &self.host_owner_epoch,
+                "active_phase_b_rebind.receipt.host_owner_epoch",
+            ),
+            (
+                &self.host_epoch_lineage,
+                "active_phase_b_rebind.receipt.host_epoch_lineage",
+            ),
+        ] {
+            handle(value, field)?;
+        }
+        for (value, field) in [
+            (
+                &self.manifest_digest,
+                "active_phase_b_rebind.receipt.manifest_digest",
+            ),
+            (
+                &self.request_digest,
+                "active_phase_b_rebind.receipt.request_digest",
+            ),
+            (
+                &self.host_process_identity,
+                "active_phase_b_rebind.receipt.host_process_identity",
+            ),
+            (
+                &self.host_process_nonce_digest,
+                "active_phase_b_rebind.receipt.host_process_nonce_digest",
+            ),
+            (
+                &self.authority_descriptor_digest,
+                "active_phase_b_rebind.receipt.authority_descriptor_digest",
+            ),
+            (
+                &self.config_file_digest,
+                "active_phase_b_rebind.receipt.config_file_digest",
+            ),
+            (
+                &self.store_bootstrap_descriptor_digest,
+                "active_phase_b_rebind.receipt.store_bootstrap_descriptor_digest",
+            ),
+            (
+                &self.eliotd_descriptor_digest,
+                "active_phase_b_rebind.receipt.eliotd_descriptor_digest",
+            ),
+            (
+                &self.receipt_digest,
+                "active_phase_b_rebind.receipt.receipt_digest",
+            ),
+        ] {
+            sha256_handle(value, field)?;
+        }
+        if self.host_epoch_sequence == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "active_phase_b_rebind.receipt.host_epoch_sequence".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        if self.receipt_digest != active_phase_b_rebind_receipt_digest(self)? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Validates the receipt against the exact intent and durable preparation.
+    pub fn validate_against(
+        &self,
+        intent: &ActivePhaseBRebindIntent,
+        prepared: &HostPhaseBPreparedMaterialization,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        prepared.validate()?;
+        if intent.validate().is_err()
+            || self.transaction_id != intent.transaction_id
+            || self.effect_id != intent.effect_id
+            || self.manifest_digest != intent.manifest_digest
+            || self.request_digest != intent.request_digest
+            || self.host_owner_epoch != intent.host_owner_epoch
+            || self.host_process_identity != intent.host_process_identity
+            || self.host_process_nonce_digest != intent.host_process_nonce_digest
+            || self.host_epoch_lineage != intent.host_epoch_lineage
+            || self.host_epoch_sequence != intent.host_epoch_sequence
+            || self.authority_descriptor_digest != prepared.authority_descriptor_digest
+            || self.config_file_digest != prepared.config_file_digest
+            || self.store_bootstrap_descriptor_digest != prepared.store_bootstrap_descriptor_digest
+            || self.eliotd_descriptor_digest != prepared.eliotd_descriptor_digest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+fn active_phase_b_rebind_receipt_digest(
+    value: &ActivePhaseBRebindReceipt,
+) -> Result<PlatformHandle, InstallationError> {
+    let bytes = serde_json::to_vec(&(
+        value.wire.as_str(),
+        value.transaction_id.as_str(),
+        value.effect_id.as_str(),
+        value.manifest_digest.as_str(),
+        value.request_digest.as_str(),
+        value.host_owner_epoch.as_str(),
+        value.host_process_identity.as_str(),
+        value.host_process_nonce_digest.as_str(),
+        value.host_epoch_lineage.as_str(),
+        value.host_epoch_sequence,
+        value.authority_descriptor_digest.as_str(),
+        value.config_file_digest.as_str(),
+        value.store_bootstrap_descriptor_digest.as_str(),
+        value.eliotd_descriptor_digest.as_str(),
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "active_phase_b_rebind.receipt.receipt_digest".to_owned(),
+        reason: error.to_string(),
+    })?;
+    PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+        field: "active_phase_b_rebind.receipt.receipt_digest".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+/// Registry-owned Active Phase-B rebind lifecycle.  The intent remains
+/// present across every state; prepared and receipt are added only after their
+/// exact preceding boundary has committed.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivePhaseBRebind {
+    /// Durable intent committed before destination mutation.
+    pub intent: ActivePhaseBRebindIntent,
+    /// Durable preparation committed before destination mutation.
+    pub prepared: Option<HostPhaseBPreparedMaterialization>,
+    /// Exact no-follow destination readback receipt.
+    pub receipt: Option<ActivePhaseBRebindReceipt>,
+}
+
+impl ActivePhaseBRebind {
+    /// Validates the complete lifecycle and all cross-record bindings.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        self.intent.validate()?;
+        if let Some(prepared) = self.prepared.as_ref() {
+            prepared.validate()?;
+            if prepared.transaction_id != self.intent.transaction_id
+                || prepared.effect_id != self.intent.effect_id
+                || prepared.manifest_digest != self.intent.manifest_digest
+                || prepared.request_digest != self.intent.request_digest
+                || prepared.host_owner_epoch != self.intent.host_owner_epoch
+                || prepared.host_process_identity != self.intent.host_process_identity
+                || prepared.host_process_nonce_digest != self.intent.host_process_nonce_digest
+                || prepared.host_epoch_lineage != self.intent.host_epoch_lineage
+                || prepared.host_epoch_sequence != self.intent.host_epoch_sequence
+                || prepared.credential_receipt_digest != self.intent.prior_phase_b_receipt_digest
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        if let Some(receipt) = self.receipt.as_ref() {
+            let prepared = self.prepared.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "active Phase-B rebind receipt has no prepared record".to_owned(),
+                )
+            })?;
+            receipt.validate_against(&self.intent, prepared)?;
+        }
+        Ok(())
+    }
+}
+
 /// Typed readiness fence that Host must present at the pending-to-active CAS.
 ///
 /// The fence is an observation binding, not a claim that process liveness is
@@ -4063,6 +4593,10 @@ pub struct ApprovedGenerationRegistry {
     /// pending activation.  A new stage supersedes this single terminal
     /// receipt.
     last_terminal_activation: Option<PendingActivationTerminal>,
+    /// Host-owned `ActiveVerified` Phase-B rebind lifecycle.  This optional
+    /// member is mandatory on the current v10 wire; explicit `null` means no
+    /// rebind has ever been attempted.
+    active_phase_b_rebind: Option<ActivePhaseBRebind>,
 }
 
 impl Default for ApprovedGenerationRegistry {
@@ -4287,7 +4821,7 @@ impl PendingActivationTerminalWire {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RegistryWireV9 {
+struct RegistryWireV10 {
     registry_wire_version: ContractVersion,
     revision: u64,
     generations: Vec<ApprovedGenerationWire>,
@@ -4296,6 +4830,7 @@ struct RegistryWireV9 {
     last_known_good_generation: RequiredOption<PlatformHandle>,
     pending_activation: RequiredOption<PendingActivationWire>,
     last_terminal_activation: RequiredOption<PendingActivationTerminalWire>,
+    active_phase_b_rebind: RequiredOption<ActivePhaseBRebind>,
 }
 
 /// An optional wire member whose presence is mandatory.  Explicit `null` is
@@ -4315,7 +4850,7 @@ where
     }
 }
 
-impl RegistryWireV9 {
+impl RegistryWireV10 {
     fn into_registry(self) -> ApprovedGenerationRegistry {
         ApprovedGenerationRegistry {
             registry_wire_version: self.registry_wire_version,
@@ -4336,6 +4871,7 @@ impl RegistryWireV9 {
                 .last_terminal_activation
                 .0
                 .map(PendingActivationTerminalWire::into_terminal),
+            active_phase_b_rebind: self.active_phase_b_rebind.0,
         }
     }
 }
@@ -4820,6 +5356,7 @@ fn current_registry_wire_missing_field(value: &serde_json::Value) -> bool {
         "last_known_good_generation",
         "pending_activation",
         "last_terminal_activation",
+        "active_phase_b_rebind",
     ]
     .iter()
     .any(|field| !object.contains_key(*field))
@@ -4844,12 +5381,12 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
         && current_registry_wire_missing_field(&value)
     {
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v9 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v10 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
 
-    if let Ok(wire) = serde_json::from_value::<RegistryWireV9>(value.clone()) {
+    if let Ok(wire) = serde_json::from_value::<RegistryWireV10>(value.clone()) {
         if wire.registry_wire_version != INSTALLATION_REGISTRY_WIRE_VERSION {
             return Err(InstallationError::MigrationRequired {
                 reason: format!(
@@ -4882,7 +5419,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             });
         }
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v9 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v10 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
@@ -4898,6 +5435,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
                         | "service_registration_approvals"
                         | "pending_activation"
                         | "last_terminal_activation"
+                        | "active_phase_b_rebind"
                         | "registry_wire_version"
                         | "revision"
                 )
@@ -5641,6 +6179,60 @@ impl RedbInstallationRegistry {
         })
     }
 
+    /// Atomically records the Host-owned `ActiveVerified` rebind intent before
+    /// any authority/config/bootstrap/eliotd destination mutation.
+    pub fn record_active_phase_b_rebind_intent(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        intent: &ActivePhaseBRebindIntent,
+    ) -> Result<ActivePhaseBRebindIntent, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        intent.validate()?;
+        let intent = intent.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            registry.record_active_phase_b_rebind_intent_unchecked(&intent)
+        })
+    }
+
+    /// Atomically records `ActiveVerified` rebind preparation before the first
+    /// destination write.
+    pub fn record_active_phase_b_rebind_prepared(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        prepared: &HostPhaseBPreparedMaterialization,
+    ) -> Result<HostPhaseBPreparedMaterialization, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        prepared.validate()?;
+        let prepared = prepared.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            registry.record_active_phase_b_rebind_prepared_unchecked(&prepared)
+        })
+    }
+
+    /// Atomically records the exact no-follow readback receipt for the current
+    /// Host owner and epoch.
+    pub fn record_active_phase_b_rebind_receipt(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        receipt: &ActivePhaseBRebindReceipt,
+    ) -> Result<ActivePhaseBRebindReceipt, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        receipt.validate()?;
+        let receipt = receipt.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            registry.record_active_phase_b_rebind_receipt_unchecked(&receipt)
+        })
+    }
+
     /// Atomically records a Host recovery disposition for one exact approval.
     pub fn mark_pending_recovery(
         &self,
@@ -5898,6 +6490,7 @@ impl ApprovedGenerationRegistry {
             last_known_good_generation: None,
             pending_activation: None,
             last_terminal_activation: None,
+            active_phase_b_rebind: None,
         }
     }
 
@@ -6076,6 +6669,13 @@ impl ApprovedGenerationRegistry {
         self.pending_activation.as_ref()
     }
 
+    /// Returns the durable `ActiveVerified` Phase-B rebind lifecycle, if one has
+    /// been started by the Host owner.
+    #[must_use]
+    pub fn active_phase_b_rebind(&self) -> Option<&ActivePhaseBRebind> {
+        self.active_phase_b_rebind.as_ref()
+    }
+
     fn record_pending_phase_b_receipt_unchecked(
         &mut self,
         receipt: &HostPhaseBMaterializationReceipt,
@@ -6200,6 +6800,158 @@ impl ApprovedGenerationRegistry {
         pending.phase_b_intent = None;
         self.validate()?;
         Ok(())
+    }
+
+    fn record_active_phase_b_rebind_intent_unchecked(
+        &mut self,
+        intent: &ActivePhaseBRebindIntent,
+    ) -> Result<ActivePhaseBRebindIntent, InstallationError> {
+        self.validate()?;
+        let active = self.active().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B rebind requires an active generation".to_owned(),
+            )
+        })?;
+        let terminal = self
+            .last_terminal_activation
+            .as_ref()
+            .filter(|terminal| {
+                terminal.disposition == PendingActivationTerminalDisposition::Committed
+            })
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "active Phase-B rebind requires a committed activation terminal".to_owned(),
+                )
+            })?;
+        let fence = terminal.commit_fence.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B rebind requires the committed activation fence".to_owned(),
+            )
+        })?;
+        let prior_binding = fence.phase_b_live_binding.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B rebind requires the committed Phase-B binding".to_owned(),
+            )
+        })?;
+        if terminal.transaction_id != intent.transaction_id
+            || terminal.plan_digest != intent.plan_digest
+            || terminal.generation != active.manifest.generation
+            || intent.manifest_digest != candidate_manifest_digest(&active.manifest)?
+            || intent.prior_terminal_digest != activation_terminal_digest(terminal)?
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        intent.validate_against_prior_binding(prior_binding)?;
+        match self.active_phase_b_rebind.as_ref() {
+            None => {
+                self.active_phase_b_rebind = Some(ActivePhaseBRebind {
+                    intent: intent.clone(),
+                    prepared: None,
+                    receipt: None,
+                });
+            }
+            Some(existing) if existing.intent == *intent => {}
+            Some(existing)
+                if existing.intent.transaction_id == intent.transaction_id
+                    && existing.intent.plan_digest == intent.plan_digest
+                    && existing.intent.effect_id == intent.effect_id
+                    && existing.intent.manifest_digest == intent.manifest_digest
+                    && existing.intent.prior_terminal_digest == intent.prior_terminal_digest
+                    && existing.intent.prior_phase_b_receipt_digest
+                        == intent.prior_phase_b_receipt_digest =>
+            {
+                // A fresh Host owner may resume the same operation after a
+                // crash.  The old attempt remains source evidence in the
+                // committed fence; only its current-owner preparation/receipt
+                // is replaced, never adopted from destination bytes.
+                self.active_phase_b_rebind = Some(ActivePhaseBRebind {
+                    intent: intent.clone(),
+                    prepared: None,
+                    receipt: None,
+                });
+            }
+            Some(_) => return Err(InstallationError::IdentityConflict),
+        }
+        let recorded = self
+            .active_phase_b_rebind
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?
+            .intent
+            .clone();
+        self.validate()?;
+        Ok(recorded)
+    }
+
+    fn record_active_phase_b_rebind_prepared_unchecked(
+        &mut self,
+        prepared: &HostPhaseBPreparedMaterialization,
+    ) -> Result<HostPhaseBPreparedMaterialization, InstallationError> {
+        self.validate()?;
+        let rebind = self.active_phase_b_rebind.as_mut().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B preparation requires a durable rebind intent".to_owned(),
+            )
+        })?;
+        if rebind.receipt.is_some()
+            || prepared.transaction_id != rebind.intent.transaction_id
+            || prepared.effect_id != rebind.intent.effect_id
+            || prepared.manifest_digest != rebind.intent.manifest_digest
+            || prepared.request_digest != rebind.intent.request_digest
+            || prepared.credential_receipt_digest != rebind.intent.prior_phase_b_receipt_digest
+            || prepared.host_owner_epoch != rebind.intent.host_owner_epoch
+            || prepared.host_process_identity != rebind.intent.host_process_identity
+            || prepared.host_process_nonce_digest != rebind.intent.host_process_nonce_digest
+            || prepared.host_epoch_lineage != rebind.intent.host_epoch_lineage
+            || prepared.host_epoch_sequence != rebind.intent.host_epoch_sequence
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if rebind
+            .prepared
+            .as_ref()
+            .is_some_and(|existing| existing != prepared)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        rebind.prepared = Some(prepared.clone());
+        let recorded = rebind
+            .prepared
+            .clone()
+            .ok_or(InstallationError::IdentityConflict)?;
+        self.validate()?;
+        Ok(recorded)
+    }
+
+    fn record_active_phase_b_rebind_receipt_unchecked(
+        &mut self,
+        receipt: &ActivePhaseBRebindReceipt,
+    ) -> Result<ActivePhaseBRebindReceipt, InstallationError> {
+        self.validate()?;
+        let rebind = self.active_phase_b_rebind.as_mut().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B receipt requires a durable rebind intent".to_owned(),
+            )
+        })?;
+        let prepared = rebind.prepared.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B receipt requires a durable preparation".to_owned(),
+            )
+        })?;
+        receipt.validate_against(&rebind.intent, prepared)?;
+        if rebind
+            .receipt
+            .as_ref()
+            .is_some_and(|existing| existing != receipt)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        rebind.receipt = Some(receipt.clone());
+        let recorded = rebind
+            .receipt
+            .clone()
+            .ok_or(InstallationError::IdentityConflict)?;
+        self.validate()?;
+        Ok(recorded)
     }
 
     fn terminal_matches(
@@ -6738,6 +7490,46 @@ impl ApprovedGenerationRegistry {
                     "pending activation candidate is absent from registry".to_owned(),
                 ));
             }
+        }
+        if let Some(rebind) = self.active_phase_b_rebind.as_ref() {
+            rebind.validate()?;
+            let active = self.active().ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "active Phase-B rebind has no active approved generation".to_owned(),
+                )
+            })?;
+            let terminal = self
+                .last_terminal_activation
+                .as_ref()
+                .filter(|terminal| {
+                    terminal.disposition == PendingActivationTerminalDisposition::Committed
+                })
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "active Phase-B rebind has no committed source terminal".to_owned(),
+                    )
+                })?;
+            let fence = terminal.commit_fence.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "active Phase-B rebind source terminal has no fence".to_owned(),
+                )
+            })?;
+            let prior_binding = fence.phase_b_live_binding.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "active Phase-B rebind source terminal has no Phase-B binding".to_owned(),
+                )
+            })?;
+            if terminal.transaction_id != rebind.intent.transaction_id
+                || terminal.plan_digest != rebind.intent.plan_digest
+                || terminal.generation != active.manifest.generation
+                || rebind.intent.manifest_digest != candidate_manifest_digest(&active.manifest)?
+                || rebind.intent.prior_terminal_digest != activation_terminal_digest(terminal)?
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            rebind
+                .intent
+                .validate_against_prior_binding(prior_binding)?;
         }
         Ok(())
     }
@@ -21511,8 +22303,45 @@ mod tests {
             decode_registry_bytes(&bytes),
             Err(InstallationError::MigrationRequired { reason })
                 if reason.contains("pending activation")
-                    || reason.contains("v2/pre-CAS")
+                || reason.contains("v2/pre-CAS")
         ));
+    }
+
+    #[test]
+    fn v9_registry_wire_requires_explicit_migration_to_v10() {
+        let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+        let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
+        object["registry_wire_version"] = serde_json::json!({
+            "major": 9,
+            "minor": 0,
+            "patch": 0
+        });
+        object.remove("active_phase_b_rebind");
+        let bytes = must(serde_json::to_vec(&legacy));
+        let Err(error) = decode_registry_bytes(&bytes) else {
+            panic!("raw v9 registry must require explicit migration");
+        };
+        assert!(
+            matches!(
+                error,
+                InstallationError::MigrationRequired { ref reason }
+                    if reason.contains("registry wire 9.0.0") && reason.contains("10.0.0")
+            ),
+            "unexpected raw v9 classification: {error:?}"
+        );
+    }
+
+    #[test]
+    fn v10_registry_wire_round_trips_without_synthesizing_rebind_state() {
+        let current = ApprovedGenerationRegistry::new();
+        let bytes = must(serde_json::to_vec(&current));
+        let decoded = must(decode_registry_bytes(&bytes));
+        assert_eq!(decoded, current);
+        assert_eq!(
+            decoded.registry_wire_version(),
+            ContractVersion::new(10, 0, 0)
+        );
+        assert!(decoded.active_phase_b_rebind().is_none());
     }
 
     #[test]
@@ -22365,6 +23194,129 @@ mod tests {
             InstallationError::MigrationRequired { reason }
                 if reason.contains("approved Host executable artifact binding")
         ));
+    }
+
+    #[test]
+    fn active_phase_b_rebind_rejects_prior_nonce_and_process_substitution() {
+        let transaction = registering_transaction();
+        let manifest = &transaction.candidate_manifest;
+        let fence = test_commit_fence(manifest);
+        let prior = fence
+            .phase_b_live_binding
+            .as_ref()
+            .unwrap_or_else(|| unreachable!());
+        let intent = must(ActivePhaseBRebindIntent::new(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("active-phase-b-rebind"),
+            must(candidate_manifest_digest(manifest)),
+            test_handle("a".repeat(64)),
+            prior,
+            test_handle("host-owner:current"),
+            test_handle("b".repeat(64)),
+            test_handle("c".repeat(64)),
+            test_handle("host-lineage:current"),
+            2,
+            test_handle("activation-lineage:current"),
+            2,
+            must(phase_b_static_template_for_candidate(manifest)),
+        ));
+        let encoded = must(serde_json::to_vec(&intent));
+        let decoded: ActivePhaseBRebindIntent = must(serde_json::from_slice(&encoded));
+        must(decoded.validate());
+        assert_eq!(decoded, intent);
+
+        let mut substituted_nonce = intent.clone();
+        substituted_nonce.prior_host_process_nonce_digest = test_handle("d".repeat(64));
+        assert!(matches!(
+            substituted_nonce.validate_against_prior_binding(prior),
+            Err(InstallationError::IdentityConflict)
+        ));
+
+        let mut substituted_process = intent;
+        substituted_process.prior_host_process_identity = test_handle("e".repeat(64));
+        assert!(matches!(
+            substituted_process.validate_against_prior_binding(prior),
+            Err(InstallationError::IdentityConflict)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_phase_b_rebind_intent_is_durable_and_idempotent_under_host_capability() {
+        let transaction = fully_applied_system_registration_transaction();
+        let approval = test_transaction_activation_approval(
+            &transaction,
+            test_handle("approval:active-phase-b-rebind"),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "eliot-active-phase-b-rebind-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let registry =
+            RedbInstallationRegistry::from_database_for_test(must(Database::create(&path)));
+        let host = host_capability();
+        let transaction_store = SharedStore::default();
+        *transaction_store
+            .state
+            .lock()
+            .unwrap_or_else(|_| unreachable!()) = Some(transaction.clone());
+        must(registry.stage_pending_activation_from_transaction_store(
+            &transaction_store,
+            &transaction.transaction_id,
+            approval.clone(),
+            must(registry.load()).revision(),
+        ));
+        must(registry.commit_pending_activation(
+            &host,
+            must(registry.load()).revision(),
+            &approval,
+            &test_commit_fence(&transaction.candidate_manifest),
+        ));
+        let committed = must(registry.load());
+        let terminal = committed
+            .last_terminal_activation
+            .as_ref()
+            .unwrap_or_else(|| unreachable!());
+        let prior = terminal
+            .commit_fence
+            .as_ref()
+            .and_then(|fence| fence.phase_b_live_binding.as_ref())
+            .unwrap_or_else(|| unreachable!());
+        let intent = must(ActivePhaseBRebindIntent::new(
+            transaction.transaction_id.clone(),
+            transaction.installer_plan_digest.clone(),
+            test_handle("active-phase-b-rebind-durable"),
+            must(candidate_manifest_digest(&transaction.candidate_manifest)),
+            must(activation_terminal_digest(terminal)),
+            prior,
+            test_handle("host-owner:durable"),
+            test_handle("f".repeat(64)),
+            test_handle("1".repeat(64)),
+            test_handle("host-lineage:durable"),
+            2,
+            test_handle("activation-lineage:durable"),
+            2,
+            must(phase_b_static_template_for_candidate(
+                &transaction.candidate_manifest,
+            )),
+        ));
+        let revision = committed.revision();
+        must(registry.record_active_phase_b_rebind_intent(&host, revision, &intent));
+        let persisted = must(registry.load());
+        assert_eq!(
+            persisted
+                .active_phase_b_rebind()
+                .map(|rebind| &rebind.intent),
+            Some(&intent)
+        );
+        let persisted_revision = persisted.revision();
+        must(registry.record_active_phase_b_rebind_intent(&host, persisted_revision, &intent));
+        assert_eq!(must(registry.load()), persisted);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

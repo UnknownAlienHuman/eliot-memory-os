@@ -32,7 +32,8 @@ use eliot_host_state::{
     WakeDisposition, record_checksum,
 };
 use eliot_installation::{
-    ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest, CredentialAccessReceipt,
+    ActivationCommitFence, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
+    ApprovedGenerationRegistry, CandidateManifest, CredentialAccessReceipt,
     HostCredentialControlResponse, HostPhaseBMaterializationIntent,
     HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, InstallationEpoch,
     InstallationError, InstallationProfile, InstallerServiceRegistrationApproval,
@@ -1123,6 +1124,86 @@ fn phase_b_build_authority_descriptor(
     };
     let marker = phase_b_authority_marker(
         &phase_b_manifest_digest(manifest)?,
+        host,
+        activation_generation,
+        &descriptor,
+    )?;
+    descriptor.contour_refs.push(marker);
+    descriptor = descriptor
+        .with_computed_digest()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    descriptor
+        .validate_structure()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    serde_json::to_vec(&descriptor).map_err(|error| HostError::ProcessContour(error.to_string()))
+}
+
+#[cfg(windows)]
+fn phase_b_build_authority_descriptor_for_rebind(
+    manifest: &CandidateManifest,
+    host: &HostInstallationEpoch,
+    activation_generation: &EpochIdentity,
+    intent: &ActivePhaseBRebindIntent,
+) -> Result<Vec<u8>, HostError> {
+    let runtime = &manifest.runtime_launch;
+    let authority_id = DispatchAuthorityId::new(intent.static_template.authority_id.as_str())
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let record_id = OperationIdentity::new(intent.static_template.record_id.as_str())
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let lineage_id = OpaqueLabel::new(host.epoch.current.lineage.as_str())
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let authority_epoch = EpochLineage {
+        current: OrsEpochIdentity {
+            lineage_id,
+            epoch: host.epoch.current.sequence,
+        },
+        predecessor: None,
+    };
+    let authority = AuthorityEpoch::new(host.epoch.current.sequence)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let state_fence = StateFence::new(authority, runtime.authority_generation);
+    let snapshot_fence = StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| HostError::ProcessContour("Phase-B clock overflow".to_owned()))?;
+    let dispatch_target = eliot_installation::dispatch_credential_target_for_store_target(
+        &runtime.store_credential_target,
+    )
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let dispatch_key = SecretReference::new("windows-credential-manager", dispatch_target.as_str())
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let mut descriptor = ProcessAuthorityHandoffDescriptor {
+        contract_version: ProcessAuthorityHandoffDescriptor::CONTRACT_VERSION,
+        handoff_id: PlatformHandle::new(format!(
+            "phase-b-active-rebind:{}:{}",
+            intent.effect_id, host.epoch.current.sequence
+        ))
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        handoff_nonce: host.nonce.clone(),
+        authority_id: authority_id.clone(),
+        snapshot_binding: AuthoritySnapshotBindingWire {
+            authority_id,
+            record_id,
+            authority_epoch,
+            state_fence: snapshot_fence,
+            created_at_ms: now_ms,
+            cleanup_after_ms: Some(now_ms.saturating_add(86_400_000)),
+        },
+        state_fence: state_fence.clone(),
+        generation: runtime.authority_generation,
+        revision_policy_binding: intent.static_template.revision_policy_binding.clone(),
+        dispatch_key,
+        descriptor_sha256: String::new(),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(86_400_000),
+        contour_refs: intent.static_template.contour_refs.clone(),
+    };
+    let marker = phase_b_authority_marker(
+        &intent.manifest_digest,
         host,
         activation_generation,
         &descriptor,
@@ -7218,19 +7299,18 @@ impl HostComposition {
                     Err(error) => return Err(error),
                 }
             }
-        } else if let Some(active) = composition.registry.active().cloned()
-            && phase_b_authority_is_observable(&active.manifest)?
-        {
-            match Self::reconcile_phase_b_for_manifest(&active.manifest) {
-                Ok(_) => start_approved_manifest_contour(
-                    &mut composition,
-                    &active.manifest,
-                    HostStartupBranch::Active,
-                    None,
-                )?,
-                Err(HostError::RecoveryRequired(_)) => {}
-                Err(error) => return Err(error),
-            }
+        } else if let Some(active) = composition.registry.active().cloned() {
+            // A committed ActiveVerified fence is source evidence only.  Every
+            // Host restart must mint a fresh owner-bound Phase-B rebind before
+            // any approved child contour is admitted; destination bytes alone
+            // are never treated as current authority.
+            composition.rebind_active_phase_b(&active)?;
+            start_approved_manifest_contour(
+                &mut composition,
+                &active.manifest,
+                HostStartupBranch::Active,
+                None,
+            )?;
         }
         Ok(composition)
     }
@@ -7961,6 +8041,7 @@ impl HostComposition {
             )
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let pending = self.registry.pending_activation().cloned();
+        let active_rebind = self.registry.active_phase_b_rebind().cloned();
         let prepared = if let Some(pending) = pending.as_ref() {
             let intent = pending.phase_b_intent.as_ref().ok_or_else(|| {
                 HostError::RecoveryRequired(
@@ -8009,6 +8090,54 @@ impl HostComposition {
             prepared.validate().map_err(HostError::Installation)?;
             let host_capability = self.owner_lease.activation_capability();
             self.persist_pending_phase_b_prepared(pending, &prepared, &host_capability)?;
+            Some(prepared)
+        } else if let Some(rebind) = active_rebind.as_ref() {
+            if rebind.intent.manifest_digest != manifest_digest {
+                return Err(HostError::RecoveryRequired(
+                    "Active Phase-B rebind preparation is not bound to the exact manifest"
+                        .to_owned(),
+                ));
+            }
+            let mut prepared = HostPhaseBPreparedMaterialization {
+                wire: PlatformHandle::new(HostPhaseBPreparedMaterialization::WIRE)
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                transaction_id: rebind.intent.transaction_id.clone(),
+                effect_id: rebind.intent.effect_id.clone(),
+                // Rebind does not mutate the credential.  This stable
+                // operation-scoped marker keeps the existing prepared wire
+                // explicit without making the old credential operation owner.
+                credential_effect_id: rebind.intent.effect_id.clone(),
+                manifest_digest: manifest_digest.clone(),
+                request_digest: rebind.intent.request_digest.clone(),
+                credential_receipt_digest: rebind.intent.prior_phase_b_receipt_digest.clone(),
+                host_owner_epoch: host_owner_epoch_digest(&self.host)?,
+                host_process_identity: host_process_identity_digest()?,
+                host_process_nonce_digest: phase_b_bytes_digest(
+                    self.host
+                        .host_process_nonce()
+                        .as_handle()
+                        .as_str()
+                        .as_bytes(),
+                )?,
+                host_epoch_lineage: self.host.epoch.current.lineage.clone(),
+                host_epoch_sequence: self.host.epoch.current.sequence,
+                activation_generation_lineage: self.activation_generation.current.lineage.clone(),
+                activation_generation_sequence: self.activation_generation.current.sequence,
+                authority_descriptor_digest: authority_descriptor_digest.clone(),
+                config_file_digest: config_file_digest.clone(),
+                store_bootstrap_descriptor_digest: store_bootstrap_descriptor_digest.clone(),
+                eliotd_descriptor_digest: eliotd_descriptor_digest.clone(),
+                semantic_config_hash: semantic_config_hash.clone(),
+                launch: launch.clone(),
+                prepared_digest: PlatformHandle::new("pending")
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+            };
+            prepared.prepared_digest = prepared
+                .computed_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            prepared.validate().map_err(HostError::Installation)?;
+            let host_capability = self.owner_lease.activation_capability();
+            self.persist_active_phase_b_rebind_prepared(&prepared, &host_capability)?;
             Some(prepared)
         } else {
             None
@@ -8106,6 +8235,167 @@ impl HostComposition {
         };
         self.phase_b = Some(receipt.clone());
         Ok(receipt)
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ActiveVerified Phase-B rebind keeps source-fence validation, durable lifecycle, four-file publication and exact receipt binding together"
+    )]
+    fn rebind_active_phase_b(
+        &mut self,
+        active: &eliot_installation::ApprovedGeneration,
+    ) -> Result<(), HostError> {
+        self.ensure_admission_open()?;
+        let manifest = &active.manifest;
+        let manifest_digest = phase_b_manifest_digest(manifest)?;
+        if active
+            .manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            != self.host.installation
+        {
+            return Err(HostError::RecoveryRequired(
+                "ActiveVerified rebind candidate belongs to a different installation".to_owned(),
+            ));
+        }
+        let committed = self
+            .registry_store
+            .read_committed_activation_receipt(
+                active.approval.transaction_id(),
+                active.approval.installer_plan_digest(),
+                &manifest.generation,
+            )
+            .map_err(HostError::Installation)?;
+        let prior_binding = committed
+            .commit_fence()
+            .phase_b_live_binding
+            .clone()
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "ActiveVerified source fence has no committed Phase-B binding".to_owned(),
+                )
+            })?;
+        if prior_binding.manifest_digest != manifest_digest {
+            return Err(HostError::RecoveryRequired(
+                "ActiveVerified source fence belongs to a different manifest".to_owned(),
+            ));
+        }
+        let host_owner_epoch = host_owner_epoch_digest(&self.host)?;
+        let host_process_identity = host_process_identity_digest()?;
+        let host_process_nonce_digest = phase_b_bytes_digest(
+            self.host
+                .host_process_nonce()
+                .as_handle()
+                .as_str()
+                .as_bytes(),
+        )?;
+        let effect_id = PlatformHandle::new(format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "eliot.host.phase-b-rebind.v1\0{}\0{}\0{}",
+                    committed.terminal_digest(),
+                    active.approval.transaction_id(),
+                    manifest_digest,
+                )
+                .as_bytes(),
+            )
+        ))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+        let static_template =
+            phase_b_static_template_for_candidate(manifest).map_err(HostError::Installation)?;
+        let intent = ActivePhaseBRebindIntent::new(
+            active.approval.transaction_id().clone(),
+            active.approval.installer_plan_digest().clone(),
+            effect_id,
+            manifest_digest.clone(),
+            committed.terminal_digest().clone(),
+            &prior_binding,
+            host_owner_epoch,
+            host_process_identity,
+            host_process_nonce_digest,
+            self.host.epoch.current.lineage.clone(),
+            self.host.epoch.current.sequence,
+            self.activation_generation.current.lineage.clone(),
+            self.activation_generation.current.sequence,
+            static_template,
+        )
+        .map_err(HostError::Installation)?;
+        let host_capability = self.owner_lease.activation_capability();
+        self.persist_active_phase_b_rebind_intent(&intent, &host_capability)?;
+
+        if let Some(rebind) = self.registry.active_phase_b_rebind().cloned()
+            && let (Some(prepared), Some(receipt)) = (rebind.prepared, rebind.receipt)
+        {
+            let mut materialization = self.rehydrate_phase_b_from_prepared(manifest, &prepared)?;
+            receipt
+                .validate_against(&intent, &prepared)
+                .map_err(HostError::Installation)?;
+            materialization.transaction_id = Some(intent.transaction_id.clone());
+            materialization.effect_id = Some(intent.effect_id.clone());
+            materialization.credential_receipt_digest =
+                Some(intent.prior_phase_b_receipt_digest.clone());
+            materialization.host_owner_epoch = Some(receipt.host_owner_epoch.clone());
+            materialization.host_process_identity = Some(receipt.host_process_identity.clone());
+            materialization.request_digest = Some(intent.request_digest.clone());
+            materialization.public_receipt_digest = Some(receipt.receipt_digest.clone());
+            self.phase_b = Some(materialization);
+            return Ok(());
+        }
+
+        let authority_descriptor_bytes = phase_b_build_authority_descriptor_for_rebind(
+            manifest,
+            &self.host,
+            &self.activation_generation.current,
+            &intent,
+        )?;
+        let mut materialization = self.materialize_phase_b(
+            manifest,
+            &HostPhaseBInput {
+                authority_descriptor_bytes,
+            },
+        )?;
+        materialization.transaction_id = Some(intent.transaction_id.clone());
+        materialization.effect_id = Some(intent.effect_id.clone());
+        materialization.credential_receipt_digest =
+            Some(intent.prior_phase_b_receipt_digest.clone());
+        materialization.request_digest = Some(intent.request_digest.clone());
+        let rebind = self
+            .registry
+            .active_phase_b_rebind()
+            .cloned()
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Active Phase-B rebind preparation disappeared after publication".to_owned(),
+                )
+            })?;
+        let prepared = rebind.prepared.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Active Phase-B publication completed without durable preparation".to_owned(),
+            )
+        })?;
+        if materialization.manifest_digest != manifest_digest
+            || materialization.authority_descriptor_digest != prepared.authority_descriptor_digest
+            || materialization.config_file_digest != prepared.config_file_digest
+            || materialization.store_bootstrap_descriptor_digest
+                != prepared.store_bootstrap_descriptor_digest
+            || materialization.eliotd_descriptor_digest != prepared.eliotd_descriptor_digest
+            || materialization.launch != prepared.launch
+        {
+            return Err(HostError::RecoveryRequired(
+                "Active Phase-B publication differs from durable preparation".to_owned(),
+            ));
+        }
+        let receipt = ActivePhaseBRebindReceipt::from_prepared(&intent, prepared)
+            .map_err(HostError::Installation)?;
+        self.persist_active_phase_b_rebind_receipt(&receipt, &host_capability)?;
+        materialization.host_owner_epoch = Some(receipt.host_owner_epoch.clone());
+        materialization.host_process_identity = Some(receipt.host_process_identity.clone());
+        materialization.public_receipt_digest = Some(receipt.receipt_digest.clone());
+        self.phase_b = Some(materialization);
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -9092,6 +9382,162 @@ impl HostComposition {
             Err(_error) if exact_readback => Ok(()),
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Phase-B receipt failed and exact registry readback did not confirm it: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(windows)]
+    fn persist_active_phase_b_rebind_intent(
+        &mut self,
+        intent: &ActivePhaseBRebindIntent,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self
+            .registry
+            .active_phase_b_rebind()
+            .is_some_and(|current| current.intent == *intent)
+        {
+            expected_revision
+        } else {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Active Phase-B rebind intent registry revision overflow".to_owned(),
+                )
+            })?
+        };
+        let outcome = self.registry_store.record_active_phase_b_rebind_intent(
+            host_capability,
+            expected_revision,
+            intent,
+        );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "Active Phase-B rebind intent outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable
+                .active_phase_b_rebind()
+                .is_some_and(|current| current.intent == *intent);
+        self.registry = durable;
+        match outcome {
+            Ok(returned) if exact_readback && returned == *intent => Ok(()),
+            Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
+                "Active Phase-B rebind intent succeeded but exact registry readback differed"
+                    .to_owned(),
+            )),
+            Ok(_) => Err(HostError::RecoveryRequired(
+                "Active Phase-B rebind intent succeeded but exact registry readback failed"
+                    .to_owned(),
+            )),
+            Err(_error) if exact_readback => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Active Phase-B rebind intent failed and exact registry readback did not confirm it: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(windows)]
+    fn persist_active_phase_b_rebind_prepared(
+        &mut self,
+        prepared: &HostPhaseBPreparedMaterialization,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self
+            .registry
+            .active_phase_b_rebind()
+            .is_some_and(|current| current.prepared.as_ref() == Some(prepared))
+        {
+            expected_revision
+        } else {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Active Phase-B rebind preparation registry revision overflow".to_owned(),
+                )
+            })?
+        };
+        let outcome = self.registry_store.record_active_phase_b_rebind_prepared(
+            host_capability,
+            expected_revision,
+            prepared,
+        );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "Active Phase-B rebind preparation outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable
+                .active_phase_b_rebind()
+                .is_some_and(|current| current.prepared.as_ref() == Some(prepared));
+        self.registry = durable;
+        match outcome {
+            Ok(returned) if exact_readback && returned == *prepared => Ok(()),
+            Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
+                "Active Phase-B rebind preparation succeeded but exact registry readback differed"
+                    .to_owned(),
+            )),
+            Ok(_) => Err(HostError::RecoveryRequired(
+                "Active Phase-B rebind preparation succeeded but exact registry readback failed"
+                    .to_owned(),
+            )),
+            Err(_error) if exact_readback => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Active Phase-B rebind preparation failed and exact registry readback did not confirm it: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(windows)]
+    fn persist_active_phase_b_rebind_receipt(
+        &mut self,
+        receipt: &ActivePhaseBRebindReceipt,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self
+            .registry
+            .active_phase_b_rebind()
+            .is_some_and(|current| current.receipt.as_ref() == Some(receipt))
+        {
+            expected_revision
+        } else {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Active Phase-B rebind receipt registry revision overflow".to_owned(),
+                )
+            })?
+        };
+        let outcome = self.registry_store.record_active_phase_b_rebind_receipt(
+            host_capability,
+            expected_revision,
+            receipt,
+        );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "Active Phase-B rebind receipt outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable
+                .active_phase_b_rebind()
+                .is_some_and(|current| current.receipt.as_ref() == Some(receipt));
+        self.registry = durable;
+        match outcome {
+            Ok(returned) if exact_readback && returned == *receipt => Ok(()),
+            Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
+                "Active Phase-B rebind receipt succeeded but exact registry readback differed"
+                    .to_owned(),
+            )),
+            Ok(_) => Err(HostError::RecoveryRequired(
+                "Active Phase-B rebind receipt succeeded but exact registry readback failed"
+                    .to_owned(),
+            )),
+            Err(_error) if exact_readback => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Active Phase-B rebind receipt failed and exact registry readback did not confirm it: {error}"
             ))),
         }
     }

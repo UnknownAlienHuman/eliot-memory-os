@@ -12,15 +12,18 @@
     reason = "the credential state machine keeps fail-closed branches explicit"
 )]
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use eliot_host_state::HostInstallationEpoch;
 use eliot_installation::{
     CredentialAccessReceipt, CredentialOwnershipMarkerIdentity, HOST_CREDENTIAL_CONTROL_PIPE,
     HostCredentialControlOperation, HostCredentialControlRequest, HostCredentialControlResponse,
-    LOCAL_SERVICE_SID, StoreCredentialAbsentSnapshot, credential_absent_response_digest,
-    credential_control_response_frame, credential_deleted_response_digest,
-    credential_matching_response_digest, decode_credential_control_request_frame,
+    HostPhaseBMaterializationIntent, LOCAL_SERVICE_SID, StoreCredentialAbsentSnapshot,
+    credential_absent_response_digest, credential_control_response_frame,
+    credential_deleted_response_digest, credential_matching_response_digest,
+    decode_credential_control_request_frame,
 };
 use eliot_ipc::{NamedPipeServer, TransportLimits};
 use eliot_platform::PlatformHandle;
@@ -32,10 +35,30 @@ use eliot_platform_windows::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::oneshot;
 
 const MARKER_LIMIT: u64 = 16 * 1024;
+const MAX_PHASE_B_QUEUE_DEPTH: usize = 32;
+const PHASE_B_QUEUE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const ENVELOPE_VERSION: &str = "eliot.store-credential-envelope.v1";
 const MARKER_VERSION: &str = "eliot.store-credential-marker.v1";
+
+/// One authenticated Phase-B handoff waiting for the mutable Host owner
+/// thread. The credential endpoint never materializes files itself; it only
+/// transfers the typed request and a one-shot reply channel to Host.
+pub struct HostPhaseBRequest {
+    /// The authenticated operation selected by the installer request.
+    pub operation: HostCredentialControlOperation,
+    /// Exact transaction-bound Phase-B handoff intent.
+    pub intent: HostPhaseBMaterializationIntent,
+    /// Exact prior LocalService credential receipt admitted by the request.
+    pub credential_receipt: CredentialAccessReceipt,
+    /// One-shot response path back to the authenticated endpoint.
+    pub reply: oneshot::Sender<HostCredentialControlResponse>,
+}
+
+/// Bounded queue crossing the authenticated endpoint and mutable Host owner.
+pub type HostPhaseBRequestQueue = Arc<Mutex<VecDeque<HostPhaseBRequest>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -141,6 +164,7 @@ impl CredentialBackend for ProductionCredentialBackend {
 /// already-open durable Host epoch and exact host-state root.
 pub struct HostCredentialControl {
     core: HostCredentialControlCore<ProductionCredentialBackend>,
+    phase_b_queue: HostPhaseBRequestQueue,
 }
 
 struct HostCredentialControlCore<B> {
@@ -159,6 +183,7 @@ impl HostCredentialControl {
         host_epoch: HostInstallationEpoch,
         host_state_root: PathBuf,
         capability: HostCredentialMutationCapability,
+        phase_b_queue: HostPhaseBRequestQueue,
     ) -> Result<Self, String> {
         let installation_root = host_state_root
             .parent()
@@ -188,12 +213,63 @@ impl HostCredentialControl {
                 primitive: WindowsInstallerRootPrimitive::new(),
                 backend: ProductionCredentialBackend(capability),
             },
+            phase_b_queue,
         })
     }
 
+    /// Returns the bounded queue consumed by the mutable Host owner thread.
+    #[must_use]
+    pub fn phase_b_queue(&self) -> HostPhaseBRequestQueue {
+        Arc::clone(&self.phase_b_queue)
+    }
+
     /// Handles one already-authenticated request. No secret is returned.
-    fn handle(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
+    async fn handle(
+        &self,
+        request: &HostCredentialControlRequest,
+    ) -> HostCredentialControlResponse {
+        if matches!(
+            request.intent.operation,
+            HostCredentialControlOperation::MaterializePhaseB
+                | HostCredentialControlOperation::ReconcilePhaseB
+        ) {
+            return self.enqueue_phase_b(request).await;
+        }
         self.core.handle(request)
+    }
+
+    async fn enqueue_phase_b(
+        &self,
+        request: &HostCredentialControlRequest,
+    ) -> HostCredentialControlResponse {
+        if request.validate().is_err() {
+            return unknown("phase-b-request-validation");
+        }
+        let Some(intent) = request.phase_b.clone() else {
+            return unknown("phase-b-request-intent");
+        };
+        let Some(credential_receipt) = request.expected_receipt.clone() else {
+            return unknown("phase-b-request-credential-receipt");
+        };
+        let (reply, response) = oneshot::channel();
+        {
+            let Ok(mut queue) = self.phase_b_queue.lock() else {
+                return unknown("phase-b-queue-lock");
+            };
+            if queue.len() >= MAX_PHASE_B_QUEUE_DEPTH {
+                return unknown("phase-b-queue-full");
+            }
+            queue.push_back(HostPhaseBRequest {
+                operation: request.intent.operation,
+                intent,
+                credential_receipt,
+                reply,
+            });
+        }
+        match tokio::time::timeout(PHASE_B_QUEUE_RESPONSE_TIMEOUT, response).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) | Err(_) => unknown("phase-b-queue-response"),
+        }
     }
 
     /// Serves one bounded request through the existing authenticated EBP
@@ -222,7 +298,7 @@ impl HostCredentialControl {
         let connection_id = frame.connection_id.clone();
         let request =
             decode_credential_control_request_frame(&frame).map_err(|error| error.to_string())?;
-        let response = self.handle(&request);
+        let response = self.handle(&request).await;
         let response = credential_control_response_frame(connection_id, &response)
             .map_err(|error| error.to_string())?;
         server
@@ -259,6 +335,8 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             HostCredentialControlOperation::Provision
             | HostCredentialControlOperation::Reconcile => self.provision_or_reconcile(request),
             HostCredentialControlOperation::Delete => self.delete(request),
+            HostCredentialControlOperation::MaterializePhaseB
+            | HostCredentialControlOperation::ReconcilePhaseB => unknown("phase-b-dispatch"),
         }
     }
 
@@ -960,6 +1038,7 @@ mod tests {
                 vec![7; 32]
             },
             expected_receipt: None,
+            phase_b: None,
         }
     }
 
