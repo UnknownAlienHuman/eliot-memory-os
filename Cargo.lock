@@ -1155,6 +1155,8 @@ dependencies = [
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
+ "eliot-protocol",
+ "eliot-receipts",
  "eliot-runtime-contracts",
  "serde",
  "serde_json",

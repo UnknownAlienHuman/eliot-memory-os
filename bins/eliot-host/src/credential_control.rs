@@ -243,21 +243,21 @@ impl HostCredentialControl {
         request: &HostCredentialControlRequest,
     ) -> HostCredentialControlResponse {
         if request.validate().is_err() {
-            return unknown("phase-b-request-validation");
+            return unknown(request, "phase-b-request-validation");
         }
         let Some(intent) = request.phase_b.clone() else {
-            return unknown("phase-b-request-intent");
+            return unknown(request, "phase-b-request-intent");
         };
         let Some(credential_receipt) = request.expected_receipt.clone() else {
-            return unknown("phase-b-request-credential-receipt");
+            return unknown(request, "phase-b-request-credential-receipt");
         };
         let (reply, response) = oneshot::channel();
         {
             let Ok(mut queue) = self.phase_b_queue.lock() else {
-                return unknown("phase-b-queue-lock");
+                return unknown(request, "phase-b-queue-lock");
             };
             if queue.len() >= MAX_PHASE_B_QUEUE_DEPTH {
-                return unknown("phase-b-queue-full");
+                return unknown(request, "phase-b-queue-full");
             }
             queue.push_back(HostPhaseBRequest {
                 operation: request.intent.operation,
@@ -268,7 +268,7 @@ impl HostCredentialControl {
         }
         match tokio::time::timeout(PHASE_B_QUEUE_RESPONSE_TIMEOUT, response).await {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) | Err(_) => unknown("phase-b-queue-response"),
+            Ok(Err(_)) | Err(_) => unknown(request, "phase-b-queue-response"),
         }
     }
 
@@ -328,7 +328,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 .map(PlatformHandle::as_str)
                 != Some(LOCAL_SERVICE_SID)
         {
-            return unknown("credential-control-admission");
+            return unknown(request, "credential-control-admission");
         }
         match request.intent.operation {
             HostCredentialControlOperation::Inspect => self.inspect(request),
@@ -336,26 +336,28 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             | HostCredentialControlOperation::Reconcile => self.provision_or_reconcile(request),
             HostCredentialControlOperation::Delete => self.delete(request),
             HostCredentialControlOperation::MaterializePhaseB
-            | HostCredentialControlOperation::ReconcilePhaseB => unknown("phase-b-dispatch"),
+            | HostCredentialControlOperation::ReconcilePhaseB => {
+                unknown(request, "phase-b-dispatch")
+            }
         }
     }
 
     fn inspect(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
         let root = match self.primitive.inspect(&self.root_spec) {
             Ok(InstallerRootPrimitiveObservation::Matching(root)) => root,
-            _ => return unknown("credential-host-root"),
+            _ => return unknown(request, "credential-host-root"),
         };
         let marker_path = marker_path(&self.root_spec.root, request);
         let marker_absent = match path_absent(&marker_path) {
             Ok(absent) => absent,
-            Err(()) => return unknown("credential-marker-absence"),
+            Err(()) => return unknown(request, "credential-marker-absence"),
         };
         let target_absent = match self.backend.read(&request.intent.provision.target) {
             Ok(value) => value.is_none(),
-            Err(_) => return unknown("credential-target-absence"),
+            Err(_) => return unknown(request, "credential-target-absence"),
         };
         if !marker_absent || !target_absent {
-            return unknown("credential-preexisting-marker-or-target");
+            return unknown(request, "credential-preexisting-marker-or-target");
         }
         let snapshot = StoreCredentialAbsentSnapshot {
             host_owner_epoch: self.host_epoch_digest.clone(),
@@ -363,7 +365,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             host_state_root: marker_identity(&root),
             marker_path_digest: match path_digest(&marker_path) {
                 Ok(value) => value,
-                Err(_) => return unknown("credential-marker-path"),
+                Err(_) => return unknown(request, "credential-marker-path"),
             },
             marker_absent: true,
             target_absent: true,
@@ -371,7 +373,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         let response_digest =
             match credential_absent_response_digest(&request.intent.request_digest, &snapshot) {
                 Ok(value) => value,
-                Err(_) => return unknown("credential-inspect-digest"),
+                Err(_) => return unknown(request, "credential-inspect-digest"),
             };
         HostCredentialControlResponse::Absent {
             snapshot,
@@ -392,12 +394,12 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         ) {
             Ok(readback) => match decode_marker(request, key, &readback.object, &readback.bytes) {
                 Ok(marker) => (readback.object, marker),
-                Err(()) => return unknown("credential-marker-mac"),
+                Err(()) => return unknown(request, "credential-marker-mac"),
             },
             Err(_) => {
                 let target = match self.backend.read(&request.intent.provision.target) {
                     Ok(value) => value,
-                    Err(_) => return unknown("credential-target-before-marker-read"),
+                    Err(_) => return unknown(request, "credential-target-before-marker-read"),
                 };
                 if request.intent.operation == HostCredentialControlOperation::Reconcile
                     && request.expected_receipt.is_some()
@@ -426,7 +428,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                             )
                             .is_ok();
                         if !valid {
-                            return unknown("credential-target-without-marker");
+                            return unknown(request, "credential-target-without-marker");
                         }
                         let mut verify = |value: &CredentialSecret| {
                             decode_envelope(
@@ -447,15 +449,15 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                             )
                             .is_err()
                         {
-                            return unknown("credential-target-without-marker-delete");
+                            return unknown(request, "credential-target-without-marker-delete");
                         }
                         deleted_response_for_receipt(request, receipt)
                     } else {
-                        unknown("credential-target-without-marker")
+                        unknown(request, "credential-target-without-marker")
                     };
                 }
                 if target.is_some() {
-                    return unknown("credential-target-before-marker");
+                    return unknown(request, "credential-target-before-marker");
                 }
                 let created = self.primitive.create_local_service_protected_file(
                     &self.root_spec,
@@ -464,7 +466,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 );
                 let identity = match created {
                     Ok(identity) => identity,
-                    Err(_) => return unknown("credential-marker-create"),
+                    Err(_) => return unknown(request, "credential-marker-create"),
                 };
                 let readback = match self.primitive.read_local_service_protected_file(
                     &self.root_spec,
@@ -472,12 +474,12 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                     MARKER_LIMIT,
                 ) {
                     Ok(value) if value.object == identity => value,
-                    Ok(_) => return unknown("credential-marker-created-identity"),
-                    Err(_) => return unknown("credential-marker-flush-readback"),
+                    Ok(_) => return unknown(request, "credential-marker-created-identity"),
+                    Err(_) => return unknown(request, "credential-marker-flush-readback"),
                 };
                 let marker = match decode_marker(request, key, &readback.object, &readback.bytes) {
                     Ok(marker) => marker,
-                    Err(()) => return unknown("credential-marker-created-mac"),
+                    Err(()) => return unknown(request, "credential-marker-created-mac"),
                 };
                 (readback.object, marker)
             }
@@ -486,11 +488,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             receipt.marker != marker_identity(&marker.0)
                 || receipt.host_owner_epoch != self.host_epoch_digest
         }) {
-            return unknown("credential-reconcile-receipt-binding");
+            return unknown(request, "credential-reconcile-receipt-binding");
         }
         let existing = match self.backend.read(&request.intent.provision.target) {
             Ok(value) => value,
-            Err(_) => return unknown("credential-target-read"),
+            Err(_) => return unknown(request, "credential-target-read"),
         };
         let envelope_bytes = if let Some(existing) = existing {
             if decode_envelope(
@@ -502,13 +504,13 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             )
             .is_err()
             {
-                return unknown("credential-target-binding");
+                return unknown(request, "credential-target-binding");
             }
             if request.expected_receipt.as_ref().is_some_and(|receipt| {
                 handle_digest(existing.expose()).ok().as_ref()
                     != Some(&receipt.credential_envelope_digest)
             }) {
-                return unknown("credential-reconcile-envelope-digest");
+                return unknown(request, "credential-reconcile-envelope-digest");
             }
             existing.expose().to_vec()
         } else {
@@ -516,7 +518,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 if self.primitive.delete_file(&marker_path, &marker.0).is_err()
                     || !matches!(path_absent(&marker_path), Ok(true))
                 {
-                    return unknown("credential-reconcile-marker-delete");
+                    return unknown(request, "credential-reconcile-marker-delete");
                 }
                 let receipt = request
                     .expected_receipt
@@ -525,11 +527,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 return deleted_response_for_receipt(request, receipt);
             }
             if matches!(marker.1.phase, MarkerPhase::Finalized) {
-                return unknown("credential-final-marker-without-target");
+                return unknown(request, "credential-final-marker-without-target");
             }
             let generated = match self.backend.generate() {
                 Ok(value) => value,
-                Err(_) => return unknown("credential-csprng"),
+                Err(_) => return unknown(request, "credential-csprng"),
             };
             let bytes = match envelope_bytes(
                 request,
@@ -539,7 +541,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 generated.expose(),
             ) {
                 Ok(value) => value,
-                Err(_) => return unknown("credential-envelope"),
+                Err(_) => return unknown(request, "credential-envelope"),
             };
             // The capability holds a protected Host-state interlock across
             // the final absence check, CredWriteW and authoritative readback.
@@ -549,7 +551,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 bytes.clone(),
             ) {
                 Ok(readback) => readback,
-                Err(label) => return unknown(label),
+                Err(label) => return unknown(request, label),
             };
             if readback.expose() != bytes
                 || decode_envelope(
@@ -561,13 +563,13 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 )
                 .is_err()
             {
-                return unknown("credential-write-mismatch");
+                return unknown(request, "credential-write-mismatch");
             }
             bytes
         };
         let envelope_digest = match handle_digest(&envelope_bytes) {
             Ok(value) => value,
-            Err(_) => return unknown("credential-envelope-digest"),
+            Err(_) => return unknown(request, "credential-envelope-digest"),
         };
         let final_bytes = match marker_bytes(
             request,
@@ -577,7 +579,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             Some(&envelope_digest),
         ) {
             Ok(value) => value,
-            Err(_) => return unknown("credential-final-marker"),
+            Err(_) => return unknown(request, "credential-final-marker"),
         };
         if self
             .primitive
@@ -589,7 +591,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             )
             .is_err()
         {
-            return unknown("credential-final-marker-write");
+            return unknown(request, "credential-final-marker-write");
         }
         let response_digest = match credential_matching_response_digest(
             &request.intent.request_digest,
@@ -599,7 +601,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             &envelope_digest,
         ) {
             Ok(value) => value,
-            Err(_) => return unknown("credential-response-digest"),
+            Err(_) => return unknown(request, "credential-response-digest"),
         };
         let receipt = CredentialAccessReceipt {
             transaction_id: request.intent.transaction_id.clone(),
@@ -628,7 +630,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             MARKER_LIMIT,
         ) {
             Ok(value) => value,
-            Err(_) => return unknown("credential-delete-marker"),
+            Err(_) => return unknown(request, "credential-delete-marker"),
         };
         if decode_marker(
             request,
@@ -638,15 +640,15 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         )
         .is_err()
         {
-            return unknown("credential-delete-marker-mac");
+            return unknown(request, "credential-delete-marker-mac");
         }
         let Some(expected_receipt) = request.expected_receipt.as_ref() else {
-            return unknown("credential-delete-receipt");
+            return unknown(request, "credential-delete-receipt");
         };
         if expected_receipt.marker != marker_identity(&readback.object)
             || expected_receipt.host_owner_epoch != self.host_epoch_digest
         {
-            return unknown("credential-delete-receipt-binding");
+            return unknown(request, "credential-delete-receipt-binding");
         }
         if delete_credential_with_readback(
             &self.backend,
@@ -663,7 +665,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 .is_err()
             || !matches!(path_absent(&marker_path), Ok(true))
         {
-            return unknown("credential-delete-readback");
+            return unknown(request, "credential-delete-readback");
         }
         let absence_digest = match credential_deleted_response_digest(
             &request.intent.request_digest,
@@ -672,7 +674,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             &expected_receipt.marker,
         ) {
             Ok(value) => value,
-            Err(_) => return unknown("credential-delete-digest"),
+            Err(_) => return unknown(request, "credential-delete-digest"),
         };
         HostCredentialControlResponse::Deleted { absence_digest }
     }
@@ -876,9 +878,16 @@ fn decode_envelope(
     Ok(())
 }
 
-fn unknown(label: &str) -> HostCredentialControlResponse {
+fn unknown(request: &HostCredentialControlRequest, label: &str) -> HostCredentialControlResponse {
     HostCredentialControlResponse::Unknown {
-        pending_ref: PlatformHandle::new(label).unwrap_or_else(|_| unreachable!()),
+        pending_ref: PlatformHandle::new(format!(
+            "credential-control:operation={:?}:transaction_id={}:effect_id={}:request_digest={}:reason={label}",
+            request.intent.operation,
+            request.intent.transaction_id.as_str(),
+            request.intent.effect_id.as_str(),
+            request.intent.request_digest.as_str(),
+        ))
+        .unwrap_or_else(|_| unreachable!()),
     }
 }
 
@@ -895,7 +904,7 @@ fn deleted_response(
         marker,
     ) {
         Ok(absence_digest) => HostCredentialControlResponse::Deleted { absence_digest },
-        Err(_) => unknown("credential-delete-digest"),
+        Err(_) => unknown(request, "credential-delete-digest"),
     }
 }
 
@@ -1040,6 +1049,34 @@ mod tests {
             expected_receipt: None,
             phase_b: None,
         }
+    }
+
+    #[test]
+    fn unknown_response_preserves_original_operation_and_request_digest() {
+        let request = request(HostCredentialControlOperation::Provision);
+        let response = unknown(&request, "injected-failure");
+        let HostCredentialControlResponse::Unknown { pending_ref } = response else {
+            panic!("expected Unknown response");
+        };
+        assert!(pending_ref.as_str().contains("Provision"));
+        assert!(
+            pending_ref
+                .as_str()
+                .contains(request.intent.transaction_id.as_str())
+        );
+        assert!(
+            pending_ref
+                .as_str()
+                .contains(request.intent.effect_id.as_str())
+        );
+        assert!(
+            pending_ref
+                .as_str()
+                .contains(request.intent.request_digest.as_str())
+        );
+        assert!(pending_ref.as_str().contains("injected-failure"));
+        let error_digest = sha256_hex(b"injected-failure");
+        assert!(!pending_ref.as_str().contains(&error_digest));
     }
 
     fn identity() -> InstallerRootObjectSnapshot {

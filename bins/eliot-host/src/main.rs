@@ -411,6 +411,21 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
         unsafe { SetServiceStatus(handle, &raw const status) };
         return;
     };
+    let Ok(runtime_control) = host.runtime_control() else {
+        status.dwCurrentState = SERVICE_STOPPED;
+        status.dwWin32ExitCode = 1;
+        let _ = host.stop();
+        unsafe { SetServiceStatus(handle, &raw const status) };
+        return;
+    };
+    let runtime_queue = runtime_control.queue();
+    let Ok(runtime_thread) = spawn_runtime_control(runtime_control) else {
+        status.dwCurrentState = SERVICE_STOPPED;
+        status.dwWin32ExitCode = 1;
+        let _ = host.stop();
+        unsafe { SetServiceStatus(handle, &raw const status) };
+        return;
+    };
     status.dwCurrentState = SERVICE_RUNNING;
     status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
     status.dwCheckPoint = 0;
@@ -418,6 +433,7 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
     unsafe { SetServiceStatus(handle, &raw const status) };
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
         process_phase_b_requests(&mut host, &phase_b_queue);
+        process_runtime_control_requests(&mut host, &runtime_queue);
         match host.has_durable_branch_fence() {
             Ok(true) => {
                 // A degraded branch has fenced the shared authority in the
@@ -453,6 +469,7 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
     }
     STOP_REQUESTED.store(true, Ordering::Release);
     let _ = credential_thread.join();
+    let _ = runtime_thread.join();
     status.dwCurrentState = SERVICE_STOP_PENDING;
     status.dwControlsAccepted = 0;
     status.dwCheckPoint = 1;
@@ -536,6 +553,50 @@ fn spawn_credential_control(
             }
         })
         .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
+fn spawn_runtime_control(
+    control: eliot_host::HostRuntimeControl,
+) -> Result<std::thread::JoinHandle<()>, HostError> {
+    std::thread::Builder::new()
+        .name("eliot-host-runtime-control".to_owned())
+        .spawn(move || {
+            use std::sync::atomic::Ordering;
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+            else {
+                STOP_REQUESTED.store(true, Ordering::Release);
+                return;
+            };
+            while !STOP_REQUESTED.load(Ordering::Acquire) {
+                if runtime
+                    .block_on(control.serve_one(std::time::Duration::from_millis(500)))
+                    .is_err()
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        })
+        .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
+fn process_runtime_control_requests(
+    host: &mut HostComposition,
+    queue: &eliot_host::HostRuntimeControlQueue,
+) {
+    loop {
+        let request = match queue.lock() {
+            Ok(mut q) => q.pop_front(),
+            Err(_) => None,
+        };
+        let Some(envelope) = request else { break };
+        let response = host.handle_kernel_restart_request(&envelope.request);
+        let _ = envelope.reply.send(response);
+    }
 }
 
 #[cfg(windows)]

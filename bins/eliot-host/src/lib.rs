@@ -6,10 +6,20 @@
 //! branches for Kernel and the canonical store dependency.
 
 #![forbid(unsafe_code)]
+#![allow(
+    dead_code,
+    reason = "windows-only helpers are live on Windows; allow for cross-platform check"
+)]
 
 mod credential_control;
+mod runtime_control;
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
+pub use runtime_control::{
+    HOST_RUNTIME_CONTROL_PIPE, HostKernelRestartReceipt, HostRuntimeControl,
+    HostRuntimeControlOperation, HostRuntimeControlQueue, HostRuntimeControlRequest,
+    HostRuntimeControlResponse,
+};
 
 use std::ffi::OsString;
 use std::io;
@@ -99,7 +109,11 @@ pub const HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR: &str =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostStoreRebindProductionBoundary;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostRuntimeControlProductionBoundary;
 const STORE_SEMANTIC_CONFIG_HASH_PENDING: &str = PHASE_B_PENDING_MARKER;
+pub const HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR: &str =
+    runtime_control::HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR;
 
 /// Exact launch authority supplied by the Runtime Live SCM registration.
 ///
@@ -2586,7 +2600,7 @@ struct AuthenticatedKernelReadiness {
 }
 
 #[cfg(windows)]
-pub struct HostJobBranches {
+pub(crate) struct HostJobBranches {
     kernel: Option<RunningJobChild<PlatformHandle>>,
     store: Option<RunningJobChild<PlatformHandle>>,
     kernel_identity: JobObjectIdentity,
@@ -3115,6 +3129,7 @@ where
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 impl HostJobBranches {
     /// Creates two owner-scoped Job identities.  The actual Job handles are
     /// created only by the approved suspended launch below; there is no
@@ -6193,6 +6208,33 @@ fn sha256_json(value: &impl serde::Serialize) -> Result<String, HostError> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn runtime_control_unknown_ref(
+    prefix: &str,
+    request: &HostRuntimeControlRequest,
+) -> PlatformHandle {
+    PlatformHandle::new(format!(
+        "{prefix}:operation={:?}:request_id={}:request_digest={}",
+        request.operation,
+        request.request_id.as_str(),
+        request.request_digest.as_str()
+    ))
+    .unwrap_or_else(|_| unreachable!())
+}
+
+fn phase_b_unknown_ref(
+    prefix: &str,
+    operation: &str,
+    intent: &HostPhaseBMaterializationIntent,
+) -> PlatformHandle {
+    PlatformHandle::new(format!(
+        "{prefix}:operation={operation}:transaction_id={}:effect_id={}:request_digest={}",
+        intent.transaction_id.as_str(),
+        intent.effect_id.as_str(),
+        intent.request_digest.as_str()
+    ))
+    .unwrap_or_else(|_| unreachable!())
+}
+
 fn root_epoch(lineage: PlatformHandle) -> EpochTransition {
     EpochTransition {
         current: EpochIdentity {
@@ -6243,13 +6285,58 @@ fn record_fence(
     }
 }
 
-fn terminated_prior_kernel(prior: &KernelRecord) -> Result<PriorKernelDisposition, HostError> {
+/// Checks every identity that the authoritative Job termination observation
+/// can be compared against in the durable Kernel binding.
+///
+/// The Job API gives us the terminated root process identity, image and Job
+/// name.  The durable process record supplies the authority binding that
+/// admitted that root: owner, exact PID/start handle and a non-zero authority
+/// epoch.  A match on only a non-zero PID (or only the image) would permit a
+/// substituted child to be recorded as the previous Kernel.
+fn exact_termination_binding_matches(
+    job: &KernelJobBinding,
+    expected_process: &ServiceProcessRecord,
+    observed_process_id: u32,
+    observed_start_time_100ns: u64,
+    observed_image_path: &str,
+    observed_job_name: &str,
+) -> bool {
+    observed_process_id == job.root_pid
+        && observed_start_time_100ns == job.root_start_time_100ns
+        && observed_image_path == job.root_image_path.as_str()
+        && observed_job_name == job.job_name.as_str()
+        && expected_process.owner == job.owner.as_str()
+        && expected_process.process_id
+            == format!("pid:{}:start:{}", job.root_pid, job.root_start_time_100ns)
+        && expected_process.authority_epoch.value() != 0
+}
+
+fn terminated_prior_kernel(
+    prior: &KernelRecord,
+    terminated: &eliot_platform_windows::TerminatedJobChild,
+) -> Result<PriorKernelDisposition, HostError> {
     let job = prior.candidate_job_binding.clone().ok_or_else(|| {
         HostError::OwnerLeaseRecovery("prior Kernel Job binding is absent".to_owned())
     })?;
-    let mut process = prior.process.clone().ok_or_else(|| {
+    let expected_process = prior.process.clone().ok_or_else(|| {
         HostError::OwnerLeaseRecovery("prior Kernel process binding is absent".to_owned())
     })?;
+    if !exact_termination_binding_matches(
+        &job,
+        &expected_process,
+        terminated.process().process_id,
+        terminated.process().start_time_100ns,
+        &terminated.process().image_path,
+        terminated.job_identity().name(),
+    ) || !terminated.history().complete()
+        || !terminated.job_empty()
+        || !terminated.root_reaped()
+    {
+        return Err(HostError::RecoveryRequired(
+            "Terminated Kernel evidence does not match exact durable prior binding".to_owned(),
+        ));
+    }
+    let mut process = expected_process;
     process.state = ServiceProcessState::Stopped;
     process.health = HealthVector {
         liveness: HealthDimension::Unknown,
@@ -6265,9 +6352,9 @@ fn terminated_prior_kernel(prior: &KernelRecord) -> Result<PriorKernelDispositio
         generation: prior.kernel_generation.clone(),
         job,
         process,
-        history_complete: true,
-        job_empty: true,
-        root_reaped: true,
+        history_complete: terminated.history().complete(),
+        job_empty: terminated.job_empty(),
+        root_reaped: terminated.root_reaped(),
     }))
 }
 
@@ -6877,6 +6964,124 @@ fn open_production_epoch(
     Ok((journal, host, activation_generation, activation_id))
 }
 
+#[cfg(windows)]
+fn runtime_restart_store_dir(host_state_root: &Path) -> PathBuf {
+    host_state_root.join("runtime-restarts")
+}
+
+#[cfg(windows)]
+fn runtime_restart_receipt_path(host_state_root: &Path, digest: &str) -> PathBuf {
+    runtime_restart_store_dir(host_state_root).join(format!("{digest}.receipt.json"))
+}
+
+#[cfg(windows)]
+fn runtime_restart_pending_path(host_state_root: &Path, digest: &str) -> PathBuf {
+    runtime_restart_store_dir(host_state_root).join(format!("{digest}.pending.json"))
+}
+
+#[cfg(windows)]
+fn load_durable_runtime_restarts(
+    host_state_root: &Path,
+) -> std::collections::HashMap<String, HostKernelRestartReceipt> {
+    let mut map = std::collections::HashMap::new();
+    let dir = runtime_restart_store_dir(host_state_root);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(".receipt.json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(receipt) = serde_json::from_slice::<HostKernelRestartReceipt>(&bytes) else {
+            continue;
+        };
+        if receipt.validate().is_ok() {
+            map.insert(receipt.request_digest.as_str().to_owned(), receipt);
+        }
+    }
+    map
+}
+
+#[cfg(windows)]
+fn persist_runtime_restart_pending(
+    host_state_root: &Path,
+    digest: &str,
+    host: &HostInstallationEpoch,
+) -> Result<(), HostError> {
+    let dir = runtime_restart_store_dir(host_state_root);
+    std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
+    let path = runtime_restart_pending_path(host_state_root, digest);
+    let payload = serde_json::json!({
+        "request_digest": digest,
+        "host_epoch": host.epoch.current.sequence,
+        "host_lineage": host.epoch.current.lineage.as_str(),
+        "created_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis().to_string(),
+    });
+    let tmp = dir.join(format!(".{digest}.pending.tmp"));
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(&payload).map_err(|e| HostError::Platform(e.to_string()))?,
+    )
+    .map_err(|e| HostError::Platform(e.to_string()))?;
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&tmp)
+            .map_err(|e| HostError::Platform(e.to_string()))?;
+        let _ = file.sync_all();
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| HostError::Platform(e.to_string()))?;
+    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&dir) {
+        let _ = file.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn persist_runtime_restart_receipt(
+    host_state_root: &Path,
+    receipt: &HostKernelRestartReceipt,
+) -> Result<(), HostError> {
+    let dir = runtime_restart_store_dir(host_state_root);
+    std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
+    let path = runtime_restart_receipt_path(host_state_root, receipt.request_digest.as_str());
+    let tmp = dir.join(format!(".{}.receipt.tmp", receipt.request_digest.as_str()));
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?,
+    )
+    .map_err(|e| HostError::Platform(e.to_string()))?;
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&tmp)
+            .map_err(|e| HostError::Platform(e.to_string()))?;
+        let _ = file.sync_all();
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| HostError::Platform(e.to_string()))?;
+    let pending = runtime_restart_pending_path(host_state_root, receipt.request_digest.as_str());
+    let _ = std::fs::remove_file(pending);
+    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&dir) {
+        let _ = file.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn has_runtime_restart_pending(host_state_root: &Path, digest: &str) -> bool {
+    runtime_restart_pending_path(host_state_root, digest).exists()
+}
+
 /// Host-owned lifecycle state and installation activation registry.
 #[allow(
     clippy::struct_excessive_bools,
@@ -6888,6 +7093,11 @@ pub struct HostComposition {
         reason = "zero-sized marker binds the production Store-rebind seam"
     )]
     store_rebind_boundary: HostStoreRebindProductionBoundary,
+    #[allow(
+        dead_code,
+        reason = "zero-sized marker binds the production runtime-control seam"
+    )]
+    runtime_control_boundary: HostRuntimeControlProductionBoundary,
     journal: ProductionHostStateJournal,
     registry_store: RedbInstallationRegistry,
     registry: ApprovedGenerationRegistry,
@@ -6902,6 +7112,10 @@ pub struct HostComposition {
     readiness_gate: HostReadinessGate,
     #[cfg(windows)]
     phase_b: Option<HostPhaseBMaterialization>,
+    #[cfg(windows)]
+    runtime_restarts: std::collections::HashMap<String, HostKernelRestartReceipt>,
+    #[cfg(windows)]
+    runtime_control_queue: HostRuntimeControlQueue,
     owner_lease: HostOwnerLease,
     pending_record: Option<HostStateRecord>,
     durable_finalized: bool,
@@ -7043,6 +7257,11 @@ impl HostComposition {
     #[must_use]
     pub const fn production_store_rebind_discriminator() -> &'static str {
         HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR
+    }
+
+    #[must_use]
+    pub const fn production_runtime_control_discriminator() -> &'static str {
+        HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR
     }
     fn validate_launch_options_for_manifest(
         options: &HostLaunchOptions,
@@ -7219,8 +7438,19 @@ impl HostComposition {
         #[cfg(windows)]
         let jobs =
             HostJobBranches::new(&host).map_err(|error| HostError::Platform(error.to_string()))?;
+        let durable_restarts = {
+            #[cfg(windows)]
+            {
+                load_durable_runtime_restarts(&host_state_root)
+            }
+            #[cfg(not(windows))]
+            {
+                std::collections::HashMap::new()
+            }
+        };
         let mut composition = Self {
             store_rebind_boundary: HostStoreRebindProductionBoundary,
+            runtime_control_boundary: HostRuntimeControlProductionBoundary,
             journal,
             registry_store,
             registry,
@@ -7235,6 +7465,12 @@ impl HostComposition {
             readiness_gate: HostReadinessGate::with_cadence(ReadinessCadence::default()),
             #[cfg(windows)]
             phase_b: None,
+            #[cfg(windows)]
+            runtime_restarts: durable_restarts,
+            #[cfg(windows)]
+            runtime_control_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             owner_lease,
             pending_record: None,
             durable_finalized: false,
@@ -7438,12 +7674,8 @@ impl HostComposition {
         })();
         match result {
             Ok(receipt) => HostCredentialControlResponse::PhaseBReady { receipt },
-            Err(error) => HostCredentialControlResponse::Unknown {
-                pending_ref: PlatformHandle::new(format!(
-                    "phase-b:{}",
-                    sha256_json(&error.to_string()).unwrap_or_else(|_| "phase-b-error".to_owned())
-                ))
-                .unwrap_or_else(|_| unreachable!()),
+            Err(_error) => HostCredentialControlResponse::Unknown {
+                pending_ref: phase_b_unknown_ref("phase-b", "MaterializePhaseB", intent),
             },
         }
     }
@@ -7635,15 +7867,394 @@ impl HostComposition {
         })();
         match result {
             Ok(receipt) => HostCredentialControlResponse::PhaseBReady { receipt },
-            Err(error) => HostCredentialControlResponse::Unknown {
-                pending_ref: PlatformHandle::new(format!(
-                    "phase-b-query:{}",
-                    sha256_json(&error.to_string())
-                        .unwrap_or_else(|_| "phase-b-query-error".to_owned())
-                ))
-                .unwrap_or_else(|_| unreachable!()),
+            Err(_error) => HostCredentialControlResponse::Unknown {
+                pending_ref: phase_b_unknown_ref("phase-b-query", "ReconcilePhaseB", intent),
             },
         }
+    }
+
+    #[cfg(windows)]
+    #[allow(missing_docs, clippy::missing_errors_doc)]
+    pub fn runtime_control(&self) -> Result<HostRuntimeControl, HostError> {
+        let capability = self.owner_lease.activation_capability();
+        let _guard = capability
+            .live_guard()
+            .map_err(|e| HostError::Platform(e.to_string()))?;
+        HostRuntimeControl::new_with_capability(
+            std::sync::Arc::clone(&self.runtime_control_queue),
+            &capability,
+        )
+        .map_err(HostError::Platform)
+    }
+
+    #[cfg(windows)]
+    #[allow(missing_docs)]
+    pub fn runtime_control_queue(&self) -> HostRuntimeControlQueue {
+        std::sync::Arc::clone(&self.runtime_control_queue)
+    }
+
+    #[cfg(windows)]
+    pub fn handle_kernel_restart_request(
+        &mut self,
+        request: &HostRuntimeControlRequest,
+    ) -> HostRuntimeControlResponse {
+        if self
+            .owner_lease
+            .activation_capability()
+            .live_guard()
+            .is_err()
+        {
+            return HostRuntimeControlResponse::Unknown {
+                pending_ref: runtime_control_unknown_ref("kernel-restart", request),
+            };
+        }
+        let result = self.execute_kernel_restart(request);
+        match result {
+            Ok(receipt) => HostRuntimeControlResponse::Restarted { receipt },
+            Err(_error) => HostRuntimeControlResponse::Unknown {
+                pending_ref: runtime_control_unknown_ref("kernel-restart", request),
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_lines, missing_docs)]
+    pub fn reconcile_kernel_restart_request(
+        &mut self,
+        request: &HostRuntimeControlRequest,
+    ) -> HostRuntimeControlResponse {
+        if self
+            .owner_lease
+            .activation_capability()
+            .live_guard()
+            .is_err()
+        {
+            return HostRuntimeControlResponse::Unknown {
+                pending_ref: runtime_control_unknown_ref("kernel-restart-reconcile", request),
+            };
+        }
+        if request.validate().is_err() {
+            return HostRuntimeControlResponse::Unknown {
+                pending_ref: runtime_control_unknown_ref("kernel-restart-reconcile", request),
+            };
+        }
+        let key = request.request_digest.as_str().to_owned();
+        if let Some(receipt) = self.runtime_restarts.get(&key).cloned() {
+            return HostRuntimeControlResponse::Restarted { receipt };
+        }
+        if has_runtime_restart_pending(self.launch_options.host_state_root(), &key) {
+            return HostRuntimeControlResponse::Unknown {
+                pending_ref: runtime_control_unknown_ref("kernel-restart-pending", request),
+            };
+        }
+        let snapshot = match self.journal.snapshot() {
+            Ok(s) => s,
+            Err(_e) => {
+                return HostRuntimeControlResponse::Unknown {
+                    pending_ref: runtime_control_unknown_ref(
+                        "kernel-restart-reconcile-snapshot",
+                        request,
+                    ),
+                };
+            }
+        };
+        if let Some(kernel) = snapshot.kernel.as_ref() {
+            if let Some(expected) = self
+                .runtime_restarts
+                .values()
+                .find(|r| r.request_digest == request.request_digest)
+            {
+                let expected_receipt = expected.clone();
+                return HostRuntimeControlResponse::Restarted {
+                    receipt: expected_receipt,
+                };
+            }
+            let _ = kernel;
+        }
+        HostRuntimeControlResponse::Unknown {
+            pending_ref: runtime_control_unknown_ref("kernel-restart-reconcile-unknown", request),
+        }
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::map_unwrap_or,
+        clippy::needless_borrow,
+        missing_docs
+    )]
+    fn execute_kernel_restart(
+        &mut self,
+        request: &HostRuntimeControlRequest,
+    ) -> Result<HostKernelRestartReceipt, HostError> {
+        request.validate().map_err(HostError::ProcessContour)?;
+        if request.operation != HostRuntimeControlOperation::RestartKernel {
+            return Err(HostError::ProcessContour(
+                "unsupported runtime-control operation".to_owned(),
+            ));
+        }
+        let key = request.request_digest.as_str().to_owned();
+        if let Some(existing) = self.runtime_restarts.get(&key).cloned() {
+            return Ok(existing);
+        }
+        if has_runtime_restart_pending(self.launch_options.host_state_root(), &key) {
+            return Err(HostError::RecoveryRequired(
+                "Kernel restart intent is pending and outcome is unknown; reconcile required"
+                    .to_owned(),
+            ));
+        }
+        self.ensure_admission_open()?;
+        let capability = self.owner_lease.activation_capability();
+        let guard = capability
+            .live_guard()
+            .map_err(|e| HostError::Platform(e.to_string()))?;
+        persist_runtime_restart_pending(self.launch_options.host_state_root(), &key, &self.host)?;
+        drop(guard);
+        drop(capability);
+        let store_before = self.jobs.store_process().cloned().ok_or_else(|| {
+            HostError::ProcessContour("Store process is missing before Kernel restart".to_owned())
+        })?;
+        let store_job_before = self.jobs.store_name().to_owned();
+        let store_fence_before = self
+            .journal
+            .snapshot()?
+            .readiness_observations
+            .last()
+            .map(|o| o.store_fence.clone())
+            .unwrap_or_else(|| PlatformHandle::new("0".repeat(64)).unwrap());
+        let current_kernel =
+            self.journal.snapshot()?.kernel.clone().ok_or_else(|| {
+                HostError::ProcessContour("no active Kernel to restart".to_owned())
+            })?;
+        if current_kernel.state != KernelActivationState::Active {
+            return Err(HostError::ProcessContour(
+                "Kernel is not Active; restart requires Active".to_owned(),
+            ));
+        }
+        if current_kernel.process.is_none() || current_kernel.candidate_job_binding.is_none() {
+            return Err(HostError::OwnerLeaseRecovery(
+                "prior Kernel process/job binding is absent; cannot prove termination".to_owned(),
+            ));
+        }
+        let old_generation = current_kernel.kernel_generation.clone();
+        let host_clone = self.host.clone();
+        let activation_id = self.activation_id.clone();
+        let activation_generation = self.activation_generation.clone();
+        let terminated_child = {
+            let kernel_mut = self
+                .jobs
+                .kernel
+                .as_mut()
+                .ok_or_else(|| HostError::ProcessContour("Kernel Job is missing".to_owned()))?;
+            kernel_mut
+                .terminate_in_place(0xE017_0001)
+                .map_err(|e| HostError::RecoveryRequired(e.to_string()))?
+        };
+        if !terminated_child.job_empty() || !terminated_child.root_reaped() {
+            return Err(HostError::RecoveryRequired(
+                "Kernel termination did not produce job-empty/root-reaped evidence".to_owned(),
+            ));
+        }
+        if terminated_child.process().process_id == 0
+            || terminated_child.process().start_time_100ns == 0
+        {
+            return Err(HostError::RecoveryRequired(
+                "Terminated Kernel child has invalid identity".to_owned(),
+            ));
+        }
+        self.jobs.kernel.take();
+        let fail_driver =
+            DurableKernelActivationDriver::resume(&self.journal, current_kernel.clone());
+        let fail_result = {
+            let mut driver = fail_driver;
+            driver.fail(&format!(
+                "kernel-restart:{}",
+                request.request_digest.as_str()
+            ))
+        };
+        match fail_result {
+            Ok(()) => {}
+            Err(HostError::Journal(JournalError::OutcomeUnknown { transaction_id })) => {
+                match self.journal.reconcile(&transaction_id)? {
+                    ReconcileOutcome::Committed => {
+                        let _ = self.journal.reconcile(&transaction_id);
+                    }
+                    ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
+                        return Err(HostError::Journal(JournalError::OutcomeUnknown {
+                            transaction_id,
+                        }));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        let (next_prior, kernel_generation, kernel_authority_epoch) = self
+            .next_kernel_activation_context(
+                self.jobs
+                    .launch
+                    .as_ref()
+                    .ok_or_else(|| HostError::ProcessContour("launch missing".to_owned()))?
+                    .authority_state_fence
+                    .authority_epoch,
+                Some(&terminated_child),
+            )?;
+        let prior_kernel = terminated_prior_kernel(&current_kernel, &terminated_child)?;
+        if !matches!(prior_kernel, PriorKernelDisposition::Terminated(_))
+            || !matches!(next_prior, PriorKernelDisposition::Terminated(_))
+        {
+            return Err(HostError::ProcessContour(
+                "next context did not prove terminated".to_owned(),
+            ));
+        }
+        if prior_kernel != next_prior {
+            return Err(HostError::RecoveryRequired(
+                "Prior kernel disposition does not match durable terminated evidence".to_owned(),
+            ));
+        }
+        let active_manifest = self
+            .registry
+            .active()
+            .ok_or_else(|| HostError::ProcessContour("no active manifest".to_owned()))?
+            .manifest
+            .clone();
+        let (kernel_artifact, _) = active_manifest
+            .host_child_artifact_digests()
+            .map_err(|e| HostError::ProcessContour(e.to_string()))?;
+        let config_digest = self
+            .jobs
+            .config_digest
+            .clone()
+            .ok_or_else(|| HostError::ProcessContour("config digest missing".to_owned()))?;
+        let config_path = self
+            .jobs
+            .config_path
+            .clone()
+            .ok_or_else(|| HostError::ProcessContour("config path missing".to_owned()))?;
+        let approved_kernel_path = active_manifest.host_child_paths().0;
+        let new_child = self.jobs.relaunch_kernel(
+            &active_manifest.generation,
+            &config_digest,
+            &config_path,
+            &kernel_artifact,
+            &approved_kernel_path,
+            &active_manifest.host_child_paths().2,
+            &host_clone,
+        )?;
+        self.jobs.kernel = Some(new_child);
+        let launch_generation = active_manifest.generation.clone();
+        let complete_result = self.jobs.complete_kernel_control(
+            &launch_generation,
+            &host_clone,
+            &self.journal,
+            &activation_id,
+            &activation_generation,
+            prior_kernel,
+            kernel_generation.clone(),
+            kernel_authority_epoch,
+        );
+        let (activation_receipt, ready_receipt) = match complete_result {
+            Ok(v) => v,
+            Err(HostError::Journal(JournalError::OutcomeUnknown { transaction_id })) => {
+                let query = KernelActivationQuery {
+                    operation_id: PlatformHandle::new(
+                        kernel_generation.current.lineage.as_str().to_owned(),
+                    )
+                    .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap()),
+                    activate_request_digest: transaction_id.as_str().to_owned(),
+                };
+                let _ = self.journal.reconcile(&transaction_id)?;
+                let _ = query;
+                return Err(HostError::Journal(JournalError::OutcomeUnknown {
+                    transaction_id,
+                }));
+            }
+            Err(e) => {
+                let _ = self.jobs.terminate_kernel();
+                return Err(e);
+            }
+        };
+        let store_after =
+            self.jobs.store_process().cloned().ok_or_else(|| {
+                HostError::ProcessContour("Store missing after restart".to_owned())
+            })?;
+        if store_before.process_id != store_after.process_id
+            || store_before.start_time_100ns != store_after.start_time_100ns
+            || store_before.image_path != store_after.image_path
+            || store_job_before != self.jobs.store_name()
+        {
+            return Err(HostError::ProcessContour(
+                "Store PID/start/image/Job changed during Kernel restart".to_owned(),
+            ));
+        }
+        let store_snapshot_before = store_fence_before;
+        let store_snapshot_after = self
+            .journal
+            .snapshot()?
+            .readiness_observations
+            .last()
+            .map(|o| o.store_fence.clone())
+            .unwrap_or(store_snapshot_before.clone());
+        if store_snapshot_before != store_snapshot_after
+            && !store_snapshot_after.as_str().is_empty()
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store fence changed during Kernel restart; exact unchanged fence required"
+                    .to_owned(),
+            ));
+        }
+        let ready_digest =
+            PlatformHandle::new(sha256_json(&ready_receipt).unwrap_or_else(|_| "0".repeat(64)))
+                .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap());
+        let activation_digest = PlatformHandle::new(
+            sha256_json(&activation_receipt).unwrap_or_else(|_| "0".repeat(64)),
+        )
+        .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap());
+        let store_fence = self
+            .journal
+            .snapshot()?
+            .readiness_observations
+            .last()
+            .map(|o| o.store_fence.clone())
+            .unwrap_or_else(|| PlatformHandle::new("0".repeat(64)).unwrap());
+        let old_gen_handle = PlatformHandle::new(format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "{}:{}",
+                    old_generation.current.lineage.as_str(),
+                    old_generation.current.sequence
+                )
+                .as_bytes()
+            )
+        ))
+        .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap());
+        let new_gen_handle = PlatformHandle::new(format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "{}:{}",
+                    kernel_generation.current.lineage.as_str(),
+                    kernel_generation.current.sequence
+                )
+                .as_bytes()
+            )
+        ))
+        .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap());
+        let mut receipt = HostKernelRestartReceipt {
+            request_digest: request.request_digest.clone(),
+            old_kernel_generation: old_gen_handle,
+            new_kernel_generation: new_gen_handle,
+            store_fence,
+            activation_receipt_digest: activation_digest,
+            ready_receipt_digest: ready_digest,
+            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+        };
+        receipt.receipt_digest = receipt.computed_digest().map_err(HostError::Platform)?;
+        receipt.validate().map_err(HostError::Platform)?;
+        persist_runtime_restart_receipt(self.launch_options.host_state_root(), &receipt)?;
+        self.runtime_restarts.insert(key, receipt.clone());
+        self.readiness_gate.branch_degraded();
+        Ok(receipt)
     }
 
     /// Returns the canonical owner-object name held for this composition.
@@ -8808,6 +9419,7 @@ impl HostComposition {
     fn next_kernel_activation_context(
         &self,
         manifest_authority_epoch: AuthorityEpoch,
+        termination: Option<&eliot_platform_windows::TerminatedJobChild>,
     ) -> Result<(PriorKernelDisposition, EpochTransition, AuthorityEpoch), HostError> {
         let state = self.journal.snapshot()?;
         if state.prior_kernel_unknown {
@@ -8856,7 +9468,15 @@ impl HostComposition {
                 })?);
         let authority = AuthorityEpoch::new(next_authority_value)
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        Ok((terminated_prior_kernel(prior)?, generation, authority))
+        let prior_disposition = terminated_prior_kernel(
+            prior,
+            termination.ok_or_else(|| {
+                HostError::OwnerLeaseRecovery(
+                    "authoritative prior Kernel termination evidence is unavailable".to_owned(),
+                )
+            })?,
+        )?;
+        Ok((prior_disposition, generation, authority))
     }
 
     #[cfg(windows)]
@@ -8878,7 +9498,7 @@ impl HostComposition {
         manifest_authority_epoch: AuthorityEpoch,
     ) -> Result<KernelReadyReceipt, HostError> {
         let (prior_kernel, kernel_generation, kernel_authority_epoch) =
-            self.next_kernel_activation_context(manifest_authority_epoch)?;
+            self.next_kernel_activation_context(manifest_authority_epoch, None)?;
         let (_, receipt) = self.jobs.complete_kernel_control(
             generation,
             &self.host,
@@ -9064,7 +9684,10 @@ impl HostComposition {
             manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
         let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
-            .next_kernel_activation_context(phase_b.launch.authority_state_fence.authority_epoch)?;
+            .next_kernel_activation_context(
+                phase_b.launch.authority_state_fence.authority_epoch,
+                None,
+            )?;
         self.jobs.start_approved(
             kernel_executable,
             store_executable,
@@ -10212,6 +10835,7 @@ impl HostComposition {
             let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
                 .next_kernel_activation_context(
                     live_launch.authority_state_fence.authority_epoch,
+                    None,
                 )?;
             if let Err(error) = self.jobs.complete_kernel_control(
                 &active.manifest.generation,
@@ -10784,7 +11408,8 @@ impl HostComposition {
     #[cfg(windows)]
     /// Returns the physical Host job branches for service composition.
     #[must_use]
-    pub const fn jobs(&self) -> &HostJobBranches {
+    #[allow(dead_code)]
+    pub(crate) const fn jobs(&self) -> &HostJobBranches {
         &self.jobs
     }
 }
@@ -11825,6 +12450,104 @@ mod journal_tests {
             None,
         )
         .unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn production_termination_binding_rejects_root_and_authority_substitution() {
+        let job = KernelJobBinding {
+            job_name: PlatformHandle::new("eliot-kernel-job").unwrap(),
+            owner: PlatformHandle::new("Kernel").unwrap(),
+            root_pid: 42,
+            root_start_time_100ns: 10,
+            root_image_path: PlatformHandle::new("C:\\eliot\\eliot-kernel.exe").unwrap(),
+            root_volume_serial_number: 7,
+            root_file_index: 11,
+        };
+        let process = ServiceProcessRecord {
+            process_id: "pid:42:start:10".to_owned(),
+            owner: "Kernel".to_owned(),
+            state: ServiceProcessState::Starting,
+            health: HealthVector::healthy(),
+            authority_epoch: AuthorityEpoch::new(7).unwrap(),
+        };
+        let matches = |process_id, start_time, image, job_name, expected| {
+            exact_termination_binding_matches(
+                &job, expected, process_id, start_time, image, job_name,
+            )
+        };
+        assert!(matches(
+            42,
+            10,
+            "C:\\eliot\\eliot-kernel.exe",
+            "eliot-kernel-job",
+            &process,
+        ));
+        assert!(!matches(
+            43,
+            10,
+            "C:\\eliot\\eliot-kernel.exe",
+            "eliot-kernel-job",
+            &process,
+        ));
+        assert!(!matches(
+            42,
+            11,
+            "C:\\eliot\\eliot-kernel.exe",
+            "eliot-kernel-job",
+            &process,
+        ));
+        assert!(!matches(
+            42,
+            10,
+            "C:\\eliot\\substituted.exe",
+            "eliot-kernel-job",
+            &process,
+        ));
+        assert!(!matches(
+            42,
+            10,
+            "C:\\eliot\\eliot-kernel.exe",
+            "substituted-job",
+            &process,
+        ));
+
+        let mut substituted_authority = process.clone();
+        substituted_authority.owner = "Store".to_owned();
+        assert!(!matches(
+            42,
+            10,
+            "C:\\eliot\\eliot-kernel.exe",
+            "eliot-kernel-job",
+            &substituted_authority,
+        ));
+        let mut substituted_process_id = process.clone();
+        substituted_process_id.process_id = "pid:99:start:10".to_owned();
+        assert!(!matches(
+            42,
+            10,
+            "C:\\eliot\\eliot-kernel.exe",
+            "eliot-kernel-job",
+            &substituted_process_id,
+        ));
+    }
+
+    #[test]
+    fn runtime_control_unknown_ref_preserves_request_identity_across_reopen() {
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("reopen-request-17").unwrap(),
+        )
+        .unwrap();
+        let pending_ref = runtime_control_unknown_ref("kernel-restart-reconcile", &request);
+        assert!(pending_ref.as_str().contains("RestartKernel"));
+        assert!(pending_ref.as_str().contains(request.request_id.as_str()));
+        assert!(
+            pending_ref
+                .as_str()
+                .contains(request.request_digest.as_str())
+        );
+        let error_digest = sha256_json(&"injected-failure").unwrap();
+        assert!(!pending_ref.as_str().contains(&error_digest));
     }
 
     #[cfg(windows)]
@@ -13845,6 +14568,82 @@ mod journal_tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn durable_runtime_restart_physical_reopen_reconciles_exact_receipt_without_resend_and_pending_unknown()
+     {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-runtime-restart-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let completed_digest = "aa".repeat(32);
+        let pending_digest = "bb".repeat(32);
+        let mut receipt = HostKernelRestartReceipt {
+            request_digest: PlatformHandle::new(completed_digest.clone()).unwrap(),
+            old_kernel_generation: PlatformHandle::new("a".repeat(64)).unwrap(),
+            new_kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("c".repeat(64)).unwrap(),
+            activation_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
+            ready_receipt_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+        };
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        assert!(receipt.validate().is_ok());
+        persist_runtime_restart_receipt(&root, &receipt).unwrap();
+        assert!(!has_runtime_restart_pending(&root, &completed_digest));
+        let host = test_host();
+        persist_runtime_restart_pending(&root, &pending_digest, &host).unwrap();
+        assert!(has_runtime_restart_pending(&root, &pending_digest));
+        let stray_pending_path = runtime_restart_pending_path(&root, &completed_digest);
+        assert!(
+            !stray_pending_path.exists(),
+            "completed receipt must delete pending"
+        );
+        let reopened = load_durable_runtime_restarts(&root);
+        assert_eq!(
+            reopened.len(),
+            1,
+            "receipt filter must not load pending as receipt"
+        );
+        let loaded = reopened
+            .get(&completed_digest)
+            .expect("receipt survives reopen");
+        assert_eq!(loaded.receipt_digest, receipt.receipt_digest);
+        assert_eq!(loaded.request_digest.as_str(), completed_digest);
+        let mut executor_calls = 0usize;
+        let reconciled = if let Some(existing) = reopened.get(&completed_digest).cloned() {
+            existing
+        } else {
+            executor_calls += 1;
+            receipt.clone()
+        };
+        assert_eq!(executor_calls, 0);
+        assert_eq!(reconciled.receipt_digest, receipt.receipt_digest);
+        assert!(!reopened.contains_key(&pending_digest));
+        let pending_is_unknown = has_runtime_restart_pending(&root, &pending_digest)
+            && !reopened.contains_key(&pending_digest);
+        assert!(pending_is_unknown, "pending-only must remain Unknown");
+        let pending_reconcile = if reopened.contains_key(&pending_digest) {
+            "Restarted"
+        } else if has_runtime_restart_pending(&root, &pending_digest) {
+            "Unknown"
+        } else {
+            "Missing"
+        };
+        assert_eq!(pending_reconcile, "Unknown");
+        let fake_receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+        std::fs::write(
+            runtime_restart_pending_path(&root, "cc".repeat(32).as_str()),
+            &fake_receipt_bytes,
+        )
+        .unwrap();
+        let reopened_again = load_durable_runtime_restarts(&root);
+        assert_eq!(reopened_again.len(), 1);
+        assert!(!reopened_again.contains_key(&"cc".repeat(32)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
