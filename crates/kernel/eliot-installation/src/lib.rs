@@ -21428,25 +21428,20 @@ mod tests {
             })
             .unwrap();
         assert!(watchdog_index < host_index, "Watchdog must precede Host");
-        // Pending transaction should have service_start_proof as None initially but deadline set after intent
-        // Verify ordering and that unknown handling would preserve intent (covered by existing exhaustive tests)
-        // This test verifies the canonical ordering is preserved and that a pending start remains IntentCommitted
-        // until authoritative Running readback, without synthesizing success.
+        // The planned start effects remain pending and carry no deadline until
+        // the coordinator durably commits their individual intents.
         let watchdog_deadline =
             transaction.effect_progress[watchdog_index].service_start_deadline_ms;
         let host_deadline = transaction.effect_progress[host_index].service_start_deadline_ms;
-        assert!(watchdog_deadline.is_some() || host_deadline.is_some() || true);
+        assert!(watchdog_deadline.is_none());
+        assert!(host_deadline.is_none());
         assert!(matches!(
-            transaction.effect_progress[watchdog_index].state,
-            InstallationEffectProgressState::IntentCommitted { .. }
-                | InstallationEffectProgressState::Pending { .. }
-                | InstallationEffectProgressState::Applied { .. }
+            &transaction.effect_progress[watchdog_index].state,
+            InstallationEffectProgressState::Pending
         ));
         assert!(matches!(
-            transaction.effect_progress[host_index].state,
-            InstallationEffectProgressState::IntentCommitted { .. }
-                | InstallationEffectProgressState::Pending { .. }
-                | InstallationEffectProgressState::Applied { .. }
+            &transaction.effect_progress[host_index].state,
+            InstallationEffectProgressState::Pending
         ));
         // Exact unknown preservation is covered by existing exhaustive coordinator tests;
         // this fixture ensures the canonical order is not synthesized away.
