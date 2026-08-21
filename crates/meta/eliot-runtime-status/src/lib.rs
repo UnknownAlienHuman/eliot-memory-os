@@ -2481,7 +2481,7 @@ mod honest_tests {
             authority_descriptor_digest: fixture_handle("7".repeat(64)),
             runtime_state_roots: runtime_state_roots.clone(),
             kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
-            kernel_artifact_digest: fixture_handle("0".repeat(64)),
+            kernel_artifact_digest: fixture_handle("d".repeat(64)),
             eliotd_executable_path: fixture_path(&portable_root, "eliotd.exe"),
             eliotd_artifact_digest: fixture_handle("8".repeat(64)),
             eliotd_config_path: fixture_path(&portable_root, "eliotd-governor.json"),
@@ -2511,7 +2511,7 @@ mod honest_tests {
                 fixture_handle("--authority-descriptor-sha256"),
                 fixture_handle("7".repeat(64)),
                 fixture_handle("--kernel-artifact-sha256"),
-                fixture_handle("0".repeat(64)),
+                fixture_handle("d".repeat(64)),
                 fixture_handle("--eliotd-descriptor"),
                 fixture_path(&portable_root, "eliotd.json"),
                 fixture_handle("--eliotd-descriptor-sha256"),
@@ -2547,7 +2547,7 @@ mod honest_tests {
             host_artifact_digest: fixture_handle("8".repeat(64)),
             watchdog_executable_path: fixture_path(&portable_root, "eliot-watchdog.exe"),
             watchdog_artifact_digest: fixture_handle("4".repeat(64)),
-            descriptor_digest: fixture_handle("0".repeat(64)),
+            descriptor_digest: fixture_handle("f".repeat(64)),
         };
         runtime_launch = runtime_launch
             .with_computed_digest()
@@ -2558,7 +2558,7 @@ mod honest_tests {
                 fixture_handle("component:kernel"),
                 fixture_handle("component:store"),
             ],
-            kernel_artifact_digest: fixture_handle("0".repeat(64)),
+            kernel_artifact_digest: fixture_handle("d".repeat(64)),
             store_bridge_artifact_digest: fixture_handle("1".repeat(64)),
             canonical_store_artifact_digest: fixture_handle("5".repeat(64)),
             host_artifact_digest: fixture_handle("8".repeat(64)),

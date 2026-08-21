@@ -52,10 +52,10 @@ use eliot_kernel_service::{
     EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
     HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationPermit,
     KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
-    KernelControlResponse, KernelReadyReceipt, KernelServiceState, RestartBudget,
-    StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
-    StoreRebindReceipt, control_request_frame, decode_control_response_frame,
-    ProcessAuthorityHandoffDescriptor, semantic_store_config_hash_from_json,
+    KernelControlResponse, KernelReadyReceipt, KernelServiceState,
+    ProcessAuthorityHandoffDescriptor, RestartBudget, StoreBootstrapHandoff, StoreProcessBinding,
+    StoreRebindHandoff, StoreRebindQuery, StoreRebindReceipt, control_request_frame,
+    decode_control_response_frame, semantic_store_config_hash_from_json,
 };
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
