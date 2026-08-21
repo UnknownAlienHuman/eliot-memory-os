@@ -2823,6 +2823,20 @@ pub fn collect_status_with_observers(
         ));
     }
     check_deadline(deadline)?;
+    // Classify a genuinely absent caller-selected root before the protected
+    // contour adapter runs.  An absent path cannot be admitted, and
+    // `ProtectedRootLease` intentionally reports both a missing path and an
+    // out-of-contour path through adapter errors; probing existence first keeps
+    // the public status contract honest without relaxing containment for any
+    // existing path.
+    if matches!(
+        std::fs::symlink_metadata(host_state_root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Err(StatusError::Unavailable(
+            "host-state-root does not exist; status never creates it".to_owned(),
+        ));
+    }
     let retained_root = eliot_platform_windows::ProtectedRootLease::open_existing(host_state_root)
         .map_err(|e| {
             let msg = e.to_string().to_ascii_lowercase();
