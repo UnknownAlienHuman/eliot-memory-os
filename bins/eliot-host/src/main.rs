@@ -350,6 +350,16 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
                 return;
             }
         };
+    if let Err(error) = eliot_host::validate_host_scm_bootstrap(&launch_options) {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "eliot-host: invalid SCM registration: {error}"
+        );
+        status.dwCurrentState = SERVICE_STOPPED;
+        status.dwWin32ExitCode = 1;
+        unsafe { SetServiceStatus(handle, &raw const status) };
+        return;
+    }
     let reporter = match HostStartPendingReporter::start(handle) {
         Ok(reporter) => reporter,
         Err(error) => {
