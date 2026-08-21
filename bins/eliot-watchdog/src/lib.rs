@@ -20,8 +20,8 @@ use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationProfile,
     InstallerServiceRegistrationApproval, InstallerServiceRole, PendingActivationState,
     RedbInstallationRegistry, RuntimeStateRoots, ValidatedRuntimeRootLeases,
-    WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider, verify_file_digest,
-    verify_file_digest_with_lease,
+    WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider, phase_b_scm_selector,
+    verify_file_digest, verify_file_digest_with_lease,
 };
 use eliot_ors::{SupervisionLeaseSnapshot, read_current_supervision_lease_read_only};
 use eliot_platform_windows::{
@@ -2564,13 +2564,16 @@ fn manifest_matches_bootstrap(
     bootstrap: &ServiceBootstrapArguments,
 ) -> bool {
     let launch = &manifest.runtime_launch;
+    let expected_descriptor_digest = phase_b_scm_selector(&launch.authority_descriptor_digest).ok();
     bootstrap.host_state_root().is_some_and(|host_state_root| {
         windows_paths_equal(
             host_state_root,
             Path::new(launch.runtime_state_roots.host_state_root.as_str()),
         )
     }) && bootstrap.config_descriptor_path() == Path::new(launch.authority_descriptor_path.as_str())
-        && bootstrap.config_descriptor_digest() == launch.authority_descriptor_digest.as_str()
+        && expected_descriptor_digest
+            .as_ref()
+            .is_some_and(|expected| bootstrap.config_descriptor_digest() == expected.as_str())
         && bootstrap.installation_id() == launch.installation_epoch.installation.as_str()
         && bootstrap.transaction_plan_generation() == launch.authority_generation.value()
 }
@@ -2619,6 +2622,7 @@ fn service_approval_matches_manifest(
         InstallerServiceRole::Host => launch.host_executable_path.as_str(),
         InstallerServiceRole::Watchdog => launch.watchdog_executable_path.as_str(),
     };
+    let expected_descriptor_digest = phase_b_scm_selector(&launch.authority_descriptor_digest).ok();
     approval.generation() == &manifest.generation
         && approval.role() == role
         && request.service_name()
@@ -2630,7 +2634,9 @@ fn service_approval_matches_manifest(
             bootstrap.config_descriptor_path(),
             Path::new(launch.authority_descriptor_path.as_str()),
         )
-        && bootstrap.config_descriptor_digest() == launch.authority_descriptor_digest.as_str()
+        && expected_descriptor_digest
+            .as_ref()
+            .is_some_and(|expected| bootstrap.config_descriptor_digest() == expected.as_str())
         && bootstrap.installation_id() == launch.installation_epoch.installation.as_str()
         && bootstrap.transaction_plan_generation() == launch.authority_generation.value()
         && windows_paths_equal(
@@ -3453,6 +3459,153 @@ mod tests {
             "runtime_launch": descriptor
         }))
         .unwrap_or_else(|error| panic!("manifest fixture: {error}"))
+    }
+
+    fn bootstrap_fixture(digest: &str) -> ServiceBootstrapArguments {
+        ServiceBootstrapArguments::new(
+            PathBuf::from(r"C:\ProgramData\Eliot\config\watchdog.json"),
+            digest,
+            "installation-7",
+            7,
+            std::iter::empty::<String>(),
+        )
+        .and_then(|value| {
+            value.with_host_state_root(PathBuf::from(
+                r"C:\ProgramData\Eliot\installations\installation-7\host",
+            ))
+        })
+        .unwrap_or_else(|error| panic!("bootstrap fixture: {error}"))
+    }
+
+    fn manifest_with_authority_digest(
+        bootstrap: &ServiceBootstrapArguments,
+        authority_digest: &str,
+    ) -> CandidateManifest {
+        let mut wire = serde_json::to_value(manifest_fixture(bootstrap, "generation-7"))
+            .unwrap_or_else(|error| panic!("serialize manifest fixture: {error}"));
+        wire["runtime_launch"]["authority_descriptor_digest"] =
+            serde_json::Value::String(authority_digest.to_owned());
+        serde_json::from_value(wire)
+            .unwrap_or_else(|error| panic!("authority digest fixture: {error}"))
+    }
+
+    fn bind_manifest_host_image(
+        manifest: CandidateManifest,
+        request: &ServiceRegistrationRequest,
+    ) -> CandidateManifest {
+        let mut wire = serde_json::to_value(manifest)
+            .unwrap_or_else(|error| panic!("serialize service manifest fixture: {error}"));
+        wire["runtime_launch"]["host_executable_path"] =
+            serde_json::Value::String(request.binary_path().to_string_lossy().into_owned());
+        serde_json::from_value(wire)
+            .unwrap_or_else(|error| panic!("service manifest fixture: {error}"))
+    }
+
+    #[test]
+    fn pending_phase_b_marker_is_accepted_by_both_watchdog_bootstrap_paths() {
+        let bootstrap = bootstrap_fixture(eliot_installation::PHASE_B_PENDING_SCM_DIGEST);
+        let (approval, request) = installer_approval_fixture_for_bootstrap(
+            InstallerServiceRole::Host,
+            &"b".repeat(64),
+            &bootstrap,
+        );
+        let manifest = bind_manifest_host_image(
+            manifest_with_authority_digest(&bootstrap, eliot_installation::PHASE_B_PENDING_MARKER),
+            &request,
+        );
+        let approved_bootstrap = request
+            .bootstrap()
+            .unwrap_or_else(|| panic!("approval bootstrap fixture is missing"));
+
+        assert_eq!(
+            phase_b_scm_selector(&manifest.runtime_launch.authority_descriptor_digest)
+                .unwrap_or_else(|error| panic!("pending selector canonicalization: {error}"))
+                .as_str(),
+            approved_bootstrap.config_descriptor_digest()
+        );
+        assert!(manifest_matches_bootstrap(&manifest, approved_bootstrap));
+        assert!(service_approval_matches_manifest(
+            &approval,
+            &request,
+            &manifest,
+            InstallerServiceRole::Host
+        ));
+    }
+
+    #[test]
+    fn raw_or_substituted_phase_b_selector_is_rejected() {
+        let bootstrap = bootstrap_fixture(eliot_installation::PHASE_B_PENDING_SCM_DIGEST);
+        let (approval, request) = installer_approval_fixture_for_bootstrap(
+            InstallerServiceRole::Host,
+            &"b".repeat(64),
+            &bootstrap,
+        );
+        let manifest = bind_manifest_host_image(
+            manifest_with_authority_digest(&bootstrap, eliot_installation::PHASE_B_PENDING_MARKER),
+            &request,
+        );
+        let raw_bootstrap = ServiceBootstrapArguments::new(
+            bootstrap.config_descriptor_path().to_path_buf(),
+            eliot_installation::PHASE_B_PENDING_MARKER,
+            bootstrap.installation_id(),
+            bootstrap.transaction_plan_generation(),
+            std::iter::empty::<String>(),
+        );
+        assert!(raw_bootstrap.is_err());
+
+        let substituted_bootstrap = bootstrap_fixture(&"c".repeat(64))
+            .with_registration_nonce("d".repeat(64))
+            .unwrap_or_else(|error| panic!("substituted bootstrap fixture: {error}"));
+        assert!(!manifest_matches_bootstrap(
+            &manifest,
+            &substituted_bootstrap
+        ));
+        let substituted_request = ServiceRegistrationRequest::with_bootstrap(
+            request.service_name(),
+            request.display_name(),
+            request.binary_path().to_path_buf(),
+            request.start_mode(),
+            request.account(),
+            substituted_bootstrap,
+        )
+        .unwrap_or_else(|error| panic!("substituted request fixture: {error}"));
+        assert!(!service_approval_matches_manifest(
+            &approval,
+            &substituted_request,
+            &manifest,
+            InstallerServiceRole::Host
+        ));
+    }
+
+    #[test]
+    fn verified_phase_b_marker_remains_an_exact_selector() {
+        let bootstrap = bootstrap_fixture(&"a".repeat(64));
+        let (approval, request) = installer_approval_fixture_for_bootstrap(
+            InstallerServiceRole::Host,
+            &"b".repeat(64),
+            &bootstrap,
+        );
+        let manifest = bind_manifest_host_image(
+            manifest_with_authority_digest(&bootstrap, bootstrap.config_descriptor_digest()),
+            &request,
+        );
+        let approved_bootstrap = request
+            .bootstrap()
+            .unwrap_or_else(|| panic!("approval bootstrap fixture is missing"));
+        let selector = phase_b_scm_selector(&manifest.runtime_launch.authority_descriptor_digest)
+            .unwrap_or_else(|error| panic!("verified selector canonicalization: {error}"));
+
+        assert_eq!(
+            selector.as_str(),
+            manifest.runtime_launch.authority_descriptor_digest.as_str()
+        );
+        assert!(manifest_matches_bootstrap(&manifest, approved_bootstrap));
+        assert!(service_approval_matches_manifest(
+            &approval,
+            &request,
+            &manifest,
+            InstallerServiceRole::Host
+        ));
     }
 
     #[test]
