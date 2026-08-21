@@ -395,6 +395,145 @@ impl SupervisionLeaseStageReceipt {
     }
 }
 
+/// Durable terminal disposition for a supervision ticket which never crossed
+/// the signed-lease commit linearization point.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SupervisionLeaseStageResolutionDisposition {
+    /// The active ticket's signed validity window elapsed before ORS commit.
+    Expired,
+    /// An explicit pre-commit abort released the exact staged ticket.
+    Aborted,
+}
+
+/// Exact durable state observed while reconciling one supervision ticket.
+///
+/// This is a read/recovery projection, not a second authority record. Each
+/// variant retains the authoritative ORS value which caused the decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SupervisionLeaseTicketReconciliation {
+    /// The exact ticket remains staged and must be resumed with the same
+    /// signer authority.
+    Staged(SupervisionLeaseStageReceipt),
+    /// The exact ticket already crossed the ORS commit linearization point.
+    Committed(Box<SupervisionLeaseSnapshot>),
+    /// The exact ticket was durably released without publishing authority.
+    Resolved(SupervisionLeaseStageResolution),
+}
+
+/// Immutable ORS evidence that one exact staged ticket was released without
+/// publishing lease authority.
+///
+/// A resolution is keyed by `ticket_id`, retains the full ticket and its
+/// canonical digest, and is written atomically with stage removal.  Its
+/// presence therefore prevents a missing staged row from being interpreted as
+/// permission to retry or replace an unknown authority operation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionLeaseStageResolution {
+    pub ticket: SupervisionLeaseCommitTicket,
+    pub ticket_sha256: String,
+    pub disposition: SupervisionLeaseStageResolutionDisposition,
+    pub resolved_at_ms: u64,
+    pub resolution_order: u64,
+    pub reason: OpaqueLabel,
+    pub resolution_sha256: String,
+}
+
+#[derive(Serialize)]
+struct SupervisionLeaseStageResolutionCore<'a> {
+    ticket: &'a SupervisionLeaseCommitTicket,
+    ticket_sha256: &'a str,
+    disposition: SupervisionLeaseStageResolutionDisposition,
+    resolved_at_ms: u64,
+    resolution_order: u64,
+    reason: &'a OpaqueLabel,
+}
+
+impl SupervisionLeaseStageResolution {
+    fn core(&self) -> SupervisionLeaseStageResolutionCore<'_> {
+        SupervisionLeaseStageResolutionCore {
+            ticket: &self.ticket,
+            ticket_sha256: &self.ticket_sha256,
+            disposition: self.disposition,
+            resolved_at_ms: self.resolved_at_ms,
+            resolution_order: self.resolution_order,
+            reason: &self.reason,
+        }
+    }
+
+    pub(crate) fn issue(
+        ticket: SupervisionLeaseCommitTicket,
+        disposition: SupervisionLeaseStageResolutionDisposition,
+        resolved_at_ms: u64,
+        resolution_order: u64,
+        reason: OpaqueLabel,
+    ) -> Result<Self, OrsError> {
+        let ticket_sha256 = ticket.ticket_sha256()?;
+        let mut resolution = Self {
+            ticket,
+            ticket_sha256,
+            disposition,
+            resolved_at_ms,
+            resolution_order,
+            reason,
+            resolution_sha256: String::new(),
+        };
+        resolution.validate_core()?;
+        let bytes = canonical_json_bytes(&resolution.core())
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        resolution.resolution_sha256 = sha256_hex(&bytes);
+        Ok(resolution)
+    }
+
+    fn validate_core(&self) -> Result<(), OrsError> {
+        self.ticket.validate()?;
+        if self.ticket_sha256 != self.ticket.ticket_sha256()? {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        if self.resolved_at_ms == 0 || self.resolution_order <= self.ticket.reservation_order {
+            return Err(OrsError::InvalidField {
+                field: "supervision_stage_resolution_sequence",
+                reason: "resolution time must be positive and order must follow reservation",
+            });
+        }
+        if self.disposition == SupervisionLeaseStageResolutionDisposition::Expired
+            && (!matches!(
+                self.ticket.operation,
+                SupervisionLeaseOperation::Commit | SupervisionLeaseOperation::Renew
+            ) || self.resolved_at_ms < self.ticket.binding.expires_at_ms)
+        {
+            return Err(OrsError::InvalidField {
+                field: "supervision_stage_resolution_expiry",
+                reason: "only an elapsed active ticket may be resolved as expired",
+            });
+        }
+        if self.disposition == SupervisionLeaseStageResolutionDisposition::Expired
+            && self.reason.as_str() != "active-ticket-window-elapsed"
+        {
+            return Err(OrsError::InvalidField {
+                field: "supervision_stage_resolution_reason",
+                reason: "expired tickets require the canonical elapsed-window reason",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        self.validate_core()?;
+        validate_digest(
+            &self.resolution_sha256,
+            "supervision_stage_resolution_sha256",
+        )?;
+        let bytes = canonical_json_bytes(&self.core())
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if sha256_hex(&bytes) != self.resolution_sha256 {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn signed_supervision_lease_from_verified(
     verified: &VerifiedSupervisionLease,
 ) -> Result<SignedSupervisionLease, OrsError> {
@@ -2106,8 +2245,18 @@ pub enum OrsError {
     SupervisionLeaseBindingMismatch,
     #[error("supervision-lease ticket is neither staged nor durably committed")]
     SupervisionLeaseTicketNotStaged,
+    #[error("supervision-lease ticket was durably resolved without a lease commit")]
+    SupervisionLeaseTicketResolved,
+    #[error("supervision-lease ticket is not yet eligible for durable expiry")]
+    SupervisionLeaseTicketNotExpired,
+    #[error("supervision-lease ticket validity window elapsed before staging")]
+    SupervisionLeaseTicketExpired,
+    #[error("supervision-lease ticket is already durably committed")]
+    SupervisionLeaseTicketAlreadyCommitted,
     #[error("supervision-lease history limit must be between 1 and {MAX_RECOVERY_PAGE}")]
     InvalidSupervisionLeaseHistoryLimit,
+    #[error("durable ORS schema migration required: {reason}")]
+    MigrationRequired { reason: String },
     #[error("durable ORS integrity problem in {record_type}: {reason}")]
     IntegrityProblem {
         record_type: &'static str,

@@ -10,7 +10,7 @@ use eliot_runtime_contracts::{
     HealthDimension, OperationalRecoveryState, SignedSupervisionLease, VerifiedSupervisionLease,
     VerifiedSupervisionLeaseTerminalTransition,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 
@@ -34,8 +34,9 @@ use crate::{
     SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot,
     SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
     SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
-    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, UserBrokerFence,
-    UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
+    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
+    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
     signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
 };
 
@@ -68,9 +69,13 @@ const SUPERVISION_LEASE_HISTORY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_history_v1");
 const SUPERVISION_LEASE_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_results_v1");
+const SUPERVISION_LEASE_STAGE_RESOLUTIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
 const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_rebind_replay_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
+const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
+const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
 
 fn current_unix_ms() -> Result<i64, OrsError> {
     let millis = SystemTime::now()
@@ -79,6 +84,11 @@ fn current_unix_ms() -> Result<i64, OrsError> {
         .as_millis();
     i64::try_from(millis)
         .map_err(|_| OrsError::Storage("system clock exceeds signed millisecond range".to_owned()))
+}
+
+fn current_unix_ms_u64() -> Result<u64, OrsError> {
+    u64::try_from(current_unix_ms()?)
+        .map_err(|_| OrsError::Storage("system clock is before Unix epoch".to_owned()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1151,6 +1161,144 @@ impl RedbRecoveryStore {
         Ok(records)
     }
 
+    fn supervision_ticket_matches_prepare(
+        ticket: &SupervisionLeaseCommitTicket,
+        request: &SupervisionLeasePrepareRequest,
+    ) -> bool {
+        ticket.ticket_id == request.ticket_id
+            && ticket.operation_id == request.operation_id
+            && ticket.lease_id == request.lease_id
+            && ticket.expected_revision == request.expected_revision
+            && ticket.operation == request.operation
+            && ticket.binding == request.binding
+    }
+
+    fn supervision_stage_is_expired(stage: &SupervisionLeaseStageReceipt, now_ms: u64) -> bool {
+        matches!(
+            stage.ticket.operation,
+            crate::SupervisionLeaseOperation::Commit | crate::SupervisionLeaseOperation::Renew
+        ) && now_ms >= stage.ticket.binding.expires_at_ms
+    }
+
+    fn supervision_result_in_write(
+        write: &redb::WriteTransaction,
+        ticket_id: &crate::OperationIdentity,
+    ) -> Result<Option<DurableSupervisionLeaseResult>, OrsError> {
+        let results = write
+            .open_table(SUPERVISION_LEASE_RESULTS)
+            .map_err(storage)?;
+        results
+            .get(ticket_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                decode_named::<DurableSupervisionLeaseResult>(
+                    value.value(),
+                    "supervision_lease_result",
+                )
+            })
+            .transpose()
+    }
+
+    fn supervision_resolution_in_write(
+        write: &redb::WriteTransaction,
+        ticket_id: &crate::OperationIdentity,
+    ) -> Result<Option<SupervisionLeaseStageResolution>, OrsError> {
+        let resolutions = write
+            .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
+            .map_err(storage)?;
+        resolutions
+            .get(ticket_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                decode_named::<SupervisionLeaseStageResolution>(
+                    value.value(),
+                    "supervision_lease_stage_resolution",
+                )
+            })
+            .transpose()
+    }
+
+    fn resolve_supervision_stage_in_write(
+        write: &redb::WriteTransaction,
+        stage: &SupervisionLeaseStageReceipt,
+        disposition: SupervisionLeaseStageResolutionDisposition,
+        resolved_at_ms: u64,
+        reason: OpaqueLabel,
+    ) -> Result<SupervisionLeaseStageResolution, OrsError> {
+        stage.validate()?;
+        if let Some(result) = Self::supervision_result_in_write(write, &stage.ticket.ticket_id)? {
+            return if result.ticket == stage.ticket {
+                Err(OrsError::SupervisionLeaseTicketAlreadyCommitted)
+            } else {
+                Err(OrsError::SupervisionLeaseTicketConflict)
+            };
+        }
+        if let Some(existing) =
+            Self::supervision_resolution_in_write(write, &stage.ticket.ticket_id)?
+        {
+            if existing.ticket == stage.ticket
+                && existing.ticket_sha256 == stage.ticket_sha256
+                && existing.disposition == disposition
+                && existing.reason == reason
+            {
+                return Ok(existing);
+            }
+            return Err(OrsError::SupervisionLeaseTicketConflict);
+        }
+        let durable_stage = {
+            let staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            staged
+                .get(stage.ticket.lease_id.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<SupervisionLeaseStageReceipt>(
+                        value.value(),
+                        "supervision_lease_staged",
+                    )
+                })
+                .transpose()?
+        }
+        .ok_or(OrsError::SupervisionLeaseTicketNotStaged)?;
+        if durable_stage != *stage {
+            return Err(OrsError::SupervisionLeaseTicketConflict);
+        }
+        let resolution = SupervisionLeaseStageResolution::issue(
+            stage.ticket.clone(),
+            disposition,
+            resolved_at_ms,
+            Self::next_operational_order(write)?,
+            reason,
+        )?;
+        {
+            let encoded = encode(&resolution)?;
+            let mut resolutions = write
+                .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
+                .map_err(storage)?;
+            if resolutions
+                .insert(resolution.ticket.ticket_id.as_str(), encoded.as_str())
+                .map_err(storage)?
+                .is_some()
+            {
+                return Err(OrsError::SupervisionLeaseTicketConflict);
+            }
+        }
+        {
+            let mut staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            if staged
+                .remove(stage.ticket.lease_id.as_str())
+                .map_err(storage)?
+                .is_none()
+            {
+                return Err(OrsError::SupervisionLeaseTicketNotStaged);
+            }
+        }
+        Ok(resolution)
+    }
+
     /// Reserves one supervision-lease revision and its canonical receipt
     /// preimage.  This method never accepts a caller-supplied revision or
     /// operation order and never publishes an authoritative lease.
@@ -1164,6 +1312,21 @@ impl RedbRecoveryStore {
     ) -> Result<SupervisionLeaseStageReceipt, OrsError> {
         request.validate()?;
         let write = self.database.begin_write().map_err(storage)?;
+        if let Some(result) = Self::supervision_result_in_write(&write, &request.ticket_id)? {
+            return if Self::supervision_ticket_matches_prepare(&result.ticket, &request) {
+                Err(OrsError::SupervisionLeaseTicketAlreadyCommitted)
+            } else {
+                Err(OrsError::SupervisionLeaseTicketConflict)
+            };
+        }
+        if let Some(resolution) = Self::supervision_resolution_in_write(&write, &request.ticket_id)?
+        {
+            return if Self::supervision_ticket_matches_prepare(&resolution.ticket, &request) {
+                Err(OrsError::SupervisionLeaseTicketResolved)
+            } else {
+                Err(OrsError::SupervisionLeaseTicketConflict)
+            };
+        }
         let existing_stage = {
             let staged = write
                 .open_table(SUPERVISION_LEASE_STAGED)
@@ -1181,17 +1344,54 @@ impl RedbRecoveryStore {
         };
         if let Some(stage) = existing_stage {
             stage.validate()?;
-            let same_request = stage.ticket.ticket_id == request.ticket_id
-                && stage.ticket.operation_id == request.operation_id
-                && stage.ticket.lease_id == request.lease_id
-                && stage.ticket.expected_revision == request.expected_revision
-                && stage.ticket.operation == request.operation
-                && stage.ticket.binding == request.binding;
-            if !same_request {
+            let same_request = Self::supervision_ticket_matches_prepare(&stage.ticket, &request);
+            let now_ms = current_unix_ms_u64()?;
+            if Self::supervision_stage_is_expired(&stage, now_ms) {
+                Self::resolve_supervision_stage_in_write(
+                    &write,
+                    &stage,
+                    SupervisionLeaseStageResolutionDisposition::Expired,
+                    now_ms,
+                    OpaqueLabel::new("active-ticket-window-elapsed")?,
+                )?;
+                if stage.ticket.ticket_id == request.ticket_id {
+                    write.commit().map_err(storage)?;
+                    return Err(if same_request {
+                        OrsError::SupervisionLeaseTicketResolved
+                    } else {
+                        OrsError::SupervisionLeaseTicketConflict
+                    });
+                }
+            } else if !same_request {
                 return Err(OrsError::SupervisionLeaseTicketConflict);
+            } else {
+                write.commit().map_err(storage)?;
+                return Ok(stage);
             }
-            write.commit().map_err(storage)?;
-            return Ok(stage);
+        }
+
+        // Ticket ids are global replay identities. The primary staged table
+        // is lease-keyed, so scan its live set before allocating a second
+        // lease under the same ticket id.
+        {
+            let staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            for row in staged.iter().map_err(storage)? {
+                let (_, value) = row.map_err(storage)?;
+                let stage: SupervisionLeaseStageReceipt =
+                    decode_named(value.value(), "supervision_lease_staged")?;
+                if stage.ticket.ticket_id == request.ticket_id {
+                    return Err(OrsError::SupervisionLeaseTicketConflict);
+                }
+            }
+        }
+        if matches!(
+            request.operation,
+            crate::SupervisionLeaseOperation::Commit | crate::SupervisionLeaseOperation::Renew
+        ) && current_unix_ms_u64()? >= request.binding.expires_at_ms
+        {
+            return Err(OrsError::SupervisionLeaseTicketExpired);
         }
 
         let current = {
@@ -1324,7 +1524,26 @@ impl RedbRecoveryStore {
             })
             .transpose()?;
         let Some(result) = result else {
-            return Ok(None);
+            let resolutions = read
+                .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
+                .map_err(storage)?;
+            let resolution = resolutions
+                .get(ticket.ticket_id.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<SupervisionLeaseStageResolution>(
+                        value.value(),
+                        "supervision_lease_stage_resolution",
+                    )
+                })
+                .transpose()?;
+            return match resolution {
+                Some(resolution) if resolution.ticket == *ticket => {
+                    Err(OrsError::SupervisionLeaseTicketResolved)
+                }
+                Some(_) => Err(OrsError::SupervisionLeaseTicketConflict),
+                None => Ok(None),
+            };
         };
         result.snapshot.validate()?;
         if result.ticket != *ticket
@@ -1367,9 +1586,8 @@ impl RedbRecoveryStore {
     }
 
     /// The current revision, history row, replay row and stage removal are one
-    /// local redb transaction.  Therefore absence of both a staged ticket and
-    /// its durable replay result is authoritative absence, not an unknown
-    /// commit outcome.
+    /// local redb transaction. A durable no-commit resolution is consulted in
+    /// the same database before absence can be interpreted as unstaged.
     #[allow(
         clippy::too_many_lines,
         reason = "one ORS write transaction atomically promotes current, history and replay state"
@@ -1403,34 +1621,52 @@ impl RedbRecoveryStore {
                 .transpose()?
         };
         let Some(stage) = stage else {
-            let result = {
-                let results = write
-                    .open_table(SUPERVISION_LEASE_RESULTS)
-                    .map_err(storage)?;
-                results
-                    .get(ticket.ticket_id.as_str())
-                    .map_err(storage)?
-                    .map(|value| {
-                        decode_named::<DurableSupervisionLeaseResult>(
-                            value.value(),
-                            "supervision_lease_result",
-                        )
-                    })
-                    .transpose()?
-            };
-            let Some(result) = result else {
-                return Err(OrsError::SupervisionLeaseTicketNotStaged);
-            };
-            result.snapshot.validate()?;
-            if result.ticket != *ticket || result.artifact != artifact {
-                return Err(OrsError::SupervisionLeaseTicketConflict);
+            if let Some(result) = Self::supervision_result_in_write(&write, &ticket.ticket_id)? {
+                result.snapshot.validate()?;
+                if result.ticket != *ticket || result.artifact != artifact {
+                    return Err(OrsError::SupervisionLeaseTicketConflict);
+                }
+                write.commit().map_err(storage)?;
+                return Ok(result.snapshot);
             }
-            write.commit().map_err(storage)?;
-            return Ok(result.snapshot);
+            if let Some(resolution) =
+                Self::supervision_resolution_in_write(&write, &ticket.ticket_id)?
+            {
+                return if resolution.ticket == *ticket && resolution.ticket_sha256 == ticket_sha256
+                {
+                    Err(OrsError::SupervisionLeaseTicketResolved)
+                } else {
+                    Err(OrsError::SupervisionLeaseTicketConflict)
+                };
+            }
+            return Err(OrsError::SupervisionLeaseTicketNotStaged);
         };
         stage.validate()?;
         if stage.ticket != *ticket || stage.ticket_sha256 != ticket_sha256 {
             return Err(OrsError::SupervisionLeaseTicketConflict);
+        }
+        if let Some(resolution) = Self::supervision_resolution_in_write(&write, &ticket.ticket_id)?
+        {
+            return Err(if resolution.ticket == *ticket {
+                OrsError::IntegrityProblem {
+                    record_type: "supervision_lease_staged",
+                    reason: "ticket is both staged and durably resolved".to_owned(),
+                }
+            } else {
+                OrsError::SupervisionLeaseTicketConflict
+            });
+        }
+        let commit_now_ms = current_unix_ms_u64()?;
+        if terminal.is_none() && Self::supervision_stage_is_expired(&stage, commit_now_ms) {
+            Self::resolve_supervision_stage_in_write(
+                &write,
+                &stage,
+                SupervisionLeaseStageResolutionDisposition::Expired,
+                commit_now_ms,
+                OpaqueLabel::new("active-ticket-window-elapsed")?,
+            )?;
+            write.commit().map_err(storage)?;
+            return Err(OrsError::SupervisionLeaseTicketResolved);
         }
         let current = {
             let current = write
@@ -1572,33 +1808,323 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
-    /// Returns an interrupted staged ticket without promoting it.
+    /// Durably resolves one exact elapsed active ticket without publishing a
+    /// signed lease. The resolution and stage removal share one redb commit,
+    /// and an exact retry returns the immutable prior resolution.
+    pub fn expire_staged_supervision_lease(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+    ) -> Result<SupervisionLeaseStageResolution, OrsError> {
+        ticket.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        if let Some(result) = Self::supervision_result_in_write(&write, &ticket.ticket_id)? {
+            return if result.ticket == *ticket {
+                Err(OrsError::SupervisionLeaseTicketAlreadyCommitted)
+            } else {
+                Err(OrsError::SupervisionLeaseTicketConflict)
+            };
+        }
+        if let Some(resolution) = Self::supervision_resolution_in_write(&write, &ticket.ticket_id)?
+        {
+            return if resolution.ticket != *ticket {
+                Err(OrsError::SupervisionLeaseTicketConflict)
+            } else if resolution.disposition == SupervisionLeaseStageResolutionDisposition::Expired
+            {
+                write.commit().map_err(storage)?;
+                Ok(resolution)
+            } else {
+                Err(OrsError::SupervisionLeaseTicketResolved)
+            };
+        }
+        let stage = {
+            let staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            staged
+                .get(ticket.lease_id.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<SupervisionLeaseStageReceipt>(
+                        value.value(),
+                        "supervision_lease_staged",
+                    )
+                })
+                .transpose()?
+        }
+        .ok_or(OrsError::SupervisionLeaseTicketNotStaged)?;
+        if stage.ticket != *ticket || stage.ticket_sha256 != ticket.ticket_sha256()? {
+            return Err(OrsError::SupervisionLeaseTicketConflict);
+        }
+        let now_ms = current_unix_ms_u64()?;
+        if !Self::supervision_stage_is_expired(&stage, now_ms) {
+            return Err(OrsError::SupervisionLeaseTicketNotExpired);
+        }
+        let resolution = Self::resolve_supervision_stage_in_write(
+            &write,
+            &stage,
+            SupervisionLeaseStageResolutionDisposition::Expired,
+            now_ms,
+            OpaqueLabel::new("active-ticket-window-elapsed")?,
+        )?;
+        write.commit().map_err(storage)?;
+        Ok(resolution)
+    }
+
+    /// Explicitly aborts one exact pre-commit stage. This is never called by
+    /// protected-key failure recovery: an unknown signer/provider outcome
+    /// must leave the stage available for exact resume.
+    pub fn abort_staged_supervision_lease(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+        reason: OpaqueLabel,
+    ) -> Result<SupervisionLeaseStageResolution, OrsError> {
+        ticket.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        if let Some(result) = Self::supervision_result_in_write(&write, &ticket.ticket_id)? {
+            return if result.ticket == *ticket {
+                Err(OrsError::SupervisionLeaseTicketAlreadyCommitted)
+            } else {
+                Err(OrsError::SupervisionLeaseTicketConflict)
+            };
+        }
+        if let Some(resolution) = Self::supervision_resolution_in_write(&write, &ticket.ticket_id)?
+        {
+            return if resolution.ticket != *ticket {
+                Err(OrsError::SupervisionLeaseTicketConflict)
+            } else if (resolution.disposition
+                == SupervisionLeaseStageResolutionDisposition::Aborted
+                && resolution.reason == reason)
+                || resolution.disposition == SupervisionLeaseStageResolutionDisposition::Expired
+            {
+                write.commit().map_err(storage)?;
+                Ok(resolution)
+            } else {
+                Err(OrsError::SupervisionLeaseTicketResolved)
+            };
+        }
+        let stage = {
+            let staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            staged
+                .get(ticket.lease_id.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<SupervisionLeaseStageReceipt>(
+                        value.value(),
+                        "supervision_lease_staged",
+                    )
+                })
+                .transpose()?
+        }
+        .ok_or(OrsError::SupervisionLeaseTicketNotStaged)?;
+        if stage.ticket != *ticket || stage.ticket_sha256 != ticket.ticket_sha256()? {
+            return Err(OrsError::SupervisionLeaseTicketConflict);
+        }
+        let resolved_at_ms = current_unix_ms_u64()?;
+        if Self::supervision_stage_is_expired(&stage, resolved_at_ms) {
+            let resolution = Self::resolve_supervision_stage_in_write(
+                &write,
+                &stage,
+                SupervisionLeaseStageResolutionDisposition::Expired,
+                resolved_at_ms,
+                OpaqueLabel::new("active-ticket-window-elapsed")?,
+            )?;
+            write.commit().map_err(storage)?;
+            return Ok(resolution);
+        }
+        let resolution = Self::resolve_supervision_stage_in_write(
+            &write,
+            &stage,
+            SupervisionLeaseStageResolutionDisposition::Aborted,
+            resolved_at_ms,
+            reason,
+        )?;
+        write.commit().map_err(storage)?;
+        Ok(resolution)
+    }
+
+    /// Reads an exact durable no-commit resolution. A reused ticket id with a
+    /// different ticket is a conflict, never a cache miss.
+    pub fn load_supervision_lease_stage_resolution(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+    ) -> Result<Option<SupervisionLeaseStageResolution>, OrsError> {
+        ticket.validate()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let resolutions = read
+            .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
+            .map_err(storage)?;
+        let resolution = resolutions
+            .get(ticket.ticket_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                decode_named::<SupervisionLeaseStageResolution>(
+                    value.value(),
+                    "supervision_lease_stage_resolution",
+                )
+            })
+            .transpose()?;
+        match resolution {
+            Some(resolution)
+                if resolution.ticket == *ticket
+                    && resolution.ticket_sha256 == ticket.ticket_sha256()? =>
+            {
+                Ok(Some(resolution))
+            }
+            Some(_) => Err(OrsError::SupervisionLeaseTicketConflict),
+            None => Ok(None),
+        }
+    }
+
+    /// Reconciles one exact ticket across all durable ORS outcomes.
+    ///
+    /// A live stage is returned unchanged for exact signer resume. An elapsed
+    /// active stage is atomically replaced by its immutable expiry resolution.
+    /// A committed result or prior no-commit resolution is returned as that
+    /// exact durable outcome. Unknown tickets remain `None`; no outcome is
+    /// guessed and no stage is aborted because a signer is unavailable.
+    pub fn reconcile_supervision_lease_ticket(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+    ) -> Result<Option<SupervisionLeaseTicketReconciliation>, OrsError> {
+        ticket.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = Self::supervision_result_in_write(&write, &ticket.ticket_id)?;
+        let resolution = Self::supervision_resolution_in_write(&write, &ticket.ticket_id)?;
+        let stage = {
+            let staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            staged
+                .get(ticket.lease_id.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<SupervisionLeaseStageReceipt>(
+                        value.value(),
+                        "supervision_lease_staged",
+                    )
+                })
+                .transpose()?
+        };
+        let stage_reuses_ticket = stage
+            .as_ref()
+            .is_some_and(|stage| stage.ticket.ticket_id == ticket.ticket_id);
+        if result.is_some() && (resolution.is_some() || stage_reuses_ticket)
+            || resolution.is_some() && stage_reuses_ticket
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "supervision_lease_ticket_reconciliation",
+                reason: "ticket has multiple durable outcomes".to_owned(),
+            });
+        }
+        if let Some(result) = result {
+            result.snapshot.validate()?;
+            if result.ticket != *ticket
+                || result.artifact != result.snapshot.record.artifact
+                || result.snapshot.record.ticket_sha256 != ticket.ticket_sha256()?
+            {
+                return Err(OrsError::SupervisionLeaseTicketConflict);
+            }
+            write.commit().map_err(storage)?;
+            return Ok(Some(SupervisionLeaseTicketReconciliation::Committed(
+                Box::new(result.snapshot),
+            )));
+        }
+        if let Some(resolution) = resolution {
+            if resolution.ticket != *ticket || resolution.ticket_sha256 != ticket.ticket_sha256()? {
+                return Err(OrsError::SupervisionLeaseTicketConflict);
+            }
+            write.commit().map_err(storage)?;
+            return Ok(Some(SupervisionLeaseTicketReconciliation::Resolved(
+                resolution,
+            )));
+        }
+        let Some(stage) = stage else {
+            write.commit().map_err(storage)?;
+            return Ok(None);
+        };
+        stage.validate()?;
+        if stage.ticket != *ticket || stage.ticket_sha256 != ticket.ticket_sha256()? {
+            return Err(OrsError::SupervisionLeaseTicketConflict);
+        }
+        let now_ms = current_unix_ms_u64()?;
+        if Self::supervision_stage_is_expired(&stage, now_ms) {
+            let resolution = Self::resolve_supervision_stage_in_write(
+                &write,
+                &stage,
+                SupervisionLeaseStageResolutionDisposition::Expired,
+                now_ms,
+                OpaqueLabel::new("active-ticket-window-elapsed")?,
+            )?;
+            write.commit().map_err(storage)?;
+            return Ok(Some(SupervisionLeaseTicketReconciliation::Resolved(
+                resolution,
+            )));
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(SupervisionLeaseTicketReconciliation::Staged(stage)))
+    }
+
+    /// Returns an interrupted staged ticket without promoting it. An elapsed
+    /// active stage is atomically resolved first and therefore returns `None`.
     pub fn reconcile_staged_supervision_lease(
         &self,
         lease_id: &crate::OperationIdentity,
     ) -> Result<Option<SupervisionLeaseStageReceipt>, OrsError> {
-        let read = self.database.begin_read().map_err(storage)?;
-        let staged = read.open_table(SUPERVISION_LEASE_STAGED).map_err(storage)?;
-        staged
-            .get(lease_id.as_str())
-            .map_err(storage)?
-            .map(|value| {
-                let stage: SupervisionLeaseStageReceipt =
-                    decode_named(value.value(), "supervision_lease_staged")?;
-                stage.validate()?;
-                if stage.ticket.lease_id != *lease_id {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "supervision_lease_staged",
-                        reason: "staged key does not match lease identity".to_owned(),
-                    });
-                }
-                Ok(stage)
-            })
-            .transpose()
+        let write = self.database.begin_write().map_err(storage)?;
+        let stage = {
+            let staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            staged
+                .get(lease_id.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    let stage: SupervisionLeaseStageReceipt =
+                        decode_named(value.value(), "supervision_lease_staged")?;
+                    stage.validate()?;
+                    if stage.ticket.lease_id != *lease_id {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "supervision_lease_staged",
+                            reason: "staged key does not match lease identity".to_owned(),
+                        });
+                    }
+                    Ok(stage)
+                })
+                .transpose()?
+        };
+        let Some(stage) = stage else {
+            write.commit().map_err(storage)?;
+            return Ok(None);
+        };
+        if Self::supervision_result_in_write(&write, &stage.ticket.ticket_id)?.is_some()
+            || Self::supervision_resolution_in_write(&write, &stage.ticket.ticket_id)?.is_some()
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "supervision_lease_staged",
+                reason: "staged ticket also has a durable terminal disposition".to_owned(),
+            });
+        }
+        let now_ms = current_unix_ms_u64()?;
+        if Self::supervision_stage_is_expired(&stage, now_ms) {
+            Self::resolve_supervision_stage_in_write(
+                &write,
+                &stage,
+                SupervisionLeaseStageResolutionDisposition::Expired,
+                now_ms,
+                OpaqueLabel::new("active-ticket-window-elapsed")?,
+            )?;
+            write.commit().map_err(storage)?;
+            return Ok(None);
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(stage))
     }
 
-    /// Reads a bounded set of staged tickets for recovery.  It performs no
-    /// write and therefore cannot guess whether a remote commit crossed.
+    /// Reconciles a bounded set of staged tickets for recovery. Elapsed active
+    /// tickets are durably resolved in this local ORS; all other stages remain
+    /// exact resume obligations for the Kernel signer.
     pub fn reconcile_staged_supervision_leases(
         &self,
         limit: u16,
@@ -1606,21 +2132,55 @@ impl RedbRecoveryStore {
         if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
             return Err(OrsError::InvalidSupervisionLeaseHistoryLimit);
         }
-        let read = self.database.begin_read().map_err(storage)?;
-        let staged = read.open_table(SUPERVISION_LEASE_STAGED).map_err(storage)?;
+        let write = self.database.begin_write().map_err(storage)?;
         let mut stage_receipts = Vec::new();
-        for row in staged.iter().map_err(storage)? {
-            let (_, value) = row.map_err(storage)?;
-            let stage: SupervisionLeaseStageReceipt =
-                decode_named(value.value(), "supervision_lease_staged")?;
-            stage.validate()?;
-            stage_receipts.push(stage);
-            if stage_receipts.len() == usize::from(limit) {
-                break;
+        {
+            let staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            for row in staged.iter().map_err(storage)? {
+                let (key, value) = row.map_err(storage)?;
+                let stage: SupervisionLeaseStageReceipt =
+                    decode_named(value.value(), "supervision_lease_staged")?;
+                stage.validate()?;
+                if key.value() != stage.ticket.lease_id.as_str() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "supervision_lease_staged",
+                        reason: "staged key does not match lease identity".to_owned(),
+                    });
+                }
+                stage_receipts.push(stage);
+                if stage_receipts.len() == usize::from(limit) {
+                    break;
+                }
             }
         }
         stage_receipts.sort_by_key(|stage| stage.ticket.reservation_order);
-        Ok(stage_receipts)
+        let now_ms = current_unix_ms_u64()?;
+        let mut pending = Vec::with_capacity(stage_receipts.len());
+        for stage in stage_receipts {
+            if Self::supervision_result_in_write(&write, &stage.ticket.ticket_id)?.is_some()
+                || Self::supervision_resolution_in_write(&write, &stage.ticket.ticket_id)?.is_some()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "supervision_lease_staged",
+                    reason: "staged ticket also has a durable terminal disposition".to_owned(),
+                });
+            }
+            if Self::supervision_stage_is_expired(&stage, now_ms) {
+                Self::resolve_supervision_stage_in_write(
+                    &write,
+                    &stage,
+                    SupervisionLeaseStageResolutionDisposition::Expired,
+                    now_ms,
+                    OpaqueLabel::new("active-ticket-window-elapsed")?,
+                )?;
+            } else {
+                pending.push(stage);
+            }
+        }
+        write.commit().map_err(storage)?;
+        Ok(pending)
     }
 
     /// Reads the current authoritative committed projection for a lease.
@@ -1713,6 +2273,18 @@ impl RedbRecoveryStore {
         snapshot: &SupervisionLeaseSnapshot,
         result: &DurableSupervisionLeaseResult,
     ) -> Result<(), OrsError> {
+        {
+            let resolutions = write
+                .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
+                .map_err(storage)?;
+            if resolutions
+                .get(result.ticket.ticket_id.as_str())
+                .map_err(storage)?
+                .is_some()
+            {
+                return Err(OrsError::SupervisionLeaseTicketResolved);
+            }
+        }
         let encoded = encode(snapshot)?;
         {
             let mut current = write
@@ -1799,6 +2371,33 @@ impl RedbRecoveryStore {
 
     fn initialize(&self) -> Result<(), OrsError> {
         let write = self.database.begin_write().map_err(storage)?;
+        let table_names = write
+            .list_tables()
+            .map_err(storage)?
+            .map(|table| table.name().to_owned())
+            .collect::<BTreeSet<_>>();
+        let store_is_empty = table_names.is_empty();
+        let has_resolution_table = table_names.contains(SUPERVISION_LEASE_STAGE_RESOLUTIONS.name());
+        let resolution_schema_marker = if table_names.contains(META.name()) {
+            let meta = write.open_table(META).map_err(storage)?;
+            meta.get(SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+        } else {
+            None
+        };
+        let initialize_resolution_schema = if store_is_empty {
+            true
+        } else if has_resolution_table
+            && resolution_schema_marker.as_deref() == Some(SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1)
+        {
+            false
+        } else {
+            return Err(OrsError::MigrationRequired {
+                reason: "supervision stage-resolution table/marker provenance is incomplete"
+                    .to_owned(),
+            });
+        };
         {
             drop(write.open_table(META).map_err(storage)?);
             drop(write.open_table(ENVELOPES).map_err(storage)?);
@@ -1834,7 +2433,20 @@ impl RedbRecoveryStore {
                     .open_table(SUPERVISION_LEASE_RESULTS)
                     .map_err(storage)?,
             );
+            drop(
+                write
+                    .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
+                    .map_err(storage)?,
+            );
             drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
+            if initialize_resolution_schema {
+                let mut meta = write.open_table(META).map_err(storage)?;
+                meta.insert(
+                    SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY,
+                    SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1,
+                )
+                .map_err(storage)?;
+            }
         }
         write.commit().map_err(storage)
     }
@@ -4703,6 +5315,14 @@ impl PersistedValue for SupervisionLeaseStageReceipt {
 
 impl PersistedValue for SupervisionLeaseSnapshot {
     const RECORD_TYPE: &'static str = "supervision_lease_snapshot";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for SupervisionLeaseStageResolution {
+    const RECORD_TYPE: &'static str = "supervision_lease_stage_resolution";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()

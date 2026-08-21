@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Barrier;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
@@ -16,7 +17,7 @@ use eliot_runtime_contracts::{
     SupervisionTrustAnchor, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
 };
 use eliot_security_contracts::PrivacyClass;
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 use serde_json::{Value, json};
 
 use crate::*;
@@ -598,8 +599,21 @@ fn process_start_replay_has_one_atomic_winner_and_rejects_substitution() -> Test
 
 fn supervision_binding(
     state: LeaseState,
-    issued_at_ms: u64,
+    issued_at_offset_ms: u64,
 ) -> TestResult<SupervisionLeaseBinding> {
+    static SUPERVISION_TEST_EPOCH_MS: OnceLock<u64> = OnceLock::new();
+    let issued_at_ms = SUPERVISION_TEST_EPOCH_MS
+        .get_or_init(|| {
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX.saturating_sub(3_600_000))
+            .saturating_add(3_600_000)
+        })
+        .saturating_add(issued_at_offset_ms);
     let terminal_disposition = match state {
         LeaseState::Released => Some(SupervisionLeaseTerminalDisposition::Released),
         LeaseState::Expired => Some(SupervisionLeaseTerminalDisposition::Expired),
@@ -831,6 +845,15 @@ fn supervision_lease_stage_is_non_authoritative_and_survives_reopen() -> TestRes
     let reopened = RedbRecoveryStore::open(&path)?;
     let recovered = reopened.reconcile_staged_supervision_lease(&label("lease-1")?)?;
     assert_eq!(recovered, Some(stage.clone()));
+    assert_eq!(
+        reopened.reconcile_supervision_lease_ticket(&stage.ticket)?,
+        Some(SupervisionLeaseTicketReconciliation::Staged(stage.clone()))
+    );
+    assert_eq!(
+        reopened.prepare_supervision_lease(request)?,
+        stage,
+        "an interrupted live stage must resume the exact reservation"
+    );
     assert!(
         reopened
             .load_current_supervision_lease(&label("lease-1")?)?
@@ -844,6 +867,12 @@ fn supervision_lease_stage_is_non_authoritative_and_survives_reopen() -> TestRes
         SupervisionLeaseProjection::Active
     );
     assert_eq!(reopened.reconcile_staged_supervision_leases(8)?.len(), 0);
+    assert_eq!(
+        reopened.reconcile_supervision_lease_ticket(&stage.ticket)?,
+        Some(SupervisionLeaseTicketReconciliation::Committed(Box::new(
+            snapshot.clone()
+        )))
+    );
     assert_eq!(
         reopened
             .load_supervision_lease_history(&label("lease-1")?, 8)?
@@ -863,6 +892,107 @@ fn supervision_lease_stage_is_non_authoritative_and_survives_reopen() -> TestRes
         1
     );
     drop(committed_reopen);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn supervision_stage_resolution_schema_requires_migration_for_legacy_stage() -> TestResult {
+    let source_path = database_path("supervision-resolution-migration-source");
+    let source = RedbRecoveryStore::open(&source_path)?;
+    let request = supervision_request(
+        "ticket-legacy-stage",
+        "operation-legacy-stage",
+        "lease-legacy-stage",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 150)?,
+    )?;
+    let stage = source.prepare_supervision_lease(request.clone())?;
+    let encoded_stage = serde_json::to_string(&stage)?;
+    drop(source);
+
+    let legacy_path = database_path("supervision-resolution-migration-target");
+    let database = redb::Database::create(&legacy_path)?;
+    let write = database.begin_write()?;
+    {
+        let meta_definition: redb::TableDefinition<&str, &str> =
+            redb::TableDefinition::new("ors_meta_v1");
+        let staged_definition: redb::TableDefinition<&str, &str> =
+            redb::TableDefinition::new("ors_supervision_lease_staged_v1");
+        let current_definition: redb::TableDefinition<&str, &str> =
+            redb::TableDefinition::new("ors_supervision_lease_current_v1");
+        let history_definition: redb::TableDefinition<&str, &str> =
+            redb::TableDefinition::new("ors_supervision_lease_history_v1");
+        let results_definition: redb::TableDefinition<&str, &str> =
+            redb::TableDefinition::new("ors_supervision_lease_results_v1");
+        let mut meta = write.open_table(meta_definition)?;
+        meta.insert(
+            "next_global_order",
+            stage.ticket.reservation_order.to_string().as_str(),
+        )?;
+        drop(meta);
+        let mut staged = write.open_table(staged_definition)?;
+        staged.insert(stage.ticket.lease_id.as_str(), encoded_stage.as_str())?;
+        drop(staged);
+        drop(write.open_table(current_definition)?);
+        drop(write.open_table(history_definition)?);
+        drop(write.open_table(results_definition)?);
+    }
+    write.commit()?;
+    drop(database);
+
+    assert!(matches!(
+        RedbRecoveryStore::open(&legacy_path),
+        Err(OrsError::MigrationRequired { .. })
+    ));
+
+    let database = redb::Database::create(&legacy_path)?;
+    let read = database.begin_read()?;
+    let meta_definition: redb::TableDefinition<&str, &str> =
+        redb::TableDefinition::new("ors_meta_v1");
+    assert_eq!(
+        read.open_table(meta_definition)?
+            .get("supervision_stage_resolution_schema")?
+            .map(|value| value.value().to_owned()),
+        None
+    );
+    let resolution_definition: redb::TableDefinition<&str, &str> =
+        redb::TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
+    assert!(matches!(
+        read.open_table(resolution_definition),
+        Err(redb::TableError::TableDoesNotExist(_))
+    ));
+    drop(read);
+    drop(database);
+    cleanup(&source_path);
+    cleanup(&legacy_path);
+    Ok(())
+}
+
+#[test]
+fn supervision_stage_resolution_schema_rejects_unmarked_authority_table() -> TestResult {
+    let path = database_path("supervision-resolution-unmarked");
+    let database = redb::Database::create(&path)?;
+    let write = database.begin_write()?;
+    for name in [
+        "ors_meta_v1",
+        "ors_supervision_lease_staged_v1",
+        "ors_supervision_lease_current_v1",
+        "ors_supervision_lease_history_v1",
+        "ors_supervision_lease_results_v1",
+        "ors_supervision_lease_stage_resolutions_v1",
+    ] {
+        let definition: redb::TableDefinition<&str, &str> = redb::TableDefinition::new(name);
+        drop(write.open_table(definition)?);
+    }
+    write.commit()?;
+    drop(database);
+
+    assert!(matches!(
+        RedbRecoveryStore::open(&path),
+        Err(OrsError::MigrationRequired { .. })
+    ));
     cleanup(&path);
     Ok(())
 }
@@ -1243,6 +1373,151 @@ fn supervision_lease_conflicting_stage_is_rejected_and_exact_stage_is_idempotent
         )?),
         Err(OrsError::SupervisionLeaseTicketConflict)
     ));
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn supervision_lease_expired_crash_stage_is_durably_resolved_and_replaceable() -> TestResult {
+    let path = database_path("supervision-expired-stage");
+    let store = RedbRecoveryStore::open(&path)?;
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let mut binding = supervision_binding(LeaseState::Active, 500)?;
+    binding.issued_at_ms = now_ms.saturating_sub(1);
+    binding.renew_before_ms = now_ms.saturating_add(75);
+    binding.expires_at_ms = now_ms.saturating_add(150);
+    let request = supervision_request(
+        "ticket-expired-crash",
+        "operation-expired-crash",
+        "lease-expired-crash",
+        None,
+        SupervisionLeaseOperation::Commit,
+        binding,
+    )?;
+    let stage = store.prepare_supervision_lease(request.clone())?;
+    drop(store);
+
+    std::thread::sleep(std::time::Duration::from_millis(220));
+    let reopened = RedbRecoveryStore::open(&path)?;
+    assert!(
+        reopened
+            .reconcile_staged_supervision_lease(&stage.ticket.lease_id)?
+            .is_none()
+    );
+    let resolution = reopened
+        .load_supervision_lease_stage_resolution(&stage.ticket)?
+        .ok_or("expired stage resolution is missing")?;
+    assert_eq!(
+        reopened.reconcile_supervision_lease_ticket(&stage.ticket)?,
+        Some(SupervisionLeaseTicketReconciliation::Resolved(
+            resolution.clone()
+        ))
+    );
+    assert_eq!(
+        resolution.disposition,
+        SupervisionLeaseStageResolutionDisposition::Expired
+    );
+    assert_eq!(resolution.ticket, stage.ticket);
+    assert_eq!(resolution.ticket_sha256, stage.ticket_sha256);
+    assert!(resolution.resolved_at_ms >= resolution.ticket.binding.expires_at_ms);
+    assert!(resolution.resolution_order > resolution.ticket.reservation_order);
+    assert!(matches!(
+        reopened.commit_supervision_lease(
+            &resolution.ticket,
+            &verified_supervision_ticket(&resolution.ticket)?,
+        ),
+        Err(OrsError::SupervisionLeaseTicketResolved)
+    ));
+    assert!(matches!(
+        reopened.prepare_supervision_lease(request),
+        Err(OrsError::SupervisionLeaseTicketResolved)
+    ));
+
+    let replacement = reopened.prepare_supervision_lease(supervision_request(
+        "ticket-expired-replacement",
+        "operation-expired-replacement",
+        "lease-expired-crash",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 600)?,
+    )?)?;
+    assert_eq!(replacement.ticket.revision, 1);
+    assert_ne!(replacement.ticket.ticket_id, resolution.ticket.ticket_id);
+    drop(reopened);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn supervision_lease_abort_is_exact_idempotent_and_foreign_ticket_fails_closed() -> TestResult {
+    let path = database_path("supervision-abort-stage");
+    let store = RedbRecoveryStore::open(&path)?;
+    let request = supervision_request(
+        "ticket-abort",
+        "operation-abort",
+        "lease-abort",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 700)?,
+    )?;
+    let stage = store.prepare_supervision_lease(request.clone())?;
+    let reason = label("operator-cancelled-before-signing")?;
+    let first = store.abort_staged_supervision_lease(&stage.ticket, reason.clone())?;
+    let replay = store.abort_staged_supervision_lease(&stage.ticket, reason)?;
+    assert_eq!(first, replay);
+    assert_eq!(
+        first.disposition,
+        SupervisionLeaseStageResolutionDisposition::Aborted
+    );
+    assert_eq!(
+        store.reconcile_supervision_lease_ticket(&stage.ticket)?,
+        Some(SupervisionLeaseTicketReconciliation::Resolved(
+            first.clone()
+        ))
+    );
+    assert!(
+        store
+            .reconcile_staged_supervision_lease(&stage.ticket.lease_id)?
+            .is_none()
+    );
+    assert!(matches!(
+        store.commit_supervision_lease(&stage.ticket, &verified_supervision_stage(&stage)?),
+        Err(OrsError::SupervisionLeaseTicketResolved)
+    ));
+
+    let mut foreign = stage.ticket.clone();
+    foreign.lease_id = label("lease-foreign")?;
+    foreign.record_id = label("lease-foreign::r00000000000000000001")?;
+    assert!(matches!(
+        store.load_supervision_lease_stage_resolution(&foreign),
+        Err(OrsError::SupervisionLeaseTicketConflict)
+    ));
+    assert!(matches!(
+        store.prepare_supervision_lease(supervision_request(
+            stage.ticket.ticket_id.as_str(),
+            "operation-foreign",
+            "lease-foreign",
+            None,
+            SupervisionLeaseOperation::Commit,
+            supervision_binding(LeaseState::Active, 800)?,
+        )?),
+        Err(OrsError::SupervisionLeaseTicketConflict)
+    ));
+
+    let replacement = store.prepare_supervision_lease(supervision_request(
+        "ticket-abort-replacement",
+        "operation-abort-replacement",
+        "lease-abort",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 900)?,
+    )?)?;
+    assert_eq!(replacement.ticket.revision, 1);
     drop(store);
     cleanup(&path);
     Ok(())

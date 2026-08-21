@@ -733,6 +733,7 @@ pub fn read_current_supervision_lease_read_only(
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
@@ -765,7 +766,24 @@ mod tests {
         OpaqueLabel::new(v).unwrap()
     }
 
+    fn test_time(offset_ms: u64) -> u64 {
+        static TEST_EPOCH_MS: OnceLock<u64> = OnceLock::new();
+        TEST_EPOCH_MS
+            .get_or_init(|| {
+                u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX.saturating_sub(3_600_000))
+                .saturating_add(3_600_000)
+            })
+            .saturating_add(offset_ms)
+    }
+
     fn binding(state: LeaseState, issued: u64) -> SupervisionLeaseBinding {
+        let issued = test_time(issued);
         SupervisionLeaseBinding {
             scope_ref: label("scope-supervision"),
             observation_scope: SupervisionObservationScope {
@@ -957,7 +975,7 @@ mod tests {
         )
         .unwrap();
         let ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: "lease-1".to_owned(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
@@ -1018,7 +1036,7 @@ mod tests {
         )
         .unwrap();
         let ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: "lease-1".to_owned(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
@@ -1101,7 +1119,7 @@ mod tests {
             let payload = &envelope.payload;
             let generation = &payload.generation_binding;
             let ctx = SupervisionLeaseVerificationContext {
-                now_ms: 101,
+                now_ms: test_time(101),
                 lease_id: payload.lease_id.clone(),
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
@@ -1179,7 +1197,7 @@ mod tests {
         let payload = &envelope.payload;
         let generation = &payload.generation_binding;
         let ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: payload.lease_id.clone(),
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
@@ -1250,7 +1268,7 @@ mod tests {
         let payload = &envelope.payload;
         let generation = &payload.generation_binding;
         let mut ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: payload.lease_id.clone(),
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
@@ -1320,7 +1338,7 @@ mod tests {
         let payload = &envelope.payload;
         let generation = &payload.generation_binding;
         let ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: payload.lease_id.clone(),
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
@@ -1402,7 +1420,7 @@ mod tests {
         let payload = &envelope.payload;
         let generation = &payload.generation_binding;
         let mut ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: payload.lease_id.clone(),
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
@@ -1475,7 +1493,7 @@ mod tests {
         let payload = &envelope.payload;
         let generation = &payload.generation_binding;
         let ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: payload.lease_id.clone(),
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
@@ -1547,7 +1565,7 @@ mod tests {
         )
         .unwrap();
         let ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: "lease-1".to_owned(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
@@ -1621,7 +1639,7 @@ mod tests {
         )
         .unwrap();
         let ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: "lease-1".to_owned(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
@@ -1697,7 +1715,7 @@ mod tests {
         )
         .unwrap();
         let ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: "lease-1".to_owned(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
@@ -1780,7 +1798,7 @@ mod tests {
         let payload = &envelope.payload;
         let generation = &payload.generation_binding;
         let ctx_active = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: payload.lease_id.clone(),
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
@@ -1849,9 +1867,9 @@ mod tests {
                         AuthorityEpoch::new(2).unwrap(),
                         ResourceGeneration::new(1).unwrap(),
                     ),
-                    issued_at_ms: 100,
-                    expires_at_ms: 1000,
-                    renew_before_ms: 550,
+                    issued_at_ms: test_time(100),
+                    expires_at_ms: test_time(1000),
+                    renew_before_ms: test_time(550),
                     wake_policy: RegisteredActivityWakePolicy::Disabled,
                     state: LeaseState::Revoked,
                     terminal_disposition: Some(
@@ -1878,7 +1896,7 @@ mod tests {
         drop(store);
         let before = file_bytes_and_mtime(&p);
         let ctx_terminal = SupervisionLeaseVerificationContext {
-            now_ms: 200,
+            now_ms: test_time(200),
             lease_id: "lease-1".to_owned(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
@@ -1965,7 +1983,7 @@ mod tests {
             let payload = &envelope.payload;
             let generation = &payload.generation_binding;
             let ctx = SupervisionLeaseVerificationContext {
-                now_ms: 101,
+                now_ms: test_time(101),
                 lease_id: payload.lease_id.clone(),
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
@@ -1999,7 +2017,7 @@ mod tests {
         let payload = &snap.record.artifact.payload;
         let generation = &payload.generation_binding;
         let ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: payload.lease_id.clone(),
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
@@ -2360,7 +2378,7 @@ mod tests {
             let payload = &envelope.payload;
             let generation = &payload.generation_binding;
             let ctx = SupervisionLeaseVerificationContext {
-                now_ms: 101,
+                now_ms: test_time(101),
                 lease_id: payload.lease_id.clone(),
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
@@ -2411,7 +2429,7 @@ mod tests {
             let payload = &snap.record.artifact.payload;
             let generation = &payload.generation_binding;
             let ctx2 = SupervisionLeaseVerificationContext {
-                now_ms: 101,
+                now_ms: test_time(101),
                 lease_id: payload.lease_id.clone(),
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
@@ -2481,7 +2499,7 @@ mod tests {
         let payload = &envelope.payload;
         let generation = &payload.generation_binding;
         let ctx = SupervisionLeaseVerificationContext {
-            now_ms: 101,
+            now_ms: test_time(101),
             lease_id: payload.lease_id.clone(),
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
@@ -2771,7 +2789,7 @@ mod tests {
             let payload = &envelope.payload;
             let generation = &payload.generation_binding;
             let ctx = SupervisionLeaseVerificationContext {
-                now_ms: 101,
+                now_ms: test_time(101),
                 lease_id: payload.lease_id.clone(),
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
@@ -2822,7 +2840,7 @@ mod tests {
             let payload = &snap.record.artifact.payload;
             let generation = &payload.generation_binding;
             let ctx2 = SupervisionLeaseVerificationContext {
-                now_ms: 101,
+                now_ms: test_time(101),
                 lease_id: payload.lease_id.clone(),
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
