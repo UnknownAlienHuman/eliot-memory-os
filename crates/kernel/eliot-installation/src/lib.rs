@@ -4172,6 +4172,272 @@ fn active_phase_b_rebind_receipt_digest(
     })
 }
 
+/// Durable owner-authorized transition that retires one completed active
+/// Phase-B rebind attempt after the owning Host died.
+///
+/// The completed receipt is copied into this record instead of being
+/// overwritten.  A fresh direct-child Host can therefore start a new attempt
+/// only after this exact transition has won the registry revision CAS.  The
+/// transition is evidence, not a destination adoption shortcut: the next
+/// intent still has to publish and read back all four Phase-B files under the
+/// fresh owner.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivePhaseBRebindRecovery {
+    /// Explicit recovery transition wire discriminator.
+    pub wire: PlatformHandle,
+    /// Sole installation transaction identity.
+    pub transaction_id: PlatformHandle,
+    /// Stable rebind operation identity.
+    pub effect_id: PlatformHandle,
+    /// Exact approved candidate manifest digest.
+    pub manifest_digest: PlatformHandle,
+    /// Digest of the committed source terminal that authorized the old
+    /// attempt.
+    pub prior_terminal_digest: PlatformHandle,
+    /// Digest of the completed attempt's intent.
+    pub prior_request_digest: PlatformHandle,
+    /// Digest of the completed attempt's receipt.
+    pub prior_receipt_digest: PlatformHandle,
+    /// Completed attempt intent retained for forensic validation after the
+    /// current lifecycle advances to a fresh owner.
+    pub prior_intent: ActivePhaseBRebindIntent,
+    /// Completed attempt preparation retained for forensic validation after
+    /// the current lifecycle advances to a fresh owner.
+    pub prior_prepared: HostPhaseBPreparedMaterialization,
+    /// Full completed receipt retained as forensic evidence.
+    pub prior_receipt: ActivePhaseBRebindReceipt,
+    /// Fresh Host owner epoch authorized to replace the completed attempt.
+    pub recovery_host_owner_epoch: PlatformHandle,
+    /// Fresh Host process identity authorized to replace the completed attempt.
+    pub recovery_host_process_identity: PlatformHandle,
+    /// Digest of the fresh Host process nonce.
+    pub recovery_host_process_nonce_digest: PlatformHandle,
+    /// Fresh Host epoch lineage.
+    pub recovery_host_epoch_lineage: PlatformHandle,
+    /// Fresh Host epoch sequence.
+    pub recovery_host_epoch_sequence: u64,
+    /// Digest of every recovery transition field except this digest.
+    pub recovery_digest: PlatformHandle,
+}
+
+impl ActivePhaseBRebindRecovery {
+    /// Current active-rebind recovery transition wire discriminator.
+    pub const WIRE: &'static str = "eliot.host.phase-b-rebind-recovery.v1";
+
+    /// Constructs a recovery transition from one exact completed rebind and a
+    /// fresh direct-child Host owner.
+    pub fn new(
+        current: &ActivePhaseBRebind,
+        recovery_host_owner_epoch: PlatformHandle,
+        recovery_host_process_identity: PlatformHandle,
+        recovery_host_process_nonce_digest: PlatformHandle,
+        recovery_host_epoch_lineage: PlatformHandle,
+        recovery_host_epoch_sequence: u64,
+    ) -> Result<Self, InstallationError> {
+        current.validate()?;
+        let prepared = current.prepared.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B recovery requires durable preparation".to_owned(),
+            )
+        })?;
+        let prior_receipt = current.receipt.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B recovery requires a completed receipt".to_owned(),
+            )
+        })?;
+        prior_receipt.validate_against(&current.intent, prepared)?;
+        let mut value = Self {
+            wire: PlatformHandle::new(Self::WIRE).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "active_phase_b_rebind.recovery.wire".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            transaction_id: current.intent.transaction_id.clone(),
+            effect_id: current.intent.effect_id.clone(),
+            manifest_digest: current.intent.manifest_digest.clone(),
+            prior_terminal_digest: current.intent.prior_terminal_digest.clone(),
+            prior_request_digest: current.intent.request_digest.clone(),
+            prior_receipt_digest: prior_receipt.receipt_digest.clone(),
+            prior_intent: current.intent.clone(),
+            prior_prepared: prepared.clone(),
+            prior_receipt: prior_receipt.clone(),
+            recovery_host_owner_epoch,
+            recovery_host_process_identity,
+            recovery_host_process_nonce_digest,
+            recovery_host_epoch_lineage,
+            recovery_host_epoch_sequence,
+            recovery_digest: PlatformHandle::new("pending").map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "active_phase_b_rebind.recovery.recovery_digest".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+        };
+        value.recovery_digest = value.computed_digest()?;
+        value.validate_against(current)?;
+        Ok(value)
+    }
+
+    /// Validates the recovery transition's own digest and typed identity
+    /// domains. Cross-record bindings are checked by [`Self::validate_against`].
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.wire.as_str() != Self::WIRE {
+            return Err(InstallationError::InvalidField {
+                field: "active_phase_b_rebind.recovery.wire".to_owned(),
+                reason: "unsupported active Phase-B recovery wire".to_owned(),
+            });
+        }
+        for (value, field) in [
+            (
+                &self.transaction_id,
+                "active_phase_b_rebind.recovery.transaction_id",
+            ),
+            (&self.effect_id, "active_phase_b_rebind.recovery.effect_id"),
+            (
+                &self.recovery_host_owner_epoch,
+                "active_phase_b_rebind.recovery.recovery_host_owner_epoch",
+            ),
+            (
+                &self.recovery_host_epoch_lineage,
+                "active_phase_b_rebind.recovery.recovery_host_epoch_lineage",
+            ),
+        ] {
+            handle(value, field)?;
+        }
+        for (value, field) in [
+            (
+                &self.manifest_digest,
+                "active_phase_b_rebind.recovery.manifest_digest",
+            ),
+            (
+                &self.prior_terminal_digest,
+                "active_phase_b_rebind.recovery.prior_terminal_digest",
+            ),
+            (
+                &self.prior_request_digest,
+                "active_phase_b_rebind.recovery.prior_request_digest",
+            ),
+            (
+                &self.prior_receipt_digest,
+                "active_phase_b_rebind.recovery.prior_receipt_digest",
+            ),
+            (
+                &self.recovery_host_process_identity,
+                "active_phase_b_rebind.recovery.recovery_host_process_identity",
+            ),
+            (
+                &self.recovery_host_process_nonce_digest,
+                "active_phase_b_rebind.recovery.recovery_host_process_nonce_digest",
+            ),
+            (
+                &self.recovery_digest,
+                "active_phase_b_rebind.recovery.recovery_digest",
+            ),
+        ] {
+            sha256_handle(value, field)?;
+        }
+        self.prior_intent.validate()?;
+        self.prior_prepared.validate()?;
+        self.prior_receipt
+            .validate_against(&self.prior_intent, &self.prior_prepared)?;
+        if self.transaction_id != self.prior_intent.transaction_id
+            || self.effect_id != self.prior_intent.effect_id
+            || self.manifest_digest != self.prior_intent.manifest_digest
+            || self.prior_terminal_digest != self.prior_intent.prior_terminal_digest
+            || self.prior_request_digest != self.prior_intent.request_digest
+            || self.prior_receipt_digest != self.prior_receipt.receipt_digest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.recovery_host_epoch_sequence == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "active_phase_b_rebind.recovery.recovery_host_epoch_sequence".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        if self.recovery_digest != self.computed_digest()? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Validates that this recovery transition is an exact CAS successor of
+    /// the currently durable completed rebind.
+    pub fn validate_against(&self, current: &ActivePhaseBRebind) -> Result<(), InstallationError> {
+        self.validate()?;
+        let prepared = current.prepared.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B recovery requires durable preparation".to_owned(),
+            )
+        })?;
+        let receipt = current.receipt.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B recovery requires a completed receipt".to_owned(),
+            )
+        })?;
+        receipt.validate_against(&current.intent, prepared)?;
+        if self.transaction_id != current.intent.transaction_id
+            || self.effect_id != current.intent.effect_id
+            || self.manifest_digest != current.intent.manifest_digest
+            || self.prior_terminal_digest != current.intent.prior_terminal_digest
+            || self.prior_request_digest != current.intent.request_digest
+            || self.prior_receipt_digest != receipt.receipt_digest
+            || self.prior_intent != current.intent
+            || self.prior_prepared != *prepared
+            || self.prior_receipt != *receipt
+            || self.recovery_host_epoch_sequence <= receipt.host_epoch_sequence
+            || self.recovery_host_owner_epoch == receipt.host_owner_epoch
+            || self.recovery_host_process_identity == receipt.host_process_identity
+            || self.recovery_host_process_nonce_digest == receipt.host_process_nonce_digest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Returns whether this transition authorizes the supplied fresh intent.
+    #[must_use]
+    pub fn authorizes_intent(&self, intent: &ActivePhaseBRebindIntent) -> bool {
+        self.transaction_id == intent.transaction_id
+            && self.effect_id == intent.effect_id
+            && self.manifest_digest == intent.manifest_digest
+            && self.recovery_host_owner_epoch == intent.host_owner_epoch
+            && self.recovery_host_process_identity == intent.host_process_identity
+            && self.recovery_host_process_nonce_digest == intent.host_process_nonce_digest
+            && self.recovery_host_epoch_lineage == intent.host_epoch_lineage
+            && self.recovery_host_epoch_sequence == intent.host_epoch_sequence
+    }
+
+    fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        let bytes = serde_json::to_vec(&(
+            self.wire.as_str(),
+            self.transaction_id.as_str(),
+            self.effect_id.as_str(),
+            self.manifest_digest.as_str(),
+            self.prior_terminal_digest.as_str(),
+            self.prior_request_digest.as_str(),
+            self.prior_receipt_digest.as_str(),
+            self.prior_intent.request_digest.as_str(),
+            self.prior_prepared.prepared_digest.as_str(),
+            self.recovery_host_owner_epoch.as_str(),
+            self.recovery_host_process_identity.as_str(),
+            self.recovery_host_process_nonce_digest.as_str(),
+            self.recovery_host_epoch_lineage.as_str(),
+            self.recovery_host_epoch_sequence,
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "active_phase_b_rebind.recovery.recovery_digest".to_owned(),
+            reason: error.to_string(),
+        })?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+            field: "active_phase_b_rebind.recovery.recovery_digest".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+}
+
 /// Registry-owned Active Phase-B rebind lifecycle.  The intent remains
 /// present across every state; prepared and receipt are added only after their
 /// exact preceding boundary has committed.
@@ -4184,6 +4450,10 @@ pub struct ActivePhaseBRebind {
     pub prepared: Option<HostPhaseBPreparedMaterialization>,
     /// Exact no-follow destination readback receipt.
     pub receipt: Option<ActivePhaseBRebindReceipt>,
+    /// Completed attempts retired by explicit fresh-owner recovery CAS. These
+    /// records are forensic evidence and never become current authority.
+    #[serde(default)]
+    pub recovery_history: Vec<ActivePhaseBRebindRecovery>,
 }
 
 impl ActivePhaseBRebind {
@@ -4213,6 +4483,9 @@ impl ActivePhaseBRebind {
                 )
             })?;
             receipt.validate_against(&self.intent, prepared)?;
+        }
+        for recovery in &self.recovery_history {
+            recovery.validate()?;
         }
         Ok(())
     }
@@ -6256,6 +6529,26 @@ impl RedbInstallationRegistry {
         })
     }
 
+    /// Atomically records the fresh-owner CAS that retires one completed
+    /// `ActiveVerified` rebind attempt. The completed receipt remains in the
+    /// registry's forensic recovery history; this transition only authorizes a
+    /// later fresh intent and never adopts destination bytes.
+    pub fn record_active_phase_b_rebind_recovery(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        recovery: &ActivePhaseBRebindRecovery,
+    ) -> Result<ActivePhaseBRebindRecovery, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        recovery.validate()?;
+        let recovery = recovery.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            registry.record_active_phase_b_rebind_recovery_unchecked(&recovery)
+        })
+    }
+
     /// Atomically records a Host recovery disposition for one exact approval.
     pub fn mark_pending_recovery(
         &self,
@@ -6888,6 +7181,7 @@ impl ApprovedGenerationRegistry {
                     intent: intent.clone(),
                     prepared: None,
                     receipt: None,
+                    recovery_history: Vec::new(),
                 });
             }
             Some(existing) if existing.intent == *intent => {}
@@ -6900,19 +7194,28 @@ impl ApprovedGenerationRegistry {
                     && existing.intent.prior_phase_b_receipt_digest
                         == intent.prior_phase_b_receipt_digest =>
             {
-                if existing.prepared.is_some() {
+                if existing.prepared.is_some() && existing.receipt.is_none() {
                     return Err(InstallationError::IdentityConflict);
                 }
-                // A fresh Host owner may resume the same operation after a
-                // crash only if no durable preparation exists. The old attempt
-                // remains source evidence in the committed fence; only its
-                // current-owner preparation/receipt is replaced, never adopted
-                // from destination bytes. An unresolved prepared must be
-                // completed or rolled back by its owner, never silently reset.
+                if existing.receipt.is_some()
+                    && !existing
+                        .recovery_history
+                        .iter()
+                        .any(|recovery| recovery.authorizes_intent(intent))
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                // A fresh Host owner may retry an intent-only operation, or a
+                // completed operation only after the explicit durable recovery
+                // CAS above. The old completed receipt is retained in the
+                // forensic history and destination bytes are never adopted as
+                // current authority.
+                let recovery_history = existing.recovery_history.clone();
                 self.active_phase_b_rebind = Some(ActivePhaseBRebind {
                     intent: intent.clone(),
                     prepared: None,
                     receipt: None,
+                    recovery_history,
                 });
             }
             Some(_) => return Err(InstallationError::IdentityConflict),
@@ -6925,6 +7228,38 @@ impl ApprovedGenerationRegistry {
             .clone();
         self.validate()?;
         Ok(recorded)
+    }
+
+    fn record_active_phase_b_rebind_recovery_unchecked(
+        &mut self,
+        recovery: &ActivePhaseBRebindRecovery,
+    ) -> Result<ActivePhaseBRebindRecovery, InstallationError> {
+        self.validate()?;
+        let rebind = self.active_phase_b_rebind.as_mut().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B recovery requires a durable rebind lifecycle".to_owned(),
+            )
+        })?;
+        recovery.validate_against(rebind)?;
+        if rebind.recovery_history.iter().any(|existing| {
+            existing.recovery_host_owner_epoch == recovery.recovery_host_owner_epoch
+                || existing.recovery_host_process_identity
+                    == recovery.recovery_host_process_identity
+                || existing.recovery_host_process_nonce_digest
+                    == recovery.recovery_host_process_nonce_digest
+        }) {
+            if rebind
+                .recovery_history
+                .iter()
+                .any(|existing| existing == recovery)
+            {
+                return Ok(recovery.clone());
+            }
+            return Err(InstallationError::IdentityConflict);
+        }
+        rebind.recovery_history.push(recovery.clone());
+        self.validate()?;
+        Ok(recovery.clone())
     }
 
     fn record_active_phase_b_rebind_prepared_unchecked(
@@ -7567,17 +7902,26 @@ impl ApprovedGenerationRegistry {
                     "active Phase-B rebind source terminal has no Phase-B binding".to_owned(),
                 )
             })?;
+            let terminal_digest = activation_terminal_digest(terminal)?;
             if terminal.transaction_id != rebind.intent.transaction_id
                 || terminal.plan_digest != rebind.intent.plan_digest
                 || terminal.generation != active.manifest.generation
                 || rebind.intent.manifest_digest != candidate_manifest_digest(&active.manifest)?
-                || rebind.intent.prior_terminal_digest != activation_terminal_digest(terminal)?
+                || rebind.intent.prior_terminal_digest != terminal_digest
             {
                 return Err(InstallationError::IdentityConflict);
             }
             rebind
                 .intent
                 .validate_against_prior_binding(prior_binding)?;
+            for recovery in &rebind.recovery_history {
+                if recovery.prior_terminal_digest != terminal_digest {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                recovery
+                    .prior_intent
+                    .validate_against_prior_binding(prior_binding)?;
+            }
         }
         Ok(())
     }
@@ -24147,8 +24491,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn active_phase_b_rebind_prepared_cannot_be_reset_by_same_operation_fresh_owner_production_path()
-     {
+    fn active_phase_b_rebind_completed_receipt_requires_fresh_owner_recovery_cas() {
         let transaction = fully_applied_system_registration_transaction();
         let approval = test_transaction_activation_approval(
             &transaction,
@@ -24255,6 +24598,48 @@ mod tests {
             ),
             Err(InstallationError::IdentityConflict)
         ));
+
+        let receipt = must(ActivePhaseBRebindReceipt::from_prepared(&intent, &prepared));
+        must(registry.record_active_phase_b_rebind_receipt(
+            &host,
+            must(registry.load()).revision(),
+            &receipt,
+        ));
+        let completed = must(registry.load())
+            .active_phase_b_rebind()
+            .cloned()
+            .unwrap_or_else(|| unreachable!());
+        let recovery = must(ActivePhaseBRebindRecovery::new(
+            &completed,
+            test_handle("host-owner:reset-2"),
+            test_handle("b".repeat(64)),
+            test_handle("c".repeat(64)),
+            test_handle("host-lineage:reset-2"),
+            3,
+        ));
+        must(registry.record_active_phase_b_rebind_recovery(
+            &host,
+            must(registry.load()).revision(),
+            &recovery,
+        ));
+        let mut recovered_intent = fresh_intent;
+        recovered_intent.host_epoch_sequence = 3;
+        recovered_intent.request_digest =
+            must(active_phase_b_rebind_intent_digest(&recovered_intent));
+        must(registry.record_active_phase_b_rebind_intent(
+            &host,
+            must(registry.load()).revision(),
+            &recovered_intent,
+        ));
+        let rebound = must(registry.load())
+            .active_phase_b_rebind()
+            .cloned()
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(rebound.intent, recovered_intent);
+        assert!(rebound.prepared.is_none());
+        assert!(rebound.receipt.is_none());
+        assert_eq!(rebound.recovery_history.len(), 1);
+        assert_eq!(rebound.recovery_history[0].prior_receipt, receipt);
         let _ = std::fs::remove_file(path);
     }
 
@@ -24509,6 +24894,7 @@ mod tests {
             )),
             prepared: None,
             receipt: None,
+            recovery_history: Vec::new(),
         });
         assert!(matches!(
             pending_plus_active.validate(),
