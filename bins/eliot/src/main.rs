@@ -13,7 +13,7 @@ use eliot_installation::{
     RedbInstallationTransactionStore, WindowsInstallationCoordinator,
     decode_installation_transaction_json, parse_installation_transaction_id,
 };
-use eliot_platform_windows::ProtectedRootLease;
+use eliot_platform_windows::{InstallerRootError, ProtectedRootLease, is_process_elevated};
 use serde_json::json;
 use std::path::PathBuf;
 use std::{
@@ -651,6 +651,44 @@ fn run_installation_effect(
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
+    if preflight_transaction.profile == InstallationProfile::SystemService {
+        match is_process_elevated() {
+            Ok(true) => {}
+            Ok(false) => {
+                write_installation_error(
+                    if recover {
+                        "INSTALLATION_RECOVER_NOT_ELEVATED"
+                    } else {
+                        "INSTALLATION_APPLY_NOT_ELEVATED"
+                    },
+                    "SystemService requires an elevated token; no effect was attempted",
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+            Err(InstallerRootError::UnsupportedPlatform) => {
+                write_installation_error(
+                    if recover {
+                        "INSTALLATION_RECOVER_NOT_ELEVATED"
+                    } else {
+                        "INSTALLATION_APPLY_NOT_ELEVATED"
+                    },
+                    "SystemService requires Windows elevation; no effect was attempted",
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+            Err(error) => {
+                write_installation_error(
+                    if recover {
+                        "INSTALLATION_RECOVER_RECOVERY_REQUIRED"
+                    } else {
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED"
+                    },
+                    &format!("elevation is unknown ({error}); recovery is required"),
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+        }
+    }
     let preflight_status = installation_preflight_status(preflight_transaction.stage(), recover);
     let should_query_host_terminal =
         should_query_host_terminal(preflight_transaction.profile, preflight_transaction.stage());
@@ -856,14 +894,23 @@ fn run_installation_effect(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
-            write_installation_error(
-                if recover {
-                    "INSTALLATION_RECOVER_ERROR"
-                } else {
-                    "INSTALLATION_APPLY_ERROR"
-                },
-                &error.to_string(),
-            );
+            let code = match &error {
+                InstallationError::UnknownOutcome { .. } => {
+                    if recover {
+                        "INSTALLATION_RECOVER_RECOVERY_REQUIRED"
+                    } else {
+                        "INSTALLATION_APPLY_RECOVERY_REQUIRED"
+                    }
+                }
+                _ => {
+                    if recover {
+                        "INSTALLATION_RECOVER_ERROR"
+                    } else {
+                        "INSTALLATION_APPLY_ERROR"
+                    }
+                }
+            };
+            write_installation_error(code, &error.to_string());
             return Ok(INVALID_REQUEST_EXIT);
         }
     };

@@ -1287,6 +1287,23 @@ fn token_is_elevated() -> Result<bool, InstallerRootError> {
     Ok(elevation.TokenIsElevated != 0)
 }
 
+/// Observes whether the current process token is elevated without
+/// mutating installer state.
+///
+/// This is a read-only probe. It does not create or widen installer
+/// mutation authority; all durable effects remain behind
+/// `WindowsInstallerRootPrimitive` and `WindowsInstallationCoordinator`.
+///
+/// # Errors
+///
+/// Returns `InstallerRootError::Indeterminate` when the token cannot be
+/// classified, `UnsupportedPlatform` off Windows, or `InvalidPath` on
+/// malformed input. `NotElevated` is never returned here; the caller
+/// interprets `Ok(false)` explicitly.
+pub fn is_process_elevated() -> Result<bool, InstallerRootError> {
+    token_is_elevated()
+}
+
 #[cfg(not(windows))]
 fn token_is_elevated() -> Result<bool, InstallerRootError> {
     Err(InstallerRootError::UnsupportedPlatform)
@@ -1709,6 +1726,19 @@ mod primitive_tests {
         assert_eq!(
             ensure_system_service_spec(&fixture.user_spec("not-system")),
             Err(InstallerRootError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn is_process_elevated_is_observable_without_mutation() {
+        let first = is_process_elevated()
+            .unwrap_or_else(|error| panic!("is_process_elevated must be observable: {error}"));
+        let second = is_process_elevated().unwrap_or_else(|error| {
+            panic!("second is_process_elevated probe must be observable: {error}")
+        });
+        assert_eq!(
+            first, second,
+            "elevation probe must be stable without mutation"
         );
     }
 }

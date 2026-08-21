@@ -43,7 +43,8 @@ pub use installer_root::{
     InstallerProtectedFileReadback, InstallerRootAbsentSnapshot, InstallerRootCreateDisposition,
     InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveCreate,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
-    WindowsInstallerRootPrimitive, windows_path_identity_digest, windows_paths_equal,
+    WindowsInstallerRootPrimitive, is_process_elevated, windows_path_identity_digest,
+    windows_paths_equal,
 };
 pub use package_staging::{
     AuthenticodeError, AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier,
