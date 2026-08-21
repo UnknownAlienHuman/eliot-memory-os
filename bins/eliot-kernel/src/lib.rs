@@ -10490,6 +10490,10 @@ mod tests {
     }
 
     #[cfg(windows)]
+    // The C54 tests intentionally keep the complete control-path fixture
+    // together; fixed data and expected setup transitions use unwrap as
+    // concise assertions.
+    #[allow(clippy::too_many_lines, clippy::unwrap_used)]
     #[tokio::test]
     async fn c54_p1_reconcile_rebind_fenced_until_publication_via_control_path() {
         assert_eq!(
@@ -10695,6 +10699,10 @@ mod tests {
     }
 
     #[cfg(windows)]
+    // The C54 tests intentionally keep the complete control-path fixture
+    // together; fixed data and expected setup transitions use unwrap as
+    // concise assertions.
+    #[allow(clippy::too_many_lines, clippy::unwrap_used)]
     #[tokio::test]
     async fn c54_p1_superseded_rebind_durably_fenced_via_control_path() {
         assert_eq!(
@@ -10893,6 +10901,10 @@ mod tests {
     }
 
     #[cfg(windows)]
+    // The C54 tests intentionally keep the complete control-path fixture
+    // together; fixed data and expected setup transitions use unwrap as
+    // concise assertions.
+    #[allow(clippy::too_many_lines, clippy::unwrap_used)]
     #[tokio::test]
     async fn c54_p1_generic_reconcile_fenced_on_mismatched_store_gate_via_control_path() {
         assert_eq!(
@@ -11076,6 +11088,10 @@ mod tests {
     }
 
     #[cfg(windows)]
+    // The C54 tests intentionally keep the complete control-path fixture
+    // together; fixed data and expected setup transitions use unwrap as
+    // concise assertions.
+    #[allow(clippy::too_many_lines, clippy::unwrap_used)]
     #[tokio::test]
     async fn c54_p1_probe_ready_requires_exact_store_fence_via_control_path() {
         assert_eq!(
@@ -11192,6 +11208,10 @@ mod tests {
     }
 
     #[cfg(windows)]
+    // The C54 tests intentionally keep the complete control-path fixture
+    // together; fixed data and expected setup transitions use unwrap as
+    // concise assertions.
+    #[allow(clippy::too_many_lines, clippy::unwrap_used)]
     #[tokio::test]
     async fn c54_p1_legacy_zero_order_requires_migration_via_control_path() {
         assert_eq!(
@@ -11534,7 +11554,7 @@ mod tests {
         tokio::pin!(timeout);
         let blocked = tokio::select! {
             _ = &mut probe_fut => false,
-            _ = &mut timeout => true,
+            () = &mut timeout => true,
         };
         assert!(
             blocked,
@@ -11712,9 +11732,10 @@ mod tests {
             assert!(svc.store_rebind_receipt().is_some());
             assert_eq!(svc.state(), KernelServiceState::Degraded);
         }
-        let svc = kernel.service.lock().unwrap();
-        let activation = svc.activation_receipt().unwrap().clone();
-        drop(svc);
+        let activation = {
+            let svc = kernel.service.lock().unwrap();
+            svc.activation_receipt().unwrap().clone()
+        };
         let fresh = KernelReadyReceipt {
             activation_id: candidate.activation_id.clone(),
             activation_operation_id: activation.operation_id.clone(),
@@ -11774,7 +11795,7 @@ mod tests {
         tokio::pin!(replay_timeout);
         let replay_blocked = tokio::select! {
             _ = &mut replay_fut => false,
-            _ = &mut replay_timeout => true,
+            () = &mut replay_timeout => true,
         };
         assert!(
             replay_blocked,
