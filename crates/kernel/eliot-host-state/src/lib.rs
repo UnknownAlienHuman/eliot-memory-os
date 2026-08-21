@@ -15,6 +15,7 @@ mod legacy;
 mod model;
 mod redb_journal;
 mod redb_store;
+mod scm_operation_store;
 mod service;
 
 pub use backend::{
@@ -43,6 +44,10 @@ pub use redb_journal::{RedbJournalBackend, RedbJournalInspection};
 pub use redb_store::{
     HostAdmissionState, HostRecoverySnapshot, RedbHostReleaseToken, RedbHostStateInspection,
     RedbHostStateStore,
+};
+pub use scm_operation_store::{
+    ScmOperationCoordinator, ScmOperationIdentity, ScmOperationRecord, ScmOperationState,
+    ScmOperationStore, ScmOperationStoreError,
 };
 pub use service::{HostStateJournalService, ProductionHostStateJournal};
 #[cfg(test)]
