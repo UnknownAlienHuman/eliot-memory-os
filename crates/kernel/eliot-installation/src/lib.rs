@@ -6619,6 +6619,11 @@ impl ApprovedGenerationRegistry {
         self.service_registration_approvals
             .extend(service_registration_approvals.iter().cloned());
         self.last_terminal_activation = None;
+        // A new candidate supersedes the one-slot ActiveVerified rebind
+        // projection. Its source terminal is the prior committed generation;
+        // staging clears that terminal, so retaining the rebind would leave a
+        // stale owner operation that cannot authorize the new generation.
+        self.active_phase_b_rebind = None;
         self.validate()
     }
 
@@ -24081,6 +24086,119 @@ mod tests {
         assert_eq!(must(registry.load()), persisted);
         drop(registry);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staging_new_generation_clears_active_phase_b_rebind_before_commit() {
+        let first = registering_transaction();
+        let host = host_capability();
+        let mut registry = ApprovedGenerationRegistry::new();
+        must(registry.stage_pending_activation(
+            first.transaction_id.clone(),
+            first.installer_plan_digest.clone(),
+            first.candidate_manifest.clone(),
+            test_handle("approval:active-rebind-stage"),
+        ));
+        must(registry.commit_pending_activation(
+            &host,
+            &first.transaction_id,
+            &first.installer_plan_digest,
+            &first.candidate_manifest.generation,
+            &test_commit_fence(&first.candidate_manifest),
+        ));
+
+        let committed = registry
+            .last_terminal_activation
+            .as_ref()
+            .unwrap_or_else(|| unreachable!());
+        let prior = committed
+            .commit_fence
+            .as_ref()
+            .and_then(|fence| fence.phase_b_live_binding.as_ref())
+            .unwrap_or_else(|| unreachable!());
+        let intent = must(ActivePhaseBRebindIntent::new(
+            first.transaction_id.clone(),
+            first.installer_plan_digest.clone(),
+            test_handle("active-phase-b-rebind-stage"),
+            must(candidate_manifest_digest(&first.candidate_manifest)),
+            must(activation_terminal_digest(committed)),
+            prior,
+            test_handle("host-owner:stage"),
+            test_handle("a".repeat(64)),
+            test_handle("b".repeat(64)),
+            test_handle("host-lineage:stage"),
+            2,
+            test_handle("activation-lineage:stage"),
+            2,
+            must(phase_b_static_template_for_candidate(
+                &first.candidate_manifest,
+            )),
+        ));
+        must(registry.record_active_phase_b_rebind_intent_unchecked(&intent));
+
+        let launch = first.candidate_manifest.runtime_launch.clone();
+        let mut prepared = HostPhaseBPreparedMaterialization {
+            wire: test_handle(HostPhaseBPreparedMaterialization::WIRE),
+            transaction_id: intent.transaction_id.clone(),
+            effect_id: intent.effect_id.clone(),
+            credential_effect_id: test_handle("credential-effect:stage"),
+            manifest_digest: intent.manifest_digest.clone(),
+            request_digest: intent.request_digest.clone(),
+            credential_receipt_digest: intent.prior_phase_b_receipt_digest.clone(),
+            host_owner_epoch: intent.host_owner_epoch.clone(),
+            host_process_identity: intent.host_process_identity.clone(),
+            host_process_nonce_digest: intent.host_process_nonce_digest.clone(),
+            host_epoch_lineage: intent.host_epoch_lineage.clone(),
+            host_epoch_sequence: intent.host_epoch_sequence,
+            activation_generation_lineage: intent.activation_generation_lineage.clone(),
+            activation_generation_sequence: intent.activation_generation_sequence,
+            authority_descriptor_digest: launch.authority_descriptor_digest.clone(),
+            config_file_digest: first.candidate_manifest.config_digest.clone(),
+            store_bootstrap_descriptor_digest: launch.store_bootstrap_descriptor_digest.clone(),
+            eliotd_descriptor_digest: launch.eliotd_descriptor_digest.clone(),
+            semantic_config_hash: test_handle("c".repeat(64)),
+            launch,
+            prepared_digest: test_handle("pending"),
+        };
+        prepared.prepared_digest = must(prepared.computed_digest());
+        must(registry.record_active_phase_b_rebind_prepared_unchecked(&prepared));
+        let receipt = must(ActivePhaseBRebindReceipt::from_prepared(&intent, &prepared));
+        must(registry.record_active_phase_b_rebind_receipt_unchecked(&receipt));
+        assert!(
+            registry
+                .active_phase_b_rebind()
+                .and_then(|rebind| rebind.receipt.as_ref())
+                .is_some()
+        );
+
+        let mut upgrade = first.candidate_manifest.clone();
+        upgrade.generation = test_handle("generation:after-active-rebind");
+        upgrade.runtime_launch.generation = upgrade.generation.clone();
+        upgrade.runtime_launch.descriptor_digest =
+            test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
+        must(upgrade.validate());
+        let upgrade_transaction_id = test_handle("transaction:after-active-rebind");
+        let upgrade_plan_digest = test_handle("d".repeat(64));
+        must(registry.stage_pending_activation(
+            upgrade_transaction_id.clone(),
+            upgrade_plan_digest.clone(),
+            upgrade.clone(),
+            test_handle("approval:after-active-rebind"),
+        ));
+        // The one-slot rebind belongs only to the prior active terminal. It
+        // must not survive as authority for the newly staged generation.
+        assert!(registry.active_phase_b_rebind().is_none());
+        must(registry.validate());
+        must(registry.commit_pending_activation(
+            &host,
+            &upgrade_transaction_id,
+            &upgrade_plan_digest,
+            &upgrade.generation,
+            &test_commit_fence(&upgrade),
+        ));
+        assert_eq!(registry.active_generation(), Some(&upgrade.generation));
+        must(registry.validate());
     }
 
     #[test]
