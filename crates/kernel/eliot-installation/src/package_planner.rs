@@ -17,6 +17,7 @@ use crate::{
     ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
     StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
     candidate_manifest_digest as candidate_digest_fn, handle,
+    phase_b_static_template_for_candidate,
 };
 
 /// The immutable package inventory produced by the trusted generation seam.
@@ -490,6 +491,7 @@ pub(crate) fn candidate_has_nonplaceholder_package_digests(candidate: &Candidate
         })
 }
 
+#[allow(dead_code)]
 pub(crate) fn validate_exact_expected_file_digests(
     candidate: &CandidateManifest,
     manifest: &PackageManifest,
@@ -1012,6 +1014,10 @@ impl GenerationPackagePlanner {
             runtime_launch: launch,
         };
         candidate.validate()?;
+        // Validate the deterministic Phase-B static constraint at the sole
+        // candidate producer. Host recomputes the same value from its exact
+        // pending manifest before accepting the live overlay.
+        let phase_b_static_template = phase_b_static_template_for_candidate(&candidate)?;
         validate_exact_candidate_package_binding(&candidate, &package_manifest)?;
         for digest in &expected_file_digests {
             let (_, _, _, expected) = strict_role_bindings(&candidate)
@@ -1080,7 +1086,7 @@ impl GenerationPackagePlanner {
             manifest: package_manifest,
             staging_root: input.staging_root.clone(),
             expected_file_digests,
-            candidate_manifest_digest,
+            candidate_manifest_digest: candidate_manifest_digest.clone(),
             package_manifest_digest,
         });
         if input.profile == InstallationProfile::SystemService {
@@ -1115,6 +1121,28 @@ impl GenerationPackagePlanner {
                     automatic_start: true,
                 });
             }
+            // First-install bootstrap starts only Host.  Watchdog is already
+            // registered for Host to inspect/start after its authenticated
+            // epoch exists; starting it here would create a second admission
+            // owner and would race the fenced Host phase.
+            effects.push(InstallerEffectPlan::StartService {
+                effect_id: PlatformHandle::new("effect:start:EliotHost").map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "generation.effect_id".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?,
+                role: InstallerServiceRole::Host,
+                service_name: PlatformHandle::new("EliotHost").map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "generation.service_name".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?,
+                executable_path: candidate.host_executable_path.clone(),
+                account: InstallerServiceAccount::LocalService,
+                automatic_start: true,
+            });
             effects.push(InstallerEffectPlan::ProvisionStoreCredential {
                 effect_id: PlatformHandle::new("effect:store-credential").map_err(|error| {
                     InstallationError::InvalidField {
@@ -1122,6 +1150,33 @@ impl GenerationPackagePlanner {
                         reason: error.to_string(),
                     }
                 })?,
+                provision: StoreCredentialProvisionPlan {
+                    host_state_root: roots.host_state_root.clone(),
+                    expected_host_executable: candidate.host_executable_path.clone(),
+                    target: candidate.store_credential_target.clone(),
+                    provider: StoreCredentialProvider::WindowsCredentialManager,
+                    scope: StoreCredentialScope::LocalService,
+                    expected_principal_sid: PlatformHandle::new(LOCAL_SERVICE_SID).map_err(
+                        |error| InstallationError::InvalidField {
+                            field: "generation.expected_principal_sid".to_owned(),
+                            reason: error.to_string(),
+                        },
+                    )?,
+                    generation: authority_generation,
+                    config_digest: candidate.config_digest.clone(),
+                },
+            });
+            effects.push(InstallerEffectPlan::MaterializePhaseB {
+                effect_id: PlatformHandle::new("effect:phase-b-materialization").map_err(
+                    |error| InstallationError::InvalidField {
+                        field: "generation.effect_id".to_owned(),
+                        reason: error.to_string(),
+                    },
+                )?,
+                candidate_manifest_digest: candidate_manifest_digest.clone(),
+                static_template: phase_b_static_template.clone(),
+                host_state_root_digest: crate::phase_b_host_state_root_digest(&candidate)?,
+                watchdog_selector_digest: crate::phase_b_watchdog_selector_digest(&candidate)?,
                 provision: StoreCredentialProvisionPlan {
                     host_state_root: roots.host_state_root.clone(),
                     expected_host_executable: candidate.host_executable_path.clone(),
@@ -1146,12 +1201,16 @@ impl GenerationPackagePlanner {
                     InstallerEffectPlan::CreateRoot { root, .. }
                     | InstallerEffectPlan::ApplyAcl { root, .. } => root.clone(),
                     InstallerEffectPlan::StagePackage { staging_root, .. } => staging_root.clone(),
-                    InstallerEffectPlan::RegisterService { service_name, .. } => {
+                    InstallerEffectPlan::RegisterService { service_name, .. }
+                    | InstallerEffectPlan::StartService { service_name, .. } => {
                         service_name.clone()
                     }
                     InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
                         provision.target.clone()
                     }
+                    InstallerEffectPlan::MaterializePhaseB {
+                        static_template, ..
+                    } => static_template.authority_id.clone(),
                 };
                 let change_id = effect.effect_id().clone();
                 Ok(PlannedChange {
@@ -2317,6 +2376,163 @@ mod tests {
         let wire = serde_json::to_string(&transaction).unwrap();
         assert!(!wire.contains("host_runtime_activation_nonce"));
         assert!(!wire.contains("host_activation_nonce"));
+    }
+
+    #[test]
+    fn system_service_planner_emits_ordered_distinct_phase_b_effect_and_rejects_substitution() {
+        fn reseal(transaction: &mut InstallationTransaction) {
+            transaction.installer_plan_digest = h(crate::sha256_hex(
+                &InstallationTransaction::installer_plan_unsigned_bytes(
+                    &transaction.transaction_id,
+                    &transaction.candidate_manifest,
+                    &transaction.staging_root,
+                    &transaction
+                        .candidate_manifest
+                        .runtime_launch
+                        .runtime_state_roots,
+                    transaction.minimum_store_available_bytes,
+                    &transaction.planned_changes,
+                    &transaction.installer_effects,
+                )
+                .unwrap(),
+            ));
+        }
+
+        let (_tmp, portable, _roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        populate_source_with_roles(source_dir.path());
+        let mut input = production_input(source_dir.path(), portable);
+        input.transaction_id = h("transaction:system-service");
+        input.profile = crate::InstallationProfile::SystemService;
+        input.profile_anchor_root = h(crate::protected_program_data_root()
+            .expect("SystemService test needs the OS profile anchor")
+            .to_string_lossy()
+            .into_owned());
+        input.installation_key = Some(h("a".repeat(64)));
+        let transaction = GenerationPackagePlanner::plan(input)
+            .expect("trusted SystemService generation planner should build");
+        assert!(candidate_has_nonplaceholder_package_digests(
+            &transaction.candidate_manifest
+        ));
+        let host_start = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| {
+                matches!(
+                    effect,
+                    InstallerEffectPlan::StartService {
+                        role: InstallerServiceRole::Host,
+                        ..
+                    }
+                )
+            })
+            .expect("Host bootstrap effect");
+        let credential = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| {
+                matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
+            })
+            .expect("credential effect");
+        let phase_b = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::MaterializePhaseB { .. }))
+            .expect("Phase-B effect");
+        assert!(host_start < credential && credential < phase_b);
+        let (
+            InstallerEffectPlan::MaterializePhaseB {
+                effect_id: phase_effect_id,
+                ..
+            },
+            InstallerEffectPlan::ProvisionStoreCredential {
+                effect_id: credential_effect_id,
+                ..
+            },
+        ) = (
+            &transaction.installer_effects[phase_b],
+            &transaction.installer_effects[credential],
+        )
+        else {
+            unreachable!()
+        };
+        assert_ne!(phase_effect_id, credential_effect_id);
+
+        let mutations: [fn(&mut InstallerEffectPlan); 7] = [
+            |effect: &mut InstallerEffectPlan| {
+                if let InstallerEffectPlan::MaterializePhaseB {
+                    candidate_manifest_digest,
+                    ..
+                } = effect
+                {
+                    *candidate_manifest_digest = h("a".repeat(64));
+                }
+            },
+            |effect: &mut InstallerEffectPlan| {
+                if let InstallerEffectPlan::MaterializePhaseB {
+                    static_template, ..
+                } = effect
+                {
+                    static_template.authority_id = h("authority:substituted");
+                }
+            },
+            |effect: &mut InstallerEffectPlan| {
+                if let InstallerEffectPlan::MaterializePhaseB {
+                    static_template, ..
+                } = effect
+                {
+                    static_template.record_id = h("record:substituted");
+                }
+            },
+            |effect: &mut InstallerEffectPlan| {
+                if let InstallerEffectPlan::MaterializePhaseB {
+                    static_template, ..
+                } = effect
+                {
+                    static_template.revision_policy_binding = h("revision:substituted");
+                }
+            },
+            |effect: &mut InstallerEffectPlan| {
+                if let InstallerEffectPlan::MaterializePhaseB {
+                    static_template, ..
+                } = effect
+                {
+                    static_template.contour_refs = vec![h("contour:substituted")];
+                }
+            },
+            |effect: &mut InstallerEffectPlan| {
+                if let InstallerEffectPlan::MaterializePhaseB {
+                    host_state_root_digest,
+                    ..
+                } = effect
+                {
+                    *host_state_root_digest = h("b".repeat(64));
+                }
+            },
+            |effect: &mut InstallerEffectPlan| {
+                if let InstallerEffectPlan::MaterializePhaseB {
+                    watchdog_selector_digest,
+                    ..
+                } = effect
+                {
+                    *watchdog_selector_digest = h("c".repeat(64));
+                }
+            },
+        ];
+        for mutate in mutations {
+            let mut substituted = transaction.clone();
+            let effect = substituted
+                .installer_effects
+                .iter_mut()
+                .find(|effect| matches!(effect, InstallerEffectPlan::MaterializePhaseB { .. }))
+                .unwrap();
+            mutate(effect);
+            reseal(&mut substituted);
+            assert!(
+                substituted.validate().is_err(),
+                "Phase-B substitution must fail closed"
+            );
+        }
     }
 
     #[test]

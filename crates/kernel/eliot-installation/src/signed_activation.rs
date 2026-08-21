@@ -20,11 +20,13 @@ use eliot_runtime_contracts::{
     InstallationDigestBinding, InstallationScmRole, SignedInstallationActivationApproval,
 };
 
+use super::transaction_store_private::{Sealed, TransactionVersion};
 use super::{
     CandidateManifest, HostOwnerEpochCapability, InstallationActivationApproval, InstallationError,
     InstallationProfile, InstallationTransaction, InstallationTransactionStore,
     InstallerServiceRole, PlatformHandle, RedbInstallationRegistry,
-    RedbInstallationTransactionStore, candidate_manifest_digest, sha256_hex,
+    RedbInstallationTransactionStore, candidate_manifest_digest, registry_projection_identity,
+    sha256_hex,
 };
 
 const ARTIFACT_KERNEL: &str = "kernel";
@@ -61,16 +63,6 @@ fn binding_mismatch(reason: impl Into<String>) -> InstallationError {
     }
 }
 
-fn transaction_checksum(
-    transaction: &InstallationTransaction,
-) -> Result<String, InstallationError> {
-    let bytes =
-        serde_json::to_vec(transaction).map_err(|error| InstallationError::CorruptRegistry {
-            reason: format!("transaction snapshot could not be canonicalized: {error}"),
-        })?;
-    Ok(sha256_hex(&bytes))
-}
-
 fn expected_elevation_evidence_digest(
     precondition_evidence: &[PlatformHandle],
 ) -> Result<String, InstallationError> {
@@ -84,30 +76,6 @@ fn expected_elevation_evidence_digest(
         }
     })?;
     Ok(sha256_hex(&bytes))
-}
-
-fn require_activation_nonce_evidence(
-    precondition_evidence: &[PlatformHandle],
-    completed_stage_refs: &[PlatformHandle],
-    observed_postconditions: &[PlatformHandle],
-    activation_nonce: &str,
-) -> Result<(), InstallationError> {
-    let nonce_digest = sha256_hex(activation_nonce.as_bytes());
-    let evidence = precondition_evidence
-        .iter()
-        .chain(completed_stage_refs.iter())
-        .chain(observed_postconditions.iter())
-        .filter(|reference| reference.as_str() == nonce_digest)
-        .count();
-    match evidence {
-        1 => Ok(()),
-        0 => Err(binding_mismatch(
-            "activation nonce is not bound to one durable transaction evidence digest",
-        )),
-        _ => Err(binding_mismatch(
-            "activation nonce evidence is duplicated in the transaction",
-        )),
-    }
 }
 
 fn require_exact_digest_set(
@@ -309,13 +277,91 @@ fn require_stopped_scm_observation(
     }
 }
 
-fn verify_and_derive_approval(
+struct VerifiedActivationProjection {
+    approval: InstallationActivationApproval,
+    envelope_digest: PlatformHandle,
+    payload_digest: PlatformHandle,
+}
+
+fn payload_digest(
+    envelope: &SignedInstallationActivationApproval,
+) -> Result<PlatformHandle, InstallationError> {
+    let bytes = serde_json::to_vec(&envelope.payload).map_err(|error| {
+        InstallationError::CorruptRegistry {
+            reason: format!("signed activation payload could not be canonicalized: {error}"),
+        }
+    })?;
+    PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+        field: "signed_envelope.payload_digest".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+fn synthetic_projection_digest(
+    label: &str,
+    approval: &InstallationActivationApproval,
+) -> Result<PlatformHandle, InstallationError> {
+    let bytes =
+        serde_json::to_vec(approval).map_err(|error| InstallationError::CorruptRegistry {
+            reason: format!("verified approval could not be canonicalized: {error}"),
+        })?;
+    let mut canonical = label.as_bytes().to_vec();
+    canonical.push(0);
+    canonical.extend_from_slice(&bytes);
+    PlatformHandle::new(sha256_hex(&canonical)).map_err(|error| InstallationError::InvalidField {
+        field: "activation_projection.synthetic_digest".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+/// Derives the private first-install approval from the exact transaction.
+///
+/// This is deliberately kept beside the signed projection machinery: the
+/// bootstrap path uses the same approval binding and transaction-owned
+/// projection intent, but has no detached signer because the Host is fenced
+/// until this durable prefix has been admitted.
+fn bootstrap_approval(
+    transaction: &InstallationTransaction,
+) -> Result<InstallationActivationApproval, InstallationError> {
+    let manifest_digest = candidate_manifest_digest(&transaction.candidate_manifest)?;
+    let approval_ref = PlatformHandle::new(sha256_hex(
+        format!(
+            "eliot.first-install.bootstrap-approval.v2\0{}\0{}\0{}",
+            transaction.transaction_id.as_str(),
+            transaction.installer_plan_digest.as_str(),
+            manifest_digest.as_str(),
+        )
+        .as_bytes(),
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "bootstrap_approval.approval_ref".to_owned(),
+        reason: error.to_string(),
+    })?;
+    let runtime = &transaction.candidate_manifest.runtime_launch;
+    Ok(InstallationActivationApproval::from_verified_parts(
+        approval_ref,
+        transaction.transaction_id.clone(),
+        transaction.installer_plan_digest.clone(),
+        transaction.candidate_manifest.generation.clone(),
+        manifest_digest,
+        runtime.descriptor_digest.clone(),
+        transaction.request.required_owner.clone(),
+        transaction.candidate_manifest.signature_ref.clone(),
+        runtime.authority_descriptor_path.clone(),
+        runtime.authority_descriptor_digest.clone(),
+        runtime.authority_generation,
+        runtime.authority_state_fence.clone(),
+    ))
+}
+
+fn verify_and_derive_projection(
     transaction: &InstallationTransaction,
     envelope: &SignedInstallationActivationApproval,
     authority_key: &InstallationAuthorityKeySigner,
     now_ms: i64,
-) -> Result<InstallationActivationApproval, InstallationError> {
-    transaction.require_all_effects_applied()?;
+    signed_transaction_revision: u64,
+) -> Result<VerifiedActivationProjection, InstallationError> {
+    transaction.require_signed_pending_activation_effects()?;
     transaction.validate()?;
 
     let staging_receipts = transaction
@@ -339,7 +385,7 @@ fn verify_and_derive_approval(
             .to_owned(),
         installation_epoch: transaction.installation_epoch.sequence,
         transaction_id: transaction.transaction_id.as_str().to_owned(),
-        transaction_revision: transaction.revision(),
+        transaction_revision: signed_transaction_revision,
         static_verification_receipt_digest: static_digest.clone(),
         authority_generation: runtime.authority_generation,
         authority_state_fence: runtime.authority_state_fence.clone(),
@@ -359,7 +405,7 @@ fn verify_and_derive_approval(
     let payload = verified.payload();
 
     if payload.transaction_id != transaction.transaction_id.as_str()
-        || payload.transaction_revision != transaction.revision()
+        || payload.transaction_revision != signed_transaction_revision
         || payload.installation_id != transaction.installation_epoch.installation.as_str()
         || payload.installation_epoch != transaction.installation_epoch.sequence
         || payload.installer_plan_digest != transaction.installer_plan_digest.as_str()
@@ -400,13 +446,6 @@ fn verify_and_derive_approval(
             "elevation evidence is not the complete transaction precondition fence",
         ));
     }
-    require_activation_nonce_evidence(
-        &transaction.precondition_evidence,
-        &transaction.completed_stage_refs,
-        &transaction.observed_postconditions,
-        &payload.activation_nonce,
-    )?;
-
     let approval_ref =
         PlatformHandle::new(verified.envelope_digest().to_owned()).map_err(|error| {
             InstallationError::InvalidField {
@@ -430,7 +469,18 @@ fn verify_and_derive_approval(
     );
     approval.validate()?;
     approval.validate_against(transaction)?;
-    Ok(approval)
+    let envelope_digest =
+        PlatformHandle::new(verified.envelope_digest().to_owned()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "signed_envelope.envelope_digest".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+    Ok(VerifiedActivationProjection {
+        approval,
+        envelope_digest,
+        payload_digest: payload_digest(envelope)?,
+    })
 }
 
 #[cfg(windows)]
@@ -464,6 +514,328 @@ fn require_stopped_scm_contour(
 }
 
 impl RedbInstallationRegistry {
+    fn pending_projection_matches(
+        &self,
+        transaction: &InstallationTransaction,
+        approval: &InstallationActivationApproval,
+    ) -> Result<bool, InstallationError> {
+        let registry = self.load()?;
+        let Some(pending) = registry.pending_activation().cloned() else {
+            return Ok(false);
+        };
+        if !matches!(pending.state, super::PendingActivationState::Pending)
+            || pending.transaction_id != transaction.transaction_id
+            || pending.plan_digest != transaction.installer_plan_digest
+            || pending.manifest != transaction.candidate_manifest
+            || pending.approval != *approval
+        {
+            return Ok(false);
+        }
+        let approvals = transaction.service_registration_approvals()?;
+        Ok(approvals.iter().all(|expected| {
+            registry.service_registration_approval(&expected.generation, expected.role)
+                == Some(expected)
+        }))
+    }
+
+    fn quarantine_activation_projection_if_current(
+        transaction_store: &mut RedbInstallationTransactionStore,
+        transaction_id: &PlatformHandle,
+        pending_ref: PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        let Some(mut current) = transaction_store.load(transaction_id)? else {
+            return Err(InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            });
+        };
+        if current.stage() != super::InstallationStage::Activating {
+            return Ok(());
+        }
+        if current.activation_projection_intent().is_none() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let expected = TransactionVersion::of(&current)?;
+        current.quarantine_activation_projection(pending_ref)?;
+        <RedbInstallationTransactionStore as Sealed>::compare_and_save(
+            transaction_store,
+            expected,
+            &current,
+        )
+    }
+
+    fn reconcile_activation_projection(
+        &self,
+        transaction_store: &mut RedbInstallationTransactionStore,
+        transaction_id: &PlatformHandle,
+        transaction: &InstallationTransaction,
+        approval: &InstallationActivationApproval,
+    ) -> Result<(), InstallationError> {
+        let intent = transaction
+            .activation_projection_intent()
+            .ok_or(InstallationError::IdentityConflict)?;
+        intent.validate_against_transaction(transaction)?;
+        if self.pending_projection_matches(transaction, approval)? {
+            return Ok(());
+        }
+
+        let registry = self.load()?;
+        let mut stage_error = if registry.revision() == intent.expected_registry_revision
+            && registry_projection_identity(&registry)? == intent.expected_registry_identity
+        {
+            self.mutate_atomic(intent.expected_registry_revision, |registry| {
+                registry.stage_pending_activation_from_transaction_with_pre_activation_approval(
+                    transaction,
+                    approval.clone(),
+                )
+            })
+        } else {
+            Err(InstallationError::IdentityConflict)
+        };
+        if stage_error.is_ok() {
+            return Ok(());
+        }
+
+        // The transaction CAS may have succeeded while the registry response
+        // was lost, or another process may have completed the exact registry
+        // projection.  Reload before deciding that the projection is a
+        // conflict; an exact pending value is an idempotent success.
+        if self.pending_projection_matches(transaction, approval)? {
+            return Ok(());
+        }
+        let pending_ref = PlatformHandle::new(sha256_hex(
+            format!(
+                "activation-projection-recovery-v1\0{}\0{}",
+                transaction.transaction_id.as_str(),
+                intent.envelope_digest.as_str(),
+            )
+            .as_bytes(),
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "activation_projection.pending_ref".to_owned(),
+            reason: error.to_string(),
+        })?;
+        if let Err(quarantine_error) = Self::quarantine_activation_projection_if_current(
+            transaction_store,
+            transaction_id,
+            pending_ref,
+        ) {
+            // Preserve the first provider/CAS diagnosis.  A concurrent actor
+            // may already have quarantined or advanced the transaction; never
+            // retry by mutating a new actor's revision.
+            if !matches!(
+                quarantine_error,
+                InstallationError::CompareAndSaveConflict { .. }
+            ) {
+                stage_error = Err(quarantine_error);
+            }
+        }
+        stage_error
+    }
+
+    fn stage_pending_activation_with_verified_projection(
+        &self,
+        transaction_store: &mut RedbInstallationTransactionStore,
+        transaction_id: &PlatformHandle,
+        projection: VerifiedActivationProjection,
+        installer_capability: &HostOwnerEpochCapability,
+        expected_registry_revision: u64,
+    ) -> Result<(), InstallationError> {
+        let _guard = installer_capability
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let current = transaction_store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        if current.transaction_id != *transaction_id
+            || projection.approval.transaction_id != *transaction_id
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        match current.stage() {
+            super::InstallationStage::Registering => {
+                projection.approval.validate_against(&current)?;
+                let registry = self.load()?;
+                if registry.revision() != expected_registry_revision {
+                    return Err(InstallationError::CompareAndSaveConflict {
+                        expected: expected_registry_revision,
+                        actual: registry.revision(),
+                    });
+                }
+                let intent = super::InstallationActivationProjectionIntent::new(
+                    &current,
+                    &projection.approval,
+                    projection.envelope_digest,
+                    projection.payload_digest,
+                    registry.revision(),
+                    registry_projection_identity(&registry)?,
+                )?;
+                let expected_transaction = TransactionVersion::of(&current)?;
+                let mut activating = current;
+                activating
+                    .advance_to_activating_for_signed_approval(&projection.approval, intent)?;
+                <RedbInstallationTransactionStore as Sealed>::compare_and_save(
+                    transaction_store,
+                    expected_transaction,
+                    &activating,
+                )?;
+                self.reconcile_activation_projection(
+                    transaction_store,
+                    transaction_id,
+                    &activating,
+                    &projection.approval,
+                )
+            }
+            super::InstallationStage::Activating => {
+                current
+                    .activation_projection_intent()
+                    .ok_or(InstallationError::IdentityConflict)?
+                    .matches_verified(
+                        &current,
+                        &projection.approval,
+                        &projection.envelope_digest,
+                        &projection.payload_digest,
+                    )?;
+                self.reconcile_activation_projection(
+                    transaction_store,
+                    transaction_id,
+                    &current,
+                    &projection.approval,
+                )
+            }
+            stage => Err(InstallationError::IllegalTransition {
+                from: stage,
+                to: super::InstallationStage::Activating,
+            }),
+        }
+    }
+
+    /// Applies the first-install bootstrap projection through the same
+    /// transaction-CAS-before-registry-CAS protocol as a signed activation.
+    ///
+    /// The bootstrap approval is derived only from the retained transaction;
+    /// it is not caller input and it carries no authority bytes.  The
+    /// transaction is first advanced to `Activating` with a durable
+    /// `InstallationActivationProjectionIntent`.  Only then is the registry
+    /// pending projection attempted.  A retry after an unknown registry write
+    /// reloads that intent and reconciles the exact projection; it never
+    /// stages a second independent approval.
+    pub(crate) fn stage_pending_activation_bootstrap(
+        &self,
+        transaction_store: &mut RedbInstallationTransactionStore,
+        transaction_id: &PlatformHandle,
+        expected_registry_revision: u64,
+    ) -> Result<(), InstallationError> {
+        let current = transaction_store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        if current.transaction_id != *transaction_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let approval = bootstrap_approval(&current)?;
+        let envelope_digest = synthetic_projection_digest("bootstrap-envelope", &approval)?;
+        let payload_digest = synthetic_projection_digest("bootstrap-payload", &approval)?;
+        match current.stage() {
+            super::InstallationStage::Registering => {
+                current.require_bootstrap_effects_ready()?;
+                approval.validate_against(&current)?;
+                let registry = self.load()?;
+                if registry.revision() != expected_registry_revision {
+                    return Err(InstallationError::CompareAndSaveConflict {
+                        expected: expected_registry_revision,
+                        actual: registry.revision(),
+                    });
+                }
+                let intent = super::InstallationActivationProjectionIntent::new(
+                    &current,
+                    &approval,
+                    envelope_digest,
+                    payload_digest,
+                    registry.revision(),
+                    registry_projection_identity(&registry)?,
+                )?;
+                let expected_transaction = TransactionVersion::of(&current)?;
+                let mut activating = current;
+                activating.advance_to_activating_for_signed_approval(&approval, intent)?;
+                <RedbInstallationTransactionStore as Sealed>::compare_and_save(
+                    transaction_store,
+                    expected_transaction,
+                    &activating,
+                )?;
+                self.reconcile_activation_projection(
+                    transaction_store,
+                    transaction_id,
+                    &activating,
+                    &approval,
+                )
+            }
+            super::InstallationStage::Activating => {
+                let intent = current
+                    .activation_projection_intent()
+                    .ok_or(InstallationError::IdentityConflict)?;
+                intent.validate_against_transaction(&current)?;
+                if intent.verified_approval
+                    != super::InstallationActivationApprovalBinding::from_approval(&approval)
+                    || intent.envelope_digest != envelope_digest
+                    || intent.payload_digest != payload_digest
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                self.reconcile_activation_projection(
+                    transaction_store,
+                    transaction_id,
+                    &current,
+                    &approval,
+                )
+            }
+            stage => Err(InstallationError::IllegalTransition {
+                from: stage,
+                to: super::InstallationStage::Activating,
+            }),
+        }
+    }
+
+    /// Applies one verified signed approval to the durable activation
+    /// boundary.  This is the production seam shared by the detached-signature
+    /// entry point and its coordinator-facing tests: the transaction CAS owns
+    /// `Registering -> Activating`, and only then may the registry projection
+    /// become pending.  The approval remains private to this crate, so callers
+    /// cannot supply a raw stage advance or an unverified identity.
+    #[cfg(test)]
+    pub(crate) fn stage_pending_activation_with_verified_approval(
+        &self,
+        transaction_store: &mut RedbInstallationTransactionStore,
+        transaction_id: &PlatformHandle,
+        approval: InstallationActivationApproval,
+        installer_capability: &HostOwnerEpochCapability,
+        expected_registry_revision: u64,
+    ) -> Result<(), InstallationError> {
+        let initial = transaction_store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        if initial.transaction_id != *transaction_id || approval.transaction_id != *transaction_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let envelope_digest = synthetic_projection_digest("verified-approval-envelope", &approval)?;
+        let payload_digest = synthetic_projection_digest("verified-approval-payload", &approval)?;
+        self.stage_pending_activation_with_verified_projection(
+            transaction_store,
+            transaction_id,
+            VerifiedActivationProjection {
+                approval,
+                envelope_digest,
+                payload_digest,
+            },
+            installer_capability,
+            expected_registry_revision,
+        )
+    }
+
     /// Verifies a detached authority-signed activation and stages the exact
     /// pending generation.  The authority key is an opaque signer loaded by
     /// `WindowsInstallationAuthorityKeyStore`; callers cannot pass a
@@ -471,11 +843,12 @@ impl RedbInstallationRegistry {
     ///
     /// The installer must hold the live exclusive Host-owner capability while
     /// Host and both SCM services are stopped.  The transaction is loaded and
-    /// checksummed before verification and reloaded inside the registry CAS;
-    /// any revision or full-byte checksum drift rejects the write.
+    /// checksummed before verification and transitioned through the sealed
+    /// transaction-store CAS before the registry CAS; any revision or
+    /// full-byte checksum drift rejects the write.
     pub fn stage_pending_activation_signed(
         &self,
-        transaction_store: &RedbInstallationTransactionStore,
+        transaction_store: &mut RedbInstallationTransactionStore,
         transaction_id: &super::PlatformHandle,
         envelope: &SignedInstallationActivationApproval,
         authority_key: &InstallationAuthorityKeySigner,
@@ -483,10 +856,6 @@ impl RedbInstallationRegistry {
         installer_capability: &HostOwnerEpochCapability,
         expected_registry_revision: u64,
     ) -> Result<(), InstallationError> {
-        let _guard = installer_capability
-            .live_guard()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-
         let initial = transaction_store.load(transaction_id)?.ok_or_else(|| {
             InstallationError::TransactionNotFound {
                 transaction_id: transaction_id.as_str().to_owned(),
@@ -495,36 +864,41 @@ impl RedbInstallationRegistry {
         if initial.transaction_id != *transaction_id {
             return Err(InstallationError::IdentityConflict);
         }
-        let initial_checksum = transaction_checksum(&initial)?;
-        if envelope.payload.transaction_revision != initial.revision()
+        let signed_transaction_revision = match initial.stage() {
+            super::InstallationStage::Registering => initial.revision(),
+            super::InstallationStage::Activating => {
+                initial
+                    .activation_projection_intent()
+                    .ok_or(InstallationError::IdentityConflict)?
+                    .original_transaction_revision
+            }
+            stage => {
+                return Err(InstallationError::IllegalTransition {
+                    from: stage,
+                    to: super::InstallationStage::Activating,
+                });
+            }
+        };
+        if envelope.payload.transaction_revision != signed_transaction_revision
             || envelope.payload.transaction_id != initial.transaction_id.as_str()
         {
             return Err(InstallationError::IdentityConflict);
         }
         require_stopped_scm_contour(&initial)?;
-
-        self.mutate_atomic(expected_registry_revision, |registry| {
-            let current = transaction_store.load(transaction_id)?.ok_or_else(|| {
-                InstallationError::TransactionNotFound {
-                    transaction_id: transaction_id.as_str().to_owned(),
-                }
-            })?;
-            let current_checksum = transaction_checksum(&current)?;
-            if current.revision() != initial.revision() {
-                return Err(InstallationError::CompareAndSaveConflict {
-                    expected: initial.revision(),
-                    actual: current.revision(),
-                });
-            }
-            if current_checksum != initial_checksum {
-                return Err(InstallationError::IdentityConflict);
-            }
-            if current.transaction_id != *transaction_id {
-                return Err(InstallationError::IdentityConflict);
-            }
-            let approval = verify_and_derive_approval(&current, envelope, authority_key, now_ms)?;
-            registry.stage_pending_activation_from_transaction_with_approval(&current, approval)
-        })
+        let projection = verify_and_derive_projection(
+            &initial,
+            envelope,
+            authority_key,
+            now_ms,
+            signed_transaction_revision,
+        )?;
+        self.stage_pending_activation_with_verified_projection(
+            transaction_store,
+            transaction_id,
+            projection,
+            installer_capability,
+            expected_registry_revision,
+        )
     }
 }
 
@@ -602,16 +976,6 @@ mod tests {
             expected_elevation_evidence_digest(&changed)
                 .unwrap_or_else(|error| panic!("changed digest must validate: {error}"))
         );
-    }
-
-    #[test]
-    fn activation_nonce_requires_one_transaction_evidence_reference() {
-        let nonce = "c".repeat(64);
-        let nonce_digest = sha256_hex(nonce.as_bytes());
-        let evidence = vec![handle(nonce_digest)];
-        assert!(require_activation_nonce_evidence(&evidence, &[], &[], &nonce).is_ok());
-        assert!(require_activation_nonce_evidence(&evidence, &[], &[], &"d".repeat(64)).is_err());
-        assert!(require_activation_nonce_evidence(&evidence, &evidence, &[], &nonce).is_err());
     }
 
     #[test]

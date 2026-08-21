@@ -17,20 +17,25 @@ use eliot_contracts::{
 };
 
 /// Stable schema marker for an authenticated installation activation.
-pub const INSTALLATION_ACTIVATION_SCHEMA: &str = "eliot.installation-activation.v1";
+///
+/// Version 2 removes the static Kernel activation nonce from the installer
+/// approval.  Host is the sole runtime nonce issuer; its dynamic nonce is
+/// bound later by the Kernel activation/readiness receipts and Host commit
+/// fence.
+pub const INSTALLATION_ACTIVATION_SCHEMA: &str = "eliot.installation-activation.v2";
 /// Stable contract identity for the installation activation surface.
 pub const INSTALLATION_ACTIVATION_CONTRACT_NAME: &str =
     "eliot.foundation.runtime-contracts.installation-activation";
 /// Current contract revision for the installation activation surface.
-pub const INSTALLATION_ACTIVATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const INSTALLATION_ACTIVATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
 /// Fixed signature algorithm admitted by this contract.
 pub const INSTALLATION_ACTIVATION_SIGNATURE_ALGORITHM: &str = "Ed25519";
 /// Ed25519 public-key size in bytes.
 pub const INSTALLATION_ACTIVATION_PUBLIC_KEY_BYTES: usize = 32;
 /// Ed25519 signature size in bytes.
 pub const INSTALLATION_ACTIVATION_SIGNATURE_BYTES: usize = 64;
-/// The nonce is a full 256-bit value represented as 64 lowercase hex digits.
-pub const INSTALLATION_ACTIVATION_NONCE_BYTES: usize = 32;
+/// Per-registration SCM nonce size in bytes.
+pub const INSTALLATION_REGISTRATION_NONCE_BYTES: usize = 32;
 
 /// Canonical SCM role covered by an installation approval.
 #[derive(
@@ -182,8 +187,6 @@ pub struct InstallationActivationPayload {
     pub authority_generation: ResourceGeneration,
     /// Exact authority fence bound to the candidate.
     pub authority_state_fence: StateFence,
-    /// Fresh, one-shot 256-bit Kernel activation nonce.
-    pub activation_nonce: String,
     /// Signed validity-window start in Unix milliseconds.
     pub issued_at_ms: i64,
     /// Signed validity-window end in Unix milliseconds (exclusive).
@@ -191,7 +194,7 @@ pub struct InstallationActivationPayload {
 }
 
 impl InstallationActivationPayload {
-    /// Validates all identity, digest, role, nonce, generation and time-shape
+    /// Validates all identity, digest, role, generation and time-shape
     /// invariants without consulting a trust anchor or wall clock.
     pub fn validate(&self) -> Result<(), InstallationActivationError> {
         non_empty_text(&self.transaction_id, "transaction_id")?;
@@ -261,7 +264,6 @@ impl InstallationActivationPayload {
                 "resource generation must equal authority_generation",
             ));
         }
-        validate_nonce(&self.activation_nonce, "activation_nonce")?;
         if self.issued_at_ms <= 0 || self.expires_at_ms <= self.issued_at_ms {
             return Err(invalid_field(
                 "issued_at_ms/expires_at_ms",
@@ -855,7 +857,7 @@ fn validate_sha256(value: &str, field: &str) -> Result<(), InstallationActivatio
 }
 
 fn validate_nonce(value: &str, field: &str) -> Result<(), InstallationActivationError> {
-    let decoded = decode_hex::<{ INSTALLATION_ACTIVATION_NONCE_BYTES }>(value, field)?;
+    let decoded = decode_hex::<{ INSTALLATION_REGISTRATION_NONCE_BYTES }>(value, field)?;
     if decoded.iter().all(|byte| *byte == 0) {
         return Err(invalid_field(field, "must not be all zero"));
     }
@@ -993,7 +995,6 @@ mod tests {
                 AuthorityEpoch::new(5).expect("epoch"),
                 ResourceGeneration::new(4).expect("generation"),
             ),
-            activation_nonce: nonce('c'),
             issued_at_ms: 1_000,
             expires_at_ms: 5_000,
         }
@@ -1069,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_roles_duplicates_digests_and_zero_nonce_fail_closed() {
+    fn malformed_roles_and_duplicate_digests_fail_closed() {
         let mut duplicate_role = payload();
         duplicate_role.scm_readbacks[1].role = InstallationScmRole::Host;
         assert!(duplicate_role.validate().is_err());
@@ -1082,10 +1083,16 @@ mod tests {
                 digest: digest('a'),
             });
         assert!(duplicate_digest.validate().is_err());
+    }
 
-        let mut zero_nonce = payload();
-        zero_nonce.activation_nonce = nonce('0');
-        assert!(zero_nonce.validate().is_err());
+    #[test]
+    fn legacy_v1_static_nonce_payload_is_rejected_fail_closed() {
+        let mut legacy = serde_json::to_value(payload()).expect("payload JSON");
+        legacy
+            .as_object_mut()
+            .expect("payload object")
+            .insert("activation_nonce".to_owned(), serde_json::json!(nonce('c')));
+        assert!(serde_json::from_value::<InstallationActivationPayload>(legacy).is_err());
     }
 
     #[test]

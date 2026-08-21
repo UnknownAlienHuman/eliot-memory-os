@@ -51,8 +51,8 @@ pub use package_staging::{
     PackageSourceFileObservation, PackageSourceObservation, PackageStager, PackageStagingError,
     PackageStagingObservation, PeCoffError, PeCoffEvidence, StagedDirectoryReceipt,
     StagedFileReceipt, StagingReceipt, TrustedSourceBundle, WindowsAuthenticodeVerifier,
-    ordinal_cmp_str, ordinal_component_cmp, ordinal_eq_str, ordinal_path_cmp, ordinal_path_eq,
-    parse_pe_coff, validate_package_relative_path,
+    ordinal_cmp_str, ordinal_component_cmp, ordinal_eq_str, ordinal_path_cmp, parse_pe_coff,
+    validate_package_relative_path,
 };
 pub use tcp_listener_owner::{
     TcpListenerOwnerError, TcpListenerOwnerObservation, observe_loopback_tcp_listener_owner,
@@ -10450,7 +10450,6 @@ const fn service_runtime_sample_is_stable(
 fn inspect_service_registration_runtime(
     request: &ServiceRegistrationRequest,
 ) -> ServiceRegistrationRuntimeInspection {
-    use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
     use windows_sys::Win32::System::Services::{
@@ -10459,7 +10458,7 @@ fn inspect_service_registration_runtime(
         SERVICE_START_PENDING, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
     };
 
-    let name = OsStr::new(request.service_name())
+    let name = std::ffi::OsStr::new(request.service_name())
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
@@ -10691,7 +10690,6 @@ fn start_service_registration(
     if request.bootstrap().is_none() {
         return Err(WindowsAdapterError::InvalidInput);
     }
-
     match inspect_service_registration_runtime(request) {
         ServiceRegistrationRuntimeInspection::Matching { observation }
             if observation.is_running() =>
@@ -10888,6 +10886,10 @@ fn stop_service_registration(
             unsafe { ControlService(service, SERVICE_CONTROL_STOP, &raw mut stop_status) } != 0;
         let post_stop = inspect_service_registration_runtime(request);
         if !stop_succeeded {
+            // A false stop result followed by a changed runtime state is not
+            // proof that this transaction owned the mutation.  Quarantine
+            // rather than turning a concurrent actor's transition into a
+            // successful rollback receipt.
             return ServiceStopOutcome::EffectUnknown;
         }
         stop_outcome_from_inspection(post_stop, true)

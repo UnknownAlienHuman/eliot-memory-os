@@ -9,10 +9,11 @@ use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest}
 use eliot_installation::{
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
-    InstallationTransactionStore, PlatformHandle, RedbInstallationTransactionStore,
-    WindowsInstallationCoordinator, decode_installation_transaction_json,
-    parse_installation_transaction_id,
+    InstallationTransactionStore, PlatformHandle, RedbInstallationRegistry,
+    RedbInstallationTransactionStore, WindowsInstallationCoordinator,
+    decode_installation_transaction_json, parse_installation_transaction_id,
 };
+use eliot_platform_windows::ProtectedRootLease;
 use serde_json::json;
 use std::path::PathBuf;
 use std::{
@@ -650,7 +651,10 @@ fn run_installation_effect(
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
-    if let Some(status) = installation_preflight_status(preflight_transaction.stage(), recover) {
+    let preflight_status = installation_preflight_status(preflight_transaction.stage(), recover);
+    let should_query_host_terminal =
+        should_query_host_terminal(preflight_transaction.profile, preflight_transaction.stage());
+    if let Some(status) = preflight_status.filter(|_| !should_query_host_terminal) {
         let staging = InstallationStagingDisposition::not_attempted(if status == "ROLLED_BACK" {
             "transaction is already rolled back; no recovery effect was attempted"
         } else {
@@ -670,9 +674,182 @@ fn run_installation_effect(
         )?;
         return Ok(installation_command_exit_code(status));
     }
+
+    // A response can be lost after Host has durably committed activation.  A
+    // recovery command must query that exact terminal before it is allowed to
+    // enter rollback; otherwise a perfectly good live generation would remain
+    // stranded in Activating.  The query is deliberately read/reconcile-only:
+    // it does not resend any effect or touch SCM/registry projection.
+    if should_query_host_terminal {
+        let host_terminal_outcome =
+            match reconcile_host_activation_terminal(store_path, &preflight_transaction) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    write_installation_error(
+                        if recover {
+                            "INSTALLATION_RECOVER_ERROR"
+                        } else {
+                            "INSTALLATION_APPLY_ERROR"
+                        },
+                        &format!("Host activation terminal query failed: {error}"),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+        if let Some(outcome) = host_terminal_outcome {
+            let store = match RedbInstallationTransactionStore::open_existing_exact_path(store_path)
+            {
+                Ok(store) => store,
+                Err(error) => {
+                    write_installation_error(
+                        "INSTALLATION_STATE_UNAVAILABLE",
+                        &format!(
+                            "Host terminal was observed but transaction readback failed: {error}"
+                        ),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            let transaction = match store.load(&transaction_id) {
+                Ok(Some(transaction)) => transaction,
+                Ok(None) => {
+                    write_installation_error(
+                        "INSTALLATION_STATE_UNAVAILABLE",
+                        "Host terminal was observed but the transaction disappeared",
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+                Err(error) => {
+                    write_installation_error(
+                        "INSTALLATION_STATE_UNAVAILABLE",
+                        &format!("Host terminal transaction readback failed: {error}"),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            let staging = InstallationStagingDisposition::not_attempted(if recover {
+                "recovery reconciled the exact Host terminal; no rollback effect was attempted"
+            } else {
+                "apply observed the exact Host terminal before projection; no effect was attempted"
+            });
+            print_transaction_projection(
+                if recover {
+                    "RECOVERY_RESULT"
+                } else {
+                    "EFFECT_RESULT"
+                },
+                store_path,
+                &transaction,
+                Some(&outcome),
+                Some(&staging),
+                Some("ACTIVE_VERIFIED"),
+            )?;
+            return Ok(installation_command_exit_code("ACTIVE_VERIFIED"));
+        }
+    }
+
+    // A queryable stage with no committed Host terminal remains subject to the
+    // ordinary preflight disposition.  Keeping this return after the query is
+    // what makes apply and recover response-loss safe without allowing either
+    // path to resend an effect or enter rollback before the readback.
+    if let Some(status) = preflight_status {
+        let staging = InstallationStagingDisposition::not_attempted(if status == "ROLLED_BACK" {
+            "transaction is already rolled back; no recovery effect was attempted"
+        } else {
+            "transaction stage is terminal or incompatible; no effect was attempted"
+        });
+        print_transaction_projection(
+            if recover {
+                "RECOVERY_RESULT"
+            } else {
+                "EFFECT_RESULT"
+            },
+            store_path,
+            &preflight_transaction,
+            None,
+            Some(&staging),
+            Some(status),
+        )?;
+        return Ok(installation_command_exit_code(status));
+    }
+
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     let outcome = if recover {
         coordinator.rollback(&transaction_id)
+    } else if preflight_transaction.profile == InstallationProfile::SystemService {
+        match coordinator.drive_until_host_bootstrap(&transaction_id) {
+            Ok(InstallationStepOutcome::Applied { .. }) => {
+                let current = match coordinator.store().load(&transaction_id) {
+                    Ok(Some(transaction)) => transaction,
+                    Ok(None) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_NOT_FOUND",
+                            "transaction disappeared before pending registry projection",
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_ERROR",
+                            &format!(
+                                "transaction readback before pending projection failed: {error}"
+                            ),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                let host_root = match ProtectedRootLease::open_existing(Path::new(
+                    current
+                        .candidate_manifest
+                        .runtime_launch
+                        .runtime_state_roots
+                        .host_state_root
+                        .as_str(),
+                )) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_ERROR",
+                            &format!("retained Host root could not be reopened: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                let registry = match RedbInstallationRegistry::open_at(host_root) {
+                    Ok(registry) => registry,
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_ERROR",
+                            &format!("pending registry could not be opened: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                let expected_revision = match registry.load() {
+                    Ok(registry) => registry.revision(),
+                    Err(error) => {
+                        write_installation_error(
+                            "INSTALLATION_APPLY_ERROR",
+                            &format!("pending registry preflight failed: {error}"),
+                        );
+                        return Ok(INVALID_REQUEST_EXIT);
+                    }
+                };
+                if let Err(error) = coordinator.stage_bootstrap_pending_activation(
+                    &registry,
+                    &transaction_id,
+                    expected_revision,
+                ) {
+                    write_installation_error(
+                        "INSTALLATION_APPLY_ERROR",
+                        &format!("pending registry projection failed: {error}"),
+                    );
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+                coordinator.drive_all_effects_until_blocked(&transaction_id)
+            }
+            outcome => outcome,
+        }
     } else {
         coordinator.drive_all_effects_until_blocked(&transaction_id)
     };
@@ -717,20 +894,87 @@ fn run_installation_effect(
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
+    let host_terminal_outcome = if transaction.profile == InstallationProfile::SystemService
+        && matches!(transaction.stage(), InstallationStage::Activating)
+    {
+        match reconcile_host_activation_terminal(store_path, &transaction) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                write_installation_error(
+                    "INSTALLATION_STATE_INVALID",
+                    &format!("Host activation terminal reconciliation failed: {error}"),
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+        }
+    } else {
+        None
+    };
+    let transaction = if host_terminal_outcome.is_some() {
+        match RedbInstallationTransactionStore::open_existing_exact_path(store_path)
+            .and_then(|store| store.load(&transaction_id))
+        {
+            Ok(Some(transaction)) => transaction,
+            Ok(None) => {
+                write_installation_error(
+                    "INSTALLATION_STATE_UNAVAILABLE",
+                    "Host terminal was observed but the transaction disappeared",
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+            Err(error) => {
+                write_installation_error(
+                    "INSTALLATION_STATE_UNAVAILABLE",
+                    &format!("Host terminal transaction readback failed: {error}"),
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+        }
+    } else {
+        transaction
+    };
+    let effective_outcome = host_terminal_outcome.as_ref().unwrap_or(&outcome);
     let all_effects_applied = transaction.effect_progress().iter().all(|progress| {
         matches!(
             progress.state,
             eliot_installation::InstallationEffectProgressState::Applied { .. }
         )
     });
-    let staging = installation_staging_disposition(
-        transaction.profile,
-        &outcome,
-        all_effects_applied,
-        recover,
-    );
-    let overall_status =
-        installation_command_status(transaction.profile, &outcome, all_effects_applied, recover);
+    // Phase-B response loss is represented by a durable IntentCommitted
+    // effect and a rejected drive step.  Keep the public command state honest:
+    // activation is pending and the next invocation will query-reconcile the
+    // Host receipt rather than retrying materialization.
+    let phase_b_pending = !recover
+        && transaction.profile == InstallationProfile::SystemService
+        && transaction.stage() == InstallationStage::Activating
+        && matches!(effective_outcome, InstallationStepOutcome::Rejected);
+    let staging = if phase_b_pending {
+        InstallationStagingDisposition {
+            disposition: "PENDING_RUNTIME",
+            reason: Some(
+                "Host Phase-B response is unresolved; activation remains fenced and the next command will query-reconcile the exact receipt"
+                    .to_owned(),
+            ),
+            registry: None,
+        }
+    } else {
+        installation_staging_disposition(
+            transaction.profile,
+            effective_outcome,
+            all_effects_applied,
+            recover,
+        )
+    };
+    let overall_status = if phase_b_pending {
+        "PENDING_RUNTIME"
+    } else {
+        installation_command_status(
+            transaction.profile,
+            effective_outcome,
+            all_effects_applied,
+            recover,
+        )
+    };
     print_transaction_projection(
         if recover {
             "RECOVERY_RESULT"
@@ -739,11 +983,51 @@ fn run_installation_effect(
         },
         store_path,
         &transaction,
-        Some(&outcome),
+        Some(effective_outcome),
         Some(&staging),
         Some(overall_status),
     )?;
     Ok(installation_command_exit_code(overall_status))
+}
+
+/// Reconciles only an exact Host-committed registry terminal.  A missing
+/// terminal is the expected fenced first-install state and remains pending;
+/// this query never starts services, rewrites descriptors, or retries a
+/// credential/SCM effect.
+fn reconcile_host_activation_terminal(
+    store_path: &Path,
+    transaction: &InstallationTransaction,
+) -> Result<Option<InstallationStepOutcome>, InstallationError> {
+    let host_root = ProtectedRootLease::open_existing(Path::new(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    ))
+    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let Some(registry) = RedbInstallationRegistry::open_existing_at(host_root)? else {
+        return Ok(None);
+    };
+    let receipt = match registry.read_committed_activation_receipt(
+        &transaction.transaction_id,
+        &transaction.installer_plan_digest,
+        &transaction.candidate_manifest.generation,
+    ) {
+        Ok(receipt) => receipt,
+        Err(InstallationError::IncompleteObservation(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let evidence = vec![
+        receipt.terminal_digest().clone(),
+        receipt.candidate_manifest_digest().clone(),
+    ];
+    let store = RedbInstallationTransactionStore::open_existing_exact_path(store_path)?;
+    let mut coordinator = WindowsInstallationCoordinator::new(store);
+    coordinator
+        .reconcile_active_verified(receipt, evidence)
+        .map(Some)
 }
 
 #[derive(Debug)]
@@ -788,6 +1072,38 @@ fn installation_staging_disposition(
         );
     }
     if profile == InstallationProfile::SystemService {
+        if matches!(
+            outcome,
+            InstallationStepOutcome::Applied {
+                stage: InstallationStage::Activating,
+                ..
+            }
+        ) {
+            return InstallationStagingDisposition {
+                disposition: "PENDING_RUNTIME",
+                reason: Some(
+                    "Host bootstrap effects are applied; activation remains pending until the Host-owned live commit fence is observed"
+                        .to_owned(),
+                ),
+                registry: None,
+            };
+        }
+        if matches!(
+            outcome,
+            InstallationStepOutcome::Applied {
+                stage: InstallationStage::ActiveVerified,
+                ..
+            }
+        ) {
+            return InstallationStagingDisposition {
+                disposition: "COMMITTED",
+                reason: Some(
+                    "the exact Host registry terminal was reconciled into the transaction"
+                        .to_owned(),
+                ),
+                registry: None,
+            };
+        }
         return InstallationStagingDisposition {
             disposition: "APPROVAL_REQUIRED",
             reason: Some(
@@ -829,6 +1145,14 @@ fn installation_command_status(
         | InstallationStepOutcome::Quarantined { .. } => "QUARANTINED",
         InstallationStepOutcome::Applied { .. } if recover => "ERROR",
         InstallationStepOutcome::Applied { .. } if !all_effects_applied => "ERROR",
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::Activating,
+            ..
+        } if !recover && profile == InstallationProfile::SystemService => "PENDING_RUNTIME",
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::ActiveVerified,
+            ..
+        } if !recover && profile == InstallationProfile::SystemService => "ACTIVE_VERIFIED",
         InstallationStepOutcome::Applied { .. }
             if !recover && profile == InstallationProfile::SystemService =>
         {
@@ -844,21 +1168,28 @@ fn installation_preflight_status(stage: InstallationStage, recover: bool) -> Opt
         return match stage {
             InstallationStage::RolledBack => Some("ROLLED_BACK"),
             InstallationStage::Quarantined => Some("QUARANTINED"),
-            InstallationStage::ActiveVerified
-            | InstallationStage::Cleaning
-            | InstallationStage::Completed => Some("REJECTED"),
+            InstallationStage::ActiveVerified => Some("ACTIVE_VERIFIED"),
+            InstallationStage::Cleaning | InstallationStage::Completed => Some("REJECTED"),
             _ => None,
         };
     }
     match stage {
         InstallationStage::RollbackRequired => Some("ROLLBACK_REQUIRED"),
         InstallationStage::Quarantined => Some("QUARANTINED"),
-        InstallationStage::ActiveVerified
-        | InstallationStage::Cleaning
+        InstallationStage::ActiveVerified => Some("ACTIVE_VERIFIED"),
+        InstallationStage::Cleaning
         | InstallationStage::Completed
         | InstallationStage::RolledBack => Some("REJECTED"),
         _ => None,
     }
+}
+
+fn should_query_host_terminal(profile: InstallationProfile, stage: InstallationStage) -> bool {
+    profile == InstallationProfile::SystemService
+        && matches!(
+            stage,
+            InstallationStage::Activating | InstallationStage::RollbackRequired
+        )
 }
 
 fn print_transaction_projection(
@@ -930,7 +1261,10 @@ fn installation_outcome_status(outcome: &InstallationStepOutcome) -> &'static st
 }
 
 fn installation_command_exit_code(status: &str) -> i32 {
-    if matches!(status, "EFFECTS_APPLIED" | "ROLLED_BACK") {
+    if matches!(
+        status,
+        "EFFECTS_APPLIED" | "ROLLED_BACK" | "ACTIVE_VERIFIED"
+    ) {
         0
     } else {
         INVALID_REQUEST_EXIT
@@ -1355,7 +1689,6 @@ mod tests {
     #[test]
     fn terminal_apply_preflight_never_reports_effects_applied() {
         for stage in [
-            InstallationStage::ActiveVerified,
             InstallationStage::Cleaning,
             InstallationStage::Completed,
             InstallationStage::RolledBack,
@@ -1369,6 +1702,43 @@ mod tests {
         assert_eq!(
             installation_preflight_status(InstallationStage::RollbackRequired, false),
             Some("ROLLBACK_REQUIRED")
+        );
+        assert_eq!(
+            installation_preflight_status(InstallationStage::ActiveVerified, false),
+            Some("ACTIVE_VERIFIED")
+        );
+        assert_eq!(
+            installation_preflight_status(InstallationStage::ActiveVerified, true),
+            Some("ACTIVE_VERIFIED")
+        );
+        assert_eq!(installation_command_exit_code("ACTIVE_VERIFIED"), 0);
+    }
+
+    #[test]
+    fn host_terminal_query_precedes_apply_and_recover_rollback_paths() {
+        for stage in [
+            InstallationStage::Activating,
+            InstallationStage::RollbackRequired,
+        ] {
+            assert!(should_query_host_terminal(
+                InstallationProfile::SystemService,
+                stage,
+            ));
+        }
+        assert!(!should_query_host_terminal(
+            InstallationProfile::PortableDev,
+            InstallationStage::RollbackRequired,
+        ));
+        // A missing terminal still leaves the original preflight disposition;
+        // the query is read-only and must not turn RollbackRequired into a
+        // successful result by itself.
+        assert_eq!(
+            installation_preflight_status(InstallationStage::RollbackRequired, false),
+            Some("ROLLBACK_REQUIRED")
+        );
+        assert_eq!(
+            installation_preflight_status(InstallationStage::RollbackRequired, true),
+            None
         );
     }
 

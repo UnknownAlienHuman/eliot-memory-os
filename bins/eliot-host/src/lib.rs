@@ -9,7 +9,7 @@
 
 mod credential_control;
 
-pub use credential_control::HostCredentialControl;
+pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 
 use std::ffi::OsString;
 use std::io;
@@ -32,12 +32,21 @@ use eliot_host_state::{
     WakeDisposition, record_checksum,
 };
 use eliot_installation::{
-    ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest, InstallationEpoch,
+    ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest, CredentialAccessReceipt,
+    HostCredentialControlResponse, HostPhaseBMaterializationIntent,
+    HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, InstallationEpoch,
     InstallationError, InstallationProfile, InstallerServiceRegistrationApproval,
-    InstallerServiceRole, PHASE_B_PENDING_MARKER, PendingActivationState, PhaseBLiveBinding,
-    RedbInstallationRegistry, RuntimeLaunchDescriptor, phase_b_scm_selector, verify_approved_path,
-    verify_file_digest_with_lease, verify_file_digest_with_user_lease,
+    InstallerServiceRole, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PendingActivationState,
+    PhaseBLiveBinding, RedbInstallationRegistry, RuntimeLaunchDescriptor, StoreCredentialProvider,
+    StoreCredentialScope,
+    phase_b_credential_receipt_digest as installation_phase_b_credential_receipt_digest,
+    phase_b_host_state_root_digest as installation_phase_b_host_state_root_digest,
+    phase_b_scm_selector, phase_b_static_template_for_candidate,
+    phase_b_watchdog_selector_digest as installation_phase_b_watchdog_selector_digest,
+    verify_approved_path, verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
+#[cfg(windows)]
+use eliot_kernel_core::AuthoritySnapshotBindingWire;
 use eliot_kernel_service::{
     EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
     HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationPermit,
@@ -51,8 +60,13 @@ use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
 };
 #[cfg(windows)]
+use eliot_ors::{
+    EpochIdentity as OrsEpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity,
+    StateFenceSnapshot,
+};
+#[cfg(windows)]
 use eliot_platform::WorkScopePath;
-use eliot_platform::{HostProcessNonce, PlatformHandle, ServiceState};
+use eliot_platform::{PlatformHandle, SecretReference, ServiceState};
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME,
     HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError, ProtectedPathLease,
@@ -62,6 +76,8 @@ use eliot_platform_windows::{
 };
 #[cfg(windows)]
 use eliot_platform_windows::{FileIdentity, PublicationOutcome};
+#[cfg(windows)]
+use eliot_process::DispatchAuthorityId;
 use eliot_runtime_contracts::{
     HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
 };
@@ -892,6 +908,236 @@ fn phase_b_manifest_digest(manifest: &CandidateManifest) -> Result<PlatformHandl
 }
 
 #[cfg(windows)]
+fn host_owner_epoch_digest(host: &HostInstallationEpoch) -> Result<PlatformHandle, HostError> {
+    PlatformHandle::new(sha256_json(&(
+        host.installation.clone(),
+        host.epoch.current.lineage.clone(),
+    ))?)
+    .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
+fn host_process_identity_digest() -> Result<PlatformHandle, HostError> {
+    let observed = observe_named_pipe_peer_process(std::process::id())
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    PlatformHandle::new(format!(
+        "{:x}",
+        Sha256::digest(observed.identity().stable_key().as_bytes())
+    ))
+    .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
+fn phase_b_credential_receipt_digest(
+    receipt: &CredentialAccessReceipt,
+) -> Result<PlatformHandle, HostError> {
+    installation_phase_b_credential_receipt_digest(receipt).map_err(HostError::Installation)
+}
+
+#[cfg(windows)]
+fn validate_phase_b_credential_receipt(
+    receipt: &CredentialAccessReceipt,
+    manifest: &CandidateManifest,
+    intent: &HostPhaseBMaterializationIntent,
+) -> Result<(), HostError> {
+    receipt
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if receipt.transaction_id != intent.transaction_id
+        || receipt.effect_id != intent.credential_effect_id
+        || receipt.generation != manifest.runtime_launch.authority_generation
+        || receipt.config_digest != manifest.config_digest
+        || receipt.target != manifest.runtime_launch.store_credential_target
+        || receipt.provider != StoreCredentialProvider::WindowsCredentialManager
+        || receipt.scope != StoreCredentialScope::LocalService
+        || receipt.principal_sid.as_str() != LOCAL_SERVICE_SID
+    {
+        return Err(HostError::RecoveryRequired(
+            "Phase-B credential receipt is not the exact LocalService receipt for the candidate"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn phase_b_root_binding_digest(manifest: &CandidateManifest) -> Result<PlatformHandle, HostError> {
+    installation_phase_b_host_state_root_digest(manifest).map_err(HostError::Installation)
+}
+
+#[cfg(windows)]
+fn phase_b_watchdog_selector_digest(
+    manifest: &CandidateManifest,
+) -> Result<PlatformHandle, HostError> {
+    installation_phase_b_watchdog_selector_digest(manifest).map_err(HostError::Installation)
+}
+
+#[cfg(windows)]
+fn phase_b_public_receipt(
+    intent: &HostPhaseBMaterializationIntent,
+    materialization: &HostPhaseBMaterialization,
+    host: &HostInstallationEpoch,
+) -> Result<HostPhaseBMaterializationReceipt, HostError> {
+    if materialization.request_digest.as_ref() != Some(&intent.request_digest) {
+        return Err(HostError::RecoveryRequired(
+            "Host Phase-B receipt is not bound to the requested transaction effect".to_owned(),
+        ));
+    }
+    let host_owner_epoch = materialization
+        .host_owner_epoch
+        .clone()
+        .unwrap_or(host_owner_epoch_digest(host)?);
+    let host_process_identity = materialization
+        .host_process_identity
+        .clone()
+        .unwrap_or(host_process_identity_digest()?);
+    let mut receipt = HostPhaseBMaterializationReceipt {
+        transaction_id: intent.transaction_id.clone(),
+        effect_id: intent.effect_id.clone(),
+        candidate_manifest_digest: materialization.manifest_digest.clone(),
+        request_digest: intent.request_digest.clone(),
+        host_owner_epoch,
+        host_process_identity,
+        authority_descriptor_digest: materialization.authority_descriptor_digest.clone(),
+        config_file_digest: materialization.config_file_digest.clone(),
+        store_bootstrap_descriptor_digest: materialization
+            .store_bootstrap_descriptor_digest
+            .clone(),
+        eliotd_descriptor_digest: materialization.eliotd_descriptor_digest.clone(),
+        receipt_digest: PlatformHandle::new("pending")
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+    };
+    receipt.receipt_digest = receipt
+        .computed_digest()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    receipt
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    Ok(receipt)
+}
+
+#[cfg(windows)]
+fn phase_b_public_receipt_from_binding(
+    intent: &HostPhaseBMaterializationIntent,
+    binding: &PhaseBLiveBinding,
+    credential_receipt: &CredentialAccessReceipt,
+) -> Result<HostPhaseBMaterializationReceipt, HostError> {
+    credential_receipt
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if binding.manifest_digest != intent.candidate_manifest_digest
+        || binding.effect_id != intent.effect_id
+        || binding.credential_receipt_digest != intent.credential_receipt_digest
+        || binding.request_digest != intent.request_digest
+        || binding.host_owner_epoch != credential_receipt.host_owner_epoch
+        || binding.host_process_identity != credential_receipt.host_process_identity
+        || phase_b_credential_receipt_digest(credential_receipt)?
+            != binding.credential_receipt_digest
+    {
+        return Err(HostError::RecoveryRequired(
+            "persisted Phase-B receipt is bound to a different request".to_owned(),
+        ));
+    }
+    let receipt = HostPhaseBMaterializationReceipt {
+        transaction_id: intent.transaction_id.clone(),
+        effect_id: binding.effect_id.clone(),
+        candidate_manifest_digest: binding.manifest_digest.clone(),
+        request_digest: binding.request_digest.clone(),
+        host_owner_epoch: binding.host_owner_epoch.clone(),
+        host_process_identity: binding.host_process_identity.clone(),
+        authority_descriptor_digest: binding.authority_descriptor_digest.clone(),
+        config_file_digest: binding.config_file_digest.clone(),
+        store_bootstrap_descriptor_digest: binding.store_bootstrap_descriptor_digest.clone(),
+        eliotd_descriptor_digest: binding.eliotd_descriptor_digest.clone(),
+        receipt_digest: binding.public_receipt_digest.clone(),
+    };
+    receipt
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    Ok(receipt)
+}
+
+#[cfg(windows)]
+fn phase_b_build_authority_descriptor(
+    manifest: &CandidateManifest,
+    host: &HostInstallationEpoch,
+    activation_generation: &EpochIdentity,
+    intent: &HostPhaseBMaterializationIntent,
+) -> Result<Vec<u8>, HostError> {
+    let runtime = &manifest.runtime_launch;
+    let authority_id = DispatchAuthorityId::new(intent.static_template.authority_id.as_str())
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let record_id = OperationIdentity::new(intent.static_template.record_id.as_str())
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let lineage_id = OpaqueLabel::new(host.epoch.current.lineage.as_str())
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let authority_epoch = EpochLineage {
+        current: OrsEpochIdentity {
+            lineage_id,
+            epoch: host.epoch.current.sequence,
+        },
+        predecessor: None,
+    };
+    let authority = AuthorityEpoch::new(host.epoch.current.sequence)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let state_fence = StateFence::new(authority, runtime.authority_generation);
+    let snapshot_fence = StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| HostError::ProcessContour("Phase-B clock overflow".to_owned()))?;
+    let dispatch_target = eliot_installation::dispatch_credential_target_for_store_target(
+        &runtime.store_credential_target,
+    )
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let dispatch_key = SecretReference::new("windows-credential-manager", dispatch_target.as_str())
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let mut descriptor = ProcessAuthorityHandoffDescriptor {
+        contract_version: ProcessAuthorityHandoffDescriptor::CONTRACT_VERSION,
+        handoff_id: PlatformHandle::new(format!(
+            "phase-b:{}:{}",
+            intent.transaction_id, host.epoch.current.sequence
+        ))
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        handoff_nonce: host.nonce.clone(),
+        authority_id: authority_id.clone(),
+        snapshot_binding: AuthoritySnapshotBindingWire {
+            authority_id,
+            record_id,
+            authority_epoch,
+            state_fence: snapshot_fence,
+            created_at_ms: now_ms,
+            cleanup_after_ms: Some(now_ms.saturating_add(86_400_000)),
+        },
+        state_fence: state_fence.clone(),
+        generation: runtime.authority_generation,
+        revision_policy_binding: intent.static_template.revision_policy_binding.clone(),
+        dispatch_key,
+        descriptor_sha256: String::new(),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(86_400_000),
+        contour_refs: intent.static_template.contour_refs.clone(),
+    };
+    let marker = phase_b_authority_marker(
+        &phase_b_manifest_digest(manifest)?,
+        host,
+        activation_generation,
+        &descriptor,
+    )?;
+    descriptor.contour_refs.push(marker);
+    descriptor = descriptor
+        .with_computed_digest()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    descriptor
+        .validate_structure()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    serde_json::to_vec(&descriptor).map_err(|error| HostError::ProcessContour(error.to_string()))
+}
+
+#[cfg(windows)]
 fn phase_b_authority_marker(
     manifest_digest: &PlatformHandle,
     host: &HostInstallationEpoch,
@@ -1146,6 +1392,12 @@ fn phase_b_lease_bytes(lease: &LaunchLease) -> Result<Vec<u8>, HostError> {
 }
 
 #[cfg(windows)]
+fn phase_b_bytes_digest(bytes: &[u8]) -> Result<PlatformHandle, HostError> {
+    PlatformHandle::new(format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
 fn phase_b_materialize_file(
     profile: InstallationProfile,
     portable_root: Option<&UserOwnedRootLease>,
@@ -1154,8 +1406,50 @@ fn phase_b_materialize_file(
     allowed_existing_digests: &[&PlatformHandle],
     label: &str,
 ) -> Result<(PlatformHandle, FileIdentity), HostError> {
+    phase_b_materialize_file_inner(
+        profile,
+        portable_root,
+        path,
+        desired,
+        allowed_existing_digests,
+        label,
+        false,
+    )
+}
+
+#[cfg(windows)]
+fn phase_b_materialize_file_with_rollback(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    path: &Path,
+    desired: &[u8],
+    allowed_existing_digests: &[&PlatformHandle],
+    label: &str,
+) -> Result<(PlatformHandle, FileIdentity), HostError> {
+    phase_b_materialize_file_inner(
+        profile,
+        portable_root,
+        path,
+        desired,
+        allowed_existing_digests,
+        label,
+        true,
+    )
+}
+
+#[cfg(windows)]
+fn phase_b_materialize_file_inner(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    path: &Path,
+    desired: &[u8],
+    allowed_existing_digests: &[&PlatformHandle],
+    label: &str,
+    retain_previous: bool,
+) -> Result<(PlatformHandle, FileIdentity), HostError> {
     let desired_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(desired)))
         .map_err(|error| HostError::Platform(error.to_string()))?;
+    let mut previous_bytes = None;
     if let Ok(lease) = open_launch_lease(profile, portable_root, path) {
         lease.verify().map_err(HostError::RecoveryRequired)?;
         let current = phase_b_lease_bytes(&lease)?;
@@ -1170,6 +1464,9 @@ fn phase_b_materialize_file(
             return Err(HostError::RecoveryRequired(format!(
                 "Phase-B {label} destination is neither the immutable template nor the exact live bytes"
             )));
+        }
+        if retain_previous {
+            previous_bytes = Some(current);
         }
     } else if std::fs::symlink_metadata(path).is_ok() {
         return Err(HostError::RecoveryRequired(format!(
@@ -1191,6 +1488,9 @@ fn phase_b_materialize_file(
     })?;
     let relative = WorkScopePath::new(file_name)
         .map_err(|error| HostError::RecoveryRequired(format!("Phase-B {label} path: {error}")))?;
+    if let Some(previous) = previous_bytes.as_deref() {
+        phase_b_write_rollback_backup(profile, portable_root, path, previous, label)?;
+    }
     match adapter
         .publish_atomic(&relative, desired)
         .map_err(|error| HostError::RecoveryRequired(format!("publish Phase-B {label}: {error}")))?
@@ -1222,6 +1522,148 @@ fn phase_b_materialize_file(
         )));
     }
     Ok((desired_digest, phase_b_lease_identity(&lease)))
+}
+
+#[cfg(windows)]
+fn phase_b_rollback_path(destination: &Path, label: &str) -> Result<PathBuf, HostError> {
+    let parent = destination.parent().ok_or_else(|| {
+        HostError::RecoveryRequired(format!(
+            "Phase-B {label} rollback destination has no parent"
+        ))
+    })?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(format!(
+                "Phase-B {label} rollback destination name is invalid"
+            ))
+        })?;
+    let retained_name = format!("{file_name}.phase-b-rollback");
+    WorkScopePath::new(&retained_name).map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "Phase-B {label} rollback path is not within the protected scope: {error}"
+        ))
+    })?;
+    Ok(parent.join(retained_name))
+}
+
+#[cfg(windows)]
+fn phase_b_write_rollback_backup(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    destination: &Path,
+    previous: &[u8],
+    label: &str,
+) -> Result<(), HostError> {
+    let backup = phase_b_rollback_path(destination, label)?;
+    let parent = backup.parent().ok_or_else(|| {
+        HostError::RecoveryRequired(format!("Phase-B {label} rollback path has no parent"))
+    })?;
+    let file_name = backup
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(format!("Phase-B {label} rollback path name is invalid"))
+        })?;
+    let adapter = WindowsPlatform::new(parent).map_err(|error| {
+        HostError::RecoveryRequired(format!("prepare Phase-B {label} rollback backup: {error}"))
+    })?;
+    let relative = WorkScopePath::new(file_name).map_err(|error| {
+        HostError::RecoveryRequired(format!("Phase-B {label} rollback backup path: {error}"))
+    })?;
+    match adapter
+        .publish_atomic(&relative, previous)
+        .map_err(|error| {
+            HostError::RecoveryRequired(format!("publish Phase-B {label} rollback backup: {error}"))
+        })? {
+        PublicationOutcome::Published(_) => {}
+        PublicationOutcome::Unknown(_) => {
+            let lease = phase_b_open_existing(profile, portable_root, &backup)?;
+            lease.verify().map_err(HostError::RecoveryRequired)?;
+            if phase_b_lease_bytes(&lease)? != previous {
+                return Err(HostError::RecoveryRequired(format!(
+                    "Phase-B {label} rollback backup outcome is unknown"
+                )));
+            }
+        }
+    }
+    let lease = phase_b_open_existing(profile, portable_root, &backup)?;
+    lease.verify().map_err(HostError::RecoveryRequired)?;
+    if phase_b_lease_bytes(&lease)? != previous {
+        return Err(HostError::RecoveryRequired(format!(
+            "Phase-B {label} rollback backup readback is not exact"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn phase_b_restore_or_remove(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    destination: &Path,
+    label: &str,
+    preserve_template_digest: Option<&PlatformHandle>,
+) -> Result<(), HostError> {
+    let backup = phase_b_rollback_path(destination, label)?;
+    if std::fs::symlink_metadata(&backup).is_ok() {
+        let backup_lease = phase_b_open_existing(profile, portable_root, &backup)?;
+        backup_lease.verify().map_err(HostError::RecoveryRequired)?;
+        let bytes = phase_b_lease_bytes(&backup_lease)?;
+        let backup_digest = phase_b_bytes_digest(&bytes)?;
+        let current_digest = match phase_b_open_existing(profile, portable_root, destination) {
+            Ok(lease) => {
+                lease.verify().map_err(HostError::RecoveryRequired)?;
+                Some(phase_b_bytes_digest(&phase_b_lease_bytes(&lease)?)?)
+            }
+            Err(HostError::RecoveryRequired(reason)) if reason.contains("missing") => None,
+            Err(error) => return Err(error),
+        };
+        if current_digest.as_ref() != Some(&backup_digest) {
+            let allowed = current_digest.as_ref().map_or_else(
+                || vec![&backup_digest],
+                |current| vec![&backup_digest, current],
+            );
+            phase_b_materialize_file(
+                profile,
+                portable_root,
+                destination,
+                &bytes,
+                &allowed,
+                &format!("{label} rollback restore"),
+            )?;
+        }
+    } else if std::fs::symlink_metadata(destination).is_ok() {
+        let lease = phase_b_open_existing(profile, portable_root, destination)?;
+        lease.verify().map_err(HostError::RecoveryRequired)?;
+        let current = phase_b_lease_bytes(&lease)?;
+        let current_digest = phase_b_bytes_digest(&current)?;
+        if preserve_template_digest.is_none_or(|expected| expected != &current_digest) {
+            std::fs::remove_file(destination).map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "remove uncommitted Phase-B {label} destination: {error}"
+                ))
+            })?;
+            if std::fs::symlink_metadata(destination).is_ok() {
+                return Err(HostError::RecoveryRequired(format!(
+                    "uncommitted Phase-B {label} destination remains after rollback"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn phase_b_remove_rollback_backup(destination: &Path, label: &str) -> Result<(), HostError> {
+    let backup = phase_b_rollback_path(destination, label)?;
+    if std::fs::symlink_metadata(&backup).is_ok() {
+        std::fs::remove_file(&backup).map_err(|error| {
+            HostError::RecoveryRequired(format!("remove Phase-B {label} rollback backup: {error}"))
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1643,6 +2085,7 @@ fn phase_b_receipt_digest(
         &receipt.config_file_digest,
         &receipt.semantic_config_hash,
         &receipt.eliotd_descriptor_digest,
+        &receipt.request_digest,
         &receipt.file_identities,
     ))?;
     PlatformHandle::new(digest).map_err(|error| HostError::Platform(error.to_string()))
@@ -6176,6 +6619,10 @@ fn pending_activation_binding(
         &pending.host_artifact_digest,
         &pending.runtime_state_roots_digest,
         &pending.manifest_digest,
+        pending
+            .phase_b_prepared
+            .as_ref()
+            .map(|prepared| &prepared.prepared_digest),
     ))?;
     PlatformHandle::new(format!("pending-activation-binding:{digest}"))
         .map_err(|error| HostError::Platform(error.to_string()))
@@ -6217,15 +6664,22 @@ fn reopen_existing_epoch<B: JournalBackend>(
         ));
     }
     // Host-owned kill-on-close Jobs terminate their children when the prior
-    // Host process dies.  Historical Active records therefore authorize only
-    // a fresh direct-child recovery attempt, never a registry commit.
+    // Host process dies. Historical Active records therefore authorize only
+    // a fresh direct-child recovery attempt, never a registry commit. A
+    // prepared Phase-B record is the narrow exception: its exact Host epoch
+    // and nonce are durable recovery bindings, so the new owner re-enters the
+    // same fenced publication contour without rewriting its four destinations.
     let activation_generation = replayed
         .activation
         .as_ref()
         .map(|activation| activation.fence.activation_generation.direct_child())
         .transpose()?
         .unwrap_or(root_epoch(fresh_identity("activation-lineage")?));
-    let host = child_host_epoch(last_host)?;
+    let host = if pending.is_some_and(|pending| pending.phase_b_prepared.is_some()) {
+        last_host.clone()
+    } else {
+        child_host_epoch(last_host)?
+    };
     let backend = current.into_backend()?;
     Ok((
         HostStateJournalService::from_backend(backend, host.clone())?,
@@ -6401,6 +6855,11 @@ pub struct HostPhaseBInput {
 #[cfg(windows)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostPhaseBMaterialization {
+    transaction_id: Option<PlatformHandle>,
+    effect_id: Option<PlatformHandle>,
+    credential_receipt_digest: Option<PlatformHandle>,
+    host_owner_epoch: Option<PlatformHandle>,
+    host_process_identity: Option<PlatformHandle>,
     manifest_digest: PlatformHandle,
     host_epoch: EpochIdentity,
     host_process_nonce: PlatformHandle,
@@ -6410,6 +6869,10 @@ pub struct HostPhaseBMaterialization {
     config_file_digest: PlatformHandle,
     semantic_config_hash: PlatformHandle,
     eliotd_descriptor_digest: PlatformHandle,
+    /// Exact Phase-B request bound to this materialization, when it was
+    /// published through the transaction-owned installer handoff.
+    request_digest: Option<PlatformHandle>,
+    public_receipt_digest: Option<PlatformHandle>,
     file_identities: [FileIdentity; 4],
     launch: RuntimeLaunchDescriptor,
 }
@@ -6699,6 +7162,49 @@ impl HostComposition {
         };
         #[cfg(windows)]
         if let Some(pending) = composition.registry.pending_activation().cloned() {
+            if let Some(prepared) = pending.phase_b_prepared.as_ref() {
+                let materialization = match composition
+                    .rehydrate_phase_b_from_prepared(&pending.manifest, prepared)
+                {
+                    Ok(materialization) => materialization,
+                    Err(error) if pending.phase_b_receipt.is_none() => {
+                        composition.rollback_uncommitted_phase_b(&pending, prepared)?;
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                composition.phase_b = Some(materialization.clone());
+                let pending_after_readback = composition
+                    .registry
+                    .pending_activation()
+                    .cloned()
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "Phase-B preparation disappeared during restart readback".to_owned(),
+                        )
+                    })?;
+                if pending_after_readback.phase_b_receipt.is_none() {
+                    let intent =
+                        pending_after_readback
+                            .phase_b_intent
+                            .as_ref()
+                            .ok_or_else(|| {
+                                HostError::RecoveryRequired(
+                                    "Phase-B preparation has no matching transaction intent"
+                                        .to_owned(),
+                                )
+                            })?;
+                    let receipt =
+                        phase_b_public_receipt(intent, &materialization, &composition.host)?;
+                    let host_capability = composition.owner_lease.activation_capability();
+                    composition.persist_pending_phase_b_receipt(
+                        &pending_after_readback,
+                        &receipt,
+                        &host_capability,
+                    )?;
+                }
+                composition.resume_pending_activation_after_phase_b()?;
+            }
             // Phase A deliberately has no authority descriptor. Keep this
             // Host owner alive in a fenced, non-admissible state until the
             // external ORS handoff reaches the Host-owned Phase-B method.
@@ -6706,7 +7212,7 @@ impl HostComposition {
             // readback/reconciliation; an incomplete/stale Phase-B contour
             // remains fenced and is resumable only with a fresh exact handoff.
             if phase_b_authority_is_observable(&pending.manifest)? {
-                match composition.reconcile_phase_b_for_manifest(&pending.manifest) {
+                match Self::reconcile_phase_b_for_manifest(&pending.manifest) {
                     Ok(_) => composition.reconcile_pending_activation(&pending)?,
                     Err(HostError::RecoveryRequired(_)) => {}
                     Err(error) => return Err(error),
@@ -6715,7 +7221,7 @@ impl HostComposition {
         } else if let Some(active) = composition.registry.active().cloned()
             && phase_b_authority_is_observable(&active.manifest)?
         {
-            match composition.reconcile_phase_b_for_manifest(&active.manifest) {
+            match Self::reconcile_phase_b_for_manifest(&active.manifest) {
                 Ok(_) => start_approved_manifest_contour(
                     &mut composition,
                     &active.manifest,
@@ -6753,8 +7259,311 @@ impl HostComposition {
             self.host.clone(),
             self.launch_options.host_state_root().to_path_buf(),
             capability,
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         )
         .map_err(HostError::Platform)
+    }
+
+    /// Handles one authenticated, transaction-bound Phase-B request on the
+    /// mutable Host owner thread. The worker has already authenticated the
+    /// installer and verified the prior `LocalService` receipt; this method is
+    /// the only production ingress that can publish the live overlay and
+    /// resume the pending activation.
+    #[cfg(windows)]
+    pub fn handle_phase_b_request(
+        &mut self,
+        intent: &HostPhaseBMaterializationIntent,
+        credential_receipt: &CredentialAccessReceipt,
+    ) -> HostCredentialControlResponse {
+        let result = (|| {
+            intent
+                .validate()
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Phase-B handoff requires the exact pending activation".to_owned(),
+                )
+            })?;
+            validate_phase_b_credential_receipt(credential_receipt, &pending.manifest, intent)?;
+            let manifest_digest = phase_b_manifest_digest(&pending.manifest)?;
+            let expected_static_template = phase_b_static_template_for_candidate(&pending.manifest)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let credential_receipt_digest = phase_b_credential_receipt_digest(credential_receipt)?;
+            if let Some(receipt) = pending.phase_b_receipt.as_ref()
+                && receipt.validate().is_ok()
+                && receipt.transaction_id == intent.transaction_id
+                && receipt.effect_id == intent.effect_id
+                && receipt.candidate_manifest_digest == manifest_digest
+                && receipt.request_digest == intent.request_digest
+                && intent.credential_receipt_digest == credential_receipt_digest
+            {
+                // A prior Host process may have completed publication and
+                // the pending registry CAS while the installer response was
+                // lost. Rehydrate the prepared contour and continue the
+                // activation handoff without rematerializing any destination.
+                // This closes the response-loss window after the receipt CAS
+                // but before the activation terminal CAS.
+                self.resume_pending_phase_b_receipt()?;
+                return Ok(receipt.clone());
+            }
+            let live_process_identity = host_process_identity_digest()?;
+            if intent.transaction_id != pending.transaction_id
+                || intent.installation_plan_digest != pending.plan_digest
+                || intent.candidate_manifest_digest != manifest_digest
+                || intent.static_template != expected_static_template
+                || credential_receipt.transaction_id != pending.transaction_id
+                || credential_receipt.effect_id != intent.credential_effect_id
+                || credential_receipt.host_owner_epoch != host_owner_epoch_digest(&self.host)?
+                || credential_receipt.host_process_identity != live_process_identity
+                || intent.host_state_root_digest != phase_b_root_binding_digest(&pending.manifest)?
+                || intent.watchdog_selector_digest
+                    != phase_b_watchdog_selector_digest(&pending.manifest)?
+                || intent.credential_receipt_digest != credential_receipt_digest
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B handoff binding does not match the live Host contour".to_owned(),
+                ));
+            }
+            let host_capability = self.owner_lease.activation_capability();
+            // This CAS is the durable crash boundary immediately before the
+            // first destination publication. A restarted Host can therefore
+            // distinguish an untouched pending activation from an interrupted
+            // Phase-B contour without consulting `self.phase_b` memory.
+            self.persist_pending_phase_b_intent(&pending, intent, &host_capability)?;
+            let authority_descriptor_bytes = phase_b_build_authority_descriptor(
+                &pending.manifest,
+                &self.host,
+                &self.activation_generation.current,
+                intent,
+            )?;
+            let mut materialization = self.materialize_phase_b(
+                &pending.manifest,
+                &HostPhaseBInput {
+                    authority_descriptor_bytes,
+                },
+            )?;
+            materialization.transaction_id = Some(intent.transaction_id.clone());
+            materialization.effect_id = Some(intent.effect_id.clone());
+            materialization.credential_receipt_digest =
+                Some(intent.credential_receipt_digest.clone());
+            materialization.request_digest = Some(intent.request_digest.clone());
+            let receipt = phase_b_public_receipt(intent, &materialization, &self.host)?;
+            materialization.host_owner_epoch = Some(receipt.host_owner_epoch.clone());
+            materialization.host_process_identity = Some(receipt.host_process_identity.clone());
+            materialization.public_receipt_digest = Some(receipt.receipt_digest.clone());
+            self.persist_pending_phase_b_receipt(&pending, &receipt, &host_capability)?;
+            self.phase_b = Some(materialization.clone());
+            self.resume_pending_activation_after_phase_b()?;
+            Ok(receipt)
+        })();
+        match result {
+            Ok(receipt) => HostCredentialControlResponse::PhaseBReady { receipt },
+            Err(error) => HostCredentialControlResponse::Unknown {
+                pending_ref: PlatformHandle::new(format!(
+                    "phase-b:{}",
+                    sha256_json(&error.to_string()).unwrap_or_else(|_| "phase-b-error".to_owned())
+                ))
+                .unwrap_or_else(|_| unreachable!()),
+            },
+        }
+    }
+
+    /// Handles a durable Phase-B response-loss retry without invoking any
+    /// materialization or activation mutation. The live Host composition is
+    /// the query owner; after activation commit it first authenticates the
+    /// exact registry terminal and then reuses only its matching in-memory
+    /// receipt. The committed registry fence is sufficient to rehydrate the
+    /// public receipt after a Host process restart; destination bytes are
+    /// never accepted as a substitute.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Phase-B query keeps pending/committed binding and response-loss reconciliation in one fail-closed boundary"
+    )]
+    pub fn reconcile_phase_b_request(
+        &mut self,
+        intent: &HostPhaseBMaterializationIntent,
+        credential_receipt: &CredentialAccessReceipt,
+    ) -> HostCredentialControlResponse {
+        let result = (|| {
+            intent
+                .validate()
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            let (
+                manifest,
+                plan_digest,
+                committed_binding,
+                pending_intent,
+                pending_prepared,
+                pending_receipt,
+            ) = if let Some(pending) = self.registry.pending_activation().cloned() {
+                if pending
+                    .phase_b_intent
+                    .as_ref()
+                    .is_some_and(|saved| saved != intent)
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "pending Phase-B intent belongs to a different request".to_owned(),
+                    ));
+                }
+                (
+                    pending.manifest,
+                    pending.plan_digest,
+                    None,
+                    pending.phase_b_intent,
+                    pending.phase_b_prepared,
+                    pending.phase_b_receipt,
+                )
+            } else {
+                let active = self.registry.active().cloned().ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "Phase-B query has neither the exact pending nor committed active generation"
+                                .to_owned(),
+                        )
+                    })?;
+                let manifest_digest = phase_b_manifest_digest(&active.manifest)?;
+                let terminal = self
+                    .registry_store
+                    .read_committed_activation_receipt(
+                        &intent.transaction_id,
+                        &intent.installation_plan_digest,
+                        &active.manifest.generation,
+                    )
+                    .map_err(HostError::Installation)?;
+                let binding = terminal
+                    .commit_fence()
+                    .phase_b_live_binding
+                    .clone()
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "committed activation is missing its Phase-B binding".to_owned(),
+                        )
+                    })?;
+                if binding.manifest_digest != manifest_digest {
+                    return Err(HostError::RecoveryRequired(
+                        "committed Phase-B binding belongs to a different manifest".to_owned(),
+                    ));
+                }
+                (
+                    active.manifest,
+                    terminal.plan_digest().clone(),
+                    Some(binding),
+                    None,
+                    None,
+                    None,
+                )
+            };
+            let manifest_digest = phase_b_manifest_digest(&manifest)?;
+            let expected_static_template = phase_b_static_template_for_candidate(&manifest)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            validate_phase_b_credential_receipt(credential_receipt, &manifest, intent)?;
+            let live_process_identity = if committed_binding.is_none()
+                && pending_receipt.is_none()
+                && pending_intent.is_none()
+            {
+                Some(host_process_identity_digest()?)
+            } else {
+                None
+            };
+            if intent.installation_plan_digest != plan_digest
+                || intent.candidate_manifest_digest != manifest_digest
+                || intent.static_template != expected_static_template
+                || credential_receipt.transaction_id != intent.transaction_id
+                || credential_receipt.effect_id != intent.credential_effect_id
+                || (committed_binding.is_none()
+                    && pending_receipt.is_none()
+                    && pending_intent.is_none()
+                    && (credential_receipt.host_owner_epoch
+                        != host_owner_epoch_digest(&self.host)?
+                        || Some(credential_receipt.host_process_identity.clone())
+                            != live_process_identity))
+                || intent.host_state_root_digest != phase_b_root_binding_digest(&manifest)?
+                || intent.watchdog_selector_digest != phase_b_watchdog_selector_digest(&manifest)?
+                || intent.credential_receipt_digest
+                    != phase_b_credential_receipt_digest(credential_receipt)?
+                || pending_prepared.as_ref().is_some_and(|prepared| {
+                    prepared.host_owner_epoch != credential_receipt.host_owner_epoch
+                        || prepared.host_process_identity
+                            != credential_receipt.host_process_identity
+                })
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B query binding does not match the live Host contour".to_owned(),
+                ));
+            }
+            if let Some(binding) = committed_binding.as_ref() {
+                return phase_b_public_receipt_from_binding(intent, binding, credential_receipt);
+            }
+            if let Some(receipt) = pending_receipt.as_ref() {
+                if receipt.validate().is_err()
+                    || receipt.transaction_id != intent.transaction_id
+                    || receipt.effect_id != intent.effect_id
+                    || receipt.candidate_manifest_digest != manifest_digest
+                    || receipt.request_digest != intent.request_digest
+                    || receipt.host_owner_epoch != credential_receipt.host_owner_epoch
+                    || receipt.host_process_identity != credential_receipt.host_process_identity
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "pending Phase-B receipt is not bound to the exact query".to_owned(),
+                    ));
+                }
+                // The receipt CAS can be durable while the activation
+                // continuation was interrupted. Rehydrate the exact
+                // prepared contour and resume that continuation; no Phase-B
+                // destination is published again.
+                self.resume_pending_phase_b_receipt()?;
+                return Ok(receipt.clone());
+            }
+            if pending_intent.is_some() && pending_prepared.is_none() {
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B publication was interrupted after its durable intent and before its receipt; rollback/recovery is required"
+                        .to_owned(),
+                ));
+            }
+            let materialization = self.phase_b.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Host has no rehydrated Phase-B materialization for the durable preparation"
+                        .to_owned(),
+                )
+            })?;
+            if materialization.manifest_digest != manifest_digest {
+                return Err(HostError::RecoveryRequired(
+                    "Host Phase-B receipt belongs to a different manifest".to_owned(),
+                ));
+            }
+            if let Some(prepared) = pending_prepared.as_ref()
+                && (materialization.transaction_id.as_ref() != Some(&prepared.transaction_id)
+                    || materialization.effect_id.as_ref() != Some(&prepared.effect_id)
+                    || materialization.request_digest.as_ref() != Some(&prepared.request_digest)
+                    || materialization.credential_receipt_digest.as_ref()
+                        != Some(&prepared.credential_receipt_digest)
+                    || materialization.authority_descriptor_digest
+                        != prepared.authority_descriptor_digest
+                    || materialization.config_file_digest != prepared.config_file_digest
+                    || materialization.store_bootstrap_descriptor_digest
+                        != prepared.store_bootstrap_descriptor_digest
+                    || materialization.eliotd_descriptor_digest
+                        != prepared.eliotd_descriptor_digest
+                    || materialization.launch != prepared.launch)
+            {
+                return Err(HostError::RecoveryRequired(
+                    "in-memory Phase-B materialization does not match the durable preparation"
+                        .to_owned(),
+                ));
+            }
+            phase_b_public_receipt(intent, materialization, &self.host)
+        })();
+        match result {
+            Ok(receipt) => HostCredentialControlResponse::PhaseBReady { receipt },
+            Err(error) => HostCredentialControlResponse::Unknown {
+                pending_ref: PlatformHandle::new(format!(
+                    "phase-b-query:{}",
+                    sha256_json(&error.to_string())
+                        .unwrap_or_else(|_| "phase-b-query-error".to_owned())
+                ))
+                .unwrap_or_else(|_| unreachable!()),
+            },
+        }
     }
 
     /// Returns the canonical owner-object name held for this composition.
@@ -6880,17 +7689,10 @@ impl HostComposition {
             .as_ref()
             .map(|binding| vec![&binding.authority_digest])
             .unwrap_or_default();
-        let (authority_physical_digest, authority_identity) = phase_b_materialize_file(
-            profile,
-            portable_root.as_ref(),
-            &authority_path,
-            &input.authority_descriptor_bytes,
-            &previous_authority_digests,
-            "authority descriptor",
-        )?;
+        let authority_physical_digest = phase_b_bytes_digest(&input.authority_descriptor_bytes)?;
         if authority_physical_digest != authority_descriptor_digest {
             return Err(HostError::RecoveryRequired(
-                "Phase-B authority descriptor digest changed during materialization".to_owned(),
+                "Phase-B authority descriptor digest changed before publication".to_owned(),
             ));
         }
 
@@ -6981,14 +7783,7 @@ impl HostComposition {
         if let Some(digest) = previous_eliotd_digest.as_ref() {
             eliotd_allowed_digests.push(digest);
         }
-        let (eliotd_descriptor_digest, eliotd_identity) = phase_b_materialize_file(
-            profile,
-            portable_root.as_ref(),
-            &eliotd_descriptor_path,
-            &eliotd_live_bytes,
-            &eliotd_allowed_digests,
-            "eliotd descriptor",
-        )?;
+        let eliotd_descriptor_digest = phase_b_bytes_digest(&eliotd_live_bytes)?;
         let live_launch_template = phase_b_live_launch(
             launch_template,
             &self.host,
@@ -7056,14 +7851,7 @@ impl HostComposition {
         if let Some(digest) = previous_config_digest.as_ref() {
             config_allowed_digests.push(digest);
         }
-        let (config_file_digest, config_identity) = phase_b_materialize_file(
-            profile,
-            portable_root.as_ref(),
-            &config_path,
-            &config_live_bytes,
-            &config_allowed_digests,
-            "Store config",
-        )?;
+        let config_file_digest = phase_b_bytes_digest(&config_live_bytes)?;
         if config_file_digest == semantic_config_hash {
             return Err(HostError::RecoveryRequired(
                 "physical Store config digest unexpectedly equals semantic digest".to_owned(),
@@ -7162,14 +7950,7 @@ impl HostComposition {
         if let Some(digest) = previous_bootstrap_digest.as_ref() {
             bootstrap_allowed_digests.push(digest);
         }
-        let (store_bootstrap_descriptor_digest, bootstrap_identity) = phase_b_materialize_file(
-            profile,
-            portable_root.as_ref(),
-            &bootstrap_path,
-            &bootstrap_bytes,
-            &bootstrap_allowed_digests,
-            "Store bootstrap descriptor",
-        )?;
+        let store_bootstrap_descriptor_digest = phase_b_bytes_digest(&bootstrap_bytes)?;
         let launch = live_launch_template
             .with_phase_b_materialization(
                 authority.generation,
@@ -7179,16 +7960,142 @@ impl HostComposition {
                 eliotd_descriptor_digest.clone(),
             )
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let pending = self.registry.pending_activation().cloned();
+        let prepared = if let Some(pending) = pending.as_ref() {
+            let intent = pending.phase_b_intent.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Phase-B publication requires the durable transaction intent".to_owned(),
+                )
+            })?;
+            if pending.manifest_digest != manifest_digest {
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B preparation manifest is not the exact pending manifest".to_owned(),
+                ));
+            }
+            let mut prepared = HostPhaseBPreparedMaterialization {
+                wire: PlatformHandle::new(HostPhaseBPreparedMaterialization::WIRE)
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+                transaction_id: intent.transaction_id.clone(),
+                effect_id: intent.effect_id.clone(),
+                credential_effect_id: intent.credential_effect_id.clone(),
+                manifest_digest: manifest_digest.clone(),
+                request_digest: intent.request_digest.clone(),
+                credential_receipt_digest: intent.credential_receipt_digest.clone(),
+                host_owner_epoch: host_owner_epoch_digest(&self.host)?,
+                host_process_identity: host_process_identity_digest()?,
+                host_process_nonce_digest: phase_b_bytes_digest(
+                    self.host
+                        .host_process_nonce()
+                        .as_handle()
+                        .as_str()
+                        .as_bytes(),
+                )?,
+                host_epoch_lineage: self.host.epoch.current.lineage.clone(),
+                host_epoch_sequence: self.host.epoch.current.sequence,
+                activation_generation_lineage: self.activation_generation.current.lineage.clone(),
+                activation_generation_sequence: self.activation_generation.current.sequence,
+                authority_descriptor_digest: authority_descriptor_digest.clone(),
+                config_file_digest: config_file_digest.clone(),
+                store_bootstrap_descriptor_digest: store_bootstrap_descriptor_digest.clone(),
+                eliotd_descriptor_digest: eliotd_descriptor_digest.clone(),
+                semantic_config_hash: semantic_config_hash.clone(),
+                launch: launch.clone(),
+                prepared_digest: PlatformHandle::new("pending")
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
+            };
+            prepared.prepared_digest = prepared
+                .computed_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            prepared.validate().map_err(HostError::Installation)?;
+            let host_capability = self.owner_lease.activation_capability();
+            self.persist_pending_phase_b_prepared(pending, &prepared, &host_capability)?;
+            Some(prepared)
+        } else {
+            None
+        };
+        let (authority_readback_digest, authority_identity) =
+            phase_b_materialize_file_with_rollback(
+                profile,
+                portable_root.as_ref(),
+                &authority_path,
+                &input.authority_descriptor_bytes,
+                &previous_authority_digests,
+                "authority descriptor",
+            )?;
+        if authority_readback_digest != authority_descriptor_digest {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B authority descriptor digest changed during materialization".to_owned(),
+            ));
+        }
+        let (eliotd_readback_digest, eliotd_identity) = phase_b_materialize_file_with_rollback(
+            profile,
+            portable_root.as_ref(),
+            &eliotd_descriptor_path,
+            &eliotd_live_bytes,
+            &eliotd_allowed_digests,
+            "eliotd descriptor",
+        )?;
+        if eliotd_readback_digest != eliotd_descriptor_digest {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B eliotd descriptor digest changed during materialization".to_owned(),
+            ));
+        }
+        let (config_readback_digest, config_identity) = phase_b_materialize_file_with_rollback(
+            profile,
+            portable_root.as_ref(),
+            &config_path,
+            &config_live_bytes,
+            &config_allowed_digests,
+            "Store config",
+        )?;
+        if config_readback_digest != config_file_digest
+            || config_readback_digest == semantic_config_hash
+        {
+            return Err(HostError::RecoveryRequired(
+                "physical Store config digest unexpectedly equals semantic digest".to_owned(),
+            ));
+        }
+        let (bootstrap_readback_digest, bootstrap_identity) =
+            phase_b_materialize_file_with_rollback(
+                profile,
+                portable_root.as_ref(),
+                &bootstrap_path,
+                &bootstrap_bytes,
+                &bootstrap_allowed_digests,
+                "Store bootstrap descriptor",
+            )?;
+        if bootstrap_readback_digest != store_bootstrap_descriptor_digest {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B Store bootstrap digest changed during materialization".to_owned(),
+            ));
+        }
+        if let Some(prepared) = prepared.as_ref()
+            && (prepared.authority_descriptor_digest != authority_readback_digest
+                || prepared.eliotd_descriptor_digest != eliotd_readback_digest
+                || prepared.config_file_digest != config_readback_digest
+                || prepared.store_bootstrap_descriptor_digest != bootstrap_readback_digest)
+        {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B destination readback differs from the durable preparation".to_owned(),
+            ));
+        }
         let receipt = HostPhaseBMaterialization {
+            transaction_id: None,
+            effect_id: None,
+            credential_receipt_digest: None,
+            host_owner_epoch: None,
+            host_process_identity: None,
             manifest_digest,
             host_epoch: self.host.epoch.current.clone(),
             host_process_nonce: self.host.host_process_nonce().as_handle().clone(),
             activation_generation: self.activation_generation.current.clone(),
             authority_descriptor_digest,
-            store_bootstrap_descriptor_digest,
-            config_file_digest,
+            store_bootstrap_descriptor_digest: bootstrap_readback_digest,
+            config_file_digest: config_readback_digest,
             semantic_config_hash,
-            eliotd_descriptor_digest,
+            eliotd_descriptor_digest: eliotd_readback_digest,
+            request_digest: None,
+            public_receipt_digest: None,
             file_identities: [
                 authority_identity,
                 config_identity,
@@ -7202,20 +8109,52 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
-    fn reconcile_phase_b_for_manifest(
-        &mut self,
+    #[allow(
+        clippy::too_many_lines,
+        reason = "prepared Phase-B rehydration keeps exact four-path readback and dynamic binding checks together"
+    )]
+    fn rehydrate_phase_b_from_prepared(
+        &self,
         manifest: &CandidateManifest,
+        prepared: &HostPhaseBPreparedMaterialization,
     ) -> Result<HostPhaseBMaterialization, HostError> {
-        let launch = &manifest.runtime_launch;
-        let portable_root = if launch.profile == InstallationProfile::PortableDev {
+        prepared.validate().map_err(HostError::Installation)?;
+        let manifest_digest = phase_b_manifest_digest(manifest)?;
+        if prepared.manifest_digest != manifest_digest
+            || prepared.launch.generation != manifest.generation
+            || prepared.launch.store_config_path != manifest.config_path
+        {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B prepared record is not bound to the exact candidate manifest".to_owned(),
+            ));
+        }
+        let nonce_digest = phase_b_bytes_digest(
+            self.host
+                .host_process_nonce()
+                .as_handle()
+                .as_str()
+                .as_bytes(),
+        )?;
+        if prepared.host_process_nonce_digest != nonce_digest
+            || prepared.host_epoch_lineage != self.host.epoch.current.lineage
+            || prepared.host_epoch_sequence != self.host.epoch.current.sequence
+        {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B prepared record belongs to a different Host epoch/process contour"
+                    .to_owned(),
+            ));
+        }
+        let profile = manifest.runtime_launch.profile;
+        let portable_root = if profile == InstallationProfile::PortableDev {
             Some(
                 UserOwnedRootLease::open_existing(Path::new(
-                    launch
+                    manifest
+                        .runtime_launch
                         .portable_root
                         .as_ref()
                         .ok_or_else(|| {
                             HostError::RecoveryRequired(
-                                "Phase-B recovery portable root is missing".to_owned(),
+                                "Phase-B prepared portable root binding is missing".to_owned(),
                             )
                         })?
                         .as_str(),
@@ -7225,19 +8164,249 @@ impl HostComposition {
         } else {
             None
         };
-        let path = approved_locator(
-            Path::new(launch.authority_descriptor_path.as_str()),
-            &launch.authority_descriptor_path,
-            launch.profile,
+        let readback = |path: &Path,
+                        expected: &PlatformHandle,
+                        label: &str|
+         -> Result<FileIdentity, HostError> {
+            let lease = phase_b_open_existing(profile, portable_root.as_ref(), path)?;
+            lease.verify().map_err(HostError::RecoveryRequired)?;
+            let bytes = phase_b_lease_bytes(&lease)?;
+            let actual = phase_b_bytes_digest(&bytes)?;
+            if actual != *expected {
+                return Err(HostError::RecoveryRequired(format!(
+                    "Phase-B prepared {label} readback digest is not exact"
+                )));
+            }
+            Ok(phase_b_lease_identity(&lease))
+        };
+        let authority_path = approved_locator(
+            Path::new(manifest.runtime_launch.authority_descriptor_path.as_str()),
+            &manifest.runtime_launch.authority_descriptor_path,
+            profile,
         )?;
-        let lease = phase_b_open_existing(launch.profile, portable_root.as_ref(), &path)?;
-        let bytes = phase_b_lease_bytes(&lease)?;
-        self.materialize_phase_b(
-            manifest,
-            &HostPhaseBInput {
-                authority_descriptor_bytes: bytes,
-            },
-        )
+        let config_path = approved_locator(
+            Path::new(manifest.config_path.as_str()),
+            &manifest.config_path,
+            profile,
+        )?;
+        let bootstrap_path = approved_locator(
+            Path::new(
+                manifest
+                    .runtime_launch
+                    .store_bootstrap_descriptor_path
+                    .as_str(),
+            ),
+            &manifest.runtime_launch.store_bootstrap_descriptor_path,
+            profile,
+        )?;
+        let eliotd_path = approved_locator(
+            Path::new(manifest.runtime_launch.eliotd_descriptor_path.as_str()),
+            &manifest.runtime_launch.eliotd_descriptor_path,
+            profile,
+        )?;
+        let authority_identity = readback(
+            &authority_path,
+            &prepared.authority_descriptor_digest,
+            "authority descriptor",
+        )?;
+        let config_identity = readback(&config_path, &prepared.config_file_digest, "Store config")?;
+        let bootstrap_identity = readback(
+            &bootstrap_path,
+            &prepared.store_bootstrap_descriptor_digest,
+            "Store bootstrap descriptor",
+        )?;
+        let eliotd_identity = readback(
+            &eliotd_path,
+            &prepared.eliotd_descriptor_digest,
+            "eliotd descriptor",
+        )?;
+        Ok(HostPhaseBMaterialization {
+            transaction_id: Some(prepared.transaction_id.clone()),
+            effect_id: Some(prepared.effect_id.clone()),
+            credential_receipt_digest: Some(prepared.credential_receipt_digest.clone()),
+            host_owner_epoch: Some(prepared.host_owner_epoch.clone()),
+            host_process_identity: Some(prepared.host_process_identity.clone()),
+            manifest_digest,
+            host_epoch: self.host.epoch.current.clone(),
+            host_process_nonce: self.host.host_process_nonce().as_handle().clone(),
+            activation_generation: self.activation_generation.current.clone(),
+            authority_descriptor_digest: prepared.authority_descriptor_digest.clone(),
+            store_bootstrap_descriptor_digest: prepared.store_bootstrap_descriptor_digest.clone(),
+            config_file_digest: prepared.config_file_digest.clone(),
+            semantic_config_hash: prepared.semantic_config_hash.clone(),
+            eliotd_descriptor_digest: prepared.eliotd_descriptor_digest.clone(),
+            request_digest: Some(prepared.request_digest.clone()),
+            public_receipt_digest: None,
+            file_identities: [
+                authority_identity,
+                config_identity,
+                bootstrap_identity,
+                eliotd_identity,
+            ],
+            launch: prepared.launch.clone(),
+        })
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "uncommitted Phase-B rollback keeps all four destination restores and CAS cleanup together"
+    )]
+    fn rollback_uncommitted_phase_b(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+        prepared: &HostPhaseBPreparedMaterialization,
+    ) -> Result<(), HostError> {
+        if pending.prior_active_generation.is_some() {
+            return Err(HostError::RecoveryRequired(
+                "interrupted Phase-B upgrade requires an explicit prior-generation recovery proof"
+                    .to_owned(),
+            ));
+        }
+        let profile = pending.manifest.runtime_launch.profile;
+        let portable_root = if profile == InstallationProfile::PortableDev {
+            Some(
+                UserOwnedRootLease::open_existing(Path::new(
+                    pending
+                        .manifest
+                        .runtime_launch
+                        .portable_root
+                        .as_ref()
+                        .ok_or_else(|| {
+                            HostError::RecoveryRequired(
+                                "Phase-B rollback portable root binding is missing".to_owned(),
+                            )
+                        })?
+                        .as_str(),
+                ))
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let authority_path = approved_locator(
+            Path::new(
+                pending
+                    .manifest
+                    .runtime_launch
+                    .authority_descriptor_path
+                    .as_str(),
+            ),
+            &pending.manifest.runtime_launch.authority_descriptor_path,
+            profile,
+        )?;
+        let config_path = approved_locator(
+            Path::new(pending.manifest.config_path.as_str()),
+            &pending.manifest.config_path,
+            profile,
+        )?;
+        let bootstrap_path = approved_locator(
+            Path::new(
+                pending
+                    .manifest
+                    .runtime_launch
+                    .store_bootstrap_descriptor_path
+                    .as_str(),
+            ),
+            &pending
+                .manifest
+                .runtime_launch
+                .store_bootstrap_descriptor_path,
+            profile,
+        )?;
+        let eliotd_path = approved_locator(
+            Path::new(
+                pending
+                    .manifest
+                    .runtime_launch
+                    .eliotd_descriptor_path
+                    .as_str(),
+            ),
+            &pending.manifest.runtime_launch.eliotd_descriptor_path,
+            profile,
+        )?;
+        phase_b_restore_or_remove(
+            profile,
+            portable_root.as_ref(),
+            &authority_path,
+            "authority descriptor",
+            None,
+        )?;
+        phase_b_restore_or_remove(
+            profile,
+            portable_root.as_ref(),
+            &config_path,
+            "Store config",
+            Some(&pending.manifest.config_digest),
+        )?;
+        phase_b_restore_or_remove(
+            profile,
+            portable_root.as_ref(),
+            &bootstrap_path,
+            "Store bootstrap descriptor",
+            Some(
+                &pending
+                    .manifest
+                    .runtime_launch
+                    .store_bootstrap_descriptor_digest,
+            ),
+        )?;
+        phase_b_restore_or_remove(
+            profile,
+            portable_root.as_ref(),
+            &eliotd_path,
+            "eliotd descriptor",
+            Some(&pending.manifest.runtime_launch.eliotd_descriptor_digest),
+        )?;
+        let intent = pending.phase_b_intent.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Phase-B rollback preparation has no matching intent".to_owned(),
+            )
+        })?;
+        let host_capability = self.owner_lease.activation_capability();
+        let expected_revision = self.registry.revision();
+        self.registry_store
+            .clear_pending_phase_b_prepared(
+                &host_capability,
+                expected_revision,
+                &pending.approval,
+                prepared,
+            )
+            .map_err(HostError::Installation)?;
+        self.registry = self.registry_store.load().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Phase-B rollback preparation clear readback failed: {error}"
+            ))
+        })?;
+        let expected_revision = self.registry.revision();
+        self.registry_store
+            .clear_pending_phase_b_intent(
+                &host_capability,
+                expected_revision,
+                &pending.approval,
+                intent,
+            )
+            .map_err(HostError::Installation)?;
+        self.registry = self.registry_store.load().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Phase-B rollback intent clear readback failed: {error}"
+            ))
+        })?;
+        phase_b_remove_rollback_backup(&authority_path, "authority descriptor")?;
+        phase_b_remove_rollback_backup(&config_path, "Store config")?;
+        phase_b_remove_rollback_backup(&bootstrap_path, "Store bootstrap descriptor")?;
+        phase_b_remove_rollback_backup(&eliotd_path, "eliotd descriptor")?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn reconcile_phase_b_for_manifest(
+        _manifest: &CandidateManifest,
+    ) -> Result<HostPhaseBMaterialization, HostError> {
+        Err(HostError::RecoveryRequired(
+            "Phase-B recovery requires a transaction-bound Host receipt; destination bytes are never an input"
+                .to_owned(),
+        ))
     }
 
     fn resume_pending_record(&mut self) -> Result<(), HostError> {
@@ -7504,6 +8673,34 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    fn resume_pending_phase_b_receipt(&mut self) -> Result<(), HostError> {
+        let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Phase-B receipt continuation has no exact pending activation".to_owned(),
+            )
+        })?;
+        let manifest_digest = phase_b_manifest_digest(&pending.manifest)?;
+        if self
+            .phase_b
+            .as_ref()
+            .is_none_or(|materialization| materialization.manifest_digest != manifest_digest)
+        {
+            let prepared = pending.phase_b_prepared.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Phase-B receipt continuation has no durable preparation".to_owned(),
+                )
+            })?;
+            let materialization =
+                self.rehydrate_phase_b_from_prepared(&pending.manifest, prepared)?;
+            self.phase_b = Some(materialization);
+        }
+        // This is the exact post-receipt continuation. It may start the
+        // already-approved child contour, but it never republishes Phase-B
+        // bytes or issues a second materialization effect.
+        self.resume_pending_activation_after_phase_b()
+    }
+
+    #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
         reason = "ordered Phase-B receipt admission, sibling start, and child readiness remain one fenced lifecycle boundary"
@@ -7524,7 +8721,7 @@ impl HostComposition {
             .filter(|receipt| receipt.manifest_digest == manifest_digest)
         {
             Some(receipt) => receipt,
-            None => self.reconcile_phase_b_for_manifest(manifest)?,
+            None => Self::reconcile_phase_b_for_manifest(manifest)?,
         };
         phase_b
             .launch
@@ -7734,6 +8931,172 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    fn persist_pending_phase_b_intent(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+        intent: &HostPhaseBMaterializationIntent,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
+            current
+                .phase_b_intent
+                .as_ref()
+                .is_some_and(|existing| existing == intent)
+        }) {
+            expected_revision
+        } else {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired("Phase-B intent registry revision overflow".to_owned())
+            })?
+        };
+        let outcome = self.registry_store.record_pending_phase_b_intent(
+            host_capability,
+            expected_revision,
+            &pending.approval,
+            intent,
+        );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "Phase-B intent outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable.pending_activation().is_some_and(|current| {
+                current.transaction_id == pending.transaction_id
+                    && current.plan_digest == pending.plan_digest
+                    && current.approval == pending.approval
+                    && current.phase_b_intent.as_ref() == Some(intent)
+                    && current.phase_b_receipt.is_none()
+            });
+        self.registry = durable;
+        match outcome {
+            Ok(returned) if exact_readback && returned == *intent => Ok(()),
+            Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
+                "Phase-B intent succeeded but exact registry readback differed".to_owned(),
+            )),
+            Ok(_) => Err(HostError::RecoveryRequired(
+                "Phase-B intent succeeded but exact registry readback failed".to_owned(),
+            )),
+            Err(_error) if exact_readback => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Phase-B intent failed and exact registry readback did not confirm it: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(windows)]
+    fn persist_pending_phase_b_prepared(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+        prepared: &HostPhaseBPreparedMaterialization,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
+            current
+                .phase_b_prepared
+                .as_ref()
+                .is_some_and(|existing| existing == prepared)
+        }) {
+            expected_revision
+        } else {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Phase-B preparation registry revision overflow".to_owned(),
+                )
+            })?
+        };
+        let outcome = self.registry_store.record_pending_phase_b_prepared(
+            host_capability,
+            expected_revision,
+            &pending.approval,
+            prepared,
+        );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "Phase-B preparation outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable.pending_activation().is_some_and(|current| {
+                current.transaction_id == pending.transaction_id
+                    && current.plan_digest == pending.plan_digest
+                    && current.approval == pending.approval
+                    && current.phase_b_prepared.as_ref() == Some(prepared)
+                    && current.phase_b_receipt.is_none()
+            });
+        self.registry = durable;
+        match outcome {
+            Ok(returned) if exact_readback && returned == *prepared => Ok(()),
+            Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
+                "Phase-B preparation succeeded but exact registry readback differed".to_owned(),
+            )),
+            Ok(_) => Err(HostError::RecoveryRequired(
+                "Phase-B preparation succeeded but exact registry readback failed".to_owned(),
+            )),
+            Err(_error) if exact_readback => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Phase-B preparation failed and exact registry readback did not confirm it: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(windows)]
+    fn persist_pending_phase_b_receipt(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+        receipt: &HostPhaseBMaterializationReceipt,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
+            current
+                .phase_b_receipt
+                .as_ref()
+                .is_some_and(|existing| existing == receipt)
+        }) {
+            expected_revision
+        } else {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired("Phase-B receipt registry revision overflow".to_owned())
+            })?
+        };
+        let outcome = self.registry_store.record_pending_phase_b_receipt(
+            host_capability,
+            expected_revision,
+            &pending.approval,
+            receipt,
+        );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "Phase-B receipt outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable.pending_activation().is_some_and(|current| {
+                current.transaction_id == pending.transaction_id
+                    && current.plan_digest == pending.plan_digest
+                    && current.approval == pending.approval
+                    && current.phase_b_receipt.as_ref() == Some(receipt)
+            });
+        self.registry = durable;
+        match outcome {
+            Ok(returned) if exact_readback && returned == *receipt => Ok(()),
+            Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
+                "Phase-B receipt succeeded but exact registry readback differed".to_owned(),
+            )),
+            Ok(_) => Err(HostError::RecoveryRequired(
+                "Phase-B receipt succeeded but exact registry readback failed".to_owned(),
+            )),
+            Err(_error) if exact_readback => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Phase-B receipt failed and exact registry readback did not confirm it: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(windows)]
     fn abort_pending_durable(
         &mut self,
         pending: &eliot_installation::PendingActivation,
@@ -7894,11 +9257,48 @@ impl HostComposition {
                     .store_bootstrap_descriptor_digest
                     .clone(),
                 config_file_digest: phase_b.config_file_digest.clone(),
+                eliotd_descriptor_digest: phase_b.eliotd_descriptor_digest.clone(),
                 semantic_config_hash: phase_b.semantic_config_hash.clone(),
                 host_epoch_lineage: phase_b.host_epoch.lineage.clone(),
                 host_epoch_sequence: phase_b.host_epoch.sequence,
-                host_process_nonce: HostProcessNonce::new(phase_b.host_process_nonce.clone()),
+                host_process_nonce_digest: PlatformHandle::new(format!(
+                    "{:x}",
+                    Sha256::digest(phase_b.host_process_nonce.as_str().as_bytes())
+                ))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
                 receipt_digest: phase_b_receipt_digest(phase_b)?,
+                effect_id: phase_b.effect_id.clone().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Phase-B commit is missing its materialization effect identity".to_owned(),
+                    )
+                })?,
+                credential_receipt_digest: phase_b.credential_receipt_digest.clone().ok_or_else(
+                    || {
+                        HostError::RecoveryRequired(
+                            "Phase-B commit is missing its credential receipt digest".to_owned(),
+                        )
+                    },
+                )?,
+                request_digest: phase_b.request_digest.clone().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Phase-B commit is missing its request digest".to_owned(),
+                    )
+                })?,
+                host_owner_epoch: phase_b.host_owner_epoch.clone().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Phase-B commit is missing its Host owner epoch receipt".to_owned(),
+                    )
+                })?,
+                host_process_identity: phase_b.host_process_identity.clone().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Phase-B commit is missing its Host process receipt".to_owned(),
+                    )
+                })?,
+                public_receipt_digest: phase_b.public_receipt_digest.clone().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Phase-B commit is missing its public receipt digest".to_owned(),
+                    )
+                })?,
             }),
             authority_generation: phase_b.launch.authority_generation,
             authority_state_fence: phase_b.launch.authority_state_fence.clone(),

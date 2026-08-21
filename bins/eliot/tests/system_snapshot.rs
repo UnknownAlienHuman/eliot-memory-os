@@ -56,7 +56,7 @@ fn minimal_pe(label: &str) -> Vec<u8> {
 
 #[cfg(windows)]
 #[test]
-fn installation_generate_cli_builds_exact_eleven_file_transaction() {
+fn installation_generate_cli_builds_exact_nine_phase_a_file_transaction() {
     let temp_root = std::env::temp_dir().join(format!(
         "eliot-installation-generate-{}",
         std::process::id()
@@ -79,8 +79,6 @@ fn installation_generate_cli_builds_exact_eleven_file_transaction() {
         ("generation.json", false),
         ("eliotd-governor.json", false),
         ("eliotd.json", false),
-        ("store-bootstrap.json", false),
-        ("authority.json", false),
     ] {
         let bytes = if executable {
             minimal_pe(name)
@@ -128,7 +126,7 @@ fn installation_generate_cli_builds_exact_eleven_file_transaction() {
     );
     let summary: Value = serde_json::from_slice(&result.stdout).expect("generation summary JSON");
     assert_eq!(summary["status"], "GENERATED");
-    assert_eq!(summary["package_file_count"], 11);
+    assert_eq!(summary["package_file_count"], 9);
     let wire = fs::read_to_string(&output).expect("generated transaction artifact");
     assert!(!wire.contains("host_runtime_activation_nonce"));
     let transaction: Value = serde_json::from_str(&wire).expect("generated transaction JSON");
@@ -146,7 +144,7 @@ fn installation_generate_cli_builds_exact_eleven_file_transaction() {
             .as_array()
             .expect("generated manifest files")
             .len(),
-        11
+        9
     );
     assert_eq!(transaction["transaction_id"], "transaction:cli");
     let _ = fs::remove_dir_all(temp_root);
@@ -568,7 +566,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         authority_descriptor_digest: fixture_handle("7".repeat(64)),
         runtime_state_roots: runtime_state_roots.clone(),
         kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
-        kernel_artifact_digest: fixture_handle("0".repeat(64)),
+        kernel_artifact_digest: fixture_handle("a".repeat(64)),
         eliotd_executable_path: fixture_path(root, "eliotd.exe"),
         eliotd_artifact_digest: fixture_handle("8".repeat(64)),
         eliotd_config_path: fixture_path(root, "eliotd-governor.json"),
@@ -596,7 +594,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
             fixture_handle("--authority-descriptor-sha256"),
             fixture_handle("7".repeat(64)),
             fixture_handle("--kernel-artifact-sha256"),
-            fixture_handle("0".repeat(64)),
+            fixture_handle("a".repeat(64)),
             fixture_handle("--eliotd-descriptor"),
             fixture_path(root, "eliotd.json"),
             fixture_handle("--eliotd-descriptor-sha256"),
@@ -643,7 +641,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
             fixture_handle("component:kernel"),
             fixture_handle("component:store"),
         ],
-        kernel_artifact_digest: fixture_handle("0".repeat(64)),
+        kernel_artifact_digest: fixture_handle("a".repeat(64)),
         store_bridge_artifact_digest: fixture_handle("1".repeat(64)),
         canonical_store_artifact_digest: fixture_handle("5".repeat(64)),
         host_artifact_digest: fixture_handle("8".repeat(64)),
@@ -799,7 +797,7 @@ fn installation_cli_rejects_valid_raw_transaction_import() {
     let planned: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
     assert_eq!(
         planned["transaction_wire_version"],
-        serde_json::json!({"major": 12, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 14, "minor": 0, "patch": 0})
     );
 
     let create = Command::new(env!("CARGO_BIN_EXE_eliot"))
@@ -995,7 +993,7 @@ fn installation_plan_reports_missing_v9_discriminator_as_migration() {
     assert!(
         output["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("required v9 discriminator"))
+            .is_some_and(|detail| detail.contains("discriminator"))
     );
 }
 

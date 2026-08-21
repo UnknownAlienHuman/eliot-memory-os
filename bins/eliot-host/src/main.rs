@@ -3,7 +3,10 @@ use std::sync::OnceLock;
 
 #[cfg(windows)]
 use eliot_host::{HostBranchDisposition, HostLivenessTick};
-use eliot_host::{HostComposition, HostError, HostLaunchOptions, PROTOCOL_VERSION, SERVICE_NAME};
+use eliot_host::{
+    HostComposition, HostError, HostLaunchOptions, HostPhaseBRequestQueue, PROTOCOL_VERSION,
+    SERVICE_NAME,
+};
 use serde::{Deserialize, Serialize};
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<HostLaunchOptions, String>> = OnceLock::new();
@@ -393,7 +396,15 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
         unsafe { SetServiceStatus(handle, &raw const status) };
         return;
     }
-    let Ok(credential_thread) = spawn_credential_control(&host) else {
+    let Ok(credential_control) = host.credential_control() else {
+        status.dwCurrentState = SERVICE_STOPPED;
+        status.dwWin32ExitCode = 1;
+        let _ = host.stop();
+        unsafe { SetServiceStatus(handle, &raw const status) };
+        return;
+    };
+    let phase_b_queue = credential_control.phase_b_queue();
+    let Ok(credential_thread) = spawn_credential_control(credential_control) else {
         status.dwCurrentState = SERVICE_STOPPED;
         status.dwWin32ExitCode = 1;
         let _ = host.stop();
@@ -406,6 +417,7 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
+        process_phase_b_requests(&mut host, &phase_b_queue);
         match host.has_durable_branch_fence() {
             Ok(true) => {
                 // A degraded branch has fenced the shared authority in the
@@ -500,9 +512,8 @@ unsafe fn service_launch_options(
 
 #[cfg(windows)]
 fn spawn_credential_control(
-    host: &HostComposition,
+    control: eliot_host::HostCredentialControl,
 ) -> Result<std::thread::JoinHandle<()>, HostError> {
-    let control = host.credential_control()?;
     std::thread::Builder::new()
         .name("eliot-host-credential-control".to_owned())
         .spawn(move || {
@@ -525,6 +536,35 @@ fn spawn_credential_control(
             }
         })
         .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
+fn process_phase_b_requests(host: &mut HostComposition, queue: &HostPhaseBRequestQueue) {
+    loop {
+        let request = match queue.lock() {
+            Ok(mut queue) => queue.pop_front(),
+            Err(_) => None,
+        };
+        let Some(request) = request else { break };
+        let eliot_host::HostPhaseBRequest {
+            operation,
+            intent,
+            credential_receipt,
+            reply,
+        } = request;
+        let response = match operation {
+            eliot_installation::HostCredentialControlOperation::MaterializePhaseB => {
+                host.handle_phase_b_request(&intent, &credential_receipt)
+            }
+            eliot_installation::HostCredentialControlOperation::ReconcilePhaseB => {
+                host.reconcile_phase_b_request(&intent, &credential_receipt)
+            }
+            _ => unreachable!("credential control queue admits only Phase-B operations"),
+        };
+        // The sender is one-shot and belongs to the authenticated worker;
+        // dropping it after a failed reply preserves the unknown outcome.
+        let _ = reply.send(response);
+    }
 }
 
 #[cfg(windows)]
