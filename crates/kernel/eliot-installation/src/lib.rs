@@ -4357,6 +4357,7 @@ impl ActivePhaseBRebindRecovery {
                 reason: "must be non-zero".to_owned(),
             });
         }
+        self.validate_direct_child_provenance()?;
         if self.recovery_digest != self.computed_digest()? {
             return Err(InstallationError::IdentityConflict);
         }
@@ -4387,10 +4388,28 @@ impl ActivePhaseBRebindRecovery {
             || self.prior_intent != current.intent
             || self.prior_prepared != *prepared
             || self.prior_receipt != *receipt
-            || self.recovery_host_epoch_sequence <= receipt.host_epoch_sequence
-            || self.recovery_host_owner_epoch == receipt.host_owner_epoch
-            || self.recovery_host_process_identity == receipt.host_process_identity
-            || self.recovery_host_process_nonce_digest == receipt.host_process_nonce_digest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_direct_child_provenance(&self) -> Result<(), InstallationError> {
+        let direct_child_sequence = self
+            .prior_receipt
+            .host_epoch_sequence
+            .checked_add(1)
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "active_phase_b_rebind.recovery.recovery_host_epoch_sequence".to_owned(),
+                reason: "completed Host epoch cannot admit a direct child after sequence overflow"
+                    .to_owned(),
+            })?;
+        if self.recovery_host_epoch_lineage != self.prior_receipt.host_epoch_lineage
+            || self.recovery_host_epoch_sequence != direct_child_sequence
+            || self.recovery_host_owner_epoch == self.prior_receipt.host_owner_epoch
+            || self.recovery_host_process_identity == self.prior_receipt.host_process_identity
+            || self.recovery_host_process_nonce_digest
+                == self.prior_receipt.host_process_nonce_digest
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -4421,6 +4440,8 @@ impl ActivePhaseBRebindRecovery {
             self.prior_receipt_digest.as_str(),
             self.prior_intent.request_digest.as_str(),
             self.prior_prepared.prepared_digest.as_str(),
+            self.prior_receipt.host_epoch_lineage.as_str(),
+            self.prior_receipt.host_epoch_sequence,
             self.recovery_host_owner_epoch.as_str(),
             self.recovery_host_process_identity.as_str(),
             self.recovery_host_process_nonce_digest.as_str(),
@@ -24588,7 +24609,7 @@ mod tests {
         fresh_intent.host_owner_epoch = test_handle("host-owner:reset-2");
         fresh_intent.host_process_identity = test_handle("b".repeat(64));
         fresh_intent.host_process_nonce_digest = test_handle("c".repeat(64));
-        fresh_intent.host_epoch_lineage = test_handle("host-lineage:reset-2");
+        fresh_intent.host_epoch_lineage = intent.host_epoch_lineage.clone();
         fresh_intent.request_digest = must(active_phase_b_rebind_intent_digest(&fresh_intent));
         assert!(matches!(
             registry.record_active_phase_b_rebind_intent(
@@ -24614,9 +24635,77 @@ mod tests {
             test_handle("host-owner:reset-2"),
             test_handle("b".repeat(64)),
             test_handle("c".repeat(64)),
-            test_handle("host-lineage:reset-2"),
+            intent.host_epoch_lineage.clone(),
             3,
         ));
+        let reject_substitution = |mut candidate: ActivePhaseBRebindRecovery| {
+            candidate.recovery_digest = must(candidate.computed_digest());
+            assert!(matches!(
+                candidate.validate_against(&completed),
+                Err(InstallationError::IdentityConflict)
+            ));
+        };
+
+        let mut different_lineage = recovery.clone();
+        different_lineage.recovery_host_epoch_lineage =
+            test_handle("host-lineage:not-a-direct-child");
+        reject_substitution(different_lineage);
+
+        let mut skipped_sequence = recovery.clone();
+        skipped_sequence.recovery_host_epoch_sequence = 4;
+        reject_substitution(skipped_sequence);
+
+        let mut same_sequence = recovery.clone();
+        same_sequence.recovery_host_epoch_sequence = receipt.host_epoch_sequence;
+        reject_substitution(same_sequence);
+
+        let mut reused_owner = recovery.clone();
+        reused_owner.recovery_host_owner_epoch = receipt.host_owner_epoch.clone();
+        reject_substitution(reused_owner);
+
+        let mut reused_process = recovery.clone();
+        reused_process.recovery_host_process_identity = receipt.host_process_identity.clone();
+        reject_substitution(reused_process);
+
+        let mut reused_nonce = recovery.clone();
+        reused_nonce.recovery_host_process_nonce_digest = receipt.host_process_nonce_digest.clone();
+        reject_substitution(reused_nonce);
+
+        let mut overflow = completed.clone();
+        overflow.intent.host_epoch_sequence = u64::MAX;
+        overflow.intent.request_digest =
+            must(active_phase_b_rebind_intent_digest(&overflow.intent));
+        let overflow_prepared = overflow.prepared.as_mut().unwrap_or_else(|| unreachable!());
+        overflow_prepared.host_epoch_sequence = u64::MAX;
+        overflow_prepared.request_digest = overflow.intent.request_digest.clone();
+        overflow_prepared.prepared_digest = must(overflow_prepared.computed_digest());
+        overflow.receipt = Some(must(ActivePhaseBRebindReceipt::from_prepared(
+            &overflow.intent,
+            overflow_prepared,
+        )));
+        assert!(matches!(
+            ActivePhaseBRebindRecovery::new(
+                &overflow,
+                test_handle("host-owner:overflow-child"),
+                test_handle("d".repeat(64)),
+                test_handle("e".repeat(64)),
+                intent.host_epoch_lineage.clone(),
+                1,
+            ),
+            Err(InstallationError::InvalidField { field, .. })
+                if field == "active_phase_b_rebind.recovery.recovery_host_epoch_sequence"
+        ));
+
+        let stale_revision = must(registry.load()).revision().saturating_sub(1);
+        assert!(matches!(
+            registry.record_active_phase_b_rebind_recovery(&host, stale_revision, &recovery),
+            Err(InstallationError::CompareAndSaveConflict { .. })
+        ));
+        assert!(
+            must(registry.load())
+                .active_phase_b_rebind()
+                .is_some_and(|current| current.recovery_history.is_empty())
+        );
         must(registry.record_active_phase_b_rebind_recovery(
             &host,
             must(registry.load()).revision(),
