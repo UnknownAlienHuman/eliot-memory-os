@@ -2393,6 +2393,51 @@ pub struct FileIdentity {
     pub file_index: u64,
 }
 
+/// Returns the stable identity of one existing regular file without following
+/// a reparse point.
+///
+/// The helper is intentionally narrow: it does not infer a source root,
+/// canonicalize caller input, or replace the retained source-bundle contour.
+/// It exists for producers that must bind a validated release artifact to the
+/// exact file object before immutable publication.
+///
+/// # Errors
+///
+/// Returns [`ProtectedPathError::InvalidPath`] for a relative path,
+/// [`ProtectedPathError::ReparsePoint`] for a non-file or reparse-point
+/// target, [`ProtectedPathError::Io`] when the file cannot be opened or its
+/// identity cannot be read, and [`ProtectedPathError::UnsupportedPlatform`]
+/// on non-Windows targets.
+pub fn file_identity_for_path(path: &Path) -> Result<FileIdentity, ProtectedPathError> {
+    if !path.is_absolute() {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| ProtectedPathError::Io)?;
+        let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ProtectedPathError::ReparsePoint);
+        }
+        file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(ProtectedPathError::UnsupportedPlatform)
+    }
+}
+
 /// Result of publishing bytes through the Windows atomic replacement path.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2416,6 +2461,212 @@ pub enum PublicationUnknown {
 pub enum PublicationOutcome {
     Published(PublicationReceipt),
     Unknown(PublicationUnknown),
+}
+
+/// Failure before a create-new directory publication can commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryPublicationError {
+    /// A caller path is relative, traversing, non-canonical or not an owned
+    /// same-parent temporary name.
+    InvalidPath,
+    /// An ancestor, parent or source directory is a reparse point.
+    ReparsePoint,
+    /// The destination already exists, including a concurrent create race.
+    AlreadyExists,
+    /// A retained source, parent or destination object changed identity.
+    IdentityMismatch,
+    /// Windows failed before the move committed.
+    Io,
+    /// The primitive is intentionally unavailable off Windows.
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for DirectoryPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidPath => "directory publication path is invalid",
+            Self::ReparsePoint => "directory publication contour contains a reparse point",
+            Self::AlreadyExists => "directory publication destination already exists",
+            Self::IdentityMismatch => "directory publication identity changed",
+            Self::Io => "directory publication I/O failed before commit",
+            Self::UnsupportedPlatform => "directory publication requires Windows",
+        })
+    }
+}
+
+impl std::error::Error for DirectoryPublicationError {}
+
+/// Exact identity receipt after a create-new directory move is read back.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryPublicationReceipt {
+    /// Caller-declared final path, validated against retained handles.
+    pub destination_path: String,
+    /// Canonical retained parent path used by the move.
+    pub canonical_parent_path: String,
+    /// Identity of the retained destination parent.
+    pub parent_identity: FileIdentity,
+    /// Identity of the owned temporary directory before the move.
+    pub source_identity: FileIdentity,
+    /// Identity of the destination directory after the move.
+    pub destination_identity: FileIdentity,
+}
+
+/// Why a committed directory move could not be promoted to a receipt.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DirectoryPublicationUnknown {
+    /// Test or provider discrimination made the post-commit read unavailable.
+    PostCommitReadbackUnavailable,
+    /// The retained moved handle no longer named the expected destination.
+    PostCommitPathChanged,
+    /// The moved or reopened destination identity could not be measured.
+    PostCommitIdentityUnavailable,
+    /// The moved or reopened destination was not the exact source object.
+    PostCommitIdentityChanged,
+}
+
+/// Durable facts retained when the move committed but readback is uncertain.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryPublicationUnknownReceipt {
+    /// Exact reason receipt promotion was withheld.
+    pub reason: DirectoryPublicationUnknown,
+    /// Caller-declared final path of the committed move.
+    pub destination_path: String,
+    /// Canonical retained parent path used by the move.
+    pub canonical_parent_path: String,
+    /// Identity of the retained destination parent.
+    pub parent_identity: FileIdentity,
+    /// Exact identity of the owned temporary directory passed to the move.
+    pub source_identity: FileIdentity,
+}
+
+/// Create-new directory publication result. A successful OS move never
+/// becomes `Err`: post-commit ambiguity is returned with reconcilable facts.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum DirectoryPublicationOutcome {
+    /// Destination path and directory identity were read back exactly.
+    Published(DirectoryPublicationReceipt),
+    /// The move committed, but receipt promotion requires reconciliation.
+    CommittedUnknown(DirectoryPublicationUnknownReceipt),
+}
+
+/// Prepared process-owned create-new directory publication.
+///
+/// Construction retains the complete destination-parent contour through
+/// no-follow, no-delete-sharing handles *before* it creates the same-parent
+/// temporary directory. The contour remains live while the caller fills and
+/// reads back the temporary tree, and until publication or rollback finishes.
+pub struct OwnedDirectoryPublication {
+    temporary: PathBuf,
+    destination: PathBuf,
+    initial_temporary_identity: FileIdentity,
+    #[cfg(windows)]
+    contour: DirectoryPublicationContour,
+    committed: bool,
+}
+
+impl std::fmt::Debug for OwnedDirectoryPublication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedDirectoryPublication")
+            .field("temporary", &self.temporary)
+            .field("destination", &self.destination)
+            .field(
+                "initial_temporary_identity",
+                &self.initial_temporary_identity,
+            )
+            .field("committed", &self.committed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OwnedDirectoryPublication {
+    /// Retain the exact destination contour and create one absent owned
+    /// same-parent temporary directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for invalid or reparse paths, an existing final
+    /// destination, identity substitution, provider I/O failure, or a
+    /// non-Windows platform.
+    pub fn create(destination: &Path) -> Result<Self, DirectoryPublicationError> {
+        #[cfg(windows)]
+        {
+            prepare_owned_directory_publication(destination)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = destination;
+            Err(DirectoryPublicationError::UnsupportedPlatform)
+        }
+    }
+
+    /// Exact absolute temporary directory held below the retained parent.
+    #[must_use]
+    pub fn temporary_path(&self) -> &Path {
+        &self.temporary
+    }
+
+    /// Identity captured immediately after create-new temporary allocation.
+    #[must_use]
+    pub const fn temporary_identity(&self) -> FileIdentity {
+        self.initial_temporary_identity
+    }
+
+    /// Atomically move the completely materialized temporary directory to the
+    /// absent destination with write-through and no replacement semantics.
+    ///
+    /// The supplied identity must be independently measured by the caller's
+    /// complete pre-commit readback. A successful Windows move is never
+    /// reported as `Err`; uncertain post-commit readback returns a typed
+    /// reconcilable outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns only pre-commit path, destination-race, identity or I/O errors.
+    pub fn publish(
+        mut self,
+        precommit_temporary_identity: FileIdentity,
+    ) -> Result<DirectoryPublicationOutcome, DirectoryPublicationError> {
+        #[cfg(windows)]
+        {
+            self.publish_inner(precommit_temporary_identity, || {}, None)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = precommit_temporary_identity;
+            Err(DirectoryPublicationError::UnsupportedPlatform)
+        }
+    }
+}
+
+impl Drop for OwnedDirectoryPublication {
+    fn drop(&mut self) {
+        if self.committed || !self.temporary.is_absolute() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let Ok(temporary) = open_publication_directory(&self.temporary, false) else {
+                return;
+            };
+            let Ok(path) = final_windows_path_from_handle(&temporary) else {
+                return;
+            };
+            let Ok(identity) = file_identity_from_handle(&temporary) else {
+                return;
+            };
+            if !windows_paths_equal(&path, &self.temporary)
+                || identity != self.initial_temporary_identity
+            {
+                return;
+            }
+            drop(temporary);
+            let _ = std::fs::remove_dir_all(&self.temporary);
+        }
+    }
 }
 
 /// Handle-bound identity of a live Windows process.
@@ -9071,6 +9322,461 @@ fn create_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+struct DirectoryPublicationContour {
+    entries: Vec<(PathBuf, FileIdentity, std::fs::File)>,
+    canonical_parent: PathBuf,
+    parent_identity: FileIdentity,
+}
+
+#[cfg(windows)]
+fn validate_directory_publication_absolute(path: &Path) -> Result<(), DirectoryPublicationError> {
+    if !path.is_absolute() {
+        return Err(DirectoryPublicationError::InvalidPath);
+    }
+    let raw = path
+        .to_str()
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("\\\\?\\")
+        || lower.starts_with("\\\\.\\")
+        || lower.starts_with("\\??\\")
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(DirectoryPublicationError::InvalidPath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn publication_path_text(path: &Path) -> Result<String, DirectoryPublicationError> {
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .ok_or(DirectoryPublicationError::InvalidPath)
+}
+
+#[cfg(windows)]
+fn validate_owned_temporary_name(
+    temporary: &Path,
+    destination: &Path,
+) -> Result<(), DirectoryPublicationError> {
+    validate_directory_publication_absolute(temporary)?;
+    validate_directory_publication_absolute(destination)?;
+    let temporary_parent = temporary
+        .parent()
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    let destination_parent = destination
+        .parent()
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    if !windows_paths_equal(temporary_parent, destination_parent) {
+        return Err(DirectoryPublicationError::InvalidPath);
+    }
+    let destination_name = destination
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    let temporary_name = temporary
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    validate_package_relative_path(Path::new(destination_name))
+        .map_err(|_| DirectoryPublicationError::InvalidPath)?;
+    validate_package_relative_path(Path::new(temporary_name))
+        .map_err(|_| DirectoryPublicationError::InvalidPath)?;
+    let prefix = format!(".{destination_name}.tmp.{}.", std::process::id());
+    let Some(index) = temporary_name.strip_prefix(&prefix) else {
+        return Err(DirectoryPublicationError::InvalidPath);
+    };
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(DirectoryPublicationError::InvalidPath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_publication_directory(
+    path: &Path,
+    share_delete: bool,
+) -> Result<std::fs::File, DirectoryPublicationError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let share_mode =
+        FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_GENERIC_READ)
+        .share_mode(share_mode)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            DirectoryPublicationError::InvalidPath
+        } else {
+            DirectoryPublicationError::Io
+        }
+    })?;
+    let metadata = file.metadata().map_err(|_| DirectoryPublicationError::Io)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(DirectoryPublicationError::ReparsePoint);
+    }
+    if !metadata.is_dir() {
+        return Err(DirectoryPublicationError::InvalidPath);
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_movable_publication_directory(
+    path: &Path,
+) -> Result<std::fs::File, DirectoryPublicationError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options
+        .open(path)
+        .map_err(|_| DirectoryPublicationError::Io)?;
+    let metadata = file.metadata().map_err(|_| DirectoryPublicationError::Io)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(DirectoryPublicationError::ReparsePoint);
+    }
+    if !metadata.is_dir() {
+        return Err(DirectoryPublicationError::InvalidPath);
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn retain_directory_publication_contour(
+    parent: &Path,
+) -> Result<DirectoryPublicationContour, DirectoryPublicationError> {
+    let mut ancestors = parent
+        .ancestors()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+    if ancestors.is_empty() {
+        return Err(DirectoryPublicationError::InvalidPath);
+    }
+    let mut entries = Vec::with_capacity(ancestors.len());
+    for expected_path in ancestors {
+        let handle = open_publication_directory(&expected_path, false)?;
+        let observed_path =
+            final_windows_path_from_handle(&handle).map_err(|_| DirectoryPublicationError::Io)?;
+        if !windows_paths_equal(&observed_path, &expected_path) {
+            return Err(DirectoryPublicationError::IdentityMismatch);
+        }
+        let identity =
+            file_identity_from_handle(&handle).map_err(|_| DirectoryPublicationError::Io)?;
+        if identity.volume_serial_number == 0 || identity.file_index == 0 {
+            return Err(DirectoryPublicationError::IdentityMismatch);
+        }
+        entries.push((observed_path, identity, handle));
+    }
+    let (canonical_parent, parent_identity, _) = entries
+        .last()
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    Ok(DirectoryPublicationContour {
+        canonical_parent: canonical_parent.clone(),
+        parent_identity: *parent_identity,
+        entries,
+    })
+}
+
+#[cfg(windows)]
+fn verify_directory_publication_contour(
+    contour: &DirectoryPublicationContour,
+) -> Result<(), DirectoryPublicationError> {
+    for (expected_path, expected_identity, handle) in &contour.entries {
+        let observed_path =
+            final_windows_path_from_handle(handle).map_err(|_| DirectoryPublicationError::Io)?;
+        let observed_identity =
+            file_identity_from_handle(handle).map_err(|_| DirectoryPublicationError::Io)?;
+        if !windows_paths_equal(&observed_path, expected_path)
+            || observed_identity != *expected_identity
+        {
+            return Err(DirectoryPublicationError::IdentityMismatch);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn require_directory_publication_absent(
+    destination: &Path,
+) -> Result<(), DirectoryPublicationError> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) => Err(DirectoryPublicationError::AlreadyExists),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(DirectoryPublicationError::Io),
+    }
+}
+
+#[cfg(windows)]
+fn move_directory_create_new_durable(
+    temporary: &Path,
+    destination: &Path,
+) -> Result<(), DirectoryPublicationError> {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    let temporary_wide = wide(temporary);
+    let destination_wide = wide(destination);
+    let moved = unsafe {
+        // SAFETY: both path buffers are NUL-terminated and live for the call.
+        // Omitting MOVEFILE_REPLACE_EXISTING is the atomic fail-if-exists
+        // contract; WRITE_THROUGH makes the metadata move durable before
+        // success is returned.
+        MoveFileExW(
+            temporary_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved != 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_ALREADY_EXISTS.cast_signed()
+                || code == ERROR_FILE_EXISTS.cast_signed()
+    ) || std::fs::symlink_metadata(destination).is_ok()
+    {
+        return Err(DirectoryPublicationError::AlreadyExists);
+    }
+    Err(DirectoryPublicationError::Io)
+}
+
+#[cfg(windows)]
+fn prepare_owned_directory_publication(
+    destination: &Path,
+) -> Result<OwnedDirectoryPublication, DirectoryPublicationError> {
+    validate_directory_publication_absolute(destination)?;
+    let destination_name = destination
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    validate_package_relative_path(Path::new(destination_name))
+        .map_err(|_| DirectoryPublicationError::InvalidPath)?;
+    let parent = destination
+        .parent()
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    let contour = retain_directory_publication_contour(parent)?;
+    verify_directory_publication_contour(&contour)?;
+    let canonical_destination = contour.canonical_parent.join(destination_name);
+    require_directory_publication_absent(&canonical_destination)?;
+
+    for index in 0_u32..64 {
+        let temporary = contour.canonical_parent.join(format!(
+            ".{destination_name}.tmp.{}.{}",
+            std::process::id(),
+            index
+        ));
+        match std::fs::create_dir(&temporary) {
+            Ok(()) => {
+                let prepared = (|| {
+                    validate_owned_temporary_name(&temporary, &canonical_destination)?;
+                    verify_directory_publication_contour(&contour)?;
+                    require_directory_publication_absent(&canonical_destination)?;
+                    let source = open_publication_directory(&temporary, false)?;
+                    let source_path = final_windows_path_from_handle(&source)
+                        .map_err(|_| DirectoryPublicationError::Io)?;
+                    let source_identity = file_identity_from_handle(&source)
+                        .map_err(|_| DirectoryPublicationError::Io)?;
+                    if !windows_paths_equal(&source_path, &temporary)
+                        || source_identity.volume_serial_number == 0
+                        || source_identity.file_index == 0
+                    {
+                        return Err(DirectoryPublicationError::IdentityMismatch);
+                    }
+                    Ok(OwnedDirectoryPublication {
+                        temporary: source_path,
+                        destination: canonical_destination.clone(),
+                        initial_temporary_identity: source_identity,
+                        contour,
+                        committed: false,
+                    })
+                })();
+                if prepared.is_err() {
+                    let _ = std::fs::remove_dir_all(&temporary);
+                }
+                return prepared;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(DirectoryPublicationError::Io),
+        }
+    }
+    Err(DirectoryPublicationError::Io)
+}
+
+#[cfg(windows)]
+impl OwnedDirectoryPublication {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the commit boundary and every post-commit no-overclaim discriminator stay in one auditable sequence"
+    )]
+    fn publish_inner<BeforeMove>(
+        &mut self,
+        precommit_temporary_identity: FileIdentity,
+        before_move: BeforeMove,
+        injected_postcommit_unknown: Option<DirectoryPublicationUnknown>,
+    ) -> Result<DirectoryPublicationOutcome, DirectoryPublicationError>
+    where
+        BeforeMove: FnOnce(),
+    {
+        validate_owned_temporary_name(&self.temporary, &self.destination)?;
+        if precommit_temporary_identity != self.initial_temporary_identity
+            || precommit_temporary_identity.volume_serial_number == 0
+            || precommit_temporary_identity.file_index == 0
+        {
+            return Err(DirectoryPublicationError::IdentityMismatch);
+        }
+        verify_directory_publication_contour(&self.contour)?;
+        let canonical_parent_path = publication_path_text(&self.contour.canonical_parent)?;
+        let destination_path = publication_path_text(&self.destination)?;
+        let source = open_movable_publication_directory(&self.temporary)?;
+        let source_path =
+            final_windows_path_from_handle(&source).map_err(|_| DirectoryPublicationError::Io)?;
+        let source_identity =
+            file_identity_from_handle(&source).map_err(|_| DirectoryPublicationError::Io)?;
+        if !windows_paths_equal(&source_path, &self.temporary)
+            || source_identity != precommit_temporary_identity
+        {
+            return Err(DirectoryPublicationError::IdentityMismatch);
+        }
+        require_directory_publication_absent(&self.destination)?;
+        verify_directory_publication_contour(&self.contour)?;
+        let source_path =
+            final_windows_path_from_handle(&source).map_err(|_| DirectoryPublicationError::Io)?;
+        let source_identity =
+            file_identity_from_handle(&source).map_err(|_| DirectoryPublicationError::Io)?;
+        if !windows_paths_equal(&source_path, &self.temporary)
+            || source_identity != precommit_temporary_identity
+        {
+            return Err(DirectoryPublicationError::IdentityMismatch);
+        }
+        before_move();
+        move_directory_create_new_durable(&self.temporary, &self.destination)?;
+        self.committed = true;
+
+        let unknown = |reason| {
+            DirectoryPublicationOutcome::CommittedUnknown(DirectoryPublicationUnknownReceipt {
+                reason,
+                destination_path: destination_path.clone(),
+                canonical_parent_path: canonical_parent_path.clone(),
+                parent_identity: self.contour.parent_identity,
+                source_identity,
+            })
+        };
+        if let Some(reason) = injected_postcommit_unknown {
+            return Ok(unknown(reason));
+        }
+
+        let Ok(moved_path) = final_windows_path_from_handle(&source) else {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
+            ));
+        };
+        if !windows_paths_equal(&moved_path, &self.destination) {
+            return Ok(unknown(DirectoryPublicationUnknown::PostCommitPathChanged));
+        }
+        let Ok(moved_identity) = file_identity_from_handle(&source) else {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitIdentityUnavailable,
+            ));
+        };
+        if moved_identity != source_identity {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitIdentityChanged,
+            ));
+        }
+        let Ok(observer) = open_publication_directory(&self.destination, true) else {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
+            ));
+        };
+        let Ok(observer_path) = final_windows_path_from_handle(&observer) else {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
+            ));
+        };
+        let Ok(observer_identity) = file_identity_from_handle(&observer) else {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitIdentityUnavailable,
+            ));
+        };
+        if !windows_paths_equal(&observer_path, &self.destination) {
+            return Ok(unknown(DirectoryPublicationUnknown::PostCommitPathChanged));
+        }
+        if observer_identity != source_identity {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitIdentityChanged,
+            ));
+        }
+        drop(source);
+        let Ok(destination_pin) = open_publication_directory(&self.destination, false) else {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
+            ));
+        };
+        let Ok(destination_pinned_path) = final_windows_path_from_handle(&destination_pin) else {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
+            ));
+        };
+        let Ok(destination_identity) = file_identity_from_handle(&destination_pin) else {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitIdentityUnavailable,
+            ));
+        };
+        if !windows_paths_equal(&destination_pinned_path, &self.destination) {
+            return Ok(unknown(DirectoryPublicationUnknown::PostCommitPathChanged));
+        }
+        if destination_identity != source_identity || destination_identity != observer_identity {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitIdentityChanged,
+            ));
+        }
+        if verify_directory_publication_contour(&self.contour).is_err() {
+            return Ok(unknown(
+                DirectoryPublicationUnknown::PostCommitIdentityChanged,
+            ));
+        }
+        if let Some((_, _, parent)) = self.contour.entries.last() {
+            // MoveFileExW WRITE_THROUGH is the durable commit boundary. Some
+            // Windows filesystems reject directory FlushFileBuffers, so this
+            // is best-effort reinforcement, not a second fallible commit.
+            let _ = parent.sync_all();
+        }
+        Ok(DirectoryPublicationOutcome::Published(
+            DirectoryPublicationReceipt {
+                destination_path,
+                canonical_parent_path,
+                parent_identity: self.contour.parent_identity,
+                source_identity,
+                destination_identity,
+            },
+        ))
+    }
+}
+
+#[cfg(windows)]
 fn pin_directory(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -14130,6 +14836,131 @@ mod tests {
         assert_eq!(
             entries, 1,
             "failed publications must not leave staging files"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_publication_concurrent_destination_race_never_replaces() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-directory-publication-race-{}",
+            unique_suffix()
+        ));
+        std::fs::create_dir(&root).unwrap_or_else(|error| panic!("create fixture: {error}"));
+        let destination = root.join("bundle");
+        let mut publication = OwnedDirectoryPublication::create(&destination)
+            .unwrap_or_else(|error| panic!("prepare publication: {error}"));
+        let temporary = publication.temporary_path().to_path_buf();
+        std::fs::write(temporary.join("role.bin"), b"candidate")
+            .unwrap_or_else(|error| panic!("write candidate: {error}"));
+        let identity = publication.temporary_identity();
+        let racing_destination = destination.clone();
+        let outcome = publication.publish_inner(
+            identity,
+            move || {
+                std::thread::spawn(move || {
+                    std::fs::create_dir(&racing_destination)
+                        .unwrap_or_else(|error| panic!("racing create: {error}"));
+                    std::fs::write(racing_destination.join("owner.txt"), b"concurrent-owner")
+                        .unwrap_or_else(|error| panic!("racing marker: {error}"));
+                })
+                .join()
+                .unwrap_or_else(|_| panic!("racing creator panicked"));
+            },
+            None,
+        );
+        assert_eq!(outcome, Err(DirectoryPublicationError::AlreadyExists));
+        assert_eq!(
+            std::fs::read(destination.join("owner.txt"))
+                .unwrap_or_else(|error| panic!("read racing marker: {error}")),
+            b"concurrent-owner"
+        );
+        assert!(temporary.exists(), "pre-commit failure retains owned temp");
+        drop(publication);
+        assert!(!temporary.exists(), "owned temp is rolled back exactly");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_publication_pins_ancestor_and_rejects_junction_substitution() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-directory-publication-contour-{}",
+            unique_suffix()
+        ));
+        let parent = root.join("parent");
+        let moved_parent = root.join("parent-moved");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&parent)
+            .unwrap_or_else(|error| panic!("create retained parent: {error}"));
+        std::fs::create_dir(&outside)
+            .unwrap_or_else(|error| panic!("create junction target: {error}"));
+        let publication = OwnedDirectoryPublication::create(&parent.join("bundle"))
+            .unwrap_or_else(|error| panic!("prepare retained publication: {error}"));
+        assert!(
+            std::fs::rename(&parent, &moved_parent).is_err(),
+            "retained no-delete-sharing contour must block ancestor rename"
+        );
+        drop(publication);
+        std::fs::rename(&parent, &moved_parent)
+            .unwrap_or_else(|error| panic!("rename after lease drop: {error}"));
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&parent)
+            .arg(&outside)
+            .output()
+            .unwrap_or_else(|error| panic!("launch mklink: {error}"));
+        assert!(
+            output.status.success(),
+            "mklink /J was not exercised: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(matches!(
+            OwnedDirectoryPublication::create(&parent.join("bundle")),
+            Err(DirectoryPublicationError::ReparsePoint)
+        ));
+        assert!(!outside.join("bundle").exists());
+        std::fs::remove_dir(&parent).unwrap_or_else(|error| panic!("remove junction: {error}"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_publication_postcommit_failure_is_reconcilable_not_error() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-directory-publication-unknown-{}",
+            unique_suffix()
+        ));
+        std::fs::create_dir(&root).unwrap_or_else(|error| panic!("create fixture: {error}"));
+        let destination = root.join("bundle");
+        let mut publication = OwnedDirectoryPublication::create(&destination)
+            .unwrap_or_else(|error| panic!("prepare publication: {error}"));
+        let temporary = publication.temporary_path().to_path_buf();
+        std::fs::write(temporary.join("role.bin"), b"candidate")
+            .unwrap_or_else(|error| panic!("write candidate: {error}"));
+        let identity = publication.temporary_identity();
+        let outcome = publication
+            .publish_inner(
+                identity,
+                || {},
+                Some(DirectoryPublicationUnknown::PostCommitReadbackUnavailable),
+            )
+            .unwrap_or_else(|error| panic!("post-commit outcome returned Err: {error}"));
+        let DirectoryPublicationOutcome::CommittedUnknown(receipt) = outcome else {
+            panic!("injected post-commit discriminator must withhold receipt");
+        };
+        assert_eq!(
+            receipt.reason,
+            DirectoryPublicationUnknown::PostCommitReadbackUnavailable
+        );
+        assert_eq!(receipt.source_identity, identity);
+        assert!(destination.exists());
+        assert!(!temporary.exists());
+        assert_eq!(
+            std::fs::read(destination.join("role.bin"))
+                .unwrap_or_else(|error| panic!("read committed role: {error}")),
+            b"candidate"
         );
         let _ = std::fs::remove_dir_all(root);
     }

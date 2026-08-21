@@ -560,16 +560,23 @@ dependencies = [
  "clap",
  "eliot-bootstrap",
  "eliot-cli",
+ "eliot-governor",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-kernel-service",
  "eliot-ors",
  "eliot-platform-windows",
  "eliot-protocol",
  "eliot-runtime-status",
+ "eliot-store-surreal",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]

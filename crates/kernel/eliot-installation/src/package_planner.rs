@@ -78,6 +78,28 @@ fn hex_digest(bytes: &[u8]) -> String {
 const CANARY_ARTIFACT_SET_EVIDENCE_DOMAIN: &[u8] =
     b"eliot.runtime-live.canary-artifact-set-evidence.v1";
 
+/// The immutable Phase-A facts used only to derive the typed launch-template
+/// nonce and Store credential target.
+///
+/// `generation.json` contains the resulting `RuntimeLaunchDescriptor`, while
+/// `eliotd.json` contains the same launch nonce.  Including either file in the
+/// derivation input would create a cryptographic self-reference.  The complete
+/// nine-role artifact evidence remains separate and continues to bind both
+/// files byte-for-byte.
+// This is a package-planner derivation domain, not a registry wire revision:
+// RegistryWireV10 decoding and its explicit active-Phase-B migration rules
+// remain unchanged by this non-recursive template split.
+const PHASE_A_TEMPLATE_CONTENT_DOMAIN: &[u8] = b"eliot.runtime-live.phase-a-template-content.v1";
+const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 7] = [
+    ("eliot-host.exe", true),
+    ("eliot-watchdog.exe", true),
+    ("eliot-kernel.exe", true),
+    ("eliot-store-surreal.exe", true),
+    ("surreal.exe", true),
+    ("eliotd.exe", true),
+    ("eliotd-governor.json", false),
+];
+
 fn append_evidence_text(bytes: &mut Vec<u8>, value: &str) {
     bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
     bytes.extend_from_slice(value.as_bytes());
@@ -172,6 +194,65 @@ pub(crate) fn artifact_set_evidence_digest(
     }
     PlatformHandle::new(hex_digest(&bytes)).map_err(|error| InstallationError::InvalidField {
         field: "generation.signature_ref".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+/// Derive the non-recursive Phase-A content digest used only for launch
+/// template derivation.
+///
+/// The input is the typed seven-role expected fact set.  The helper validates
+/// that exact set and hashes it in the fixed order above.  `generation.json`
+/// and `eliotd.json` remain fully bound by [`artifact_set_evidence_digest`],
+/// the candidate manifest and the staging receipt; they are excluded here
+/// solely because both contain the derived launch nonce.
+pub fn phase_a_template_content_digest(
+    expected: &[PackageArtifactDigest],
+) -> Result<PlatformHandle, InstallationError> {
+    if expected.len() != PHASE_A_TEMPLATE_ROLES.len() {
+        return Err(InstallationError::IncompleteObservation(
+            "Phase-A template facts require exactly seven immutable roles".to_owned(),
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for item in expected {
+        let path = validate_package_relative_path(Path::new(&item.relative_path))
+            .map_err(|error| package_plan_error(&error))?;
+        if path.as_str() != item.relative_path || !names.insert(item.relative_path.clone()) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        crate::sha256_handle(&item.sha256, "Phase-A template fact digest")?;
+        if item.expected_size == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "Phase-A template fact size".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+    }
+    let expected_names = PHASE_A_TEMPLATE_ROLES
+        .iter()
+        .map(|(name, _)| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    if names != expected_names {
+        return Err(InstallationError::IdentityConflict);
+    }
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PHASE_A_TEMPLATE_CONTENT_DOMAIN);
+    bytes.push(0);
+    bytes.extend_from_slice(&(PHASE_A_TEMPLATE_ROLES.len() as u64).to_le_bytes());
+    for (role, executable) in PHASE_A_TEMPLATE_ROLES {
+        let item = expected
+            .iter()
+            .find(|item| item.relative_path == role)
+            .ok_or(InstallationError::IdentityConflict)?;
+        append_evidence_text(&mut bytes, role);
+        bytes.push(u8::from(executable));
+        bytes.extend_from_slice(&item.expected_size.to_le_bytes());
+        append_evidence_text(&mut bytes, item.sha256.as_str());
+    }
+    PlatformHandle::new(hex_digest(&bytes)).map_err(|error| InstallationError::InvalidField {
+        field: "generation.phase_a_template_content_digest".to_owned(),
         reason: error.to_string(),
     })
 }
@@ -648,6 +729,28 @@ pub struct GenerationPackagePlanInput {
 pub struct GenerationPackagePlanner;
 
 impl GenerationPackagePlanner {
+    /// Computes the canonical full nine-role artifact evidence reference.
+    ///
+    /// This associated wrapper is the single public entry point for producers
+    /// that materialize the retained source bundle before invoking [`Self::plan`].
+    pub fn artifact_set_evidence_digest(
+        manifest: &PackageManifest,
+        expected: &[PackageArtifactDigest],
+    ) -> Result<PlatformHandle, InstallationError> {
+        artifact_set_evidence_digest(manifest, expected)
+    }
+
+    /// Computes the canonical non-recursive Phase-A template derivation input.
+    ///
+    /// This is intentionally separate from the full artifact evidence
+    /// reference: it exists only to let a typed source-bundle producer derive
+    /// the launch nonce before the two nonce-bearing JSON roles are serialized.
+    pub fn phase_a_template_content_digest(
+        expected: &[PackageArtifactDigest],
+    ) -> Result<PlatformHandle, InstallationError> {
+        phase_a_template_content_digest(expected)
+    }
+
     /// Derive the complete candidate/package/effect graph and create one
     /// immutable `PLANNED` transaction.
     ///
@@ -806,6 +909,18 @@ impl GenerationPackagePlanner {
                 }
             })?,
         );
+        let phase_a_template_facts = PHASE_A_TEMPLATE_ROLES
+            .iter()
+            .map(|(role, _)| {
+                expected_file_digests
+                    .iter()
+                    .find(|item| item.relative_path == *role)
+                    .cloned()
+                    .ok_or(InstallationError::IdentityConflict)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let phase_a_template_content_digest =
+            Self::phase_a_template_content_digest(&phase_a_template_facts)?;
         // Phase A carries only a valid descriptor template fence. It is not a
         // live authority and is deliberately independent of the installer
         // sequence. Host replaces the fence after opening a real
@@ -826,7 +941,7 @@ impl GenerationPackagePlanner {
             input.transaction_id,
             input.installation_epoch.installation,
             input.generation,
-            phase_a_content_digest,
+            phase_a_template_content_digest,
         );
         let eliotd_launch_nonce =
             PlatformHandle::new(format!("eliotd:{}", hex_digest(nonce_seed.as_bytes()))).map_err(
@@ -838,7 +953,9 @@ impl GenerationPackagePlanner {
         let credential_token = hex_digest(
             format!(
                 "eliot-store-credential:phase-a-template:{}:{}:{}",
-                input.installation_epoch.installation, input.generation, phase_a_content_digest
+                input.installation_epoch.installation,
+                input.generation,
+                phase_a_template_content_digest
             )
             .as_bytes(),
         );
@@ -2256,6 +2373,93 @@ mod tests {
         artifact_set_evidence_digest(manifest, &expected).unwrap()
     }
 
+    #[test]
+    fn phase_a_template_digest_requires_exact_typed_seven_role_facts() {
+        let roles = [
+            "eliot-host.exe",
+            "eliot-watchdog.exe",
+            "eliot-kernel.exe",
+            "eliot-store-surreal.exe",
+            "surreal.exe",
+            "eliotd.exe",
+            "eliotd-governor.json",
+        ];
+        let facts = roles
+            .iter()
+            .enumerate()
+            .map(|(index, role)| PackageArtifactDigest {
+                relative_path: (*role).to_owned(),
+                expected_size: (index + 1) as u64,
+                sha256: h(format!("{index:01x}{index:01x}").repeat(32)),
+            })
+            .collect::<Vec<_>>();
+        let digest = GenerationPackagePlanner::phase_a_template_content_digest(&facts)
+            .expect("exact seven typed template facts must be accepted");
+        let mut reordered = facts.clone();
+        reordered.swap(0, 6);
+        assert_eq!(
+            digest,
+            GenerationPackagePlanner::phase_a_template_content_digest(&reordered)
+                .expect("fact order is canonicalized by role"),
+            "template digest must use the fixed role order"
+        );
+
+        let mut missing = facts.clone();
+        missing.pop();
+        assert!(
+            GenerationPackagePlanner::phase_a_template_content_digest(&missing).is_err(),
+            "missing template role must be rejected"
+        );
+        let mut extra = facts.clone();
+        extra.push(PackageArtifactDigest {
+            relative_path: "authority.json".to_owned(),
+            expected_size: 1,
+            sha256: h("a".repeat(64)),
+        });
+        assert!(
+            GenerationPackagePlanner::phase_a_template_content_digest(&extra).is_err(),
+            "Phase-B role must not enter template derivation"
+        );
+        let mut duplicate = facts;
+        duplicate[0].relative_path = duplicate[1].relative_path.clone();
+        assert!(
+            GenerationPackagePlanner::phase_a_template_content_digest(&duplicate).is_err(),
+            "duplicate role must be rejected"
+        );
+    }
+
+    #[test]
+    fn phase_a_template_digest_changes_for_every_immutable_template_fact() {
+        let roles = [
+            "eliot-host.exe",
+            "eliot-watchdog.exe",
+            "eliot-kernel.exe",
+            "eliot-store-surreal.exe",
+            "surreal.exe",
+            "eliotd.exe",
+            "eliotd-governor.json",
+        ];
+        let facts = roles
+            .iter()
+            .map(|role| PackageArtifactDigest {
+                relative_path: (*role).to_owned(),
+                expected_size: 10,
+                sha256: h("b".repeat(64)),
+            })
+            .collect::<Vec<_>>();
+        let original = GenerationPackagePlanner::phase_a_template_content_digest(&facts).unwrap();
+        for index in 0..facts.len() {
+            let mut changed = facts.clone();
+            changed[index].expected_size += 1;
+            assert_ne!(
+                original,
+                GenerationPackagePlanner::phase_a_template_content_digest(&changed).unwrap(),
+                "immutable role {} must affect template derivation",
+                roles[index]
+            );
+        }
+    }
+
     fn production_input(
         source_root: &std::path::Path,
         portable_root: PlatformHandle,
@@ -2588,6 +2792,60 @@ mod tests {
         assert_eq!(
             first.candidate_manifest.signature_ref, second.candidate_manifest.signature_ref,
             "artifact evidence must exclude volatile source file identity"
+        );
+    }
+
+    #[test]
+    fn launch_template_derivation_excludes_nonce_bearing_json_but_evidence_binds_it() {
+        let (_tmp, portable, _roots) = temp_portable_root();
+        let source_a = tempfile::TempDir::new().unwrap();
+        let source_b = tempfile::TempDir::new().unwrap();
+        populate_source_with_roles(source_a.path());
+        populate_source_with_roles(source_b.path());
+        std::fs::write(
+            source_b.path().join("generation.json"),
+            b"content:generation-mutated",
+        )
+        .unwrap();
+        std::fs::write(
+            source_b.path().join("eliotd.json"),
+            b"content:eliotd-mutated",
+        )
+        .unwrap();
+
+        let first_input = production_input(source_a.path(), portable.clone());
+        let mut second_input = production_input(source_b.path(), portable);
+        // Keep destination paths fixed so this assertion isolates derivation
+        // from the source-bundle location itself.
+        second_input.staging_root = first_input.staging_root.clone();
+        let first =
+            GenerationPackagePlanner::plan(first_input).expect("first trusted source should plan");
+        let second = GenerationPackagePlanner::plan(second_input)
+            .expect("second trusted source should plan");
+
+        assert_eq!(
+            first.candidate_manifest.runtime_launch.eliotd_launch_nonce,
+            second.candidate_manifest.runtime_launch.eliotd_launch_nonce,
+            "nonce derivation must use the fixed immutable template facts"
+        );
+        assert_eq!(
+            first
+                .candidate_manifest
+                .runtime_launch
+                .store_credential_target,
+            second
+                .candidate_manifest
+                .runtime_launch
+                .store_credential_target,
+            "Store credential derivation must use the same non-recursive template"
+        );
+        assert_ne!(
+            first.candidate_manifest.config_digest, second.candidate_manifest.config_digest,
+            "full candidate binding must still include mutated generation.json bytes"
+        );
+        assert_ne!(
+            first.candidate_manifest.signature_ref, second.candidate_manifest.signature_ref,
+            "full nine-role artifact evidence must still include both nonce-bearing JSON roles"
         );
     }
 

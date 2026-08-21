@@ -23,6 +23,8 @@ use std::{
 };
 use tracing_subscriber::EnvFilter;
 
+mod source_bundle_materializer;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INVALID_REQUEST_EXIT: i32 = 2;
 const FRONT_DOOR_CLOSED_EXIT: i32 = 69;
@@ -73,7 +75,7 @@ enum InstallationCommand {
     /// and installation identity. No candidate/package JSON is accepted here.
     #[command(alias = "plan-generation", alias = "generation-plan")]
     Generate {
-        /// Absolute retained source bundle containing the exact eleven-file inventory.
+        /// Absolute retained source bundle containing the exact nine-file Phase-A inventory.
         #[arg(long, value_parser = absolute_path)]
         source_root: PathBuf,
         /// Explicit installation profile (`system_service`, `user_mode`, or `portable_dev`).
@@ -171,6 +173,50 @@ enum InstallationCommand {
         /// Optional transaction identity, accepted only to make the refusal scope explicit.
         #[arg(long)]
         transaction_id: Option<String>,
+    },
+    /// Materialize an exact nine-role Phase-A source bundle and feed it through
+    /// the existing trusted Generate/Plan path.
+    MaterializeSourceBundle {
+        #[arg(long, value_parser = absolute_path)]
+        eliot_host: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_watchdog: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_kernel: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_store_surreal: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        surreal: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliotd: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        output_bundle: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        store: Option<PathBuf>,
+        #[arg(long)]
+        generation: String,
+        #[arg(long)]
+        installation: String,
+        #[arg(long)]
+        lineage_id: String,
+        #[arg(long)]
+        sequence: u64,
+        #[arg(long)]
+        transaction_id: String,
+        #[arg(long, value_parser = absolute_path)]
+        staging_root: PathBuf,
+        #[arg(long)]
+        minimum_store_available_bytes: u64,
+        #[arg(long)]
+        recovery_command: String,
+        #[arg(long, value_parser = parse_installation_profile)]
+        profile: InstallationProfile,
+        #[arg(long, value_parser = absolute_path)]
+        profile_anchor_root: PathBuf,
+        #[arg(long)]
+        installation_key: Option<String>,
     },
 }
 
@@ -355,6 +401,49 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             );
             Ok(INVALID_REQUEST_EXIT)
         }
+        InstallationCommand::MaterializeSourceBundle {
+            eliot_host,
+            eliot_watchdog,
+            eliot_kernel,
+            eliot_store_surreal,
+            surreal,
+            eliotd,
+            output_bundle,
+            output,
+            store,
+            generation,
+            installation,
+            lineage_id,
+            sequence,
+            transaction_id,
+            staging_root,
+            minimum_store_available_bytes,
+            recovery_command,
+            profile,
+            profile_anchor_root,
+            installation_key,
+        } => run_installation_materialize_source_bundle(
+            eliot_host,
+            eliot_watchdog,
+            eliot_kernel,
+            eliot_store_surreal,
+            surreal,
+            eliotd,
+            output_bundle,
+            output,
+            store,
+            generation,
+            installation,
+            lineage_id,
+            sequence,
+            transaction_id,
+            staging_root,
+            minimum_store_available_bytes,
+            recovery_command,
+            profile,
+            profile_anchor_root,
+            installation_key,
+        ),
     }
 }
 
@@ -435,6 +524,114 @@ fn run_installation_generate(
         }))?
     );
     Ok(0)
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+fn run_installation_materialize_source_bundle(
+    eliot_host: PathBuf,
+    eliot_watchdog: PathBuf,
+    eliot_kernel: PathBuf,
+    eliot_store_surreal: PathBuf,
+    surreal: PathBuf,
+    eliotd: PathBuf,
+    output_bundle: PathBuf,
+    output: PathBuf,
+    store: Option<PathBuf>,
+    generation: String,
+    installation: String,
+    lineage_id: String,
+    sequence: u64,
+    transaction_id: String,
+    staging_root: PathBuf,
+    minimum_store_available_bytes: u64,
+    recovery_command: String,
+    profile: InstallationProfile,
+    profile_anchor_root: PathBuf,
+    installation_key: Option<String>,
+) -> Result<i32> {
+    let materialize_input = source_bundle_materializer::CanarySourceBundleMaterializeInput {
+        eliot_host_exe: eliot_host,
+        eliot_watchdog_exe: eliot_watchdog,
+        eliot_kernel_exe: eliot_kernel,
+        eliot_store_surreal_exe: eliot_store_surreal,
+        surreal_exe: surreal,
+        eliotd_exe: eliotd,
+        output_bundle: output_bundle.clone(),
+        generation: cli_handle(generation.clone(), "generation")?,
+        installation_epoch: InstallationEpoch {
+            installation: cli_handle(installation.clone(), "installation")?,
+            lineage_id: cli_handle(lineage_id.clone(), "lineage_id")?,
+            sequence,
+        },
+        profile,
+        profile_anchor_root: cli_path_handle(&profile_anchor_root, "profile_anchor_root")?,
+        installation_key: installation_key
+            .clone()
+            .map(|value| cli_handle(value, "installation_key"))
+            .transpose()?,
+        transaction_id: cli_handle(transaction_id.clone(), "transaction_id")?,
+        staging_root: cli_path_handle(&staging_root, "staging_root")?,
+    };
+    let receipt =
+        match source_bundle_materializer::materialize_canary_source_bundle(&materialize_input) {
+            Ok(source_bundle_materializer::CanarySourceBundleMaterializeOutcome::Published(
+                receipt,
+            )) => receipt,
+            Ok(
+                source_bundle_materializer::CanarySourceBundleMaterializeOutcome::CommittedUnknown(
+                    reconciliation,
+                ),
+            ) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "contract": "eliot.kernel.installation",
+                        "contract_version": INSTALLATION_CONTRACT_VERSION,
+                        "status": "SOURCE_BUNDLE_PUBLICATION_RECONCILIATION_REQUIRED",
+                        "reconciliation": reconciliation,
+                    }))?
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+            Err(error) => {
+                write_installation_error(
+                    "SOURCE_BUNDLE_MATERIALIZATION_REJECTED",
+                    &error.to_string(),
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+        };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": "SOURCE_BUNDLE_MATERIALIZED",
+            "bundle_path": receipt.bundle_path,
+            "generation": receipt.generation,
+            "evidence_digest": receipt.evidence_digest,
+            "file_count": receipt.files.len(),
+            "files": receipt.files,
+            "source_identity": receipt.source_identity,
+            "directory_publication": receipt.directory_publication,
+        }))?
+    );
+    run_installation_generate(
+        output_bundle,
+        profile,
+        profile_anchor_root,
+        installation_key,
+        installation,
+        lineage_id,
+        sequence,
+        generation,
+        staging_root,
+        transaction_id,
+        minimum_store_available_bytes,
+        recovery_command,
+        output,
+        store,
+    )
 }
 
 fn run_installation_create(_input: &Path, _store_path: &Path) -> i32 {

@@ -15,16 +15,28 @@ anyhow.workspace = true
 clap.workspace = true
 eliot-bootstrap.workspace = true
 eliot-cli.workspace = true
+eliot-governor.workspace = true
+eliot-kernel-service.workspace = true
 eliot-host-state.workspace = true
 eliot-installation.workspace = true
 eliot-ors.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
 eliot-runtime-status.workspace = true
+eliot-store-surreal = { path = "../eliot-store-surreal", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
