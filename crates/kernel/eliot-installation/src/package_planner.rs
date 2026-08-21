@@ -1121,28 +1121,42 @@ impl GenerationPackagePlanner {
                     automatic_start: true,
                 });
             }
-            // First-install bootstrap starts only Host.  Watchdog is already
-            // registered for Host to inspect/start after its authenticated
-            // epoch exists; starting it here would create a second admission
-            // owner and would race the fenced Host phase.
-            effects.push(InstallerEffectPlan::StartService {
-                effect_id: PlatformHandle::new("effect:start:EliotHost").map_err(|error| {
-                    InstallationError::InvalidField {
-                        field: "generation.effect_id".to_owned(),
-                        reason: error.to_string(),
-                    }
-                })?,
-                role: InstallerServiceRole::Host,
-                service_name: PlatformHandle::new("EliotHost").map_err(|error| {
-                    InstallationError::InvalidField {
-                        field: "generation.service_name".to_owned(),
-                        reason: error.to_string(),
-                    }
-                })?,
-                executable_path: candidate.host_executable_path.clone(),
-                account: InstallerServiceAccount::LocalService,
-                automatic_start: true,
-            });
+            // Registration and liveness are separate durable effects. The
+            // dependency contour starts Watchdog first, then Host, so Host
+            // supervision is present before the primary daemon is started.
+            for (role, name, executable_path) in [
+                (
+                    InstallerServiceRole::Watchdog,
+                    "EliotWatchdog",
+                    candidate.runtime_launch.watchdog_executable_path.clone(),
+                ),
+                (
+                    InstallerServiceRole::Host,
+                    "EliotHost",
+                    candidate.host_executable_path.clone(),
+                ),
+            ] {
+                effects.push(InstallerEffectPlan::StartService {
+                    effect_id: PlatformHandle::new(format!("effect:start:{name}")).map_err(
+                        |error| InstallationError::InvalidField {
+                            field: "generation.effect_id".to_owned(),
+                            reason: error.to_string(),
+                        },
+                    )?,
+                    role,
+                    service_name: PlatformHandle::new(name).map_err(|error| {
+                        InstallationError::InvalidField {
+                            field: "generation.service_name".to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?,
+                    executable_path,
+                    account: InstallerServiceAccount::LocalService,
+                    automatic_start: true,
+                });
+            }
+            // The LocalService store credential is provisioned only after the
+            // Host start effect has converged to an exact Running readback.
             effects.push(InstallerEffectPlan::ProvisionStoreCredential {
                 effect_id: PlatformHandle::new("effect:store-credential").map_err(|error| {
                     InstallationError::InvalidField {

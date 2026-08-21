@@ -797,7 +797,7 @@ fn installation_cli_rejects_valid_raw_transaction_import() {
     let planned: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
     assert_eq!(
         planned["transaction_wire_version"],
-        serde_json::json!({"major": 14, "minor": 0, "patch": 0})
+        serde_json::json!({"major": 15, "minor": 0, "patch": 0})
     );
 
     let create = Command::new(env!("CARGO_BIN_EXE_eliot"))
