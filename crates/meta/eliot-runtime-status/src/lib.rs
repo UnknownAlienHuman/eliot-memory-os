@@ -2326,7 +2326,6 @@ impl StoreLiveObserver for ProductionStoreLiveObserver {
         #[cfg(not(windows))]
         {
             let _ = (expected_pid, expected_start, expected_image, expected_job);
-            let _ = &self.host_state_root;
             return Ok(None);
         }
         #[cfg(windows)]
