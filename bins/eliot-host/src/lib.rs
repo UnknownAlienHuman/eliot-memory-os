@@ -6213,7 +6213,7 @@ fn runtime_control_unknown_ref(
     request: &HostRuntimeControlRequest,
 ) -> PlatformHandle {
     PlatformHandle::new(format!(
-        "{prefix}:operation={:?}:request_id={}:request_digest={}",
+        "{prefix}:operation={:?}:request_id={}:request_digest:{}",
         request.operation,
         request.request_id.as_str(),
         request.request_digest.as_str()
@@ -7079,7 +7079,25 @@ fn persist_runtime_restart_receipt(
 
 #[cfg(windows)]
 fn has_runtime_restart_pending(host_state_root: &Path, digest: &str) -> bool {
-    runtime_restart_pending_path(host_state_root, digest).exists()
+    let path = runtime_restart_pending_path(host_state_root, digest);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    value
+        .get("request_digest")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v == digest)
+        && value
+            .get("request_digest")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| {
+                v.len() == 64
+                    && v.bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
 }
 
 /// Host-owned lifecycle state and installation activation registry.
@@ -7898,6 +7916,9 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> HostRuntimeControlResponse {
+        if request.operation == HostRuntimeControlOperation::ReconcileKernelRestart {
+            return self.reconcile_kernel_restart_request(request);
+        }
         if self
             .owner_lease
             .activation_capability()

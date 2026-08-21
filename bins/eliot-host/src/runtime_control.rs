@@ -37,6 +37,27 @@ const WIRE: &str = "eliot.host.runtime-control.v1";
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum HostRuntimeControlOperation {
     RestartKernel,
+    ReconcileKernelRestart,
+}
+
+fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
+    match operation {
+        HostRuntimeControlOperation::RestartKernel => "RestartKernel",
+        HostRuntimeControlOperation::ReconcileKernelRestart => "RestartKernel",
+    }
+}
+
+fn runtime_control_unknown_ref(
+    prefix: &str,
+    request: &HostRuntimeControlRequest,
+) -> PlatformHandle {
+    PlatformHandle::new(format!(
+        "{prefix}:operation={:?}:request_id={}:request_digest:{}",
+        request.operation,
+        request.request_id.as_str(),
+        request.request_digest.as_str()
+    ))
+    .unwrap_or_else(|_| unreachable!())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -58,7 +79,7 @@ impl HostRuntimeControlRequest {
             format!(
                 "{}:{}:{}",
                 wire.as_str(),
-                format!("{operation:?}"),
+                canonical_operation_name(&operation),
                 request_id.as_str()
             )
             .as_bytes(),
@@ -96,7 +117,7 @@ impl HostRuntimeControlRequest {
             format!(
                 "{}:{}:{}",
                 self.wire.as_str(),
-                format!("{:?}", self.operation),
+                canonical_operation_name(&self.operation),
                 self.request_id.as_str()
             )
             .as_bytes(),
@@ -225,15 +246,21 @@ impl HostRuntimeControl {
 
     async fn handle(&self, request: &HostRuntimeControlRequest) -> HostRuntimeControlResponse {
         if request.validate().is_err() {
-            return unknown("runtime-control-validation");
+            return HostRuntimeControlResponse::Unknown {
+                pending_ref: runtime_control_unknown_ref("kernel-restart-validation", request),
+            };
         }
         let (reply, response) = oneshot::channel();
         {
             let Ok(mut q) = self.queue.lock() else {
-                return unknown("runtime-control-queue-lock");
+                return HostRuntimeControlResponse::Unknown {
+                    pending_ref: runtime_control_unknown_ref("kernel-restart-queue-lock", request),
+                };
             };
             if q.len() >= MAX_QUEUE_DEPTH {
-                return unknown("runtime-control-queue-full");
+                return HostRuntimeControlResponse::Unknown {
+                    pending_ref: runtime_control_unknown_ref("kernel-restart-queue-full", request),
+                };
             }
             q.push_back(HostRuntimeControlEnvelope {
                 request: request.clone(),
@@ -242,7 +269,9 @@ impl HostRuntimeControl {
         }
         match tokio::time::timeout(QUEUE_RESPONSE_TIMEOUT, response).await {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) | Err(_) => unknown("runtime-control-queue-response"),
+            Ok(Err(_)) | Err(_) => HostRuntimeControlResponse::Unknown {
+                pending_ref: runtime_control_unknown_ref("kernel-restart-queue-response", request),
+            },
         }
     }
 
@@ -270,12 +299,6 @@ impl HostRuntimeControl {
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
-    }
-}
-
-fn unknown(label: &str) -> HostRuntimeControlResponse {
-    HostRuntimeControlResponse::Unknown {
-        pending_ref: PlatformHandle::new(label).unwrap_or_else(|_| unreachable!()),
     }
 }
 
@@ -660,5 +683,212 @@ mod tests {
         assert_eq!(frame.request_id.as_ref().unwrap().as_str(), digest);
         let decoded = decode_runtime_control_response_frame(&frame).unwrap();
         assert_eq!(decoded, pending);
+    }
+
+    #[test]
+    fn reconcile_carries_same_digest_as_restart_for_same_request_id() {
+        let restart = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("same-id-99"),
+        )
+        .unwrap();
+        let reconcile = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::ReconcileKernelRestart,
+            handle("same-id-99"),
+        )
+        .unwrap();
+        assert_eq!(restart.request_id, reconcile.request_id);
+        assert_eq!(restart.request_digest, reconcile.request_digest);
+        assert_ne!(restart.operation, reconcile.operation);
+        let r_frame = runtime_control_request_frame("conn-r", &restart).unwrap();
+        let c_frame = runtime_control_request_frame("conn-c", &reconcile).unwrap();
+        assert_eq!(
+            r_frame.request_id.as_ref().unwrap().as_str(),
+            c_frame.request_id.as_ref().unwrap().as_str()
+        );
+        assert_eq!(
+            r_frame.request_identity.as_ref().unwrap().idempotency_key,
+            c_frame.request_identity.as_ref().unwrap().idempotency_key
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_full_preserves_request_identity_and_frame_binding() {
+        let q: HostRuntimeControlQueue = Arc::new(Mutex::new(VecDeque::new()));
+        for _ in 0..MAX_QUEUE_DEPTH {
+            q.lock().unwrap().push_back(HostRuntimeControlEnvelope {
+                request: HostRuntimeControlRequest::new(
+                    HostRuntimeControlOperation::RestartKernel,
+                    handle("fill"),
+                )
+                .unwrap(),
+                reply: oneshot::channel().0,
+            });
+        }
+        let control = HostRuntimeControl::new(Arc::clone(&q));
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("full-test-1"),
+        )
+        .unwrap();
+        let response = control.handle(&request).await;
+        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+            panic!("expected Unknown for queue-full");
+        };
+        assert!(pending_ref.as_str().contains(request.request_id.as_str()));
+        assert!(
+            pending_ref
+                .as_str()
+                .contains(request.request_digest.as_str())
+        );
+        assert!(!pending_ref.as_str().contains("runtime-control-queue-full"));
+        let error_hash = sha256_hex(b"runtime-control-queue-full");
+        assert!(!pending_ref.as_str().contains(&error_hash));
+        let frame = runtime_control_response_frame(
+            "conn-full",
+            &HostRuntimeControlResponse::Unknown {
+                pending_ref: pending_ref.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            frame.request_id.as_ref().unwrap().as_str(),
+            request.request_digest.as_str()
+        );
+        assert_eq!(
+            frame.request_identity.as_ref().unwrap().idempotency_key,
+            request.request_digest.as_str()
+        );
+        let decoded = decode_runtime_control_response_frame(&frame).unwrap();
+        assert_eq!(decoded, HostRuntimeControlResponse::Unknown { pending_ref });
+    }
+
+    #[tokio::test]
+    async fn queue_response_timeout_and_sender_drop_preserve_identity() {
+        let q: HostRuntimeControlQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let control = HostRuntimeControl::new(Arc::clone(&q));
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("sender-drop-1"),
+        )
+        .unwrap();
+        let dropped = request.request_digest.as_str().to_owned();
+        let q_clone = Arc::clone(&q);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let envelope = {
+                let mut guard = q_clone.lock().unwrap();
+                guard.pop_front()
+            };
+            if let Some(env) = envelope {
+                drop(env.reply);
+            }
+        });
+        let response = control.handle(&request).await;
+        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+            panic!("expected Unknown for sender drop/timeout");
+        };
+        assert!(pending_ref.as_str().contains(request.request_id.as_str()));
+        assert!(pending_ref.as_str().contains(&dropped));
+        let frame = runtime_control_response_frame(
+            "conn-drop",
+            &HostRuntimeControlResponse::Unknown {
+                pending_ref: pending_ref.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            frame.request_id.as_ref().unwrap().as_str(),
+            request.request_digest.as_str()
+        );
+        let _ = decode_runtime_control_response_frame(&frame).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validation_unknown_preserves_digest_and_rejects_error_hash() {
+        let q: HostRuntimeControlQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let control = HostRuntimeControl::new(Arc::clone(&q));
+        let mut bad = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("validation-1"),
+        )
+        .unwrap();
+        bad.request_digest = handle("b".repeat(64));
+        let response = control.handle(&bad).await;
+        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+            panic!("expected Unknown for validation");
+        };
+        assert!(pending_ref.as_str().contains(bad.request_id.as_str()));
+        assert!(pending_ref.as_str().contains(bad.request_digest.as_str()));
+        let error_hash = sha256_hex(b"runtime-control-validation");
+        assert!(!pending_ref.as_str().contains(&error_hash));
+        let frame = runtime_control_response_frame(
+            "conn-val",
+            &HostRuntimeControlResponse::Unknown {
+                pending_ref: pending_ref.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            frame.request_id.as_ref().unwrap().as_str(),
+            bad.request_digest.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_lock_poison_preserves_identity() {
+        let q: HostRuntimeControlQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let _ = std::panic::catch_unwind({
+            let q = Arc::clone(&q);
+            move || {
+                let _guard = q.lock().unwrap();
+                panic!("poison");
+            }
+        });
+        let control = HostRuntimeControl::new(Arc::clone(&q));
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("lock-poison-1"),
+        )
+        .unwrap();
+        let response = control.handle(&request).await;
+        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+            panic!("expected Unknown for lock poison");
+        };
+        assert!(
+            pending_ref
+                .as_str()
+                .contains(request.request_digest.as_str())
+        );
+    }
+
+    #[test]
+    fn reconcile_frame_preserves_identity_and_decode_rejects_digest_substitution() {
+        let restart = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("reconcile-frame-1"),
+        )
+        .unwrap();
+        let reconcile = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::ReconcileKernelRestart,
+            handle("reconcile-frame-1"),
+        )
+        .unwrap();
+        assert_eq!(restart.request_digest, reconcile.request_digest);
+        let frame = runtime_control_request_frame("conn-reconcile", &reconcile).unwrap();
+        assert_eq!(
+            frame.request_id.as_ref().unwrap().as_str(),
+            reconcile.request_digest.as_str()
+        );
+        let decoded = decode_runtime_control_request_frame(&frame).unwrap();
+        assert_eq!(decoded.request_digest, restart.request_digest);
+        let mut tampered = frame.clone();
+        let mut payload = serde_json::to_value(&reconcile).unwrap();
+        payload["request_digest"] = serde_json::Value::String("c".repeat(64));
+        tampered.payload = ProtocolPayload::Json(payload);
+        assert!(decode_runtime_control_request_frame(&tampered).is_err());
+        tampered = frame.clone();
+        tampered.request_id = Some(eliot_contracts::RequestId::new("d".repeat(64)).unwrap());
+        assert!(decode_runtime_control_request_frame(&tampered).is_err());
     }
 }
