@@ -2919,6 +2919,37 @@ fn reconcile_authenticated_readiness(
     }
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScmStoreRecoveryRoute {
+    Recovered,
+    Fenced(HostBranchDisposition),
+}
+
+/// Routes SCM's dead-Store observation through the Host-owned durable
+/// operation. The callback is `execute_store_recovery` in production; the
+/// seam is kept here so tests can prove the intent/termination/new-process/
+/// readiness ordering without giving the generic branch relauncher authority.
+#[cfg(windows)]
+fn route_scm_store_recovery(
+    kernel_live: bool,
+    kernel_requires_activation: bool,
+    store_present: bool,
+    request: &HostRuntimeControlRequest,
+    recover: impl FnOnce(&HostRuntimeControlRequest) -> Result<(), HostError>,
+) -> ScmStoreRecoveryRoute {
+    if !kernel_live || kernel_requires_activation {
+        return ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::BothDegraded);
+    }
+    if !store_present {
+        return ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::StoreDegraded);
+    }
+    match recover(request) {
+        Ok(()) => ScmStoreRecoveryRoute::Recovered,
+        Err(_) => ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::StoreDegraded),
+    }
+}
+
 /// Result of one cheap SCM liveness tick.  The tick never performs bounded
 /// restart, file/digest verification, Kernel pipe I/O, or journal append.
 #[cfg(windows)]
@@ -5521,9 +5552,11 @@ impl HostJobBranches {
         Ok(())
     }
 
-    /// Reconciles Kernel and store branches independently with one bounded
-    /// restart attempt per branch failure. A failed branch never terminates a
-    /// healthy sibling or reuses an observed PID.
+    /// Reconciles the retained Kernel branch and an already-live Store with one
+    /// bounded restart attempt for Kernel failure. A failed branch never
+    /// terminates a healthy sibling or reuses an observed PID. A dead Store is
+    /// rejected here because only [`HostComposition`] owns the durable outer
+    /// recovery intent required before Store termination.
     ///
     /// # Errors
     ///
@@ -5546,6 +5579,19 @@ impl HostJobBranches {
         store_artifact: &PlatformHandle,
         host: &HostInstallationEpoch,
     ) -> Result<HostBranchDisposition, HostError> {
+        // This low-level branch helper has no journal/outer-intent authority.
+        // A dead Store must therefore be recovered by HostComposition's one
+        // durable Store-recovery operation, never by the generic relaunch
+        // closures below.  Keep the guard here as a fail-closed backstop for
+        // future callers that might otherwise reintroduce the old bypass.
+        if matches!(
+            Self::branch_state(self.store.as_ref()),
+            Ok(BranchLiveness::Dead)
+        ) {
+            return Err(HostError::RecoveryRequired(
+                "dead Store requires Host-owned durable recovery".to_owned(),
+            ));
+        }
         if self
             .kernel_artifact_digest
             .as_ref()
@@ -6353,6 +6399,30 @@ fn sha256_json(value: &impl serde::Serialize) -> Result<String, HostError> {
     let bytes =
         serde_json::to_vec(value).map_err(|error| HostError::ProcessContour(error.to_string()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(windows)]
+fn host_owned_store_recovery_request(
+    host: &HostInstallationEpoch,
+    activation_id: &PlatformHandle,
+    activation_generation: &EpochTransition,
+    generation: &PlatformHandle,
+    config_digest: &PlatformHandle,
+) -> Result<HostRuntimeControlRequest, HostError> {
+    let identity_digest = sha256_json(&(
+        "eliot-host::scm-store-recovery:v1",
+        &host.installation,
+        &host.epoch,
+        activation_id,
+        activation_generation,
+        generation,
+        config_digest,
+    ))?;
+    let request_id =
+        PlatformHandle::new(format!("host-owned-scm-store-recovery:{identity_digest}"))
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    HostRuntimeControlRequest::new(HostRuntimeControlOperation::RecoverStore, request_id)
+        .map_err(HostError::ProcessContour)
 }
 
 fn phase_b_unknown_ref(
@@ -10398,6 +10468,25 @@ impl HostComposition {
         }
     }
 
+    /// Builds the deterministic request identity used by the Host-owned SCM
+    /// dead-Store trigger.  This is an internal typed caller of the same
+    /// durable operation used by the authenticated runtime-control endpoint;
+    /// it does not pass through the external Builtin-Administrators pipe.
+    #[cfg(windows)]
+    fn scm_store_recovery_request(
+        &self,
+        generation: &PlatformHandle,
+        config_digest: &PlatformHandle,
+    ) -> Result<HostRuntimeControlRequest, HostError> {
+        host_owned_store_recovery_request(
+            &self.host,
+            &self.activation_id,
+            &self.activation_generation,
+            generation,
+            config_digest,
+        )
+    }
+
     #[cfg(windows)]
     #[allow(clippy::too_many_lines)]
     fn reconcile_committed_store_recovery(
@@ -13929,6 +14018,59 @@ impl HostComposition {
             DurableKernelActivationDriver::resume(&self.journal, current)
                 .fail("kernel-process-observed-dead")?;
         }
+        if store_requires_restart {
+            // The generic branch state machine has no durable outer-intent
+            // authority and must never be allowed to terminate/relaunch a
+            // dead Store. A valid retained Kernel is required to bind the
+            // Store-only recovery; when it is absent or not authoritatively
+            // live, fence the composition instead of mutating the Store.
+            let kernel_live = matches!(
+                HostJobBranches::branch_state(self.jobs.kernel.as_ref()),
+                Ok(BranchLiveness::Live)
+            );
+            let route = if !kernel_live || kernel_requires_activation {
+                ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::BothDegraded)
+            } else if self.jobs.store.is_none() {
+                ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::StoreDegraded)
+            } else {
+                let request = self.scm_store_recovery_request(
+                    &active.manifest.generation,
+                    &materialized_config_digest,
+                )?;
+                route_scm_store_recovery(
+                    kernel_live,
+                    kernel_requires_activation,
+                    self.jobs.store.is_some(),
+                    &request,
+                    |request| self.execute_store_recovery(request).map(|_| ()),
+                )
+            };
+            if route == ScmStoreRecoveryRoute::Recovered {
+                return Ok(self.reconcile_branch_readiness_at(
+                    &active.manifest.generation,
+                    kernel_artifact,
+                    store_artifact,
+                    &materialized_config_digest,
+                    HostBranchDisposition::LiveAwaitingReadiness,
+                    std::time::Instant::now(),
+                ));
+            }
+            let disposition = match route {
+                ScmStoreRecoveryRoute::Fenced(disposition) => disposition,
+                ScmStoreRecoveryRoute::Recovered => unreachable!("recovered route returned"),
+            };
+            if let Err(error) =
+                self.persist_degraded_process_observation(&active.manifest.generation, disposition)
+            {
+                self.readiness_gate.fail(
+                    None,
+                    readiness_failure_kind(&error),
+                    std::time::Instant::now(),
+                );
+                return Ok(HostBranchDisposition::ReadinessDegraded);
+            }
+            return Ok(disposition);
+        }
         let disposition = self.jobs.reconcile(
             &active.manifest.generation,
             &materialized_config_digest,
@@ -13963,51 +14105,6 @@ impl HostComposition {
                         "Kernel restart activation failed ({error}); Kernel cleanup failed ({cleanup})"
                     )),
                 });
-            }
-        } else if store_requires_restart
-            && !kernel_requires_activation
-            && self.jobs.store.is_some()
-            && self.jobs.kernel.is_some()
-        {
-            if HostJobBranches::branch_state(self.jobs.kernel.as_ref()).is_err() {
-                self.readiness_gate.branch_degraded();
-                let _ = self.persist_degraded_process_observation(
-                    &active.manifest.generation,
-                    HostBranchDisposition::BothDegraded,
-                );
-                return Ok(HostBranchDisposition::BothDegraded);
-            }
-            self.readiness_gate.branch_degraded();
-            let _ = self.persist_degraded_process_observation(
-                &active.manifest.generation,
-                HostBranchDisposition::StoreDegraded,
-            );
-            if let Err(error) = self.jobs.rebind_store_control(
-                &active.manifest.generation,
-                &self.journal,
-                &self.host,
-                &self.activation_id,
-                &self.activation_generation,
-                None,
-            ) {
-                if matches!(error, HostError::Journal(_)) {
-                    self.readiness_gate.fail(
-                        None,
-                        ReadinessFailureKind::JournalRejected,
-                        std::time::Instant::now(),
-                    );
-                    return Ok(HostBranchDisposition::ReadinessDegraded);
-                }
-                if error.to_string().contains("unknown") {
-                    self.readiness_gate.fail(
-                        None,
-                        ReadinessFailureKind::JournalOutcomeUnknown,
-                        std::time::Instant::now(),
-                    );
-                    return Ok(HostBranchDisposition::ReadinessDegraded);
-                }
-                self.readiness_gate.branch_degraded();
-                return Ok(HostBranchDisposition::ReadinessDegraded);
             }
         }
         Ok(self.reconcile_branch_readiness_at(
@@ -18411,9 +18508,10 @@ mod tests {
         HostRuntimeControlOperation, HostRuntimeControlRequest, HostRuntimeControlResponse,
         HostStoreRecoveryReceipt, KERNEL_BOOTSTRAP_ENVIRONMENT, KERNEL_CONTROL_PIPE,
         KernelControlResponse, KernelLaunchBinding, KernelServiceState, PlatformHandle,
-        ReconciliationObservation, ReconciliationState, StoreKernelLaunchError,
-        StoreLivenessEvidence, activation_response_or_reconcile, fresh_host_epoch,
-        launch_store_then_kernel, reconcile_state_machine,
+        ReconciliationObservation, ReconciliationState, ScmStoreRecoveryRoute,
+        StoreKernelLaunchError, StoreLivenessEvidence, activation_response_or_reconcile,
+        fresh_host_epoch, host_owned_store_recovery_request, launch_store_then_kernel,
+        reconcile_state_machine, route_scm_store_recovery,
     };
     use eliot_platform_windows::JobObjectIdentity;
 
@@ -18997,37 +19095,164 @@ mod tests {
     }
 
     #[test]
-    fn pulse4_store_death_restarts_only_store_and_preserves_kernel_identity() {
-        let kernel_before = MockChild { id: 42, live: true };
-        let mut state = ReconciliationState {
-            store: Some(MockChild { id: 7, live: false }),
-            kernel: Some(kernel_before),
-            store_restart_attempts: 0,
-            kernel_restart_attempts: 0,
-        };
-        let kernel_identity_before = 42_u8;
-        let disposition = reconcile_state_machine(
-            &mut state,
-            mock_observation,
-            mock_observation,
-            |_| Ok(()),
-            |_| Ok(()),
-            || Ok(MockChild { id: 99, live: true }),
-            || {
-                panic!("Kernel must not restart on Store-only death");
-            },
-        );
-        assert_eq!(disposition, HostBranchDisposition::LiveAwaitingReadiness);
+    fn scm_store_death_routes_durable_recovery_before_fresh_readiness() {
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("scm-store-recovery-route").unwrap(),
+        )
+        .unwrap();
+        let host = fresh_host_epoch(
+            PlatformHandle::new("scm-store-recovery-route-host").unwrap(),
+            None,
+        )
+        .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-scm-store-route-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let events = RefCell::new(Vec::new());
+        let mut fresh_readiness = false;
+        let route = route_scm_store_recovery(true, false, true, &request, |request| {
+            assert_eq!(request.operation, HostRuntimeControlOperation::RecoverStore);
+            super::persist_store_recovery_pending(&root, request, &host).unwrap();
+            assert!(
+                super::store_recovery_pending_path(&root, request.mutation_digest.as_str())
+                    .exists()
+            );
+            events.borrow_mut().push("outer-intent");
+            assert!(
+                super::store_recovery_pending_path(&root, request.mutation_digest.as_str())
+                    .exists()
+            );
+            events.borrow_mut().push("exact-store-termination");
+            events.borrow_mut().push("new-store-job-pid-image");
+            events.borrow_mut().push("fresh-probeready");
+            events.borrow_mut().push("readiness-journal");
+            fresh_readiness = true;
+            Ok(())
+        });
+        assert_eq!(route, ScmStoreRecoveryRoute::Recovered);
+        assert!(fresh_readiness, "Healthy requires fresh readiness evidence");
         assert_eq!(
-            state.kernel,
-            Some(MockChild {
-                id: kernel_identity_before,
-                live: true
-            })
+            *events.borrow(),
+            [
+                "outer-intent",
+                "exact-store-termination",
+                "new-store-job-pid-image",
+                "fresh-probeready",
+                "readiness-journal",
+            ]
         );
-        assert_eq!(state.store, Some(MockChild { id: 99, live: true }));
-        assert_eq!(state.kernel_restart_attempts, 0);
-        assert_eq!(state.store_restart_attempts, 1);
+        let disposition = if fresh_readiness {
+            HostBranchDisposition::Healthy
+        } else {
+            HostBranchDisposition::StoreDegraded
+        };
+        assert_eq!(disposition, HostBranchDisposition::Healthy);
+
+        let mut direct_reconcile_calls = 0;
+        let fenced = route_scm_store_recovery(true, false, true, &request, |_| {
+            direct_reconcile_calls += 1;
+            Err(HostError::RecoveryRequired(
+                "jobs.reconcile bypass is forbidden".to_owned(),
+            ))
+        });
+        assert_eq!(
+            fenced,
+            ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::StoreDegraded)
+        );
+        assert_eq!(direct_reconcile_calls, 1);
+        let both_fenced = route_scm_store_recovery(false, true, true, &request, |_| {
+            panic!("invalid Kernel must not invoke Store recovery")
+        });
+        assert_eq!(
+            both_fenced,
+            ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::BothDegraded)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generic_reconcile_rejects_dead_store_without_durable_host_authority() {
+        let host = fresh_host_epoch(
+            PlatformHandle::new("scm-store-recovery-guard").unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut jobs = HostJobBranches::new_fenced(&host).unwrap();
+        let generation = PlatformHandle::new("generation").unwrap();
+        let config_digest = PlatformHandle::new("config-digest").unwrap();
+        let error = jobs
+            .reconcile(
+                &generation,
+                &config_digest,
+                Path::new(r"C:\Eliot\config.json"),
+                &PlatformHandle::new(r"C:\Eliot\kernel.exe").unwrap(),
+                &PlatformHandle::new(r"C:\Eliot\store.exe").unwrap(),
+                &PlatformHandle::new(r"C:\Eliot\config.json").unwrap(),
+                &PlatformHandle::new("kernel-artifact").unwrap(),
+                &PlatformHandle::new("store-artifact").unwrap(),
+                &host,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HostError::RecoveryRequired(message)
+                if message == "dead Store requires Host-owned durable recovery"
+        ));
+    }
+
+    #[test]
+    fn scm_store_recovery_request_identity_is_stable_and_contour_bound() {
+        let host = fresh_host_epoch(
+            PlatformHandle::new("scm-store-recovery-identity").unwrap(),
+            None,
+        )
+        .unwrap();
+        let activation_id = PlatformHandle::new("activation-id").unwrap();
+        let activation_generation = super::root_epoch(PlatformHandle::new("activation").unwrap());
+        let generation = PlatformHandle::new("generation").unwrap();
+        let config = PlatformHandle::new("config").unwrap();
+        let first = host_owned_store_recovery_request(
+            &host,
+            &activation_id,
+            &activation_generation,
+            &generation,
+            &config,
+        )
+        .unwrap();
+        let replay = host_owned_store_recovery_request(
+            &host,
+            &activation_id,
+            &activation_generation,
+            &generation,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(first.request_id, replay.request_id);
+        assert_eq!(first.mutation_digest, replay.mutation_digest);
+        assert_eq!(first.request_digest, replay.request_digest);
+        let changed_config = host_owned_store_recovery_request(
+            &host,
+            &activation_id,
+            &activation_generation,
+            &generation,
+            &PlatformHandle::new("config-changed").unwrap(),
+        )
+        .unwrap();
+        assert_ne!(first.mutation_digest, changed_config.mutation_digest);
+        let mut next_host = host.clone();
+        next_host.epoch = host.epoch.direct_child().unwrap();
+        let changed_epoch = host_owned_store_recovery_request(
+            &next_host,
+            &activation_id,
+            &activation_generation,
+            &generation,
+            &config,
+        )
+        .unwrap();
+        assert_ne!(first.mutation_digest, changed_epoch.mutation_digest);
     }
 
     #[test]
