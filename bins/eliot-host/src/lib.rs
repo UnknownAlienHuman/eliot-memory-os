@@ -565,6 +565,9 @@ pub enum HostError {
     StoreNotLive { evidence: StoreLivenessEvidence },
     #[error("Host child cleanup requires recovery: {0}")]
     RecoveryRequired(String),
+    #[cfg(windows)]
+    #[error("Host-owned Store recovery is required: {0}")]
+    StoreRecoveryRequired(#[from] StoreRecoveryRequired),
     #[error("another live Host owns this installation")]
     OwnerLeaseHeld,
     #[error("Host owner lease recovery is required: {0}")]
@@ -2776,6 +2779,7 @@ fn readiness_failure_kind(error: &HostError) -> ReadinessFailureKind {
         | HostError::Stopped
         | HostError::MissingInstallation
         | HostError::StoreNotLive { .. }
+        | HostError::StoreRecoveryRequired(_)
         | HostError::OwnerLeaseHeld
         | HostError::OwnerLeaseRecovery(_) => ReadinessFailureKind::ProbeRejected,
     }
@@ -2924,29 +2928,65 @@ fn reconcile_authenticated_readiness(
 enum ScmStoreRecoveryRoute {
     Recovered,
     Fenced(HostBranchDisposition),
+    Continue(HostBranchDisposition),
 }
 
-/// Routes SCM's dead-Store observation through the Host-owned durable
-/// operation. The callback is `execute_store_recovery` in production; the
-/// seam is kept here so tests can prove the intent/termination/new-process/
-/// readiness ordering without giving the generic branch relauncher authority.
 #[cfg(windows)]
-fn route_scm_store_recovery(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the four independent liveness facts are the explicit SCM route discriminator"
+)]
+struct ScmStoreRecoveryObservation {
+    store_requires_restart: bool,
     kernel_live: bool,
     kernel_requires_activation: bool,
     store_present: bool,
+}
+
+/// Routes both the early Store-dead observation and the late Store-dead result
+/// from generic reconciliation through the Host-owned durable operation. The
+/// callback is `execute_store_recovery` in production; this shared discriminator
+/// is also the deterministic seam for proving the liveness race cannot bypass
+/// the durable outer intent.
+#[cfg(windows)]
+fn route_scm_store_recovery(
+    observation: ScmStoreRecoveryObservation,
+    reconciled: Option<Result<HostBranchDisposition, HostError>>,
     request: &HostRuntimeControlRequest,
     recover: impl FnOnce(&HostRuntimeControlRequest) -> Result<(), HostError>,
-) -> ScmStoreRecoveryRoute {
-    if !kernel_live || kernel_requires_activation {
-        return ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::BothDegraded);
+) -> Result<ScmStoreRecoveryRoute, HostError> {
+    let recovery_required = if observation.store_requires_restart {
+        true
+    } else {
+        match reconciled {
+            Some(Ok(disposition)) => return Ok(ScmStoreRecoveryRoute::Continue(disposition)),
+            Some(Err(HostError::StoreRecoveryRequired(_))) => true,
+            Some(Err(error)) => return Err(error),
+            None => {
+                return Err(HostError::RecoveryRequired(
+                    "Store reconciliation result was omitted without an early Store-dead observation"
+                        .to_owned(),
+                ));
+            }
+        }
+    };
+    debug_assert!(recovery_required);
+    if !observation.kernel_live || observation.kernel_requires_activation {
+        return Ok(ScmStoreRecoveryRoute::Fenced(
+            HostBranchDisposition::BothDegraded,
+        ));
     }
-    if !store_present {
-        return ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::StoreDegraded);
+    if !observation.store_present {
+        return Ok(ScmStoreRecoveryRoute::Fenced(
+            HostBranchDisposition::StoreDegraded,
+        ));
     }
     match recover(request) {
-        Ok(()) => ScmStoreRecoveryRoute::Recovered,
-        Err(_) => ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::StoreDegraded),
+        Ok(()) => Ok(ScmStoreRecoveryRoute::Recovered),
+        Err(_) => Ok(ScmStoreRecoveryRoute::Fenced(
+            HostBranchDisposition::StoreDegraded,
+        )),
     }
 }
 
@@ -3022,6 +3062,13 @@ enum BranchLiveness {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum StoreRecoveryRequired {
+    #[error("Store became dead during branch reconciliation")]
+    LateDead,
+}
+
+#[cfg(windows)]
 #[allow(dead_code)]
 enum CutoverLaunchOutcome {
     Candidate,
@@ -3062,81 +3109,35 @@ struct ReconciliationState<S, K> {
 #[cfg(windows)]
 #[allow(
     clippy::too_many_lines,
-    reason = "Store restart must rebind and, when needed, restart Kernel in one ordered state machine"
+    reason = "bounded Kernel-only restart stays ordered while Store recovery remains Host-owned"
 )]
-fn reconcile_state_machine<S, K, SO, KO, ST, KT, SL, KL>(
+fn reconcile_state_machine<S, K, SO, KO, KT, KL>(
     state: &mut ReconciliationState<S, K>,
     mut observe_store: SO,
     mut observe_kernel: KO,
-    mut terminate_store: ST,
     mut terminate_kernel: KT,
-    mut launch_store: SL,
     mut launch_kernel: KL,
-) -> HostBranchDisposition
+) -> Result<HostBranchDisposition, StoreRecoveryRequired>
 where
     SO: FnMut(Option<&S>) -> ReconciliationObservation,
     KO: FnMut(Option<&K>) -> ReconciliationObservation,
-    ST: FnMut(&mut Option<S>) -> Result<(), ()>,
     KT: FnMut(&mut Option<K>) -> Result<(), ()>,
-    SL: FnMut() -> Result<S, ()>,
     KL: FnMut() -> Result<K, ()>,
 {
     let kernel_observation = observe_kernel(state.kernel.as_ref());
     let store_observation = observe_store(state.store.as_ref());
-    let kernel_dead = kernel_observation == ReconciliationObservation::Dead;
-    let mut store_dead = store_observation == ReconciliationObservation::Dead;
-    let mut kernel_degraded = kernel_observation == ReconciliationObservation::Unknown;
-    let mut store_degraded = store_observation == ReconciliationObservation::Unknown;
-
-    let both_dead = kernel_dead && store_dead;
-    if both_dead {
-        if store_degraded
-            || terminate_store(&mut state.store).is_err()
-            || state.store_restart_attempts >= 1
-        {
-            store_degraded = true;
-        } else {
-            state.store_restart_attempts += 1;
-            if let Ok(store) = launch_store() {
-                state.store = Some(store);
-                if observe_store(state.store.as_ref()) != ReconciliationObservation::Live {
-                    store_degraded = true;
-                    if terminate_store(&mut state.store).is_err() {
-                        store_degraded = true;
-                    }
-                } else if state.kernel.is_some() {
-                    // A fresh Store process necessarily has a new PID/start
-                    // binding. Restart Kernel before publishing a contour so
-                    // its one-shot Store handoff cannot retain the old peer.
-                    if terminate_kernel(&mut state.kernel).is_err()
-                        || state.kernel_restart_attempts >= 1
-                    {
-                        kernel_degraded = true;
-                    } else {
-                        state.kernel_restart_attempts += 1;
-                        if let Ok(kernel) = launch_kernel() {
-                            state.kernel = Some(kernel);
-                            if observe_kernel(state.kernel.as_ref())
-                                != ReconciliationObservation::Live
-                            {
-                                kernel_degraded = true;
-                                if terminate_kernel(&mut state.kernel).is_err() {
-                                    kernel_degraded = true;
-                                }
-                            }
-                        } else {
-                            kernel_degraded = true;
-                        }
-                    }
-                }
-            } else {
-                store_degraded = true;
-            }
-        }
-        store_dead = state.store.is_none() || store_degraded;
+    if store_observation == ReconciliationObservation::Dead {
+        // The generic branch machine may retain and restart Kernel, but it
+        // has no durable outer-intent authority for Store mutation.  A Store
+        // death observed after its caller's guard is therefore handed back to
+        // HostComposition, which owns execute_store_recovery.
+        return Err(StoreRecoveryRequired::LateDead);
     }
+    let kernel_dead = kernel_observation == ReconciliationObservation::Dead;
+    let mut kernel_degraded = kernel_observation == ReconciliationObservation::Unknown;
+    let store_degraded = store_observation == ReconciliationObservation::Unknown;
 
-    if kernel_dead && !store_dead && !store_degraded && state.store.is_some() {
+    if kernel_dead && !store_degraded && state.store.is_some() {
         if terminate_kernel(&mut state.kernel).is_err() || state.kernel_restart_attempts >= 1 {
             kernel_degraded = true;
         } else {
@@ -3157,40 +3158,15 @@ where
         kernel_degraded = true;
     }
 
-    if store_dead && !both_dead {
-        if kernel_observation == ReconciliationObservation::Unknown {
-            kernel_degraded = true;
-            store_degraded = true;
-        } else if terminate_store(&mut state.store).is_err() || state.store_restart_attempts >= 1 {
-            store_degraded = true;
-        } else {
-            state.store_restart_attempts += 1;
-            if let Ok(store) = launch_store() {
-                state.store = Some(store);
-                if observe_store(state.store.as_ref()) != ReconciliationObservation::Live {
-                    store_degraded = true;
-                    if terminate_store(&mut state.store).is_err() {
-                        store_degraded = true;
-                    }
-                }
-            } else {
-                store_degraded = true;
-            }
-        }
-    }
-
-    if state.kernel.is_none() {
+    if state.kernel.is_none() || kernel_observation == ReconciliationObservation::Unknown {
         kernel_degraded = true;
     }
-    if state.store.is_none() {
-        store_degraded = true;
-    }
-    match (kernel_degraded, store_degraded) {
+    Ok(match (kernel_degraded, store_degraded) {
         (false, false) => HostBranchDisposition::LiveAwaitingReadiness,
         (true, false) => HostBranchDisposition::KernelDegraded,
         (false, true) => HostBranchDisposition::StoreDegraded,
         (true, true) => HostBranchDisposition::BothDegraded,
-    }
+    })
 }
 
 #[cfg(windows)]
@@ -5588,9 +5564,7 @@ impl HostJobBranches {
             Self::branch_state(self.store.as_ref()),
             Ok(BranchLiveness::Dead)
         ) {
-            return Err(HostError::RecoveryRequired(
-                "dead Store requires Host-owned durable recovery".to_owned(),
-            ));
+            return Err(StoreRecoveryRequired::LateDead.into());
         }
         if self
             .kernel_artifact_digest
@@ -5689,17 +5663,6 @@ impl HostJobBranches {
                 Ok(BranchLiveness::Dead) => ReconciliationObservation::Dead,
                 Err(_) => ReconciliationObservation::Unknown,
             },
-            |store| {
-                let Some(child) = store.as_mut() else {
-                    return Ok(());
-                };
-                child
-                    .terminate_in_place(0xE017_0002)
-                    .map(|_| {
-                        store.take();
-                    })
-                    .map_err(|_| ())
-            },
             |kernel| {
                 let Some(child) = kernel.as_mut() else {
                     return Ok(());
@@ -5710,18 +5673,6 @@ impl HostJobBranches {
                         kernel.take();
                     })
                     .map_err(|_| ())
-            },
-            || {
-                self.relaunch_store(
-                    generation,
-                    config_digest,
-                    config_path,
-                    store_artifact,
-                    approved_store_bridge_path,
-                    approved_config_path,
-                    host,
-                )
-                .map_err(|_| ())
             },
             || {
                 self.relaunch_kernel(
@@ -5735,12 +5686,13 @@ impl HostJobBranches {
                 )
                 .map_err(|_| ())
             },
-        );
+        )
+        .map_err(HostError::from);
         self.store = state.store;
         self.kernel = state.kernel;
         self.store_restart_attempts = state.store_restart_attempts;
         self.kernel_restart_attempts = state.kernel_restart_attempts;
-        Ok(disposition)
+        disposition
     }
 
     /// Performs a bounded side-by-side cutover with an explicit rollback
@@ -14018,34 +13970,43 @@ impl HostComposition {
             DurableKernelActivationDriver::resume(&self.journal, current)
                 .fail("kernel-process-observed-dead")?;
         }
-        if store_requires_restart {
-            // The generic branch state machine has no durable outer-intent
-            // authority and must never be allowed to terminate/relaunch a
-            // dead Store. A valid retained Kernel is required to bind the
-            // Store-only recovery; when it is absent or not authoritatively
-            // live, fence the composition instead of mutating the Store.
-            let kernel_live = matches!(
-                HostJobBranches::branch_state(self.jobs.kernel.as_ref()),
-                Ok(BranchLiveness::Live)
-            );
-            let route = if !kernel_live || kernel_requires_activation {
-                ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::BothDegraded)
-            } else if self.jobs.store.is_none() {
-                ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::StoreDegraded)
-            } else {
-                let request = self.scm_store_recovery_request(
-                    &active.manifest.generation,
-                    &materialized_config_digest,
-                )?;
-                route_scm_store_recovery(
-                    kernel_live,
-                    kernel_requires_activation,
-                    self.jobs.store.is_some(),
-                    &request,
-                    |request| self.execute_store_recovery(request).map(|_| ()),
-                )
-            };
-            if route == ScmStoreRecoveryRoute::Recovered {
+        let reconciled = if store_requires_restart {
+            None
+        } else {
+            Some(self.jobs.reconcile(
+                &active.manifest.generation,
+                &materialized_config_digest,
+                &config_path,
+                approved_kernel_path,
+                approved_store_path,
+                approved_config_path,
+                kernel_artifact,
+                store_artifact,
+                &self.host,
+            ))
+        };
+        // Re-observe after generic reconciliation.  A Store can die after
+        // the outer liveness check and the generic guard; only this shared
+        // route may turn that typed late-dead result into Store mutation.
+        let kernel_live = matches!(
+            HostJobBranches::branch_state(self.jobs.kernel.as_ref()),
+            Ok(BranchLiveness::Live)
+        );
+        let request = self
+            .scm_store_recovery_request(&active.manifest.generation, &materialized_config_digest)?;
+        let route = route_scm_store_recovery(
+            ScmStoreRecoveryObservation {
+                store_requires_restart,
+                kernel_live,
+                kernel_requires_activation,
+                store_present: self.jobs.store.is_some(),
+            },
+            reconciled,
+            &request,
+            |request| self.execute_store_recovery(request).map(|_| ()),
+        )?;
+        let disposition = match route {
+            ScmStoreRecoveryRoute::Recovered => {
                 return Ok(self.reconcile_branch_readiness_at(
                     &active.manifest.generation,
                     kernel_artifact,
@@ -14055,33 +14016,21 @@ impl HostComposition {
                     std::time::Instant::now(),
                 ));
             }
-            let disposition = match route {
-                ScmStoreRecoveryRoute::Fenced(disposition) => disposition,
-                ScmStoreRecoveryRoute::Recovered => unreachable!("recovered route returned"),
-            };
-            if let Err(error) =
-                self.persist_degraded_process_observation(&active.manifest.generation, disposition)
-            {
-                self.readiness_gate.fail(
-                    None,
-                    readiness_failure_kind(&error),
-                    std::time::Instant::now(),
-                );
-                return Ok(HostBranchDisposition::ReadinessDegraded);
+            ScmStoreRecoveryRoute::Fenced(disposition) => {
+                if let Err(error) = self
+                    .persist_degraded_process_observation(&active.manifest.generation, disposition)
+                {
+                    self.readiness_gate.fail(
+                        None,
+                        readiness_failure_kind(&error),
+                        std::time::Instant::now(),
+                    );
+                    return Ok(HostBranchDisposition::ReadinessDegraded);
+                }
+                return Ok(disposition);
             }
-            return Ok(disposition);
-        }
-        let disposition = self.jobs.reconcile(
-            &active.manifest.generation,
-            &materialized_config_digest,
-            &config_path,
-            approved_kernel_path,
-            approved_store_path,
-            approved_config_path,
-            kernel_artifact,
-            store_artifact,
-            &self.host,
-        )?;
+            ScmStoreRecoveryRoute::Continue(disposition) => disposition,
+        };
         if kernel_requires_activation && self.jobs.kernel.is_some() {
             let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
                 .next_kernel_activation_context(
@@ -18509,9 +18458,9 @@ mod tests {
         HostStoreRecoveryReceipt, KERNEL_BOOTSTRAP_ENVIRONMENT, KERNEL_CONTROL_PIPE,
         KernelControlResponse, KernelLaunchBinding, KernelServiceState, PlatformHandle,
         ReconciliationObservation, ReconciliationState, ScmStoreRecoveryRoute,
-        StoreKernelLaunchError, StoreLivenessEvidence, activation_response_or_reconcile,
-        fresh_host_epoch, host_owned_store_recovery_request, launch_store_then_kernel,
-        reconcile_state_machine, route_scm_store_recovery,
+        StoreKernelLaunchError, StoreLivenessEvidence, StoreRecoveryRequired,
+        activation_response_or_reconcile, fresh_host_epoch, host_owned_store_recovery_request,
+        launch_store_then_kernel, reconcile_state_machine, route_scm_store_recovery,
     };
     use eliot_platform_windows::JobObjectIdentity;
 
@@ -18885,39 +18834,31 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_store_first_then_kernel() {
+    fn reconcile_dead_store_returns_typed_recovery_without_mutation() {
         let events = RefCell::new(Vec::new());
         let mut state = ReconciliationState {
-            store: None,
-            kernel: None,
+            store: Some(MockChild { id: 1, live: false }),
+            kernel: Some(MockChild { id: 2, live: true }),
             store_restart_attempts: 0,
             kernel_restart_attempts: 0,
         };
-        let disposition = reconcile_state_machine(
+        let result = reconcile_state_machine(
             &mut state,
-            |child| {
-                if child.is_some() {
-                    events.borrow_mut().push("observe Store");
-                }
-                mock_observation(child)
-            },
             mock_observation,
-            |_| Ok(()),
-            |_| Ok(()),
-            || {
-                events.borrow_mut().push("launch Store");
-                Ok(MockChild { id: 1, live: true })
+            mock_observation,
+            |_| {
+                events.borrow_mut().push("terminate Kernel");
+                Ok(())
             },
             || {
                 events.borrow_mut().push("launch Kernel");
-                Ok(MockChild { id: 2, live: true })
+                Ok(MockChild { id: 3, live: true })
             },
         );
-        assert_eq!(disposition, HostBranchDisposition::LiveAwaitingReadiness);
-        assert_eq!(
-            *events.borrow(),
-            ["launch Store", "observe Store", "launch Kernel"]
-        );
+        assert_eq!(result, Err(StoreRecoveryRequired::LateDead));
+        assert!(events.borrow().is_empty());
+        assert_eq!(state.store, Some(MockChild { id: 1, live: false }));
+        assert_eq!(state.kernel, Some(MockChild { id: 2, live: true }));
     }
 
     #[test]
@@ -18930,7 +18871,7 @@ mod tests {
                 store_restart_attempts: 0,
                 kernel_restart_attempts: 0,
             };
-            let disposition = reconcile_state_machine(
+            let result = reconcile_state_machine(
                 &mut state,
                 |child| {
                     if unknown {
@@ -18940,21 +18881,23 @@ mod tests {
                     }
                 },
                 mock_observation,
-                |_| Ok(()),
-                |_| Ok(()),
-                || {
-                    if unknown {
-                        Ok(MockChild { id: 8, live: true })
-                    } else {
-                        Err(())
-                    }
+                |_| {
+                    *kernel_launches.borrow_mut() += 1;
+                    Ok(())
                 },
                 || {
                     *kernel_launches.borrow_mut() += 1;
                     Ok(MockChild { id: 9, live: true })
                 },
             );
-            assert_eq!(disposition, HostBranchDisposition::BothDegraded);
+            assert_eq!(
+                result,
+                if unknown {
+                    Ok(HostBranchDisposition::BothDegraded)
+                } else {
+                    Err(StoreRecoveryRequired::LateDead)
+                }
+            );
             assert_eq!(*kernel_launches.borrow(), 0);
         }
     }
@@ -18974,8 +18917,6 @@ mod tests {
                 mock_observation,
                 mock_observation,
                 |_| Ok(()),
-                |_| Ok(()),
-                || Ok(MockChild { id: 8, live: true }),
                 || {
                     *kernel_launches.borrow_mut() += 1;
                     Ok(MockChild { id: 9, live: true })
@@ -18984,10 +18925,10 @@ mod tests {
         };
         assert_eq!(
             run(&mut state),
-            HostBranchDisposition::LiveAwaitingReadiness
+            Ok(HostBranchDisposition::LiveAwaitingReadiness)
         );
         state.kernel.as_mut().expect("kernel restart").live = false;
-        assert_eq!(run(&mut state), HostBranchDisposition::KernelDegraded);
+        assert_eq!(run(&mut state), Ok(HostBranchDisposition::KernelDegraded));
         assert_eq!(*kernel_launches.borrow(), 1);
     }
 
@@ -18999,24 +18940,22 @@ mod tests {
             store_restart_attempts: 0,
             kernel_restart_attempts: 0,
         };
-        let disposition = reconcile_state_machine(
+        let result = reconcile_state_machine(
             &mut state,
             mock_observation,
             mock_observation,
-            |_| Err(()),
             |_| Ok(()),
-            || Ok(MockChild { id: 8, live: true }),
             || Ok(MockChild { id: 10, live: true }),
         );
-        assert_eq!(disposition, HostBranchDisposition::StoreDegraded);
+        assert_eq!(result, Err(StoreRecoveryRequired::LateDead));
         assert_eq!(state.store, Some(MockChild { id: 7, live: false }));
     }
 
     #[test]
     fn reconcile_kernel_failure_retains_restarted_store() {
         let mut state = ReconciliationState {
-            store: None,
-            kernel: None,
+            store: Some(MockChild { id: 6, live: true }),
+            kernel: Some(MockChild { id: 5, live: false }),
             store_restart_attempts: 0,
             kernel_restart_attempts: 0,
         };
@@ -19024,13 +18963,14 @@ mod tests {
             &mut state,
             mock_observation,
             mock_observation,
-            |_| Ok(()),
-            |_| Ok(()),
-            || Ok(MockChild { id: 7, live: true }),
+            |kernel| {
+                kernel.take();
+                Ok(())
+            },
             || Err(()),
         );
-        assert_eq!(disposition, HostBranchDisposition::KernelDegraded);
-        assert_eq!(state.store, Some(MockChild { id: 7, live: true }));
+        assert_eq!(disposition, Ok(HostBranchDisposition::KernelDegraded));
+        assert_eq!(state.store, Some(MockChild { id: 6, live: true }));
         assert!(state.kernel.is_none());
     }
 
@@ -19056,15 +18996,13 @@ mod tests {
                         ReconciliationObservation::Dead
                     }
                 },
-                |_| Ok(()),
                 |kernel| {
                     kernel.take();
                     Ok(())
                 },
-                || Ok(MockChild { id: 3, live: true }),
                 || Ok(MockChild { id: 4, live: false }),
             );
-            assert_eq!(disposition, HostBranchDisposition::KernelDegraded);
+            assert_eq!(disposition, Ok(HostBranchDisposition::KernelDegraded));
             if observation == ReconciliationObservation::Dead {
                 assert!(state.kernel.is_none());
             } else {
@@ -19085,17 +19023,47 @@ mod tests {
             &mut state,
             mock_observation,
             mock_observation,
-            |_| Ok(()),
             |_| Err(()),
-            || Ok(MockChild { id: 3, live: true }),
             || Ok(MockChild { id: 4, live: true }),
         );
-        assert_eq!(disposition, HostBranchDisposition::KernelDegraded);
+        assert_eq!(disposition, Ok(HostBranchDisposition::KernelDegraded));
         assert_eq!(state.kernel, Some(MockChild { id: 2, live: false }));
     }
 
     #[test]
-    fn scm_store_death_routes_durable_recovery_before_fresh_readiness() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "race seam keeps durable ordering evidence adjacent"
+    )]
+    fn scm_store_late_dead_shared_route_records_intent_before_replacement() {
+        let source = include_str!("lib.rs");
+        let generic_start = source
+            .find("pub fn reconcile(")
+            .expect("HostJobBranches::reconcile source");
+        let generic_end = source[generic_start..]
+            .find("fn cutover_with_rollback(")
+            .map(|offset| generic_start + offset)
+            .expect("HostJobBranches::reconcile end");
+        let generic_source = &source[generic_start..generic_end];
+        assert!(
+            !generic_source.contains("relaunch_store("),
+            "generic branch reconciliation must not relaunch Store"
+        );
+        assert!(
+            !generic_source.contains("terminate_in_place(0xE017_0002)"),
+            "generic branch reconciliation must not terminate Store"
+        );
+        let composition_start = source
+            .find("pub fn reconcile_approved_contour(")
+            .expect("HostComposition::reconcile_approved_contour source");
+        let composition_end = source[composition_start..]
+            .find("fn reconcile_branch_readiness_at(")
+            .map(|offset| composition_start + offset)
+            .expect("HostComposition::reconcile_approved_contour end");
+        assert!(
+            source[composition_start..composition_end].contains("route_scm_store_recovery("),
+            "the production SCM seam must own late-dead routing"
+        );
         let request = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RecoverStore,
             PlatformHandle::new("scm-store-recovery-route").unwrap(),
@@ -19113,25 +19081,47 @@ mod tests {
         ));
         let events = RefCell::new(Vec::new());
         let mut fresh_readiness = false;
-        let route = route_scm_store_recovery(true, false, true, &request, |request| {
-            assert_eq!(request.operation, HostRuntimeControlOperation::RecoverStore);
-            super::persist_store_recovery_pending(&root, request, &host).unwrap();
-            assert!(
-                super::store_recovery_pending_path(&root, request.mutation_digest.as_str())
-                    .exists()
-            );
-            events.borrow_mut().push("outer-intent");
-            assert!(
-                super::store_recovery_pending_path(&root, request.mutation_digest.as_str())
-                    .exists()
-            );
-            events.borrow_mut().push("exact-store-termination");
-            events.borrow_mut().push("new-store-job-pid-image");
-            events.borrow_mut().push("fresh-probeready");
-            events.borrow_mut().push("readiness-journal");
-            fresh_readiness = true;
-            Ok(())
-        });
+        let mut generic_reconcile_calls = 0;
+        // The outer and generic guards both observed Live; the shared
+        // production discriminator receives the generic machine's late-dead
+        // result and must select execute_store_recovery.
+        let reconciled = {
+            generic_reconcile_calls += 1;
+            Err(HostError::StoreRecoveryRequired(
+                StoreRecoveryRequired::LateDead,
+            ))
+        };
+        let route = route_scm_store_recovery(
+            super::ScmStoreRecoveryObservation {
+                store_requires_restart: false,
+                kernel_live: true,
+                kernel_requires_activation: false,
+                store_present: true,
+            },
+            Some(reconciled),
+            &request,
+            |request| {
+                assert_eq!(request.operation, HostRuntimeControlOperation::RecoverStore);
+                super::persist_store_recovery_pending(&root, request, &host).unwrap();
+                assert!(
+                    super::store_recovery_pending_path(&root, request.mutation_digest.as_str())
+                        .exists()
+                );
+                events.borrow_mut().push("outer-intent");
+                assert!(
+                    super::store_recovery_pending_path(&root, request.mutation_digest.as_str())
+                        .exists()
+                );
+                events.borrow_mut().push("exact-store-termination");
+                events.borrow_mut().push("new-store-job-pid-image");
+                events.borrow_mut().push("fresh-probeready");
+                events.borrow_mut().push("readiness-journal");
+                fresh_readiness = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(generic_reconcile_calls, 1);
         assert_eq!(route, ScmStoreRecoveryRoute::Recovered);
         assert!(fresh_readiness, "Healthy requires fresh readiness evidence");
         assert_eq!(
@@ -19151,21 +19141,34 @@ mod tests {
         };
         assert_eq!(disposition, HostBranchDisposition::Healthy);
 
-        let mut direct_reconcile_calls = 0;
-        let fenced = route_scm_store_recovery(true, false, true, &request, |_| {
-            direct_reconcile_calls += 1;
-            Err(HostError::RecoveryRequired(
-                "jobs.reconcile bypass is forbidden".to_owned(),
-            ))
-        });
+        let fenced = route_scm_store_recovery(
+            super::ScmStoreRecoveryObservation {
+                store_requires_restart: true,
+                kernel_live: true,
+                kernel_requires_activation: false,
+                store_present: true,
+            },
+            None,
+            &request,
+            |_| Err(HostError::RecoveryRequired("recovery failed".to_owned())),
+        )
+        .unwrap();
         assert_eq!(
             fenced,
             ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::StoreDegraded)
         );
-        assert_eq!(direct_reconcile_calls, 1);
-        let both_fenced = route_scm_store_recovery(false, true, true, &request, |_| {
-            panic!("invalid Kernel must not invoke Store recovery")
-        });
+        let both_fenced = route_scm_store_recovery(
+            super::ScmStoreRecoveryObservation {
+                store_requires_restart: true,
+                kernel_live: false,
+                kernel_requires_activation: true,
+                store_present: true,
+            },
+            None,
+            &request,
+            |_| panic!("invalid Kernel must not invoke Store recovery"),
+        )
+        .unwrap();
         assert_eq!(
             both_fenced,
             ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::BothDegraded)
@@ -19198,8 +19201,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            HostError::RecoveryRequired(message)
-                if message == "dead Store requires Host-owned durable recovery"
+            HostError::StoreRecoveryRequired(StoreRecoveryRequired::LateDead)
         ));
     }
 
