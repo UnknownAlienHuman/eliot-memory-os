@@ -32,6 +32,30 @@ pub const HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR: &str =
 const MAX_QUEUE_DEPTH: usize = 32;
 const QUEUE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const WIRE: &str = "eliot.host.runtime-control.v2";
+const UNKNOWN_REF_TAG: &str = "unknown";
+const UNKNOWN_REF_REASONS: &[&str] = &[
+    "kernel-restart-validation",
+    "kernel-restart-queue-lock",
+    "kernel-restart-queue-full",
+    "kernel-restart-queue-response",
+    "kernel-restart",
+    "kernel-restart-reconcile",
+    "kernel-restart-reconcile-conflict",
+    "kernel-restart-pending",
+    "kernel-restart-reconcile-snapshot",
+    "kernel-restart-reconcile-unknown",
+];
+
+#[derive(Clone, Debug)]
+struct HostRuntimeControlResponseCapability(Arc<()>);
+
+impl PartialEq for HostRuntimeControlResponseCapability {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for HostRuntimeControlResponseCapability {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -77,17 +101,60 @@ fn request_digest_for(
     )
 }
 
-fn runtime_control_unknown_ref(
+pub(crate) fn runtime_control_unknown_ref(
     prefix: &str,
     request: &HostRuntimeControlRequest,
 ) -> PlatformHandle {
-    PlatformHandle::new(format!(
-        "{prefix}:operation={:?}:request_id={}:request_digest:{}",
-        request.operation,
+    let payload = serde_json::to_string(&(
+        canonical_operation_name(&request.operation),
         request.request_id.as_str(),
-        request.request_digest.as_str()
+        request.mutation_digest.as_str(),
+        request.request_digest.as_str(),
     ))
-    .unwrap_or_else(|_| unreachable!())
+    .unwrap_or_else(|_| unreachable!());
+    PlatformHandle::new(format!("{WIRE}:{UNKNOWN_REF_TAG}:{prefix}:{payload}"))
+        .unwrap_or_else(|_| unreachable!())
+}
+
+fn parse_runtime_control_unknown_ref(
+    pending_ref: &PlatformHandle,
+) -> Option<HostRuntimeControlRequest> {
+    let mut parts = pending_ref.as_str().splitn(4, ':');
+    let wire = parts.next()?;
+    let tag = parts.next()?;
+    let reason = parts.next()?;
+    let payload = parts.next()?;
+    if wire != WIRE || tag != UNKNOWN_REF_TAG || !UNKNOWN_REF_REASONS.contains(&reason) {
+        return None;
+    }
+    let (operation_name, request_id, mutation_digest, request_digest) =
+        serde_json::from_str::<(String, String, String, String)>(payload).ok()?;
+    if serde_json::to_string(&(
+        operation_name.as_str(),
+        request_id.as_str(),
+        mutation_digest.as_str(),
+        request_digest.as_str(),
+    ))
+    .ok()
+    .as_deref()
+        != Some(payload)
+    {
+        return None;
+    }
+    let operation = match operation_name.as_str() {
+        "RestartKernel" => HostRuntimeControlOperation::RestartKernel,
+        "ReconcileKernelRestart" => HostRuntimeControlOperation::ReconcileKernelRestart,
+        _ => return None,
+    };
+    let request = HostRuntimeControlRequest {
+        wire: PlatformHandle::new(wire.to_owned()).ok()?,
+        operation,
+        request_id: PlatformHandle::new(request_id).ok()?,
+        mutation_digest: PlatformHandle::new(mutation_digest).ok()?,
+        request_digest: PlatformHandle::new(request_digest).ok()?,
+        response_capability: None,
+    };
+    request.validate().ok().map(|_| request)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -98,6 +165,8 @@ pub struct HostRuntimeControlRequest {
     pub request_id: PlatformHandle,
     pub mutation_digest: PlatformHandle,
     pub request_digest: PlatformHandle,
+    #[serde(skip)]
+    response_capability: Option<HostRuntimeControlResponseCapability>,
 }
 
 impl HostRuntimeControlRequest {
@@ -131,6 +200,7 @@ impl HostRuntimeControlRequest {
             request_id,
             mutation_digest,
             request_digest,
+            response_capability: None,
         };
         value.validate().map_err(|e| e.to_string())?;
         Ok(value)
@@ -145,6 +215,19 @@ impl HostRuntimeControlRequest {
             request_id,
             mutation_digest,
         )
+    }
+
+    fn with_response_capability(
+        mut self,
+        capability: HostRuntimeControlResponseCapability,
+    ) -> Self {
+        self.response_capability = Some(capability);
+        self
+    }
+
+    #[allow(private_interfaces)]
+    pub(crate) fn response_capability(&self) -> Option<HostRuntimeControlResponseCapability> {
+        self.response_capability.clone()
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -234,6 +317,7 @@ impl HostKernelRestartReceipt {
     }
 }
 
+#[allow(private_interfaces)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "status",
@@ -241,31 +325,60 @@ impl HostKernelRestartReceipt {
     deny_unknown_fields
 )]
 pub enum HostRuntimeControlResponse {
-    Restarted { receipt: HostKernelRestartReceipt },
-    Unknown { pending_ref: PlatformHandle },
+    Restarted {
+        receipt: HostKernelRestartReceipt,
+        #[serde(skip)]
+        capability: Option<HostRuntimeControlResponseCapability>,
+    },
+    Unknown {
+        pending_ref: PlatformHandle,
+        #[serde(skip)]
+        capability: Option<HostRuntimeControlResponseCapability>,
+    },
 }
 
 impl HostRuntimeControlResponse {
+    pub(crate) fn restarted_for(
+        request: &HostRuntimeControlRequest,
+        receipt: HostKernelRestartReceipt,
+    ) -> Self {
+        Self::Restarted {
+            receipt,
+            capability: request.response_capability(),
+        }
+    }
+
+    pub(crate) fn unknown_for(
+        request: &HostRuntimeControlRequest,
+        pending_ref: PlatformHandle,
+    ) -> Self {
+        Self::Unknown {
+            pending_ref,
+            capability: request.response_capability(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Restarted { receipt } => receipt.validate(),
-            Self::Unknown { pending_ref } => {
-                if pending_ref.as_str().trim().is_empty() {
-                    return Err("pending_ref invalid".to_owned());
-                }
-                Ok(())
-            }
+            Self::Restarted { receipt, .. } => receipt.validate(),
+            Self::Unknown { pending_ref, .. } => parse_runtime_control_unknown_ref(pending_ref)
+                .map(|_| ())
+                .ok_or_else(|| "pending_ref is not canonical".to_owned()),
         }
     }
 }
 
-fn pending_ref_digest(pending_ref: &PlatformHandle) -> Option<&str> {
-    let (_, suffix) = pending_ref.as_str().rsplit_once(':')?;
-    (suffix.len() == 64
-        && suffix
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
-    .then_some(suffix)
+fn pending_ref_matches_request(
+    pending_ref: &PlatformHandle,
+    request: &HostRuntimeControlRequest,
+) -> bool {
+    parse_runtime_control_unknown_ref(pending_ref).is_some_and(|parsed| {
+        parsed.wire == request.wire
+            && parsed.operation == request.operation
+            && parsed.request_id == request.request_id
+            && parsed.mutation_digest == request.mutation_digest
+            && parsed.request_digest == request.request_digest
+    })
 }
 
 fn response_matches_request(
@@ -275,13 +388,24 @@ fn response_matches_request(
     if response.validate().is_err() {
         return false;
     }
+    let Some(expected_capability) = request.response_capability.as_ref() else {
+        return false;
+    };
     match response {
-        HostRuntimeControlResponse::Restarted { receipt } => {
-            receipt.request_digest == request.request_digest
+        HostRuntimeControlResponse::Restarted {
+            receipt,
+            capability,
+        } => {
+            capability.as_ref() == Some(expected_capability)
+                && receipt.request_digest == request.request_digest
                 && receipt.mutation_digest == request.mutation_digest
         }
-        HostRuntimeControlResponse::Unknown { pending_ref } => {
-            pending_ref_digest(pending_ref) == Some(request.request_digest.as_str())
+        HostRuntimeControlResponse::Unknown {
+            pending_ref,
+            capability,
+        } => {
+            capability.as_ref() == Some(expected_capability)
+                && pending_ref_matches_request(pending_ref, request)
         }
     }
 }
@@ -318,35 +442,43 @@ impl HostRuntimeControl {
 
     async fn handle(&self, request: &HostRuntimeControlRequest) -> HostRuntimeControlResponse {
         if request.validate().is_err() {
-            return HostRuntimeControlResponse::Unknown {
-                pending_ref: runtime_control_unknown_ref("kernel-restart-validation", request),
-            };
+            return HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("kernel-restart-validation", request),
+            );
         }
         let (reply, response) = oneshot::channel();
+        let queued_request = request
+            .clone()
+            .with_response_capability(HostRuntimeControlResponseCapability(Arc::new(())));
         {
             let Ok(mut q) = self.queue.lock() else {
-                return HostRuntimeControlResponse::Unknown {
-                    pending_ref: runtime_control_unknown_ref("kernel-restart-queue-lock", request),
-                };
+                return HostRuntimeControlResponse::unknown_for(
+                    request,
+                    runtime_control_unknown_ref("kernel-restart-queue-lock", request),
+                );
             };
             if q.len() >= MAX_QUEUE_DEPTH {
-                return HostRuntimeControlResponse::Unknown {
-                    pending_ref: runtime_control_unknown_ref("kernel-restart-queue-full", request),
-                };
+                return HostRuntimeControlResponse::unknown_for(
+                    request,
+                    runtime_control_unknown_ref("kernel-restart-queue-full", request),
+                );
             }
             q.push_back(HostRuntimeControlEnvelope {
-                request: request.clone(),
+                request: queued_request.clone(),
                 reply,
             });
         }
         match tokio::time::timeout(QUEUE_RESPONSE_TIMEOUT, response).await {
-            Ok(Ok(response)) if response_matches_request(request, &response) => response,
-            Ok(Ok(_)) => HostRuntimeControlResponse::Unknown {
-                pending_ref: runtime_control_unknown_ref("kernel-restart-queue-response", request),
-            },
-            Ok(Err(_)) | Err(_) => HostRuntimeControlResponse::Unknown {
-                pending_ref: runtime_control_unknown_ref("kernel-restart-queue-response", request),
-            },
+            Ok(Ok(response)) if response_matches_request(&queued_request, &response) => response,
+            Ok(Ok(_)) => HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("kernel-restart-queue-response", request),
+            ),
+            Ok(Err(_)) | Err(_) => HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("kernel-restart-queue-response", request),
+            ),
         }
     }
 
@@ -479,25 +611,15 @@ pub fn runtime_control_response_frame(
         .validate()
         .map_err(|_| "SessionFenced".to_owned())?;
     let digest = match response {
-        HostRuntimeControlResponse::Restarted { receipt } => {
+        HostRuntimeControlResponse::Restarted { receipt, .. } => {
             receipt.request_digest.as_str().to_owned()
         }
-        HostRuntimeControlResponse::Unknown { pending_ref } => {
-            let s = pending_ref.as_str();
-            if let Some(pos) = s.rfind(':') {
-                let suffix = &s[pos + 1..];
-                if suffix.len() == 64
-                    && suffix
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                {
-                    suffix.to_owned()
-                } else {
-                    s.to_owned()
-                }
-            } else {
-                s.to_owned()
-            }
+        HostRuntimeControlResponse::Unknown { pending_ref, .. } => {
+            parse_runtime_control_unknown_ref(pending_ref)
+                .ok_or_else(|| "SessionFenced".to_owned())?
+                .request_digest
+                .as_str()
+                .to_owned()
         }
     };
     let (request_id, request_identity) =
@@ -549,28 +671,15 @@ pub fn decode_runtime_control_response_frame(
         return Err("SessionFenced".to_owned());
     }
     match &response {
-        HostRuntimeControlResponse::Restarted { receipt } => {
+        HostRuntimeControlResponse::Restarted { receipt, .. } => {
             if frame_request_id.as_str() != receipt.request_digest.as_str() {
                 return Err("SessionFenced".to_owned());
             }
         }
-        HostRuntimeControlResponse::Unknown { pending_ref } => {
-            let s = pending_ref.as_str();
-            let expected = if let Some(pos) = s.rfind(':') {
-                let suffix = &s[pos + 1..];
-                if suffix.len() == 64
-                    && suffix
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                {
-                    suffix
-                } else {
-                    s
-                }
-            } else {
-                s
-            };
-            if frame_request_id.as_str() != expected {
+        HostRuntimeControlResponse::Unknown { pending_ref, .. } => {
+            let pending_request = parse_runtime_control_unknown_ref(pending_ref)
+                .ok_or_else(|| "SessionFenced".to_owned())?;
+            if frame_request_id.as_str() != pending_request.request_digest.as_str() {
                 return Err("SessionFenced".to_owned());
             }
         }
@@ -607,11 +716,54 @@ mod tests {
 
     #[test]
     fn response_rejects_empty_pending_ref() {
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("pending-ref-valid"),
+        )
+        .unwrap();
         let r = HostRuntimeControlResponse::Unknown {
-            pending_ref: handle("x"),
+            pending_ref: runtime_control_unknown_ref("kernel-restart", &request),
+            capability: None,
         };
         assert!(r.validate().is_ok());
+        let malformed = HostRuntimeControlResponse::Unknown {
+            pending_ref: handle("x"),
+            capability: None,
+        };
+        assert!(malformed.validate().is_err());
         assert!(PlatformHandle::new(" ".to_owned()).is_err());
+    }
+
+    #[test]
+    fn unknown_response_requires_canonical_exact_identity() {
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("unknown-canonical-request"),
+        )
+        .unwrap();
+        let capability = HostRuntimeControlResponseCapability(Arc::new(()));
+        let bound_request = request.clone().with_response_capability(capability.clone());
+        let arbitrary_prefix = HostRuntimeControlResponse::Unknown {
+            pending_ref: handle(format!(
+                "arbitrary-prefix:{}",
+                request.request_digest.as_str()
+            )),
+            capability: Some(capability.clone()),
+        };
+        assert!(arbitrary_prefix.validate().is_err());
+        assert!(!response_matches_request(&bound_request, &arbitrary_prefix));
+
+        let foreign = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("unknown-canonical-foreign"),
+        )
+        .unwrap();
+        let foreign_identity = HostRuntimeControlResponse::Unknown {
+            pending_ref: runtime_control_unknown_ref("kernel-restart", &foreign),
+            capability: Some(capability),
+        };
+        assert!(foreign_identity.validate().is_ok());
+        assert!(!response_matches_request(&bound_request, &foreign_identity));
     }
 
     #[test]
@@ -633,6 +785,28 @@ mod tests {
         let mut bad = good.clone();
         bad.store_fence = handle("0".repeat(64));
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn same_digest_forged_restarted_evidence_requires_private_capability() {
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("same-digest-forged-receipt"),
+        )
+        .unwrap();
+        let capability = HostRuntimeControlResponseCapability(Arc::new(()));
+        let bound_request = request.clone().with_response_capability(capability.clone());
+        let forged = HostRuntimeControlResponse::Restarted {
+            receipt: receipt_for(&request),
+            capability: None,
+        };
+        assert!(forged.validate().is_ok());
+        assert!(!response_matches_request(&bound_request, &forged));
+        let trusted = HostRuntimeControlResponse::Restarted {
+            receipt: receipt_for(&request),
+            capability: Some(capability),
+        };
+        assert!(response_matches_request(&bound_request, &trusted));
     }
 
     #[test]
@@ -744,6 +918,7 @@ mod tests {
         };
         let resp = HostRuntimeControlResponse::Restarted {
             receipt: receipt.clone(),
+            capability: None,
         };
         let rframe = runtime_control_response_frame("conn-2", &resp).unwrap();
         assert_eq!(
@@ -759,12 +934,21 @@ mod tests {
 
     #[test]
     fn frame_pending_unknown_is_bound_without_parallel_wire() {
-        let digest = "aa".repeat(32);
+        let request = HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("frame-pending-unknown"),
+            handle("aa".repeat(32)),
+        )
+        .unwrap();
         let pending = HostRuntimeControlResponse::Unknown {
-            pending_ref: handle(format!("kernel-restart-pending:{digest}")),
+            pending_ref: runtime_control_unknown_ref("kernel-restart-pending", &request),
+            capability: None,
         };
         let frame = runtime_control_response_frame("conn-3", &pending).unwrap();
-        assert_eq!(frame.request_id.as_ref().unwrap().as_str(), digest);
+        assert_eq!(
+            frame.request_id.as_ref().unwrap().as_str(),
+            request.request_digest.as_str()
+        );
         let decoded = decode_runtime_control_response_frame(&frame).unwrap();
         assert_eq!(decoded, pending);
     }
@@ -821,7 +1005,7 @@ mod tests {
         )
         .unwrap();
         let response = control.handle(&request).await;
-        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+        let HostRuntimeControlResponse::Unknown { pending_ref, .. } = response else {
             panic!("expected Unknown for queue-full");
         };
         assert!(pending_ref.as_str().contains(request.request_id.as_str()));
@@ -837,6 +1021,7 @@ mod tests {
             "conn-full",
             &HostRuntimeControlResponse::Unknown {
                 pending_ref: pending_ref.clone(),
+                capability: None,
             },
         )
         .unwrap();
@@ -849,7 +1034,13 @@ mod tests {
             request.request_digest.as_str()
         );
         let decoded = decode_runtime_control_response_frame(&frame).unwrap();
-        assert_eq!(decoded, HostRuntimeControlResponse::Unknown { pending_ref });
+        assert_eq!(
+            decoded,
+            HostRuntimeControlResponse::Unknown {
+                pending_ref,
+                capability: None,
+            }
+        );
     }
 
     fn receipt_for(request: &HostRuntimeControlRequest) -> HostKernelRestartReceipt {
@@ -894,22 +1085,29 @@ mod tests {
         let mut mutation_substitution = receipt_for(&request);
         mutation_substitution.mutation_digest = foreign.mutation_digest.clone();
         mutation_substitution.receipt_digest = mutation_substitution.computed_digest().unwrap();
+        let bound_request = request
+            .clone()
+            .with_response_capability(HostRuntimeControlResponseCapability(Arc::new(())));
         assert!(!response_matches_request(
-            &request,
+            &bound_request,
             &HostRuntimeControlResponse::Restarted {
                 receipt: mutation_substitution,
+                capability: None,
             }
         ));
         let queue_for_worker = Arc::clone(&queue);
         let foreign_for_worker = foreign.clone();
         tokio::spawn(async move {
             let envelope = pop_envelope(&queue_for_worker).await;
-            let _ = envelope.reply.send(HostRuntimeControlResponse::Restarted {
-                receipt: receipt_for(&foreign_for_worker),
-            });
+            let _ = envelope
+                .reply
+                .send(HostRuntimeControlResponse::restarted_for(
+                    &foreign_for_worker,
+                    receipt_for(&foreign_for_worker),
+                ));
         });
         let response = control.handle(&request).await;
-        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+        let HostRuntimeControlResponse::Unknown { pending_ref, .. } = response else {
             panic!("foreign Restarted response must become Unknown");
         };
         assert!(
@@ -939,12 +1137,13 @@ mod tests {
         let foreign_for_worker = foreign.clone();
         tokio::spawn(async move {
             let envelope = pop_envelope(&queue_for_worker).await;
-            let _ = envelope.reply.send(HostRuntimeControlResponse::Unknown {
-                pending_ref: runtime_control_unknown_ref("foreign-worker", &foreign_for_worker),
-            });
+            let _ = envelope.reply.send(HostRuntimeControlResponse::unknown_for(
+                &foreign_for_worker,
+                runtime_control_unknown_ref("kernel-restart", &foreign_for_worker),
+            ));
         });
         let response = control.handle(&request).await;
-        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+        let HostRuntimeControlResponse::Unknown { pending_ref, .. } = response else {
             panic!("foreign Unknown response must become Unknown");
         };
         assert!(
@@ -977,7 +1176,7 @@ mod tests {
             }
         });
         let response = control.handle(&request).await;
-        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+        let HostRuntimeControlResponse::Unknown { pending_ref, .. } = response else {
             panic!("expected Unknown for sender drop/timeout");
         };
         assert!(pending_ref.as_str().contains(request.request_id.as_str()));
@@ -986,6 +1185,7 @@ mod tests {
             "conn-drop",
             &HostRuntimeControlResponse::Unknown {
                 pending_ref: pending_ref.clone(),
+                capability: None,
             },
         )
         .unwrap();
@@ -1007,23 +1207,21 @@ mod tests {
         .unwrap();
         bad.request_digest = handle("b".repeat(64));
         let response = control.handle(&bad).await;
-        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+        let HostRuntimeControlResponse::Unknown { pending_ref, .. } = response else {
             panic!("expected Unknown for validation");
         };
         assert!(pending_ref.as_str().contains(bad.request_id.as_str()));
         assert!(pending_ref.as_str().contains(bad.request_digest.as_str()));
         let error_hash = sha256_hex(b"runtime-control-validation");
         assert!(!pending_ref.as_str().contains(&error_hash));
-        let frame = runtime_control_response_frame(
-            "conn-val",
-            &HostRuntimeControlResponse::Unknown {
-                pending_ref: pending_ref.clone(),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            frame.request_id.as_ref().unwrap().as_str(),
-            bad.request_digest.as_str()
+        assert!(
+            HostRuntimeControlResponse::Unknown {
+                pending_ref,
+                capability: None,
+            }
+            .validate()
+            .is_err(),
+            "invalid requests cannot be framed as canonical responses"
         );
     }
 
@@ -1044,7 +1242,7 @@ mod tests {
         )
         .unwrap();
         let response = control.handle(&request).await;
-        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+        let HostRuntimeControlResponse::Unknown { pending_ref, .. } = response else {
             panic!("expected Unknown for lock poison");
         };
         assert!(
