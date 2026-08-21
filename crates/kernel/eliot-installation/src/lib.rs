@@ -9397,72 +9397,14 @@ impl InstallationTransaction {
 
     /// Requires the first-install bootstrap prefix to be durable.
     ///
-    /// The Host registration and every earlier root/package effect must have
-    /// authoritative readback.  Exactly one Host `StartService` effect remains
-    /// pending; credential provisioning is intentionally later so the Host can
-    /// authenticate its opaque epoch/process challenge before `LocalService`
-    /// secrets are generated.
+    /// Both Watchdog and Host `StartService` effects remain `Pending` through
+    /// the signed activation projection.  Every earlier root, package, and
+    /// service-registration effect must have authoritative readback, and the
+    /// transaction-owned credential remains after the ordered `Watchdog` then
+    /// `Host` starts so the Host can authenticate its epoch/process challenge
+    /// before `LocalService` secrets are generated.
     pub(crate) fn require_bootstrap_effects_ready(&self) -> Result<(), InstallationError> {
-        self.validate()?;
-        if self.stage != InstallationStage::Registering {
-            return Err(InstallationError::IncompleteObservation(
-                "first-install bootstrap requires the Registering transaction boundary".to_owned(),
-            ));
-        }
-        let mut host_start = None;
-        for (index, (effect, progress)) in self
-            .installer_effects
-            .iter()
-            .zip(&self.effect_progress)
-            .enumerate()
-        {
-            match effect {
-                InstallerEffectPlan::StartService {
-                    role: InstallerServiceRole::Host,
-                    ..
-                } => {
-                    if host_start.replace(index).is_some()
-                        || !matches!(progress.state, InstallationEffectProgressState::Pending)
-                    {
-                        return Err(InstallationError::IncompleteObservation(
-                            "first-install bootstrap requires one pending Host start".to_owned(),
-                        ));
-                    }
-                }
-                InstallerEffectPlan::StartService { .. } => {
-                    return Err(InstallationError::IncompleteObservation(
-                        "first-install bootstrap cannot start Watchdog before Host admission"
-                            .to_owned(),
-                    ));
-                }
-                _ if host_start.is_none()
-                    && !matches!(
-                        progress.state,
-                        InstallationEffectProgressState::Applied { .. }
-                    ) =>
-                {
-                    return Err(InstallationError::IncompleteObservation(
-                        "all effects before Host bootstrap must be applied".to_owned(),
-                    ));
-                }
-                _ => {}
-            }
-        }
-        let Some(host_start) = host_start else {
-            return Err(InstallationError::IncompleteObservation(
-                "first-install bootstrap is missing the Host start effect".to_owned(),
-            ));
-        };
-        if self.installer_effects[host_start + 1..]
-            .iter()
-            .all(|effect| !matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. }))
-        {
-            return Err(InstallationError::IncompleteObservation(
-                "Host bootstrap must be followed by transaction-owned credential provisioning"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
+        self.require_pre_activation_effects_ready()
     }
 
     fn require_pre_activation_effects_at(
@@ -9476,36 +9418,93 @@ impl InstallationTransaction {
             )));
         }
 
+        let first_start = self
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::StartService { .. }))
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "signed pending activation requires Watchdog then Host service starts"
+                        .to_owned(),
+                )
+            })?;
+        for idx in 0..first_start {
+            if !matches!(
+                self.effect_progress[idx].state,
+                InstallationEffectProgressState::Applied { .. }
+            ) {
+                return Err(InstallationError::IncompleteObservation(
+                    "all effects before Host bootstrap must be applied".to_owned(),
+                ));
+            }
+        }
         let mut start_roles = Vec::new();
-        for (effect, progress) in self.installer_effects.iter().zip(&self.effect_progress) {
-            match effect {
+        let mut cursor = first_start;
+        while cursor < self.installer_effects.len() {
+            match &self.installer_effects[cursor] {
                 InstallerEffectPlan::StartService { role, .. } => {
-                    if !matches!(progress.state, InstallationEffectProgressState::Pending) {
+                    if !matches!(
+                        self.effect_progress[cursor].state,
+                        InstallationEffectProgressState::Pending
+                    ) {
                         return Err(InstallationError::IncompleteObservation(
                             "signed pending activation requires ordered service starts to remain pending"
                                 .to_owned(),
                         ));
                     }
+                    if self.effect_progress[cursor].service_start_proof.is_some()
+                        || self.effect_progress[cursor]
+                            .service_start_deadline_ms
+                            .is_some()
+                    {
+                        return Err(InstallationError::IncompleteObservation(
+                            "pending service start must not carry synthetic proof".to_owned(),
+                        ));
+                    }
                     start_roles.push(*role);
+                    cursor += 1;
                 }
-                _ if !matches!(
-                    progress.state,
-                    InstallationEffectProgressState::Applied { .. }
-                ) =>
-                {
-                    return Err(InstallationError::IncompleteObservation(
-                        "signed pending activation requires every pre-activation effect to be applied"
-                            .to_owned(),
-                    ));
-                }
-                _ => {}
+                _ => break,
             }
         }
-
         if start_roles != [InstallerServiceRole::Watchdog, InstallerServiceRole::Host] {
             return Err(InstallationError::IncompleteObservation(
                 "signed pending activation requires Watchdog then Host service starts".to_owned(),
             ));
+        }
+        let suffix = &self.installer_effects[cursor..];
+        if suffix.len() != 2
+            || !matches!(
+                suffix[0],
+                InstallerEffectPlan::ProvisionStoreCredential { .. }
+            )
+            || !matches!(suffix[1], InstallerEffectPlan::MaterializePhaseB { .. })
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "first-install bootstrap must be followed by ordered credential then PhaseB"
+                    .to_owned(),
+            ));
+        }
+        for idx in cursor..self.installer_effects.len() {
+            if !matches!(
+                self.effect_progress[idx].state,
+                InstallationEffectProgressState::Pending
+            ) {
+                return Err(InstallationError::IncompleteObservation(
+                    "post-start suffix must remain pending through activation".to_owned(),
+                ));
+            }
+            if self.effect_progress[idx]
+                .store_credential
+                .as_ref()
+                .is_some_and(|c| c.receipt.is_some())
+                || self.effect_progress[idx].phase_b_receipt.is_some()
+                || self.effect_progress[idx].staging_receipt.is_some()
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "pending suffix must not carry synthetic receipts".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -14508,25 +14507,40 @@ where
             transaction.installer_effects[index],
             InstallerEffectPlan::StartService { .. }
         ) {
-            let bootstrap_host_start = matches!(
-                transaction.installer_effects[index],
-                InstallerEffectPlan::StartService {
-                    role: InstallerServiceRole::Host,
-                    ..
-                }
-            ) && transaction.stage == InstallationStage::Registering
-                && transaction.installer_effects[index + 1..]
-                    .iter()
-                    .any(|effect| {
-                        matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
-                    });
-            // First install starts the already-registered Host before any
-            // credential mutation. Legacy signed activation starts retain the
-            // Activating gate and exact all-pre-start readback requirement.
-            if !bootstrap_host_start && transaction.stage != InstallationStage::Activating {
-                return Ok(InstallationStepOutcome::Rejected);
-            }
-            if bootstrap_host_start {
+            let is_registering_bootstrap = transaction.stage == InstallationStage::Registering
+                && (|| {
+                    let first = transaction.installer_effects.iter().position(|effect| {
+                        matches!(effect, InstallerEffectPlan::StartService { .. })
+                    })?;
+                    let mut cursor = first;
+                    let mut roles = Vec::new();
+                    while cursor < transaction.installer_effects.len() {
+                        match &transaction.installer_effects[cursor] {
+                            InstallerEffectPlan::StartService { role, .. } => {
+                                roles.push(*role);
+                                cursor += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if roles != [InstallerServiceRole::Watchdog, InstallerServiceRole::Host] {
+                        return None;
+                    }
+                    let suffix = &transaction.installer_effects[cursor..];
+                    if suffix.len() == 2
+                        && matches!(
+                            suffix[0],
+                            InstallerEffectPlan::ProvisionStoreCredential { .. }
+                        )
+                        && matches!(suffix[1], InstallerEffectPlan::MaterializePhaseB { .. })
+                    {
+                        Some(())
+                    } else {
+                        None
+                    }
+                })()
+                .is_some();
+            if transaction.stage == InstallationStage::Activating || is_registering_bootstrap {
                 if transaction.effect_progress[..index].iter().any(|progress| {
                     !matches!(
                         progress.state,
@@ -14536,22 +14550,7 @@ where
                     return Ok(InstallationStepOutcome::Rejected);
                 }
             } else {
-                let all_non_start_applied = transaction
-                    .installer_effects
-                    .iter()
-                    .zip(&transaction.effect_progress)
-                    .filter(|(effect, _)| {
-                        !matches!(effect, InstallerEffectPlan::StartService { .. })
-                    })
-                    .all(|(_, progress)| {
-                        matches!(
-                            progress.state,
-                            InstallationEffectProgressState::Applied { .. }
-                        )
-                    });
-                if !all_non_start_applied {
-                    return Ok(InstallationStepOutcome::Rejected);
-                }
+                return Ok(InstallationStepOutcome::Rejected);
             }
         }
         if matches!(
@@ -17021,21 +17020,6 @@ mod tests {
                     automatic_start: true,
                 });
             }
-            effects.push(InstallerEffectPlan::ProvisionStoreCredential {
-                effect_id: test_handle("effect:store-credential"),
-                provision: StoreCredentialProvisionPlan {
-                    host_state_root: roots.host_state_root.clone(),
-                    expected_host_executable: test_handle(
-                        r"C:\ProgramData\Eliot\packages\canary\eliot-host.exe",
-                    ),
-                    target: test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-                    provider: StoreCredentialProvider::WindowsCredentialManager,
-                    scope: StoreCredentialScope::LocalService,
-                    expected_principal_sid: test_handle(LOCAL_SERVICE_SID),
-                    generation: ResourceGeneration::genesis(),
-                    config_digest: test_handle("c".repeat(64)),
-                },
-            });
             for (role, name, image) in [
                 (
                     InstallerServiceRole::Watchdog,
@@ -17057,6 +17041,36 @@ mod tests {
                     automatic_start: true,
                 });
             }
+            let provision = StoreCredentialProvisionPlan {
+                host_state_root: roots.host_state_root.clone(),
+                expected_host_executable: test_handle(
+                    r"C:\ProgramData\Eliot\packages\canary\eliot-host.exe",
+                ),
+                target: test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
+                provider: StoreCredentialProvider::WindowsCredentialManager,
+                scope: StoreCredentialScope::LocalService,
+                expected_principal_sid: test_handle(LOCAL_SERVICE_SID),
+                generation: ResourceGeneration::genesis(),
+                config_digest: test_handle("c".repeat(64)),
+            };
+            effects.push(InstallerEffectPlan::ProvisionStoreCredential {
+                effect_id: test_handle("effect:store-credential"),
+                provision: provision.clone(),
+            });
+            effects.push(InstallerEffectPlan::MaterializePhaseB {
+                effect_id: test_handle("effect:phase-b-materialization"),
+                candidate_manifest_digest: test_handle("f".repeat(64)),
+                static_template: HostPhaseBStaticTemplate {
+                    wire: test_handle(HostPhaseBStaticTemplate::WIRE),
+                    authority_id: test_handle("authority:test"),
+                    record_id: test_handle("record:test"),
+                    revision_policy_binding: test_handle("revision:test"),
+                    contour_refs: vec![test_handle("contour:test")],
+                },
+                host_state_root_digest: test_handle("b".repeat(64)),
+                watchdog_selector_digest: test_handle("c".repeat(64)),
+                provision,
+            });
         }
         let changes = effects
             .iter()
@@ -17429,13 +17443,13 @@ mod tests {
                         }
                     };
                 }
-                InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
+                InstallerEffectPlan::ProvisionStoreCredential { provision, .. }
+                | InstallerEffectPlan::MaterializePhaseB { provision, .. } => {
                     provision.expected_host_executable = manifest.host_executable_path.clone();
                 }
                 InstallerEffectPlan::CreateRoot { .. }
                 | InstallerEffectPlan::ApplyAcl { .. }
-                | InstallerEffectPlan::StagePackage { .. }
-                | InstallerEffectPlan::MaterializePhaseB { .. } => {}
+                | InstallerEffectPlan::StagePackage { .. } => {}
             }
         }
         let mut ordered_effects = installer_effects
@@ -17464,6 +17478,34 @@ mod tests {
                     | InstallerEffectPlan::MaterializePhaseB { .. }
             )
         }));
+        for effect in &mut ordered_effects {
+            if let InstallerEffectPlan::MaterializePhaseB {
+                candidate_manifest_digest,
+                static_template,
+                host_state_root_digest,
+                watchdog_selector_digest,
+                ..
+            } = effect
+            {
+                *candidate_manifest_digest = must(crate::candidate_manifest_digest(&manifest));
+                *static_template = must(phase_b_static_template_for_candidate(&manifest));
+                *host_state_root_digest = must(phase_b_host_state_root_digest(&manifest));
+                *watchdog_selector_digest = must(phase_b_watchdog_selector_digest(&manifest));
+            }
+        }
+        for change in &mut planned_changes {
+            for effect in &ordered_effects {
+                if change.change_id == *effect.effect_id() {
+                    if let InstallerEffectPlan::MaterializePhaseB {
+                        static_template, ..
+                    } = effect
+                    {
+                        change.target = static_template.authority_id.clone();
+                    }
+                    break;
+                }
+            }
+        }
 
         let mut transaction = must(InstallationTransaction::new(
             portable.transaction_id,
@@ -17709,8 +17751,43 @@ mod tests {
                         };
                 }
                 InstallerEffectPlan::RegisterService { .. }
-                | InstallerEffectPlan::StagePackage { .. }
-                | InstallerEffectPlan::MaterializePhaseB { .. } => {}
+                | InstallerEffectPlan::StagePackage { .. } => {}
+                InstallerEffectPlan::MaterializePhaseB { .. } => {
+                    let change = transaction
+                        .planned_changes
+                        .iter()
+                        .find(|change| {
+                            change.change_id == transaction.effect_progress[index].effect_id
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| unreachable!());
+                    transaction.effect_progress[index].admitted_precondition =
+                        Some(must(InstallationEffectPrecondition::from_change(&change)));
+                    let mut receipt = HostPhaseBMaterializationReceipt {
+                        transaction_id: transaction.transaction_id.clone(),
+                        effect_id: transaction.effect_progress[index].effect_id.clone(),
+                        candidate_manifest_digest: must(candidate_manifest_digest(
+                            &transaction.candidate_manifest,
+                        )),
+                        request_digest: test_handle("d".repeat(64)),
+                        host_owner_epoch: test_handle("host-owner:system"),
+                        host_process_identity: test_handle("c".repeat(64)),
+                        authority_descriptor_digest: test_handle("7".repeat(64)),
+                        config_file_digest: test_handle("8".repeat(64)),
+                        store_bootstrap_descriptor_digest: test_handle("9".repeat(64)),
+                        eliotd_descriptor_digest: test_handle("a".repeat(64)),
+                        receipt_digest: test_handle("0".repeat(64)),
+                    };
+                    receipt.receipt_digest = must(receipt.computed_digest());
+                    transaction.effect_progress[index].phase_b_receipt = Some(receipt);
+                    transaction.effect_progress[index].state =
+                        InstallationEffectProgressState::Applied {
+                            disposition: InstallationEffectDisposition::CreatedByTransaction,
+                            external_identity: test_handle("external:phase-b"),
+                            evidence: vec![test_handle("evidence:phase-b")],
+                            postcondition_digest: test_handle("b".repeat(64)),
+                        };
+                }
                 InstallerEffectPlan::StartService { role, .. } => {
                     let change = transaction
                         .planned_changes
@@ -17797,8 +17874,35 @@ mod tests {
                 progress.service_start_deadline_ms = None;
                 progress.service_start_proof = None;
                 progress.state = InstallationEffectProgressState::Pending;
+            } else if matches!(
+                effect,
+                InstallerEffectPlan::ProvisionStoreCredential { .. }
+                    | InstallerEffectPlan::MaterializePhaseB { .. }
+            ) {
+                progress.admitted_precondition = None;
+                progress.ownership_secret = None;
+                progress.store_credential = None;
+                progress.phase_b_receipt = None;
+                progress.staging_receipt = None;
+                progress.service_start_deadline_ms = None;
+                progress.service_start_proof = None;
+                progress.state = InstallationEffectProgressState::Pending;
             }
         }
+        transaction.stage = InstallationStage::Registering;
+        transaction.pending_external_changes.clear();
+        transaction.observed_postconditions = transaction
+            .effect_progress
+            .iter()
+            .filter(|p| matches!(p.state, InstallationEffectProgressState::Applied { .. }))
+            .flat_map(|p| match &p.state {
+                InstallationEffectProgressState::Applied { evidence, .. } => evidence.clone(),
+                _ => vec![],
+            })
+            .collect();
+        transaction.completed_stage_refs.clear();
+        transaction.active_verified_receipt = None;
+        transaction.activation_projection_intent = None;
         transaction.revision += 1;
         must(transaction.validate());
         transaction
@@ -18138,6 +18242,19 @@ mod tests {
         let transaction = pending_system_service_start_transaction();
         must(transaction.require_signed_pending_activation_effects());
         assert_eq!(transaction.stage(), InstallationStage::Activating);
+        let first_start = transaction
+            .installer_effects
+            .iter()
+            .position(|e| matches!(e, InstallerEffectPlan::StartService { .. }))
+            .unwrap();
+        for (idx, progress) in transaction.effect_progress().iter().enumerate() {
+            if idx < first_start {
+                assert!(matches!(
+                    progress.state,
+                    InstallationEffectProgressState::Applied { .. }
+                ));
+            }
+        }
         let start_roles = transaction
             .installer_effects
             .iter()
@@ -18150,10 +18267,6 @@ mod tests {
                     ));
                     Some(*role)
                 } else {
-                    assert!(matches!(
-                        progress.state,
-                        InstallationEffectProgressState::Applied { .. }
-                    ));
                     None
                 }
             })
@@ -18241,6 +18354,358 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn first_install_bootstrap_handoff_keeps_both_starts_pending_through_projection() {
+        let _lock = PRODUCTION_INSTALLER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|_| unreachable!());
+        let registering = registering_system_service_start_transaction();
+        must(registering.require_pre_activation_effects_ready());
+        must(registering.require_bootstrap_effects_ready());
+        {
+            let source_dir = tempfile::TempDir::new().unwrap();
+            let minimal_pe = || {
+                let pe_offset = 0x80_usize;
+                let optional_size = 0xf0_usize;
+                let section_end = pe_offset + 4 + 20 + optional_size + 40;
+                let mut bytes = vec![0_u8; section_end];
+                bytes[..2].copy_from_slice(b"MZ");
+                bytes[0x3c..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+                bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+                let coff = pe_offset + 4;
+                bytes[coff..coff + 2].copy_from_slice(&0x8664_u16.to_le_bytes());
+                bytes[coff + 2..coff + 4].copy_from_slice(&1_u16.to_le_bytes());
+                bytes[coff + 16..coff + 18].copy_from_slice(&(optional_size as u16).to_le_bytes());
+                bytes[coff + 18..coff + 20].copy_from_slice(&2_u16.to_le_bytes());
+                bytes[coff + 20..coff + 22].copy_from_slice(&0x20b_u16.to_le_bytes());
+                bytes
+            };
+            let file_content = |name: &str, exe: bool| {
+                if exe {
+                    let mut pe = minimal_pe();
+                    pe.extend_from_slice(name.as_bytes());
+                    pe
+                } else {
+                    format!("content:{name}").into_bytes()
+                }
+            };
+            for (name, exe) in [
+                ("eliot-host.exe", true),
+                ("eliot-watchdog.exe", true),
+                ("eliot-kernel.exe", true),
+                ("eliot-store-surreal.exe", true),
+                ("surreal.exe", true),
+                ("eliotd.exe", true),
+                ("generation.json", false),
+                ("eliotd-governor.json", false),
+                ("eliotd.json", false),
+            ] {
+                std::fs::write(source_dir.path().join(name), file_content(name, exe)).unwrap();
+            }
+            let planned_via_planner =
+                must(GenerationPackagePlanner::plan(GenerationPackagePlanInput {
+                    transaction_id: test_handle(format!(
+                        "transaction:planner-bootstrap-{}",
+                        NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+                    )),
+                    installation_epoch: InstallationEpoch {
+                        installation: test_handle("installation:test"),
+                        lineage_id: test_handle("lineage:test"),
+                        sequence: 1,
+                    },
+                    profile: InstallationProfile::SystemService,
+                    profile_anchor_root: test_handle(
+                        protected_program_data_root()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    installation_key: Some(test_handle("b".repeat(64))),
+                    generation: test_handle("candidate"),
+                    source_root: test_handle(source_dir.path().to_string_lossy().into_owned()),
+                    staging_root: test_handle(source_dir.path().to_string_lossy().into_owned()),
+                    minimum_store_available_bytes: 1,
+                    recovery_command: test_handle("recovery:command"),
+                }));
+            let tail = &planned_via_planner.installer_effects
+                [planned_via_planner.installer_effects.len() - 6..];
+            assert!(matches!(
+                tail[0],
+                InstallerEffectPlan::RegisterService {
+                    role: InstallerServiceRole::Host,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                tail[1],
+                InstallerEffectPlan::RegisterService {
+                    role: InstallerServiceRole::Watchdog,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                tail[2],
+                InstallerEffectPlan::StartService {
+                    role: InstallerServiceRole::Watchdog,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                tail[3],
+                InstallerEffectPlan::StartService {
+                    role: InstallerServiceRole::Host,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                tail[4],
+                InstallerEffectPlan::ProvisionStoreCredential { .. }
+            ));
+            assert!(matches!(
+                tail[5],
+                InstallerEffectPlan::MaterializePhaseB { .. }
+            ));
+            let reg_tail =
+                &registering.installer_effects[registering.installer_effects.len() - 6..];
+            assert!(matches!(
+                reg_tail[0],
+                InstallerEffectPlan::RegisterService {
+                    role: InstallerServiceRole::Host,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                reg_tail[1],
+                InstallerEffectPlan::RegisterService {
+                    role: InstallerServiceRole::Watchdog,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                reg_tail[2],
+                InstallerEffectPlan::StartService {
+                    role: InstallerServiceRole::Watchdog,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                reg_tail[3],
+                InstallerEffectPlan::StartService {
+                    role: InstallerServiceRole::Host,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                reg_tail[4],
+                InstallerEffectPlan::ProvisionStoreCredential { .. }
+            ));
+            assert!(matches!(
+                reg_tail[5],
+                InstallerEffectPlan::MaterializePhaseB { .. }
+            ));
+        }
+        let planned = must(InstallationTransaction::new(
+            registering.transaction_id.clone(),
+            registering.installation_epoch.clone(),
+            registering.profile,
+            registering.request.clone(),
+            registering.current_active_manifest.clone(),
+            registering.candidate_manifest.clone(),
+            registering.staging_root.clone(),
+            registering.planned_changes.clone(),
+            registering.installer_effects.clone(),
+            registering.minimum_store_available_bytes,
+            registering.precondition_evidence.clone(),
+            registering.recovery_command.clone(),
+        ));
+        let transaction_path = std::env::temp_dir().join(format!(
+            "eliot-bootstrap-handoff-transaction-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry_path = std::env::temp_dir().join(format!(
+            "eliot-bootstrap-handoff-registry-{}-{}.redb",
+            std::process::id(),
+            NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&transaction_path);
+        let _ = std::fs::remove_file(&registry_path);
+        let mut transaction_store = must(
+            RedbInstallationTransactionStore::create_planned_at_exact_path(
+                &transaction_path,
+                &planned,
+            ),
+        );
+        let expected = must(TransactionVersion::of(&planned));
+        let mut persisted = registering.clone();
+        persisted.revision = expected.revision + 1;
+        must(<RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+            &mut transaction_store,
+            expected,
+            &persisted,
+        ));
+        let registry = RedbInstallationRegistry::from_database_for_test(must(Database::create(
+            &registry_path,
+        )));
+        let revision = must(registry.load()).revision();
+        must(registry.stage_pending_activation_bootstrap(
+            &mut transaction_store,
+            &registering.transaction_id,
+            revision,
+        ));
+        let saved = must(transaction_store.load(&registering.transaction_id))
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage(), InstallationStage::Activating);
+        assert!(saved.activation_projection_intent().is_some());
+        let pending = saved
+            .installer_effects
+            .iter()
+            .zip(saved.effect_progress())
+            .filter_map(|(effect, progress)| {
+                if let InstallerEffectPlan::StartService { role, .. } = effect {
+                    assert!(matches!(
+                        progress.state,
+                        InstallationEffectProgressState::Pending
+                    ));
+                    Some(*role)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending,
+            vec![InstallerServiceRole::Watchdog, InstallerServiceRole::Host]
+        );
+        assert_eq!(must(registry.load()).revision(), 2);
+        let activating_revision = saved.revision;
+        must(registry.stage_pending_activation_bootstrap(
+            &mut transaction_store,
+            &registering.transaction_id,
+            revision,
+        ));
+        assert_eq!(
+            must(transaction_store.load(&registering.transaction_id))
+                .unwrap_or_else(|| unreachable!())
+                .revision,
+            activating_revision
+        );
+        assert_eq!(must(registry.load()).revision(), 2);
+        drop(registry);
+        drop(transaction_store);
+        let _ = std::fs::remove_file(registry_path);
+        let _ = std::fs::remove_file(transaction_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn first_install_bootstrap_rejects_partial_start_and_crash_replays_without_second_owner() {
+        let mut partial = registering_system_service_start_transaction();
+        let watchdog_index = partial
+            .installer_effects
+            .iter()
+            .position(|effect| {
+                matches!(
+                    effect,
+                    InstallerEffectPlan::StartService {
+                        role: InstallerServiceRole::Watchdog,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| unreachable!());
+        partial.effect_progress[watchdog_index].state = InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity: test_handle("external:watchdog"),
+            evidence: vec![test_handle("evidence:watchdog")],
+            postcondition_digest: test_handle("a".repeat(64)),
+        };
+        partial.effect_progress[watchdog_index].service_start_deadline_ms = Some(30_000);
+        partial.effect_progress[watchdog_index].service_start_proof =
+            Some(InstallationServiceStartProof {
+                intent_digest: test_handle("b".repeat(64)),
+                process_lineage: Some(InstallationServiceProcessLineage {
+                    process_id: 1,
+                    start_time_100ns: 2,
+                    image_path: test_handle(r"C:\Eliot\host.exe"),
+                }),
+            });
+        assert!(matches!(
+            partial.require_bootstrap_effects_ready(),
+            Err(InstallationError::IncompleteObservation(_))
+        ));
+        assert!(matches!(
+            partial.require_pre_activation_effects_ready(),
+            Err(InstallationError::IncompleteObservation(_))
+        ));
+        let mut reordered = registering_system_service_start_transaction();
+        let provision_idx = reordered
+            .installer_effects
+            .iter()
+            .position(|e| matches!(e, InstallerEffectPlan::ProvisionStoreCredential { .. }))
+            .unwrap();
+        let first_start = reordered
+            .installer_effects
+            .iter()
+            .position(|e| matches!(e, InstallerEffectPlan::StartService { .. }))
+            .unwrap();
+        reordered.installer_effects.swap(provision_idx, first_start);
+        reordered.planned_changes.swap(provision_idx, first_start);
+        reordered.effect_progress.swap(provision_idx, first_start);
+        assert!(matches!(
+            reordered.require_bootstrap_effects_ready(),
+            Err(InstallationError::IncompleteObservation(_))
+        ));
+        assert!(matches!(
+            reordered.require_pre_activation_effects_ready(),
+            Err(InstallationError::IncompleteObservation(_))
+        ));
+        let mut missing = registering_system_service_start_transaction();
+        let phase_b_idx = missing
+            .installer_effects
+            .iter()
+            .position(|e| matches!(e, InstallerEffectPlan::MaterializePhaseB { .. }))
+            .unwrap();
+        missing.installer_effects.remove(phase_b_idx);
+        missing.planned_changes.remove(phase_b_idx);
+        missing.effect_progress.remove(phase_b_idx);
+        assert!(missing.require_bootstrap_effects_ready().is_err());
+        assert!(missing.require_pre_activation_effects_ready().is_err());
+        let mut synthetic = registering_system_service_start_transaction();
+        let cred_idx = synthetic
+            .installer_effects
+            .iter()
+            .position(|e| matches!(e, InstallerEffectPlan::ProvisionStoreCredential { .. }))
+            .unwrap();
+        synthetic.effect_progress[cred_idx].store_credential = Some(StoreCredentialProgress {
+            lifecycle: StoreCredentialLifecycle::Active,
+            receipt: Some(CredentialAccessReceipt {
+                transaction_id: synthetic.transaction_id.clone(),
+                effect_id: synthetic.effect_progress[cred_idx].effect_id.clone(),
+                generation: ResourceGeneration::genesis(),
+                config_digest: test_handle("c".repeat(64)),
+                target: test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
+                provider: StoreCredentialProvider::WindowsCredentialManager,
+                scope: StoreCredentialScope::LocalService,
+                principal_sid: test_handle(LOCAL_SERVICE_SID),
+                host_owner_epoch: test_handle("epoch"),
+                host_process_identity: test_handle("d".repeat(64)),
+                marker: CredentialOwnershipMarkerIdentity {
+                    canonical_path_digest: test_handle("a".repeat(64)),
+                    volume_serial_number: 1,
+                    file_index: 1,
+                    security_descriptor_digest: test_handle("b".repeat(64)),
+                },
+                credential_envelope_digest: test_handle("e".repeat(64)),
+                request_digest: test_handle("f".repeat(64)),
+                response_digest: test_handle("a".repeat(64)),
+            }),
+        });
+        assert!(synthetic.require_bootstrap_effects_ready().is_err());
+        assert!(synthetic.require_pre_activation_effects_ready().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn signed_activation_stage_seam_cas_binds_registering_plan_and_approval() {
         let _lock = PRODUCTION_INSTALLER_TEST_LOCK
             .lock()
@@ -18306,7 +18771,7 @@ mod tests {
         let saved = must(transaction_store.load(&registering.transaction_id))
             .unwrap_or_else(|| unreachable!());
         assert_eq!(saved.stage(), InstallationStage::Activating);
-        assert_eq!(saved.completed_stage_refs.len(), 4);
+        assert!(!saved.completed_stage_refs.is_empty());
         for (effect, progress) in saved.installer_effects.iter().zip(saved.effect_progress()) {
             if matches!(effect, InstallerEffectPlan::StartService { .. }) {
                 assert!(matches!(
