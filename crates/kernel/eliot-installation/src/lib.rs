@@ -21246,6 +21246,132 @@ mod tests {
     }
 
     #[test]
+    fn canonical_transaction_rejects_reordered_watchdog_host() {
+        let transaction = pending_system_service_start_transaction();
+        let mut effects = transaction.installer_effects.clone();
+        let mut changes = transaction.planned_changes.clone();
+        let watchdog = effects
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    InstallerEffectPlan::StartService {
+                        role: InstallerServiceRole::Watchdog,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let host = effects
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    InstallerEffectPlan::StartService {
+                        role: InstallerServiceRole::Host,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        effects.swap(watchdog, host);
+        changes.swap(watchdog, host);
+        let roots = &transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots;
+        let target = &transaction.candidate_manifest.store_credential_target;
+        assert!(
+            validate_installer_effects(transaction.profile, roots, target, &changes, &effects)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn start_service_rejects_wrong_automatic_start() {
+        let transaction = pending_system_service_start_transaction();
+        let mut effects = transaction.installer_effects.clone();
+        for effect in &mut effects {
+            if let InstallerEffectPlan::StartService {
+                automatic_start, ..
+            } = effect
+            {
+                *automatic_start = false;
+                break;
+            }
+        }
+        let roots = &transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots;
+        let target = &transaction.candidate_manifest.store_credential_target;
+        assert!(
+            validate_installer_effects(
+                transaction.profile,
+                roots,
+                target,
+                &transaction.planned_changes,
+                &effects,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn service_start_deadline_must_be_durable_for_intent() {
+        let mut transaction = pending_system_service_start_transaction();
+        let idx = transaction
+            .installer_effects
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    InstallerEffectPlan::StartService {
+                        role: InstallerServiceRole::Watchdog,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        transaction.effect_progress[idx].service_start_deadline_ms = None;
+        transaction.effect_progress[idx].state = InstallationEffectProgressState::IntentCommitted {
+            attempt: 1,
+            intent_digest: test_handle("a".repeat(64)),
+        };
+        assert!(transaction.validate().is_err());
+    }
+
+    #[test]
+    fn unknown_start_preserves_intent_does_not_auto_retry() {
+        let mut transaction = pending_system_service_start_transaction();
+        let idx = transaction
+            .installer_effects
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    InstallerEffectPlan::StartService {
+                        role: InstallerServiceRole::Watchdog,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        transaction.effect_progress[idx].state = InstallationEffectProgressState::Unknown {
+            pending_ref: test_handle("pending:unknown-start"),
+        };
+        transaction.stage = InstallationStage::RollbackRequired;
+        transaction.pending_external_changes = vec![test_handle("pending:unknown-start")];
+        transaction.revision = 9;
+        assert!(transaction.validate().is_ok());
+        assert!(
+            transaction.effect_progress[idx]
+                .service_start_proof
+                .is_none()
+        );
+    }
+
+    #[test]
     fn ordered_watchdog_then_host_starts_are_canonical() {
         let transaction = pending_system_service_start_transaction();
         let mut roles = Vec::new();
