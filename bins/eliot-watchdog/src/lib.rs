@@ -2924,8 +2924,7 @@ fn verify_against_durable_current(
             "signed supervision lease is not the exact durable Kernel ORS artifact".to_owned(),
         ));
     }
-    context
-        .validate_payload_bindings(&envelope.payload)
+    validate_payload_bindings(context, &envelope.payload)
         .map_err(|error| map_lease_verification_error(&error))?;
     let mut context = context.clone();
     context.ors_mirror = durable_current.record.artifact.payload.ors_mirror.clone();
@@ -2941,6 +2940,52 @@ fn verify_against_durable_current(
         ));
     }
     Ok(lease)
+}
+
+/// Validates the independently admitted lease contour before replacing the
+/// context ORS mirror with the exact durable artifact.  The Store-base
+/// runtime-contracts crate predates the shared helper, so this composition
+/// root keeps the same comparison local rather than accepting a payload-owned
+/// ORS mirror.
+fn validate_payload_bindings(
+    context: &SupervisionLeaseVerificationContext,
+    payload: &eliot_runtime_contracts::SupervisionLease,
+) -> Result<(), SupervisionLeaseError> {
+    context.validate()?;
+    payload
+        .validate()
+        .map_err(SupervisionLeaseError::InvalidPayload)?;
+    if payload.lease_id != context.lease_id {
+        return Err(SupervisionLeaseError::LeaseIdentityMismatch);
+    }
+    if payload.host_epoch != context.host_epoch
+        || payload.activation_generation != context.activation_generation
+        || payload.activation_id != context.activation_id
+        || payload.kernel_epoch != context.kernel_epoch
+        || payload.watchdog_epoch != context.watchdog_epoch
+        || payload.state_fence != context.state_fence
+        || payload.scope_ref != context.scope_ref
+        || payload.observation_scope != context.observation_scope
+    {
+        return Err(SupervisionLeaseError::EpochOrActivationMismatch);
+    }
+    let binding = &payload.generation_binding;
+    if binding.target_id != context.target_id
+        || binding.module_id != context.module_id
+        || binding.process_id != context.process_id
+        || binding.target_generation != context.target_generation
+        || binding.module_generation != context.module_generation
+        || binding.process_generation != context.process_generation
+    {
+        return Err(SupervisionLeaseError::GenerationMismatch);
+    }
+    if payload.state != context.active_state.state
+        || payload.revocation_id != context.active_state.revocation_id
+        || payload.revocation_epoch != context.active_state.revocation_epoch
+    {
+        return Err(SupervisionLeaseError::ActiveStateMismatch);
+    }
+    Ok(())
 }
 
 fn map_lease_verification_error(error: &SupervisionLeaseError) -> SpoolError {
