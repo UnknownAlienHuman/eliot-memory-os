@@ -31,7 +31,7 @@ pub const HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR: &str =
     "eliot-host::production-runtime-control:v1";
 const MAX_QUEUE_DEPTH: usize = 32;
 const QUEUE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-const WIRE: &str = "eliot.host.runtime-control.v1";
+const WIRE: &str = "eliot.host.runtime-control.v2";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -43,8 +43,38 @@ pub enum HostRuntimeControlOperation {
 fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
     match operation {
         HostRuntimeControlOperation::RestartKernel => "RestartKernel",
-        HostRuntimeControlOperation::ReconcileKernelRestart => "RestartKernel",
+        HostRuntimeControlOperation::ReconcileKernelRestart => "ReconcileKernelRestart",
     }
+}
+
+fn is_sha256_digest(value: &PlatformHandle) -> bool {
+    value.as_str().len() == 64
+        && value
+            .as_str()
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn mutation_digest_for_request_id(wire: &PlatformHandle, request_id: &PlatformHandle) -> String {
+    sha256_hex(format!("{}:mutation:{}", wire.as_str(), request_id.as_str()).as_bytes())
+}
+
+fn request_digest_for(
+    wire: &PlatformHandle,
+    operation: &HostRuntimeControlOperation,
+    request_id: &PlatformHandle,
+    mutation_digest: &PlatformHandle,
+) -> String {
+    sha256_hex(
+        format!(
+            "{}:{}:{}:{}",
+            wire.as_str(),
+            canonical_operation_name(operation),
+            request_id.as_str(),
+            mutation_digest.as_str()
+        )
+        .as_bytes(),
+    )
 }
 
 fn runtime_control_unknown_ref(
@@ -66,6 +96,7 @@ pub struct HostRuntimeControlRequest {
     pub wire: PlatformHandle,
     pub operation: HostRuntimeControlOperation,
     pub request_id: PlatformHandle,
+    pub mutation_digest: PlatformHandle,
     pub request_digest: PlatformHandle,
 }
 
@@ -75,24 +106,45 @@ impl HostRuntimeControlRequest {
         request_id: PlatformHandle,
     ) -> Result<Self, String> {
         let wire = PlatformHandle::new(WIRE.to_owned()).map_err(|e| e.to_string())?;
-        let digest = PlatformHandle::new(sha256_hex(
-            format!(
-                "{}:{}:{}",
-                wire.as_str(),
-                canonical_operation_name(&operation),
-                request_id.as_str()
-            )
-            .as_bytes(),
+        let mutation_digest =
+            PlatformHandle::new(mutation_digest_for_request_id(&wire, &request_id))
+                .map_err(|e| e.to_string())?;
+        Self::new_with_mutation_digest(operation, request_id, mutation_digest)
+    }
+
+    pub fn new_with_mutation_digest(
+        operation: HostRuntimeControlOperation,
+        request_id: PlatformHandle,
+        mutation_digest: PlatformHandle,
+    ) -> Result<Self, String> {
+        let wire = PlatformHandle::new(WIRE.to_owned()).map_err(|e| e.to_string())?;
+        let request_digest = PlatformHandle::new(request_digest_for(
+            &wire,
+            &operation,
+            &request_id,
+            &mutation_digest,
         ))
         .map_err(|e| e.to_string())?;
         let value = Self {
             wire,
             operation,
             request_id,
-            request_digest: digest,
+            mutation_digest,
+            request_digest,
         };
         value.validate().map_err(|e| e.to_string())?;
         Ok(value)
+    }
+
+    pub fn new_reconcile(
+        request_id: PlatformHandle,
+        mutation_digest: PlatformHandle,
+    ) -> Result<Self, String> {
+        Self::new_with_mutation_digest(
+            HostRuntimeControlOperation::ReconcileKernelRestart,
+            request_id,
+            mutation_digest,
+        )
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -104,23 +156,17 @@ impl HostRuntimeControlRequest {
         {
             return Err("request_id invalid".to_owned());
         }
-        if self.request_digest.as_str().len() != 64
-            || !self
-                .request_digest
-                .as_str()
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
+        if !is_sha256_digest(&self.mutation_digest) {
+            return Err("mutation_digest must be lowercase sha256".to_owned());
+        }
+        if !is_sha256_digest(&self.request_digest) {
             return Err("request_digest must be lowercase sha256".to_owned());
         }
-        let expected = sha256_hex(
-            format!(
-                "{}:{}:{}",
-                self.wire.as_str(),
-                canonical_operation_name(&self.operation),
-                self.request_id.as_str()
-            )
-            .as_bytes(),
+        let expected = request_digest_for(
+            &self.wire,
+            &self.operation,
+            &self.request_id,
+            &self.mutation_digest,
         );
         if expected != self.request_digest.as_str() {
             return Err("request_digest mismatch".to_owned());
@@ -132,6 +178,7 @@ impl HostRuntimeControlRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostKernelRestartReceipt {
+    pub mutation_digest: PlatformHandle,
     pub request_digest: PlatformHandle,
     pub old_kernel_generation: PlatformHandle,
     pub new_kernel_generation: PlatformHandle,
@@ -144,6 +191,7 @@ pub struct HostKernelRestartReceipt {
 impl HostKernelRestartReceipt {
     pub fn computed_digest(&self) -> Result<PlatformHandle, String> {
         let bytes = serde_json::to_vec(&(
+            self.mutation_digest.as_str(),
             self.request_digest.as_str(),
             self.old_kernel_generation.as_str(),
             self.new_kernel_generation.as_str(),
@@ -156,13 +204,10 @@ impl HostKernelRestartReceipt {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.request_digest.as_str().len() != 64
-            || !self
-                .request_digest
-                .as_str()
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
+        if !is_sha256_digest(&self.mutation_digest) {
+            return Err("mutation_digest must be sha256".to_owned());
+        }
+        if !is_sha256_digest(&self.request_digest) {
             return Err("request_digest must be sha256".to_owned());
         }
         for (v, name) in [
@@ -210,6 +255,33 @@ impl HostRuntimeControlResponse {
                 }
                 Ok(())
             }
+        }
+    }
+}
+
+fn pending_ref_digest(pending_ref: &PlatformHandle) -> Option<&str> {
+    let (_, suffix) = pending_ref.as_str().rsplit_once(':')?;
+    (suffix.len() == 64
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    .then_some(suffix)
+}
+
+fn response_matches_request(
+    request: &HostRuntimeControlRequest,
+    response: &HostRuntimeControlResponse,
+) -> bool {
+    if response.validate().is_err() {
+        return false;
+    }
+    match response {
+        HostRuntimeControlResponse::Restarted { receipt } => {
+            receipt.request_digest == request.request_digest
+                && receipt.mutation_digest == request.mutation_digest
+        }
+        HostRuntimeControlResponse::Unknown { pending_ref } => {
+            pending_ref_digest(pending_ref) == Some(request.request_digest.as_str())
         }
     }
 }
@@ -268,7 +340,10 @@ impl HostRuntimeControl {
             });
         }
         match tokio::time::timeout(QUEUE_RESPONSE_TIMEOUT, response).await {
-            Ok(Ok(r)) => r,
+            Ok(Ok(response)) if response_matches_request(request, &response) => response,
+            Ok(Ok(_)) => HostRuntimeControlResponse::Unknown {
+                pending_ref: runtime_control_unknown_ref("kernel-restart-queue-response", request),
+            },
             Ok(Err(_)) | Err(_) => HostRuntimeControlResponse::Unknown {
                 pending_ref: runtime_control_unknown_ref("kernel-restart-queue-response", request),
             },
@@ -522,6 +597,12 @@ mod tests {
         let mut bad = req.clone();
         bad.request_digest = handle("0".repeat(64));
         assert!(bad.validate().is_err());
+        bad = req.clone();
+        bad.operation = HostRuntimeControlOperation::ReconcileKernelRestart;
+        assert!(bad.validate().is_err());
+        bad = req.clone();
+        bad.wire = handle("eliot.host.runtime-control.v1");
+        assert!(bad.validate().is_err());
     }
 
     #[test]
@@ -536,6 +617,7 @@ mod tests {
     #[test]
     fn receipt_digest_is_bound() {
         let receipt = HostKernelRestartReceipt {
+            mutation_digest: handle("a".repeat(64)),
             request_digest: handle("a".repeat(64)),
             old_kernel_generation: handle("b".repeat(64)),
             new_kernel_generation: handle("c".repeat(64)),
@@ -591,6 +673,7 @@ mod tests {
         .unwrap();
         let mut map = std::collections::HashMap::new();
         let receipt = HostKernelRestartReceipt {
+            mutation_digest: req.mutation_digest.clone(),
             request_digest: req.request_digest.clone(),
             old_kernel_generation: handle("a".repeat(64)),
             new_kernel_generation: handle("b".repeat(64)),
@@ -647,6 +730,7 @@ mod tests {
         assert!(decode_runtime_control_request_frame(&tampered).is_err());
         let receipt = {
             let mut r = HostKernelRestartReceipt {
+                mutation_digest: req.mutation_digest.clone(),
                 request_digest: req.request_digest.clone(),
                 old_kernel_generation: handle("a".repeat(64)),
                 new_kernel_generation: handle("b".repeat(64)),
@@ -686,27 +770,32 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_carries_same_digest_as_restart_for_same_request_id() {
+    fn reconcile_carries_original_mutation_digest_but_uses_operation_bound_digest() {
         let restart = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RestartKernel,
             handle("same-id-99"),
         )
         .unwrap();
-        let reconcile = HostRuntimeControlRequest::new(
-            HostRuntimeControlOperation::ReconcileKernelRestart,
-            handle("same-id-99"),
+        let reconcile = HostRuntimeControlRequest::new_reconcile(
+            handle("query-id-99"),
+            restart.mutation_digest.clone(),
         )
         .unwrap();
-        assert_eq!(restart.request_id, reconcile.request_id);
-        assert_eq!(restart.request_digest, reconcile.request_digest);
+        assert_ne!(restart.request_id, reconcile.request_id);
+        assert_eq!(restart.mutation_digest, reconcile.mutation_digest);
+        assert_ne!(restart.request_digest, reconcile.request_digest);
         assert_ne!(restart.operation, reconcile.operation);
         let r_frame = runtime_control_request_frame("conn-r", &restart).unwrap();
         let c_frame = runtime_control_request_frame("conn-c", &reconcile).unwrap();
-        assert_eq!(
+        assert_ne!(
             r_frame.request_id.as_ref().unwrap().as_str(),
             c_frame.request_id.as_ref().unwrap().as_str()
         );
         assert_eq!(
+            r_frame.request_identity.as_ref().unwrap().idempotency_key,
+            r_frame.request_id.as_ref().unwrap().as_str()
+        );
+        assert_ne!(
             r_frame.request_identity.as_ref().unwrap().idempotency_key,
             c_frame.request_identity.as_ref().unwrap().idempotency_key
         );
@@ -761,6 +850,109 @@ mod tests {
         );
         let decoded = decode_runtime_control_response_frame(&frame).unwrap();
         assert_eq!(decoded, HostRuntimeControlResponse::Unknown { pending_ref });
+    }
+
+    fn receipt_for(request: &HostRuntimeControlRequest) -> HostKernelRestartReceipt {
+        let mut receipt = HostKernelRestartReceipt {
+            mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            old_kernel_generation: handle("a".repeat(64)),
+            new_kernel_generation: handle("b".repeat(64)),
+            store_fence: handle("c".repeat(64)),
+            activation_receipt_digest: handle("d".repeat(64)),
+            ready_receipt_digest: handle("e".repeat(64)),
+            receipt_digest: handle("0".repeat(64)),
+        };
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        receipt
+    }
+
+    async fn pop_envelope(queue: &HostRuntimeControlQueue) -> HostRuntimeControlEnvelope {
+        loop {
+            if let Some(envelope) = queue.lock().unwrap().pop_front() {
+                return envelope;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_restarted_substitution_becomes_original_request_unknown() {
+        let queue: HostRuntimeControlQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let control = HostRuntimeControl::new(Arc::clone(&queue));
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("worker-restarted-original"),
+        )
+        .unwrap();
+        let foreign = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("worker-restarted-foreign"),
+        )
+        .unwrap();
+        let foreign_digest = foreign.request_digest.clone();
+        let mut mutation_substitution = receipt_for(&request);
+        mutation_substitution.mutation_digest = foreign.mutation_digest.clone();
+        mutation_substitution.receipt_digest = mutation_substitution.computed_digest().unwrap();
+        assert!(!response_matches_request(
+            &request,
+            &HostRuntimeControlResponse::Restarted {
+                receipt: mutation_substitution,
+            }
+        ));
+        let queue_for_worker = Arc::clone(&queue);
+        let foreign_for_worker = foreign.clone();
+        tokio::spawn(async move {
+            let envelope = pop_envelope(&queue_for_worker).await;
+            let _ = envelope.reply.send(HostRuntimeControlResponse::Restarted {
+                receipt: receipt_for(&foreign_for_worker),
+            });
+        });
+        let response = control.handle(&request).await;
+        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+            panic!("foreign Restarted response must become Unknown");
+        };
+        assert!(
+            pending_ref
+                .as_str()
+                .contains(request.request_digest.as_str())
+        );
+        assert!(!pending_ref.as_str().contains(foreign_digest.as_str()));
+    }
+
+    #[tokio::test]
+    async fn worker_unknown_substitution_becomes_original_request_unknown() {
+        let queue: HostRuntimeControlQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let control = HostRuntimeControl::new(Arc::clone(&queue));
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("worker-unknown-original"),
+        )
+        .unwrap();
+        let foreign = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("worker-unknown-foreign"),
+        )
+        .unwrap();
+        let foreign_digest = foreign.request_digest.clone();
+        let queue_for_worker = Arc::clone(&queue);
+        let foreign_for_worker = foreign.clone();
+        tokio::spawn(async move {
+            let envelope = pop_envelope(&queue_for_worker).await;
+            let _ = envelope.reply.send(HostRuntimeControlResponse::Unknown {
+                pending_ref: runtime_control_unknown_ref("foreign-worker", &foreign_for_worker),
+            });
+        });
+        let response = control.handle(&request).await;
+        let HostRuntimeControlResponse::Unknown { pending_ref } = response else {
+            panic!("foreign Unknown response must become Unknown");
+        };
+        assert!(
+            pending_ref
+                .as_str()
+                .contains(request.request_digest.as_str())
+        );
+        assert!(!pending_ref.as_str().contains(foreign_digest.as_str()));
     }
 
     #[tokio::test]
@@ -869,19 +1061,21 @@ mod tests {
             handle("reconcile-frame-1"),
         )
         .unwrap();
-        let reconcile = HostRuntimeControlRequest::new(
-            HostRuntimeControlOperation::ReconcileKernelRestart,
+        let reconcile = HostRuntimeControlRequest::new_reconcile(
             handle("reconcile-frame-1"),
+            restart.mutation_digest.clone(),
         )
         .unwrap();
-        assert_eq!(restart.request_digest, reconcile.request_digest);
+        assert_eq!(restart.mutation_digest, reconcile.mutation_digest);
+        assert_ne!(restart.request_digest, reconcile.request_digest);
         let frame = runtime_control_request_frame("conn-reconcile", &reconcile).unwrap();
         assert_eq!(
             frame.request_id.as_ref().unwrap().as_str(),
             reconcile.request_digest.as_str()
         );
         let decoded = decode_runtime_control_request_frame(&frame).unwrap();
-        assert_eq!(decoded.request_digest, restart.request_digest);
+        assert_eq!(decoded.mutation_digest, restart.mutation_digest);
+        assert_eq!(decoded.request_digest, reconcile.request_digest);
         let mut tampered = frame.clone();
         let mut payload = serde_json::to_value(&reconcile).unwrap();
         payload["request_digest"] = serde_json::Value::String("c".repeat(64));
@@ -890,5 +1084,11 @@ mod tests {
         tampered = frame.clone();
         tampered.request_id = Some(eliot_contracts::RequestId::new("d".repeat(64)).unwrap());
         assert!(decode_runtime_control_request_frame(&tampered).is_err());
+
+        let mut operation_flip = frame;
+        let mut payload = serde_json::to_value(&reconcile).unwrap();
+        payload["operation"] = serde_json::Value::String("RESTART_KERNEL".to_owned());
+        operation_flip.payload = ProtocolPayload::Json(payload);
+        assert!(decode_runtime_control_request_frame(&operation_flip).is_err());
     }
 }

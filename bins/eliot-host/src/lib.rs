@@ -7006,45 +7006,247 @@ fn load_durable_runtime_restarts(
             continue;
         };
         if receipt.validate().is_ok() {
-            map.insert(receipt.request_digest.as_str().to_owned(), receipt);
+            map.insert(receipt.mutation_digest.as_str().to_owned(), receipt);
         }
     }
     map
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeRestartPendingIdentity {
+    wire: String,
+    operation: HostRuntimeControlOperation,
+    request_id: String,
+    mutation_digest: String,
+    request_digest: String,
+    host_epoch: u64,
+    host_lineage: String,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeRestartPendingPublication {
+    Created,
+    Replay,
+}
+
+#[cfg(windows)]
+fn runtime_restart_pending_identity(
+    request: &HostRuntimeControlRequest,
+    host: &HostInstallationEpoch,
+) -> RuntimeRestartPendingIdentity {
+    RuntimeRestartPendingIdentity {
+        wire: request.wire.as_str().to_owned(),
+        operation: request.operation.clone(),
+        request_id: request.request_id.as_str().to_owned(),
+        mutation_digest: request.mutation_digest.as_str().to_owned(),
+        request_digest: request.request_digest.as_str().to_owned(),
+        host_epoch: host.epoch.current.sequence,
+        host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+    }
+}
+
+#[cfg(windows)]
+fn runtime_restart_pending_payload(
+    identity: &RuntimeRestartPendingIdentity,
+) -> Result<serde_json::Value, HostError> {
+    Ok(serde_json::json!({
+        "wire": identity.wire,
+        "operation": serde_json::to_value(&identity.operation)
+            .map_err(|e| HostError::Platform(e.to_string()))?,
+        "request_id": identity.request_id,
+        "mutation_digest": identity.mutation_digest,
+        "request_digest": identity.request_digest,
+        "host_epoch": identity.host_epoch,
+        "host_lineage": identity.host_lineage,
+        "created_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string(),
+    }))
+}
+
+#[cfg(windows)]
+fn runtime_restart_pending_identity_from_bytes(
+    bytes: &[u8],
+) -> Result<RuntimeRestartPendingIdentity, HostError> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|e| {
+        HostError::RecoveryRequired(format!("runtime restart pending record is malformed: {e}"))
+    })?;
+    let string = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(format!(
+                    "runtime restart pending record is missing {name}"
+                ))
+            })
+    };
+    let operation = value
+        .get("operation")
+        .cloned()
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "runtime restart pending record is missing operation".to_owned(),
+            )
+        })
+        .and_then(|operation| {
+            serde_json::from_value::<HostRuntimeControlOperation>(operation).map_err(|e| {
+                HostError::RecoveryRequired(format!(
+                    "runtime restart pending operation is malformed: {e}"
+                ))
+            })
+        })?;
+    let host_epoch = value
+        .get("host_epoch")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "runtime restart pending host_epoch is malformed".to_owned(),
+            )
+        })?;
+    let identity = RuntimeRestartPendingIdentity {
+        wire: string("wire")?,
+        operation,
+        request_id: string("request_id")?,
+        mutation_digest: string("mutation_digest")?,
+        request_digest: string("request_digest")?,
+        host_epoch,
+        host_lineage: string("host_lineage")?,
+    };
+    if identity.wire != "eliot.host.runtime-control.v2"
+        || identity.request_id.trim().is_empty()
+        || identity.request_id.chars().any(char::is_control)
+        || identity.mutation_digest.len() != 64
+        || !identity
+            .mutation_digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        || identity.request_digest.len() != 64
+        || !identity
+            .request_digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        || identity.host_lineage.trim().is_empty()
+    {
+        return Err(HostError::RecoveryRequired(
+            "runtime restart pending record identity is malformed".to_owned(),
+        ));
+    }
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn read_runtime_restart_pending_identity(
+    path: &Path,
+) -> Result<Option<RuntimeRestartPendingIdentity>, HostError> {
+    const MAX_PENDING_BYTES: u64 = 16 * 1024;
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "runtime restart pending record cannot be inspected: {error}"
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_PENDING_BYTES {
+        return Err(HostError::RecoveryRequired(
+            "runtime restart pending record is malformed or too large".to_owned(),
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "runtime restart pending record cannot be read: {error}"
+        ))
+    })?;
+    if bytes.len() as u64 > MAX_PENDING_BYTES {
+        return Err(HostError::RecoveryRequired(
+            "runtime restart pending record is too large".to_owned(),
+        ));
+    }
+    runtime_restart_pending_identity_from_bytes(&bytes).map(Some)
+}
+
+#[cfg(windows)]
+fn sync_runtime_restart_store_dir(dir: &Path) {
+    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(dir) {
+        let _ = file.sync_all();
+    }
+}
+
+#[cfg(windows)]
 fn persist_runtime_restart_pending(
     host_state_root: &Path,
-    digest: &str,
+    request: &HostRuntimeControlRequest,
     host: &HostInstallationEpoch,
-) -> Result<(), HostError> {
+) -> Result<RuntimeRestartPendingPublication, HostError> {
+    request.validate().map_err(HostError::RecoveryRequired)?;
     let dir = runtime_restart_store_dir(host_state_root);
     std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
-    let path = runtime_restart_pending_path(host_state_root, digest);
-    let payload = serde_json::json!({
-        "request_digest": digest,
-        "host_epoch": host.epoch.current.sequence,
-        "host_lineage": host.epoch.current.lineage.as_str(),
-        "created_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis().to_string(),
-    });
-    let tmp = dir.join(format!(".{digest}.pending.tmp"));
-    std::fs::write(
-        &tmp,
-        serde_json::to_vec(&payload).map_err(|e| HostError::Platform(e.to_string()))?,
-    )
-    .map_err(|e| HostError::Platform(e.to_string()))?;
-    {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&tmp)
-            .map_err(|e| HostError::Platform(e.to_string()))?;
-        let _ = file.sync_all();
+    let identity = runtime_restart_pending_identity(request, host);
+    let path = runtime_restart_pending_path(host_state_root, request.mutation_digest.as_str());
+    if let Some(existing) = read_runtime_restart_pending_identity(&path)? {
+        if existing == identity {
+            return Ok(RuntimeRestartPendingPublication::Replay);
+        }
+        return Err(HostError::RecoveryRequired(
+            "runtime restart pending record conflicts with the requested operation".to_owned(),
+        ));
     }
-    std::fs::rename(&tmp, &path).map_err(|e| HostError::Platform(e.to_string()))?;
-    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&dir) {
-        let _ = file.sync_all();
+    let payload = runtime_restart_pending_payload(&identity)?;
+    let bytes = serde_json::to_vec(&payload).map_err(|e| HostError::Platform(e.to_string()))?;
+    let tmp = dir.join(format!(
+        ".{}.pending.{}.tmp",
+        request.mutation_digest.as_str(),
+        Uuid::new_v4().simple()
+    ));
+    let publication = (|| {
+        std::fs::write(&tmp, bytes).map_err(|e| HostError::Platform(e.to_string()))?;
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+            let _ = file.sync_all();
+        }
+        // A hard-link publication is atomic and, unlike rename, never replaces
+        // a final record that won a concurrent create race.
+        match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                sync_runtime_restart_store_dir(&dir);
+                Ok(RuntimeRestartPendingPublication::Created)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let Some(existing) = read_runtime_restart_pending_identity(&path)? else {
+                    return Err(HostError::RecoveryRequired(
+                        "runtime restart pending record disappeared during publication".to_owned(),
+                    ));
+                };
+                if existing == identity {
+                    Ok(RuntimeRestartPendingPublication::Replay)
+                } else {
+                    Err(HostError::RecoveryRequired(
+                        "runtime restart pending record conflicts with the requested operation"
+                            .to_owned(),
+                    ))
+                }
+            }
+            Err(error) => Err(HostError::Platform(error.to_string())),
+        }
+    })();
+    let cleanup = std::fs::remove_file(&tmp);
+    sync_runtime_restart_store_dir(&dir);
+    match publication {
+        Err(error) => Err(error),
+        Ok(value) => match cleanup {
+            Ok(()) => Ok(value),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(value),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "runtime restart pending temporary cleanup failed: {error}"
+            ))),
+        },
     }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -7054,8 +7256,8 @@ fn persist_runtime_restart_receipt(
 ) -> Result<(), HostError> {
     let dir = runtime_restart_store_dir(host_state_root);
     std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
-    let path = runtime_restart_receipt_path(host_state_root, receipt.request_digest.as_str());
-    let tmp = dir.join(format!(".{}.receipt.tmp", receipt.request_digest.as_str()));
+    let path = runtime_restart_receipt_path(host_state_root, receipt.mutation_digest.as_str());
+    let tmp = dir.join(format!(".{}.receipt.tmp", receipt.mutation_digest.as_str()));
     std::fs::write(
         &tmp,
         serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?,
@@ -7069,7 +7271,7 @@ fn persist_runtime_restart_receipt(
         let _ = file.sync_all();
     }
     std::fs::rename(&tmp, &path).map_err(|e| HostError::Platform(e.to_string()))?;
-    let pending = runtime_restart_pending_path(host_state_root, receipt.request_digest.as_str());
+    let pending = runtime_restart_pending_path(host_state_root, receipt.mutation_digest.as_str());
     let _ = std::fs::remove_file(pending);
     if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&dir) {
         let _ = file.sync_all();
@@ -7080,24 +7282,29 @@ fn persist_runtime_restart_receipt(
 #[cfg(windows)]
 fn has_runtime_restart_pending(host_state_root: &Path, digest: &str) -> bool {
     let path = runtime_restart_pending_path(host_state_root, digest);
-    let Ok(bytes) = std::fs::read(&path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
-    };
-    value
-        .get("request_digest")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == digest)
-        && value
-            .get("request_digest")
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| {
-                v.len() == 64
-                    && v.bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            })
+    read_runtime_restart_pending_identity(&path)
+        .ok()
+        .flatten()
+        .is_some_and(|identity| identity.mutation_digest == digest)
+}
+
+#[cfg(windows)]
+fn rebind_runtime_restart_receipt(
+    receipt: &HostKernelRestartReceipt,
+    request: &HostRuntimeControlRequest,
+) -> Result<HostKernelRestartReceipt, HostError> {
+    if request.operation != HostRuntimeControlOperation::ReconcileKernelRestart
+        || receipt.mutation_digest != request.mutation_digest
+    {
+        return Err(HostError::RecoveryRequired(
+            "runtime restart receipt is not bound to the requested mutation".to_owned(),
+        ));
+    }
+    let mut rebound = receipt.clone();
+    rebound.request_digest = request.request_digest.clone();
+    rebound.receipt_digest = rebound.computed_digest().map_err(HostError::Platform)?;
+    rebound.validate().map_err(HostError::Platform)?;
+    Ok(rebound)
 }
 
 /// Host-owned lifecycle state and installation activation registry.
@@ -7959,9 +8166,17 @@ impl HostComposition {
                 pending_ref: runtime_control_unknown_ref("kernel-restart-reconcile", request),
             };
         }
-        let key = request.request_digest.as_str().to_owned();
+        let key = request.mutation_digest.as_str().to_owned();
         if let Some(receipt) = self.runtime_restarts.get(&key).cloned() {
-            return HostRuntimeControlResponse::Restarted { receipt };
+            return match rebind_runtime_restart_receipt(&receipt, request) {
+                Ok(receipt) => HostRuntimeControlResponse::Restarted { receipt },
+                Err(_) => HostRuntimeControlResponse::Unknown {
+                    pending_ref: runtime_control_unknown_ref(
+                        "kernel-restart-reconcile-conflict",
+                        request,
+                    ),
+                },
+            };
         }
         if has_runtime_restart_pending(self.launch_options.host_state_root(), &key) {
             return HostRuntimeControlResponse::Unknown {
@@ -7980,16 +8195,6 @@ impl HostComposition {
             }
         };
         if let Some(kernel) = snapshot.kernel.as_ref() {
-            if let Some(expected) = self
-                .runtime_restarts
-                .values()
-                .find(|r| r.request_digest == request.request_digest)
-            {
-                let expected_receipt = expected.clone();
-                return HostRuntimeControlResponse::Restarted {
-                    receipt: expected_receipt,
-                };
-            }
             let _ = kernel;
         }
         HostRuntimeControlResponse::Unknown {
@@ -8014,7 +8219,7 @@ impl HostComposition {
                 "unsupported runtime-control operation".to_owned(),
             ));
         }
-        let key = request.request_digest.as_str().to_owned();
+        let key = request.mutation_digest.as_str().to_owned();
         if let Some(existing) = self.runtime_restarts.get(&key).cloned() {
             return Ok(existing);
         }
@@ -8029,7 +8234,16 @@ impl HostComposition {
         let guard = capability
             .live_guard()
             .map_err(|e| HostError::Platform(e.to_string()))?;
-        persist_runtime_restart_pending(self.launch_options.host_state_root(), &key, &self.host)?;
+        if persist_runtime_restart_pending(
+            self.launch_options.host_state_root(),
+            request,
+            &self.host,
+        )? == RuntimeRestartPendingPublication::Replay
+        {
+            return Err(HostError::RecoveryRequired(
+                "Kernel restart intent is already pending; reconcile required".to_owned(),
+            ));
+        }
         drop(guard);
         drop(capability);
         let store_before = self.jobs.store_process().cloned().ok_or_else(|| {
@@ -8262,6 +8476,7 @@ impl HostComposition {
         ))
         .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap());
         let mut receipt = HostKernelRestartReceipt {
+            mutation_digest: request.mutation_digest.clone(),
             request_digest: request.request_digest.clone(),
             old_kernel_generation: old_gen_handle,
             new_kernel_generation: new_gen_handle,
@@ -14600,10 +14815,17 @@ mod journal_tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let completed_digest = "aa".repeat(32);
-        let pending_digest = "bb".repeat(32);
+        let completed_mutation_digest = "aa".repeat(32);
+        let pending_mutation_digest = "bb".repeat(32);
+        let completed_request = HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("completed-restart").unwrap(),
+            PlatformHandle::new(completed_mutation_digest.clone()).unwrap(),
+        )
+        .unwrap();
         let mut receipt = HostKernelRestartReceipt {
-            request_digest: PlatformHandle::new(completed_digest.clone()).unwrap(),
+            mutation_digest: PlatformHandle::new(completed_mutation_digest.clone()).unwrap(),
+            request_digest: completed_request.request_digest.clone(),
             old_kernel_generation: PlatformHandle::new("a".repeat(64)).unwrap(),
             new_kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
             store_fence: PlatformHandle::new("c".repeat(64)).unwrap(),
@@ -14614,11 +14836,23 @@ mod journal_tests {
         receipt.receipt_digest = receipt.computed_digest().unwrap();
         assert!(receipt.validate().is_ok());
         persist_runtime_restart_receipt(&root, &receipt).unwrap();
-        assert!(!has_runtime_restart_pending(&root, &completed_digest));
+        assert!(!has_runtime_restart_pending(
+            &root,
+            &completed_mutation_digest
+        ));
         let host = test_host();
-        persist_runtime_restart_pending(&root, &pending_digest, &host).unwrap();
-        assert!(has_runtime_restart_pending(&root, &pending_digest));
-        let stray_pending_path = runtime_restart_pending_path(&root, &completed_digest);
+        let pending_request = HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("pending-restart").unwrap(),
+            PlatformHandle::new(pending_mutation_digest.clone()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persist_runtime_restart_pending(&root, &pending_request, &host).unwrap(),
+            RuntimeRestartPendingPublication::Created
+        );
+        assert!(has_runtime_restart_pending(&root, &pending_mutation_digest));
+        let stray_pending_path = runtime_restart_pending_path(&root, &completed_mutation_digest);
         assert!(
             !stray_pending_path.exists(),
             "completed receipt must delete pending"
@@ -14630,12 +14864,12 @@ mod journal_tests {
             "receipt filter must not load pending as receipt"
         );
         let loaded = reopened
-            .get(&completed_digest)
+            .get(&completed_mutation_digest)
             .expect("receipt survives reopen");
         assert_eq!(loaded.receipt_digest, receipt.receipt_digest);
-        assert_eq!(loaded.request_digest.as_str(), completed_digest);
+        assert_eq!(loaded.mutation_digest.as_str(), completed_mutation_digest);
         let mut executor_calls = 0usize;
-        let reconciled = if let Some(existing) = reopened.get(&completed_digest).cloned() {
+        let reconciled = if let Some(existing) = reopened.get(&completed_mutation_digest).cloned() {
             existing
         } else {
             executor_calls += 1;
@@ -14643,13 +14877,13 @@ mod journal_tests {
         };
         assert_eq!(executor_calls, 0);
         assert_eq!(reconciled.receipt_digest, receipt.receipt_digest);
-        assert!(!reopened.contains_key(&pending_digest));
-        let pending_is_unknown = has_runtime_restart_pending(&root, &pending_digest)
-            && !reopened.contains_key(&pending_digest);
+        assert!(!reopened.contains_key(&pending_mutation_digest));
+        let pending_is_unknown = has_runtime_restart_pending(&root, &pending_mutation_digest)
+            && !reopened.contains_key(&pending_mutation_digest);
         assert!(pending_is_unknown, "pending-only must remain Unknown");
-        let pending_reconcile = if reopened.contains_key(&pending_digest) {
+        let pending_reconcile = if reopened.contains_key(&pending_mutation_digest) {
             "Restarted"
-        } else if has_runtime_restart_pending(&root, &pending_digest) {
+        } else if has_runtime_restart_pending(&root, &pending_mutation_digest) {
             "Unknown"
         } else {
             "Missing"
@@ -14664,6 +14898,68 @@ mod journal_tests {
         let reopened_again = load_durable_runtime_restarts(&root);
         assert_eq!(reopened_again.len(), 1);
         assert!(!reopened_again.contains_key(&"cc".repeat(32)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn durable_runtime_restart_pending_is_no_replace_and_exactly_bound() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-runtime-restart-pending-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = test_host();
+        let mutation_digest = PlatformHandle::new("d1".repeat(32)).unwrap();
+        let request = HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("pending-exact").unwrap(),
+            mutation_digest.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            persist_runtime_restart_pending(&root, &request, &host).unwrap(),
+            RuntimeRestartPendingPublication::Created
+        );
+        let path = runtime_restart_pending_path(&root, mutation_digest.as_str());
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            persist_runtime_restart_pending(&root, &request, &host).unwrap(),
+            RuntimeRestartPendingPublication::Replay
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            std::fs::read_dir(runtime_restart_store_dir(&root))
+                .unwrap()
+                .flatten()
+                .all(
+                    |entry| !entry.file_name().to_string_lossy().contains(".pending.")
+                        || entry.path() == path
+                )
+        );
+
+        std::fs::write(&path, br"{malformed").unwrap();
+        let malformed_before = std::fs::read(&path).unwrap();
+        let malformed = persist_runtime_restart_pending(&root, &request, &host);
+        assert!(matches!(malformed, Err(HostError::RecoveryRequired(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), malformed_before);
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            persist_runtime_restart_pending(&root, &request, &host).unwrap(),
+            RuntimeRestartPendingPublication::Created
+        );
+        let exact_before_conflict = std::fs::read(&path).unwrap();
+
+        let conflict_request = HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("pending-conflict").unwrap(),
+            mutation_digest,
+        )
+        .unwrap();
+        let conflict = persist_runtime_restart_pending(&root, &conflict_request, &host);
+        assert!(matches!(conflict, Err(HostError::RecoveryRequired(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), exact_before_conflict);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
