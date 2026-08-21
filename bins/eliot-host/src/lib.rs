@@ -942,9 +942,15 @@ fn phase_b_manifest_digest(manifest: &CandidateManifest) -> Result<PlatformHandl
 
 #[cfg(windows)]
 fn host_owner_epoch_digest(host: &HostInstallationEpoch) -> Result<PlatformHandle, HostError> {
+    // `EpochTransition::direct_child` preserves lineage by design. Bind the
+    // checked monotonic sequence as well, otherwise a restarted direct child
+    // would collide with the completed receipt's owner capability before the
+    // recovery CAS can retire that receipt.
     PlatformHandle::new(sha256_json(&(
+        "eliot.host.owner-epoch.v2",
         host.installation.clone(),
         host.epoch.current.lineage.clone(),
+        host.epoch.current.sequence,
     ))?)
     .map_err(|error| HostError::Platform(error.to_string()))
 }
@@ -12055,7 +12061,7 @@ impl HostComposition {
             "{:x}",
             Sha256::digest(
                 format!(
-                    "eliot.host.phase-b-rebind.v1\0{}\0{}\0{}",
+                    "eliot.host.phase-b-rebind.v2\0{}\0{}\0{}",
                     committed.terminal_digest(),
                     active.approval.transaction_id(),
                     manifest_digest,
@@ -17317,7 +17323,7 @@ mod journal_tests {
         };
         let rebind = eliot_installation::ActivePhaseBRebind {
             intent: ActivePhaseBRebindIntent {
-                wire: handle("eliot.host.phase-b-rebind.v1"),
+                wire: handle(ActivePhaseBRebindIntent::WIRE),
                 transaction_id: handle("transaction"),
                 plan_digest: handle("plan"),
                 effect_id: handle("effect"),
@@ -17454,6 +17460,28 @@ mod journal_tests {
         );
         assert!(reused.is_err());
         let _ = production_path;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_owner_epoch_digest_is_bound_to_exact_direct_child_sequence() {
+        let installation = handle("owner-digest-sequence-installation");
+        let parent = fresh_host_epoch(installation, None).unwrap();
+        let child = child_host_epoch(&parent).unwrap();
+        assert_eq!(parent.epoch.current.lineage, child.epoch.current.lineage);
+        assert_eq!(parent.epoch.current.sequence, 1);
+        assert_eq!(child.epoch.current.sequence, 2);
+        assert_ne!(
+            host_owner_epoch_digest(&parent).unwrap(),
+            host_owner_epoch_digest(&child).unwrap(),
+            "owner proof must not collapse same-lineage parent and direct child"
+        );
+        let mut overflow = parent;
+        overflow.epoch.current.sequence = u64::MAX;
+        assert!(
+            child_host_epoch(&overflow).is_err(),
+            "direct-child owner epoch minting must fail closed on sequence overflow"
+        );
     }
 
     #[test]

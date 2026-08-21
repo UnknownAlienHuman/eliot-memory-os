@@ -3438,7 +3438,12 @@ pub struct HostPhaseBPreparedMaterialization {
 
 impl HostPhaseBPreparedMaterialization {
     /// Current prepared-materialization wire.
-    pub const WIRE: &'static str = "eliot.host.phase-b-prepared.v1";
+    ///
+    /// The owner-epoch identity domain is sequence-bound as of v2. A
+    /// persisted v1 preparation therefore cannot be replayed as a current
+    /// proof after a Host restart; its discriminator is rejected before any
+    /// destination readback or mutation.
+    pub const WIRE: &'static str = "eliot.host.phase-b-prepared.v2";
 
     /// Recomputes the prepared record digest without its self-reference.
     pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
@@ -3724,7 +3729,7 @@ pub struct ActivePhaseBRebindIntent {
 
 impl ActivePhaseBRebindIntent {
     /// Current active-rebind wire discriminator.
-    pub const WIRE: &'static str = "eliot.host.phase-b-rebind.v1";
+    pub const WIRE: &'static str = "eliot.host.phase-b-rebind.v2";
 
     /// Constructs and validates one current-Host rebind intent from the prior
     /// committed Phase-B binding and the fresh Host owner/epoch evidence.
@@ -3998,7 +4003,7 @@ pub struct ActivePhaseBRebindReceipt {
 
 impl ActivePhaseBRebindReceipt {
     /// Current active-rebind receipt wire discriminator.
-    pub const WIRE: &'static str = "eliot.host.phase-b-rebind-receipt.v1";
+    pub const WIRE: &'static str = "eliot.host.phase-b-rebind-receipt.v2";
 
     /// Constructs an exact receipt from the durable prepared materialization.
     pub fn from_prepared(
@@ -4223,7 +4228,7 @@ pub struct ActivePhaseBRebindRecovery {
 
 impl ActivePhaseBRebindRecovery {
     /// Current active-rebind recovery transition wire discriminator.
-    pub const WIRE: &'static str = "eliot.host.phase-b-rebind-recovery.v1";
+    pub const WIRE: &'static str = "eliot.host.phase-b-rebind-recovery.v2";
 
     /// Constructs a recovery transition from one exact completed rebind and a
     /// fresh direct-child Host owner.
@@ -24462,6 +24467,18 @@ mod tests {
         must(decoded.validate());
         assert_eq!(decoded, intent);
 
+        // The owner digest domain changed with the exact epoch sequence. A
+        // persisted v1 nested proof must therefore be rejected, never
+        // reinterpreted as the v2 direct-child proof after registry decode.
+        let mut legacy_wire = decoded.clone();
+        legacy_wire.wire = test_handle("eliot.host.phase-b-rebind.v1");
+        legacy_wire.request_digest = must(active_phase_b_rebind_intent_digest(&legacy_wire));
+        assert!(matches!(
+            legacy_wire.validate(),
+            Err(InstallationError::InvalidField { field, .. })
+                if field == "active_phase_b_rebind.wire"
+        ));
+
         let mut substituted_nonce = intent.clone();
         substituted_nonce.prior_host_process_nonce_digest = test_handle("d".repeat(64));
         assert!(matches!(
@@ -24600,6 +24617,14 @@ mod tests {
         };
         let mut prepared = prepared;
         prepared.prepared_digest = must(prepared.computed_digest());
+        let mut legacy_prepared = prepared.clone();
+        legacy_prepared.wire = test_handle("eliot.host.phase-b-prepared.v1");
+        legacy_prepared.prepared_digest = must(legacy_prepared.computed_digest());
+        assert!(matches!(
+            legacy_prepared.validate(),
+            Err(InstallationError::InvalidField { field, .. })
+                if field == "phase_b.prepared.wire"
+        ));
         must(registry.record_active_phase_b_rebind_prepared(
             &host,
             must(registry.load()).revision(),
@@ -24630,6 +24655,14 @@ mod tests {
             .active_phase_b_rebind()
             .cloned()
             .unwrap_or_else(|| unreachable!());
+        let mut legacy_registry = must(serde_json::to_value(must(registry.load())));
+        legacy_registry["active_phase_b_rebind"]["intent"]["wire"] =
+            serde_json::Value::String("eliot.host.phase-b-rebind.v1".to_owned());
+        let legacy_registry_bytes = must(serde_json::to_vec(&legacy_registry));
+        assert!(matches!(
+            decode_registry_bytes(&legacy_registry_bytes),
+            Err(InstallationError::CorruptRegistry { .. })
+        ));
         let recovery = must(ActivePhaseBRebindRecovery::new(
             &completed,
             test_handle("host-owner:reset-2"),
@@ -24638,6 +24671,25 @@ mod tests {
             intent.host_epoch_lineage.clone(),
             3,
         ));
+
+        let mut legacy_receipt = receipt.clone();
+        legacy_receipt.wire = test_handle("eliot.host.phase-b-rebind-receipt.v1");
+        legacy_receipt.receipt_digest = must(active_phase_b_rebind_receipt_digest(&legacy_receipt));
+        assert!(matches!(
+            legacy_receipt.validate(),
+            Err(InstallationError::InvalidField { field, .. })
+                if field == "active_phase_b_rebind.receipt.wire"
+        ));
+
+        let mut legacy_recovery = recovery.clone();
+        legacy_recovery.wire = test_handle("eliot.host.phase-b-rebind-recovery.v1");
+        legacy_recovery.recovery_digest = must(legacy_recovery.computed_digest());
+        assert!(matches!(
+            legacy_recovery.validate(),
+            Err(InstallationError::InvalidField { field, .. })
+                if field == "active_phase_b_rebind.recovery.wire"
+        ));
+
         let reject_substitution = |mut candidate: ActivePhaseBRebindRecovery| {
             candidate.recovery_digest = must(candidate.computed_digest());
             assert!(matches!(
