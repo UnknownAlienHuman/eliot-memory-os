@@ -483,8 +483,9 @@ impl HostRuntimeControl {
     }
 
     pub async fn serve_one(&self, timeout: Duration) -> Result<(), String> {
-        let installer = eliot_platform_windows::current_process_named_pipe_expectation()
-            .map_err(|e| e.to_string())?;
+        let installer =
+            eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
+                .map_err(|e| e.to_string())?;
         let mut server = NamedPipeServer::create(HOST_RUNTIME_CONTROL_PIPE, &installer)
             .map_err(|e| e.to_string())?;
         server
@@ -818,6 +819,23 @@ mod tests {
         assert_ne!(
             HOST_RUNTIME_CONTROL_PIPE,
             eliot_kernel_service::KERNEL_CONTROL_PIPE
+        );
+    }
+
+    #[test]
+    fn production_runtime_control_requires_elevated_admin_pipe_and_capability() {
+        let expectation =
+            eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
+                .unwrap();
+        assert!(expectation.requires_builtin_administrators());
+        assert_eq!(expectation.expected_sid(), "S-1-5-32-544");
+        assert_eq!(
+            HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR,
+            "eliot-host::production-runtime-control:v1"
+        );
+        assert_eq!(
+            HOST_RUNTIME_CONTROL_PIPE,
+            r"\\.\pipe\eliot\host\runtime-control-v1"
         );
     }
 
