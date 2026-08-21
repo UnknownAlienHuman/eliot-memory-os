@@ -23,6 +23,7 @@ use eliot_installation::{
     WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider, verify_file_digest,
     verify_file_digest_with_lease,
 };
+use eliot_ors::{SupervisionLeaseSnapshot, read_current_supervision_lease_read_only};
 use eliot_platform_windows::{
     NamedPipePeerProcessBinding, ProcessIdentity, ProtectedPathLease, ProtectedRootLease,
     ProtectedRuntimePathLease, ServiceBootstrapArguments, ServiceRegistrationRequest,
@@ -56,6 +57,7 @@ pub const INSTALLATION_REGISTRY_FILE_NAME: &str = "installation-registry.redb";
 const ADMISSION_CONFIG_SCHEMA: &str = "eliot.watchdog-admission.v1";
 const ADMISSION_CONFIG_LIMIT: u64 = 1024 * 1024;
 const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
+const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 
 /// Failure while validating the immutable argv contract supplied by SCM.
 #[derive(Debug, Error)]
@@ -2868,14 +2870,77 @@ fn load_supervision_lease_bound(
     let lease_bytes = read_bounded(lease_path, LEASE_FILE_LIMIT)?;
     let envelope: SignedSupervisionLease = serde_json::from_slice(&lease_bytes)
         .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    let lease = config
-        .trust_anchor
-        .verify(&envelope, &context)
-        .map_err(|error| map_lease_verification_error(&error))?;
+    let durable_current = read_manifest_selected_ors_current(&selected_manifest, &context)?;
+    let lease =
+        verify_against_durable_current(&config.trust_anchor, &context, &envelope, durable_current)?;
     Ok(VerifiedWatchdogAdmission {
         watchdog_epoch: context.watchdog_epoch,
         lease,
     })
+}
+
+fn read_manifest_selected_ors_current(
+    selected_manifest: &CandidateManifest,
+    context: &SupervisionLeaseVerificationContext,
+) -> Result<Option<SupervisionLeaseSnapshot>, SpoolError> {
+    let kernel_ors_path = PathBuf::from(
+        selected_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .kernel_ors_root
+            .as_str(),
+    )
+    .join(KERNEL_ORS_FILE_NAME);
+    let kernel_ors_lease = ProtectedRuntimePathLease::open_existing_absolute(&kernel_ors_path)
+        .map_err(|error| SpoolError::InvalidLease(format!("Kernel ORS open failed: {error}")))?;
+    if !windows_paths_equal(kernel_ors_lease.path(), &kernel_ors_path) {
+        return Err(SpoolError::InvalidLease(
+            "Kernel ORS path is not the manifest-selected path".to_owned(),
+        ));
+    }
+    kernel_ors_lease
+        .verify_stable_identity()
+        .map_err(|error| SpoolError::InvalidLease(format!("Kernel ORS changed: {error}")))?;
+    kernel_ors_lease
+        .verify_path_identity()
+        .map_err(|error| SpoolError::InvalidLease(format!("Kernel ORS path changed: {error}")))?;
+    let lease_id = eliot_ors::OperationIdentity::new(context.lease_id.clone())
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    read_current_supervision_lease_read_only(kernel_ors_lease.path(), &lease_id)
+        .map_err(|error| SpoolError::InvalidLease(format!("Kernel ORS read failed: {error}")))
+}
+
+fn verify_against_durable_current(
+    trust_anchor: &SupervisionTrustAnchor,
+    context: &SupervisionLeaseVerificationContext,
+    envelope: &SignedSupervisionLease,
+    durable_current: Option<SupervisionLeaseSnapshot>,
+) -> Result<VerifiedSupervisionLease, SpoolError> {
+    let durable_current = durable_current.ok_or_else(|| {
+        SpoolError::LeaseFenced("Kernel ORS has no current supervision lease".to_owned())
+    })?;
+    if durable_current.record.artifact != *envelope {
+        return Err(SpoolError::LeaseFenced(
+            "signed supervision lease is not the exact durable Kernel ORS artifact".to_owned(),
+        ));
+    }
+    context
+        .validate_payload_bindings(&envelope.payload)
+        .map_err(|error| map_lease_verification_error(&error))?;
+    let mut context = context.clone();
+    context.ors_mirror = durable_current.record.artifact.payload.ors_mirror.clone();
+    context
+        .validate()
+        .map_err(|error| map_lease_verification_error(&error))?;
+    let lease = trust_anchor
+        .verify(envelope, &context)
+        .map_err(|error| map_lease_verification_error(&error))?;
+    if lease.payload() != &durable_current.record.artifact.payload {
+        return Err(SpoolError::LeaseFenced(
+            "verified supervision lease diverged from the durable Kernel ORS artifact".to_owned(),
+        ));
+    }
+    Ok(lease)
 }
 
 fn map_lease_verification_error(error: &SupervisionLeaseError) -> SpoolError {
@@ -2930,6 +2995,7 @@ fn is_sha256_hex(value: &str) -> bool {
 mod tests {
     use super::registry_fixture::RegistryFixture;
     use super::*;
+    use eliot_runtime_contracts::{SupervisionLeaseSigner, SupervisionLeaseVerifier};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 
@@ -4274,6 +4340,9 @@ mod tests {
         assert!(library.contains("ProtectedRootLease::open_existing"));
         assert!(library.contains("RedbInstallationRegistry::inspect_existing_at"));
         assert!(library.contains("ProtectedRuntimePathLease::open_existing_absolute"));
+        assert!(library.contains("read_current_supervision_lease_read_only"));
+        assert!(library.contains("validate_payload_bindings"));
+        assert!(library.contains("trust_anchor.verify"));
         assert!(library.contains("binding.watchdog_state_root()"));
         let legacy_spool_path = ["Eliot/", "watchdog/watchdog.redb"].concat();
         assert!(!library.contains(&legacy_spool_path));
@@ -4296,6 +4365,241 @@ mod tests {
                 "Watchdog production must remain read-only: {forbidden}"
             );
         }
+    }
+
+    fn supervision_fixture_path() -> PathBuf {
+        let serial = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "eliot-watchdog-supervision-{pid}-{serial}.redb",
+            pid = std::process::id()
+        ))
+    }
+
+    fn supervision_fixture_binding(
+        issued_at_ms: u64,
+    ) -> Result<eliot_ors::SupervisionLeaseBinding, Box<dyn std::error::Error>> {
+        Ok(eliot_ors::SupervisionLeaseBinding {
+            scope_ref: eliot_ors::OperationIdentity::new("scope-supervision")?,
+            observation_scope: eliot_runtime_contracts::SupervisionObservationScope {
+                targets: vec!["target-1".to_owned()],
+                sensor_profile: "kernel-heartbeat".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live".to_owned(),
+            },
+            installation_id: eliot_ors::OperationIdentity::new("installation-1")?,
+            host_epoch: AuthorityEpoch::new(1)?,
+            activation_id: eliot_ors::OperationIdentity::new("activation-1")?,
+            activation_generation: eliot_contracts::ResourceGeneration::new(1)?,
+            kernel_epoch: AuthorityEpoch::new(2)?,
+            watchdog_epoch: AuthorityEpoch::new(1)?,
+            generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
+                target_id: "target-1".to_owned(),
+                target_generation: eliot_contracts::ResourceGeneration::new(1)?,
+                module_id: "module-1".to_owned(),
+                module_generation: eliot_contracts::ResourceGeneration::new(1)?,
+                process_id: "kernel-process-1".to_owned(),
+                process_generation: eliot_contracts::ResourceGeneration::new(1)?,
+            },
+            state_fence: eliot_contracts::StateFence::new(
+                AuthorityEpoch::new(2)?,
+                eliot_contracts::ResourceGeneration::new(1)?,
+            ),
+            issued_at_ms,
+            expires_at_ms: issued_at_ms + 900,
+            renew_before_ms: issued_at_ms + 450,
+            wake_policy: eliot_runtime_contracts::RegisteredActivityWakePolicy::Disabled,
+            state: eliot_runtime_contracts::LeaseState::Active,
+            terminal_disposition: None,
+            revocation_reason: None,
+            revocation_id: None,
+            revocation_epoch: None,
+        })
+    }
+
+    fn supervision_fixture_request(
+        ticket_id: &str,
+        operation_id: &str,
+        lease_id: &str,
+        expected_revision: Option<u64>,
+        operation: eliot_ors::SupervisionLeaseOperation,
+        binding: eliot_ors::SupervisionLeaseBinding,
+    ) -> Result<eliot_ors::SupervisionLeasePrepareRequest, Box<dyn std::error::Error>> {
+        Ok(eliot_ors::SupervisionLeasePrepareRequest {
+            ticket_id: eliot_ors::OperationIdentity::new(ticket_id)?,
+            operation_id: eliot_ors::OperationIdentity::new(operation_id)?,
+            lease_id: eliot_ors::OperationIdentity::new(lease_id)?,
+            expected_revision,
+            operation,
+            binding,
+        })
+    }
+
+    fn supervision_fixture_signer()
+    -> Result<eliot_runtime_contracts::Ed25519SupervisionLeaseSigner, Box<dyn std::error::Error>>
+    {
+        Ok(
+            eliot_runtime_contracts::Ed25519SupervisionLeaseSigner::from_secret_key(
+                "kernel-1",
+                "kernel-key-1",
+                [7; 32],
+            )?,
+        )
+    }
+
+    fn supervision_fixture_envelope(
+        stage: &eliot_ors::SupervisionLeaseStageReceipt,
+    ) -> Result<SignedSupervisionLease, Box<dyn std::error::Error>> {
+        Ok(stage
+            .ticket
+            .expected_payload()?
+            .sign(&supervision_fixture_signer()?)?)
+    }
+
+    fn supervision_fixture_verifier(
+        envelope: &SignedSupervisionLease,
+    ) -> Result<
+        (SupervisionTrustAnchor, SupervisionLeaseVerificationContext),
+        Box<dyn std::error::Error>,
+    > {
+        let signer = supervision_fixture_signer()?;
+        let anchor = SupervisionTrustAnchor::new(
+            envelope.payload.installation_id.clone(),
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )?;
+        let generation = &envelope.payload.generation_binding;
+        let context = SupervisionLeaseVerificationContext {
+            now_ms: envelope.payload.issued_at_ms + 1,
+            lease_id: envelope.payload.lease_id.clone(),
+            host_epoch: envelope.payload.host_epoch,
+            activation_id: envelope.payload.activation_id.clone(),
+            activation_generation: envelope.payload.activation_generation,
+            kernel_epoch: envelope.payload.kernel_epoch,
+            watchdog_epoch: envelope.payload.watchdog_epoch,
+            state_fence: envelope.payload.state_fence.clone(),
+            scope_ref: envelope.payload.scope_ref.clone(),
+            observation_scope: envelope.payload.observation_scope.clone(),
+            target_id: generation.target_id.clone(),
+            module_id: generation.module_id.clone(),
+            process_id: generation.process_id.clone(),
+            target_generation: generation.target_generation,
+            module_generation: generation.module_generation,
+            process_generation: generation.process_generation,
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: envelope.payload.ors_mirror.clone(),
+            active_state: eliot_runtime_contracts::SupervisionLeaseActiveStateBinding {
+                state: envelope.payload.state,
+                revocation_id: envelope.payload.revocation_id.clone(),
+                revocation_epoch: envelope.payload.revocation_epoch,
+            },
+        };
+        Ok((anchor, context))
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the renewal matrix keeps exact, stale, substituted, missing and unknown ORS cases together"
+    )]
+    fn watchdog_renewal_requires_exact_current_ors_artifact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = supervision_fixture_path();
+        let store = eliot_ors::RedbRecoveryStore::open(&path)?;
+        let first_stage = store.prepare_supervision_lease(supervision_fixture_request(
+            "ticket-r1",
+            "operation-r1",
+            "lease-renewal",
+            None,
+            eliot_ors::SupervisionLeaseOperation::Commit,
+            supervision_fixture_binding(100)?,
+        )?)?;
+        let first_envelope = supervision_fixture_envelope(&first_stage)?;
+        let (first_anchor, first_context) = supervision_fixture_verifier(&first_envelope)?;
+        let first_verified = first_anchor.verify(&first_envelope, &first_context)?;
+        let first = store.commit_supervision_lease(&first_stage.ticket, &first_verified)?;
+
+        let second_stage = store.prepare_supervision_lease(supervision_fixture_request(
+            "ticket-r2",
+            "operation-r2",
+            "lease-renewal",
+            Some(1),
+            eliot_ors::SupervisionLeaseOperation::Renew,
+            supervision_fixture_binding(200)?,
+        )?)?;
+        let second_envelope = supervision_fixture_envelope(&second_stage)?;
+        let (second_anchor, second_context) = supervision_fixture_verifier(&second_envelope)?;
+        let second_verified = second_anchor.verify(&second_envelope, &second_context)?;
+        let second = store.commit_supervision_lease(&second_stage.ticket, &second_verified)?;
+        drop(store);
+
+        let (anchor, mut stale_context) = supervision_fixture_verifier(&first_envelope)?;
+        stale_context.now_ms = second_envelope.payload.issued_at_ms + 1;
+        let lease_id = eliot_ors::OperationIdentity::new("lease-renewal")?;
+        let durable_r2 = eliot_ors::read_current_supervision_lease_read_only(&path, &lease_id)?;
+        assert_eq!(
+            durable_r2
+                .as_ref()
+                .map(|snapshot| &snapshot.record.artifact),
+            Some(&second_envelope)
+        );
+        let accepted = verify_against_durable_current(
+            &anchor,
+            &stale_context,
+            &second_envelope,
+            durable_r2.clone(),
+        )?;
+        assert_eq!(accepted.lease_revision(), 2);
+        assert_eq!(accepted.payload(), &second_envelope.payload);
+
+        assert!(
+            verify_against_durable_current(
+                &anchor,
+                &stale_context,
+                &second_envelope,
+                Some(first.clone()),
+            )
+            .is_err()
+        );
+
+        let mut substituted = second.clone();
+        substituted.record.artifact = first_envelope.clone();
+        assert!(
+            verify_against_durable_current(
+                &anchor,
+                &stale_context,
+                &second_envelope,
+                Some(substituted),
+            )
+            .is_err()
+        );
+
+        assert!(
+            verify_against_durable_current(&anchor, &stale_context, &second_envelope, None,)
+                .is_err()
+        );
+
+        let unknown_lease = eliot_ors::OperationIdentity::new("lease-unknown")?;
+        let unknown_current =
+            eliot_ors::read_current_supervision_lease_read_only(&path, &unknown_lease)?;
+        assert!(unknown_current.is_none());
+        assert!(
+            verify_against_durable_current(
+                &anchor,
+                &stale_context,
+                &second_envelope,
+                unknown_current,
+            )
+            .is_err()
+        );
+
+        let missing_path = path.with_file_name("eliot-watchdog-supervision-missing.redb");
+        assert!(
+            eliot_ors::read_current_supervision_lease_read_only(&missing_path, &unknown_lease,)
+                .is_err()
+        );
+        let _ignored = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]

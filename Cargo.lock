@@ -2152,6 +2152,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-installation",
+ "eliot-ors",
  "eliot-platform-windows",
  "eliot-runtime",
  "eliot-runtime-contracts",

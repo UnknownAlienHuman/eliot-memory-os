@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 eliot-contracts.workspace = true
 eliot-installation.workspace = true
+eliot-ors.workspace = true
 eliot-platform-windows.workspace = true
 eliot-watchdog-core.workspace = true
 eliot-runtime.workspace = true
@@ -26,6 +27,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 windows-sys = { workspace = true, features = ["Win32_System_Services", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+eliot-runtime-contracts = { workspace = true, features = ["test-support"] }
 
 [lints.rust]
 unsafe_code = "allow"

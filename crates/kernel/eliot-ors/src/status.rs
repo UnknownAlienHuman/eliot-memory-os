@@ -693,6 +693,35 @@ pub fn open_existing_read_only(
     }
 }
 
+/// Reads one validated current supervision-lease snapshot without invoking a
+/// trust-anchor verifier.  Consumers that must compare a signed envelope with
+/// the durable ORS artifact use this seam to establish the durable mirror
+/// before constructing their final verification context.
+pub fn read_current_supervision_lease_read_only(
+    path: impl AsRef<Path>,
+    lease_id: &crate::OperationIdentity,
+) -> Result<Option<SupervisionLeaseSnapshot>, OrsSupervisionStatusError> {
+    let path = path.as_ref();
+    validate_path(path)?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let db = ReadOnlyDatabase::open(path).map_err(map_db_error)?;
+        let read = db.begin_read().map_err(map_tx_error)?;
+        check_schema(&read)?;
+        let mut used = 0usize;
+        let current = load_current(&read, lease_id.as_str(), &mut used)?;
+        let history = load_history(&read, lease_id.as_str(), &mut used)?;
+        validate_history_provenance(current.as_ref(), &history)?;
+        if let Some(current) = &current {
+            validate_replay_authority(&read, current, &mut used)?;
+        }
+        Ok(current)
+    }));
+    match outcome {
+        Ok(result) => result,
+        Err(error) => Err(map_panic(error)),
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
