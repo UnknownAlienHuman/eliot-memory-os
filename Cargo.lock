@@ -1802,6 +1802,7 @@ dependencies = [
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-process",
  "eliot-runtime-contracts",
  "redb",
  "serde",

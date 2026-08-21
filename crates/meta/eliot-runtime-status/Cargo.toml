@@ -12,6 +12,7 @@ eliot-installation.workspace = true
 eliot-ors.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
+eliot-process.workspace = true
 eliot-runtime-contracts.workspace = true
 redb.workspace = true
 serde.workspace = true

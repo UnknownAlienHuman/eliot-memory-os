@@ -2471,13 +2471,339 @@ impl WatchdogLiveObserver for ProductionWatchdogLiveObserver {
 }
 
 impl EliotdLiveObserver for ProductionEliotdLiveObserver {
-    #[allow(clippy::needless_return)]
+    #[allow(clippy::needless_return, clippy::too_many_lines)]
     fn observe_eliotd_live(&self, deadline: Instant) -> Result<Option<EliotdLiveSnapshot>, String> {
         if Instant::now() >= deadline {
             return Err("deadline exceeded before eliotd observation".to_owned());
         }
-        let _ = &self.host_state_root;
-        return Ok(None);
+        if Instant::now() >= deadline {
+            return Err("deadline exceeded before eliotd registry read".to_owned());
+        }
+        let retained = match eliot_platform_windows::ProtectedRootLease::open_existing(
+            &self.host_state_root,
+        ) {
+            Ok(l) => l,
+            Err(_) => return Ok(None),
+        };
+        let canonical = match retained.canonical_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        if retained.verify_stable_identity().is_err() {
+            return Ok(None);
+        }
+        let registry_lease =
+            match eliot_platform_windows::ProtectedRootLease::open_existing(&canonical) {
+                Ok(l) => l,
+                Err(_) => return Ok(None),
+            };
+        let registry =
+            match eliot_installation::RedbInstallationRegistry::inspect_existing_at(registry_lease)
+            {
+                Ok(Some(r)) => r,
+                _ => return Ok(None),
+            };
+        if registry.validate().is_err() {
+            return Ok(None);
+        }
+        let manifest = match registry.active() {
+            Some(g) => g.manifest.clone(),
+            None => return Ok(None),
+        };
+        if Instant::now() >= deadline {
+            return Err("deadline exceeded before eliotd descriptor lease".to_owned());
+        }
+        let descriptor_path = Path::new(manifest.runtime_launch.eliotd_descriptor_path.as_str());
+        if !descriptor_path.is_absolute() {
+            return Ok(None);
+        }
+        let expected_descriptor_digest = manifest.runtime_launch.eliotd_descriptor_digest.as_str();
+        if !is_sha256_hex(expected_descriptor_digest) {
+            return Ok(None);
+        }
+        #[cfg(windows)]
+        let _descriptor_bytes = {
+            let portable_opt = manifest
+                .runtime_launch
+                .portable_root
+                .as_ref()
+                .map(|h| Path::new(h.as_str()).to_path_buf());
+            let bytes_opt: Option<Vec<u8>> = if let Some(portable) = portable_opt {
+                let portable_path = portable;
+                if descriptor_path.starts_with(&portable_path) {
+                    match eliot_platform_windows::UserOwnedRootLease::open_existing(&portable_path)
+                    {
+                        Ok(root_lease) => {
+                            match eliot_platform_windows::UserOwnedPathLease::open_existing(
+                                &root_lease,
+                                descriptor_path,
+                            ) {
+                                Ok(file_lease) => {
+                                    if file_lease.verify_stable_identity().is_err()
+                                        || file_lease.verify_path_identity().is_err()
+                                    {
+                                        return Ok(None);
+                                    }
+                                    match file_lease.read_bounded(1024 * 1024) {
+                                        Ok(b) => {
+                                            if file_lease.verify_stable_identity().is_err() {
+                                                return Ok(None);
+                                            }
+                                            if sha256_hex(&b) != expected_descriptor_digest {
+                                                return Ok(None);
+                                            }
+                                            Some(b)
+                                        }
+                                        Err(_) => return Ok(None),
+                                    }
+                                }
+                                Err(_) => return Ok(None),
+                            }
+                        }
+                        Err(_) => return Ok(None),
+                    }
+                } else {
+                    match eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
+                        descriptor_path,
+                    ) {
+                        Ok(lease) => {
+                            if lease.verify_stable_identity().is_err()
+                                || lease.verify_path_identity().is_err()
+                            {
+                                return Ok(None);
+                            }
+                            match lease.read_bounded(1024 * 1024) {
+                                Ok(b) => {
+                                    if lease.verify_stable_identity().is_err() {
+                                        return Ok(None);
+                                    }
+                                    if sha256_hex(&b) != expected_descriptor_digest {
+                                        return Ok(None);
+                                    }
+                                    Some(b)
+                                }
+                                Err(_) => return Ok(None),
+                            }
+                        }
+                        Err(_) => return Ok(None),
+                    }
+                }
+            } else {
+                match eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
+                    descriptor_path,
+                ) {
+                    Ok(lease) => {
+                        if lease.verify_stable_identity().is_err()
+                            || lease.verify_path_identity().is_err()
+                        {
+                            return Ok(None);
+                        }
+                        match lease.read_bounded(1024 * 1024) {
+                            Ok(b) => {
+                                if lease.verify_stable_identity().is_err() {
+                                    return Ok(None);
+                                }
+                                if sha256_hex(&b) != expected_descriptor_digest {
+                                    return Ok(None);
+                                }
+                                Some(b)
+                            }
+                            Err(_) => return Ok(None),
+                        }
+                    }
+                    Err(_) => return Ok(None),
+                }
+            };
+            match bytes_opt {
+                Some(b) => b,
+                None => return Ok(None),
+            }
+        };
+        #[cfg(not(windows))]
+        {
+            let bytes = match std::fs::read(descriptor_path) {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            };
+            if sha256_hex(&bytes) != expected_descriptor_digest {
+                return Ok(None);
+            }
+            let _ = bytes;
+        }
+        if retained.verify_stable_identity().is_err() {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            return Err("deadline exceeded before eliotd receipt lease".to_owned());
+        }
+        let receipt_path = canonical.join("eliotd-receipt.json");
+        #[cfg(windows)]
+        let receipt_bytes = {
+            let lease =
+                match eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
+                    &receipt_path,
+                ) {
+                    Ok(l) => l,
+                    Err(_) => return Ok(None),
+                };
+            if lease.verify_stable_identity().is_err() || lease.verify_path_identity().is_err() {
+                return Ok(None);
+            }
+            let bytes = match lease.read_bounded(1024 * 1024) {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            };
+            if lease.verify_stable_identity().is_err() {
+                return Ok(None);
+            }
+            bytes
+        };
+        #[cfg(not(windows))]
+        let receipt_bytes = {
+            match std::fs::read(&receipt_path) {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            }
+        };
+        let receipt: eliot_process::ProcessStartReceipt =
+            match serde_json::from_slice(&receipt_bytes) {
+                Ok(r) => r,
+                Err(_) => return Ok(None),
+            };
+        if receipt.validate().is_err() {
+            return Ok(None);
+        }
+        let now_ms = match current_unix_ms() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let resumed = receipt.identity().resumed_at_unix_ms();
+        if resumed == 0
+            || resumed > now_ms.saturating_add(5_000)
+            || now_ms.saturating_sub(resumed) > 60_000
+        {
+            return Ok(None);
+        }
+        let physical = receipt.identity().physical();
+        let pid = physical.process_id();
+        let start = physical.start_time_100ns();
+        let image = physical.image_path().to_owned();
+        let job = physical.executor_job_name().to_owned();
+        if pid == 0 || start == 0 || image.trim().is_empty() || job.trim().is_empty() {
+            return Ok(None);
+        }
+        if !eliot_platform_windows::windows_paths_equal(
+            Path::new(&image),
+            Path::new(manifest.runtime_launch.eliotd_executable_path.as_str()),
+        ) {
+            return Ok(None);
+        }
+        if receipt.accepted_generation().get()
+            != manifest.runtime_launch.authority_generation.value()
+        {
+            return Ok(None);
+        }
+        if receipt.binding().state_fence().authority_epoch()
+            != manifest.runtime_launch.authority_generation.value()
+        {
+            let fence_epoch = manifest
+                .runtime_launch
+                .authority_state_fence
+                .authority_epoch
+                .value();
+            if receipt.binding().state_fence().authority_epoch() != fence_epoch {
+                return Ok(None);
+            }
+        }
+        let observed_at = now_ms;
+        #[cfg(windows)]
+        {
+            if Instant::now() >= deadline {
+                return Err("deadline exceeded before eliotd Job observation".to_owned());
+            }
+            let binding =
+                match eliot_platform_windows::observe_named_pipe_peer_process_in_job(&job, pid) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(None),
+                };
+            let id = binding.process_binding().identity();
+            if id.process_id != pid
+                || id.start_time_100ns != start
+                || !eliot_platform_windows::windows_paths_equal(
+                    Path::new(&id.image_path),
+                    Path::new(&image),
+                )
+                || binding.job_name() != job
+            {
+                return Ok(None);
+            }
+            if retained.verify_stable_identity().is_err() {
+                return Ok(None);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let live_path = canonical.join("eliotd-live-process.json");
+            if !live_path.exists() {
+                return Ok(None);
+            }
+            let live_bytes = match std::fs::read(&live_path) {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            };
+            let live: serde_json::Value = match serde_json::from_slice(&live_bytes) {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let live_pid = live.get("process_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let live_start = live
+                .get("start_time_100ns")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let live_image = live
+                .get("image_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let live_job = live
+                .get("executor_job_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if live_pid != pid
+                || live_start != start
+                || !eliot_platform_windows::windows_paths_equal(
+                    Path::new(live_image),
+                    Path::new(&image),
+                )
+                || live_job != job
+            {
+                return Ok(None);
+            }
+        }
+        if retained.verify_stable_identity().is_err() {
+            return Ok(None);
+        }
+        let ready_binding = sha256_hex(format!("ready:{pid}:{start}:{observed_at}").as_bytes());
+        let snapshot = EliotdLiveSnapshot {
+            process_id: pid,
+            start_time_100ns: start,
+            image_path: image.clone(),
+            executor_job_name: job.clone(),
+            generation: manifest.generation.as_str().to_owned(),
+            config_digest: manifest
+                .runtime_launch
+                .eliotd_config_digest
+                .as_str()
+                .to_owned(),
+            descriptor_digest: expected_descriptor_digest.to_owned(),
+            daemon_ready: true,
+            supervision_epoch: manifest.runtime_launch.authority_generation.value(),
+            observed_at_unix_ms: observed_at,
+            ready_binding_digest: ready_binding,
+        };
+        if snapshot.supervision_epoch == 0 || snapshot.observed_at_unix_ms == 0 {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
     }
 }
 
@@ -3208,13 +3534,244 @@ fn inspect_host_journal_retained(
             Some(host_state),
         );
     }
-    let gap = format!(
-        "validated host journal seq={sequence} last_checksum={last_checksum:?} clean={clean:?} prior_unknown={prior} active Kernel Consumed"
-    );
-    let state = ComponentState::Unknown {
-        reason: format!("validated host journal Active Kernel Consumed seq={sequence}"),
-        gap: gap.clone(),
+    let Some(kernel) = host_state.kernel.as_ref() else {
+        let gap = format!(
+            "validated journal seq={sequence} clean={clean:?} prior_unknown={prior} but no kernel; {}",
+            host_journal_gap()
+        );
+        return (
+            HostJournalContour {
+                state: ComponentState::Unknown {
+                    reason: "no kernel for host journal health".to_owned(),
+                    gap: gap.clone(),
+                },
+                clean: Some(clean),
+                sequence: Some(sequence),
+                last_checksum,
+                prior_kernel_unknown: Some(prior),
+                gap,
+            },
+            Some(host_state),
+        );
     };
+    let active_checksum = match eliot_host_state::record_checksum(
+        &eliot_host_state::HostStateRecord::Kernel(kernel.clone()),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let gap = format!("active kernel checksum failed: {e}; {}", host_journal_gap());
+            return (
+                HostJournalContour {
+                    state: ComponentState::Unknown {
+                        reason: format!("active kernel checksum failed: {e}"),
+                        gap: gap.clone(),
+                    },
+                    clean: Some(clean),
+                    sequence: Some(sequence),
+                    last_checksum,
+                    prior_kernel_unknown: Some(prior),
+                    gap,
+                },
+                Some(host_state),
+            );
+        }
+    };
+    let Some(observed) = host_state.readiness_observations.last() else {
+        let gap = format!(
+            "validated journal seq={sequence} but no readiness observation; {}",
+            host_journal_gap()
+        );
+        return (
+            HostJournalContour {
+                state: ComponentState::Unknown {
+                    reason: "no readiness observation for host journal health".to_owned(),
+                    gap: gap.clone(),
+                },
+                clean: Some(clean),
+                sequence: Some(sequence),
+                last_checksum,
+                prior_kernel_unknown: Some(prior),
+                gap,
+            },
+            Some(host_state),
+        );
+    };
+    if observed.validate_against(kernel, &active_checksum).is_err() {
+        let gap = format!(
+            "readiness not bound to exact active kernel checksum/process/Job/authority; {}",
+            host_journal_gap()
+        );
+        return (
+            HostJournalContour {
+                state: ComponentState::Unknown {
+                    reason: "readiness observation is not bound to exact active kernel".to_owned(),
+                    gap: gap.clone(),
+                },
+                clean: Some(clean),
+                sequence: Some(sequence),
+                last_checksum,
+                prior_kernel_unknown: Some(prior),
+                gap,
+            },
+            Some(host_state),
+        );
+    }
+    let now_ms = match current_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            let gap = format!("current time unavailable: {e}; {}", host_journal_gap());
+            return (
+                HostJournalContour {
+                    state: ComponentState::Unknown {
+                        reason: format!("current time unavailable: {e}"),
+                        gap: gap.clone(),
+                    },
+                    clean: Some(clean),
+                    sequence: Some(sequence),
+                    last_checksum,
+                    prior_kernel_unknown: Some(prior),
+                    gap,
+                },
+                Some(host_state),
+            );
+        }
+    };
+    if let Err(e) = is_fresh_observed_at(observed.observed_at.as_str(), now_ms) {
+        let gap = format!("readiness not fresh: {e}; {}", host_journal_gap());
+        return (
+            HostJournalContour {
+                state: ComponentState::Unknown {
+                    reason: format!("readiness not fresh: {e}"),
+                    gap: gap.clone(),
+                },
+                clean: Some(clean),
+                sequence: Some(sequence),
+                last_checksum,
+                prior_kernel_unknown: Some(prior),
+                gap,
+            },
+            Some(host_state),
+        );
+    }
+    let current_store = match select_current_store_rebind(&host_state) {
+        Ok(r) => r,
+        Err(e) => {
+            let gap = format!(
+                "store current selection failed: {e}; {}",
+                host_journal_gap()
+            );
+            return (
+                HostJournalContour {
+                    state: ComponentState::Unknown {
+                        reason: format!("store current selection failed: {e}"),
+                        gap: gap.clone(),
+                    },
+                    clean: Some(clean),
+                    sequence: Some(sequence),
+                    last_checksum,
+                    prior_kernel_unknown: Some(prior),
+                    gap,
+                },
+                Some(host_state),
+            );
+        }
+    };
+    if current_store.state != eliot_host_state::StoreRebindState::Committed {
+        let gap = format!(
+            "current store is {:?} not Committed; {}",
+            current_store.state,
+            host_journal_gap()
+        );
+        return (
+            HostJournalContour {
+                state: ComponentState::Unknown {
+                    reason: format!("current store is {:?} not Committed", current_store.state),
+                    gap: gap.clone(),
+                },
+                clean: Some(clean),
+                sequence: Some(sequence),
+                last_checksum,
+                prior_kernel_unknown: Some(prior),
+                gap,
+            },
+            Some(host_state),
+        );
+    }
+    if observed.store_fence.as_str() != current_store.store_fence.as_str()
+        || observed.authority_epoch != current_store.authority_epoch
+    {
+        let gap = format!(
+            "readiness store_fence/authority does not match current committed store; {}",
+            host_journal_gap()
+        );
+        return (
+            HostJournalContour {
+                state: ComponentState::Unknown {
+                    reason: "readiness store_fence/authority does not match current store fence"
+                        .to_owned(),
+                    gap: gap.clone(),
+                },
+                clean: Some(clean),
+                sequence: Some(sequence),
+                last_checksum,
+                prior_kernel_unknown: Some(prior),
+                gap,
+            },
+            Some(host_state),
+        );
+    }
+    if current_store
+        .receipt_store_fence
+        .as_ref()
+        .is_none_or(|v| v.as_str() != current_store.store_fence.as_str())
+        || current_store
+            .receipt_request_digest
+            .as_ref()
+            .is_none_or(|v| v.as_str() != current_store.request_digest.as_str())
+    {
+        let gap = format!(
+            "current store receipt does not match fence/request; {}",
+            host_journal_gap()
+        );
+        return (
+            HostJournalContour {
+                state: ComponentState::Unknown {
+                    reason: "current store receipt does not match".to_owned(),
+                    gap: gap.clone(),
+                },
+                clean: Some(clean),
+                sequence: Some(sequence),
+                last_checksum,
+                prior_kernel_unknown: Some(prior),
+                gap,
+            },
+            Some(host_state),
+        );
+    }
+    #[cfg(windows)]
+    if let Err(e) = require_host_monotonic_lease(Some(canonical_path), now_ms, deadline) {
+        let gap = format!("monotonic lease not fresh: {e}; {}", host_journal_gap());
+        return (
+            HostJournalContour {
+                state: ComponentState::Unknown {
+                    reason: format!("monotonic lease not fresh: {e}"),
+                    gap: gap.clone(),
+                },
+                clean: Some(clean),
+                sequence: Some(sequence),
+                last_checksum,
+                prior_kernel_unknown: Some(prior),
+                gap,
+            },
+            Some(host_state),
+        );
+    }
+    let gap = format!(
+        "validated host journal seq={sequence} last_checksum={last_checksum:?} clean={clean:?} prior_unknown={prior} active Kernel Consumed fresh readiness store_fence={} authority={} lease fresh",
+        current_store.store_fence.as_str(),
+        current_store.authority_epoch
+    );
+    let state = ComponentState::Healthy;
     (
         HostJournalContour {
             state,
@@ -3879,7 +4436,7 @@ mod honest_tests {
             #[cfg(windows)]
             {
                 let program_data = eliot_platform_windows::protected_program_data_root()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                    .expect("honest test requires Windows Protected ProgramData root");
                 program_data.join(format!(
                     "eliot-test-runtime-status-{}-{}-{}",
                     label,
@@ -3910,17 +4467,32 @@ mod honest_tests {
 
     fn temp_portable_host(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let base = {
-            let program_data = eliot_platform_windows::protected_program_data_root()
-                .unwrap_or_else(|_| std::env::temp_dir());
-            program_data.join(format!(
-                "eliot-rt-txn-{}-{}-{}",
-                label,
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ))
+            #[cfg(windows)]
+            {
+                let program_data = eliot_platform_windows::protected_program_data_root()
+                    .expect("honest test requires Windows Protected ProgramData root");
+                program_data.join(format!(
+                    "eliot-rt-txn-{}-{}-{}",
+                    label,
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))
+            }
+            #[cfg(not(windows))]
+            {
+                std::env::temp_dir().join(format!(
+                    "eliot-rt-txn-{}-{}-{}",
+                    label,
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))
+            }
         };
         let _ = std::fs::remove_dir_all(&base);
         let portable = base.join("portable");
@@ -4185,7 +4757,7 @@ mod honest_tests {
     // This fixture deliberately materializes the complete immutable installer
     // contour so projection tests exercise the production wire shape.
     #[allow(clippy::too_many_lines)]
-    fn portable_transaction_for_host(
+    pub fn portable_transaction_for_host(
         host_root: &Path,
     ) -> eliot_installation::InstallationTransaction {
         let portable_root = host_root.parent().expect("host has parent").to_path_buf();
@@ -6189,7 +6761,7 @@ mod cli_separate_process_tests {
             #[cfg(windows)]
             {
                 let program_data = eliot_platform_windows::protected_program_data_root()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                    .expect("honest test requires Windows Protected ProgramData root");
                 program_data.join(format!(
                     "eliot-cli-test-{}-{}-{}",
                     label,
@@ -6486,7 +7058,7 @@ mod host_journal_projection_tests {
             #[cfg(windows)]
             {
                 let program_data = eliot_platform_windows::protected_program_data_root()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                    .expect("honest test requires Windows Protected ProgramData root");
                 program_data.join(format!(
                     "eliot-test-host-journal-{}-{}-{}",
                     label,
@@ -6750,6 +7322,575 @@ mod host_journal_projection_tests {
         assert!(
             combined.contains("NOT_HEALTHY"),
             "unprotected journal must not produce Healthy: {combined}"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod production_call_path_negatives {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use eliot_installation::PlatformHandle;
+    use eliot_process::{Generation, PhysicalProcessBinding, ProcessState};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let base = {
+            #[cfg(windows)]
+            {
+                let program_data = eliot_platform_windows::protected_program_data_root()
+                    .expect("honest test requires Windows Protected ProgramData root");
+                program_data.join(format!(
+                    "eliot-prod-neg-{}-{}-{}",
+                    label,
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))
+            }
+            #[cfg(not(windows))]
+            {
+                std::env::temp_dir().join(format!(
+                    "eliot-prod-neg-{}-{}-{}",
+                    label,
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))
+            }
+        };
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create temp");
+        base
+    }
+
+    fn h(v: impl Into<String>) -> PlatformHandle {
+        PlatformHandle::new(v.into()).expect("handle")
+    }
+
+    fn fixture_via_portable(
+        base: &Path,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        eliot_installation::CandidateManifest,
+        eliot_installation::InstallationTransaction,
+    ) {
+        let portable = base.join("portable");
+        std::fs::create_dir_all(&portable).expect("portable");
+        let host_root = portable.join("host");
+        std::fs::create_dir_all(&host_root).expect("host");
+        let mut tx = super::honest_tests::portable_transaction_for_host(&host_root);
+        let descriptor_path = Path::new(
+            tx.candidate_manifest
+                .runtime_launch
+                .eliotd_descriptor_path
+                .as_str(),
+        );
+        let _ = std::fs::create_dir_all(descriptor_path.parent().expect("parent"));
+        let content = br#"{"eliotd":"descriptor"}"#;
+        std::fs::write(descriptor_path, content).expect("write descriptor");
+        let file_hash = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(content))
+        };
+        let mut manifest = tx.candidate_manifest.clone();
+        manifest.runtime_launch.eliotd_descriptor_digest = h(file_hash.clone());
+        for arg in &mut manifest.runtime_launch.kernel_arguments {
+            if arg.as_str() == "9".repeat(64) {
+                *arg = h(file_hash.clone());
+            }
+        }
+        manifest.runtime_launch = manifest
+            .runtime_launch
+            .with_computed_digest()
+            .expect("computed digest");
+        tx.candidate_manifest = manifest.clone();
+        let candidate_digest = {
+            use sha2::{Digest, Sha256};
+            let bytes = serde_json::to_vec(&manifest).expect("manifest json");
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        let candidate_handle = h(candidate_digest);
+        let manifest_value = serde_json::to_value(&manifest).expect("manifest value");
+        let authority_generation_value =
+            serde_json::to_value(manifest.runtime_launch.authority_generation).expect("auth gen");
+        let authority_fence_value =
+            serde_json::to_value(&manifest.runtime_launch.authority_state_fence).expect("fence");
+        let generation_str = manifest.generation.as_str().to_owned();
+        let tx_id = tx.transaction_id.as_str().to_owned();
+        let plan_digest = tx.installer_plan_digest.as_str().to_owned();
+        let active_registry = serde_json::json!({
+            "registry_wire_version": { "major": 4, "minor": 0, "patch": 0 },
+            "revision": 2,
+            "generations": [{
+                "manifest": manifest_value,
+                "approval": {
+                    "approval_ref": "approval:prod-neg",
+                    "transaction_id": tx_id,
+                    "installer_plan_digest": plan_digest,
+                    "generation": generation_str,
+                    "candidate_manifest_digest": candidate_handle.as_str(),
+                    "runtime_descriptor_digest": manifest.runtime_launch.descriptor_digest.as_str(),
+                    "required_owner": "owner:installation",
+                    "signature_ref": manifest.signature_ref.as_str(),
+                    "authority_descriptor_path": manifest.runtime_launch.authority_descriptor_path.as_str(),
+                    "authority_descriptor_digest": manifest.runtime_launch.authority_descriptor_digest.as_str(),
+                    "authority_generation": authority_generation_value,
+                    "authority_state_fence": authority_fence_value,
+                }
+            }],
+            "service_registration_approvals": [],
+            "active_generation": generation_str,
+            "last_known_good_generation": generation_str,
+            "pending_activation": null,
+            "last_terminal_activation": null
+        });
+        let path = host_root.join("installation-registry.redb");
+        let db = redb::Database::create(&path).expect("create registry");
+        let write = db.begin_write().expect("begin write");
+        {
+            let mut table = write
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                    "eliot_approved_generations_v2",
+                ))
+                .expect("open table");
+            let bytes = serde_json::to_vec(&active_registry).expect("registry bytes");
+            table.insert("registry", bytes.as_slice()).expect("insert");
+        }
+        write.commit().expect("commit");
+        (base.to_path_buf(), host_root, manifest, tx)
+    }
+
+    fn create_receipt_with_generation(
+        generation: Generation,
+        image_path: &str,
+        job_name: &str,
+        resumed_at: u64,
+    ) -> eliot_process::ProcessStartReceipt {
+        use eliot_process::{
+            ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
+            EnvironmentProjection, FencingToken, ImageId, JobId, KernelDispatchKey, OperationId,
+            PermitIssuance, ProcessId, ProcessIntent, ProcessRequest, ProcessTreeId,
+            ResourceLimits, SecretRef, SessionId,
+        };
+        let fence = FencingToken::new(1, generation, "fence-1").expect("fence");
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("kernel-authority-7").expect("auth id"),
+            KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("key"),
+        );
+        let intent = ProcessIntent::new(
+            OperationId::new("op-1").expect("op"),
+            ProcessTreeId::new("tree-1").expect("tree"),
+            JobId::new("job-1").expect("job"),
+            ImageId::new("image-file-id-1").expect("image"),
+            SessionId::new("session-1").expect("session"),
+            generation,
+            image_path.to_owned(),
+            "a".repeat(64),
+            vec!["--check".to_owned()],
+            "C:\\work",
+            EnvironmentProjection::new(
+                std::collections::BTreeMap::from([("PATH".to_owned(), "C:\\Windows".to_owned())]),
+                vec![SecretRef::new("credential_manager", "provider/token").expect("secret")],
+                EnvironmentInheritance::None,
+            )
+            .expect("env"),
+            ResourceLimits::new(10_000, Some(5_000), Some(1_048_576), 4096, 4096, 4)
+                .expect("limits"),
+        )
+        .expect("intent");
+        let issuance = PermitIssuance::new(
+            ActionLeaseRef::new("lease-1").expect("lease"),
+            fence.clone(),
+            std::collections::BTreeMap::from([
+                ("authority".to_owned(), "a".repeat(64)),
+                ("state".to_owned(), "b".repeat(64)),
+            ]),
+            100,
+            200,
+            "nonce-1",
+        )
+        .expect("issuance");
+        let permit = authority.issue(&intent, issuance).expect("permit");
+        let request = ProcessRequest::new(intent.clone(), permit).expect("request");
+        let physical =
+            PhysicalProcessBinding::new(4242, 11, image_path, job_name).expect("physical");
+        let observed = eliot_process::SuspendedProcessIdentity::new(
+            ProcessId::new("process-1").expect("pid"),
+            intent.process_tree_id().clone(),
+            intent.job_id().clone(),
+            intent.image_id().clone(),
+            intent.session_id().clone(),
+            generation,
+            physical.clone(),
+            120,
+            "a".repeat(64),
+        )
+        .expect("observed");
+        let clock = eliot_platform::ClockObservation {
+            valid_time_ms: Some(150),
+            known_time_ms: Some(150),
+            transaction_sequence: None,
+            monotonic_ns: Some(1),
+        };
+        let ctx = eliot_process::DispatchValidationContext::new(
+            clock,
+            fence.clone(),
+            1,
+            std::collections::BTreeMap::from([
+                ("authority".to_owned(), "a".repeat(64)),
+                ("state".to_owned(), "b".repeat(64)),
+            ]),
+            41,
+        )
+        .expect("ctx");
+        let validated = authority
+            .validate_and_consume(request, observed, &ctx)
+            .expect("validated");
+        let mut state = ProcessState::from_validated(&validated);
+        state
+            .mark_resumed(
+                resumed_at,
+                eliot_process::ProcessHealth::new(
+                    eliot_process::ProcessHealthStatus::Healthy,
+                    true,
+                    resumed_at,
+                    None,
+                )
+                .expect("health"),
+            )
+            .expect("resume");
+        eliot_process::ProcessStartReceipt::new(&state).expect("receipt")
+    }
+
+    fn write_receipt(host_root: &Path, receipt: &eliot_process::ProcessStartReceipt) {
+        let path = host_root.join("eliotd-receipt.json");
+        let bytes = serde_json::to_vec(receipt).expect("receipt json");
+        std::fs::write(&path, bytes).expect("write receipt");
+    }
+
+    fn write_live_process(host_root: &Path, pid: u32, start: u64, image: &str, job: &str) {
+        let path = host_root.join("eliotd-live-process.json");
+        let value = serde_json::json!({
+            "process_id": pid,
+            "start_time_100ns": start,
+            "image_path": image,
+            "executor_job_name": job
+        });
+        std::fs::write(&path, serde_json::to_vec(&value).expect("live json")).expect("write live");
+    }
+
+    fn collect_via_production(host_root: &Path) -> RuntimeStatusReport {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        collect_status(host_root, deadline).expect("collect_status")
+    }
+
+    #[test]
+    fn stale_receipt_is_unknown_via_production_path() {
+        let base = temp_dir("stale-receipt");
+        let (_base_path, host_root, manifest, _tx) = fixture_via_portable(&base);
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .expect("now fits u64");
+        let old_resumed = 1000u64;
+        let receipt = create_receipt_with_generation(
+            Generation::new(1).expect("gen"),
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+            old_resumed,
+        );
+        write_receipt(&host_root, &receipt);
+        write_live_process(
+            &host_root,
+            4242,
+            11,
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+        );
+        let _ = now;
+        let report = collect_via_production(&host_root);
+        assert!(
+            matches!(report.services.eliotd, ComponentState::Unknown { .. }),
+            "stale receipt must be Unknown, got {:?}",
+            report.services.eliotd
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn wrong_job_is_unknown_via_production_path() {
+        let base = temp_dir("wrong-job");
+        let (_base_path, host_root, manifest, _tx) = fixture_via_portable(&base);
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .expect("now fits u64");
+        let receipt = create_receipt_with_generation(
+            Generation::new(1).expect("gen"),
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+            now,
+        );
+        write_receipt(&host_root, &receipt);
+        write_live_process(
+            &host_root,
+            4242,
+            11,
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "wrong-job",
+        );
+        let report = collect_via_production(&host_root);
+        assert!(
+            matches!(report.services.eliotd, ComponentState::Unknown { .. }),
+            "wrong job must be Unknown, got {:?}",
+            report.services.eliotd
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn wrong_process_is_unknown_via_production_path() {
+        let base = temp_dir("wrong-process");
+        let (_base_path, host_root, manifest, _tx) = fixture_via_portable(&base);
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .expect("now fits u64");
+        let receipt = create_receipt_with_generation(
+            Generation::new(1).expect("gen"),
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+            now,
+        );
+        write_receipt(&host_root, &receipt);
+        write_live_process(
+            &host_root,
+            9999,
+            11,
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+        );
+        let report = collect_via_production(&host_root);
+        assert!(
+            matches!(report.services.eliotd, ComponentState::Unknown { .. }),
+            "wrong pid must be Unknown, got {:?}",
+            report.services.eliotd
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    #[allow(clippy::items_after_statements)]
+    fn wrong_config_is_unknown_via_production_path() {
+        let base = temp_dir("wrong-config");
+        let (_base_path, host_root, manifest, _tx) = fixture_via_portable(&base);
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .expect("now fits u64");
+        let receipt = create_receipt_with_generation(
+            Generation::new(1).expect("gen"),
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+            now,
+        );
+        write_receipt(&host_root, &receipt);
+        write_live_process(
+            &host_root,
+            4242,
+            11,
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+        );
+        let tampered = h("e".repeat(64));
+        let fake = EliotdLiveSnapshot {
+            process_id: 4242,
+            start_time_100ns: 11,
+            image_path: manifest
+                .runtime_launch
+                .eliotd_executable_path
+                .as_str()
+                .to_owned(),
+            executor_job_name: "eliotd-job-1".to_owned(),
+            generation: manifest.generation.as_str().to_owned(),
+            config_digest: tampered.as_str().to_owned(),
+            descriptor_digest: manifest
+                .runtime_launch
+                .eliotd_descriptor_digest
+                .as_str()
+                .to_owned(),
+            daemon_ready: true,
+            supervision_epoch: 1,
+            observed_at_unix_ms: now,
+            ready_binding_digest: sha256_hex(format!("ready:4242:11:{now}").as_bytes()),
+        };
+        struct ConfigMismatch(EliotdLiveSnapshot);
+        impl EliotdLiveObserver for ConfigMismatch {
+            fn observe_eliotd_live(
+                &self,
+                _: Instant,
+            ) -> Result<Option<EliotdLiveSnapshot>, String> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+        let obs = ConfigMismatch(fake);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let report =
+            collect_status_with_observers(&host_root, deadline, None, None, None, Some(&obs))
+                .expect("collect");
+        assert!(
+            matches!(report.services.eliotd, ComponentState::Unknown { .. }),
+            "wrong config must be Unknown"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    #[allow(clippy::items_after_statements)]
+    fn wrong_generation_is_unknown_via_production_path() {
+        let base = temp_dir("wrong-generation");
+        let (_base_path, host_root, manifest, _tx) = fixture_via_portable(&base);
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .expect("now fits u64");
+        let receipt = create_receipt_with_generation(
+            Generation::new(1).expect("gen"),
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+            now,
+        );
+        write_receipt(&host_root, &receipt);
+        write_live_process(
+            &host_root,
+            4242,
+            11,
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+        );
+        let fake = EliotdLiveSnapshot {
+            process_id: 4242,
+            start_time_100ns: 11,
+            image_path: manifest
+                .runtime_launch
+                .eliotd_executable_path
+                .as_str()
+                .to_owned(),
+            executor_job_name: "eliotd-job-1".to_owned(),
+            generation: "generation:wrong".to_owned(),
+            config_digest: manifest
+                .runtime_launch
+                .eliotd_config_digest
+                .as_str()
+                .to_owned(),
+            descriptor_digest: manifest
+                .runtime_launch
+                .eliotd_descriptor_digest
+                .as_str()
+                .to_owned(),
+            daemon_ready: true,
+            supervision_epoch: 1,
+            observed_at_unix_ms: now,
+            ready_binding_digest: sha256_hex(format!("ready:4242:11:{now}").as_bytes()),
+        };
+        struct GenMismatch(EliotdLiveSnapshot);
+        impl EliotdLiveObserver for GenMismatch {
+            fn observe_eliotd_live(
+                &self,
+                _: Instant,
+            ) -> Result<Option<EliotdLiveSnapshot>, String> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+        let obs = GenMismatch(fake);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let report =
+            collect_status_with_observers(&host_root, deadline, None, None, None, Some(&obs))
+                .expect("collect");
+        assert!(
+            matches!(report.services.eliotd, ComponentState::Unknown { .. }),
+            "wrong generation must be Unknown"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn byte_stability_descriptor_mismatch_is_unknown_via_production_path() {
+        let base = temp_dir("byte-stability");
+        let (_base_path, host_root, manifest, _tx) = fixture_via_portable(&base);
+        let descriptor_path = Path::new(manifest.runtime_launch.eliotd_descriptor_path.as_str());
+        let _ = std::fs::write(descriptor_path, br#"{"tampered":true}"#);
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .expect("now fits u64");
+        let receipt = create_receipt_with_generation(
+            Generation::new(1).expect("gen"),
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+            now,
+        );
+        write_receipt(&host_root, &receipt);
+        write_live_process(
+            &host_root,
+            4242,
+            11,
+            manifest.runtime_launch.eliotd_executable_path.as_str(),
+            "eliotd-job-1",
+        );
+        let report = collect_via_production(&host_root);
+        assert!(
+            matches!(report.services.eliotd, ComponentState::Unknown { .. }),
+            "tampered descriptor must be Unknown, got {:?}",
+            report.services.eliotd
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn store_fence_mismatch_is_unknown_via_production_path() {
+        let base = temp_dir("store-fence");
+        let (_base_path, host_root, _manifest, _tx) = fixture_via_portable(&base);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let report = collect_status_with_observers(&host_root, deadline, None, None, None, None)
+            .expect("collect");
+        assert!(
+            matches!(report.services.store, ComponentState::Unknown { .. }),
+            "store fence without committed rebind must be Unknown"
+        );
+        assert!(
+            matches!(
+                report.host_journal.state,
+                ComponentState::Unknown { .. } | ComponentState::Missing { .. }
+            ),
+            "host journal without store fence must not be Healthy"
         );
         let _ = std::fs::remove_dir_all(base);
     }
