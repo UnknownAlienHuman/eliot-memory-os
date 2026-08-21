@@ -1,14 +1,20 @@
 #![allow(dead_code)]
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eliot_platform::PlatformHandle;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const SCM_STORE_MAGIC: &str = "ELIOT-SCM-OP-STORE-V1";
 const SCM_STORE_VERSION: u16 = 1;
+const SCM_RECORD_ENVELOPE_MAGIC: &str = "ELIOT-SCM-OP-RECORD-V1";
+const SCM_RECORD_ENVELOPE_VERSION: u16 = 1;
+const SCM_INDEX_MAGIC: &str = "ELIOT-SCM-OP-INDEX-V1";
+const SCM_INDEX_VERSION: u16 = 1;
+const MAX_HISTORY_ENTRIES: usize = 4096;
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("eliot_scm_store_meta_v1");
 const OPS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("eliot_scm_operations_v1");
 const INDEX_TABLE: TableDefinition<&str, &[u8]> =
@@ -20,6 +26,8 @@ const CANONICAL_SERVICE: &str = "EliotHost";
 pub enum ScmOperationStoreError {
     #[error("scm operation store is unavailable")]
     Unavailable,
+    #[error("scm operation store file is missing")]
+    MissingFile,
     #[error("scm operation store is corrupt")]
     Corrupt,
     #[error("scm operation store legacy version {version}")]
@@ -36,6 +44,8 @@ pub enum ScmOperationStoreError {
     IllegalTransition { from: String, to: String },
     #[error("scm operation is quarantined")]
     Quarantined,
+    #[error("scm operation coordinator is not bound to this store")]
+    NotOwner,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -79,6 +89,13 @@ fn is_legal_transition(from: ScmOperationState, to: ScmOperationState) -> bool {
 struct StoreMeta {
     magic: String,
     version: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScmOperationHistoryLink {
+    revision: u64,
+    checksum: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -130,6 +147,23 @@ impl ScmOperationIdentity {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScmOperationRecordEnvelope {
+    magic: String,
+    version: u16,
+    record: ScmOperationRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScmOperationIndexEntry {
+    magic: String,
+    version: u16,
+    stable_key: String,
+    record_key: String,
+}
+
 /// Durable record. Fields are private to prevent forging.
 ///
 /// ```compile_fail
@@ -163,6 +197,8 @@ pub struct ScmOperationRecord {
     state: ScmOperationState,
     revision: u64,
     prior_sha256: String,
+    checksum: String,
+    history: Vec<ScmOperationHistoryLink>,
 }
 
 impl ScmOperationRecord {
@@ -192,6 +228,9 @@ impl ScmOperationRecord {
     }
     pub fn prior_sha256(&self) -> &str {
         &self.prior_sha256
+    }
+    pub fn checksum(&self) -> &str {
+        &self.checksum
     }
     pub fn key(&self) -> String {
         [
@@ -238,18 +277,44 @@ impl ScmOperationRecord {
                 "revision must be positive".into(),
             ));
         }
-        if self.prior_sha256.len() != 64
-            || !self
-                .prior_sha256
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
-            if self.prior_sha256 == "GENESIS" {
-            } else {
-                return Err(ScmOperationStoreError::InvalidRecord(
-                    "prior_sha256 must be 64 lowercase hex or GENESIS".into(),
-                ));
+        if self.history.len() > MAX_HISTORY_ENTRIES {
+            return Err(ScmOperationStoreError::InvalidRecord(
+                "operation history exceeds bounded limit".into(),
+            ));
+        }
+        let expected_history_len = self.revision.checked_sub(1).ok_or_else(|| {
+            ScmOperationStoreError::InvalidRecord("revision must be positive".into())
+        })?;
+        if usize::try_from(expected_history_len).ok() != Some(self.history.len()) {
+            return Err(ScmOperationStoreError::Corrupt);
+        }
+        if self.history.is_empty() {
+            if self.prior_sha256 != "GENESIS" {
+                return Err(ScmOperationStoreError::Corrupt);
             }
+        } else {
+            for (index, link) in self.history.iter().enumerate() {
+                let expected_revision = u64::try_from(index)
+                    .ok()
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(ScmOperationStoreError::Corrupt)?;
+                if link.revision != expected_revision || !is_sha256(&link.checksum) {
+                    return Err(ScmOperationStoreError::Corrupt);
+                }
+            }
+            if self
+                .history
+                .last()
+                .is_none_or(|link| link.checksum != self.prior_sha256)
+            {
+                return Err(ScmOperationStoreError::Corrupt);
+            }
+        }
+        if !is_sha256(&self.checksum) {
+            return Err(ScmOperationStoreError::Corrupt);
+        }
+        if normalized_sha(self)? != self.checksum {
+            return Err(ScmOperationStoreError::Corrupt);
         }
         Ok(())
     }
@@ -282,55 +347,159 @@ fn digest(value: &PlatformHandle, field: &'static str) -> Result<(), ScmOperatio
     Ok(())
 }
 
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn map_database_open_error(error: redb::DatabaseError) -> ScmOperationStoreError {
+    match error {
+        redb::DatabaseError::Storage(redb::StorageError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            ScmOperationStoreError::MissingFile
+        }
+        redb::DatabaseError::Storage(redb::StorageError::Corrupted(_)) => {
+            ScmOperationStoreError::Corrupt
+        }
+        redb::DatabaseError::UpgradeRequired(version) => ScmOperationStoreError::Legacy {
+            version: u16::from(version),
+        },
+        _ => ScmOperationStoreError::Unavailable,
+    }
+}
+
+#[derive(Serialize)]
+struct ScmOperationRecordDigest<'a> {
+    magic: &'a str,
+    version: u16,
+    installation: &'a PlatformHandle,
+    service: &'a PlatformHandle,
+    approval_digest: &'a PlatformHandle,
+    config_digest: &'a PlatformHandle,
+    operation_id: &'a PlatformHandle,
+    request_digest: &'a PlatformHandle,
+    state: ScmOperationState,
+    revision: u64,
+    prior_sha256: &'a str,
+    history: &'a [ScmOperationHistoryLink],
+}
+
 fn normalized_sha(record: &ScmOperationRecord) -> Result<String, ScmOperationStoreError> {
-    let bytes = serde_json::to_vec(record).map_err(|_| ScmOperationStoreError::Corrupt)?;
+    let digest_input = ScmOperationRecordDigest {
+        magic: &record.magic,
+        version: record.version,
+        installation: &record.installation,
+        service: &record.service,
+        approval_digest: &record.approval_digest,
+        config_digest: &record.config_digest,
+        operation_id: &record.operation_id,
+        request_digest: &record.request_digest,
+        state: record.state,
+        revision: record.revision,
+        prior_sha256: &record.prior_sha256,
+        history: &record.history,
+    };
+    let bytes = serde_json::to_vec(&digest_input).map_err(|_| ScmOperationStoreError::Corrupt)?;
     Ok(sha256_hex(&bytes))
+}
+
+fn encode_record(record: &ScmOperationRecord) -> Result<Vec<u8>, ScmOperationStoreError> {
+    let envelope = ScmOperationRecordEnvelope {
+        magic: SCM_RECORD_ENVELOPE_MAGIC.to_owned(),
+        version: SCM_RECORD_ENVELOPE_VERSION,
+        record: record.clone(),
+    };
+    serde_json::to_vec(&envelope).map_err(|_| ScmOperationStoreError::Corrupt)
+}
+
+fn decode_record(bytes: &[u8]) -> Result<ScmOperationRecord, ScmOperationStoreError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| ScmOperationStoreError::Corrupt)?;
+    let envelope: ScmOperationRecordEnvelope =
+        if let Ok(envelope) = serde_json::from_value(value.clone()) {
+            envelope
+        } else {
+            // The pre-envelope representation is never silently adopted. It
+            // must be explicitly restaged by a future migration tool.
+            if let Some(version) = value.get("version").and_then(serde_json::Value::as_u64)
+                && let Ok(version) = u16::try_from(version)
+            {
+                return Err(ScmOperationStoreError::Legacy { version });
+            }
+            return Err(ScmOperationStoreError::Corrupt);
+        };
+    if envelope.magic != SCM_RECORD_ENVELOPE_MAGIC {
+        return Err(ScmOperationStoreError::Corrupt);
+    }
+    if envelope.version != SCM_RECORD_ENVELOPE_VERSION {
+        return Err(ScmOperationStoreError::Legacy {
+            version: envelope.version,
+        });
+    }
+    envelope.record.validate()?;
+    Ok(envelope.record)
+}
+
+fn encode_index(stable_key: &str, record_key: &str) -> Result<Vec<u8>, ScmOperationStoreError> {
+    let entry = ScmOperationIndexEntry {
+        magic: SCM_INDEX_MAGIC.to_owned(),
+        version: SCM_INDEX_VERSION,
+        stable_key: stable_key.to_owned(),
+        record_key: record_key.to_owned(),
+    };
+    serde_json::to_vec(&entry).map_err(|_| ScmOperationStoreError::Corrupt)
+}
+
+fn decode_index(bytes: &[u8]) -> Result<ScmOperationIndexEntry, ScmOperationStoreError> {
+    let entry: ScmOperationIndexEntry =
+        serde_json::from_slice(bytes).map_err(|_| ScmOperationStoreError::Corrupt)?;
+    if entry.magic != SCM_INDEX_MAGIC {
+        return Err(ScmOperationStoreError::Corrupt);
+    }
+    if entry.version != SCM_INDEX_VERSION {
+        return Err(ScmOperationStoreError::Legacy {
+            version: entry.version,
+        });
+    }
+    if entry.stable_key.is_empty() || entry.record_key.is_empty() {
+        return Err(ScmOperationStoreError::Corrupt);
+    }
+    Ok(entry)
 }
 
 mod sealed {
     pub trait Sealed {}
 }
 
-/// Sealed coordinator capability. Only `ScmOperationStore::coordinator` can create it.
+/// Sealed, store-bound coordinator capability. Only
+/// `ScmOperationStore::coordinator` can create it, and the capability cannot
+/// be used with another store instance.
 ///
 /// ```compile_fail
 /// use eliot_host_state::ScmOperationCoordinator;
 /// let c = ScmOperationCoordinator { _private: () };
 /// ```
 ///
-/// ```compile_fail
-/// use eliot_host_state::{ScmOperationStore, ScmOperationState, ScmOperationIdentity};
-/// use eliot_platform::PlatformHandle;
-/// let store = ScmOperationStore::open("x.redb").unwrap();
-/// store.advance_to(
-///     &store.coordinator(),
-///     &ScmOperationIdentity {
-///         installation: PlatformHandle::new("i").unwrap(),
-///         service: PlatformHandle::new("EliotHost").unwrap(),
-///         approval_digest: PlatformHandle::new(&"a".repeat(64)).unwrap(),
-///         config_digest: PlatformHandle::new(&"b".repeat(64)).unwrap(),
-///         operation_id: PlatformHandle::new("o").unwrap(),
-///         request_digest: PlatformHandle::new(&"c".repeat(64)).unwrap(),
-///     },
-///     1,
-///     "sha",
-///     ScmOperationState::StopObserved,
-/// );
-/// ```
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ScmOperationCoordinator {
-    _private: (),
+    owner: Arc<ScmOperationStoreOwner>,
 }
 
 impl sealed::Sealed for ScmOperationCoordinator {}
 
+#[derive(Debug)]
+struct ScmOperationStoreOwner;
+
 impl ScmOperationCoordinator {
-    fn new() -> Self {
-        Self { _private: () }
+    fn new(owner: Arc<ScmOperationStoreOwner>) -> Self {
+        Self { owner }
     }
 }
 
@@ -338,6 +507,7 @@ impl ScmOperationCoordinator {
 pub struct ScmOperationStore {
     database: Database,
     path: PathBuf,
+    owner: Arc<ScmOperationStoreOwner>,
 }
 
 impl ScmOperationStore {
@@ -347,19 +517,34 @@ impl ScmOperationStore {
             std::fs::create_dir_all(parent).map_err(|_| ScmOperationStoreError::Unavailable)?;
         }
         let database = Database::create(&path).map_err(|_| ScmOperationStoreError::Unavailable)?;
-        let store = Self { database, path };
+        let store = Self {
+            database,
+            path,
+            owner: Arc::new(ScmOperationStoreOwner),
+        };
         store.ensure_schema()?;
         Ok(store)
     }
 
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, ScmOperationStoreError> {
         let path = path.as_ref().to_path_buf();
-        if std::fs::symlink_metadata(&path).is_err() {
-            return Err(ScmOperationStoreError::Unavailable);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ScmOperationStoreError::MissingFile);
+            }
+            Err(_) => return Err(ScmOperationStoreError::Unavailable),
         }
-        let database = Database::open(&path).map_err(|_| ScmOperationStoreError::Unavailable)?;
-        let store = Self { database, path };
-        store.ensure_schema()?;
+        let database = Database::open(&path).map_err(map_database_open_error)?;
+        let store = Self {
+            database,
+            path,
+            owner: Arc::new(ScmOperationStoreOwner),
+        };
+        // Opening an existing store is deliberately read-only with respect to
+        // the schema. In particular, a blank/partial file must not be turned
+        // into a usable store as a side effect of a query or status read.
+        store.validate_existing_schema()?;
         Ok(store)
     }
 
@@ -371,7 +556,18 @@ impl ScmOperationStore {
     }
 
     pub fn coordinator(&self) -> ScmOperationCoordinator {
-        ScmOperationCoordinator::new()
+        ScmOperationCoordinator::new(Arc::clone(&self.owner))
+    }
+
+    fn authorize(
+        &self,
+        coordinator: &ScmOperationCoordinator,
+    ) -> Result<(), ScmOperationStoreError> {
+        if Arc::ptr_eq(&self.owner, &coordinator.owner) {
+            Ok(())
+        } else {
+            Err(ScmOperationStoreError::NotOwner)
+        }
     }
 
     fn ensure_schema(&self) -> Result<(), ScmOperationStoreError> {
@@ -457,6 +653,61 @@ impl ScmOperationStore {
         Ok(())
     }
 
+    fn validate_existing_schema(&self) -> Result<(), ScmOperationStoreError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|_| ScmOperationStoreError::Unavailable)?;
+        for table in [META_TABLE.name(), OPS_TABLE.name(), INDEX_TABLE.name()] {
+            let result = match table {
+                name if name == META_TABLE.name() => read.open_table(META_TABLE).map(|_| ()),
+                name if name == OPS_TABLE.name() => read.open_table(OPS_TABLE).map(|_| ()),
+                name if name == INDEX_TABLE.name() => read.open_table(INDEX_TABLE).map(|_| ()),
+                _ => unreachable!("all schema tables are listed explicitly"),
+            };
+            match result {
+                Ok(()) => {}
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(ScmOperationStoreError::MissingTable);
+                }
+                Err(_) => return Err(ScmOperationStoreError::Corrupt),
+            }
+        }
+        let table = read.open_table(META_TABLE).map_err(|error| match error {
+            redb::TableError::TableDoesNotExist(_) => ScmOperationStoreError::MissingTable,
+            _ => ScmOperationStoreError::Corrupt,
+        })?;
+        let mut found = None;
+        let mut count = 0usize;
+        for item in table.iter().map_err(|_| ScmOperationStoreError::Corrupt)? {
+            let (key, value) = item.map_err(|_| ScmOperationStoreError::Corrupt)?;
+            if key.value() != META_KEY {
+                return Err(ScmOperationStoreError::Corrupt);
+            }
+            found = Some(
+                serde_json::from_slice::<StoreMeta>(value.value())
+                    .map_err(|_| ScmOperationStoreError::Corrupt)?,
+            );
+            count = count
+                .checked_add(1)
+                .ok_or(ScmOperationStoreError::Corrupt)?;
+        }
+        if count != 1 {
+            return Err(ScmOperationStoreError::Corrupt);
+        }
+        let meta = found.ok_or(ScmOperationStoreError::Corrupt)?;
+        if meta.magic != SCM_STORE_MAGIC {
+            return Err(ScmOperationStoreError::Corrupt);
+        }
+        if meta.version != SCM_STORE_VERSION {
+            return Err(ScmOperationStoreError::Legacy {
+                version: meta.version,
+            });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
     pub fn create_operation(
         &self,
         identity: ScmOperationIdentity,
@@ -472,28 +723,49 @@ impl ScmOperationStore {
             let index = write
                 .open_table(INDEX_TABLE)
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
-            let idx_opt = index
+            let index_bytes = index
                 .get(stable.as_str())
-                .map_err(|_| ScmOperationStoreError::Corrupt)?;
-            if let Some(idx) = idx_opt {
-                let full_key = String::from_utf8(idx.value().to_vec())
-                    .map_err(|_| ScmOperationStoreError::Corrupt)?;
+                .map_err(|_| ScmOperationStoreError::Corrupt)?
+                .map(|value| value.value().to_vec());
+            drop(index);
+            if let Some(index_bytes) = index_bytes {
+                let entry = decode_index(&index_bytes)?;
+                if entry.stable_key != stable {
+                    return Err(ScmOperationStoreError::Corrupt);
+                }
                 let ops = write
                     .open_table(OPS_TABLE)
                     .map_err(|_| ScmOperationStoreError::Unavailable)?;
                 match ops
-                    .get(full_key.as_str())
+                    .get(entry.record_key.as_str())
                     .map_err(|_| ScmOperationStoreError::Corrupt)?
                 {
                     Some(v) => {
-                        let rec: ScmOperationRecord = serde_json::from_slice(v.value())
-                            .map_err(|_| ScmOperationStoreError::Corrupt)?;
-                        rec.validate()?;
+                        let rec = decode_record(v.value())?;
+                        if rec.key() != entry.record_key || rec.stable_key() != stable {
+                            return Err(ScmOperationStoreError::Corrupt);
+                        }
                         Some(rec)
                     }
                     None => return Err(ScmOperationStoreError::Corrupt),
                 }
             } else {
+                // Never repair a missing index during create. If the record
+                // exists, the index is corrupt and must be rebuilt by an
+                // explicit migration/recovery operation.
+                let ops = write
+                    .open_table(OPS_TABLE)
+                    .map_err(|_| ScmOperationStoreError::Unavailable)?;
+                for item in ops.iter().map_err(|_| ScmOperationStoreError::Corrupt)? {
+                    let (record_key, value) = item.map_err(|_| ScmOperationStoreError::Corrupt)?;
+                    let rec = decode_record(value.value())?;
+                    if rec.key() != record_key.value() {
+                        return Err(ScmOperationStoreError::Corrupt);
+                    }
+                    if rec.stable_key() == stable {
+                        return Err(ScmOperationStoreError::Corrupt);
+                    }
+                }
                 None
             }
         };
@@ -509,7 +781,7 @@ impl ScmOperationStore {
             }
             return Ok(existing);
         }
-        let record = ScmOperationRecord {
+        let mut record = ScmOperationRecord {
             magic: SCM_STORE_MAGIC.to_owned(),
             version: SCM_STORE_VERSION,
             installation: identity.installation,
@@ -520,10 +792,14 @@ impl ScmOperationStore {
             request_digest: identity.request_digest,
             state: ScmOperationState::StopIntentCommitted,
             revision: 1,
-            prior_sha256: sha256_hex(b"GENESIS"),
+            prior_sha256: "GENESIS".to_owned(),
+            checksum: String::new(),
+            history: Vec::new(),
         };
+        record.checksum = normalized_sha(&record)?;
         record.validate()?;
-        let bytes = serde_json::to_vec(&record).map_err(|_| ScmOperationStoreError::Corrupt)?;
+        let bytes = encode_record(&record)?;
+        let index_bytes = encode_index(&stable, &key)?;
         {
             let mut ops = write
                 .open_table(OPS_TABLE)
@@ -534,7 +810,7 @@ impl ScmOperationStore {
                 .open_table(INDEX_TABLE)
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
             index
-                .insert(stable.as_str(), key.as_bytes())
+                .insert(stable.as_str(), index_bytes.as_slice())
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
         }
         write
@@ -559,7 +835,7 @@ impl ScmOperationStore {
     }
 
     fn load_by_key(&self, key: &str) -> Result<Option<ScmOperationRecord>, ScmOperationStoreError> {
-        self.ensure_schema()?;
+        self.validate_existing_schema()?;
         let read = self
             .database
             .begin_read()
@@ -573,9 +849,10 @@ impl ScmOperationStore {
         else {
             return Ok(None);
         };
-        let rec: ScmOperationRecord =
-            serde_json::from_slice(v.value()).map_err(|_| ScmOperationStoreError::Corrupt)?;
-        rec.validate()?;
+        let rec = decode_record(v.value())?;
+        if rec.key() != key {
+            return Err(ScmOperationStoreError::Corrupt);
+        }
         Ok(Some(rec))
     }
 
@@ -584,7 +861,7 @@ impl ScmOperationStore {
         stable: &str,
         identity: &ScmOperationIdentity,
     ) -> Result<Option<ScmOperationRecord>, ScmOperationStoreError> {
-        self.ensure_schema()?;
+        self.validate_existing_schema()?;
         let read = self
             .database
             .begin_read()
@@ -592,26 +869,44 @@ impl ScmOperationStore {
         let index = read
             .open_table(INDEX_TABLE)
             .map_err(|_| ScmOperationStoreError::MissingTable)?;
-        let Some(idx) = index
+        let index_bytes = index
             .get(stable)
             .map_err(|_| ScmOperationStoreError::Corrupt)?
-        else {
-            return Ok(None);
-        };
-        let full_key =
-            String::from_utf8(idx.value().to_vec()).map_err(|_| ScmOperationStoreError::Corrupt)?;
+            .map(|value| value.value().to_vec());
+        drop(index);
         let ops = read
             .open_table(OPS_TABLE)
             .map_err(|_| ScmOperationStoreError::MissingTable)?;
+        let Some(index_bytes) = index_bytes else {
+            // An index miss is only a legitimate absence when no durable
+            // operation with this stable identity exists. Do not turn a
+            // damaged index into a fresh operation by returning `None`.
+            for item in ops.iter().map_err(|_| ScmOperationStoreError::Corrupt)? {
+                let (record_key, value) = item.map_err(|_| ScmOperationStoreError::Corrupt)?;
+                let rec = decode_record(value.value())?;
+                if rec.key() != record_key.value() {
+                    return Err(ScmOperationStoreError::Corrupt);
+                }
+                if rec.stable_key() == stable {
+                    return Err(ScmOperationStoreError::Corrupt);
+                }
+            }
+            return Ok(None);
+        };
+        let entry = decode_index(&index_bytes)?;
+        if entry.stable_key != stable {
+            return Err(ScmOperationStoreError::Corrupt);
+        }
         let Some(v) = ops
-            .get(full_key.as_str())
+            .get(entry.record_key.as_str())
             .map_err(|_| ScmOperationStoreError::Corrupt)?
         else {
             return Err(ScmOperationStoreError::Corrupt);
         };
-        let rec: ScmOperationRecord =
-            serde_json::from_slice(v.value()).map_err(|_| ScmOperationStoreError::Corrupt)?;
-        rec.validate()?;
+        let rec = decode_record(v.value())?;
+        if rec.key() != entry.record_key || rec.stable_key() != stable {
+            return Err(ScmOperationStoreError::Corrupt);
+        }
         if rec.installation != identity.installation
             || rec.service != identity.service
             || rec.operation_id != identity.operation_id
@@ -630,12 +925,13 @@ impl ScmOperationStore {
     #[allow(clippy::too_many_lines)]
     fn cas_transition(
         &self,
-        _coord: ScmOperationCoordinator,
+        coordinator: &ScmOperationCoordinator,
         identity: &ScmOperationIdentity,
         expected_revision: u64,
         expected_prior_sha: &str,
         target: ScmOperationState,
     ) -> Result<ScmOperationRecord, ScmOperationStoreError> {
+        self.authorize(coordinator)?;
         identity.validate()?;
         let write = self
             .database
@@ -646,26 +942,30 @@ impl ScmOperationStore {
             let index = write
                 .open_table(INDEX_TABLE)
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
-            let Some(idx) = index
+            let Some(index_bytes) = index
                 .get(stable.as_str())
                 .map_err(|_| ScmOperationStoreError::Corrupt)?
+                .map(|value| value.value().to_vec())
             else {
                 return Err(ScmOperationStoreError::InvalidRecord("not found".into()));
             };
-            let full_key = String::from_utf8(idx.value().to_vec())
-                .map_err(|_| ScmOperationStoreError::Corrupt)?;
+            let entry = decode_index(&index_bytes)?;
+            if entry.stable_key != stable {
+                return Err(ScmOperationStoreError::Corrupt);
+            }
             let ops = write
                 .open_table(OPS_TABLE)
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
             let Some(v) = ops
-                .get(full_key.as_str())
+                .get(entry.record_key.as_str())
                 .map_err(|_| ScmOperationStoreError::Corrupt)?
             else {
                 return Err(ScmOperationStoreError::Corrupt);
             };
-            let rec: ScmOperationRecord =
-                serde_json::from_slice(v.value()).map_err(|_| ScmOperationStoreError::Corrupt)?;
-            rec.validate()?;
+            let rec = decode_record(v.value())?;
+            if rec.key() != entry.record_key || rec.stable_key() != stable {
+                return Err(ScmOperationStoreError::Corrupt);
+            }
             if rec.installation != identity.installation
                 || rec.service != identity.service
                 || rec.operation_id != identity.operation_id
@@ -688,7 +988,10 @@ impl ScmOperationStore {
             if stored.revision == expected_revision && computed == expected_prior_sha {
                 return Ok(stored);
             }
-            if stored.revision == expected_revision + 1 && stored.prior_sha256 == expected_prior_sha
+            if expected_revision
+                .checked_add(1)
+                .is_some_and(|revision| stored.revision == revision)
+                && stored.prior_sha256 == expected_prior_sha
             {
                 return Ok(stored);
             }
@@ -719,7 +1022,16 @@ impl ScmOperationStore {
         if computed != expected_prior_sha {
             return Err(ScmOperationStoreError::Conflict);
         }
-        let next = ScmOperationRecord {
+        let next_revision = stored
+            .revision
+            .checked_add(1)
+            .ok_or(ScmOperationStoreError::Conflict)?;
+        let mut history = stored.history.clone();
+        history.push(ScmOperationHistoryLink {
+            revision: stored.revision,
+            checksum: stored.checksum.clone(),
+        });
+        let mut next = ScmOperationRecord {
             magic: SCM_STORE_MAGIC.to_owned(),
             version: SCM_STORE_VERSION,
             installation: stored.installation.clone(),
@@ -729,11 +1041,14 @@ impl ScmOperationStore {
             operation_id: stored.operation_id.clone(),
             request_digest: stored.request_digest.clone(),
             state: target,
-            revision: stored.revision + 1,
+            revision: next_revision,
             prior_sha256: computed,
+            checksum: String::new(),
+            history,
         };
+        next.checksum = normalized_sha(&next)?;
         next.validate()?;
-        let bytes = serde_json::to_vec(&next).map_err(|_| ScmOperationStoreError::Corrupt)?;
+        let bytes = encode_record(&next)?;
         {
             let mut table = write
                 .open_table(OPS_TABLE)
@@ -748,16 +1063,21 @@ impl ScmOperationStore {
         Ok(next)
     }
 
-    pub(crate) fn advance_to(
+    /// Advance an operation through the Host-owned state machine.
+    ///
+    /// The coordinator is a non-forgeable capability bound to this exact
+    /// store instance; a coordinator obtained from another store is rejected
+    /// before any database read or write.
+    pub fn advance_to(
         &self,
-        coord: ScmOperationCoordinator,
+        coordinator: &ScmOperationCoordinator,
         identity: &ScmOperationIdentity,
         expected_revision: u64,
         expected_prior_sha: &str,
         target: ScmOperationState,
     ) -> Result<ScmOperationRecord, ScmOperationStoreError> {
         self.cas_transition(
-            coord,
+            coordinator,
             identity,
             expected_revision,
             expected_prior_sha,
@@ -765,13 +1085,19 @@ impl ScmOperationStore {
         )
     }
 
-    pub(crate) fn quarantine_to_unknown(
+    /// Quarantine an operation after an ambiguous effect outcome.
+    ///
+    /// This is also guarded by the store-bound coordinator and is terminal;
+    /// callers must reconcile the external effect before any later action.
+    #[allow(clippy::too_many_lines)]
+    pub fn quarantine_to_unknown(
         &self,
-        coord: ScmOperationCoordinator,
+        coordinator: &ScmOperationCoordinator,
         identity: &ScmOperationIdentity,
         expected_revision: u64,
         expected_prior_sha: &str,
     ) -> Result<ScmOperationRecord, ScmOperationStoreError> {
+        self.authorize(coordinator)?;
         identity.validate()?;
         let write = self
             .database
@@ -782,26 +1108,30 @@ impl ScmOperationStore {
             let index = write
                 .open_table(INDEX_TABLE)
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
-            let Some(idx) = index
+            let Some(index_bytes) = index
                 .get(stable.as_str())
                 .map_err(|_| ScmOperationStoreError::Corrupt)?
+                .map(|value| value.value().to_vec())
             else {
                 return Err(ScmOperationStoreError::InvalidRecord("not found".into()));
             };
-            let full_key = String::from_utf8(idx.value().to_vec())
-                .map_err(|_| ScmOperationStoreError::Corrupt)?;
+            let entry = decode_index(&index_bytes)?;
+            if entry.stable_key != stable {
+                return Err(ScmOperationStoreError::Corrupt);
+            }
             let ops = write
                 .open_table(OPS_TABLE)
                 .map_err(|_| ScmOperationStoreError::Unavailable)?;
             let Some(v) = ops
-                .get(full_key.as_str())
+                .get(entry.record_key.as_str())
                 .map_err(|_| ScmOperationStoreError::Corrupt)?
             else {
                 return Err(ScmOperationStoreError::Corrupt);
             };
-            let rec: ScmOperationRecord =
-                serde_json::from_slice(v.value()).map_err(|_| ScmOperationStoreError::Corrupt)?;
-            rec.validate()?;
+            let rec = decode_record(v.value())?;
+            if rec.key() != entry.record_key || rec.stable_key() != stable {
+                return Err(ScmOperationStoreError::Corrupt);
+            }
             if rec.installation != identity.installation
                 || rec.service != identity.service
                 || rec.operation_id != identity.operation_id
@@ -821,7 +1151,10 @@ impl ScmOperationStore {
             if stored.revision == expected_revision && computed == expected_prior_sha {
                 return Ok(stored);
             }
-            if stored.revision == expected_revision + 1 && stored.prior_sha256 == expected_prior_sha
+            if expected_revision
+                .checked_add(1)
+                .is_some_and(|revision| stored.revision == revision)
+                && stored.prior_sha256 == expected_prior_sha
             {
                 return Ok(stored);
             }
@@ -837,7 +1170,16 @@ impl ScmOperationStore {
         if stored.revision != expected_revision || computed != expected_prior_sha {
             return Err(ScmOperationStoreError::Conflict);
         }
-        let next = ScmOperationRecord {
+        let next_revision = stored
+            .revision
+            .checked_add(1)
+            .ok_or(ScmOperationStoreError::Conflict)?;
+        let mut history = stored.history.clone();
+        history.push(ScmOperationHistoryLink {
+            revision: stored.revision,
+            checksum: stored.checksum.clone(),
+        });
+        let mut next = ScmOperationRecord {
             magic: SCM_STORE_MAGIC.to_owned(),
             version: SCM_STORE_VERSION,
             installation: stored.installation.clone(),
@@ -847,11 +1189,14 @@ impl ScmOperationStore {
             operation_id: stored.operation_id.clone(),
             request_digest: stored.request_digest.clone(),
             state: ScmOperationState::Unknown,
-            revision: stored.revision + 1,
+            revision: next_revision,
             prior_sha256: computed,
+            checksum: String::new(),
+            history,
         };
+        next.checksum = normalized_sha(&next)?;
         next.validate()?;
-        let bytes = serde_json::to_vec(&next).map_err(|_| ScmOperationStoreError::Corrupt)?;
+        let bytes = encode_record(&next)?;
         {
             let mut table = write
                 .open_table(OPS_TABLE)
@@ -863,7 +1208,6 @@ impl ScmOperationStore {
         write
             .commit()
             .map_err(|_| ScmOperationStoreError::Unavailable)?;
-        let _ = coord;
         Ok(next)
     }
 
@@ -921,7 +1265,7 @@ mod tests {
         let s1 = sha_of(&r1);
         let r2 = store
             .advance_to(
-                coord,
+                &coord,
                 &id,
                 r1.revision(),
                 &s1,
@@ -932,7 +1276,7 @@ mod tests {
         let s2 = sha_of(&r2);
         let r3 = store
             .advance_to(
-                coord,
+                &coord,
                 &id,
                 r2.revision(),
                 &s2,
@@ -942,7 +1286,7 @@ mod tests {
         let s3 = sha_of(&r3);
         let r4 = store
             .advance_to(
-                coord,
+                &coord,
                 &id,
                 r3.revision(),
                 &s3,
@@ -951,13 +1295,19 @@ mod tests {
             .unwrap();
         let s4 = sha_of(&r4);
         let r5 = store
-            .advance_to(coord, &id, r4.revision(), &s4, ScmOperationState::Completed)
+            .advance_to(
+                &coord,
+                &id,
+                r4.revision(),
+                &s4,
+                ScmOperationState::Completed,
+            )
             .unwrap();
         assert_eq!(r5.state(), ScmOperationState::Completed);
         let s5 = sha_of(&r5);
         assert_eq!(
             store.advance_to(
-                coord,
+                &coord,
                 &id,
                 r5.revision(),
                 &s5,
@@ -983,7 +1333,7 @@ mod tests {
         let s1 = sha_of(&r1);
         let r2 = store
             .advance_to(
-                coord,
+                &coord,
                 &id,
                 r1.revision(),
                 &s1,
@@ -992,7 +1342,7 @@ mod tests {
             .unwrap();
         let r2_replay = store
             .advance_to(
-                coord,
+                &coord,
                 &id,
                 r1.revision(),
                 &s1,
@@ -1015,7 +1365,7 @@ mod tests {
         let s1 = sha_of(&r1);
         assert_eq!(
             store.advance_to(
-                coord,
+                &coord,
                 &bad,
                 r1.revision(),
                 &s1,
@@ -1038,7 +1388,7 @@ mod tests {
         bad_sha.replace_range(0..1, "f");
         assert_eq!(
             store.advance_to(
-                coord,
+                &coord,
                 &id,
                 r1.revision(),
                 &bad_sha,
@@ -1048,7 +1398,7 @@ mod tests {
         );
         assert_eq!(
             store.advance_to(
-                coord,
+                &coord,
                 &id,
                 r1.revision() + 1,
                 &s1,
@@ -1070,7 +1420,7 @@ mod tests {
             let s1 = sha_of(&r1);
             let r2 = store
                 .advance_to(
-                    coord,
+                    &coord,
                     &id,
                     r1.revision(),
                     &s1,
@@ -1086,7 +1436,7 @@ mod tests {
         let coord2 = store2.coordinator();
         let r3 = store2
             .advance_to(
-                coord2,
+                &coord2,
                 &id,
                 loaded.revision(),
                 &sha_of(&loaded),
@@ -1106,7 +1456,7 @@ mod tests {
         let coord = store.coordinator();
         let s1 = sha_of(&r1);
         let u = store
-            .quarantine_to_unknown(coord, &id, r1.revision(), &s1)
+            .quarantine_to_unknown(&coord, &id, r1.revision(), &s1)
             .unwrap();
         assert_eq!(u.state(), ScmOperationState::Unknown);
         let q = store.query_operation(&id).unwrap().unwrap();
@@ -1114,7 +1464,7 @@ mod tests {
         let sq = sha_of(&q);
         assert_eq!(
             store.advance_to(
-                coord,
+                &coord,
                 &id,
                 q.revision(),
                 &sq,
@@ -1213,7 +1563,214 @@ mod tests {
         assert_eq!(e, ScmOperationStoreError::MissingTable);
         assert_eq!(
             ScmOperationStore::open_existing("nonexistent/missing.redb").unwrap_err(),
-            ScmOperationStoreError::Unavailable
+            ScmOperationStoreError::MissingFile
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_existing_is_read_only_for_blank_database() {
+        let path = temp_path("blank-read-only");
+        {
+            let database = Database::create(&path).unwrap();
+            drop(database);
+        }
+        assert_eq!(
+            ScmOperationStore::open_existing(&path).unwrap_err(),
+            ScmOperationStoreError::MissingTable
+        );
+        let database = Database::open(&path).unwrap();
+        let read = database.begin_read().unwrap();
+        assert!(matches!(
+            read.open_table(META_TABLE),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        drop(read);
+        drop(database);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_index_with_existing_record_is_corrupt() {
+        let path = temp_path("missing-index");
+        let id = identity("op-missing-index");
+        {
+            let store = ScmOperationStore::open(&path).unwrap();
+            store.create_operation(id.clone()).unwrap();
+        }
+        {
+            let database = Database::open(&path).unwrap();
+            let write = database.begin_write().unwrap();
+            {
+                let mut index = write.open_table(INDEX_TABLE).unwrap();
+                index.remove(id.stable_key().as_str()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let store = ScmOperationStore::open_existing(&path).unwrap();
+        assert_eq!(
+            store.query_operation(&id).unwrap_err(),
+            ScmOperationStoreError::Corrupt
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn index_binds_stable_key_and_record_key() {
+        let path = temp_path("index-binding");
+        let id = identity("op-index-binding");
+        {
+            let store = ScmOperationStore::open(&path).unwrap();
+            store.create_operation(id.clone()).unwrap();
+        }
+        {
+            let database = Database::open(&path).unwrap();
+            let write = database.begin_write().unwrap();
+            {
+                let mut index = write.open_table(INDEX_TABLE).unwrap();
+                let entry = ScmOperationIndexEntry {
+                    magic: SCM_INDEX_MAGIC.to_owned(),
+                    version: SCM_INDEX_VERSION,
+                    stable_key: "other-stable".to_owned(),
+                    record_key: id.key(),
+                };
+                let bytes = serde_json::to_vec(&entry).unwrap();
+                index
+                    .insert(id.stable_key().as_str(), bytes.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let store = ScmOperationStore::open_existing(&path).unwrap();
+        assert_eq!(
+            store.query_operation(&id).unwrap_err(),
+            ScmOperationStoreError::Corrupt
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_checksum_and_predecessor_history_are_verified() {
+        let path = temp_path("checksum-history");
+        let id = identity("op-checksum-history");
+        let record = {
+            let store = ScmOperationStore::open(&path).unwrap();
+            let first = store.create_operation(id.clone()).unwrap();
+            let coordinator = store.coordinator();
+            store
+                .advance_to(
+                    &coordinator,
+                    &id,
+                    first.revision(),
+                    first.checksum(),
+                    ScmOperationState::StopObserved,
+                )
+                .unwrap()
+        };
+        {
+            let database = Database::open(&path).unwrap();
+            let write = database.begin_write().unwrap();
+            {
+                let mut operations = write.open_table(OPS_TABLE).unwrap();
+                let mut envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
+                    operations.get(id.key().as_str()).unwrap().unwrap().value(),
+                )
+                .unwrap();
+                envelope.record.checksum = "0".repeat(64);
+                let bytes = serde_json::to_vec(&envelope).unwrap();
+                operations
+                    .insert(id.key().as_str(), bytes.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let store = ScmOperationStore::open_existing(&path).unwrap();
+        assert_eq!(
+            store.query_operation(&id).unwrap_err(),
+            ScmOperationStoreError::Corrupt
+        );
+        drop(store);
+
+        // A current checksum can be recomputed, but an invalid predecessor
+        // link must still fail closed.
+        {
+            let database = Database::open(&path).unwrap();
+            let write = database.begin_write().unwrap();
+            {
+                let mut operations = write.open_table(OPS_TABLE).unwrap();
+                let mut envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
+                    operations.get(id.key().as_str()).unwrap().unwrap().value(),
+                )
+                .unwrap();
+                envelope.record.checksum = record.checksum().to_owned();
+                envelope.record.prior_sha256 = "d".repeat(64);
+                envelope.record.checksum = normalized_sha(&envelope.record).unwrap();
+                let bytes = serde_json::to_vec(&envelope).unwrap();
+                operations
+                    .insert(id.key().as_str(), bytes.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let store = ScmOperationStore::open_existing(&path).unwrap();
+        assert_eq!(
+            store.query_operation(&id).unwrap_err(),
+            ScmOperationStoreError::Corrupt
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn coordinator_is_bound_to_its_store() {
+        let path = temp_path("owner-a");
+        let other_path = temp_path("owner-b");
+        let store = ScmOperationStore::open(&path).unwrap();
+        let other = ScmOperationStore::open(&other_path).unwrap();
+        let id = identity("op-owner");
+        let record = store.create_operation(id.clone()).unwrap();
+        let coordinator = store.coordinator();
+        assert_eq!(
+            other.advance_to(
+                &coordinator,
+                &id,
+                record.revision(),
+                record.checksum(),
+                ScmOperationState::StopObserved,
+            ),
+            Err(ScmOperationStoreError::NotOwner)
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(other_path);
+    }
+
+    #[test]
+    fn record_envelope_rejects_unversioned_legacy_payload() {
+        let path = temp_path("record-envelope");
+        let id = identity("op-record-envelope");
+        {
+            let store = ScmOperationStore::open(&path).unwrap();
+            store.create_operation(id.clone()).unwrap();
+        }
+        {
+            let database = Database::open(&path).unwrap();
+            let write = database.begin_write().unwrap();
+            {
+                let mut operations = write.open_table(OPS_TABLE).unwrap();
+                let envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
+                    operations.get(id.key().as_str()).unwrap().unwrap().value(),
+                )
+                .unwrap();
+                let bytes = serde_json::to_vec(&envelope.record).unwrap();
+                operations
+                    .insert(id.key().as_str(), bytes.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let store = ScmOperationStore::open_existing(&path).unwrap();
+        assert_eq!(
+            store.query_operation(&id).unwrap_err(),
+            ScmOperationStoreError::Legacy { version: 1 }
         );
         let _ = std::fs::remove_file(path);
     }
