@@ -74,7 +74,7 @@ enum JournalPathLease {
         _root_lease: ProtectedRootLease,
         _path_lease: ProtectedRuntimePathLease,
     },
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Unprotected,
 }
 
@@ -303,8 +303,14 @@ impl RedbJournalBackend {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_unprotected_for_test(path: impl AsRef<Path>) -> Result<Self, BackendError> {
+    /// Opens a physical redb journal without the production `ProgramData` ACL
+    /// contour. This exists only for cross-crate integration tests; default
+    /// builds do not compile this entry point and must use [`Self::open_at`].
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_unprotected_for_integration_test(
+        path: impl AsRef<Path>,
+    ) -> Result<Self, BackendError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|_| BackendError::Unavailable)?;
@@ -1197,8 +1203,8 @@ mod tests {
             std::process::id()
         ));
         let path = root.join("journal.redb");
-        let backend =
-            RedbJournalBackend::open_unprotected_for_test(&path).unwrap_or_else(|_| unreachable!());
+        let backend = RedbJournalBackend::open_unprotected_for_integration_test(&path)
+            .unwrap_or_else(|_| unreachable!());
         (backend, root)
     }
 
@@ -1309,8 +1315,9 @@ mod tests {
             .prepare(&descriptor)
             .unwrap_or_else(|_| unreachable!());
         drop(backend);
-        let mut reopened = RedbJournalBackend::open_unprotected_for_test(root.join("journal.redb"))
-            .unwrap_or_else(|_| unreachable!());
+        let mut reopened =
+            RedbJournalBackend::open_unprotected_for_integration_test(root.join("journal.redb"))
+                .unwrap_or_else(|_| unreachable!());
         assert_eq!(reopened.prepared_appends(), Ok(vec![descriptor.clone()]));
         assert_eq!(
             reopened.reconcile(&descriptor.transaction_id),
@@ -1348,8 +1355,9 @@ mod tests {
         assert_eq!(image.receipts.len(), 1);
         assert_eq!(image.receipts[0].payload_digest, descriptor.payload_digest);
         drop(backend);
-        let mut reopened = RedbJournalBackend::open_unprotected_for_test(root.join("journal.redb"))
-            .unwrap_or_else(|_| unreachable!());
+        let mut reopened =
+            RedbJournalBackend::open_unprotected_for_integration_test(root.join("journal.redb"))
+                .unwrap_or_else(|_| unreachable!());
         let reopened_image = reopened.load().unwrap_or_else(|_| unreachable!());
         assert_eq!(reopened_image.epochs[0].bytes, bytes);
         assert_eq!(reopened_image.receipts, image.receipts);
@@ -1525,7 +1533,10 @@ mod tests {
             .unwrap_or_else(|_| unreachable!());
         write.commit().unwrap_or_else(|_| unreachable!());
         drop(backend);
-        assert!(RedbJournalBackend::open_unprotected_for_test(root.join("journal.redb")).is_err());
+        assert!(
+            RedbJournalBackend::open_unprotected_for_integration_test(root.join("journal.redb"))
+                .is_err()
+        );
         remove(&root);
 
         let (backend, root) = new_backend();
@@ -1538,7 +1549,10 @@ mod tests {
             .unwrap_or_else(|_| unreachable!());
         write.commit().unwrap_or_else(|_| unreachable!());
         drop(backend);
-        assert!(RedbJournalBackend::open_unprotected_for_test(root.join("journal.redb")).is_err());
+        assert!(
+            RedbJournalBackend::open_unprotected_for_integration_test(root.join("journal.redb"))
+                .is_err()
+        );
         remove(&root);
     }
 
@@ -1584,7 +1598,10 @@ mod tests {
         write.commit().unwrap_or_else(|_| unreachable!());
         assert!(backend.load().is_err());
         drop(backend);
-        assert!(RedbJournalBackend::open_unprotected_for_test(root.join("journal.redb")).is_err());
+        assert!(
+            RedbJournalBackend::open_unprotected_for_integration_test(root.join("journal.redb"))
+                .is_err()
+        );
         remove(&root);
     }
 
@@ -1822,7 +1839,7 @@ mod tests {
         drop(backend);
 
         let reopened_backend =
-            RedbJournalBackend::open_unprotected_for_test(root.join("journal.redb"))
+            RedbJournalBackend::open_unprotected_for_integration_test(root.join("journal.redb"))
                 .unwrap_or_else(|_| unreachable!());
         let reopened = HostStateJournal::open(reopened_backend, recovered_host)
             .unwrap_or_else(|_| unreachable!());

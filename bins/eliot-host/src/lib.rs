@@ -19,7 +19,7 @@ use runtime_control::runtime_control_unknown_ref;
 pub use runtime_control::{
     HOST_RUNTIME_CONTROL_PIPE, HostKernelRestartReceipt, HostRuntimeControl,
     HostRuntimeControlOperation, HostRuntimeControlQueue, HostRuntimeControlRequest,
-    HostRuntimeControlResponse,
+    HostRuntimeControlResponse, HostStoreRecoveryReceipt,
 };
 
 use std::ffi::OsString;
@@ -86,7 +86,7 @@ use eliot_platform_windows::{
     HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError, ProtectedPathLease,
     ProtectedRootLease, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationInspection,
     ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection, ServiceStartMode,
-    WindowsPlatform, fresh_kernel_activation_nonce,
+    TerminatedJobChild, WindowsPlatform, fresh_kernel_activation_nonce,
 };
 #[cfg(windows)]
 use eliot_platform_windows::{FileIdentity, PublicationOutcome};
@@ -103,7 +103,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 #[cfg(windows)]
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const SERVICE_NAME: &str = ELIOT_HOST_SERVICE_NAME;
 pub const PROTOCOL_VERSION: &str = "eliot.host.v1";
@@ -112,6 +112,15 @@ const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 /// Stable production-boundary identity for the Host Store-rebind seam.
 pub const HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR: &str =
     "eliot-host::production-store-rebind:v1";
+/// Stable discriminator for the crash fence that exists because Host-owned
+/// `KILL_ON_JOB_CLOSE` Jobs make a prior Store/Kernel process contour
+/// unattachable after Host death.  The fenced query is deliberately an
+/// operation-specific Unknown/manual new-lineage directive, never a positive
+/// attach or receipt adoption.
+pub const HOST_STORE_RECOVERY_KILL_ON_JOB_CLOSE_CRASH_FENCE_DISCRIMINATOR: &str =
+    "eliot-host::store-recovery::kill-on-job-close-crash-fence:v1";
+const STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON: &str =
+    "store-recovery-crash-fence-manual-new-lineage";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostStoreRebindProductionBoundary;
@@ -2630,7 +2639,7 @@ pub(crate) struct HostJobBranches {
     store: Option<RunningJobChild<PlatformHandle>>,
     kernel_identity: JobObjectIdentity,
     store_identity: JobObjectIdentity,
-    kernel_launch_binding: KernelLaunchBinding,
+    kernel_launch_binding: Option<KernelLaunchBinding>,
     kernel_executable: Option<PathBuf>,
     store_bridge_executable: Option<PathBuf>,
     kernel_lease: Option<LaunchLease>,
@@ -3177,7 +3186,48 @@ impl HostJobBranches {
             store: None,
             kernel_identity,
             store_identity,
-            kernel_launch_binding,
+            kernel_launch_binding: Some(kernel_launch_binding),
+            kernel_executable: None,
+            store_bridge_executable: None,
+            kernel_lease: None,
+            store_lease: None,
+            config_path: None,
+            config_lease: None,
+            store_bootstrap_lease: None,
+            eliotd_config_lease: None,
+            eliotd_descriptor_lease: None,
+            store_bootstrap_requirement: None,
+            config_pin: None,
+            portable_root: None,
+            launch: None,
+            kernel_artifact_digest: None,
+            store_artifact_digest: None,
+            config_digest: None,
+            store_config_semantic_hash: None,
+            approved_generation: None,
+            kernel_candidate: None,
+            kernel_activation_receipt: None,
+            kernel_restart_attempts: 0,
+            store_restart_attempts: 0,
+        })
+    }
+
+    /// Creates the inert identity projection used while Store recovery is
+    /// fenced. No current-process observation or child/Job launch is allowed
+    /// on this startup path; the binding is populated only by a later
+    /// approved contour admission.
+    pub fn new_fenced(host: &HostInstallationEpoch) -> Result<Self, WindowsAdapterError> {
+        let suffix = format!(
+            "{}-{}",
+            host.epoch.current.lineage.as_str(),
+            host.epoch.current.sequence
+        );
+        Ok(Self {
+            kernel: None,
+            store: None,
+            kernel_identity: JobObjectIdentity::new(format!("Local\\Eliot-Host-Kernel-{suffix}"))?,
+            store_identity: JobObjectIdentity::new(format!("Local\\Eliot-Host-Store-{suffix}"))?,
+            kernel_launch_binding: None,
             kernel_executable: None,
             store_bridge_executable: None,
             kernel_lease: None,
@@ -3384,7 +3434,12 @@ impl HostJobBranches {
         // Kernel authenticates the connected Host peer against this exact
         // value, so it is read from the live current-process handle. A PID
         // alone would not make PID reuse or image substitution observable.
-        self.kernel_launch_binding.validate_current()?;
+        let kernel_launch_binding = self.kernel_launch_binding.as_ref().ok_or_else(|| {
+            HostError::ProcessContour(
+                "Kernel launch binding is unavailable while Host is fenced".to_owned(),
+            )
+        })?;
+        kernel_launch_binding.validate_current()?;
         // Inert projection of the Host-retained Kernel Job. It grants nothing:
         // Kernel must reopen the named Job and re-observe its own root
         // membership before it will author readiness.
@@ -3406,8 +3461,8 @@ impl HostJobBranches {
             config_hash: config_digest.clone(),
             job_object_id: PlatformHandle::new(kernel.job_identity().name())
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
-            pipe_identity: self.kernel_launch_binding.pipe_identity.clone(),
-            host_process: self.kernel_launch_binding.host_process.clone(),
+            pipe_identity: kernel_launch_binding.pipe_identity.clone(),
+            host_process: kernel_launch_binding.host_process.clone(),
             job_binding,
             restart_budget: RestartBudget::new(3, 3)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
@@ -4035,6 +4090,7 @@ impl HostJobBranches {
         host: &HostInstallationEpoch,
         activation_id: &PlatformHandle,
         activation_generation: &EpochTransition,
+        store_recovery: Option<(&Path, &HostRuntimeControlRequest)>,
     ) -> Result<StoreRebindReceipt, HostError> {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
@@ -4236,6 +4292,18 @@ impl HostJobBranches {
             handoff_with_digest
                 .validate_canonical_digest()
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            if let Some((host_state_root, recovery_request)) = store_recovery {
+                // Publish the outer->inner identity before the inner journal
+                // request or delivery. A crash after Kernel commits can then
+                // identify exactly one canonical StoreRebind; destination
+                // state and an unrelated committed record are insufficient.
+                persist_store_recovery_inner_binding(
+                    host_state_root,
+                    recovery_request,
+                    host,
+                    &handoff_with_digest,
+                )?;
+            }
             // Retain the exact request identity before any frame construction
             // or delivery can fail; every later terminal disposition must use
             // this operation/request pair rather than a current fence.
@@ -5093,7 +5161,7 @@ impl HostJobBranches {
                     host,
                     &launch.kernel_arguments,
                     &kernel_working_directory,
-                    Some(&self.kernel_launch_binding),
+                    self.kernel_launch_binding.as_ref(),
                 )
             },
             |mut store| {
@@ -5268,7 +5336,7 @@ impl HostJobBranches {
             host,
             &launch.kernel_arguments,
             &kernel_working_directory,
-            Some(&self.kernel_launch_binding),
+            self.kernel_launch_binding.as_ref(),
         )?;
         Ok(child)
     }
@@ -5304,6 +5372,60 @@ impl HostJobBranches {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
         })?;
+        launch
+            .require_phase_b_live()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let config_handle = PlatformHandle::new(config_path.to_string_lossy().into_owned())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        launch
+            .validate_for_config(&config_handle)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let store_bootstrap_lease = self.store_bootstrap_lease.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("Store bootstrap descriptor lease is missing".to_owned())
+        })?;
+        if store_bootstrap_lease.path()
+            != Path::new(launch.store_bootstrap_descriptor_path.as_str())
+        {
+            return Err(HostError::ProcessContour(
+                "Store bootstrap descriptor lease is not bound to the approved path".to_owned(),
+            ));
+        }
+        let semantic_config_hash = self.store_config_semantic_hash.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("Store semantic config hash is missing".to_owned())
+        })?;
+        let expected_bootstrap = validate_store_bootstrap_descriptor(
+            store_bootstrap_lease,
+            &launch.store_bootstrap_descriptor_digest,
+            artifact,
+            semantic_config_hash,
+            host.host_process_nonce().as_handle(),
+        )?;
+        if self.store_bootstrap_requirement.as_ref() != Some(&expected_bootstrap) {
+            return Err(HostError::ProcessContour(
+                "retained Store bootstrap requirement changed before relaunch".to_owned(),
+            ));
+        }
+        let eliotd_config_lease = self.eliotd_config_lease.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("eliotd Governor config lease is missing".to_owned())
+        })?;
+        if eliotd_config_lease.path() != Path::new(launch.eliotd_config_path.as_str()) {
+            return Err(HostError::ProcessContour(
+                "eliotd Governor config lease is not bound to the approved path".to_owned(),
+            ));
+        }
+        verify_launch_digest(
+            eliotd_config_lease,
+            &launch.eliotd_config_digest,
+            "runtime.eliotd_config",
+        )?;
+        let eliotd_descriptor_lease = self.eliotd_descriptor_lease.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("eliotd launch descriptor lease is missing".to_owned())
+        })?;
+        validate_eliotd_launch_descriptor(
+            eliotd_descriptor_lease,
+            &launch.eliotd_descriptor_digest,
+            launch,
+        )?;
         let (_, store_working_directory) =
             Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
         let child = Self::launch(
@@ -6808,17 +6930,192 @@ fn pending_activation_binding(
         .map_err(|error| HostError::Platform(error.to_string()))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoreRecoveryReopenTermination {
+    process_id: u32,
+    process_start_time_100ns: u64,
+    process_image_path: String,
+    job_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoreRecoveryReopenInnerBinding {
+    operation_id: String,
+    request_digest: String,
+    handoff: StoreRebindHandoff,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoreRecoveryReopenFence {
+    mutation_digest: String,
+    request_id: String,
+    request_digest: String,
+    host_epoch: u64,
+    host_lineage: String,
+    termination: Option<StoreRecoveryReopenTermination>,
+    inner: Option<StoreRecoveryReopenInnerBinding>,
+}
+
+impl StoreRecoveryReopenFence {
+    #[cfg(windows)]
+    fn from_durable(
+        mutation_digest: String,
+        pending: StoreRecoveryPendingIdentity,
+        termination: Option<StoreRecoveryTerminationEvidence>,
+        inner: Option<StoreRecoveryInnerBinding>,
+    ) -> Result<Self, HostError> {
+        pending.recover_request()?;
+        if pending.mutation_digest != mutation_digest {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery filename and pending mutation differ".to_owned(),
+            ));
+        }
+        if let Some(termination) = termination.as_ref() {
+            termination.validate_for_pending(&pending)?;
+        }
+        if let Some(inner) = inner.as_ref() {
+            let termination = termination.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Store recovery inner binding has no termination evidence".to_owned(),
+                )
+            })?;
+            inner.validate_for_pending(&pending, termination)?;
+        }
+        Ok(Self {
+            mutation_digest,
+            request_id: pending.request_id,
+            request_digest: pending.request_digest,
+            host_epoch: pending.host_epoch,
+            host_lineage: pending.host_lineage,
+            termination: termination.map(|evidence| StoreRecoveryReopenTermination {
+                process_id: evidence.process_id,
+                process_start_time_100ns: evidence.process_start_time_100ns,
+                process_image_path: evidence.process_image_path,
+                job_name: evidence.job_name,
+            }),
+            inner: inner.map(|binding| StoreRecoveryReopenInnerBinding {
+                operation_id: binding.store_rebind_operation_id,
+                request_digest: binding.store_rebind_request_digest,
+                handoff: binding.handoff,
+            }),
+        })
+    }
+
+    fn validate_for_reopen(
+        &self,
+        last_host: &HostInstallationEpoch,
+        replayed: &HostState,
+    ) -> Result<(), HostError> {
+        if self.host_epoch != last_host.epoch.current.sequence
+            || self.host_lineage != last_host.epoch.current.lineage.as_str()
+            || replayed.host != *last_host
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery fence belongs to another durable Host epoch".to_owned(),
+            ));
+        }
+        let Some(inner) = self.inner.as_ref() else {
+            return Ok(());
+        };
+        inner
+            .handoff
+            .validate_canonical_digest()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        if inner.handoff.operation_id.as_str() != inner.operation_id
+            || inner.handoff.request_digest != inner.request_digest
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery startup handoff identity was substituted".to_owned(),
+            ));
+        }
+        let mut records = replayed
+            .store_rebinds
+            .iter()
+            .filter(|record| record.operation_id.as_str() == inner.operation_id);
+        let Some(record) = records.next() else {
+            // The inner binding is intentionally published before the journal
+            // request/delivery. Absence is therefore a recoverable Unknown,
+            // never permission to start a fresh contour.
+            return Ok(());
+        };
+        if records.next().is_some() {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery fence matched multiple inner journal records".to_owned(),
+            ));
+        }
+        if record.request_digest.as_str() != inner.request_digest {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery inner request digest was substituted".to_owned(),
+            ));
+        }
+        let activation = replayed.activation.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery inner record has no durable activation fence".to_owned(),
+            )
+        })?;
+        if record.fence != activation.fence || record.fence.host != *last_host {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery inner record is bound to another activation".to_owned(),
+            ));
+        }
+        if record.state == StoreRebindState::Committed {
+            let termination = self.termination.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "committed Store recovery has no exact termination evidence".to_owned(),
+                )
+            })?;
+            if record.process_id == termination.process_id
+                && record.process_start_time_100ns == termination.process_start_time_100ns
+                && record.process_image_path.as_str() == termination.process_image_path
+                && record.job_name.as_str() == termination.job_name
+            {
+                return Err(HostError::RecoveryRequired(
+                    "committed Store recovery points at the terminated predecessor".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Mutable Host-local startup state for one or more exact unresolved Store
+/// recovery bindings.  The binding itself remains durable and immutable until
+/// authenticated reconciliation publishes its receipt; this state is only the
+/// in-memory admission gate for the current owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StoreRecoveryStartupFence {
+    Clear,
+    Unresolved(Vec<StoreRecoveryReopenFence>),
+}
+
+impl StoreRecoveryStartupFence {
+    #[must_use]
+    const fn is_fenced(&self) -> bool {
+        matches!(self, Self::Unresolved(_))
+    }
+
+    #[must_use]
+    fn bindings(&self) -> &[StoreRecoveryReopenFence] {
+        match self {
+            Self::Clear => &[],
+            Self::Unresolved(bindings) => bindings,
+        }
+    }
+}
+
 fn reopen_existing_epoch<B: JournalBackend>(
     current: HostStateJournalService<B>,
     last_host: &HostInstallationEpoch,
     installation: &PlatformHandle,
     pending: Option<&eliot_installation::PendingActivation>,
     active_phase_b_rebind: Option<&eliot_installation::ActivePhaseBRebind>,
+    store_recovery_fences: &[StoreRecoveryReopenFence],
 ) -> Result<
     (
         HostStateJournalService<B>,
         HostInstallationEpoch,
         EpochTransition,
+        StoreRecoveryStartupFence,
     ),
     HostError,
 > {
@@ -6838,7 +7135,23 @@ fn reopen_existing_epoch<B: JournalBackend>(
         }
     }
     let replayed = current.snapshot()?;
-    if pending.is_none() && active_phase_b_rebind.is_none() && replayed.clean_marker.is_none() {
+    // An exact unresolved Store recovery contour outranks the shutdown marker:
+    // a Host crash can occur between any two durable publications, and a
+    // clean marker is never permission to attach a lost kill-on-close Job.
+    let store_recovery_startup_fence = !store_recovery_fences.is_empty();
+    let store_recovery_startup_fence = if store_recovery_startup_fence {
+        for fence in store_recovery_fences {
+            fence.validate_for_reopen(last_host, &replayed)?;
+        }
+        StoreRecoveryStartupFence::Unresolved(store_recovery_fences.to_vec())
+    } else {
+        StoreRecoveryStartupFence::Clear
+    };
+    if pending.is_none()
+        && active_phase_b_rebind.is_none()
+        && replayed.clean_marker.is_none()
+        && !store_recovery_startup_fence.is_fenced()
+    {
         return Err(HostError::OwnerLeaseRecovery(
             "current Host journal epoch is unclean; explicit new-lineage recovery is required"
                 .to_owned(),
@@ -6850,13 +7163,27 @@ fn reopen_existing_epoch<B: JournalBackend>(
     // prepared Phase-B record is the narrow exception: its exact Host epoch
     // and nonce are durable recovery bindings, so the new owner re-enters the
     // same fenced publication contour without rewriting its four destinations.
-    let activation_generation = replayed
-        .activation
-        .as_ref()
-        .map(|activation| activation.fence.activation_generation.direct_child())
-        .transpose()?
-        .unwrap_or(root_epoch(fresh_identity("activation-lineage")?));
-    let host = if pending.is_some_and(|pending| pending.phase_b_prepared.is_some()) {
+    let activation_generation = if store_recovery_startup_fence.is_fenced() {
+        replayed
+            .activation
+            .as_ref()
+            .map(|activation| activation.fence.activation_generation.clone())
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Store recovery fence has no retained activation generation".to_owned(),
+                )
+            })?
+    } else {
+        replayed
+            .activation
+            .as_ref()
+            .map(|activation| activation.fence.activation_generation.direct_child())
+            .transpose()?
+            .unwrap_or(root_epoch(fresh_identity("activation-lineage")?))
+    };
+    let host = if store_recovery_startup_fence.is_fenced()
+        || pending.is_some_and(|pending| pending.phase_b_prepared.is_some())
+    {
         last_host.clone()
     } else {
         child_host_epoch(last_host)?
@@ -6866,6 +7193,7 @@ fn reopen_existing_epoch<B: JournalBackend>(
         HostStateJournalService::from_backend(backend, host.clone())?,
         host,
         activation_generation,
+        store_recovery_startup_fence,
     ))
 }
 
@@ -6934,16 +7262,43 @@ fn open_production_epoch(
     installation: PlatformHandle,
     pending: Option<&eliot_installation::PendingActivation>,
     active_phase_b_rebind: Option<&eliot_installation::ActivePhaseBRebind>,
+    store_recovery_fences: &[StoreRecoveryReopenFence],
 ) -> Result<
     (
         ProductionHostStateJournal,
         HostInstallationEpoch,
         EpochTransition,
         PlatformHandle,
+        StoreRecoveryStartupFence,
     ),
     HostError,
 > {
-    let mut backend = RedbJournalBackend::open_at(path).map_err(JournalError::Backend)?;
+    let backend = RedbJournalBackend::open_at(path).map_err(JournalError::Backend)?;
+    open_production_epoch_from_backend(
+        backend,
+        installation,
+        pending,
+        active_phase_b_rebind,
+        store_recovery_fences,
+    )
+}
+
+fn open_production_epoch_from_backend(
+    mut backend: RedbJournalBackend,
+    installation: PlatformHandle,
+    pending: Option<&eliot_installation::PendingActivation>,
+    active_phase_b_rebind: Option<&eliot_installation::ActivePhaseBRebind>,
+    store_recovery_fences: &[StoreRecoveryReopenFence],
+) -> Result<
+    (
+        ProductionHostStateJournal,
+        HostInstallationEpoch,
+        EpochTransition,
+        PlatformHandle,
+        StoreRecoveryStartupFence,
+    ),
+    HostError,
+> {
     let last_host = backend
         .load()
         .map_err(JournalError::Backend)?
@@ -6951,36 +7306,73 @@ fn open_production_epoch(
         .last()
         .map(|epoch| epoch.host.clone());
 
-    let (journal, host, activation_generation) = if let Some(last_host) = last_host {
-        let current = HostStateJournalService::from_backend(backend, last_host.clone())?;
-        let (journal, host, activation_generation) = reopen_existing_epoch(
-            current,
-            &last_host,
-            &installation,
-            pending,
-            active_phase_b_rebind,
+    let (journal, host, activation_generation, activation_id, store_recovery_startup_fence) =
+        if let Some(last_host) = last_host {
+            let current = HostStateJournalService::from_backend(backend, last_host.clone())?;
+            let retained_activation_id = current
+                .snapshot()?
+                .activation
+                .as_ref()
+                .map(|activation| activation.activation_id.clone());
+            let (journal, host, activation_generation, store_recovery_startup_fence) =
+                reopen_existing_epoch(
+                    current,
+                    &last_host,
+                    &installation,
+                    pending,
+                    active_phase_b_rebind,
+                    store_recovery_fences,
+                )?;
+            let activation_id = if store_recovery_startup_fence.is_fenced() {
+                retained_activation_id.ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Store recovery fence has no retained activation identity".to_owned(),
+                    )
+                })?
+            } else {
+                fresh_identity("activation")?
+            };
+            (
+                journal,
+                host,
+                activation_generation,
+                activation_id,
+                store_recovery_startup_fence,
+            )
+        } else if !store_recovery_fences.is_empty() {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery fence has no prior Host epoch; manual new-lineage recovery is required"
+                    .to_owned(),
+            ));
+        } else {
+            let host = fresh_host_epoch(installation, None)?;
+            (
+                HostStateJournalService::from_backend(backend, host.clone())?,
+                host,
+                root_epoch(fresh_identity("activation-lineage")?),
+                fresh_identity("activation")?,
+                StoreRecoveryStartupFence::Clear,
+            )
+        };
+    if !store_recovery_startup_fence.is_fenced() {
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &activation_generation,
+                ActivationState::Stopped,
+                "host-open",
+            )?),
         )?;
-        (journal, host, activation_generation)
-    } else {
-        let host = fresh_host_epoch(installation, None)?;
-        (
-            HostStateJournalService::from_backend(backend, host.clone())?,
-            host,
-            root_epoch(fresh_identity("activation-lineage")?),
-        )
-    };
-    let activation_id = fresh_identity("activation")?;
-    append_reconciled(
-        &journal,
-        HostStateRecord::Activation(initial_activation_record(
-            &host,
-            &activation_id,
-            &activation_generation,
-            ActivationState::Stopped,
-            "host-open",
-        )?),
-    )?;
-    Ok((journal, host, activation_generation, activation_id))
+    }
+    Ok((
+        journal,
+        host,
+        activation_generation,
+        activation_id,
+        store_recovery_startup_fence,
+    ))
 }
 
 #[cfg(windows)]
@@ -7431,6 +7823,1292 @@ fn rebind_runtime_restart_receipt(
     Ok(rebound)
 }
 
+#[cfg(windows)]
+fn store_recovery_store_dir(host_state_root: &Path) -> PathBuf {
+    host_state_root.join("store-recoveries")
+}
+
+#[cfg(windows)]
+fn store_recovery_receipt_path(host_state_root: &Path, digest: &str) -> PathBuf {
+    store_recovery_store_dir(host_state_root).join(format!("{digest}.receipt.json"))
+}
+
+#[cfg(windows)]
+fn store_recovery_pending_path(host_state_root: &Path, digest: &str) -> PathBuf {
+    store_recovery_store_dir(host_state_root).join(format!("{digest}.pending.json"))
+}
+
+#[cfg(windows)]
+fn store_recovery_termination_path(host_state_root: &Path, digest: &str) -> PathBuf {
+    store_recovery_store_dir(host_state_root).join(format!("{digest}.termination.json"))
+}
+
+#[cfg(windows)]
+fn store_recovery_inner_binding_path(host_state_root: &Path, digest: &str) -> PathBuf {
+    store_recovery_store_dir(host_state_root).join(format!("{digest}.inner.json"))
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreRecoveryTerminationEvidence {
+    wire: String,
+    operation: HostRuntimeControlOperation,
+    request_id: String,
+    mutation_digest: String,
+    request_digest: String,
+    host_epoch: u64,
+    host_lineage: String,
+    process_id: u32,
+    process_start_time_100ns: u64,
+    process_image_path: String,
+    job_name: String,
+    job_empty: bool,
+    root_reaped: bool,
+    restart_attempt: u8,
+}
+
+#[cfg(windows)]
+impl StoreRecoveryTerminationEvidence {
+    fn validate_for_digest(&self, expected_mutation_digest: &str) -> Result<(), HostError> {
+        if self.wire != "eliot.host.runtime-control.v2"
+            || self.operation != HostRuntimeControlOperation::RecoverStore
+            || self.request_id.trim().is_empty()
+            || self.request_id.chars().any(char::is_control)
+            || !valid_sha256_text(&self.mutation_digest)
+            || !valid_sha256_text(&self.request_digest)
+            || self.mutation_digest != expected_mutation_digest
+            || self.host_epoch == 0
+            || self.host_lineage.trim().is_empty()
+            || self.host_lineage.chars().any(char::is_control)
+            || self.process_id == 0
+            || self.process_start_time_100ns == 0
+            || self.process_image_path.trim().is_empty()
+            || self.process_image_path.chars().any(char::is_control)
+            || self.job_name.trim().is_empty()
+            || self.job_name.chars().any(char::is_control)
+            || !self.job_empty
+            || !self.root_reaped
+            || self.restart_attempt != 1
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store termination evidence is not complete or is not bound to the mutation"
+                    .to_owned(),
+            ));
+        }
+        let request_id = PlatformHandle::new(self.request_id.clone()).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Store termination request identity is malformed: {error}"
+            ))
+        })?;
+        let mutation_digest =
+            PlatformHandle::new(self.mutation_digest.clone()).map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "Store termination mutation identity is malformed: {error}"
+                ))
+            })?;
+        let expected_request = HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RecoverStore,
+            request_id,
+            mutation_digest,
+        )
+        .map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Store termination request identity is malformed: {error}"
+            ))
+        })?;
+        if expected_request.request_digest.as_str() != self.request_digest {
+            return Err(HostError::RecoveryRequired(
+                "Store termination request digest does not match its mutation identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_for_pending(
+        &self,
+        pending: &StoreRecoveryPendingIdentity,
+    ) -> Result<(), HostError> {
+        self.validate_for_digest(&pending.mutation_digest)?;
+        if self.wire != pending.wire
+            || self.operation != pending.operation
+            || self.request_id != pending.request_id
+            || self.mutation_digest != pending.mutation_digest
+            || self.request_digest != pending.request_digest
+            || self.host_epoch != pending.host_epoch
+            || self.host_lineage != pending.host_lineage
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store termination evidence is not cross-bound to the exact recovery intent"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn read_store_recovery_termination_evidence(
+    host_state_root: &Path,
+    mutation_digest: &str,
+) -> Result<Option<StoreRecoveryTerminationEvidence>, HostError> {
+    const MAX_TERMINATION_BYTES: u64 = 16 * 1024;
+    if !valid_sha256_text(mutation_digest) {
+        return Err(HostError::RecoveryRequired(
+            "Store termination path is not bound to a lowercase sha256 mutation".to_owned(),
+        ));
+    }
+    let path = store_recovery_termination_path(host_state_root, mutation_digest);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "Store termination evidence cannot be inspected: {error}"
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_TERMINATION_BYTES {
+        return Err(HostError::RecoveryRequired(
+            "Store termination evidence is malformed or too large".to_owned(),
+        ));
+    }
+    let bytes = read_bounded_runtime_restart_file(
+        &path,
+        MAX_TERMINATION_BYTES,
+        "Store termination evidence",
+    )?;
+    let evidence =
+        serde_json::from_slice::<StoreRecoveryTerminationEvidence>(&bytes).map_err(|error| {
+            HostError::RecoveryRequired(format!("Store termination evidence is malformed: {error}"))
+        })?;
+    evidence.validate_for_digest(mutation_digest)?;
+    Ok(Some(evidence))
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreRecoveryInnerBinding {
+    wire: String,
+    operation: HostRuntimeControlOperation,
+    request_id: String,
+    external_control_mutation_digest: String,
+    external_control_request_digest: String,
+    host_epoch: u64,
+    host_lineage: String,
+    terminated_store_evidence_digest: String,
+    store_rebind_operation_id: String,
+    store_rebind_request_digest: String,
+    handoff: StoreRebindHandoff,
+}
+
+#[cfg(windows)]
+impl StoreRecoveryInnerBinding {
+    fn validate_for_pending(
+        &self,
+        pending: &StoreRecoveryPendingIdentity,
+        termination: &StoreRecoveryTerminationEvidence,
+    ) -> Result<(), HostError> {
+        pending.recover_request()?;
+        termination.validate_for_pending(pending)?;
+        self.handoff
+            .validate_canonical_digest()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let termination_digest = sha256_json(termination)?;
+        if self.wire != pending.wire
+            || self.operation != HostRuntimeControlOperation::RecoverStore
+            || self.request_id != pending.request_id
+            || self.external_control_mutation_digest != pending.mutation_digest
+            || self.external_control_request_digest != pending.request_digest
+            || self.host_epoch != pending.host_epoch
+            || self.host_lineage != pending.host_lineage
+            || self.terminated_store_evidence_digest != termination_digest
+            || self.store_rebind_operation_id.trim().is_empty()
+            || self.store_rebind_operation_id.chars().any(char::is_control)
+            || !valid_sha256_text(&self.store_rebind_request_digest)
+            || self.handoff.operation_id.as_str() != self.store_rebind_operation_id
+            || self.handoff.request_digest != self.store_rebind_request_digest
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery inner binding is not canonical or cross-bound".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn read_store_recovery_inner_binding(
+    host_state_root: &Path,
+    mutation_digest: &str,
+) -> Result<Option<StoreRecoveryInnerBinding>, HostError> {
+    const MAX_INNER_BINDING_BYTES: u64 = 16 * 1024;
+    if !valid_sha256_text(mutation_digest) {
+        return Err(HostError::RecoveryRequired(
+            "Store recovery inner-binding path is not a lowercase sha256 mutation".to_owned(),
+        ));
+    }
+    let path = store_recovery_inner_binding_path(host_state_root, mutation_digest);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "Store recovery inner binding cannot be inspected: {error}"
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_INNER_BINDING_BYTES {
+        return Err(HostError::RecoveryRequired(
+            "Store recovery inner binding is malformed or too large".to_owned(),
+        ));
+    }
+    let bytes = read_bounded_runtime_restart_file(
+        &path,
+        MAX_INNER_BINDING_BYTES,
+        "Store recovery inner binding",
+    )?;
+    serde_json::from_slice::<StoreRecoveryInnerBinding>(&bytes)
+        .map(Some)
+        .map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Store recovery inner binding is malformed: {error}"
+            ))
+        })
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the loader performs one exhaustive fail-closed filename, shape, and cross-binding audit before exposing startup fences"
+)]
+fn load_durable_store_recoveries(
+    host_state_root: &Path,
+) -> Result<Vec<StoreRecoveryReopenFence>, HostError> {
+    const MAX_STORE_RECOVERY_RECORD_BYTES: u64 = 16 * 1024;
+    const MAX_STORE_RECOVERY_RECORDS: usize = 1024;
+    let mut pending_records = std::collections::HashMap::new();
+    let mut termination_records = std::collections::HashMap::new();
+    let mut inner_bindings = std::collections::HashMap::new();
+    let dir = store_recovery_store_dir(host_state_root);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "store recovery store cannot be enumerated: {error}"
+            )));
+        }
+    };
+    for (entry_index, entry) in entries.enumerate() {
+        if entry_index >= MAX_STORE_RECOVERY_RECORDS {
+            return Err(HostError::RecoveryRequired(
+                "store recovery store contains too many records".to_owned(),
+            ));
+        }
+        let entry = entry.map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "store recovery store entry cannot be inspected: {error}"
+            ))
+        })?;
+        let path = entry.path();
+        let metadata = entry.metadata().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "store recovery store entry metadata cannot be read: {error}"
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(HostError::RecoveryRequired(
+                "store recovery store contains a non-file entry".to_owned(),
+            ));
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "store recovery store contains a non-text filename".to_owned(),
+                )
+            })?;
+        let pending_digest = file_name
+            .strip_suffix(".pending.json")
+            .filter(|digest| valid_sha256_text(digest));
+        if let Some(pending_digest) = pending_digest {
+            let pending = read_store_recovery_pending_identity(&path)?.ok_or_else(|| {
+                HostError::RecoveryRequired(format!(
+                    "store recovery pending record {file_name} disappeared during inspection"
+                ))
+            })?;
+            pending_records.insert(pending_digest.to_owned(), pending);
+            continue;
+        }
+        let termination_digest = file_name
+            .strip_suffix(".termination.json")
+            .filter(|digest| valid_sha256_text(digest));
+        if let Some(termination_digest) = termination_digest {
+            let termination = read_store_recovery_termination_evidence(
+                host_state_root,
+                termination_digest,
+            )?
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(format!(
+                    "store recovery termination record {file_name} disappeared during inspection"
+                ))
+            })?;
+            termination_records.insert(termination_digest.to_owned(), termination);
+            continue;
+        }
+        let inner_digest = file_name
+            .strip_suffix(".inner.json")
+            .filter(|digest| valid_sha256_text(digest));
+        if let Some(inner_digest) = inner_digest {
+            let inner = read_store_recovery_inner_binding(host_state_root, inner_digest)?
+                .ok_or_else(|| {
+                    HostError::RecoveryRequired(format!(
+                        "store recovery inner binding {file_name} disappeared during inspection"
+                    ))
+                })?;
+            inner_bindings.insert(inner_digest.to_owned(), inner);
+            continue;
+        }
+        let receipt_digest = file_name
+            .strip_suffix(".receipt.json")
+            .filter(|digest| valid_sha256_text(digest))
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(format!(
+                    "store recovery store contains an unknown or wrongly named record: {file_name}"
+                ))
+            })?;
+        if metadata.len() > MAX_STORE_RECOVERY_RECORD_BYTES {
+            return Err(HostError::RecoveryRequired(format!(
+                "store recovery receipt {file_name} is too large"
+            )));
+        }
+        let bytes = read_bounded_runtime_restart_file(
+            &path,
+            MAX_STORE_RECOVERY_RECORD_BYTES,
+            &format!("store recovery receipt {file_name}"),
+        )?;
+        let receipt =
+            serde_json::from_slice::<HostStoreRecoveryReceipt>(&bytes).map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "store recovery receipt {file_name} is malformed: {error}"
+                ))
+            })?;
+        receipt.validate().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "store recovery receipt {file_name} is invalid: {error}"
+            ))
+        })?;
+        if receipt.external_control_mutation_digest.as_str() != receipt_digest {
+            return Err(HostError::RecoveryRequired(format!(
+                "store recovery receipt {file_name} is bound to the wrong mutation"
+            )));
+        }
+        // Receipt shape is checked so malformed durable state still fences
+        // startup, but the receipt is deliberately not adopted as authority.
+        // A live StoreRecovered response is rebuilt only from the exact
+        // pending/termination/inner journal contour below.
+    }
+    for (digest, termination) in &termination_records {
+        let pending = pending_records.get(digest).ok_or_else(|| {
+            HostError::RecoveryRequired(format!(
+                "Store termination evidence {digest} has no exact durable recovery intent"
+            ))
+        })?;
+        termination.validate_for_pending(pending)?;
+    }
+    for (digest, inner) in &inner_bindings {
+        let pending = pending_records.get(digest).ok_or_else(|| {
+            HostError::RecoveryRequired(format!(
+                "Store inner binding {digest} has no exact durable recovery intent"
+            ))
+        })?;
+        let termination = termination_records.get(digest).ok_or_else(|| {
+            HostError::RecoveryRequired(format!(
+                "Store inner binding {digest} has no exact termination evidence"
+            ))
+        })?;
+        inner.validate_for_pending(pending, termination)?;
+    }
+    let mut fences = pending_records
+        .into_iter()
+        .map(|(digest, pending)| {
+            StoreRecoveryReopenFence::from_durable(
+                digest.clone(),
+                pending,
+                termination_records.remove(&digest),
+                inner_bindings.remove(&digest),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    fences.sort_by(|left, right| left.mutation_digest.cmp(&right.mutation_digest));
+    Ok(fences)
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoreRecoveryPendingIdentity {
+    wire: String,
+    operation: HostRuntimeControlOperation,
+    request_id: String,
+    mutation_digest: String,
+    request_digest: String,
+    host_epoch: u64,
+    host_lineage: String,
+}
+
+#[cfg(windows)]
+impl StoreRecoveryPendingIdentity {
+    fn recover_request(&self) -> Result<HostRuntimeControlRequest, HostError> {
+        let request_id = PlatformHandle::new(self.request_id.clone()).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "Store recovery pending request_id is malformed: {error}"
+            ))
+        })?;
+        let mutation_digest =
+            PlatformHandle::new(self.mutation_digest.clone()).map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "Store recovery pending mutation_digest is malformed: {error}"
+                ))
+            })?;
+        let request = HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RecoverStore,
+            request_id,
+            mutation_digest,
+        )
+        .map_err(HostError::RecoveryRequired)?;
+        if request.wire.as_str() != self.wire
+            || request.request_digest.as_str() != self.request_digest
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery pending request is not canonical".to_owned(),
+            ));
+        }
+        Ok(request)
+    }
+
+    fn validate_current_request(
+        &self,
+        request: &HostRuntimeControlRequest,
+    ) -> Result<(), HostError> {
+        request.validate().map_err(HostError::RecoveryRequired)?;
+        if request.mutation_digest.as_str() != self.mutation_digest {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery request mutation does not match the durable intent".to_owned(),
+            ));
+        }
+        match request.operation {
+            HostRuntimeControlOperation::RecoverStore => {
+                if request != &self.recover_request()? {
+                    return Err(HostError::RecoveryRequired(
+                        "RecoverStore replay does not match the exact durable request".to_owned(),
+                    ));
+                }
+            }
+            HostRuntimeControlOperation::ReconcileStoreRecovery => {}
+            _ => {
+                return Err(HostError::RecoveryRequired(
+                    "Store recovery durable intent was queried by another operation".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreRecoveryPendingRecord {
+    wire: String,
+    operation: HostRuntimeControlOperation,
+    request_id: String,
+    mutation_digest: String,
+    request_digest: String,
+    host_epoch: u64,
+    host_lineage: String,
+    created_at: String,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoreRecoveryPendingPublication {
+    Created,
+    Replay,
+}
+
+#[cfg(windows)]
+fn store_recovery_pending_identity(
+    request: &HostRuntimeControlRequest,
+    host: &HostInstallationEpoch,
+) -> StoreRecoveryPendingIdentity {
+    StoreRecoveryPendingIdentity {
+        wire: request.wire.as_str().to_owned(),
+        operation: request.operation.clone(),
+        request_id: request.request_id.as_str().to_owned(),
+        mutation_digest: request.mutation_digest.as_str().to_owned(),
+        request_digest: request.request_digest.as_str().to_owned(),
+        host_epoch: host.epoch.current.sequence,
+        host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+    }
+}
+
+#[cfg(windows)]
+fn store_recovery_pending_payload(
+    identity: &StoreRecoveryPendingIdentity,
+) -> Result<serde_json::Value, HostError> {
+    Ok(serde_json::json!({
+        "wire": identity.wire,
+        "operation": serde_json::to_value(&identity.operation)
+            .map_err(|e| HostError::Platform(e.to_string()))?,
+        "request_id": identity.request_id,
+        "mutation_digest": identity.mutation_digest,
+        "request_digest": identity.request_digest,
+        "host_epoch": identity.host_epoch,
+        "host_lineage": identity.host_lineage,
+        "created_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string(),
+    }))
+}
+
+#[cfg(windows)]
+fn store_recovery_pending_identity_from_bytes(
+    bytes: &[u8],
+    expected_mutation_digest: &str,
+) -> Result<StoreRecoveryPendingIdentity, HostError> {
+    let record = serde_json::from_slice::<StoreRecoveryPendingRecord>(bytes).map_err(|e| {
+        HostError::RecoveryRequired(format!("store recovery pending record is malformed: {e}"))
+    })?;
+    let identity = StoreRecoveryPendingIdentity {
+        wire: record.wire,
+        operation: record.operation,
+        request_id: record.request_id,
+        mutation_digest: record.mutation_digest,
+        request_digest: record.request_digest,
+        host_epoch: record.host_epoch,
+        host_lineage: record.host_lineage,
+    };
+    if identity.wire != "eliot.host.runtime-control.v2"
+        || identity.operation != HostRuntimeControlOperation::RecoverStore
+        || identity.request_id.trim().is_empty()
+        || identity.request_id.chars().any(char::is_control)
+        || !valid_sha256_text(&identity.mutation_digest)
+        || !valid_sha256_text(&identity.request_digest)
+        || identity.host_epoch == 0
+        || identity.host_lineage.trim().is_empty()
+        || identity.host_lineage.chars().any(char::is_control)
+        || record.created_at.trim().is_empty()
+        || record.created_at.chars().any(char::is_control)
+        || identity.mutation_digest != expected_mutation_digest
+    {
+        return Err(HostError::RecoveryRequired(
+            "store recovery pending record identity is malformed".to_owned(),
+        ));
+    }
+    let request_id = PlatformHandle::new(identity.request_id.clone()).map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "store recovery pending request_id is malformed: {error}"
+        ))
+    })?;
+    let mutation_digest =
+        PlatformHandle::new(identity.mutation_digest.clone()).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "store recovery pending mutation_digest is malformed: {error}"
+            ))
+        })?;
+    let expected_request = HostRuntimeControlRequest::new_with_mutation_digest(
+        HostRuntimeControlOperation::RecoverStore,
+        request_id,
+        mutation_digest,
+    )
+    .map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "store recovery pending request identity is malformed: {error}"
+        ))
+    })?;
+    if expected_request.request_digest.as_str() != identity.request_digest {
+        return Err(HostError::RecoveryRequired(
+            "store recovery pending request_digest does not match its operation and mutation"
+                .to_owned(),
+        ));
+    }
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn read_store_recovery_pending_identity(
+    path: &Path,
+) -> Result<Option<StoreRecoveryPendingIdentity>, HostError> {
+    const MAX_PENDING_BYTES: u64 = 16 * 1024;
+    let expected_mutation_digest = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".pending.json"))
+        .filter(|digest| valid_sha256_text(digest))
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "store recovery pending path is not bound to a lowercase sha256 mutation"
+                    .to_owned(),
+            )
+        })?;
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "store recovery pending record cannot be inspected: {error}"
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_PENDING_BYTES {
+        return Err(HostError::RecoveryRequired(
+            "store recovery pending record is malformed or too large".to_owned(),
+        ));
+    }
+    let bytes = read_bounded_runtime_restart_file(
+        path,
+        MAX_PENDING_BYTES,
+        "store recovery pending record",
+    )?;
+    store_recovery_pending_identity_from_bytes(&bytes, expected_mutation_digest).map(Some)
+}
+
+#[cfg(windows)]
+fn sync_store_recovery_dir(dir: &Path) {
+    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(dir) {
+        let _ = file.sync_all();
+    }
+}
+
+#[cfg(windows)]
+fn persist_store_recovery_pending(
+    host_state_root: &Path,
+    request: &HostRuntimeControlRequest,
+    host: &HostInstallationEpoch,
+) -> Result<StoreRecoveryPendingPublication, HostError> {
+    request.validate().map_err(HostError::RecoveryRequired)?;
+    if request.operation != HostRuntimeControlOperation::RecoverStore {
+        return Err(HostError::RecoveryRequired(
+            "store recovery pending records are reserved for RecoverStore".to_owned(),
+        ));
+    }
+    if host.epoch.current.sequence == 0 {
+        return Err(HostError::RecoveryRequired(
+            "store recovery pending records require a non-zero host epoch".to_owned(),
+        ));
+    }
+    let dir = store_recovery_store_dir(host_state_root);
+    std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
+    let identity = store_recovery_pending_identity(request, host);
+    let path = store_recovery_pending_path(host_state_root, request.mutation_digest.as_str());
+    if let Some(existing) = read_store_recovery_pending_identity(&path)? {
+        if existing == identity {
+            return Ok(StoreRecoveryPendingPublication::Replay);
+        }
+        return Err(HostError::RecoveryRequired(
+            "store recovery pending record conflicts with the requested operation".to_owned(),
+        ));
+    }
+    let payload = store_recovery_pending_payload(&identity)?;
+    let bytes = serde_json::to_vec(&payload).map_err(|e| HostError::Platform(e.to_string()))?;
+    let tmp = dir.join(format!(
+        ".{}.pending.{}.tmp",
+        request.mutation_digest.as_str(),
+        Uuid::new_v4().simple()
+    ));
+    let publication = (|| {
+        std::fs::write(&tmp, bytes).map_err(|e| HostError::Platform(e.to_string()))?;
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+            let _ = file.sync_all();
+        }
+        match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                sync_store_recovery_dir(&dir);
+                Ok(StoreRecoveryPendingPublication::Created)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let Some(existing) = read_store_recovery_pending_identity(&path)? else {
+                    return Err(HostError::RecoveryRequired(
+                        "store recovery pending record disappeared during publication".to_owned(),
+                    ));
+                };
+                if existing == identity {
+                    Ok(StoreRecoveryPendingPublication::Replay)
+                } else {
+                    Err(HostError::RecoveryRequired(
+                        "store recovery pending record conflicts with the requested operation"
+                            .to_owned(),
+                    ))
+                }
+            }
+            Err(error) => Err(HostError::Platform(error.to_string())),
+        }
+    })();
+    let cleanup = std::fs::remove_file(&tmp);
+    sync_store_recovery_dir(&dir);
+    match publication {
+        Err(error) => Err(error),
+        Ok(value) => match cleanup {
+            Ok(()) => Ok(value),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(value),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "store recovery pending temporary cleanup failed: {error}"
+            ))),
+        },
+    }
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the termination receipt persists exact mutation and Job completion evidence atomically"
+)]
+fn persist_store_recovery_termination_evidence(
+    host_state_root: &Path,
+    request: &HostRuntimeControlRequest,
+    host: &HostInstallationEpoch,
+    terminated: &TerminatedJobChild,
+    expected_job_name: &str,
+) -> Result<(), HostError> {
+    request.validate().map_err(HostError::RecoveryRequired)?;
+    if request.operation != HostRuntimeControlOperation::RecoverStore {
+        return Err(HostError::RecoveryRequired(
+            "Store termination evidence is reserved for RecoverStore".to_owned(),
+        ));
+    }
+    let pending = read_store_recovery_pending_identity(&store_recovery_pending_path(
+        host_state_root,
+        request.mutation_digest.as_str(),
+    ))?
+    .ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "Store termination evidence requires the exact durable recovery intent".to_owned(),
+        )
+    })?;
+    let expected = store_recovery_pending_identity(request, host);
+    if pending != expected {
+        return Err(HostError::RecoveryRequired(
+            "Store termination evidence does not match the durable recovery intent".to_owned(),
+        ));
+    }
+    let process = terminated.process();
+    let evidence = StoreRecoveryTerminationEvidence {
+        wire: request.wire.as_str().to_owned(),
+        operation: request.operation.clone(),
+        request_id: request.request_id.as_str().to_owned(),
+        mutation_digest: request.mutation_digest.as_str().to_owned(),
+        request_digest: request.request_digest.as_str().to_owned(),
+        host_epoch: host.epoch.current.sequence,
+        host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+        process_id: process.process_id,
+        process_start_time_100ns: process.start_time_100ns,
+        process_image_path: process.image_path.clone(),
+        job_name: expected_job_name.to_owned(),
+        job_empty: terminated.job_empty(),
+        root_reaped: terminated.root_reaped(),
+        restart_attempt: 1,
+    };
+    evidence.validate_for_digest(request.mutation_digest.as_str())?;
+    let dir = store_recovery_store_dir(host_state_root);
+    std::fs::create_dir_all(&dir).map_err(|error| HostError::Platform(error.to_string()))?;
+    let path = store_recovery_termination_path(host_state_root, request.mutation_digest.as_str());
+    if let Some(existing) =
+        read_store_recovery_termination_evidence(host_state_root, request.mutation_digest.as_str())?
+    {
+        if existing == evidence {
+            return Ok(());
+        }
+        return Err(HostError::RecoveryRequired(
+            "Store termination evidence conflicts with the requested operation".to_owned(),
+        ));
+    }
+    let bytes =
+        serde_json::to_vec(&evidence).map_err(|error| HostError::Platform(error.to_string()))?;
+    let tmp = dir.join(format!(
+        ".{}.termination.{}.tmp",
+        request.mutation_digest.as_str(),
+        Uuid::new_v4().simple()
+    ));
+    let publication = (|| {
+        std::fs::write(&tmp, bytes).map_err(|error| HostError::Platform(error.to_string()))?;
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+            let _ = file.sync_all();
+        }
+        match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                sync_store_recovery_dir(&dir);
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let Some(existing) = read_store_recovery_termination_evidence(
+                    host_state_root,
+                    request.mutation_digest.as_str(),
+                )?
+                else {
+                    return Err(HostError::RecoveryRequired(
+                        "Store termination evidence disappeared during publication".to_owned(),
+                    ));
+                };
+                if existing == evidence {
+                    Ok(())
+                } else {
+                    Err(HostError::RecoveryRequired(
+                        "Store termination evidence conflicts with the requested operation"
+                            .to_owned(),
+                    ))
+                }
+            }
+            Err(error) => Err(HostError::Platform(error.to_string())),
+        }
+    })();
+    let cleanup = std::fs::remove_file(&tmp);
+    sync_store_recovery_dir(&dir);
+    match publication {
+        Err(error) => Err(error),
+        Ok(()) => match cleanup {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Store termination temporary cleanup failed: {error}"
+            ))),
+        },
+    }
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the no-replace publication verifies every outer, termination, and canonical inner handoff binding before durable readback"
+)]
+fn persist_store_recovery_inner_binding(
+    host_state_root: &Path,
+    request: &HostRuntimeControlRequest,
+    host: &HostInstallationEpoch,
+    handoff: &StoreRebindHandoff,
+) -> Result<(), HostError> {
+    request.validate().map_err(HostError::RecoveryRequired)?;
+    if request.operation != HostRuntimeControlOperation::RecoverStore {
+        return Err(HostError::RecoveryRequired(
+            "Store inner bindings are reserved for RecoverStore".to_owned(),
+        ));
+    }
+    handoff
+        .validate_canonical_digest()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let pending = read_store_recovery_pending_identity(&store_recovery_pending_path(
+        host_state_root,
+        request.mutation_digest.as_str(),
+    ))?
+    .ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "Store inner binding requires the exact durable recovery intent".to_owned(),
+        )
+    })?;
+    if pending != store_recovery_pending_identity(request, host) {
+        return Err(HostError::RecoveryRequired(
+            "Store inner binding does not match the exact recovery request/Host epoch".to_owned(),
+        ));
+    }
+    let termination = read_store_recovery_termination_evidence(
+        host_state_root,
+        request.mutation_digest.as_str(),
+    )?
+    .ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "Store inner binding requires exact termination evidence".to_owned(),
+        )
+    })?;
+    termination.validate_for_pending(&pending)?;
+    if handoff.process_binding.process.process_id == termination.process_id
+        && handoff.process_binding.process.start_time_100ns == termination.process_start_time_100ns
+        && handoff.process_binding.process.image_path == termination.process_image_path
+        && handoff.process_binding.job.as_str() == termination.job_name
+    {
+        return Err(HostError::RecoveryRequired(
+            "Store inner binding points at the terminated predecessor".to_owned(),
+        ));
+    }
+    let binding = StoreRecoveryInnerBinding {
+        wire: request.wire.as_str().to_owned(),
+        operation: request.operation.clone(),
+        request_id: request.request_id.as_str().to_owned(),
+        external_control_mutation_digest: request.mutation_digest.as_str().to_owned(),
+        external_control_request_digest: request.request_digest.as_str().to_owned(),
+        host_epoch: host.epoch.current.sequence,
+        host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+        terminated_store_evidence_digest: sha256_json(&termination)?,
+        store_rebind_operation_id: handoff.operation_id.as_str().to_owned(),
+        store_rebind_request_digest: handoff.request_digest.clone(),
+        handoff: handoff.clone(),
+    };
+    binding.validate_for_pending(&pending, &termination)?;
+    let dir = store_recovery_store_dir(host_state_root);
+    std::fs::create_dir_all(&dir).map_err(|error| HostError::Platform(error.to_string()))?;
+    let path = store_recovery_inner_binding_path(host_state_root, request.mutation_digest.as_str());
+    if let Some(existing) =
+        read_store_recovery_inner_binding(host_state_root, request.mutation_digest.as_str())?
+    {
+        return if existing == binding {
+            Ok(())
+        } else {
+            Err(HostError::RecoveryRequired(
+                "Store recovery inner binding conflicts with retained identity".to_owned(),
+            ))
+        };
+    }
+    let bytes =
+        serde_json::to_vec(&binding).map_err(|error| HostError::Platform(error.to_string()))?;
+    let tmp = dir.join(format!(
+        ".{}.inner.{}.tmp",
+        request.mutation_digest.as_str(),
+        Uuid::new_v4().simple()
+    ));
+    let publication = (|| {
+        std::fs::write(&tmp, bytes).map_err(|error| HostError::Platform(error.to_string()))?;
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+            let _ = file.sync_all();
+        }
+        match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                sync_store_recovery_dir(&dir);
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = read_store_recovery_inner_binding(
+                    host_state_root,
+                    request.mutation_digest.as_str(),
+                )?
+                .ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Store recovery inner binding disappeared during publication".to_owned(),
+                    )
+                })?;
+                if existing == binding {
+                    Ok(())
+                } else {
+                    Err(HostError::RecoveryRequired(
+                        "Store recovery inner binding conflicts with retained identity".to_owned(),
+                    ))
+                }
+            }
+            Err(error) => Err(HostError::Platform(error.to_string())),
+        }
+    })();
+    let cleanup = std::fs::remove_file(&tmp);
+    sync_store_recovery_dir(&dir);
+    match publication {
+        Err(error) => Err(error),
+        Ok(()) => match cleanup {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Store recovery inner-binding temporary cleanup failed: {error}"
+            ))),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn read_store_recovery_receipt(
+    host_state_root: &Path,
+    mutation_digest: &str,
+) -> Result<Option<HostStoreRecoveryReceipt>, HostError> {
+    if !valid_sha256_text(mutation_digest) {
+        return Err(HostError::RecoveryRequired(
+            "Store recovery receipt path is not a lowercase sha256 mutation".to_owned(),
+        ));
+    }
+    let path = store_recovery_receipt_path(host_state_root, mutation_digest);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "Store recovery receipt cannot be inspected: {error}"
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.len() > 16 * 1024 {
+        return Err(HostError::RecoveryRequired(
+            "Store recovery receipt is malformed or too large".to_owned(),
+        ));
+    }
+    let bytes = read_bounded_runtime_restart_file(&path, 16 * 1024, "Store recovery receipt")?;
+    let receipt = serde_json::from_slice::<HostStoreRecoveryReceipt>(&bytes).map_err(|error| {
+        HostError::RecoveryRequired(format!("Store recovery receipt is malformed: {error}"))
+    })?;
+    receipt.validate().map_err(HostError::RecoveryRequired)?;
+    if receipt.external_control_mutation_digest.as_str() != mutation_digest {
+        return Err(HostError::RecoveryRequired(
+            "Store recovery receipt is bound to another mutation".to_owned(),
+        ));
+    }
+    Ok(Some(receipt))
+}
+
+#[cfg(windows)]
+fn persist_store_recovery_receipt(
+    host_state_root: &Path,
+    receipt: &HostStoreRecoveryReceipt,
+) -> Result<(), HostError> {
+    let dir = store_recovery_store_dir(host_state_root);
+    std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
+    let path = store_recovery_receipt_path(
+        host_state_root,
+        receipt.external_control_mutation_digest.as_str(),
+    );
+    if let Some(existing) = read_store_recovery_receipt(
+        host_state_root,
+        receipt.external_control_mutation_digest.as_str(),
+    )? {
+        if existing == *receipt {
+            return Ok(());
+        }
+        return Err(HostError::RecoveryRequired(
+            "existing Store recovery receipt conflicts with reconstructed authority".to_owned(),
+        ));
+    }
+    let tmp = dir.join(format!(
+        ".{}.receipt.{}.tmp",
+        receipt.external_control_mutation_digest.as_str(),
+        Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?,
+    )
+    .map_err(|e| HostError::Platform(e.to_string()))?;
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&tmp)
+            .map_err(|e| HostError::Platform(e.to_string()))?;
+        let _ = file.sync_all();
+    }
+    // Publish with a hard link so a concurrent writer can never replace an
+    // already durable outer receipt.  The winner is read back and must be the
+    // exact same canonical authority; a conflicting winner remains Unknown.
+    let publication = match std::fs::hard_link(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let bytes =
+                read_bounded_runtime_restart_file(&path, 16 * 1024, "Store recovery receipt")?;
+            let existing =
+                serde_json::from_slice::<HostStoreRecoveryReceipt>(&bytes).map_err(|error| {
+                    HostError::RecoveryRequired(format!(
+                        "existing Store recovery receipt is malformed: {error}"
+                    ))
+                })?;
+            existing.validate().map_err(HostError::RecoveryRequired)?;
+            if existing == *receipt {
+                Ok(())
+            } else {
+                Err(HostError::RecoveryRequired(
+                    "existing Store recovery receipt conflicts with reconstructed authority"
+                        .to_owned(),
+                ))
+            }
+        }
+        Err(error) => Err(HostError::Platform(error.to_string())),
+    };
+    let cleanup = std::fs::remove_file(&tmp);
+    sync_store_recovery_dir(&dir);
+    match publication {
+        Err(error) => Err(error),
+        Ok(()) => match cleanup {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Store recovery receipt temporary cleanup failed: {error}"
+            ))),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_store_recovery_supporting_evidence_for(
+    host_state_root: &Path,
+    mutation_digest: &str,
+) -> Result<(), HostError> {
+    if !valid_sha256_text(mutation_digest) {
+        return Err(HostError::RecoveryRequired(
+            "Store recovery resolution mutation is not a lowercase sha256".to_owned(),
+        ));
+    }
+    let receipt_path = store_recovery_receipt_path(host_state_root, mutation_digest);
+    let receipt_bytes = read_bounded_runtime_restart_file(
+        &receipt_path,
+        16 * 1024,
+        "Store recovery resolution receipt",
+    )?;
+    let receipt = serde_json::from_slice::<HostStoreRecoveryReceipt>(&receipt_bytes)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    receipt.validate().map_err(HostError::RecoveryRequired)?;
+    if receipt.external_control_mutation_digest.as_str() != mutation_digest {
+        return Err(HostError::RecoveryRequired(
+            "Store recovery resolution receipt is bound to another mutation".to_owned(),
+        ));
+    }
+    let dir = store_recovery_store_dir(host_state_root);
+    for path in [
+        store_recovery_pending_path(host_state_root, mutation_digest),
+        store_recovery_termination_path(host_state_root, mutation_digest),
+        store_recovery_inner_binding_path(host_state_root, mutation_digest),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "Store recovery resolution cleanup failed for {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    sync_store_recovery_dir(&dir);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_completed_store_recovery_supporting_evidence(
+    host_state_root: &Path,
+) -> Result<(), HostError> {
+    let fences = load_durable_store_recoveries(host_state_root)?;
+    let dir = store_recovery_store_dir(host_state_root);
+    for fence in fences {
+        if !store_recovery_receipt_path(host_state_root, &fence.mutation_digest).exists() {
+            continue;
+        }
+        for path in [
+            store_recovery_pending_path(host_state_root, &fence.mutation_digest),
+            store_recovery_termination_path(host_state_root, &fence.mutation_digest),
+            store_recovery_inner_binding_path(host_state_root, &fence.mutation_digest),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "completed Store recovery evidence cleanup failed for {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    sync_store_recovery_dir(&dir);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn has_store_recovery_pending(host_state_root: &Path, digest: &str) -> Result<bool, HostError> {
+    let path = store_recovery_pending_path(host_state_root, digest);
+    Ok(read_store_recovery_pending_identity(&path)?
+        .is_some_and(|identity| identity.mutation_digest == digest))
+}
+
+#[cfg(windows)]
+fn rebind_store_recovery_receipt(
+    receipt: &HostStoreRecoveryReceipt,
+    request: &HostRuntimeControlRequest,
+) -> Result<HostStoreRecoveryReceipt, HostError> {
+    if request.operation != HostRuntimeControlOperation::ReconcileStoreRecovery
+        || receipt.external_control_mutation_digest != request.mutation_digest
+    {
+        return Err(HostError::RecoveryRequired(
+            "store recovery receipt is not bound to the requested mutation".to_owned(),
+        ));
+    }
+    let mut rebound = receipt.clone();
+    rebound.request_digest = request.request_digest.clone();
+    rebound.receipt_digest = rebound.computed_digest().map_err(HostError::Platform)?;
+    rebound.validate().map_err(HostError::Platform)?;
+    Ok(rebound)
+}
+
+#[cfg(windows)]
+fn committed_store_rebind_receipt(
+    record: &StoreRebindRecord,
+    requirement: &HostStoreBootstrapRequirement,
+    candidate_digest: &str,
+) -> Result<StoreRebindReceipt, HostError> {
+    requirement
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let expected_requirement_digest = sha256_json(requirement)?;
+    if record.requirement.as_str() != expected_requirement_digest {
+        return Err(HostError::RecoveryRequired(
+            "committed Store rebind requirement digest is substituted".to_owned(),
+        ));
+    }
+    let generation = ResourceGeneration::new(record.generation)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let authority_epoch = AuthorityEpoch::new(record.authority_epoch)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let process_binding = StoreProcessBinding {
+        process: HostProcessBinding {
+            process_id: record.process_id,
+            start_time_100ns: record.process_start_time_100ns,
+            image_path: record.process_image_path.as_str().to_owned(),
+        },
+        job: record.job_name.clone(),
+    };
+    process_binding
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let handoff = StoreRebindHandoff {
+        operation_id: record.operation_id.clone(),
+        request_digest: "0".repeat(64),
+        requirement: requirement.clone(),
+        process_binding: process_binding.clone(),
+        candidate_binding_digest: candidate_digest.to_owned(),
+        generation,
+        authority_epoch,
+        store_fence: record.store_fence.as_str().to_owned(),
+    };
+    let expected_inner_digest = handoff
+        .canonical_request_digest()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let inner_request_digest = record.receipt_request_digest.clone().ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "committed Store rebind is missing its canonical request digest".to_owned(),
+        )
+    })?;
+    let inner_store_fence = record.receipt_store_fence.clone().ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "committed Store rebind is missing its receipt fence".to_owned(),
+        )
+    })?;
+    if inner_request_digest != record.request_digest
+        || inner_request_digest.as_str() != expected_inner_digest
+        || inner_store_fence != record.store_fence
+    {
+        return Err(HostError::RecoveryRequired(
+            "committed Store rebind receipt is not bound to its canonical request".to_owned(),
+        ));
+    }
+    let inner = StoreRebindReceipt {
+        operation_id: record.operation_id.clone(),
+        request_digest: inner_request_digest.as_str().to_owned(),
+        requirement_digest: record.requirement.as_str().to_owned(),
+        process_binding,
+        candidate_binding_digest: record.candidate_binding_digest.as_str().to_owned(),
+        generation: handoff.generation,
+        authority_epoch: handoff.authority_epoch,
+        store_fence: inner_store_fence.as_str().to_owned(),
+    };
+    inner
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    Ok(inner)
+}
+
 /// Host-owned lifecycle state and installation activation registry.
 #[allow(
     clippy::struct_excessive_bools,
@@ -7465,6 +9143,8 @@ pub struct HostComposition {
     runtime_restarts: std::collections::HashMap<String, HostKernelRestartReceipt>,
     #[cfg(windows)]
     runtime_control_queue: HostRuntimeControlQueue,
+    #[cfg(windows)]
+    store_recovery_startup_fence: StoreRecoveryStartupFence,
     owner_lease: HostOwnerLease,
     pending_record: Option<HostStateRecord>,
     durable_finalized: bool,
@@ -7795,16 +9475,32 @@ impl HostComposition {
                 std::collections::HashMap::new()
             }
         };
+        let durable_store_recovery_fences = {
+            #[cfg(windows)]
+            {
+                load_durable_store_recoveries(&host_state_root)?
+            }
+            #[cfg(not(windows))]
+            {
+                Vec::new()
+            }
+        };
         let journal_path = host_state_root.join(HOST_JOURNAL_FILE_NAME);
-        let (journal, host, activation_generation, activation_id) = open_production_epoch(
-            &journal_path,
-            installation,
-            pending_for_reopen.as_ref(),
-            registry.active_phase_b_rebind(),
-        )?;
+        let (journal, host, activation_generation, activation_id, store_recovery_startup_fence) =
+            open_production_epoch(
+                &journal_path,
+                installation,
+                pending_for_reopen.as_ref(),
+                registry.active_phase_b_rebind(),
+                &durable_store_recovery_fences,
+            )?;
         #[cfg(windows)]
-        let jobs =
-            HostJobBranches::new(&host).map_err(|error| HostError::Platform(error.to_string()))?;
+        let jobs = if store_recovery_startup_fence.is_fenced() {
+            HostJobBranches::new_fenced(&host)
+        } else {
+            HostJobBranches::new(&host)
+        }
+        .map_err(|error| HostError::Platform(error.to_string()))?;
         let mut composition = Self {
             store_rebind_boundary: HostStoreRebindProductionBoundary,
             runtime_control_boundary: HostRuntimeControlProductionBoundary,
@@ -7828,12 +9524,25 @@ impl HostComposition {
             runtime_control_queue: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
+            #[cfg(windows)]
+            store_recovery_startup_fence,
             owner_lease,
             pending_record: None,
             durable_finalized: false,
             owner_released: false,
             shutdown_failed: false,
         };
+        #[cfg(windows)]
+        if composition.store_recovery_startup_fence.is_fenced() {
+            // A durable Store recovery fence is resolved only by the
+            // authenticated ReconcileStoreRecovery route.  The `jobs` value
+            // above is an inert identity holder with no current-process
+            // observation, Job handle, or child; no Phase-B materialization,
+            // child launch, or readiness publication may run before the exact
+            // inner contour is reconstructed.
+            composition.readiness_gate.branch_degraded();
+            return Ok(composition);
+        }
         #[cfg(windows)]
         if let Some(pending) = composition.registry.pending_activation().cloned() {
             if let Some(prepared) = pending.phase_b_prepared.as_ref() {
@@ -7893,6 +9602,15 @@ impl HostComposition {
                 }
             }
         } else if let Some(active) = composition.registry.active().cloned() {
+            if composition.store_recovery_startup_fence.is_fenced() {
+                // A prior Host died while an exact RecoverStore intent was
+                // unresolved. New Job names, PIDs, activation nonce, and Host
+                // epoch cannot satisfy the prior committed inner receipt.
+                // Keep the runtime-control query surface alive, but admit no
+                // Phase-B/process/readiness contour for this fresh owner.
+                composition.readiness_gate.branch_degraded();
+                return Ok(composition);
+            }
             // A committed ActiveVerified fence is source evidence only.  Every
             // Host restart must mint a fresh owner-bound Phase-B rebind before
             // any approved child contour is admitted; destination bytes alone
@@ -7948,6 +9666,15 @@ impl HostComposition {
         intent: &HostPhaseBMaterializationIntent,
         credential_receipt: &CredentialAccessReceipt,
     ) -> HostCredentialControlResponse {
+        if self.store_recovery_startup_fence.is_fenced() {
+            return HostCredentialControlResponse::Unknown {
+                pending_ref: phase_b_unknown_ref(
+                    "store-recovery-fence",
+                    "MaterializePhaseB",
+                    intent,
+                ),
+            };
+        }
         let result = (|| {
             intent
                 .validate()
@@ -8055,6 +9782,11 @@ impl HostComposition {
         intent: &HostPhaseBMaterializationIntent,
         credential_receipt: &CredentialAccessReceipt,
     ) -> HostCredentialControlResponse {
+        if self.store_recovery_startup_fence.is_fenced() {
+            return HostCredentialControlResponse::Unknown {
+                pending_ref: phase_b_unknown_ref("store-recovery-fence", "ReconcilePhaseB", intent),
+            };
+        }
         let result = (|| {
             intent
                 .validate()
@@ -8628,6 +10360,949 @@ impl HostComposition {
         persist_runtime_restart_receipt(self.launch_options.host_state_root(), &receipt)?;
         self.runtime_restarts.insert(key, receipt.clone());
         self.readiness_gate.branch_degraded();
+        Ok(receipt)
+    }
+
+    #[cfg(windows)]
+    pub fn handle_store_recovery_request(
+        &mut self,
+        request: &HostRuntimeControlRequest,
+    ) -> HostRuntimeControlResponse {
+        if request.operation == HostRuntimeControlOperation::ReconcileStoreRecovery {
+            return self.reconcile_store_recovery_request(request);
+        }
+        if self.store_recovery_startup_fence.is_fenced() {
+            return HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref(STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON, request),
+            );
+        }
+        if self
+            .owner_lease
+            .activation_capability()
+            .live_guard()
+            .is_err()
+        {
+            return HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("store-recovery", request),
+            );
+        }
+        let result = self.execute_store_recovery(request);
+        match result {
+            Ok(receipt) => HostRuntimeControlResponse::store_recovered_for(request, receipt),
+            Err(_error) => HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("store-recovery", request),
+            ),
+        }
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_committed_store_recovery(
+        &mut self,
+        request: &HostRuntimeControlRequest,
+    ) -> Result<Option<HostStoreRecoveryReceipt>, HostError> {
+        if self.store_recovery_startup_fence.is_fenced()
+            && request.operation != HostRuntimeControlOperation::ReconcileStoreRecovery
+        {
+            return Err(HostError::RecoveryRequired(
+                "RecoverStore cannot bypass an unresolved startup fence; reconcile is required"
+                    .to_owned(),
+            ));
+        }
+        let key = request.mutation_digest.as_str().to_owned();
+        let pending = read_store_recovery_pending_identity(&store_recovery_pending_path(
+            self.launch_options.host_state_root(),
+            &key,
+        ))?;
+        let Some(pending) = pending else {
+            // A committed inner rebind is only admissible for the exact outer
+            // recovery intent.  Without that intent this is an unrelated
+            // destination observation, not proof for this request.
+            return Ok(None);
+        };
+        pending.validate_current_request(request)?;
+        if pending.host_epoch != self.host.epoch.current.sequence
+            || pending.host_lineage != self.host.epoch.current.lineage.as_str()
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery pending identity belongs to another live Host epoch".to_owned(),
+            ));
+        }
+        let termination =
+            read_store_recovery_termination_evidence(self.launch_options.host_state_root(), &key)?
+                .ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Store recovery has no durable exact termination evidence".to_owned(),
+                    )
+                })?;
+        termination.validate_for_pending(&pending)?;
+        let inner_binding =
+            read_store_recovery_inner_binding(self.launch_options.host_state_root(), &key)?
+                .ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Store recovery has no durable canonical inner request binding".to_owned(),
+                    )
+                })?;
+        inner_binding.validate_for_pending(&pending, &termination)?;
+
+        let snapshot = self.journal.snapshot()?;
+        let kernel = snapshot.kernel.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery reconciliation has no durable Kernel record".to_owned(),
+            )
+        })?;
+        if kernel.state != KernelActivationState::Active
+            || kernel.one_time_nonce.state() != NonceState::Consumed
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery reconciliation requires the unchanged Active Kernel contour"
+                    .to_owned(),
+            ));
+        }
+        let candidate = self.jobs.kernel_candidate.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery reconciliation has no retained Kernel candidate".to_owned(),
+            )
+        })?;
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let candidate_authority_epoch = candidate.kernel_epoch;
+        let launch = self.jobs.launch.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery reconciliation has no runtime launch descriptor".to_owned(),
+            )
+        })?;
+        let active_fence =
+            record_fence(&self.host, &self.activation_id, &self.activation_generation);
+        let mut committed = snapshot.store_rebinds.iter().filter(|record| {
+            record.state == StoreRebindState::Committed
+                && record.operation_id.as_str() == inner_binding.store_rebind_operation_id
+                && record.request_digest.as_str() == inner_binding.store_rebind_request_digest
+                && record.fence == active_fence
+                && record.generation == launch.authority_generation.value()
+                && record.authority_epoch == candidate_authority_epoch.value()
+                && record.candidate_binding_digest.as_str() == candidate_digest
+        });
+        let Some(record) = committed.next() else {
+            return Ok(None);
+        };
+        if committed.next().is_some() {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery reconciliation found multiple committed inner rebinds".to_owned(),
+            ));
+        }
+        if record.process_id == termination.process_id
+            && record.process_start_time_100ns == termination.process_start_time_100ns
+            && record.process_image_path.as_str() == termination.process_image_path
+            && record.job_name.as_str() == termination.job_name
+        {
+            return Err(HostError::RecoveryRequired(
+                "committed Store rebind points at the terminated predecessor".to_owned(),
+            ));
+        }
+
+        let requirement = self
+            .jobs
+            .store_bootstrap_requirement
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Store recovery reconciliation has no retained Store requirement".to_owned(),
+                )
+            })?;
+        let inner = committed_store_rebind_receipt(record, requirement, &candidate_digest)?;
+        if inner.request_digest != inner_binding.store_rebind_request_digest {
+            return Err(HostError::RecoveryRequired(
+                "committed Store rebind differs from the durable inner request binding".to_owned(),
+            ));
+        }
+        let live_store = self.jobs.store.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery reconciliation has no relaunched Store process".to_owned(),
+            )
+        })?;
+        let live_process = live_store.evidence().process();
+        if live_process.process_id != inner.process_binding.process.process_id
+            || live_process.start_time_100ns != inner.process_binding.process.start_time_100ns
+            || live_process.image_path != inner.process_binding.process.image_path
+            || live_store.job_identity().name() != inner.process_binding.job.as_str()
+            || !live_store
+                .job_processes()
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+                .iter()
+                .any(|observed| observed == live_process)
+        {
+            return Err(HostError::RecoveryRequired(
+                "live Store process/Job does not match the committed inner rebind".to_owned(),
+            ));
+        }
+        let active = self.registry.active().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery reconciliation has no active approved generation".to_owned(),
+            )
+        })?;
+        let phase_b = self.phase_b.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery reconciliation has no current Phase-B materialization".to_owned(),
+            )
+        })?;
+        let launch = self.jobs.launch.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery reconciliation has no retained launch descriptor".to_owned(),
+            )
+        })?;
+        let launch_authority_generation = launch.authority_generation;
+        if self.jobs.approved_generation.as_ref() != Some(&active.manifest.generation)
+            || phase_b.manifest_digest != phase_b_manifest_digest(&active.manifest)?
+            || &phase_b.launch != launch
+            || self.jobs.config_digest.as_ref() != Some(&phase_b.config_file_digest)
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery generation/config/Phase-B binding is stale".to_owned(),
+            ));
+        }
+        let config_lease = self.jobs.config_lease.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired("Store recovery has no retained config lease".to_owned())
+        })?;
+        config_lease.verify().map_err(HostError::RecoveryRequired)?;
+        verify_launch_digest(config_lease, &phase_b.config_file_digest, "runtime.config")?;
+        let store_lease = self.jobs.store_lease.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery has no retained Store image lease".to_owned(),
+            )
+        })?;
+        store_lease.verify().map_err(HostError::RecoveryRequired)?;
+        verify_launch_digest(
+            store_lease,
+            &launch.store_bridge_artifact_digest,
+            "runtime.store_artifact",
+        )?;
+        let eliotd_config_lease = self.jobs.eliotd_config_lease.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery has no retained eliotd config lease".to_owned(),
+            )
+        })?;
+        eliotd_config_lease
+            .verify()
+            .map_err(HostError::RecoveryRequired)?;
+        verify_launch_digest(
+            eliotd_config_lease,
+            &launch.eliotd_config_digest,
+            "runtime.eliotd_config",
+        )?;
+        let eliotd_descriptor_lease =
+            self.jobs.eliotd_descriptor_lease.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Store recovery has no retained eliotd descriptor lease".to_owned(),
+                )
+            })?;
+        eliotd_descriptor_lease
+            .verify()
+            .map_err(HostError::RecoveryRequired)?;
+        verify_launch_digest(
+            eliotd_descriptor_lease,
+            &launch.eliotd_descriptor_digest,
+            "runtime.eliotd_descriptor",
+        )?;
+        validate_eliotd_launch_descriptor(
+            eliotd_descriptor_lease,
+            &launch.eliotd_descriptor_digest,
+            launch,
+        )?;
+        let generation_handle = self.jobs.approved_generation.clone().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery reconciliation has no approved generation".to_owned(),
+            )
+        })?;
+        let readiness_contour = self.persist_fresh_authenticated_readiness(&generation_handle)?;
+        let readiness_observation = self
+            .journal
+            .snapshot()?
+            .readiness_observations
+            .last()
+            .cloned()
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "fresh Kernel ProbeReady did not produce a readiness observation".to_owned(),
+                )
+            })?;
+        let store_fence = PlatformHandle::new(inner.store_fence.clone())
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let config_digest = self.jobs.config_digest.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery reconciliation has no materialized config digest".to_owned(),
+            )
+        })?;
+        if readiness_contour.store_proof_fence.as_ref() != Some(&store_fence)
+            || readiness_observation.store_fence != store_fence
+            || readiness_observation.config_digest != *config_digest
+        {
+            return Err(HostError::RecoveryRequired(
+                "fresh readiness observation is not bound to the committed Store rebind".to_owned(),
+            ));
+        }
+        let kernel_generation = kernel.kernel_generation.clone();
+        let kernel_generation_digest = PlatformHandle::new(sha256_json(&kernel_generation)?)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let activation_receipt = self
+            .jobs
+            .kernel_activation_receipt
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "durable Kernel activation receipt is missing during Store reconciliation"
+                        .to_owned(),
+                )
+            })?;
+        if activation_receipt.candidate_binding_digest != candidate_digest
+            || activation_receipt.generation != launch_authority_generation
+            || activation_receipt.authority_epoch != candidate_authority_epoch
+        {
+            return Err(HostError::RecoveryRequired(
+                "Kernel consumed-nonce receipt is not bound to the durable Active candidate"
+                    .to_owned(),
+            ));
+        }
+        let activation_nonce_digest =
+            PlatformHandle::new(activation_receipt.activation_nonce_digest.clone())
+                .map_err(|error| HostError::Platform(error.to_string()))?;
+        let new_store_process_id = PlatformHandle::new(format!(
+            "pid:{}:start:{}",
+            inner.process_binding.process.process_id,
+            inner.process_binding.process.start_time_100ns
+        ))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+        let mut receipt = HostStoreRecoveryReceipt {
+            external_control_mutation_digest: request.mutation_digest.clone(),
+            request_digest: pending.recover_request()?.request_digest,
+            store_rebind_request_digest: PlatformHandle::new(inner.request_digest.clone())
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            store_fence,
+            new_store_process_id,
+            kernel_generation: kernel_generation_digest,
+            activation_nonce_digest,
+            ready_receipt_digest: readiness_observation.ready_receipt_digest.clone(),
+            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+        };
+        receipt.receipt_digest = receipt.computed_digest().map_err(HostError::Platform)?;
+        receipt.validate().map_err(HostError::Platform)?;
+        persist_store_recovery_receipt(self.launch_options.host_state_root(), &receipt)?;
+        if !self.readiness_gate.grant(readiness_contour, Instant::now()) {
+            return Err(HostError::RecoveryRequired(
+                "fresh Store readiness did not produce an admissible lease".to_owned(),
+            ));
+        }
+        if self.store_recovery_startup_fence.is_fenced() {
+            // Receipt publication and supporting-evidence removal form the
+            // durable resolution boundary.  The in-memory fence is cleared
+            // only after both exact receipt readback and no-replace cleanup
+            // succeed; any failure leaves Unknown and blocks admission.
+            cleanup_store_recovery_supporting_evidence_for(
+                self.launch_options.host_state_root(),
+                request.mutation_digest.as_str(),
+            )?;
+            let remaining = self
+                .store_recovery_startup_fence
+                .bindings()
+                .iter()
+                .filter(|binding| binding.mutation_digest != request.mutation_digest.as_str())
+                .cloned()
+                .collect::<Vec<_>>();
+            self.store_recovery_startup_fence = if remaining.is_empty() {
+                StoreRecoveryStartupFence::Clear
+            } else {
+                StoreRecoveryStartupFence::Unresolved(remaining)
+            };
+        }
+        let response_receipt =
+            if request.operation == HostRuntimeControlOperation::ReconcileStoreRecovery {
+                rebind_store_recovery_receipt(&receipt, request)?
+            } else {
+                receipt
+            };
+        Ok(Some(response_receipt))
+    }
+
+    /// A receipt-only retry is valid only while this exact Host still owns
+    /// the committed Store contour.  The file is response-loss evidence, not
+    /// authority: after Host death the kill-on-close Job is gone, a fresh Host
+    /// epoch has a different fence, and this check must refuse positive
+    /// adoption even if the receipt file remains on disk.
+    #[cfg(windows)]
+    fn store_recovery_receipt_matches_current_contour(
+        &self,
+        receipt: &HostStoreRecoveryReceipt,
+    ) -> Result<bool, HostError> {
+        let snapshot = self.journal.snapshot()?;
+        let active_fence =
+            record_fence(&self.host, &self.activation_id, &self.activation_generation);
+        let mut committed = snapshot.store_rebinds.iter().filter(|record| {
+            record.state == StoreRebindState::Committed
+                && record.fence == active_fence
+                && record.request_digest == receipt.store_rebind_request_digest
+                && record.receipt_request_digest.as_ref()
+                    == Some(&receipt.store_rebind_request_digest)
+                && record.receipt_store_fence.as_ref() == Some(&receipt.store_fence)
+                && record.store_fence == receipt.store_fence
+        });
+        let Some(record) = committed.next() else {
+            return Ok(false);
+        };
+        if committed.next().is_some() {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery receipt matches multiple current committed rebinds".to_owned(),
+            ));
+        }
+        let Some(store) = self.jobs.store.as_ref() else {
+            return Ok(false);
+        };
+        let process = store.evidence().process();
+        let process_identity = format!(
+            "pid:{}:start:{}",
+            process.process_id, process.start_time_100ns
+        );
+        if receipt.new_store_process_id.as_str() != process_identity
+            || record.process_id != process.process_id
+            || record.process_start_time_100ns != process.start_time_100ns
+            || record.process_image_path.as_str() != process.image_path
+            || record.job_name.as_str() != store.job_identity().name()
+        {
+            return Ok(false);
+        }
+        if !store
+            .job_processes()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+            .iter()
+            .any(|observed| observed == process)
+        {
+            return Ok(false);
+        }
+        Ok(snapshot.readiness_observations.iter().any(|observation| {
+            observation.fence == active_fence
+                && observation.store_fence == receipt.store_fence
+                && observation.ready_receipt_digest == receipt.ready_receipt_digest
+        }))
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_lines)]
+    pub fn reconcile_store_recovery_request(
+        &mut self,
+        request: &HostRuntimeControlRequest,
+    ) -> HostRuntimeControlResponse {
+        if self
+            .owner_lease
+            .activation_capability()
+            .live_guard()
+            .is_err()
+        {
+            return HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("store-recovery-reconcile", request),
+            );
+        }
+        if request.validate().is_err()
+            || request.operation != HostRuntimeControlOperation::ReconcileStoreRecovery
+        {
+            return HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("store-recovery-reconcile", request),
+            );
+        }
+        if self.store_recovery_startup_fence.is_fenced() {
+            return HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref(STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON, request),
+            );
+        }
+        let key = request.mutation_digest.as_str().to_owned();
+        match self.reconcile_committed_store_recovery(request) {
+            Ok(Some(receipt)) => {
+                return HostRuntimeControlResponse::store_recovered_for(request, receipt);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return HostRuntimeControlResponse::unknown_for(
+                    request,
+                    runtime_control_unknown_ref("store-recovery-reconcile-unknown", request),
+                );
+            }
+        }
+        match has_store_recovery_pending(self.launch_options.host_state_root(), &key) {
+            Ok(true) => {
+                return HostRuntimeControlResponse::unknown_for(
+                    request,
+                    runtime_control_unknown_ref("store-recovery-pending", request),
+                );
+            }
+            Err(_) => {
+                return HostRuntimeControlResponse::unknown_for(
+                    request,
+                    runtime_control_unknown_ref("store-recovery-reconcile-snapshot", request),
+                );
+            }
+            Ok(false) => {}
+        }
+        // Once the exact supporting evidence has been removed, the durable
+        // outer receipt can answer response loss only after the current Host
+        // journal, live Store Job/process, and readiness observation prove
+        // that this same process still owns the contour. It is never adopted
+        // after Host death.
+        match read_store_recovery_receipt(self.launch_options.host_state_root(), &key) {
+            Ok(Some(receipt)) => {
+                match self.store_recovery_receipt_matches_current_contour(&receipt) {
+                    Ok(true) => match rebind_store_recovery_receipt(&receipt, request) {
+                        Ok(rebound) => {
+                            return HostRuntimeControlResponse::store_recovered_for(
+                                request, rebound,
+                            );
+                        }
+                        Err(_) => {
+                            return HostRuntimeControlResponse::unknown_for(
+                                request,
+                                runtime_control_unknown_ref(
+                                    "store-recovery-reconcile-conflict",
+                                    request,
+                                ),
+                            );
+                        }
+                    },
+                    Ok(false) => {
+                        return HostRuntimeControlResponse::unknown_for(
+                            request,
+                            runtime_control_unknown_ref(
+                                STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON,
+                                request,
+                            ),
+                        );
+                    }
+                    Err(_) => {
+                        return HostRuntimeControlResponse::unknown_for(
+                            request,
+                            runtime_control_unknown_ref(
+                                "store-recovery-reconcile-snapshot",
+                                request,
+                            ),
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return HostRuntimeControlResponse::unknown_for(
+                    request,
+                    runtime_control_unknown_ref("store-recovery-reconcile-snapshot", request),
+                );
+            }
+        }
+        let active_fence =
+            record_fence(&self.host, &self.activation_id, &self.activation_generation);
+        match self.journal.snapshot() {
+            Ok(snapshot) => {
+                if snapshot.store_rebinds.iter().any(|r| {
+                    r.fence == active_fence
+                        && matches!(
+                            r.state,
+                            StoreRebindState::Pending | StoreRebindState::Unknown
+                        )
+                }) {
+                    return HostRuntimeControlResponse::unknown_for(
+                        request,
+                        runtime_control_unknown_ref("store-recovery-pending", request),
+                    );
+                }
+            }
+            Err(_) => {
+                return HostRuntimeControlResponse::unknown_for(
+                    request,
+                    runtime_control_unknown_ref("store-recovery-reconcile-snapshot", request),
+                );
+            }
+        }
+        HostRuntimeControlResponse::unknown_for(
+            request,
+            runtime_control_unknown_ref("store-recovery-reconcile-unknown", request),
+        )
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_lines)]
+    fn execute_store_recovery(
+        &mut self,
+        request: &HostRuntimeControlRequest,
+    ) -> Result<HostStoreRecoveryReceipt, HostError> {
+        request.validate().map_err(HostError::ProcessContour)?;
+        if request.operation != HostRuntimeControlOperation::RecoverStore {
+            return Err(HostError::ProcessContour(
+                "unsupported runtime-control operation for store recovery".to_owned(),
+            ));
+        }
+        let key = request.mutation_digest.as_str().to_owned();
+        if let Some(receipt) = self.reconcile_committed_store_recovery(request)? {
+            return Ok(receipt);
+        }
+        if has_store_recovery_pending(self.launch_options.host_state_root(), &key)? {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery intent is pending and outcome is unknown; reconcile required"
+                    .to_owned(),
+            ));
+        }
+        if read_store_recovery_termination_evidence(self.launch_options.host_state_root(), &key)?
+            .is_some()
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store termination evidence is retained without a receipt; reconcile required"
+                    .to_owned(),
+            ));
+        }
+        if let Some(receipt) =
+            read_store_recovery_receipt(self.launch_options.host_state_root(), &key)?
+        {
+            if receipt.request_digest == request.request_digest
+                && self.store_recovery_receipt_matches_current_contour(&receipt)?
+            {
+                return Ok(receipt);
+            }
+            return Err(HostError::RecoveryRequired(
+                "durable Store recovery receipt is not bound to this live Host contour; manual new-lineage recovery is required".to_owned(),
+            ));
+        }
+        let active_fence =
+            record_fence(&self.host, &self.activation_id, &self.activation_generation);
+        if self.journal.snapshot()?.store_rebinds.iter().any(|r| {
+            r.fence == active_fence
+                && matches!(
+                    r.state,
+                    StoreRebindState::Pending | StoreRebindState::Unknown
+                )
+        }) {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery journal intent is pending; reconcile required".to_owned(),
+            ));
+        }
+        self.ensure_admission_open()?;
+        if self.jobs.store_restart_attempts >= 1 {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery restart budget is exhausted; reconcile required".to_owned(),
+            ));
+        }
+        // A recovery intent is itself a state mutation. Invalidate the
+        // current lease before publishing it so no caller can observe the
+        // old Healthy contour while Store recovery is being committed.
+        self.readiness_gate.branch_degraded();
+        let capability = self.owner_lease.activation_capability();
+        let guard = capability
+            .live_guard()
+            .map_err(|e| HostError::Platform(e.to_string()))?;
+        if persist_store_recovery_pending(
+            self.launch_options.host_state_root(),
+            request,
+            &self.host,
+        )? == StoreRecoveryPendingPublication::Replay
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store recovery intent is already pending; reconcile required".to_owned(),
+            ));
+        }
+        drop(guard);
+        let snapshot_before = self.journal.snapshot()?;
+        let kernel_before = snapshot_before.kernel.clone().ok_or_else(|| {
+            HostError::ProcessContour("no active Kernel for store recovery".to_owned())
+        })?;
+        if kernel_before.state != KernelActivationState::Active {
+            return Err(HostError::ProcessContour(
+                "Kernel is not Active; store recovery requires Active".to_owned(),
+            ));
+        }
+        let host_epoch_before = self.host.epoch.clone();
+        let kernel_generation_before = kernel_before.kernel_generation.clone();
+        let activation_nonce_before = kernel_before.one_time_nonce.clone();
+        let kernel_process_before = kernel_before.process.clone().ok_or_else(|| {
+            HostError::ProcessContour("Kernel process missing before store recovery".to_owned())
+        })?;
+        let kernel_job_before = kernel_before.candidate_job_binding.clone().ok_or_else(|| {
+            HostError::ProcessContour("Kernel job missing before store recovery".to_owned())
+        })?;
+        let old_store = self.jobs.store.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("Store process missing before recovery".to_owned())
+        })?;
+        let old_proc = old_store.evidence().process().clone();
+        if old_proc.process_id == 0
+            || old_proc.start_time_100ns == 0
+            || old_proc.image_path.is_empty()
+        {
+            return Err(HostError::ProcessContour(
+                "old Store PID/start/image invalid before containment".to_owned(),
+            ));
+        }
+        let old_job_name = old_store.job_identity().name().to_owned();
+        if old_job_name.trim().is_empty() {
+            return Err(HostError::ProcessContour(
+                "old Store Job name missing before containment".to_owned(),
+            ));
+        }
+        let members = old_store
+            .job_processes()
+            .map_err(|e| HostError::ProcessContour(e.to_string()))?;
+        if !members.iter().any(|m| m == &old_proc) {
+            return Err(HostError::ProcessContour(
+                "old Store Job does not contain exact process before relaunch".to_owned(),
+            ));
+        }
+        self.jobs.store_restart_attempts = self
+            .jobs
+            .store_restart_attempts
+            .checked_add(1)
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Store recovery restart attempt counter overflowed".to_owned(),
+                )
+            })?;
+        let terminated_store = {
+            let store_mut = self.jobs.store.as_mut().ok_or_else(|| {
+                HostError::ProcessContour("Store Job is missing before termination".to_owned())
+            })?;
+            store_mut
+                .terminate_in_place(0xE017_0002)
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+        };
+        if !terminated_store.job_empty() || !terminated_store.root_reaped() {
+            return Err(HostError::RecoveryRequired(
+                "Store termination did not produce job-empty/root-reaped evidence".to_owned(),
+            ));
+        }
+        persist_store_recovery_termination_evidence(
+            self.launch_options.host_state_root(),
+            request,
+            &self.host,
+            &terminated_store,
+            &old_job_name,
+        )?;
+        let termination =
+            read_store_recovery_termination_evidence(self.launch_options.host_state_root(), &key)?
+                .ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Store termination evidence disappeared before relaunch".to_owned(),
+                    )
+                })?;
+        let pending = read_store_recovery_pending_identity(&store_recovery_pending_path(
+            self.launch_options.host_state_root(),
+            &key,
+        ))?
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Store recovery intent disappeared after termination".to_owned(),
+            )
+        })?;
+        pending.validate_current_request(request)?;
+        termination.validate_for_pending(&pending)?;
+        if termination.process_id != old_proc.process_id
+            || termination.process_start_time_100ns != old_proc.start_time_100ns
+            || termination.process_image_path != old_proc.image_path
+            || termination.job_name != old_job_name
+            || !termination.job_empty
+            || !termination.root_reaped
+            || termination.restart_attempt != 1
+        {
+            return Err(HostError::RecoveryRequired(
+                "Store termination evidence does not match the contained Store".to_owned(),
+            ));
+        }
+        self.jobs.store.take();
+        let generation =
+            self.jobs.approved_generation.clone().ok_or_else(|| {
+                HostError::ProcessContour("approved generation missing".to_owned())
+            })?;
+        let config_digest = self
+            .jobs
+            .config_digest
+            .clone()
+            .ok_or_else(|| HostError::ProcessContour("config digest missing".to_owned()))?;
+        let config_path = self
+            .jobs
+            .config_path
+            .clone()
+            .ok_or_else(|| HostError::ProcessContour("config path missing".to_owned()))?;
+        let store_artifact = self
+            .jobs
+            .store_artifact_digest
+            .clone()
+            .ok_or_else(|| HostError::ProcessContour("store artifact missing".to_owned()))?;
+        let approved_store_path = PlatformHandle::new(
+            self.jobs
+                .store_bridge_executable
+                .as_ref()
+                .ok_or_else(|| HostError::ProcessContour("store image missing".to_owned()))?
+                .to_string_lossy()
+                .to_string(),
+        )
+        .map_err(|e| HostError::Platform(e.to_string()))?;
+        let approved_config_path = PlatformHandle::new(config_path.to_string_lossy().to_string())
+            .map_err(|e| HostError::Platform(e.to_string()))?;
+        let new_child = self.jobs.relaunch_store(
+            &generation,
+            &config_digest,
+            &config_path,
+            &store_artifact,
+            &approved_store_path,
+            &approved_config_path,
+            &self.host,
+        )?;
+        self.jobs.store = Some(new_child);
+        let (new_proc, new_store_job_name) = {
+            let new_store = self.jobs.store.as_ref().unwrap();
+            let new_proc = new_store.evidence().process().clone();
+            if new_proc == old_proc {
+                return Err(HostError::ProcessContour(
+                    "relaunched Store reused the terminated PID/start/image contour".to_owned(),
+                ));
+            }
+            if !new_store
+                .job_processes()
+                .map_err(|e| HostError::ProcessContour(e.to_string()))?
+                .iter()
+                .any(|m| m == &new_proc)
+            {
+                return Err(HostError::ProcessContour(
+                    "new Store Job does not contain exact relaunched process".to_owned(),
+                ));
+            }
+            match new_store
+                .observe()
+                .map_err(|e| HostError::ProcessContour(e.to_string()))?
+            {
+                eliot_platform_windows::RunningJobObservation::Running { active_processes }
+                    if active_processes > 0 => {}
+                _ => {
+                    return Err(HostError::ProcessContour(
+                        "new Store Job is not live after relaunch".to_owned(),
+                    ));
+                }
+            }
+            (new_proc, new_store.job_identity().name().to_owned())
+        };
+        let snapshot_after_relaunch = self.journal.snapshot()?;
+        let kernel_after = snapshot_after_relaunch.kernel.clone().ok_or_else(|| {
+            HostError::ProcessContour("Kernel missing after store relaunch".to_owned())
+        })?;
+        if kernel_after.kernel_generation != kernel_generation_before {
+            return Err(HostError::ProcessContour(
+                "Kernel generation changed during store-only recovery".to_owned(),
+            ));
+        }
+        if kernel_after.process != Some(kernel_process_before.clone()) {
+            return Err(HostError::ProcessContour(
+                "Kernel process changed during store-only recovery".to_owned(),
+            ));
+        }
+        if kernel_after.candidate_job_binding != Some(kernel_job_before.clone()) {
+            return Err(HostError::ProcessContour(
+                "Kernel job changed during store-only recovery".to_owned(),
+            ));
+        }
+        if kernel_after.one_time_nonce != activation_nonce_before {
+            return Err(HostError::ProcessContour(
+                "Kernel activation nonce changed during store-only recovery".to_owned(),
+            ));
+        }
+        if snapshot_after_relaunch.host.epoch != host_epoch_before {
+            return Err(HostError::ProcessContour(
+                "Host epoch changed during store-only recovery".to_owned(),
+            ));
+        }
+        let store_rebind_receipt = self.jobs.rebind_store_control(
+            &generation,
+            &self.journal,
+            &self.host,
+            &self.activation_id,
+            &self.activation_generation,
+            Some((self.launch_options.host_state_root(), request)),
+        )?;
+        store_rebind_receipt
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let approved_config = config_digest.clone();
+        let readiness_contour = self.persist_fresh_authenticated_readiness(&generation)?;
+        let readiness_observation = self
+            .journal
+            .snapshot()?
+            .readiness_observations
+            .last()
+            .cloned()
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "fresh Kernel ProbeReady did not produce a journal observation".to_owned(),
+                )
+            })?;
+        let store_fence = store_rebind_receipt.store_fence.clone();
+        let store_fence_handle = PlatformHandle::new(store_fence.clone())
+            .map_err(|e| HostError::Platform(e.to_string()))?;
+        if readiness_contour.store_proof_fence.as_ref() != Some(&store_fence_handle)
+            || readiness_observation.store_fence != store_fence_handle
+            || readiness_observation.config_digest != approved_config
+        {
+            return Err(HostError::ProcessContour(
+                "fresh readiness observation is not bound to the authoritative Store rebind"
+                    .to_owned(),
+            ));
+        }
+        let rebound_process = &store_rebind_receipt.process_binding.process;
+        if rebound_process.process_id != new_proc.process_id
+            || rebound_process.start_time_100ns != new_proc.start_time_100ns
+            || rebound_process.image_path != new_proc.image_path
+            || store_rebind_receipt.process_binding.job.as_str() != new_store_job_name
+        {
+            return Err(HostError::ProcessContour(
+                "authoritative Store rebind receipt changed the relaunched process".to_owned(),
+            ));
+        }
+        let new_store_pid_handle = PlatformHandle::new(format!(
+            "pid:{}:start:{}",
+            rebound_process.process_id, rebound_process.start_time_100ns
+        ))
+        .map_err(|e| HostError::Platform(e.to_string()))?;
+        let kernel_gen_handle = PlatformHandle::new(sha256_json(&kernel_generation_before)?)
+            .map_err(|e| HostError::Platform(e.to_string()))?;
+        let activation_nonce_digest = PlatformHandle::new(
+            self.jobs
+                .kernel_activation_receipt
+                .as_ref()
+                .ok_or_else(|| {
+                    HostError::ProcessContour(
+                        "durable Kernel activation receipt is missing after ProbeReady".to_owned(),
+                    )
+                })?
+                .activation_nonce_digest
+                .clone(),
+        )
+        .map_err(|e| HostError::Platform(e.to_string()))?;
+        let ready_digest = readiness_observation.ready_receipt_digest.clone();
+        let mut receipt = HostStoreRecoveryReceipt {
+            external_control_mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            store_rebind_request_digest: PlatformHandle::new(
+                store_rebind_receipt.request_digest.clone(),
+            )
+            .map_err(|e| HostError::Platform(e.to_string()))?,
+            store_fence: store_fence_handle,
+            new_store_process_id: new_store_pid_handle,
+            kernel_generation: kernel_gen_handle,
+            activation_nonce_digest,
+            ready_receipt_digest: ready_digest,
+            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+        };
+        receipt.receipt_digest = receipt.computed_digest().map_err(HostError::Platform)?;
+        receipt.validate().map_err(HostError::Platform)?;
+        persist_store_recovery_receipt(self.launch_options.host_state_root(), &receipt)?;
+        if !self.readiness_gate.grant(readiness_contour, Instant::now()) {
+            return Err(HostError::ProcessContour(
+                "fresh Store readiness did not produce an admissible lease".to_owned(),
+            ));
+        }
         Ok(receipt)
     }
 
@@ -11313,6 +13988,7 @@ impl HostComposition {
                 &self.host,
                 &self.activation_id,
                 &self.activation_generation,
+                None,
             ) {
                 if matches!(error, HostError::Journal(_)) {
                     self.readiness_gate.fail(
@@ -11630,7 +14306,8 @@ impl HostComposition {
     /// Returns an error if the durable Host state cannot be loaded.
     pub fn has_durable_branch_fence(&self) -> Result<bool, HostError> {
         let state = self.snapshot()?;
-        Ok(self.pending_record.is_some()
+        Ok(self.store_recovery_startup_fence.is_fenced()
+            || self.pending_record.is_some()
             || state.activation.as_ref().is_some_and(|activation| {
                 matches!(
                     activation.state,
@@ -11679,6 +14356,12 @@ impl HostComposition {
         if !self.running {
             return Err(HostError::Stopped);
         }
+        #[cfg(windows)]
+        if self.store_recovery_startup_fence.is_fenced() {
+            return Err(HostError::OwnerLeaseRecovery(
+                "crashed Store recovery fence blocks fresh admission".to_owned(),
+            ));
+        }
         if self.pending_record.is_some() || self.shutdown_failed {
             return Err(HostError::OwnerLeaseRecovery(
                 "durable Host release/recovery is still pending".to_owned(),
@@ -11701,6 +14384,15 @@ impl HostComposition {
     pub fn stop(&mut self) -> Result<(), HostError> {
         if !self.running {
             return Err(HostError::Stopped);
+        }
+        #[cfg(windows)]
+        if self.store_recovery_startup_fence.is_fenced() {
+            self.readiness_gate.branch_degraded();
+            self.shutdown_failed = true;
+            return Err(HostError::RecoveryRequired(
+                "crashed Store recovery remains Unknown; clean shutdown cannot erase its fence"
+                    .to_owned(),
+            ));
         }
         self.resume_pending_record()?;
         if !self.durable_finalized {
@@ -11801,6 +14493,10 @@ impl HostComposition {
             {
                 self.transition_activation(ActivationState::StoppedClean, "host-stopped-clean")?;
             }
+            #[cfg(windows)]
+            cleanup_completed_store_recovery_supporting_evidence(
+                self.launch_options.host_state_root(),
+            )?;
             let state = self.journal.snapshot()?;
             let marker = clean_marker_record(
                 &state,
@@ -12982,6 +15678,56 @@ mod journal_tests {
         );
         let error_digest = sha256_json(&"injected-failure").unwrap();
         assert!(!pending_ref.as_str().contains(&error_digest));
+    }
+
+    #[test]
+    fn store_termination_evidence_requires_complete_single_attempt() {
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("termination-evidence-request").unwrap(),
+        )
+        .unwrap();
+        let mut evidence = StoreRecoveryTerminationEvidence {
+            wire: "eliot.host.runtime-control.v2".to_owned(),
+            operation: HostRuntimeControlOperation::RecoverStore,
+            request_id: request.request_id.as_str().to_owned(),
+            mutation_digest: request.mutation_digest.as_str().to_owned(),
+            request_digest: request.request_digest.as_str().to_owned(),
+            host_epoch: 1,
+            host_lineage: "termination-lineage".to_owned(),
+            process_id: 42,
+            process_start_time_100ns: 7,
+            process_image_path: r"C:\eliot\store.exe".to_owned(),
+            job_name: r"Local\Eliot-Store".to_owned(),
+            job_empty: true,
+            root_reaped: true,
+            restart_attempt: 1,
+        };
+        assert!(
+            evidence
+                .validate_for_digest(request.mutation_digest.as_str())
+                .is_ok()
+        );
+        evidence.job_empty = false;
+        assert!(
+            evidence
+                .validate_for_digest(request.mutation_digest.as_str())
+                .is_err()
+        );
+        evidence.job_empty = true;
+        evidence.root_reaped = false;
+        assert!(
+            evidence
+                .validate_for_digest(request.mutation_digest.as_str())
+                .is_err()
+        );
+        evidence.root_reaped = true;
+        evidence.restart_attempt = 2;
+        assert!(
+            evidence
+                .validate_for_digest(request.mutation_digest.as_str())
+                .is_err()
+        );
     }
 
     #[cfg(windows)]
@@ -14460,8 +17206,10 @@ mod journal_tests {
             .fence
             .activation_generation
             .clone();
-        let (reopened, reopened_host, reopened_generation) =
-            reopen_existing_epoch(fixture.journal, &last_host, &installation, None, None).unwrap();
+        let (reopened, reopened_host, reopened_generation, store_recovery_fenced) =
+            reopen_existing_epoch(fixture.journal, &last_host, &installation, None, None, &[])
+                .unwrap();
+        assert!(!store_recovery_fenced.is_fenced());
         assert_ne!(reopened_host, last_host);
         assert_eq!(
             reopened_host.epoch.parent,
@@ -14501,7 +17249,7 @@ mod journal_tests {
             "unexpected fault result: {append_result:?}"
         );
         assert!(matches!(
-            reopen_existing_epoch(journal, &host, &host.installation, None, None,),
+            reopen_existing_epoch(journal, &host, &host.installation, None, None, &[],),
             Err(HostError::Journal(JournalError::OutcomeUnknown { .. }))
         ));
     }
@@ -14549,12 +17297,13 @@ mod journal_tests {
             prepared: None,
             receipt: None,
         };
-        let (_, reopened_host, _) = reopen_existing_epoch(
+        let (_, reopened_host, _, _) = reopen_existing_epoch(
             fixture.journal,
             &last_host,
             &installation,
             None,
             Some(&rebind),
+            &[],
         )
         .unwrap();
         assert_ne!(reopened_host, last_host);
@@ -15441,6 +18190,211 @@ mod journal_tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression drives the real redb reopen path with exact outer, termination, and inner durable records"
+    )]
+    fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_epoch() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-store-recovery-open-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let journal_path = root.join(HOST_JOURNAL_FILE_NAME);
+        let host = fresh_host_epoch(
+            PlatformHandle::new("store-recovery-physical-installation").unwrap(),
+            None,
+        )
+        .unwrap();
+        let activation_generation =
+            root_epoch(fresh_identity("store-recovery-physical-generation").unwrap());
+        let activation_id = fresh_identity("store-recovery-physical-activation").unwrap();
+        let backend =
+            RedbJournalBackend::open_unprotected_for_integration_test(&journal_path).unwrap();
+        let journal = HostStateJournalService::from_backend(backend, host.clone()).unwrap();
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(
+                initial_activation_record(
+                    &host,
+                    &activation_id,
+                    &activation_generation,
+                    ActivationState::Starting,
+                    "store-recovery-physical-starting",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let mutation_digest = PlatformHandle::new("a7".repeat(32)).unwrap();
+        let request = HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("store-recovery-physical-request").unwrap(),
+            mutation_digest.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            persist_store_recovery_pending(&root, &request, &host).unwrap(),
+            StoreRecoveryPendingPublication::Created
+        );
+        let termination = StoreRecoveryTerminationEvidence {
+            wire: request.wire.as_str().to_owned(),
+            operation: request.operation.clone(),
+            request_id: request.request_id.as_str().to_owned(),
+            mutation_digest: request.mutation_digest.as_str().to_owned(),
+            request_digest: request.request_digest.as_str().to_owned(),
+            host_epoch: host.epoch.current.sequence,
+            host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+            process_id: 4_101,
+            process_start_time_100ns: 41_010,
+            process_image_path: r"C:\Eliot\store-old.exe".to_owned(),
+            job_name: r"Local\Eliot-Store-old".to_owned(),
+            job_empty: true,
+            root_reaped: true,
+            restart_attempt: 1,
+        };
+        termination
+            .validate_for_digest(mutation_digest.as_str())
+            .unwrap();
+        std::fs::write(
+            store_recovery_termination_path(&root, mutation_digest.as_str()),
+            serde_json::to_vec(&termination).unwrap(),
+        )
+        .unwrap();
+
+        let generation = ResourceGeneration::genesis();
+        let authority_epoch = AuthorityEpoch::genesis();
+        let requirement = HostStoreBootstrapRequirement {
+            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)
+                .unwrap(),
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
+            store_generation: generation,
+            state_fence: StateFence::new(authority_epoch, generation),
+            launch_nonce: PlatformHandle::new("store-recovery-physical-nonce").unwrap(),
+            connection_id: PlatformHandle::new("store-recovery-physical-connection").unwrap(),
+            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            expected_peer_session_id: 0,
+            approved_artifact_hash: PlatformHandle::new("b".repeat(64)).unwrap(),
+            approved_config_hash: PlatformHandle::new("c".repeat(64)).unwrap(),
+            timeout_ms: 5_000,
+        };
+        let process_binding = StoreProcessBinding {
+            process: HostProcessBinding {
+                process_id: 4_202,
+                start_time_100ns: 42_020,
+                image_path: r"C:\Eliot\store-new.exe".to_owned(),
+            },
+            job: PlatformHandle::new(r"Local\Eliot-Store-new").unwrap(),
+        };
+        let mut handoff = StoreRebindHandoff {
+            operation_id: PlatformHandle::new("store-recovery-physical-inner").unwrap(),
+            request_digest: "0".repeat(64),
+            requirement: requirement.clone(),
+            process_binding: process_binding.clone(),
+            candidate_binding_digest: "d".repeat(64),
+            generation,
+            authority_epoch,
+            store_fence: "e".repeat(64),
+        };
+        handoff.request_digest = handoff.canonical_request_digest().unwrap();
+        handoff.validate_canonical_digest().unwrap();
+        persist_store_recovery_inner_binding(&root, &request, &host, &handoff).unwrap();
+        assert_eq!(
+            persist_store_recovery_pending(&root, &request, &host).unwrap(),
+            StoreRecoveryPendingPublication::Replay
+        );
+        persist_store_recovery_inner_binding(&root, &request, &host, &handoff).unwrap();
+        let pending_inner = StoreRebindRecord {
+            fence: record_fence(&host, &activation_id, &activation_generation),
+            operation: operation("store-recovery-physical-inner-pending").unwrap(),
+            state: StoreRebindState::Pending,
+            operation_id: handoff.operation_id.clone(),
+            request_digest: PlatformHandle::new(handoff.request_digest.clone()).unwrap(),
+            requirement: PlatformHandle::new(sha256_json(&requirement).unwrap()).unwrap(),
+            candidate_binding_digest: PlatformHandle::new(handoff.candidate_binding_digest.clone())
+                .unwrap(),
+            store_fence: PlatformHandle::new(handoff.store_fence.clone()).unwrap(),
+            process_id: process_binding.process.process_id,
+            process_start_time_100ns: process_binding.process.start_time_100ns,
+            process_image_path: PlatformHandle::new(process_binding.process.image_path.clone())
+                .unwrap(),
+            job_name: process_binding.job.clone(),
+            generation: generation.value(),
+            authority_epoch: authority_epoch.value(),
+            receipt_request_digest: None,
+            receipt_store_fence: None,
+        };
+        append_reconciled(
+            &journal,
+            HostStateRecord::StoreRebind(pending_inner.clone()),
+        )
+        .unwrap();
+        let mut committed_inner = pending_inner;
+        committed_inner.operation = operation("store-recovery-physical-inner-commit").unwrap();
+        committed_inner.state = StoreRebindState::Committed;
+        committed_inner.receipt_request_digest = Some(committed_inner.request_digest.clone());
+        committed_inner.receipt_store_fence = Some(committed_inner.store_fence.clone());
+        append_reconciled(
+            &journal,
+            HostStateRecord::StoreRebind(committed_inner.clone()),
+        )
+        .unwrap();
+
+        let fences = load_durable_store_recoveries(&root).unwrap();
+        assert_eq!(fences.len(), 1);
+        let physical_snapshot = journal.snapshot().unwrap();
+        fences[0]
+            .validate_for_reopen(&host, &physical_snapshot)
+            .unwrap();
+        let mut substituted = fences[0].clone();
+        substituted.inner.as_mut().unwrap().request_digest = "f".repeat(64);
+        assert!(
+            substituted
+                .validate_for_reopen(&host, &physical_snapshot)
+                .is_err()
+        );
+        drop(journal);
+
+        let reopened_backend =
+            RedbJournalBackend::open_unprotected_for_integration_test(&journal_path).unwrap();
+        let (reopened, reopened_host, _, _, startup_fenced) = open_production_epoch_from_backend(
+            reopened_backend,
+            host.installation.clone(),
+            None,
+            None,
+            &fences,
+        )
+        .unwrap();
+        assert!(startup_fenced.is_fenced());
+        assert_eq!(
+            reopened_host.epoch.current, host.epoch.current,
+            "fenced startup must retain the exact pre-crash host identity"
+        );
+        assert_eq!(
+            reopened_host.epoch.parent, host.epoch.parent,
+            "fenced startup must not create a child host epoch"
+        );
+        let reopened_state = reopened.snapshot().unwrap();
+        assert_eq!(
+            reopened_state
+                .activation
+                .as_ref()
+                .map(|record| record.state),
+            Some(ActivationState::Starting),
+            "fenced startup retains the exact pre-crash activation until reconciliation"
+        );
+        assert!(reopened_state.readiness_observations.is_empty());
+        assert_eq!(
+            reopened_state.store_rebinds, physical_snapshot.store_rebinds,
+            "fenced startup must not append a second Store rebind record"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -15451,13 +18405,15 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        CutoverLaunchOutcome, HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR, HostBranchDisposition,
+        CutoverLaunchOutcome, HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR,
+        HOST_STORE_RECOVERY_KILL_ON_JOB_CLOSE_CRASH_FENCE_DISCRIMINATOR, HostBranchDisposition,
         HostComposition, HostError, HostJobBranches, HostProcessBinding,
-        KERNEL_BOOTSTRAP_ENVIRONMENT, KERNEL_CONTROL_PIPE, KernelControlResponse,
-        KernelLaunchBinding, KernelServiceState, PlatformHandle, ReconciliationObservation,
-        ReconciliationState, StoreKernelLaunchError, StoreLivenessEvidence,
-        activation_response_or_reconcile, fresh_host_epoch, launch_store_then_kernel,
-        reconcile_state_machine,
+        HostRuntimeControlOperation, HostRuntimeControlRequest, HostRuntimeControlResponse,
+        HostStoreRecoveryReceipt, KERNEL_BOOTSTRAP_ENVIRONMENT, KERNEL_CONTROL_PIPE,
+        KernelControlResponse, KernelLaunchBinding, KernelServiceState, PlatformHandle,
+        ReconciliationObservation, ReconciliationState, StoreKernelLaunchError,
+        StoreLivenessEvidence, activation_response_or_reconcile, fresh_host_epoch,
+        launch_store_then_kernel, reconcile_state_machine,
     };
     use eliot_platform_windows::JobObjectIdentity;
 
@@ -15520,6 +18476,51 @@ mod tests {
             )
         })
         .collect()
+    }
+
+    #[test]
+    fn fenced_startup_job_projection_has_no_process_or_child_contour() {
+        let host = fresh_host_epoch(
+            PlatformHandle::new("fenced-startup-job-projection").expect("installation"),
+            None,
+        )
+        .expect("host epoch");
+        let jobs = HostJobBranches::new_fenced(&host).expect("fenced job projection");
+        assert!(jobs.kernel.is_none());
+        assert!(jobs.store.is_none());
+        assert!(jobs.kernel_launch_binding.is_none());
+        assert!(!jobs.has_recorded_contour());
+    }
+
+    #[test]
+    fn kill_on_close_crash_fence_is_operation_specific_and_never_positive_attach() {
+        assert_eq!(
+            HOST_STORE_RECOVERY_KILL_ON_JOB_CLOSE_CRASH_FENCE_DISCRIMINATOR,
+            "eliot-host::store-recovery::kill-on-job-close-crash-fence:v1"
+        );
+        let request = HostRuntimeControlRequest::new_store_reconcile(
+            PlatformHandle::new("store-recovery-crash-fence-query").unwrap(),
+            PlatformHandle::new("a".repeat(64)).unwrap(),
+        )
+        .unwrap();
+        let pending_ref = super::runtime_control_unknown_ref(
+            super::STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON,
+            &request,
+        );
+        let response = HostRuntimeControlResponse::unknown_for(&request, pending_ref.clone());
+        assert!(response.validate().is_ok());
+        assert!(pending_ref.as_str().contains("store-recovery-crash-fence"));
+
+        let host = fresh_host_epoch(
+            PlatformHandle::new("store-recovery-crash-fence-host").unwrap(),
+            None,
+        )
+        .unwrap();
+        let jobs = HostJobBranches::new_fenced(&host).unwrap();
+        assert!(jobs.kernel.is_none());
+        assert!(jobs.store.is_none());
+        assert!(jobs.launch.is_none());
+        assert!(jobs.kernel_launch_binding.is_none());
     }
 
     #[test]
@@ -16080,6 +19081,483 @@ mod tests {
             HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR
         );
         assert!(!HostComposition::production_store_rebind_discriminator().is_empty());
+    }
+
+    #[test]
+    fn store_recovery_stale_binding_rejected_production_bound() {
+        assert_eq!(
+            HostComposition::production_store_rebind_discriminator(),
+            HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR
+        );
+        assert_eq!(
+            HostComposition::production_runtime_control_discriminator(),
+            super::HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR
+        );
+        let req = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("store-recovery-stale").unwrap(),
+        )
+        .unwrap();
+        let mut stale = req.clone();
+        stale.request_digest = PlatformHandle::new("0".repeat(64)).unwrap();
+        assert!(stale.validate().is_err());
+        assert!(req.validate().is_ok());
+        let receipt = HostStoreRecoveryReceipt {
+            external_control_mutation_digest: req.mutation_digest.clone(),
+            request_digest: req.request_digest.clone(),
+            store_rebind_request_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("a".repeat(64)).unwrap(),
+            new_store_process_id: PlatformHandle::new("pid:101:start:1001").unwrap(),
+            kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
+            activation_nonce_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
+            ready_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+        };
+        let mut good = receipt.clone();
+        good.receipt_digest = good.computed_digest().unwrap();
+        assert!(good.validate().is_ok());
+        let mut bad = good.clone();
+        bad.store_fence = PlatformHandle::new("0".repeat(64)).unwrap();
+        assert!(bad.validate().is_err());
+        let mut aliased = good;
+        aliased.store_rebind_request_digest = aliased.external_control_mutation_digest.clone();
+        aliased.receipt_digest = aliased.computed_digest().unwrap();
+        assert!(aliased.validate().is_err());
+    }
+
+    #[test]
+    fn store_recovery_response_loss_query_preserves_original_digest() {
+        assert_eq!(
+            HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR,
+            "eliot-host::production-store-rebind:v1"
+        );
+        let req = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("store-recovery-response-loss").unwrap(),
+        )
+        .unwrap();
+        let mut receipt = HostStoreRecoveryReceipt {
+            external_control_mutation_digest: req.mutation_digest.clone(),
+            request_digest: req.request_digest.clone(),
+            store_rebind_request_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("a".repeat(64)).unwrap(),
+            new_store_process_id: PlatformHandle::new("pid:101:start:1001").unwrap(),
+            kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
+            activation_nonce_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
+            ready_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+        };
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        let map = {
+            let mut m = std::collections::HashMap::new();
+            m.insert(req.mutation_digest.as_str().to_owned(), receipt.clone());
+            m
+        };
+        let pending_ref = super::runtime_control_unknown_ref("store-recovery-pending", &req);
+        assert!(pending_ref.as_str().contains(req.request_digest.as_str()));
+        let recovered = map.get(req.mutation_digest.as_str()).unwrap();
+        assert_eq!(
+            recovered.external_control_mutation_digest,
+            req.mutation_digest
+        );
+        assert_eq!(recovered.request_digest, req.request_digest);
+        assert_eq!(
+            recovered.store_rebind_request_digest,
+            PlatformHandle::new("e".repeat(64)).unwrap()
+        );
+        let reconcile = HostRuntimeControlRequest::new_store_reconcile(
+            PlatformHandle::new("store-recovery-response-loss-query").unwrap(),
+            req.mutation_digest.clone(),
+        )
+        .unwrap();
+        assert_eq!(reconcile.mutation_digest, req.mutation_digest);
+        assert_ne!(reconcile.request_digest, req.request_digest);
+        let rebound = super::rebind_store_recovery_receipt(&receipt, &reconcile).unwrap();
+        assert_eq!(
+            rebound.external_control_mutation_digest,
+            req.mutation_digest
+        );
+        assert_eq!(rebound.request_digest, reconcile.request_digest);
+        assert_eq!(
+            rebound.store_rebind_request_digest,
+            PlatformHandle::new("e".repeat(64)).unwrap()
+        );
+        assert_ne!(rebound.receipt_digest, receipt.receipt_digest);
+    }
+
+    #[test]
+    fn store_recovery_reconciles_only_canonical_committed_inner_rebind() {
+        use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+        use eliot_kernel_service::{
+            HostStoreBootstrapRequirement, StoreProcessBinding, StoreRebindHandoff,
+        };
+
+        let host = super::fresh_host_epoch(PlatformHandle::new("inner-rebind-test").unwrap(), None)
+            .unwrap();
+        let activation_id = super::fresh_identity("inner-rebind-activation").unwrap();
+        let activation_generation =
+            super::root_epoch(super::fresh_identity("inner-rebind-lineage").unwrap());
+        let authority_epoch = AuthorityEpoch::new(7).unwrap();
+        let generation = ResourceGeneration::new(3).unwrap();
+        let requirement = HostStoreBootstrapRequirement {
+            route_identity: PlatformHandle::new("store_bridge").unwrap(),
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
+            store_generation: generation,
+            state_fence: StateFence::new(authority_epoch, generation),
+            launch_nonce: PlatformHandle::new("inner-rebind-launch-nonce").unwrap(),
+            connection_id: PlatformHandle::new("inner-rebind-connection").unwrap(),
+            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            expected_peer_session_id: 0,
+            approved_artifact_hash: PlatformHandle::new("a".repeat(64)).unwrap(),
+            approved_config_hash: PlatformHandle::new("b".repeat(64)).unwrap(),
+            timeout_ms: 5_000,
+        };
+        let operation_id = PlatformHandle::new("inner-rebind-operation").unwrap();
+        let candidate_digest = "c".repeat(64);
+        let store_fence = "d".repeat(64);
+        let process_binding = StoreProcessBinding {
+            process: HostProcessBinding {
+                process_id: 731,
+                start_time_100ns: 7_311,
+                image_path: r"C:\Eliot\store-new.exe".to_owned(),
+            },
+            job: PlatformHandle::new(r"Local\Eliot-Store-new").unwrap(),
+        };
+        let handoff = StoreRebindHandoff {
+            operation_id: operation_id.clone(),
+            request_digest: "0".repeat(64),
+            requirement: requirement.clone(),
+            process_binding: process_binding.clone(),
+            candidate_binding_digest: candidate_digest.clone(),
+            generation,
+            authority_epoch,
+            store_fence: store_fence.clone(),
+        };
+        let inner_digest = handoff.canonical_request_digest().unwrap();
+        let requirement_digest = super::sha256_json(&requirement).unwrap();
+        let record = eliot_host_state::StoreRebindRecord {
+            fence: super::record_fence(&host, &activation_id, &activation_generation),
+            operation: eliot_host_state::IdempotencyIdentity {
+                operation_id: PlatformHandle::new("inner-rebind-journal-operation").unwrap(),
+                idempotency_key: PlatformHandle::new("inner-rebind-journal-key").unwrap(),
+            },
+            state: eliot_host_state::StoreRebindState::Committed,
+            operation_id,
+            request_digest: PlatformHandle::new(inner_digest.clone()).unwrap(),
+            requirement: PlatformHandle::new(requirement_digest).unwrap(),
+            candidate_binding_digest: PlatformHandle::new(candidate_digest.clone()).unwrap(),
+            store_fence: PlatformHandle::new(store_fence.clone()).unwrap(),
+            process_id: process_binding.process.process_id,
+            process_start_time_100ns: process_binding.process.start_time_100ns,
+            process_image_path: PlatformHandle::new(process_binding.process.image_path.clone())
+                .unwrap(),
+            job_name: process_binding.job.clone(),
+            generation: generation.value(),
+            authority_epoch: authority_epoch.value(),
+            receipt_request_digest: Some(PlatformHandle::new(inner_digest.clone()).unwrap()),
+            receipt_store_fence: Some(PlatformHandle::new(store_fence).unwrap()),
+        };
+        let receipt =
+            super::committed_store_rebind_receipt(&record, &requirement, &candidate_digest)
+                .unwrap();
+        assert_eq!(receipt.request_digest, inner_digest);
+        assert_eq!(receipt.process_binding, process_binding);
+
+        let mut substituted = record.clone();
+        substituted.request_digest = PlatformHandle::new("e".repeat(64)).unwrap();
+        substituted.receipt_request_digest = Some(PlatformHandle::new("e".repeat(64)).unwrap());
+        assert!(
+            super::committed_store_rebind_receipt(&substituted, &requirement, &candidate_digest,)
+                .is_err()
+        );
+
+        let mut destination_only = record;
+        destination_only.process_id = destination_only.process_id.saturating_add(1);
+        assert!(
+            super::committed_store_rebind_receipt(
+                &destination_only,
+                &requirement,
+                &candidate_digest,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn store_recovery_changes_only_store_identity_kernel_fence_invariants_hold() {
+        let host = super::fresh_host_epoch(PlatformHandle::new("test-installation").unwrap(), None)
+            .unwrap();
+        let journal = eliot_host_state::HostStateJournalService::from_backend(
+            eliot_host_state::MemoryBackend::default(),
+            host.clone(),
+        )
+        .unwrap();
+        let activation_generation =
+            super::root_epoch(super::fresh_identity("store-recovery-activation").unwrap());
+        let activation_id = super::fresh_identity("store-recovery-activation-id").unwrap();
+        super::append_reconciled(
+            &journal,
+            eliot_host_state::HostStateRecord::Activation(
+                super::initial_activation_record(
+                    &host,
+                    &activation_id,
+                    &activation_generation,
+                    eliot_host_state::ActivationState::Starting,
+                    "store-recovery-test-starting",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let snapshot_before = journal.snapshot().unwrap();
+        let kernel_before = snapshot_before.kernel.clone();
+        let host_epoch_before = snapshot_before.host.epoch.clone();
+        let req = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("store-recovery-kernel-invariant").unwrap(),
+        )
+        .unwrap();
+        let candidate_digest = "c".repeat(64);
+        let store_fence = PlatformHandle::new("d".repeat(64)).unwrap();
+        let pending = eliot_host_state::StoreRebindRecord {
+            fence: super::record_fence(&host, &activation_id, &activation_generation),
+            operation: eliot_host_state::IdempotencyIdentity {
+                operation_id: PlatformHandle::new("store-recovery-op").unwrap(),
+                idempotency_key: PlatformHandle::new("store-recovery-key").unwrap(),
+            },
+            state: eliot_host_state::StoreRebindState::Pending,
+            operation_id: PlatformHandle::new("store-recovery-op").unwrap(),
+            request_digest: req.mutation_digest.clone(),
+            requirement: PlatformHandle::new("b".repeat(64)).unwrap(),
+            candidate_binding_digest: PlatformHandle::new(candidate_digest).unwrap(),
+            store_fence: store_fence.clone(),
+            process_id: 101,
+            process_start_time_100ns: 1001,
+            process_image_path: PlatformHandle::new(r"C:\Eliot\store-new.exe").unwrap(),
+            job_name: PlatformHandle::new(r"Local\Eliot-Store-new").unwrap(),
+            generation: 1,
+            authority_epoch: 1,
+            receipt_request_digest: None,
+            receipt_store_fence: None,
+        };
+        super::append_reconciled(
+            &journal,
+            eliot_host_state::HostStateRecord::StoreRebind(pending),
+        )
+        .unwrap();
+        let committed = eliot_host_state::StoreRebindRecord {
+            fence: super::record_fence(&host, &activation_id, &activation_generation),
+            operation: eliot_host_state::IdempotencyIdentity {
+                operation_id: PlatformHandle::new("store-recovery-op").unwrap(),
+                idempotency_key: PlatformHandle::new("store-recovery-key-committed").unwrap(),
+            },
+            state: eliot_host_state::StoreRebindState::Committed,
+            operation_id: PlatformHandle::new("store-recovery-op").unwrap(),
+            request_digest: req.mutation_digest.clone(),
+            requirement: PlatformHandle::new("b".repeat(64)).unwrap(),
+            candidate_binding_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
+            store_fence: store_fence.clone(),
+            process_id: 101,
+            process_start_time_100ns: 1001,
+            process_image_path: PlatformHandle::new(r"C:\Eliot\store-new.exe").unwrap(),
+            job_name: PlatformHandle::new(r"Local\Eliot-Store-new").unwrap(),
+            generation: 1,
+            authority_epoch: 1,
+            receipt_request_digest: Some(req.mutation_digest.clone()),
+            receipt_store_fence: Some(store_fence.clone()),
+        };
+        super::append_reconciled(
+            &journal,
+            eliot_host_state::HostStateRecord::StoreRebind(committed),
+        )
+        .unwrap();
+        let snapshot_after = journal.snapshot().unwrap();
+        assert_eq!(snapshot_after.host.epoch, host_epoch_before);
+        assert_eq!(snapshot_after.kernel, kernel_before);
+        assert!(
+            snapshot_after
+                .store_rebinds
+                .iter()
+                .any(|r| r.process_id == 101)
+        );
+        assert!(
+            snapshot_after
+                .store_rebinds
+                .iter()
+                .any(|r| r.state == eliot_host_state::StoreRebindState::Committed)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn store_recovery_same_host_response_loss_preserves_commit_and_idempotent_replay() {
+        let host = super::fresh_host_epoch(PlatformHandle::new("test-installation").unwrap(), None)
+            .unwrap();
+        let journal = eliot_host_state::HostStateJournalService::from_backend(
+            eliot_host_state::MemoryBackend::default(),
+            host.clone(),
+        )
+        .unwrap();
+        let activation_generation =
+            super::root_epoch(super::fresh_identity("crash-reopen-activation").unwrap());
+        let activation_id = super::fresh_identity("crash-reopen-activation-id").unwrap();
+        super::append_reconciled(
+            &journal,
+            eliot_host_state::HostStateRecord::Activation(
+                super::initial_activation_record(
+                    &host,
+                    &activation_id,
+                    &activation_generation,
+                    eliot_host_state::ActivationState::Starting,
+                    "crash-reopen-starting",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let req = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("store-recovery-crash").unwrap(),
+        )
+        .unwrap();
+        let store_fence = PlatformHandle::new("e".repeat(64)).unwrap();
+        let pending = eliot_host_state::StoreRebindRecord {
+            fence: super::record_fence(&host, &activation_id, &activation_generation),
+            operation: eliot_host_state::IdempotencyIdentity {
+                operation_id: PlatformHandle::new("crash-op").unwrap(),
+                idempotency_key: PlatformHandle::new("crash-key").unwrap(),
+            },
+            state: eliot_host_state::StoreRebindState::Pending,
+            operation_id: PlatformHandle::new("crash-op").unwrap(),
+            request_digest: req.mutation_digest.clone(),
+            requirement: PlatformHandle::new("b".repeat(64)).unwrap(),
+            candidate_binding_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
+            store_fence: store_fence.clone(),
+            process_id: 201,
+            process_start_time_100ns: 2001,
+            process_image_path: PlatformHandle::new(r"C:\Eliot\store-crash.exe").unwrap(),
+            job_name: PlatformHandle::new(r"Local\Eliot-Store-crash").unwrap(),
+            generation: 1,
+            authority_epoch: 1,
+            receipt_request_digest: None,
+            receipt_store_fence: None,
+        };
+        super::append_reconciled(
+            &journal,
+            eliot_host_state::HostStateRecord::StoreRebind(pending),
+        )
+        .unwrap();
+        let committed = eliot_host_state::StoreRebindRecord {
+            fence: super::record_fence(&host, &activation_id, &activation_generation),
+            operation: eliot_host_state::IdempotencyIdentity {
+                operation_id: PlatformHandle::new("crash-op").unwrap(),
+                idempotency_key: PlatformHandle::new("crash-key-committed").unwrap(),
+            },
+            state: eliot_host_state::StoreRebindState::Committed,
+            operation_id: PlatformHandle::new("crash-op").unwrap(),
+            request_digest: req.mutation_digest.clone(),
+            requirement: PlatformHandle::new("b".repeat(64)).unwrap(),
+            candidate_binding_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
+            store_fence: store_fence.clone(),
+            process_id: 201,
+            process_start_time_100ns: 2001,
+            process_image_path: PlatformHandle::new(r"C:\Eliot\store-crash.exe").unwrap(),
+            job_name: PlatformHandle::new(r"Local\Eliot-Store-crash").unwrap(),
+            generation: 1,
+            authority_epoch: 1,
+            receipt_request_digest: Some(req.mutation_digest.clone()),
+            receipt_store_fence: Some(store_fence.clone()),
+        };
+        super::append_reconciled(
+            &journal,
+            eliot_host_state::HostStateRecord::StoreRebind(committed.clone()),
+        )
+        .unwrap();
+        let snapshot_before = journal.snapshot().unwrap();
+        assert!(
+            snapshot_before
+                .store_rebinds
+                .iter()
+                .any(|r| r.state == eliot_host_state::StoreRebindState::Committed)
+        );
+        let replay = super::append_reconciled(
+            &journal,
+            eliot_host_state::HostStateRecord::StoreRebind(committed),
+        )
+        .unwrap();
+        assert_eq!(
+            replay.disposition(),
+            eliot_host_state::AppendDisposition::Replayed
+        );
+        let snapshot_after = journal.snapshot().unwrap();
+        assert!(
+            snapshot_after
+                .store_rebinds
+                .iter()
+                .any(|r| r.state == eliot_host_state::StoreRebindState::Committed
+                    && r.request_digest == req.mutation_digest)
+        );
+    }
+
+    #[test]
+    fn store_recovery_unknown_is_mutation_keyed_not_destination() {
+        let req = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("store-recovery-unknown-mutation").unwrap(),
+        )
+        .unwrap();
+        let foreign = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("store-recovery-unknown-foreign").unwrap(),
+        )
+        .unwrap();
+        assert_ne!(req.mutation_digest, foreign.mutation_digest);
+        let receipt = HostStoreRecoveryReceipt {
+            external_control_mutation_digest: req.mutation_digest.clone(),
+            request_digest: req.request_digest.clone(),
+            store_rebind_request_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("a".repeat(64)).unwrap(),
+            new_store_process_id: PlatformHandle::new("pid:301:start:3001").unwrap(),
+            kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
+            activation_nonce_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
+            ready_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+        };
+        let mut good = receipt.clone();
+        good.receipt_digest = good.computed_digest().unwrap();
+        assert!(good.validate().is_ok());
+        let reconcile_foreign = HostRuntimeControlRequest::new_store_reconcile(
+            PlatformHandle::new("store-recovery-unknown-query").unwrap(),
+            foreign.mutation_digest.clone(),
+        )
+        .unwrap();
+        let unknown = super::rebind_store_recovery_receipt(&good, &reconcile_foreign);
+        assert!(unknown.is_err(), "foreign mutation must not match receipt");
+        let reconcile_correct = HostRuntimeControlRequest::new_store_reconcile(
+            PlatformHandle::new("store-recovery-unknown-query-ok").unwrap(),
+            req.mutation_digest.clone(),
+        )
+        .unwrap();
+        let ok = super::rebind_store_recovery_receipt(&good, &reconcile_correct).unwrap();
+        assert_eq!(ok.external_control_mutation_digest, req.mutation_digest);
+        assert_eq!(ok.request_digest, reconcile_correct.request_digest);
+
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-store-recovery-receipt-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        super::persist_store_recovery_receipt(&root, &good).unwrap();
+        let path = super::store_recovery_receipt_path(&root, req.mutation_digest.as_str());
+        let original = std::fs::read(&path).unwrap();
+        super::persist_store_recovery_receipt(&root, &good).unwrap();
+        let mut substituted = good.clone();
+        substituted.ready_receipt_digest = PlatformHandle::new("f".repeat(64)).unwrap();
+        substituted.receipt_digest = substituted.computed_digest().unwrap();
+        assert!(super::persist_store_recovery_receipt(&root, &substituted).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

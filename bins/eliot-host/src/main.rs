@@ -2,7 +2,7 @@ use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 
 #[cfg(windows)]
-use eliot_host::{HostBranchDisposition, HostLivenessTick};
+use eliot_host::{HostBranchDisposition, HostLivenessTick, HostRuntimeControlOperation};
 use eliot_host::{
     HostComposition, HostError, HostLaunchOptions, HostPhaseBRequestQueue, PROTOCOL_VERSION,
     SERVICE_NAME,
@@ -584,6 +584,23 @@ fn spawn_runtime_control(
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeControlDispatch {
+    Kernel,
+    Store,
+}
+
+#[cfg(windows)]
+fn runtime_control_dispatch(operation: &HostRuntimeControlOperation) -> RuntimeControlDispatch {
+    match operation {
+        HostRuntimeControlOperation::RestartKernel
+        | HostRuntimeControlOperation::ReconcileKernelRestart => RuntimeControlDispatch::Kernel,
+        HostRuntimeControlOperation::RecoverStore
+        | HostRuntimeControlOperation::ReconcileStoreRecovery => RuntimeControlDispatch::Store,
+    }
+}
+
+#[cfg(windows)]
 fn process_runtime_control_requests(
     host: &mut HostComposition,
     queue: &eliot_host::HostRuntimeControlQueue,
@@ -594,7 +611,10 @@ fn process_runtime_control_requests(
             Err(_) => None,
         };
         let Some(envelope) = request else { break };
-        let response = host.handle_kernel_restart_request(&envelope.request);
+        let response = match runtime_control_dispatch(&envelope.request.operation) {
+            RuntimeControlDispatch::Kernel => host.handle_kernel_restart_request(&envelope.request),
+            RuntimeControlDispatch::Store => host.handle_store_recovery_request(&envelope.request),
+        };
         let _ = envelope.reply.send(response);
     }
 }
@@ -765,6 +785,26 @@ mod tests {
         assert_eq!(spy.file_digest_verifications, 1);
         assert_eq!(spy.pipe_exchanges, 1);
         assert_eq!(spy.durable_journal_operations, 1);
+    }
+
+    #[test]
+    fn production_runtime_control_dispatch_is_operation_exact() {
+        assert_eq!(
+            runtime_control_dispatch(&HostRuntimeControlOperation::RestartKernel),
+            RuntimeControlDispatch::Kernel
+        );
+        assert_eq!(
+            runtime_control_dispatch(&HostRuntimeControlOperation::ReconcileKernelRestart),
+            RuntimeControlDispatch::Kernel
+        );
+        assert_eq!(
+            runtime_control_dispatch(&HostRuntimeControlOperation::RecoverStore),
+            RuntimeControlDispatch::Store
+        );
+        assert_eq!(
+            runtime_control_dispatch(&HostRuntimeControlOperation::ReconcileStoreRecovery),
+            RuntimeControlDispatch::Store
+        );
     }
 }
 

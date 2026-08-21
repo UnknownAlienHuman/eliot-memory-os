@@ -29,6 +29,8 @@ use tokio::sync::oneshot;
 pub const HOST_RUNTIME_CONTROL_PIPE: &str = r"\\.\pipe\eliot\host\runtime-control-v1";
 pub const HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR: &str =
     "eliot-host::production-runtime-control:v1";
+pub const HOST_RUNTIME_CONTROL_PRODUCTION_TRACE_CONTEXT_KEY: &str =
+    "eliot.host.production-discriminator";
 const MAX_QUEUE_DEPTH: usize = 32;
 const QUEUE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const WIRE: &str = "eliot.host.runtime-control.v2";
@@ -44,6 +46,17 @@ const UNKNOWN_REF_REASONS: &[&str] = &[
     "kernel-restart-pending",
     "kernel-restart-reconcile-snapshot",
     "kernel-restart-reconcile-unknown",
+    "store-recovery-validation",
+    "store-recovery-queue-lock",
+    "store-recovery-queue-full",
+    "store-recovery-queue-response",
+    "store-recovery",
+    "store-recovery-pending",
+    "store-recovery-reconcile",
+    "store-recovery-reconcile-conflict",
+    "store-recovery-reconcile-snapshot",
+    "store-recovery-reconcile-unknown",
+    "store-recovery-crash-fence-manual-new-lineage",
 ];
 
 #[derive(Clone, Debug)]
@@ -62,13 +75,37 @@ impl Eq for HostRuntimeControlResponseCapability {}
 pub enum HostRuntimeControlOperation {
     RestartKernel,
     ReconcileKernelRestart,
+    RecoverStore,
+    ReconcileStoreRecovery,
 }
 
 fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
     match operation {
         HostRuntimeControlOperation::RestartKernel => "RestartKernel",
         HostRuntimeControlOperation::ReconcileKernelRestart => "ReconcileKernelRestart",
+        HostRuntimeControlOperation::RecoverStore => "RecoverStore",
+        HostRuntimeControlOperation::ReconcileStoreRecovery => "ReconcileStoreRecovery",
     }
+}
+
+fn operation_unknown_prefix(operation: &HostRuntimeControlOperation) -> &'static str {
+    match operation {
+        HostRuntimeControlOperation::RestartKernel
+        | HostRuntimeControlOperation::ReconcileKernelRestart => "kernel-restart",
+        HostRuntimeControlOperation::RecoverStore
+        | HostRuntimeControlOperation::ReconcileStoreRecovery => "store-recovery",
+    }
+}
+
+fn operation_unknown_ref(
+    operation: &HostRuntimeControlOperation,
+    suffix: &str,
+    request: &HostRuntimeControlRequest,
+) -> PlatformHandle {
+    runtime_control_unknown_ref(
+        &format!("{}-{suffix}", operation_unknown_prefix(operation)),
+        request,
+    )
 }
 
 fn is_sha256_digest(value: &PlatformHandle) -> bool {
@@ -77,6 +114,20 @@ fn is_sha256_digest(value: &PlatformHandle) -> bool {
             .as_str()
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn is_store_process_identity(value: &PlatformHandle) -> bool {
+    let Some(identity) = value.as_str().strip_prefix("pid:") else {
+        return false;
+    };
+    let Some((pid, start)) = identity.split_once(":start:") else {
+        return false;
+    };
+    !pid.is_empty()
+        && !start.is_empty()
+        && pid.parse::<u32>().is_ok_and(|value| value != 0)
+        && start.parse::<u64>().is_ok_and(|value| value != 0)
+        && !start.contains(':')
 }
 
 fn mutation_digest_for_request_id(wire: &PlatformHandle, request_id: &PlatformHandle) -> String {
@@ -144,6 +195,8 @@ fn parse_runtime_control_unknown_ref(
     let operation = match operation_name.as_str() {
         "RestartKernel" => HostRuntimeControlOperation::RestartKernel,
         "ReconcileKernelRestart" => HostRuntimeControlOperation::ReconcileKernelRestart,
+        "RecoverStore" => HostRuntimeControlOperation::RecoverStore,
+        "ReconcileStoreRecovery" => HostRuntimeControlOperation::ReconcileStoreRecovery,
         _ => return None,
     };
     let request = HostRuntimeControlRequest {
@@ -212,6 +265,17 @@ impl HostRuntimeControlRequest {
     ) -> Result<Self, String> {
         Self::new_with_mutation_digest(
             HostRuntimeControlOperation::ReconcileKernelRestart,
+            request_id,
+            mutation_digest,
+        )
+    }
+
+    pub fn new_store_reconcile(
+        request_id: PlatformHandle,
+        mutation_digest: PlatformHandle,
+    ) -> Result<Self, String> {
+        Self::new_with_mutation_digest(
+            HostRuntimeControlOperation::ReconcileStoreRecovery,
             request_id,
             mutation_digest,
         )
@@ -317,6 +381,75 @@ impl HostKernelRestartReceipt {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostStoreRecoveryReceipt {
+    /// The mutation identity of the external Host runtime-control request.
+    pub external_control_mutation_digest: PlatformHandle,
+    pub request_digest: PlatformHandle,
+    /// The canonical payload digest of the inner Kernel StoreRebind request.
+    pub store_rebind_request_digest: PlatformHandle,
+    pub store_fence: PlatformHandle,
+    pub new_store_process_id: PlatformHandle,
+    pub kernel_generation: PlatformHandle,
+    pub activation_nonce_digest: PlatformHandle,
+    pub ready_receipt_digest: PlatformHandle,
+    pub receipt_digest: PlatformHandle,
+}
+
+impl HostStoreRecoveryReceipt {
+    pub fn computed_digest(&self) -> Result<PlatformHandle, String> {
+        let bytes = serde_json::to_vec(&(
+            self.external_control_mutation_digest.as_str(),
+            self.request_digest.as_str(),
+            self.store_rebind_request_digest.as_str(),
+            self.store_fence.as_str(),
+            self.new_store_process_id.as_str(),
+            self.kernel_generation.as_str(),
+            self.activation_nonce_digest.as_str(),
+            self.ready_receipt_digest.as_str(),
+        ))
+        .map_err(|e| e.to_string())?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|e| e.to_string())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (v, name) in [
+            (
+                &self.external_control_mutation_digest,
+                "external_control_mutation_digest",
+            ),
+            (&self.request_digest, "request_digest"),
+            (
+                &self.store_rebind_request_digest,
+                "store_rebind_request_digest",
+            ),
+            (&self.store_fence, "store_fence"),
+            (&self.kernel_generation, "kernel_generation"),
+            (&self.activation_nonce_digest, "activation_nonce_digest"),
+            (&self.ready_receipt_digest, "ready_receipt_digest"),
+            (&self.receipt_digest, "receipt_digest"),
+        ] {
+            if !is_sha256_digest(v) {
+                return Err(format!("{name} must be sha256"));
+            }
+        }
+        if self.external_control_mutation_digest == self.store_rebind_request_digest {
+            return Err(
+                "external_control_mutation_digest and store_rebind_request_digest must remain distinct"
+                    .to_owned(),
+            );
+        }
+        if !is_store_process_identity(&self.new_store_process_id) {
+            return Err("new_store_process_id must be pid:<u32>:start:<u64>".to_owned());
+        }
+        if self.receipt_digest != self.computed_digest()? {
+            return Err("receipt_digest mismatch".to_owned());
+        }
+        Ok(())
+    }
+}
+
 #[allow(private_interfaces)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -327,6 +460,11 @@ impl HostKernelRestartReceipt {
 pub enum HostRuntimeControlResponse {
     Restarted {
         receipt: HostKernelRestartReceipt,
+        #[serde(skip)]
+        capability: Option<HostRuntimeControlResponseCapability>,
+    },
+    StoreRecovered {
+        receipt: HostStoreRecoveryReceipt,
         #[serde(skip)]
         capability: Option<HostRuntimeControlResponseCapability>,
     },
@@ -348,6 +486,16 @@ impl HostRuntimeControlResponse {
         }
     }
 
+    pub(crate) fn store_recovered_for(
+        request: &HostRuntimeControlRequest,
+        receipt: HostStoreRecoveryReceipt,
+    ) -> Self {
+        Self::StoreRecovered {
+            receipt,
+            capability: request.response_capability(),
+        }
+    }
+
     pub(crate) fn unknown_for(
         request: &HostRuntimeControlRequest,
         pending_ref: PlatformHandle,
@@ -361,6 +509,7 @@ impl HostRuntimeControlResponse {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::Restarted { receipt, .. } => receipt.validate(),
+            Self::StoreRecovered { receipt, .. } => receipt.validate(),
             Self::Unknown { pending_ref, .. } => parse_runtime_control_unknown_ref(pending_ref)
                 .map(|_| ())
                 .ok_or_else(|| "pending_ref is not canonical".to_owned()),
@@ -399,6 +548,14 @@ fn response_matches_request(
             capability.as_ref() == Some(expected_capability)
                 && receipt.request_digest == request.request_digest
                 && receipt.mutation_digest == request.mutation_digest
+        }
+        HostRuntimeControlResponse::StoreRecovered {
+            receipt,
+            capability,
+        } => {
+            capability.as_ref() == Some(expected_capability)
+                && receipt.request_digest == request.request_digest
+                && receipt.external_control_mutation_digest == request.mutation_digest
         }
         HostRuntimeControlResponse::Unknown {
             pending_ref,
@@ -444,7 +601,7 @@ impl HostRuntimeControl {
         if request.validate().is_err() {
             return HostRuntimeControlResponse::unknown_for(
                 request,
-                runtime_control_unknown_ref("kernel-restart-validation", request),
+                operation_unknown_ref(&request.operation, "validation", request),
             );
         }
         let (reply, response) = oneshot::channel();
@@ -455,13 +612,13 @@ impl HostRuntimeControl {
             let Ok(mut q) = self.queue.lock() else {
                 return HostRuntimeControlResponse::unknown_for(
                     request,
-                    runtime_control_unknown_ref("kernel-restart-queue-lock", request),
+                    operation_unknown_ref(&request.operation, "queue-lock", request),
                 );
             };
             if q.len() >= MAX_QUEUE_DEPTH {
                 return HostRuntimeControlResponse::unknown_for(
                     request,
-                    runtime_control_unknown_ref("kernel-restart-queue-full", request),
+                    operation_unknown_ref(&request.operation, "queue-full", request),
                 );
             }
             q.push_back(HostRuntimeControlEnvelope {
@@ -473,11 +630,11 @@ impl HostRuntimeControl {
             Ok(Ok(response)) if response_matches_request(&queued_request, &response) => response,
             Ok(Ok(_)) => HostRuntimeControlResponse::unknown_for(
                 request,
-                runtime_control_unknown_ref("kernel-restart-queue-response", request),
+                operation_unknown_ref(&request.operation, "queue-response", request),
             ),
             Ok(Err(_)) | Err(_) => HostRuntimeControlResponse::unknown_for(
                 request,
-                runtime_control_unknown_ref("kernel-restart-queue-response", request),
+                operation_unknown_ref(&request.operation, "queue-response", request),
             ),
         }
     }
@@ -562,7 +719,7 @@ pub fn runtime_control_request_frame(
         payload: ProtocolPayload::Json(
             serde_json::to_value(request).map_err(|_| "SessionFenced".to_owned())?,
         ),
-        trace_context: std::collections::BTreeMap::new(),
+        trace_context: production_trace_context(),
     };
     frame.validate().map_err(|_| "SessionFenced".to_owned())?;
     Ok(frame)
@@ -572,6 +729,7 @@ pub fn decode_runtime_control_request_frame(
     frame: &Frame,
 ) -> Result<HostRuntimeControlRequest, String> {
     frame.validate().map_err(|_| "SessionFenced".to_owned())?;
+    validate_production_trace_context(frame)?;
     if frame.kind != FrameKind::Control || frame.message_type != MessageType::Start {
         return Err("SessionFenced".to_owned());
     }
@@ -615,6 +773,9 @@ pub fn runtime_control_response_frame(
         HostRuntimeControlResponse::Restarted { receipt, .. } => {
             receipt.request_digest.as_str().to_owned()
         }
+        HostRuntimeControlResponse::StoreRecovered { receipt, .. } => {
+            receipt.request_digest.as_str().to_owned()
+        }
         HostRuntimeControlResponse::Unknown { pending_ref, .. } => {
             parse_runtime_control_unknown_ref(pending_ref)
                 .ok_or_else(|| "SessionFenced".to_owned())?
@@ -636,7 +797,7 @@ pub fn runtime_control_response_frame(
         payload: ProtocolPayload::Json(
             serde_json::to_value(response).map_err(|_| "SessionFenced".to_owned())?,
         ),
-        trace_context: std::collections::BTreeMap::new(),
+        trace_context: production_trace_context(),
     };
     frame.validate().map_err(|_| "SessionFenced".to_owned())?;
     Ok(frame)
@@ -646,6 +807,7 @@ pub fn decode_runtime_control_response_frame(
     frame: &Frame,
 ) -> Result<HostRuntimeControlResponse, String> {
     frame.validate().map_err(|_| "SessionFenced".to_owned())?;
+    validate_production_trace_context(frame)?;
     if frame.kind != FrameKind::Control || frame.message_type != MessageType::Ready {
         return Err("SessionFenced".to_owned());
     }
@@ -677,6 +839,11 @@ pub fn decode_runtime_control_response_frame(
                 return Err("SessionFenced".to_owned());
             }
         }
+        HostRuntimeControlResponse::StoreRecovered { receipt, .. } => {
+            if frame_request_id.as_str() != receipt.request_digest.as_str() {
+                return Err("SessionFenced".to_owned());
+            }
+        }
         HostRuntimeControlResponse::Unknown { pending_ref, .. } => {
             let pending_request = parse_runtime_control_unknown_ref(pending_ref)
                 .ok_or_else(|| "SessionFenced".to_owned())?;
@@ -686,6 +853,26 @@ pub fn decode_runtime_control_response_frame(
         }
     }
     Ok(response)
+}
+
+fn production_trace_context() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([(
+        HOST_RUNTIME_CONTROL_PRODUCTION_TRACE_CONTEXT_KEY.to_owned(),
+        HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR.to_owned(),
+    )])
+}
+
+fn validate_production_trace_context(frame: &Frame) -> Result<(), String> {
+    if frame.trace_context.len() != 1
+        || frame
+            .trace_context
+            .get(HOST_RUNTIME_CONTROL_PRODUCTION_TRACE_CONTEXT_KEY)
+            .map(String::as_str)
+            != Some(HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR)
+    {
+        return Err("SessionFenced".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -948,6 +1135,72 @@ mod tests {
         let mut rtampered = rframe.clone();
         rtampered.request_identity = None;
         assert!(decode_runtime_control_response_frame(&rtampered).is_err());
+    }
+
+    #[test]
+    fn production_trace_discriminator_binds_both_frame_directions() {
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RecoverStore,
+            handle("production-trace-store"),
+        )
+        .unwrap();
+        let frame = runtime_control_request_frame("trace-store", &request).unwrap();
+        assert_eq!(
+            frame
+                .trace_context
+                .get(HOST_RUNTIME_CONTROL_PRODUCTION_TRACE_CONTEXT_KEY)
+                .map(String::as_str),
+            Some(HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR)
+        );
+        let mut missing = frame.clone();
+        missing.trace_context.clear();
+        assert!(decode_runtime_control_request_frame(&missing).is_err());
+
+        let response = HostRuntimeControlResponse::Unknown {
+            pending_ref: runtime_control_unknown_ref("store-recovery", &request),
+            capability: None,
+        };
+        let response_frame = runtime_control_response_frame("trace-store", &response).unwrap();
+        assert_eq!(
+            response_frame
+                .trace_context
+                .get(HOST_RUNTIME_CONTROL_PRODUCTION_TRACE_CONTEXT_KEY)
+                .map(String::as_str),
+            Some(HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR)
+        );
+        let mut substituted = response_frame;
+        substituted.trace_context.insert(
+            HOST_RUNTIME_CONTROL_PRODUCTION_TRACE_CONTEXT_KEY.to_owned(),
+            "eliot-host::other-boundary:v1".to_owned(),
+        );
+        assert!(decode_runtime_control_response_frame(&substituted).is_err());
+    }
+
+    #[tokio::test]
+    async fn store_unknown_taxonomy_never_uses_kernel_restart_reason() {
+        let queue: HostRuntimeControlQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let control = HostRuntimeControl::new(queue);
+        for (operation, request_id) in [
+            (
+                HostRuntimeControlOperation::RecoverStore,
+                "store-taxonomy-recover",
+            ),
+            (
+                HostRuntimeControlOperation::ReconcileStoreRecovery,
+                "store-taxonomy-reconcile",
+            ),
+        ] {
+            let mut request =
+                HostRuntimeControlRequest::new(operation, handle(request_id)).unwrap();
+            request.request_digest = handle("b".repeat(64));
+            let HostRuntimeControlResponse::Unknown { pending_ref, .. } =
+                control.handle(&request).await
+            else {
+                panic!("invalid Store request must remain Unknown");
+            };
+            assert!(pending_ref.as_str().contains(":store-recovery-validation:"));
+            assert!(!pending_ref.as_str().contains("kernel-restart"));
+        }
     }
 
     #[test]

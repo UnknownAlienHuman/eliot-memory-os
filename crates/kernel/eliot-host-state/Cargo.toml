@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Pure HostStateJournal state machine and persistence port"
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 eliot-observation-contracts.workspace = true
 eliot-platform.workspace = true
