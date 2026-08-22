@@ -908,8 +908,8 @@ try {
 
     @'
 This bundle is intentionally unsigned. Before public distribution:
-1. Sign every shipped .exe and .dll with the organization EV/OV Authenticode certificate.
-2. Verify with: Get-AuthenticodeSignature <file>.
+1. Sign the six materializer runtime PE roles and the install-authoritative runtime/eliot.exe CLI trust role with the organization EV/OV Authenticode certificate.
+2. Use scripts/invoke-eliot-windows-x64-production.ps1 for the authoritative handoff; it retains runtime/eliot.exe, reruns seven-role public readback, and binds a suspended child before resume.
 3. Rebuild SHA256SUMS.json after signing.
 4. Timestamp signatures using the certificate provider's RFC3161 service.
 '@ | Set-Content -LiteralPath (Join-Path $bundle 'SIGNING_REQUIRED.txt') -Encoding utf8

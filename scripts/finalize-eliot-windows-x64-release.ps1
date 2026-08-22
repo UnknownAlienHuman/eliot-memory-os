@@ -1,13 +1,21 @@
 [CmdletBinding()]
 param(
-    [string]$UnsignedBundle,
-    [string]$SignedBundle,
-    [string]$SignToolPath,
-    [string]$CertificateStoreLocation,
-    [string]$CertificateThumbprint,
-    [string]$TimestampUrl,
-    [string]$VerifyBundle,
-    [switch]$PlanOnly
+    [Alias('UnsignedBundle')]
+    [string]$FinalizerUnsignedBundle,
+    [Alias('SignedBundle')]
+    [string]$FinalizerSignedBundle,
+    [Alias('SignToolPath')]
+    [string]$FinalizerSignToolPath,
+    [Alias('CertificateStoreLocation')]
+    [string]$FinalizerCertificateStoreLocation,
+    [Alias('CertificateThumbprint')]
+    [string]$FinalizerCertificateThumbprint,
+    [Alias('TimestampUrl')]
+    [string]$FinalizerTimestampUrl,
+    [Alias('VerifyBundle')]
+    [string]$FinalizerVerifyBundle,
+    [Alias('PlanOnly')]
+    [switch]$FinalizerPlanOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,12 +26,27 @@ $ErrorActionPreference = 'Stop'
 $releaseBuilder = Join-Path $PSScriptRoot 'build-eliot-windows-x64-release.ps1'
 . $releaseBuilder
 
+# Keep the unsigned-bundle verifier available to the production consumer from
+# this sealed finalizer scope.  The verifier implementation remains the
+# canonical builder implementation, but consumers must not reach through the
+# builder's private loading seam or supply a replacement scriptblock.
+if (-not (Get-Command Test-ReleaseBundle -CommandType Function -ErrorAction SilentlyContinue)) {
+    throw 'release finalizer failed to expose its canonical unsigned-bundle verifier'
+}
+
+function Invoke-ReleaseBundleInputVerification {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    Test-ReleaseBundle $Path
+}
+
 Set-StrictMode -Version Latest
 
 $script:AuthenticodeCodeSigningEku = '1.3.6.1.5.5.7.3.3'
 $script:X509EnhancedKeyUsageExtensionOid = '2.5.29.37'
 $script:AuthenticodeSigningPolicy = 'authenticode-rfc3161'
-$script:AuthenticodeSigningScope = 'runtime-materializer-six-pe-roles'
+$script:AuthenticodeSigningScope = 'runtime-materializer-six-plus-cli-pe-roles'
 $script:StagingOwnerMarker = '.eliot-release-staging-owner'
 $script:Rfc3161TimestampAttributeOid = '1.3.6.1.4.1.311.3.3.1'
 $script:Rfc3161TstInfoContentTypeOid = '1.2.840.113549.1.9.16.1.4'
@@ -376,6 +399,18 @@ public static class EliotReleaseNativeFileSystem
         }
     }
 
+    public static string ReadUtf8Text(SafeFileHandle source)
+    {
+        using (SafeFileHandle duplicate = DuplicateSameAccess(source))
+        using (FileStream stream = new FileStream(duplicate, FileAccess.Read, 65536, false))
+        using (StreamReader reader = new StreamReader(
+            stream, new UTF8Encoding(false, true), true, 65536, false))
+        {
+            stream.Seek(0, SeekOrigin.Begin);
+            return reader.ReadToEnd();
+        }
+    }
+
     public static void DeleteFileByHandle(SafeFileHandle file)
     {
         if (file == null || file.IsInvalid || file.IsClosed)
@@ -566,11 +601,14 @@ function Close-NativeDirectoryPin([object]$Pin) {
 }
 
 function Get-AuthenticodeRoleDefinitions {
-    # These are the six executable roles admitted by
-    # bins/eliot/src/source_bundle_materializer.rs::REQUIRED_ROLES.  The
-    # release also contains the CLI, Governor, Operator, and other payload;
-    # they are deliberately outside this exact canary signing scope.
+    # The six non-CLI executable roles are admitted by
+    # bins/eliot/src/source_bundle_materializer.rs::REQUIRED_ROLES.  The Rust
+    # CLI is an additional trust role: it is the install-authoritative front
+    # door named by the production handoff, but it is not a Phase-A payload
+    # role.  Governor, Operator UI, and other payload remain outside this
+    # exact signing scope.
     @(
+        [ordered]@{ role = 'cli'; path = 'runtime/eliot.exe' }
         [ordered]@{ role = 'host'; path = 'runtime/eliot-host.exe' }
         [ordered]@{ role = 'watchdog'; path = 'runtime/eliot-watchdog.exe' }
         [ordered]@{ role = 'kernel'; path = 'runtime/eliot-kernel.exe' }
@@ -2284,8 +2322,9 @@ function Invoke-ReleaseBundleFinalization {
             $receipt.role = [string]$role.role
             [void]$roleEvidence.Add([pscustomobject]$receipt)
         }
-        if ($roleEvidence.Count -ne 6) {
-            throw "exact six Authenticode roles were not signed: $($roleEvidence.Count)"
+        $expectedRoleCount = @((Get-AuthenticodeRoleDefinitions)).Count
+        if ($roleEvidence.Count -ne $expectedRoleCount) {
+            throw "exact Authenticode role set was not signed: expected=$expectedRoleCount actual=$($roleEvidence.Count)"
         }
 
         $signatureEvidence = Update-SignedReleaseManifests $staging $Plan $certificate @($roleEvidence)
@@ -2368,7 +2407,7 @@ function Invoke-ReleaseBundleFinalization {
                 bundle = $Plan.signed_bundle
                 staging_token = [string]$ownership.token
                 durable_install_authority = $false
-                next_authoritative_handoff = 'eliot installation materialize-source-bundle'
+                next_authoritative_handoff = 'scripts/invoke-eliot-windows-x64-production.ps1'
                 detail = [string]$_.Exception.Message
             }
         }
@@ -2380,9 +2419,9 @@ function Invoke-ReleaseBundleFinalization {
             staging_token = [string]$ownership.token
             immediate_readback = 'VERIFIED_SIGNED_SNAPSHOT'
             durable_install_authority = $false
-            next_authoritative_handoff = 'eliot installation materialize-source-bundle'
+            next_authoritative_handoff = 'scripts/invoke-eliot-windows-x64-production.ps1'
             signed_scope = $script:AuthenticodeSigningScope
-            roles = 6
+            roles = @((Get-AuthenticodeRoleDefinitions)).Count
             signature_evidence = $signatureEvidence
             detail = 'The committed directory passed immediate readback but its namespace cannot remain frozen through a durable consumer handoff.'
         }
@@ -2412,41 +2451,45 @@ if ($MyInvocation.InvocationName -eq '.') {
     return
 }
 
-if ($VerifyBundle) {
+if ($FinalizerVerifyBundle) {
     foreach ($required in @{
-            UnsignedBundle = $UnsignedBundle
-            SignToolPath = $SignToolPath
-            CertificateStoreLocation = $CertificateStoreLocation
-            CertificateThumbprint = $CertificateThumbprint
-            TimestampUrl = $TimestampUrl
+            UnsignedBundle = $FinalizerUnsignedBundle
+            SignToolPath = $FinalizerSignToolPath
+            CertificateStoreLocation = $FinalizerCertificateStoreLocation
+            CertificateThumbprint = $FinalizerCertificateThumbprint
+            TimestampUrl = $FinalizerTimestampUrl
         }.GetEnumerator()) {
         if ([string]::IsNullOrWhiteSpace([string]$required.Value)) {
             throw "-$($required.Key) is required for external-policy signed-bundle verification"
         }
     }
-    $verificationPlan = New-AuthenticodeVerificationPlan $UnsignedBundle $VerifyBundle $SignToolPath $CertificateStoreLocation $CertificateThumbprint $TimestampUrl
-    Test-ReleaseBundle $verificationPlan.unsigned_bundle | Out-Null
+    $verificationPlan = New-AuthenticodeVerificationPlan `
+        $FinalizerUnsignedBundle $FinalizerVerifyBundle $FinalizerSignToolPath `
+        $FinalizerCertificateStoreLocation $FinalizerCertificateThumbprint $FinalizerTimestampUrl
+    Invoke-ReleaseBundleInputVerification $verificationPlan.unsigned_bundle | Out-Null
     $verificationBaseline = New-ReleaseFinalizationBaseline $verificationPlan.unsigned_bundle
     $verificationCertificate = Resolve-CodeSigningCertificateIdentity $verificationPlan.certificate_store_location $verificationPlan.certificate_thumbprint
-    Test-FinalizedReleaseBundle $VerifyBundle $null $verificationBaseline $verificationPlan $verificationCertificate | ConvertTo-Json -Depth 12
+    Test-FinalizedReleaseBundle $FinalizerVerifyBundle $null $verificationBaseline $verificationPlan $verificationCertificate | ConvertTo-Json -Depth 12
     exit 0
 }
 
 foreach ($required in @{
-        UnsignedBundle = $UnsignedBundle
-        SignedBundle = $SignedBundle
-        SignToolPath = $SignToolPath
-        CertificateStoreLocation = $CertificateStoreLocation
-        CertificateThumbprint = $CertificateThumbprint
-        TimestampUrl = $TimestampUrl
+        UnsignedBundle = $FinalizerUnsignedBundle
+        SignedBundle = $FinalizerSignedBundle
+        SignToolPath = $FinalizerSignToolPath
+        CertificateStoreLocation = $FinalizerCertificateStoreLocation
+        CertificateThumbprint = $FinalizerCertificateThumbprint
+        TimestampUrl = $FinalizerTimestampUrl
     }.GetEnumerator()) {
     if ([string]::IsNullOrWhiteSpace([string]$required.Value)) {
         throw "-$($required.Key) is required; use -PlanOnly to inspect a complete explicit signing plan"
     }
 }
 
-$plan = New-AuthenticodeSigningPlan $UnsignedBundle $SignedBundle $SignToolPath $CertificateStoreLocation $CertificateThumbprint $TimestampUrl
-if ($PlanOnly) {
+$plan = New-AuthenticodeSigningPlan `
+    $FinalizerUnsignedBundle $FinalizerSignedBundle $FinalizerSignToolPath `
+    $FinalizerCertificateStoreLocation $FinalizerCertificateThumbprint $FinalizerTimestampUrl
+if ($FinalizerPlanOnly) {
     $plan | ConvertTo-Json -Depth 8
     exit 0
 }

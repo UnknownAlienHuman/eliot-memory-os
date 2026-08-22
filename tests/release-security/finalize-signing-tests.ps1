@@ -133,7 +133,6 @@ try {
         New-FakeUnsignedPe (Join-Path $source $role.path) ([byte]$roleMarker)
         $roleMarker++
     }
-    New-FakeUnsignedPe (Join-Path $source 'runtime/eliot.exe') ([byte]99)
     Set-Content -LiteralPath (Join-Path $source 'SIGNING_REQUIRED.txt') -Value 'unsigned fixture' -Encoding utf8
     Set-Content -LiteralPath (Join-Path $source 'NOTICE.txt') -Value 'immutable non-role fixture' -Encoding utf8
     $runtimeArtifacts = foreach ($role in $roles) {
@@ -150,18 +149,6 @@ try {
             bytes = [int64](Get-Item -LiteralPath $artifactPath).Length
         }
     }
-    $cliPath = Join-Path $source 'runtime/eliot.exe'
-    $runtimeArtifacts = @([ordered]@{
-            package = 'eliot'
-            binary = 'eliot'
-            role = 'cli'
-            path = 'runtime/eliot.exe'
-            source = 'fixture'
-            version = '0.1.0'
-            architecture = 'windows-x64'
-            sha256 = (Get-FileHash -LiteralPath $cliPath -Algorithm SHA256).Hash.ToLowerInvariant()
-            bytes = [int64](Get-Item -LiteralPath $cliPath).Length
-        }) + @($runtimeArtifacts)
     $releaseArtifacts = foreach ($artifact in $runtimeArtifacts) {
         [ordered]@{
             package = $artifact.package
@@ -220,10 +207,10 @@ try {
         $thumbprint `
         'http://timestamp.example.test/rfc3161'
     if ([string]$plan.schema -ne 'eliot-authenticode-signing-plan-v1' -or
-        @($plan.roles).Count -ne 6 -or
+        @($plan.roles).Count -ne 7 -or
         [string]$plan.file_digest_algorithm -cne 'sha256' -or
         [string]$plan.timestamp_digest_algorithm -cne 'sha256') {
-        throw 'pure signing plan does not bind the exact six roles and SHA-256 algorithms'
+        throw 'pure signing plan does not bind the exact six materializer roles plus CLI trust role and SHA-256 algorithms'
     }
     $finalizerSource = [System.IO.File]::ReadAllText((Join-Path $repo 'scripts/finalize-eliot-windows-x64-release.ps1'))
     foreach ($requiredNativeContract in @(
@@ -417,7 +404,7 @@ try {
         }
         if ($state.signCount -eq 1 -and $state.mutateNonRole) {
             $stageRoot = Split-Path -Parent (Split-Path -Parent $file)
-            Add-Content -LiteralPath (Join-Path $stageRoot 'runtime/eliot.exe') -Value 'non-role mutation'
+            Add-Content -LiteralPath (Join-Path $stageRoot 'NOTICE.txt') -Value 'non-role mutation'
         }
         if ($state.signCount -eq 1 -and $state.mutateNonRoleDirectory) {
             $stageRoot = Split-Path -Parent (Split-Path -Parent $file)
@@ -467,10 +454,16 @@ try {
         [string]$success.reason -cne 'MUTABLE_DIRECTORY_REQUIRES_CONSUMER_RECONCILIATION' -or
         [string]$success.immediate_readback -cne 'VERIFIED_SIGNED_SNAPSHOT' -or
         $success.durable_install_authority -ne $false -or
-        [string]$success.next_authoritative_handoff -cne 'eliot installation materialize-source-bundle' -or
+        [string]$success.next_authoritative_handoff -cne 'scripts/invoke-eliot-windows-x64-production.ps1' -or
         -not (Test-Path -LiteralPath $plan.signed_bundle -PathType Container) -or
-        $state.signCount -ne 6) {
-        throw 'normal finalization did not commit exactly six signed roles as typed mutable-directory uncertainty'
+        $state.signCount -ne 7) {
+        throw 'normal finalization did not commit exactly six materializer roles plus the CLI trust role as typed mutable-directory uncertainty'
+    }
+    $cliEvidence = @($success.signature_evidence.roles | Where-Object {
+            [string]$_.role_path -ceq 'runtime/eliot.exe' -and [string]$_.role -ceq 'cli'
+        })
+    if ($cliEvidence.Count -ne 1 -or -not $state.signedRoleNames.Contains('eliot.exe')) {
+        throw 'normal finalization did not produce the install-authoritative CLI trust-role receipt'
     }
     $sourceRelease = Get-Content -LiteralPath (Join-Path $source 'RELEASE.json') -Raw | ConvertFrom-Json
     if ($sourceRelease.signed -ne $false -or -not (Test-Path -LiteralPath (Join-Path $source 'SIGNING_REQUIRED.txt'))) {
@@ -933,7 +926,8 @@ try {
     [ordered]@{
         component = 'eliot_release_finalize_signing_tests'
         status = 'VERIFIED'
-        exact_roles = 6
+        exact_roles = 7
+        cli_trust_role_signed = $true
         explicit_signtool_store_timestamp = $true
         missing_certificate_rejected = $true
         wrong_certificate_rejected = $true
