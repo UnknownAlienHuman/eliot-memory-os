@@ -17,6 +17,7 @@ mod redb_journal;
 mod redb_store;
 mod scm_operation_store;
 mod service;
+mod supervision;
 
 pub use backend::{
     BackendReconcileState, CommittedAppend, DurableImage, FaultPoint, JournalBackend,
@@ -50,5 +51,6 @@ pub use scm_operation_store::{
     ScmOperationStore, ScmOperationStoreError,
 };
 pub use service::{HostStateJournalService, ProductionHostStateJournal};
+pub use supervision::reconstruct_current_supervision_incarnation;
 #[cfg(test)]
 mod tests;

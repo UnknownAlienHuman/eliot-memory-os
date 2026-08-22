@@ -2921,7 +2921,7 @@ struct ReadinessContourIdentity {
 
 #[cfg(windows)]
 impl ReadinessContourIdentity {
-    fn same_authority_contour(&self, other: &Self) -> bool {
+    fn same_probe_input_contour(&self, other: &Self) -> bool {
         self.approved_generation == other.approved_generation
             && self.approved_kernel_artifact == other.approved_kernel_artifact
             && self.approved_store_artifact == other.approved_store_artifact
@@ -2930,8 +2930,6 @@ impl ReadinessContourIdentity {
             && self.candidate_binding_digest == other.candidate_binding_digest
             && self.store_requirement_digest == other.store_requirement_digest
             && self.supervision_lease_id == other.supervision_lease_id
-            && self.supervision_ors_receipt_digest == other.supervision_ors_receipt_digest
-            && self.watchdog_publication_digest == other.watchdog_publication_digest
     }
 }
 
@@ -3579,6 +3577,10 @@ impl HostJobBranches {
         environment
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch environment projection binds the complete admitted Host, generation, process, and receipt contour"
+    )]
     fn environment(
         host: &HostInstallationEpoch,
         generation: &PlatformHandle,
@@ -6977,6 +6979,10 @@ fn supervision_publication_identity(
 }
 
 #[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "immutable Watchdog publication keeps ORS verification, marker-last creation, atomic commit, readback, and bounded retirement ordered"
+)]
 fn publish_current_watchdog_supervision_bundle(
     host_state_root: &Path,
     manifest: &CandidateManifest,
@@ -7073,16 +7079,15 @@ fn publish_current_watchdog_supervision_bundle(
                     "Watchdog publication temporary directory identity changed".to_owned(),
                 ));
             }
+            // A concurrent exact replay may win the create-new name, and a
+            // committed-unknown move may already own it. Neither outcome is
+            // authority until the exact retained readback below succeeds.
             match publication.publish(precommit.directory_identity) {
                 Ok(
                     DirectoryPublicationOutcome::Published(_)
                     | DirectoryPublicationOutcome::CommittedUnknown(_),
-                ) => {}
-                Err(DirectoryPublicationError::AlreadyExists) => {
-                    // A concurrent exact replay may win the create-new name.
-                    // Authority remains the retained post-commit readback
-                    // below; this losing temp can never replace the winner.
-                }
+                )
+                | Err(DirectoryPublicationError::AlreadyExists) => {}
                 Err(error) => {
                     return Err(HostError::RecoveryRequired(format!(
                         "Watchdog directory publication failed before commit: {error}"
@@ -15439,6 +15444,10 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "fresh readiness keeps probe, exact supervision publication, final ORS fence, journal append, and readback in causal order"
+    )]
     fn persist_fresh_authenticated_readiness(
         &mut self,
         generation: &PlatformHandle,
@@ -15536,8 +15545,13 @@ impl HostComposition {
             store_artifact,
             materialized_config_digest,
         )?;
-        if !confirmed.same_authority_contour(&contour)
+        if !confirmed.same_probe_input_contour(&contour)
             || confirmed.store_proof_fence.as_ref() != Some(&proof.store_fence)
+            || confirmed.supervision_lease_id.as_ref() != Some(&published_supervision.lease_id)
+            || confirmed.supervision_ors_receipt_digest.as_ref()
+                != Some(&published_supervision.ors_receipt_digest)
+            || confirmed.watchdog_publication_digest.as_ref()
+                != Some(&published_supervision.publication_digest)
         {
             return Err(HostError::ProcessContour(
                 "readiness contour changed while admitting the proof".to_owned(),
@@ -15946,7 +15960,7 @@ fn test_provisioned_supervision_authority(
     )
     .unwrap_or_else(|_| unreachable!());
     ProvisionedSupervisionAuthority::new(
-        "test-supervision-lease",
+        "test-supervision-scope",
         candidate_generation,
         authority_generation,
         key_reference,
@@ -17267,6 +17281,10 @@ mod journal_tests {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture constructs one complete signed ORS supervision snapshot for production-bound readiness tests"
+    )]
     fn readiness_supervision_snapshot(
         fixture: &ReadinessFixture,
     ) -> eliot_ors::SupervisionLeaseSnapshot {
@@ -18555,11 +18573,20 @@ mod journal_tests {
             classify_liveness_tick(
                 &mut exact_gate,
                 HostBranchDisposition::LiveAwaitingReadiness,
-                Some(Ok(exact)),
+                Some(Ok(exact.clone())),
                 now + std::time::Duration::from_millis(250),
             ),
             HostLivenessTick::HealthyLeasePreserved
         );
+
+        let mut renewed = exact.clone();
+        renewed.supervision_ors_receipt_digest = Some(changed("renewed-supervision-ors-receipt"));
+        renewed.watchdog_publication_digest = Some(changed("renewed-watchdog-publication"));
+        assert_ne!(renewed, exact);
+        assert!(renewed.same_probe_input_contour(&exact));
+        let mut foreign_incarnation = renewed;
+        foreign_incarnation.supervision_lease_id = Some(changed("foreign-supervision-lease"));
+        assert!(!foreign_incarnation.same_probe_input_contour(&exact));
 
         let mut missing_gate = HostReadinessGate::default();
         missing_gate.fail(None, ReadinessFailureKind::ContourUnavailable, now);

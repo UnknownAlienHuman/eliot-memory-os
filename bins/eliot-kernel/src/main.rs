@@ -513,9 +513,8 @@ async fn serve_control_connection(
         };
         let request = decode_control_request_frame(&received)?;
         let is_ready = matches!(&request.command, KernelControlCommand::ProbeReady);
-        let response = kernel
-            .apply_control_request(request, &peer, expected_sequence)
-            .await?;
+        let response =
+            Box::pin(kernel.apply_control_request(request, &peer, expected_sequence)).await?;
         expected_sequence = expected_sequence.saturating_add(1);
         let response_frame = control_response_frame(&received.connection_id, &response)?;
         send_checked(&mut front_door, &response_frame, limits).await?;

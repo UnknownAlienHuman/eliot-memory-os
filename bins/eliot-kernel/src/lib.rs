@@ -78,10 +78,11 @@ use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 use eliot_runtime_contracts::{
     Ed25519SupervisionLeaseSigner, GenerationCutoverRecord as RuntimeGenerationCutoverRecord,
     GenerationCutoverState, HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState,
-    ProvisionedSupervisionAuthority, SupervisionLease, SupervisionLeaseActiveStateBinding,
-    SupervisionLeaseError, SupervisionLeasePredecessorProof, SupervisionLeaseSigner,
-    SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionSealedKeyReference,
-    SupervisionTrustAnchor,
+    ProvisionedSupervisionAuthority, SupervisionGenerationBinding, SupervisionLease,
+    SupervisionLeaseActiveStateBinding, SupervisionLeaseError, SupervisionLeaseIncarnationBinding,
+    SupervisionLeasePredecessorIdentity, SupervisionLeasePredecessorProof, SupervisionLeaseSigner,
+    SupervisionLeaseTerminalDisposition, SupervisionLeaseVerificationContext,
+    SupervisionLeaseVerifier, SupervisionSealedKeyReference, SupervisionTrustAnchor,
 };
 use eliot_store_api::{
     CanonicalStoreClient, CanonicalValidationSnapshot, OrderingHeadExpectation, PreparedTransition,
@@ -108,6 +109,10 @@ pub const KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR: &str =
     "eliot-kernel::production-store-rebind:v1";
 const STORE_BRIDGE_ROUTE: &str = "store_bridge";
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
+#[cfg(windows)]
+const SUPERVISION_LEASE_VALIDITY_MS: u64 = 60_000;
+#[cfg(windows)]
+const SUPERVISION_LEASE_RENEW_AFTER_MS: u64 = 30_000;
 const ELIOTD_RECEIPT_PENDING_DEPENDENCY: &str = "eliotd-process-receipt";
 const ELIOTD_RECEIPT_PENDING_REASON: &str = "exact launched process receipt publication is pending";
 #[cfg(windows)]
@@ -640,6 +645,122 @@ struct DaemonRuntimeState {
     status: DaemonRuntimeStatus,
     receipt: Option<ProcessStartReceipt>,
     recovery_fenced: bool,
+    #[cfg(windows)]
+    supervision: Option<DaemonSupervisionContour>,
+    #[cfg(windows)]
+    live_ready: Option<EliotdLiveReadyEvidence>,
+}
+
+#[cfg(windows)]
+impl DaemonRuntimeState {
+    fn bind_live_receipt_publication_operation(
+        &mut self,
+        ready: &EliotdLiveReadyEvidence,
+    ) -> Result<(), KernelServiceError> {
+        if !matches!(
+            self.status,
+            DaemonRuntimeStatus::Running | DaemonRuntimeStatus::Ready
+        ) || self.receipt.is_none()
+            || self.live_ready.as_ref().is_some_and(|bound| bound != ready)
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        self.live_ready = Some(ready.clone());
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonSupervisionContour {
+    candidate_digest: String,
+    incarnation: SupervisionLeaseIncarnationBinding,
+    activation: KernelActivationReceipt,
+    generation_binding: SupervisionGenerationBinding,
+    state_fence: StateFence,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EliotdSupervisionSuccessorEvidence {
+    operation: SupervisionLeaseOperation,
+    state: LeaseState,
+    lease_id: String,
+    revision: u64,
+    receipt_sha256: String,
+    previous_receipt_sha256: Option<String>,
+}
+
+#[cfg(windows)]
+impl From<&SupervisionLeaseSnapshot> for EliotdSupervisionSuccessorEvidence {
+    fn from(snapshot: &SupervisionLeaseSnapshot) -> Self {
+        Self {
+            operation: snapshot.record.operation,
+            state: snapshot.record.state,
+            lease_id: snapshot.record.lease_id.as_str().to_owned(),
+            revision: snapshot.record.revision,
+            receipt_sha256: snapshot.receipt.receipt_sha256.clone(),
+            previous_receipt_sha256: snapshot.record.previous_receipt_sha256.clone(),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EliotdLiveReceiptDisposition {
+    ExactReplay,
+    ReplaceActivationPredecessor,
+    ReplaceRenewalPredecessor,
+}
+
+#[cfg(windows)]
+fn classify_eliotd_live_receipt_transition(
+    old: &EliotdLiveReceipt,
+    expected: &EliotdLiveReceipt,
+    status_is_ready: bool,
+    activation_predecessor: Option<&SupervisionLeasePredecessorIdentity>,
+    supervision_successor: Option<&EliotdSupervisionSuccessorEvidence>,
+) -> Result<EliotdLiveReceiptDisposition, KernelServiceError> {
+    if old == expected {
+        return Ok(EliotdLiveReceiptDisposition::ExactReplay);
+    }
+    let exact_activation_predecessor = activation_predecessor.is_some_and(|predecessor| {
+        predecessor.supervision_lease_id == old.supervision.lease_id
+            && predecessor.ors_receipt_sha256 == old.supervision.receipt_sha256
+            && old.installation_id == expected.installation_id
+            && old.runtime_state_roots_digest == expected.runtime_state_roots_digest
+            && old.supervision.public_key_fingerprint == expected.supervision.public_key_fingerprint
+    });
+    if !status_is_ready && exact_activation_predecessor {
+        return Ok(EliotdLiveReceiptDisposition::ReplaceActivationPredecessor);
+    }
+    let exact_renewal_predecessor = supervision_successor.is_some_and(|successor| {
+        successor.operation == SupervisionLeaseOperation::Renew
+            && successor.state == LeaseState::Active
+            && successor.lease_id == expected.supervision.lease_id
+            && successor.revision == expected.supervision.revision
+            && successor.receipt_sha256 == expected.supervision.receipt_sha256
+            && successor.previous_receipt_sha256.as_deref()
+                == Some(old.supervision.receipt_sha256.as_str())
+            && old.supervision.revision.checked_add(1) == Some(expected.supervision.revision)
+            && old.process == expected.process
+            && old.ready == expected.ready
+            && old.receipt_root_identity_sha256 == expected.receipt_root_identity_sha256
+            && old.runtime_state_roots_digest == expected.runtime_state_roots_digest
+            && old.installation_id == expected.installation_id
+            && old.approved_generation == expected.approved_generation
+            && old.generation == expected.generation
+            && old.authority_epoch == expected.authority_epoch
+            && old.config_descriptor_sha256 == expected.config_descriptor_sha256
+            && old.descriptor_sha256 == expected.descriptor_sha256
+            && old.kernel_artifact_sha256 == expected.kernel_artifact_sha256
+            && old.supervision.lease_id == expected.supervision.lease_id
+            && old.supervision.public_key_fingerprint == expected.supervision.public_key_fingerprint
+    });
+    if status_is_ready && exact_renewal_predecessor {
+        return Ok(EliotdLiveReceiptDisposition::ReplaceRenewalPredecessor);
+    }
+    Err(KernelServiceError::ReadinessNotProven)
 }
 
 /// Fail-closed errors for the Kernel-owned supervision lease authority.  The
@@ -686,7 +807,7 @@ impl From<OrsError> for SupervisionLeaseAuthorityError {
 
 /// Kernel-held signer which reopens and revalidates the exact installer-owned
 /// ciphertext file, then asks DPAPI-NG to unseal it under the current
-/// EliotHost service-SID token for each operation.
+/// `EliotHost` service-SID token for each operation.
 #[cfg(windows)]
 pub struct ProtectedSupervisionLeaseSigner {
     kernel_root: PathBuf,
@@ -883,7 +1004,7 @@ impl KernelSupervisionLeaseAuthority {
     }
 
     /// Returns the exact authoritative ORS head selected by the provisioned
-    /// lease identity. ProbeReady callers fail closed when this is absent.
+    /// lease identity. `ProbeReady` callers fail closed when this is absent.
     pub fn current_snapshot(
         &self,
         supervision_lease_id: &str,
@@ -894,16 +1015,80 @@ impl KernelSupervisionLeaseAuthority {
             .map_err(Into::into)
     }
 
+    fn staged_snapshot(
+        &self,
+        supervision_lease_id: &str,
+    ) -> Result<Option<SupervisionLeaseStageReceipt>, SupervisionLeaseAuthorityError> {
+        let lease_id = OperationIdentity::new(supervision_lease_id.to_owned())?;
+        self.ors
+            .reconcile_staged_supervision_lease(&lease_id)
+            .map_err(Into::into)
+    }
+
+    fn verify_active_snapshot(
+        &self,
+        snapshot: &SupervisionLeaseSnapshot,
+        supervision_lease_id: &str,
+        now_ms: u64,
+    ) -> Result<(), SupervisionLeaseAuthorityError> {
+        snapshot
+            .validate()
+            .map_err(SupervisionLeaseAuthorityError::Ors)?;
+        if snapshot.record.lease_id.as_str() != supervision_lease_id
+            || snapshot.record.state != LeaseState::Active
+            || snapshot.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+        {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ));
+        }
+        let context = snapshot
+            .active_verification_context(self.trust_anchor.public_key_fingerprint(), now_ms)
+            .map_err(SupervisionLeaseAuthorityError::Ors)?;
+        self.trust_anchor
+            .verify(&snapshot.record.artifact, &context)
+            .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+        Ok(())
+    }
+
+    fn verify_superseded_replay(
+        &self,
+        terminal: &SupervisionLeaseSnapshot,
+        expected_predecessor: &SupervisionLeasePredecessorIdentity,
+    ) -> Result<(), SupervisionLeaseAuthorityError> {
+        verify_superseded_supervision_replay(
+            self.ors.as_ref(),
+            &self.trust_anchor,
+            terminal,
+            expected_predecessor,
+        )
+    }
+
     /// Reads and authenticates the exact active ORS head embedded in the
     /// Kernel-owned eliotd receipt. Missing, terminal, stale, foreign, or
     /// differently fenced records are never projected as readiness evidence.
     pub fn current_eliotd_live_evidence(
         &self,
+        expected_supervision_lease_id: &str,
         expected_generation: u64,
         expected_authority_epoch: u64,
     ) -> Result<EliotdLiveSupervisionEvidence, SupervisionLeaseAuthorityError> {
+        self.current_eliotd_live_projection(
+            expected_supervision_lease_id,
+            expected_generation,
+            expected_authority_epoch,
+        )
+        .map(|(evidence, _)| evidence)
+    }
+
+    fn current_eliotd_live_projection(
+        &self,
+        expected_supervision_lease_id: &str,
+        expected_generation: u64,
+        expected_authority_epoch: u64,
+    ) -> Result<(EliotdLiveSupervisionEvidence, u64), SupervisionLeaseAuthorityError> {
         let current = self
-            .current_snapshot()?
+            .current_snapshot(expected_supervision_lease_id)?
             .ok_or(SupervisionLeaseAuthorityError::Ors(
                 OrsError::SupervisionLeaseBindingMismatch,
             ))?;
@@ -912,7 +1097,7 @@ impl KernelSupervisionLeaseAuthority {
             .map_err(SupervisionLeaseAuthorityError::Ors)?;
         if current.record.state != LeaseState::Active
             || current.record.projection != eliot_ors::SupervisionLeaseProjection::Active
-            || current.record.lease_id.as_str() != self.supervision_lease_id
+            || current.record.lease_id.as_str() != expected_supervision_lease_id
             || current
                 .record
                 .binding
@@ -955,15 +1140,18 @@ impl KernelSupervisionLeaseAuthority {
             .artifact
             .envelope_digest()
             .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
-        Ok(EliotdLiveSupervisionEvidence {
-            lease_id: current.record.lease_id.as_str().to_owned(),
-            record_id: current.record.record_id.as_str().to_owned(),
-            revision: current.record.revision,
-            receipt_sha256: current.receipt.receipt_sha256.clone(),
-            envelope_sha256,
-            payload_sha256: current.record.artifact.payload_sha256.clone(),
-            public_key_fingerprint: self.trust_anchor.public_key_fingerprint().to_owned(),
-        })
+        Ok((
+            EliotdLiveSupervisionEvidence {
+                lease_id: current.record.lease_id.as_str().to_owned(),
+                record_id: current.record.record_id.as_str().to_owned(),
+                revision: current.record.revision,
+                receipt_sha256: current.receipt.receipt_sha256.clone(),
+                envelope_sha256,
+                payload_sha256: current.record.artifact.payload_sha256.clone(),
+                public_key_fingerprint: self.trust_anchor.public_key_fingerprint().to_owned(),
+            },
+            payload.issued_at_ms,
+        ))
     }
 
     fn validate_binding(
@@ -994,31 +1182,7 @@ impl KernelSupervisionLeaseAuthority {
         payload: &SupervisionLease,
         now_ms: u64,
     ) -> SupervisionLeaseVerificationContext {
-        SupervisionLeaseVerificationContext {
-            now_ms,
-            lease_id: payload.lease_id.clone(),
-            host_epoch: payload.host_epoch,
-            activation_id: payload.activation_id.clone(),
-            activation_generation: payload.activation_generation,
-            kernel_epoch: payload.kernel_epoch,
-            watchdog_epoch: payload.watchdog_epoch,
-            state_fence: payload.state_fence.clone(),
-            scope_ref: payload.scope_ref.clone(),
-            observation_scope: payload.observation_scope.clone(),
-            target_id: payload.generation_binding.target_id.clone(),
-            module_id: payload.generation_binding.module_id.clone(),
-            process_id: payload.generation_binding.process_id.clone(),
-            target_generation: payload.generation_binding.target_generation,
-            module_generation: payload.generation_binding.module_generation,
-            process_generation: payload.generation_binding.process_generation,
-            public_key_fingerprint: self.trust_anchor.public_key_fingerprint.clone(),
-            ors_mirror: payload.ors_mirror.clone(),
-            active_state: SupervisionLeaseActiveStateBinding {
-                state: payload.state,
-                revocation_id: payload.revocation_id.clone(),
-                revocation_epoch: payload.revocation_epoch,
-            },
-        }
+        verification_context_for_supervision_payload(&self.trust_anchor, payload, now_ms)
     }
 
     fn staged_ticket(
@@ -1173,6 +1337,150 @@ impl KernelSupervisionLeaseAuthority {
         }
         Ok(committed)
     }
+}
+
+#[cfg(windows)]
+fn verification_context_for_supervision_payload(
+    trust_anchor: &SupervisionTrustAnchor,
+    payload: &SupervisionLease,
+    now_ms: u64,
+) -> SupervisionLeaseVerificationContext {
+    SupervisionLeaseVerificationContext {
+        now_ms,
+        lease_id: payload.lease_id.clone(),
+        host_epoch: payload.host_epoch,
+        activation_id: payload.activation_id.clone(),
+        activation_generation: payload.activation_generation,
+        kernel_epoch: payload.kernel_epoch,
+        watchdog_epoch: payload.watchdog_epoch,
+        state_fence: payload.state_fence.clone(),
+        scope_ref: payload.scope_ref.clone(),
+        observation_scope: payload.observation_scope.clone(),
+        target_id: payload.generation_binding.target_id.clone(),
+        module_id: payload.generation_binding.module_id.clone(),
+        process_id: payload.generation_binding.process_id.clone(),
+        target_generation: payload.generation_binding.target_generation,
+        module_generation: payload.generation_binding.module_generation,
+        process_generation: payload.generation_binding.process_generation,
+        public_key_fingerprint: trust_anchor.public_key_fingerprint.clone(),
+        ors_mirror: payload.ors_mirror.clone(),
+        active_state: SupervisionLeaseActiveStateBinding {
+            state: payload.state,
+            revocation_id: payload.revocation_id.clone(),
+            revocation_epoch: payload.revocation_epoch,
+        },
+    }
+}
+
+#[cfg(windows)]
+fn verify_superseded_supervision_replay(
+    ors: &RedbRecoveryStore,
+    trust_anchor: &SupervisionTrustAnchor,
+    terminal: &SupervisionLeaseSnapshot,
+    expected_predecessor: &SupervisionLeasePredecessorIdentity,
+) -> Result<(), SupervisionLeaseAuthorityError> {
+    terminal
+        .validate()
+        .map_err(SupervisionLeaseAuthorityError::Ors)?;
+    expected_predecessor
+        .validate()
+        .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+    if terminal.record.operation != SupervisionLeaseOperation::Supersede
+        || terminal.record.state != LeaseState::Superseded
+        || terminal.record.projection != eliot_ors::SupervisionLeaseProjection::Terminal
+        || terminal.record.binding.terminal_disposition
+            != Some(SupervisionLeaseTerminalDisposition::Superseded)
+        || terminal.record.lease_id.as_str() != expected_predecessor.supervision_lease_id
+        || terminal.record.previous_receipt_sha256.as_deref()
+            != Some(expected_predecessor.ors_receipt_sha256.as_str())
+    {
+        return Err(SupervisionLeaseAuthorityError::Ors(
+            OrsError::SupervisionLeaseBindingMismatch,
+        ));
+    }
+    let lease_id = OperationIdentity::new(expected_predecessor.supervision_lease_id.clone())?;
+    let history = ors.load_supervision_lease_history(&lease_id, 2)?;
+    if history.len() != 2 || history.first() != Some(terminal) {
+        return Err(SupervisionLeaseAuthorityError::Ors(
+            OrsError::SupervisionLeaseBindingMismatch,
+        ));
+    }
+    let prior = &history[1];
+    prior
+        .validate()
+        .map_err(SupervisionLeaseAuthorityError::Ors)?;
+    if prior.record.state != LeaseState::Active
+        || prior.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+        || prior.record.lease_id != lease_id
+        || prior.record.revision.checked_add(1) != Some(terminal.record.revision)
+        || prior.receipt.receipt_sha256 != expected_predecessor.ors_receipt_sha256
+    {
+        return Err(SupervisionLeaseAuthorityError::Ors(
+            OrsError::SupervisionLeaseBindingMismatch,
+        ));
+    }
+    let prior_context = verification_context_for_supervision_payload(
+        trust_anchor,
+        &prior.record.artifact.payload,
+        prior.record.artifact.payload.issued_at_ms,
+    );
+    let verified_prior = trust_anchor
+        .verify(&prior.record.artifact, &prior_context)
+        .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+    let predecessor_proof = SupervisionLeasePredecessorProof {
+        lease_id: prior.record.lease_id.as_str().to_owned(),
+        record_id: prior.record.record_id.as_str().to_owned(),
+        lease_revision: prior.record.revision,
+        receipt_sha256: prior.receipt.receipt_sha256.clone(),
+        envelope_sha256: prior
+            .record
+            .artifact
+            .envelope_digest()
+            .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
+    };
+    trust_anchor
+        .verify_terminal_transition(
+            &verified_prior,
+            &terminal.record.artifact,
+            &predecessor_proof,
+        )
+        .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn supervision_operation_identity(
+    kind: &str,
+    lease_id: &str,
+    predecessor_receipt: Option<&str>,
+) -> Result<OperationIdentity, SupervisionLeaseAuthorityError> {
+    let digest = sha256_json(&(kind, lease_id, predecessor_receipt))
+        .map_err(|error| SupervisionLeaseAuthorityError::Configuration(error.to_string()))?;
+    OperationIdentity::new(format!("eliot-supervision:{kind}:{digest}")).map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn supervision_binding_matches_contour(
+    binding: &eliot_ors::SupervisionLeaseBinding,
+    contour: &DaemonSupervisionContour,
+) -> Result<bool, SupervisionLeaseAuthorityError> {
+    let incarnation = &contour.incarnation;
+    let scope_ref = incarnation
+        .derived_scope_ref()
+        .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+    let watchdog_epoch = AuthorityEpoch::new(incarnation.watchdog_epoch.sequence)
+        .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+    Ok(binding.scope_ref.as_str() == scope_ref
+        && binding.observation_scope == incarnation.observation_scope
+        && binding.installation_id.as_str() == incarnation.installation_id
+        && binding.host_epoch.value() == incarnation.host_epoch.sequence
+        && binding.activation_id.as_str() == incarnation.activation_id
+        && binding.activation_generation == contour.activation.generation
+        && binding.kernel_epoch == contour.activation.authority_epoch
+        && binding.watchdog_epoch == watchdog_epoch
+        && binding.generation_binding == contour.generation_binding
+        && binding.state_fence == contour.state_fence
+        && binding.wake_policy == incarnation.wake_policy)
 }
 
 /// Result of the closed Kernel semantic gateway for one authenticated frame.
@@ -3958,6 +4266,10 @@ impl KernelComposition {
                 status: DaemonRuntimeStatus::NotLaunched,
                 receipt: None,
                 recovery_fenced: false,
+                #[cfg(windows)]
+                supervision: None,
+                #[cfg(windows)]
+                live_ready: None,
             }),
             daemon_status_changed: tokio::sync::Notify::new(),
             #[cfg(windows)]
@@ -4885,6 +5197,8 @@ impl KernelComposition {
                 ));
             }
             state.status = DaemonRuntimeStatus::Launching;
+            state.supervision = None;
+            state.live_ready = None;
         }
         let receipt = match gateway.start(&owner, admission, proof).await {
             Ok(receipt) => receipt,
@@ -5213,6 +5527,8 @@ impl KernelComposition {
             state.status = DaemonRuntimeStatus::NotLaunched;
             state.receipt = None;
             state.recovery_fenced = false;
+            state.supervision = None;
+            state.live_ready = None;
         }
         self.daemon_status_changed.notify_one();
         let launched = match self.launch_eliotd().await {
@@ -5286,6 +5602,17 @@ impl KernelComposition {
             .daemon_runtime
             .lock()
             .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?;
+        #[cfg(windows)]
+        if state.receipt.is_some()
+            && state.status == DaemonRuntimeStatus::Ready
+            && state.supervision.is_some()
+        {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        if state.supervision.is_none() {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
         if state.receipt.is_none() || state.status != DaemonRuntimeStatus::Running {
             return Err(KernelServiceError::ReadinessNotProven);
         }
@@ -5329,6 +5656,11 @@ impl KernelComposition {
             .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?;
         state.status = DaemonRuntimeStatus::Failed(reason.to_owned());
         state.recovery_fenced |= recovery_fenced;
+        #[cfg(windows)]
+        {
+            state.supervision = None;
+            state.live_ready = None;
+        }
         drop(state);
         self.daemon_status_changed.notify_one();
         let mut service = self
@@ -5880,6 +6212,10 @@ impl KernelComposition {
     /// narrow handshake/health dispositions are handled here; semantic
     /// Governor mutations remain owned by `eliotd` and the existing Kernel
     /// transition gateway.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed daemon dispatcher keeps authenticated lifecycle operations and their exact response projection in one audited gateway"
+    )]
     pub async fn execute_daemon_request(
         &self,
         session: &Session,
@@ -5915,9 +6251,40 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 #[cfg(windows)]
-                self.validate_authenticated_daemon_ready()
-                    .await
-                    .map_err(|_| TransportError::SessionFenced)?;
+                {
+                    let (launch, process) = self
+                        .validated_authenticated_daemon_ready_inputs()
+                        .await
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    let (contour, snapshot) = self
+                        .establish_daemon_supervision(session, &process)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    if snapshot.record.lease_id.as_str() != contour.incarnation.supervision_lease_id
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let ready = Self::eliotd_live_ready_evidence(session, &request_id, &payload)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    {
+                        let mut state = self
+                            .daemon_runtime
+                            .lock()
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        if state
+                            .supervision
+                            .as_ref()
+                            .is_some_and(|bound| bound != &contour)
+                        {
+                            return Err(TransportError::SessionFenced);
+                        }
+                        state
+                            .bind_live_receipt_publication_operation(&ready)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        state.supervision = Some(contour.clone());
+                    }
+                    self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, None)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                }
                 self.mark_daemon_ready()
                     .map_err(|_| TransportError::SessionFenced)
                     .map(|()| Self::accepted_daemon_response())
@@ -6245,15 +6612,472 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    fn daemon_supervision_contour(
+        &self,
+        session: &Session,
+        process: &ProcessStartReceipt,
+    ) -> Result<DaemonSupervisionContour, KernelServiceError> {
+        process
+            .validate()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let (candidate, activation) = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?;
+            let candidate = service
+                .candidate_binding()
+                .cloned()
+                .ok_or(KernelServiceError::ReadinessNotProven)?;
+            let activation = service
+                .activation_receipt()
+                .cloned()
+                .ok_or(KernelServiceError::ReadinessNotProven)?;
+            (candidate, activation)
+        };
+        candidate
+            .validate()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        candidate
+            .supervision_incarnation
+            .validate()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        if activation.candidate_binding_digest != candidate_digest
+            || activation.authority_epoch != candidate.kernel_epoch
+            || session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER
+            || session.authority_epoch != activation.authority_epoch.value()
+            || session.module_generation.generation != activation.generation
+            || process.accepted_generation().get() != session.module_generation.generation.value()
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let state_fence = StateFence::new(activation.authority_epoch, activation.generation);
+        if session.module_generation.state_fence != state_fence {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let authority = self
+            .supervision_lease_authority
+            .as_ref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        if authority.supervision_lease_scope_id()
+            != candidate.supervision_incarnation.supervision_lease_scope_id
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let physical = process.identity().physical();
+        let generation_binding = SupervisionGenerationBinding {
+            target_id: session.module_generation.artifact_id.as_str().to_owned(),
+            target_generation: session.module_generation.generation,
+            module_id: session.module_generation.module_id.as_str().to_owned(),
+            module_generation: session.module_generation.generation,
+            process_id: format!(
+                "pid:{}:start:{}",
+                physical.process_id(),
+                physical.start_time_100ns()
+            ),
+            process_generation: ResourceGeneration::new(process.accepted_generation().get())
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?,
+        };
+        Ok(DaemonSupervisionContour {
+            candidate_digest,
+            incarnation: candidate.supervision_incarnation,
+            activation,
+            generation_binding,
+            state_fence,
+        })
+    }
+
+    #[cfg(windows)]
+    fn active_supervision_binding(
+        contour: &DaemonSupervisionContour,
+        issued_at_ms: u64,
+    ) -> Result<eliot_ors::SupervisionLeaseBinding, SupervisionLeaseAuthorityError> {
+        if issued_at_ms == 0 {
+            return Err(SupervisionLeaseAuthorityError::Configuration(
+                "supervision issue time is zero".to_owned(),
+            ));
+        }
+        let expires_at_ms = issued_at_ms
+            .checked_add(SUPERVISION_LEASE_VALIDITY_MS)
+            .ok_or_else(|| {
+                SupervisionLeaseAuthorityError::Configuration(
+                    "supervision validity interval overflowed".to_owned(),
+                )
+            })?;
+        let renew_before_ms = issued_at_ms
+            .checked_add(SUPERVISION_LEASE_RENEW_AFTER_MS)
+            .ok_or_else(|| {
+                SupervisionLeaseAuthorityError::Configuration(
+                    "supervision renewal interval overflowed".to_owned(),
+                )
+            })?;
+        let incarnation = &contour.incarnation;
+        Ok(eliot_ors::SupervisionLeaseBinding {
+            scope_ref: OperationIdentity::new(
+                incarnation
+                    .derived_scope_ref()
+                    .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
+            )?,
+            observation_scope: incarnation.observation_scope.clone(),
+            installation_id: OperationIdentity::new(incarnation.installation_id.clone())?,
+            host_epoch: AuthorityEpoch::new(incarnation.host_epoch.sequence)
+                .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
+            activation_id: OperationIdentity::new(incarnation.activation_id.clone())?,
+            activation_generation: contour.activation.generation,
+            kernel_epoch: contour.activation.authority_epoch,
+            watchdog_epoch: AuthorityEpoch::new(incarnation.watchdog_epoch.sequence)
+                .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
+            generation_binding: contour.generation_binding.clone(),
+            state_fence: contour.state_fence.clone(),
+            issued_at_ms,
+            expires_at_ms,
+            renew_before_ms,
+            wake_policy: incarnation.wake_policy.clone(),
+            state: LeaseState::Active,
+            terminal_disposition: None,
+            revocation_reason: None,
+            revocation_id: None,
+            revocation_epoch: None,
+        })
+    }
+
+    #[cfg(windows)]
+    fn supersede_predecessor(
+        authority: &KernelSupervisionLeaseAuthority,
+        contour: &DaemonSupervisionContour,
+    ) -> Result<(), SupervisionLeaseAuthorityError> {
+        let Some(predecessor) = contour.incarnation.predecessor.as_ref() else {
+            return Ok(());
+        };
+        predecessor
+            .validate()
+            .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+        let current = authority
+            .current_snapshot(&predecessor.supervision_lease_id)?
+            .ok_or(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ))?;
+        current
+            .validate()
+            .map_err(SupervisionLeaseAuthorityError::Ors)?;
+        if current.record.state == LeaseState::Superseded
+            && current.record.projection == eliot_ors::SupervisionLeaseProjection::Terminal
+            && current
+                .record
+                .artifact
+                .payload
+                .ors_mirror
+                .previous_receipt_sha256
+                .as_deref()
+                == Some(predecessor.ors_receipt_sha256.as_str())
+        {
+            return authority.verify_superseded_replay(&current, predecessor);
+        }
+        if current.record.state != LeaseState::Active
+            || current.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+            || current.receipt.receipt_sha256 != predecessor.ors_receipt_sha256
+        {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ));
+        }
+        let stage = if let Some(stage) =
+            authority.staged_snapshot(&predecessor.supervision_lease_id)?
+        {
+            if stage.ticket.operation != SupervisionLeaseOperation::Supersede
+                || stage.ticket.expected_revision != Some(current.record.revision)
+                || stage.ticket.previous_receipt_sha256.as_deref()
+                    != Some(predecessor.ors_receipt_sha256.as_str())
+                || stage.ticket.binding.state != LeaseState::Superseded
+                || stage.ticket.binding.terminal_disposition
+                    != Some(SupervisionLeaseTerminalDisposition::Superseded)
+            {
+                return Err(SupervisionLeaseAuthorityError::Ors(
+                    OrsError::SupervisionLeaseTicketConflict,
+                ));
+            }
+            stage
+        } else {
+            let mut binding = current.record.binding.clone();
+            binding.state = LeaseState::Superseded;
+            binding.terminal_disposition = Some(SupervisionLeaseTerminalDisposition::Superseded);
+            let ticket_id = supervision_operation_identity(
+                "supersede-ticket",
+                &predecessor.supervision_lease_id,
+                Some(&predecessor.ors_receipt_sha256),
+            )?;
+            authority.prepare(SupervisionLeasePrepareRequest {
+                operation_id: supervision_operation_identity(
+                    "supersede-operation",
+                    &predecessor.supervision_lease_id,
+                    Some(&predecessor.ors_receipt_sha256),
+                )?,
+                ticket_id,
+                lease_id: OperationIdentity::new(predecessor.supervision_lease_id.clone())?,
+                expected_revision: Some(current.record.revision),
+                operation: SupervisionLeaseOperation::Supersede,
+                binding,
+            })?
+        };
+        let terminal = authority.commit_terminal(&stage.ticket)?;
+        if terminal.record.state != LeaseState::Superseded
+            || terminal.record.projection != eliot_ors::SupervisionLeaseProjection::Terminal
+            || terminal
+                .record
+                .artifact
+                .payload
+                .ors_mirror
+                .previous_receipt_sha256
+                .as_deref()
+                != Some(predecessor.ors_receipt_sha256.as_str())
+        {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ));
+        }
+        authority.verify_superseded_replay(&terminal, predecessor)
+    }
+
+    #[cfg(windows)]
+    fn commit_or_replay_active_supervision(
+        authority: &KernelSupervisionLeaseAuthority,
+        contour: &DaemonSupervisionContour,
+        now_ms: u64,
+    ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
+        let lease_id = contour.incarnation.supervision_lease_id.as_str();
+        Self::supersede_predecessor(authority, contour)?;
+        if let Some(current) = authority.current_snapshot(lease_id)? {
+            authority.verify_active_snapshot(&current, lease_id, now_ms)?;
+            if !supervision_binding_matches_contour(&current.record.binding, contour)? {
+                return Err(SupervisionLeaseAuthorityError::Ors(
+                    OrsError::SupervisionLeaseBindingMismatch,
+                ));
+            }
+            return Ok(current);
+        }
+        let stage = if let Some(stage) = authority.staged_snapshot(lease_id)? {
+            if stage.ticket.operation != SupervisionLeaseOperation::Commit
+                || stage.ticket.expected_revision.is_some()
+                || stage.ticket.binding.state != LeaseState::Active
+                || !supervision_binding_matches_contour(&stage.ticket.binding, contour)?
+                || now_ms >= stage.ticket.binding.expires_at_ms
+            {
+                return Err(SupervisionLeaseAuthorityError::Ors(
+                    OrsError::SupervisionLeaseTicketConflict,
+                ));
+            }
+            stage
+        } else {
+            let binding = Self::active_supervision_binding(contour, now_ms)?;
+            authority.prepare(SupervisionLeasePrepareRequest {
+                ticket_id: supervision_operation_identity("commit-ticket", lease_id, None)?,
+                operation_id: supervision_operation_identity("commit-operation", lease_id, None)?,
+                lease_id: OperationIdentity::new(lease_id.to_owned())?,
+                expected_revision: None,
+                operation: SupervisionLeaseOperation::Commit,
+                binding,
+            })?
+        };
+        let current = authority.commit_active(&stage.ticket)?;
+        authority.verify_active_snapshot(&current, lease_id, now_ms)?;
+        if !supervision_binding_matches_contour(&current.record.binding, contour)? {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ));
+        }
+        Ok(current)
+    }
+
+    #[cfg(windows)]
+    fn renew_current_supervision(
+        authority: &KernelSupervisionLeaseAuthority,
+        contour: &DaemonSupervisionContour,
+        now_ms: u64,
+    ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
+        let lease_id = contour.incarnation.supervision_lease_id.as_str();
+        let current =
+            authority
+                .current_snapshot(lease_id)?
+                .ok_or(SupervisionLeaseAuthorityError::Ors(
+                    OrsError::SupervisionLeaseBindingMismatch,
+                ))?;
+        authority.verify_active_snapshot(&current, lease_id, now_ms)?;
+        if !supervision_binding_matches_contour(&current.record.binding, contour)? {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ));
+        }
+        if now_ms < current.record.binding.renew_before_ms {
+            return Ok(current);
+        }
+        let stage = if let Some(stage) = authority.staged_snapshot(lease_id)? {
+            if stage.ticket.operation != SupervisionLeaseOperation::Renew
+                || stage.ticket.expected_revision != Some(current.record.revision)
+                || stage.ticket.previous_receipt_sha256.as_deref()
+                    != Some(current.receipt.receipt_sha256.as_str())
+                || stage.ticket.binding.state != LeaseState::Active
+                || !supervision_binding_matches_contour(&stage.ticket.binding, contour)?
+                || now_ms >= stage.ticket.binding.expires_at_ms
+            {
+                return Err(SupervisionLeaseAuthorityError::Ors(
+                    OrsError::SupervisionLeaseTicketConflict,
+                ));
+            }
+            stage
+        } else {
+            let binding = Self::active_supervision_binding(contour, now_ms)?;
+            authority.prepare(SupervisionLeasePrepareRequest {
+                ticket_id: supervision_operation_identity(
+                    "renew-ticket",
+                    lease_id,
+                    Some(&current.receipt.receipt_sha256),
+                )?,
+                operation_id: supervision_operation_identity(
+                    "renew-operation",
+                    lease_id,
+                    Some(&current.receipt.receipt_sha256),
+                )?,
+                lease_id: OperationIdentity::new(lease_id.to_owned())?,
+                expected_revision: Some(current.record.revision),
+                operation: SupervisionLeaseOperation::Renew,
+                binding,
+            })?
+        };
+        let renewed = authority.commit_active(&stage.ticket)?;
+        authority.verify_active_snapshot(&renewed, lease_id, now_ms)?;
+        if renewed.record.revision <= current.record.revision
+            || !supervision_binding_matches_contour(&renewed.record.binding, contour)?
+        {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ));
+        }
+        Ok(renewed)
+    }
+
+    #[cfg(windows)]
+    fn establish_daemon_supervision(
+        &self,
+        session: &Session,
+        process: &ProcessStartReceipt,
+    ) -> Result<(DaemonSupervisionContour, SupervisionLeaseSnapshot), KernelServiceError> {
+        let contour = self.daemon_supervision_contour(session, process)?;
+        let authority = self
+            .supervision_lease_authority
+            .as_ref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let snapshot = Self::commit_or_replay_active_supervision(authority, &contour, unix_ms())
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        Ok((contour, snapshot))
+    }
+
+    #[cfg(windows)]
+    fn renew_daemon_supervision_for_probe(
+        &self,
+        request: &KernelControlRequest,
+    ) -> Result<(SupervisionLeaseSnapshot, EliotdLiveReceipt), KernelServiceError> {
+        let (contour, process, ready) = {
+            let state = self.daemon_runtime.lock().map_err(|_| {
+                KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
+            })?;
+            if state.status != DaemonRuntimeStatus::Ready {
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
+            (
+                state
+                    .supervision
+                    .clone()
+                    .ok_or(KernelServiceError::ReadinessNotProven)?,
+                state
+                    .receipt
+                    .clone()
+                    .ok_or(KernelServiceError::ReadinessNotProven)?,
+                state
+                    .live_ready
+                    .clone()
+                    .ok_or(KernelServiceError::ReadinessNotProven)?,
+            )
+        };
+        let candidate_digest = request
+            .candidate
+            .compute_digest()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let activation = self
+            .service
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?
+            .activation_receipt()
+            .cloned()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        if contour.candidate_digest != candidate_digest
+            || contour.incarnation != request.candidate.supervision_incarnation
+            || contour.activation != activation
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let authority = self
+            .supervision_lease_authority
+            .as_ref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let launch = self
+            .active_daemon_launch()?
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let lease_id = &contour.incarnation.supervision_lease_id;
+        let before = authority
+            .current_snapshot(lease_id)
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        authority
+            .verify_active_snapshot(&before, lease_id, unix_ms())
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        if !supervision_binding_matches_contour(&before.record.binding, &contour)
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        // A retry first reconciles any exact current ORS successor left by an
+        // earlier ambiguous publication. This prevents a second Renew from
+        // skipping over the receipt that still names the older ORS head.
+        let _ =
+            self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, Some(&before))?;
+        let renewed = Self::renew_current_supervision(authority, &contour, unix_ms())
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let published =
+            self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, Some(&renewed))?;
+        Ok((renewed, published))
+    }
+
+    #[cfg(windows)]
+    fn eliotd_live_ready_evidence(
+        session: &Session,
+        request_id: &RequestId,
+        payload: &serde_json::Value,
+    ) -> Result<EliotdLiveReadyEvidence, KernelServiceError> {
+        Ok(EliotdLiveReadyEvidence {
+            request_id: request_id.as_str().to_owned(),
+            request_payload_sha256: sha256_json(payload)
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?,
+            connection_id: session.connection_id.clone(),
+            session_epoch: session.session_epoch,
+            authority_epoch: session.authority_epoch,
+            generation: session.module_generation.generation.value(),
+            launch_nonce_sha256: format!("{:x}", Sha256::digest(session.launch_nonce.as_bytes())),
+        })
+    }
+
+    #[cfg(windows)]
     #[allow(clippy::too_many_lines)]
     fn publish_eliotd_live_receipt(
         &self,
         launch: &EliotdLaunchDescriptor,
         process: &ProcessStartReceipt,
-        session: &Session,
-        request_id: &RequestId,
-        payload: &serde_json::Value,
-    ) -> Result<(), KernelServiceError> {
+        ready: &EliotdLiveReadyEvidence,
+        supervision_contour: &DaemonSupervisionContour,
+        supervision_successor: Option<&SupervisionLeaseSnapshot>,
+    ) -> Result<EliotdLiveReceipt, KernelServiceError> {
         let runtime_binding = self
             .eliotd_receipt_binding
             .as_ref()
@@ -6287,19 +7111,28 @@ impl KernelComposition {
             .supervision_lease_authority
             .as_ref()
             .ok_or(KernelServiceError::ReadinessNotProven)?;
-        let supervision = supervision_authority
-            .current_eliotd_live_evidence(launch.generation.value(), launch.authority_epoch.value())
+        if let Some(expected_successor) = supervision_successor {
+            let observed = supervision_authority
+                .current_snapshot(&supervision_contour.incarnation.supervision_lease_id)
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+            if observed.as_ref() != Some(expected_successor) {
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
+            supervision_authority
+                .verify_active_snapshot(
+                    expected_successor,
+                    &supervision_contour.incarnation.supervision_lease_id,
+                    unix_ms(),
+                )
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        }
+        let (supervision, supervision_issued_at_ms) = supervision_authority
+            .current_eliotd_live_projection(
+                &supervision_contour.incarnation.supervision_lease_id,
+                launch.generation.value(),
+                launch.authority_epoch.value(),
+            )
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
-        let ready = EliotdLiveReadyEvidence {
-            request_id: request_id.as_str().to_owned(),
-            request_payload_sha256: sha256_json(payload)
-                .map_err(|_| KernelServiceError::ReadinessNotProven)?,
-            connection_id: session.connection_id.clone(),
-            session_epoch: session.session_epoch,
-            authority_epoch: session.authority_epoch,
-            generation: session.module_generation.generation.value(),
-            launch_nonce_sha256: format!("{:x}", Sha256::digest(session.launch_nonce.as_bytes())),
-        };
         let receipt = EliotdLiveReceipt::new(
             canonical_root.to_string_lossy(),
             sha256_json(&root_lease.identity())
@@ -6314,8 +7147,8 @@ impl KernelComposition {
             kernel_artifact,
             process.clone(),
             supervision.clone(),
-            ready,
-            unix_ms(),
+            ready.clone(),
+            supervision_issued_at_ms,
         )
         .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         receipt
@@ -6351,22 +7184,37 @@ impl KernelComposition {
                 {
                     return Err(KernelServiceError::ReadinessNotProven);
                 }
-                // A prior receipt is replaceable only as a stale physical
-                // daemon instance inside this exact immutable launch contour.
-                // A foreign installation/generation/root/artifact or lease
-                // identity is not a CAS predecessor and must never be adopted
-                // or overwritten just because it occupies the destination.
+                let same_active_contour = old.runtime_state_roots_digest
+                    == receipt.runtime_state_roots_digest
+                    && old.installation_id == receipt.installation_id
+                    && old.approved_generation == receipt.approved_generation
+                    && old.generation == receipt.generation
+                    && old.authority_epoch == receipt.authority_epoch
+                    && old.config_descriptor_sha256 == receipt.config_descriptor_sha256
+                    && old.descriptor_sha256 == receipt.descriptor_sha256
+                    && old.kernel_artifact_sha256 == receipt.kernel_artifact_sha256
+                    && old.supervision.lease_id == receipt.supervision.lease_id
+                    && old.supervision.public_key_fingerprint
+                        == receipt.supervision.public_key_fingerprint;
+                let exact_predecessor = supervision_contour
+                    .incarnation
+                    .predecessor
+                    .as_ref()
+                    .is_some_and(|predecessor| {
+                        predecessor.supervision_lease_id == old.supervision.lease_id
+                            && predecessor.ors_receipt_sha256 == old.supervision.receipt_sha256
+                            && old.installation_id == receipt.installation_id
+                            && old.supervision.public_key_fingerprint
+                                == receipt.supervision.public_key_fingerprint
+                    });
+                // The destination is replaceable only by the same active
+                // contour or by the exact journal-bound predecessor that was
+                // durably Superseded before this publication.
+                if !same_active_contour && !exact_predecessor {
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
                 if old.runtime_state_roots_digest != receipt.runtime_state_roots_digest
                     || old.installation_id != receipt.installation_id
-                    || old.approved_generation != receipt.approved_generation
-                    || old.generation != receipt.generation
-                    || old.authority_epoch != receipt.authority_epoch
-                    || old.config_descriptor_sha256 != receipt.config_descriptor_sha256
-                    || old.descriptor_sha256 != receipt.descriptor_sha256
-                    || old.kernel_artifact_sha256 != receipt.kernel_artifact_sha256
-                    || old.supervision.lease_id != receipt.supervision.lease_id
-                    || old.supervision.public_key_fingerprint
-                        != receipt.supervision.public_key_fingerprint
                 {
                     return Err(KernelServiceError::ReadinessNotProven);
                 }
@@ -6387,52 +7235,46 @@ impl KernelComposition {
             .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?
             .status
             == DaemonRuntimeStatus::Ready;
-        if let Some((old_bytes, _)) = &existing {
+        let successor_evidence = supervision_successor.map(Into::into);
+        let existing_disposition = if let Some((old_bytes, _)) = &existing {
             let old: EliotdLiveReceipt = serde_json::from_slice(old_bytes)
                 .map_err(|_| KernelServiceError::ReadinessNotProven)?;
-            if old.process != *process
-                || old.generation != receipt.generation
-                || old.authority_epoch != receipt.authority_epoch
-                || old.runtime_state_roots_digest != receipt.runtime_state_roots_digest
-                || old.installation_id != receipt.installation_id
-                || old.approved_generation != receipt.approved_generation
-                || old.config_descriptor_sha256 != receipt.config_descriptor_sha256
-                || old.descriptor_sha256 != receipt.descriptor_sha256
-                || old.kernel_artifact_sha256 != receipt.kernel_artifact_sha256
-                || old.supervision != receipt.supervision
-                || old.ready != receipt.ready
-            {
-                if status_is_ready {
-                    return Err(KernelServiceError::ReadinessNotProven);
-                }
-            } else {
-                // Only the already-Ready in-memory state proves that this
-                // Kernel previously accepted the exact publication. A file
-                // left by a failed/unknown attempt is never destination-only
-                // recovery authority.
-                return if status_is_ready {
-                    Ok(())
-                } else {
-                    Err(KernelServiceError::ReadinessNotProven)
-                };
-            }
+            Some(classify_eliotd_live_receipt_transition(
+                &old,
+                &receipt,
+                status_is_ready,
+                supervision_contour.incarnation.predecessor.as_ref(),
+                successor_evidence.as_ref(),
+            )?)
         } else if status_is_ready {
             return Err(KernelServiceError::ReadinessNotProven);
-        }
-        if status_is_ready {
-            return Err(KernelServiceError::ReadinessNotProven);
-        }
+        } else {
+            None
+        };
+        let reconciled_existing =
+            existing_disposition == Some(EliotdLiveReceiptDisposition::ExactReplay);
 
-        let expected_existing = existing.as_ref().map(|(_, fence)| fence);
-        let outcome = publish_atomic_owned_runtime_receipt(&path, &bytes, expected_existing)
-            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
-        let published_identity = match outcome {
-            PublicationOutcome::Published(receipt) => receipt.identity,
-            PublicationOutcome::Unknown(unknown) => unknown.expected_identity,
+        let published_identity = if reconciled_existing {
+            None
+        } else {
+            let expected_existing = existing.as_ref().map(|(_, fence)| fence);
+            let outcome = publish_atomic_owned_runtime_receipt(&path, &bytes, expected_existing)
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+            match outcome {
+                PublicationOutcome::Published(receipt) => Some(receipt.identity),
+                // Exact destination reconciliation is deliberately deferred
+                // to a replay of the same authenticated daemon_ready request.
+                // An ambiguous attempt itself never advances readiness.
+                PublicationOutcome::Unknown(_) => {
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
+            }
         };
         let lease = ProtectedRuntimePathLease::open_existing_absolute(&path)
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
-        if lease.identity() != published_identity
+        if published_identity
+            .as_ref()
+            .is_some_and(|identity| lease.identity() != *identity)
             || lease.verify_stable_identity().is_err()
             || lease.verify_path_identity().is_err()
         {
@@ -6461,20 +7303,78 @@ impl KernelComposition {
         // Re-read the protected ORS identity and exact active signature after
         // the receipt CAS. A successful destination readback alone must not
         // outlive a concurrent authority rotation or ORS root substitution.
-        let post_supervision = supervision_authority
-            .current_eliotd_live_evidence(launch.generation.value(), launch.authority_epoch.value())
+        let (post_supervision, post_issued_at_ms) = supervision_authority
+            .current_eliotd_live_projection(
+                &supervision_contour.incarnation.supervision_lease_id,
+                launch.generation.value(),
+                launch.authority_epoch.value(),
+            )
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
-        if post_supervision != supervision {
+        if post_supervision != supervision || post_issued_at_ms != supervision_issued_at_ms {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        Ok(receipt)
+    }
+
+    #[cfg(windows)]
+    fn verify_published_eliotd_live_receipt(
+        &self,
+        expected: &EliotdLiveReceipt,
+    ) -> Result<(), KernelServiceError> {
+        expected
+            .validate()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let runtime_binding = self
+            .eliotd_receipt_binding
+            .as_ref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        runtime_binding
+            .validate()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let root_lease = ProtectedRootLease::open_existing(runtime_binding.receipt_root())
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let canonical_root = root_lease
+            .canonical_path()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        if !windows_paths_equal(&canonical_root, runtime_binding.receipt_root())
+            || !windows_paths_equal(Path::new(&expected.receipt_root), &canonical_root)
+            || expected.receipt_root_identity_sha256
+                != sha256_json(&root_lease.identity())
+                    .map_err(|_| KernelServiceError::ReadinessNotProven)?
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let path = canonical_root.join("eliotd-receipt.json");
+        let lease = ProtectedRuntimePathLease::open_existing_absolute(&path)
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        if root_lease.verify_stable_identity().is_err()
+            || lease.verify_stable_identity().is_err()
+            || lease.verify_path_identity().is_err()
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let observed = lease
+            .read_bounded(1024 * 1024)
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let expected_bytes = eliot_contracts::canonical_json_bytes(expected)
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        if observed != expected_bytes
+            || root_lease.verify_stable_identity().is_err()
+            || lease.verify_stable_identity().is_err()
+            || lease.verify_path_identity().is_err()
+        {
             return Err(KernelServiceError::ReadinessNotProven);
         }
         Ok(())
     }
 
     #[cfg(windows)]
-    async fn validate_authenticated_daemon_ready(&self) -> Result<(), KernelServiceError> {
-        let Some(launch) = self.active_daemon_launch()? else {
-            return Ok(());
-        };
+    async fn validated_authenticated_daemon_ready_inputs(
+        &self,
+    ) -> Result<(EliotdLaunchDescriptor, ProcessStartReceipt), KernelServiceError> {
+        let launch = self
+            .active_daemon_launch()?
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
         let receipt = self
             .daemon_runtime
             .lock()
@@ -6483,7 +7383,8 @@ impl KernelComposition {
             .clone()
             .ok_or(KernelServiceError::ReadinessNotProven)?;
         self.validate_daemon_process_readiness(&launch, &receipt)
-            .await
+            .await?;
+        Ok((launch, receipt))
     }
 
     #[cfg(windows)]
@@ -7207,6 +8108,21 @@ impl KernelComposition {
             _ => None,
         };
         let is_probe = matches!(&request.command, KernelControlCommand::ProbeReady);
+        #[cfg(windows)]
+        let supervision_publication = if is_probe {
+            Some(
+                self.renew_daemon_supervision_for_probe(&request)
+                    .map_err(|_| TransportError::SessionFenced)?,
+            )
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        let supervision_lease = supervision_publication
+            .as_ref()
+            .map(|(snapshot, _)| snapshot.clone());
+        #[cfg(not(windows))]
+        let supervision_lease = None;
         let receipt = if is_probe {
             #[cfg(windows)]
             {
@@ -7224,8 +8140,8 @@ impl KernelComposition {
             None
         };
         #[cfg(windows)]
-        let supervision_lease = if is_probe {
-            let snapshot = self
+        if let Some((expected, expected_live_receipt)) = supervision_publication.as_ref() {
+            let after = self
                 .supervision_lease_authority
                 .as_ref()
                 .ok_or(TransportError::SessionFenced)?
@@ -7235,19 +8151,27 @@ impl KernelComposition {
                         .supervision_incarnation
                         .supervision_lease_id,
                 )
-                .map_err(|_| TransportError::SessionFenced)?
-                .ok_or(TransportError::SessionFenced)?;
-            if snapshot.record.state != LeaseState::Active
-                || snapshot.record.projection != eliot_ors::SupervisionLeaseProjection::Active
-            {
+                .map_err(|_| TransportError::SessionFenced)?;
+            if after.as_ref() != Some(expected) {
                 return Err(TransportError::SessionFenced);
             }
-            Some(snapshot)
-        } else {
-            None
-        };
-        #[cfg(not(windows))]
-        let supervision_lease = None;
+            self.verify_published_eliotd_live_receipt(expected_live_receipt)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let after_receipt_readback = self
+                .supervision_lease_authority
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?
+                .current_snapshot(
+                    &request
+                        .candidate
+                        .supervision_incarnation
+                        .supervision_lease_id,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+            if after_receipt_readback.as_ref() != Some(expected) {
+                return Err(TransportError::SessionFenced);
+            }
+        }
         let activation_receipt: Option<KernelActivationReceipt> = match &request.command {
             KernelControlCommand::Activate(permit) => Some(
                 self.service
@@ -7425,6 +8349,10 @@ pub fn default_work_root() -> Result<PathBuf, std::io::Error> {
 
 #[cfg(test)]
 #[allow(clippy::default_trait_access, clippy::expect_used)]
+#[allow(
+    clippy::large_futures,
+    reason = "control-path tests intentionally await the concrete production future so their fixtures exercise its full state machine"
+)]
 mod tests {
     use super::*;
     use eliot_contracts::ContractVersion;
@@ -8102,7 +9030,7 @@ mod tests {
             authority_descriptor_path: authority_descriptor_path.clone(),
             authority_descriptor_digest: authority_descriptor_digest.clone(),
             supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
-                supervision_lease_id: handle("supervision-lease-live-receipt".to_owned()),
+                supervision_lease_scope_id: handle("supervision-lease-live-receipt".to_owned()),
             },
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
@@ -8195,7 +9123,7 @@ mod tests {
             store_credential_target: handle(
                 "eliot/store/v1/0123456789abcdef0123456789abcdef".to_owned(),
             ),
-            supervision_key_fingerprint: handle(supervision_key_fingerprint.to_owned()),
+            supervision_key_slot: handle(supervision_key_fingerprint.to_owned()),
             signature_ref: handle("evidence:signature".to_owned()),
             runtime_state_roots_digest: roots.roots_digest.clone(),
             runtime_launch,
@@ -8321,6 +9249,338 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn test_eliotd_live_receipt(
+        revision: u64,
+        ors_receipt_sha256: &str,
+        request_id: &str,
+    ) -> EliotdLiveReceipt {
+        EliotdLiveReceipt::new(
+            r"C:\ProgramData\Eliot\HostState",
+            "1".repeat(64),
+            "2".repeat(64),
+            "installation-1",
+            "generation-1",
+            1,
+            1,
+            "3".repeat(64),
+            "4".repeat(64),
+            "5".repeat(64),
+            test_process_start_receipt(401),
+            EliotdLiveSupervisionEvidence {
+                lease_id: "eliot-supervision-lease:v1:current".to_owned(),
+                record_id: format!("eliot-supervision-lease:v1:current::r{revision:020}"),
+                revision,
+                receipt_sha256: ors_receipt_sha256.to_owned(),
+                envelope_sha256: "6".repeat(64),
+                payload_sha256: "7".repeat(64),
+                public_key_fingerprint: "8".repeat(64),
+            },
+            EliotdLiveReadyEvidence {
+                request_id: request_id.to_owned(),
+                request_payload_sha256: "9".repeat(64),
+                connection_id: "connection-1".to_owned(),
+                session_epoch: 1,
+                authority_epoch: 1,
+                generation: 1,
+                launch_nonce_sha256: "a".repeat(64),
+            },
+            1_000 + revision,
+        )
+        .expect("valid test eliotd live receipt")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn eliotd_receipt_replay_and_renewal_require_exact_operation_lineage() {
+        let first = test_eliotd_live_receipt(1, &"b".repeat(64), "daemon-ready-1");
+        assert_eq!(
+            classify_eliotd_live_receipt_transition(&first, &first, false, None, None)
+                .expect("exact response-loss replay"),
+            EliotdLiveReceiptDisposition::ExactReplay
+        );
+        let foreign_request = test_eliotd_live_receipt(1, &"b".repeat(64), "daemon-ready-foreign");
+        assert!(
+            classify_eliotd_live_receipt_transition(&first, &foreign_request, false, None, None,)
+                .is_err()
+        );
+
+        let renewed = test_eliotd_live_receipt(2, &"c".repeat(64), "daemon-ready-1");
+        let successor = EliotdSupervisionSuccessorEvidence {
+            operation: SupervisionLeaseOperation::Renew,
+            state: LeaseState::Active,
+            lease_id: renewed.supervision.lease_id.clone(),
+            revision: renewed.supervision.revision,
+            receipt_sha256: renewed.supervision.receipt_sha256.clone(),
+            previous_receipt_sha256: Some(first.supervision.receipt_sha256.clone()),
+        };
+        assert_eq!(
+            classify_eliotd_live_receipt_transition(
+                &first,
+                &renewed,
+                true,
+                None,
+                Some(&successor),
+            )
+            .expect("exact ORS renewal predecessor"),
+            EliotdLiveReceiptDisposition::ReplaceRenewalPredecessor
+        );
+        let mut substituted = successor;
+        substituted.previous_receipt_sha256 = Some("d".repeat(64));
+        assert!(
+            classify_eliotd_live_receipt_transition(
+                &first,
+                &renewed,
+                true,
+                None,
+                Some(&substituted),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn running_daemon_retains_only_the_same_authenticated_ready_publication_operation() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-ready-operation-binding-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("composition");
+        let policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy")
+            .clone();
+        let session = Session {
+            connection_id: "authenticated-eliotd-connection".to_owned(),
+            protocol_version: policy.protocol_range.maximum,
+            peer: PeerIdentity::Unavailable {
+                reason: eliot_ipc::PeerIdentityUnavailable::ProviderProofNotComposed,
+            },
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.value(),
+            module_generation: policy.module_generation.clone(),
+            launch_nonce: policy.launch_nonce.clone(),
+            capabilities: policy.allowed_capabilities.clone(),
+            privacy_classes: policy.allowed_privacy_classes.clone(),
+            effects: policy.allowed_effects.clone(),
+            session_epoch: 1,
+            state: eliot_ipc::SessionState::Open,
+        };
+        let payload = serde_json::json!({
+            "generation": session.module_generation.generation.value(),
+            "authority_epoch": session.authority_epoch,
+        });
+        let exact = KernelComposition::eliotd_live_ready_evidence(
+            &session,
+            &RequestId::new("daemon-ready-1").expect("request id"),
+            &payload,
+        )
+        .expect("exact authenticated operation");
+        let foreign = KernelComposition::eliotd_live_ready_evidence(
+            &session,
+            &RequestId::new("daemon-ready-foreign").expect("request id"),
+            &payload,
+        )
+        .expect("foreign authenticated operation");
+        let mut state = DaemonRuntimeState {
+            status: DaemonRuntimeStatus::Running,
+            receipt: Some(test_process_start_receipt(401)),
+            recovery_fenced: false,
+            supervision: None,
+            live_ready: None,
+        };
+        state
+            .bind_live_receipt_publication_operation(&exact)
+            .expect("first authenticated operation binding");
+        state
+            .bind_live_receipt_publication_operation(&exact)
+            .expect("same operation response-loss replay");
+        assert!(
+            state
+                .bind_live_receipt_publication_operation(&foreign)
+                .is_err()
+        );
+        assert_eq!(state.live_ready.as_ref(), Some(&exact));
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cryptographic replay discriminator constructs and corrupts one complete active-to-terminal Redb history"
+    )]
+    fn superseded_replay_requires_the_exact_terminal_signature_and_history() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-supervision-terminal-replay-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("create ORS test root");
+        let ors = RedbRecoveryStore::open(root.join("kernel-ors.redb")).expect("open ORS");
+        let signer = Ed25519SupervisionLeaseSigner::from_secret_key(
+            "kernel-test-signer",
+            "kernel-test-key",
+            [0x31; 32],
+        )
+        .expect("test signer");
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .expect("test trust anchor");
+        let lease_id = OperationIdentity::new(supervision_incarnation().supervision_lease_id)
+            .expect("lease id");
+        let now_ms = unix_ms();
+        let binding = eliot_ors::SupervisionLeaseBinding {
+            scope_ref: OperationIdentity::new(
+                supervision_incarnation()
+                    .derived_scope_ref()
+                    .expect("scope ref"),
+            )
+            .expect("scope identity"),
+            observation_scope: eliot_runtime_contracts::canonical_observation_scope(),
+            installation_id: OperationIdentity::new("installation-1").expect("installation"),
+            host_epoch: AuthorityEpoch::genesis(),
+            activation_id: OperationIdentity::new("activation-1").expect("activation"),
+            activation_generation: ResourceGeneration::genesis(),
+            kernel_epoch: AuthorityEpoch::genesis(),
+            watchdog_epoch: AuthorityEpoch::genesis(),
+            generation_binding: SupervisionGenerationBinding {
+                target_id: "eliotd-artifact".to_owned(),
+                target_generation: ResourceGeneration::genesis(),
+                module_id: "eliotd".to_owned(),
+                module_generation: ResourceGeneration::genesis(),
+                process_id: "pid:401:start:1".to_owned(),
+                process_generation: ResourceGeneration::genesis(),
+            },
+            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            issued_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(60_000),
+            renew_before_ms: now_ms.saturating_add(30_000),
+            wake_policy: eliot_runtime_contracts::canonical_wake_policy(),
+            state: LeaseState::Active,
+            terminal_disposition: None,
+            revocation_reason: None,
+            revocation_id: None,
+            revocation_epoch: None,
+        };
+        let active_stage = ors
+            .prepare_supervision_lease(SupervisionLeasePrepareRequest {
+                ticket_id: OperationIdentity::new("active-ticket").expect("ticket"),
+                operation_id: OperationIdentity::new("active-operation").expect("operation"),
+                lease_id: lease_id.clone(),
+                expected_revision: None,
+                operation: SupervisionLeaseOperation::Commit,
+                binding: binding.clone(),
+            })
+            .expect("prepare active");
+        let active_envelope = active_stage
+            .ticket
+            .expected_payload()
+            .expect("active payload")
+            .sign(&signer)
+            .expect("sign active");
+        let active_context = verification_context_for_supervision_payload(
+            &anchor,
+            &active_envelope.payload,
+            active_envelope.payload.issued_at_ms,
+        );
+        let active_verified = anchor
+            .verify(&active_envelope, &active_context)
+            .expect("verify active");
+        let active = ors
+            .commit_supervision_lease(&active_stage.ticket, &active_verified)
+            .expect("commit active");
+        let predecessor = SupervisionLeasePredecessorIdentity {
+            supervision_lease_id: lease_id.as_str().to_owned(),
+            ors_receipt_sha256: active.receipt.receipt_sha256.clone(),
+        };
+        let mut terminal_binding = binding;
+        terminal_binding.state = LeaseState::Superseded;
+        terminal_binding.terminal_disposition =
+            Some(SupervisionLeaseTerminalDisposition::Superseded);
+        let terminal_stage = ors
+            .prepare_supervision_lease(SupervisionLeasePrepareRequest {
+                ticket_id: OperationIdentity::new("terminal-ticket").expect("ticket"),
+                operation_id: OperationIdentity::new("terminal-operation").expect("operation"),
+                lease_id,
+                expected_revision: Some(active.record.revision),
+                operation: SupervisionLeaseOperation::Supersede,
+                binding: terminal_binding,
+            })
+            .expect("prepare terminal");
+        let terminal_envelope = terminal_stage
+            .ticket
+            .expected_payload()
+            .expect("terminal payload")
+            .sign(&signer)
+            .expect("sign terminal");
+        let predecessor_proof = SupervisionLeasePredecessorProof {
+            lease_id: active.record.lease_id.as_str().to_owned(),
+            record_id: active.record.record_id.as_str().to_owned(),
+            lease_revision: active.record.revision,
+            receipt_sha256: active.receipt.receipt_sha256.clone(),
+            envelope_sha256: active
+                .record
+                .artifact
+                .envelope_digest()
+                .expect("active envelope digest"),
+        };
+        let terminal_verified = anchor
+            .verify_terminal_transition(&active_verified, &terminal_envelope, &predecessor_proof)
+            .expect("verify terminal");
+        let terminal = ors
+            .commit_terminal_supervision_lease(&terminal_stage.ticket, &terminal_verified)
+            .expect("commit terminal");
+        verify_superseded_supervision_replay(&ors, &anchor, &terminal, &predecessor)
+            .expect("cryptographic terminal replay");
+
+        let mut forged_signature = terminal.clone();
+        forged_signature.record.artifact.signature = "00".repeat(64);
+        assert!(
+            verify_superseded_supervision_replay(&ors, &anchor, &forged_signature, &predecessor,)
+                .is_err()
+        );
+        let mut forged_mirror = terminal.clone();
+        forged_mirror
+            .record
+            .artifact
+            .payload
+            .ors_mirror
+            .previous_receipt_sha256 = Some("d".repeat(64));
+        assert!(
+            verify_superseded_supervision_replay(&ors, &anchor, &forged_mirror, &predecessor,)
+                .is_err()
+        );
+
+        let foreign_signer = Ed25519SupervisionLeaseSigner::from_secret_key(
+            "kernel-test-signer",
+            "kernel-test-key",
+            [0x32; 32],
+        )
+        .expect("foreign signer");
+        let foreign_anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            foreign_signer.signer_id(),
+            foreign_signer.key_id(),
+            foreign_signer.public_key().to_vec(),
+        )
+        .expect("foreign anchor");
+        assert!(
+            verify_superseded_supervision_replay(&ors, &foreign_anchor, &terminal, &predecessor,)
+                .is_err()
+        );
+        drop(ors);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn eliotd_attempt_identity_is_stable_within_one_kernel_and_changes_after_restart() {
         let root = std::env::temp_dir().join(format!(
@@ -8394,6 +9654,8 @@ mod tests {
             status: DaemonRuntimeStatus::Launching,
             receipt: None,
             recovery_fenced: false,
+            supervision: None,
+            live_ready: None,
         };
         assert!(matches!(
             KernelComposition::published_daemon_receipt(&state),
@@ -8414,9 +9676,9 @@ mod tests {
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the production-bound handshake test proves success, timeout, and non-ready daemon states through one retained contour"
+        reason = "the authenticated handshake negative keeps generation and missing production supervision dependencies on one retained contour"
     )]
-    async fn authenticated_handshake_and_bounded_ready_rendezvous_fail_closed() {
+    async fn authenticated_handshake_fences_ready_without_production_supervision_dependencies() {
         let root = std::env::temp_dir().join(format!(
             "eliot-kernel-daemon-ready-rendezvous-{}",
             std::process::id()
@@ -8474,7 +9736,7 @@ mod tests {
         let wait_receipt = receipt.clone();
         let waiter = tokio::spawn(async move {
             wait_kernel
-                .await_daemon_ready(&wait_receipt, Duration::from_secs(1))
+                .await_daemon_ready(&wait_receipt, Duration::from_millis(50))
                 .await
         });
         tokio::task::yield_now().await;
@@ -8498,45 +9760,26 @@ mod tests {
                 .is_err()
         );
         assert!(!waiter.is_finished());
-        kernel
-            .execute_daemon_request(
-                &handshake.session,
-                RequestId::new("eliotd-ready-exact").expect("request id"),
-                "daemon_ready",
-                serde_json::json!({
-                    "generation": policy.module_generation.generation.value(),
-                    "authority_epoch": policy
-                        .module_generation
-                        .state_fence
-                        .authority_epoch
-                        .value(),
-                }),
-            )
-            .await
-            .expect("authenticated ready report");
-        waiter
-            .await
-            .expect("ready waiter task")
-            .expect("ready rendezvous");
-
-        let substituted = test_process_start_receipt(41_002);
         assert!(
             kernel
-                .await_daemon_ready(&substituted, Duration::from_millis(10))
+                .execute_daemon_request(
+                    &handshake.session,
+                    RequestId::new("eliotd-ready-exact").expect("request id"),
+                    "daemon_ready",
+                    serde_json::json!({
+                        "generation": policy.module_generation.generation.value(),
+                        "authority_epoch": policy
+                            .module_generation
+                            .state_fence
+                            .authority_epoch
+                            .value(),
+                    }),
+                )
                 .await
                 .is_err()
         );
-
-        {
-            let mut state = kernel.daemon_runtime.lock().expect("daemon runtime lock");
-            state.status = DaemonRuntimeStatus::Running;
-        }
-        assert!(
-            kernel
-                .await_daemon_ready(&receipt, Duration::from_millis(1))
-                .await
-                .is_err()
-        );
+        assert!(!kernel.daemon_ready());
+        assert!(waiter.await.expect("ready waiter task").is_err());
         let state = kernel.daemon_runtime.lock().expect("daemon runtime lock");
         assert!(matches!(state.status, DaemonRuntimeStatus::Failed(_)));
         drop(state);

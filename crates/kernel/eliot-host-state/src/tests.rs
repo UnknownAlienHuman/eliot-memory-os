@@ -5,7 +5,9 @@ use eliot_observation_contracts::{
 };
 use eliot_platform::{PlatformHandle, PortOutcome, UnknownReason};
 use eliot_runtime_contracts::{
-    HealthDimension, KernelActivationState, ServiceProcessRecord, WakeIntent,
+    HealthDimension, KernelActivationState, ServiceProcessRecord, SupervisionJournalEpoch,
+    SupervisionLeaseIncarnationBinding, SupervisionLeasePredecessorIdentity, WakeIntent,
+    canonical_observation_scope, canonical_wake_policy,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -2808,6 +2810,124 @@ fn readiness_observation(
         evidence_refs: vec![h("kernel-authored-probe-ready")],
         active_supervision_lease: None,
     }
+}
+
+fn expected_supervision_incarnation(
+    state: &HostState,
+    predecessor: Option<SupervisionLeasePredecessorIdentity>,
+) -> SupervisionLeaseIncarnationBinding {
+    let activation = state.activation.as_ref().unwrap_or_else(|| unreachable!());
+    let kernel = state.kernel.as_ref().unwrap_or_else(|| unreachable!());
+    SupervisionLeaseIncarnationBinding {
+        supervision_lease_scope_id: "eliot-supervision-scope:v1:journal-test".to_owned(),
+        supervision_lease_id: String::new(),
+        scope_ref_digest: String::new(),
+        installation_id: state.host.installation.as_str().to_owned(),
+        host_epoch: SupervisionJournalEpoch {
+            lineage_id: state.host.epoch.current.lineage.as_str().to_owned(),
+            sequence: state.host.epoch.current.sequence,
+        },
+        activation_id: activation.activation_id.as_str().to_owned(),
+        activation_generation: SupervisionJournalEpoch {
+            lineage_id: activation
+                .fence
+                .activation_generation
+                .current
+                .lineage
+                .as_str()
+                .to_owned(),
+            sequence: activation.fence.activation_generation.current.sequence,
+        },
+        kernel_generation: SupervisionJournalEpoch {
+            lineage_id: kernel.kernel_generation.current.lineage.as_str().to_owned(),
+            sequence: kernel.kernel_generation.current.sequence,
+        },
+        watchdog_epoch: SupervisionJournalEpoch {
+            lineage_id: activation
+                .lineage
+                .watchdog_epoch
+                .lineage
+                .as_str()
+                .to_owned(),
+            sequence: activation.lineage.watchdog_epoch.sequence,
+        },
+        observation_scope: canonical_observation_scope(),
+        wake_policy: canonical_wake_policy(),
+        predecessor,
+    }
+    .with_derived_ids()
+    .unwrap_or_else(|_| unreachable!())
+}
+
+#[test]
+fn supervision_reconstruction_uses_observation_before_first_current_kernel_readiness() {
+    let (journal, _, _) = active_kernel_journal();
+    let mut state = journal.snapshot().unwrap_or_else(|_| unreachable!());
+    state
+        .kernel
+        .as_mut()
+        .unwrap_or_else(|| unreachable!())
+        .prior_kernel_disposition = terminated_prior(true, &[]);
+    let active = state.kernel.clone().unwrap_or_else(|| unreachable!());
+    let predecessor = SupervisionLeasePredecessorIdentity {
+        supervision_lease_id: "eliot-supervision-lease:v1:prior".to_owned(),
+        ors_receipt_sha256: "a".repeat(64),
+    };
+    let mut prior = readiness_observation(&active, "prior-readiness", '1', '2');
+    prior.active_kernel_record_checksum = digest_handle('9');
+    prior.active_supervision_lease = Some(predecessor.clone());
+
+    let expected = expected_supervision_incarnation(&state, Some(predecessor));
+    let mut first_current = readiness_observation(&active, "current-readiness-1", '3', '4');
+    first_current.active_supervision_lease = Some(SupervisionLeasePredecessorIdentity {
+        supervision_lease_id: expected.supervision_lease_id.clone(),
+        ors_receipt_sha256: "b".repeat(64),
+    });
+    let mut repeat_current = readiness_observation(&active, "current-readiness-2", '5', '6');
+    repeat_current.active_supervision_lease = Some(SupervisionLeasePredecessorIdentity {
+        supervision_lease_id: expected.supervision_lease_id.clone(),
+        ors_receipt_sha256: "c".repeat(64),
+    });
+    state.readiness_observations = vec![prior, first_current, repeat_current];
+
+    let (reconstructed, current) = reconstruct_current_supervision_incarnation(
+        &state,
+        &expected.supervision_lease_scope_id,
+        &canonical_observation_scope(),
+        &canonical_wake_policy(),
+    )
+    .unwrap_or_else(|error| panic!("reconstruction failed: {error}"));
+    assert_eq!(reconstructed, expected);
+    assert_eq!(current.ors_receipt_sha256, "c".repeat(64));
+
+    let mut substituted = state.clone();
+    substituted
+        .activation
+        .as_mut()
+        .unwrap_or_else(|| unreachable!())
+        .lineage
+        .watchdog_epoch
+        .sequence += 1;
+    assert!(
+        reconstruct_current_supervision_incarnation(
+            &substituted,
+            &expected.supervision_lease_scope_id,
+            &canonical_observation_scope(),
+            &canonical_wake_policy(),
+        )
+        .is_err()
+    );
+    let mut unknown_prior = state;
+    unknown_prior.prior_kernel_unknown = true;
+    assert!(
+        reconstruct_current_supervision_incarnation(
+            &unknown_prior,
+            &expected.supervision_lease_scope_id,
+            &canonical_observation_scope(),
+            &canonical_wake_policy(),
+        )
+        .is_err()
+    );
 }
 
 #[test]

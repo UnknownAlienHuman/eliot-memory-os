@@ -34,7 +34,8 @@ use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
 };
 use eliot_runtime_contracts::{
-    ProvisionedSupervisionAuthority, SignedSupervisionLease, SupervisionLeaseError,
+    KernelActivationState, ProvisionedSupervisionAuthority, SignedSupervisionLease,
+    SupervisionLeaseError, SupervisionLeaseIncarnationBinding, SupervisionLeasePredecessorIdentity,
     SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionTrustAnchor,
     VerifiedSupervisionLease, WATCHDOG_PUBLICATION_DIRECTORY_PREFIX,
     WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate, WatchdogPublicationBundle,
@@ -56,6 +57,7 @@ pub const PROTOCOL_VERSION: &str = "eliot.watchdog.v1";
 pub const INSTALLATION_REGISTRY_FILE_NAME: &str = "installation-registry.redb";
 const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
 const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
+const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
 /// Failure while validating the immutable argv contract supplied by SCM.
 #[derive(Debug, Error)]
@@ -2295,6 +2297,10 @@ async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) -> bool {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "runtime binding selection keeps protected registry, manifest, bootstrap, and retained-root checks in one fail-closed read transaction"
+)]
 fn load_runtime_binding(
     registry_path: &Path,
     bootstrap: &ServiceBootstrapArguments,
@@ -2840,6 +2846,93 @@ fn scan_watchdog_publications(
     Ok(observed)
 }
 
+fn read_journaled_current_supervision(
+    binding: &WatchdogRuntimeBinding,
+    template: &WatchdogAdmissionTemplate,
+) -> Result<
+    (
+        SupervisionLeaseIncarnationBinding,
+        SupervisionLeasePredecessorIdentity,
+    ),
+    SpoolError,
+> {
+    binding
+        .host_state_root_lease
+        .verify_stable_identity()
+        .map_err(|error| SpoolError::InvalidLease(format!("Host state root changed: {error}")))?;
+    let journal_path = binding.host_state_root().join(HOST_JOURNAL_FILE_NAME);
+    let journal_lease = ProtectedRuntimePathLease::open_existing_absolute(&journal_path)
+        .map_err(|error| SpoolError::InvalidLease(format!("Host journal open failed: {error}")))?;
+    if !windows_paths_equal(journal_lease.path(), &journal_path) {
+        return Err(SpoolError::InvalidLease(
+            "Host journal path is not the exact retained child".to_owned(),
+        ));
+    }
+    journal_lease
+        .verify_stable_identity()
+        .and_then(|()| journal_lease.verify_path_identity())
+        .map_err(|error| {
+            SpoolError::InvalidLease(format!("Host journal identity failed: {error}"))
+        })?;
+    let inspection = eliot_host_state::RedbJournalBackend::inspect_existing_at(&journal_path)
+        .map_err(|error| {
+            SpoolError::InvalidLease(format!("Host journal inspection failed: {error}"))
+        })?
+        .ok_or_else(|| SpoolError::LeaseFenced("Host journal is missing".to_owned()))?;
+    let state = eliot_host_state::readonly_project_host_state(&inspection.image)
+        .map_err(|error| SpoolError::LeaseFenced(format!("Host journal replay failed: {error}")))?;
+    let kernel = state
+        .kernel
+        .as_ref()
+        .filter(|kernel| kernel.state == KernelActivationState::Active)
+        .ok_or_else(|| SpoolError::LeaseFenced("Host journal has no active Kernel".to_owned()))?;
+    let readiness = state.readiness_observations.last().ok_or_else(|| {
+        SpoolError::LeaseFenced("Host journal has no admitted readiness observation".to_owned())
+    })?;
+    let expected_checksum = eliot_host_state::record_checksum(
+        &eliot_host_state::HostStateRecord::Kernel(kernel.clone()),
+    )
+    .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    if state.prior_kernel_unknown
+        || readiness.fence != kernel.fence
+        || readiness.active_kernel_record_checksum.as_str() != expected_checksum
+    {
+        return Err(SpoolError::LeaseFenced(
+            "latest readiness is not bound to the current active Kernel".to_owned(),
+        ));
+    }
+    let reconstructed = eliot_host_state::reconstruct_current_supervision_incarnation(
+        &state,
+        &template.supervision_lease_scope_id,
+        &template.observation_scope,
+        &template.wake_policy,
+    )
+    .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    if state.host.installation.as_str()
+        != binding
+            .selected_manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .as_str()
+        || journal_lease.verify_stable_identity().is_err()
+        || journal_lease.verify_path_identity().is_err()
+        || binding
+            .host_state_root_lease
+            .verify_stable_identity()
+            .is_err()
+    {
+        return Err(SpoolError::LeaseFenced(
+            "Host journal or installation contour changed during read".to_owned(),
+        ));
+    }
+    Ok(reconstructed)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the content-addressed admission read keeps registry, Host journal, ORS, publication, signature, retention, and final readback checks ordered"
+)]
 fn load_content_addressed_supervision_lease_bound(
     source: &FileWatchdogAdmission,
     config: &WatchdogAdmissionConfig,
@@ -2934,12 +3027,40 @@ fn load_content_addressed_supervision_lease_bound(
             "Watchdog admission is foreign to the selected generation".to_owned(),
         ));
     }
-    let lease_id = eliot_ors::OperationIdentity::new(config.supervision_lease_scope_id.clone())
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    let (journaled_incarnation, journaled_supervision) =
+        read_journaled_current_supervision(binding, config)?;
+    let lease_id =
+        eliot_ors::OperationIdentity::new(journaled_supervision.supervision_lease_id.clone())
+            .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
     let durable_current = read_manifest_selected_ors_current(&selected_manifest, &lease_id)?
         .ok_or_else(|| {
             SpoolError::LeaseFenced("Kernel ORS has no current supervision lease".to_owned())
         })?;
+    if durable_current.receipt.receipt_sha256 != journaled_supervision.ors_receipt_sha256 {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel ORS head is not the exact journaled readiness receipt".to_owned(),
+        ));
+    }
+    let derived_scope_ref = journaled_incarnation
+        .derived_scope_ref()
+        .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    let durable_binding = &durable_current.record.binding;
+    if durable_current.record.lease_id.as_str() != journaled_incarnation.supervision_lease_id
+        || durable_binding.scope_ref.as_str() != derived_scope_ref
+        || durable_binding.installation_id.as_str() != journaled_incarnation.installation_id
+        || durable_binding.host_epoch.value() != journaled_incarnation.host_epoch.sequence
+        || durable_binding.activation_id.as_str() != journaled_incarnation.activation_id
+        || durable_binding.activation_generation.value()
+            != journaled_incarnation.activation_generation.sequence
+        || durable_binding.kernel_epoch.value() != journaled_incarnation.kernel_generation.sequence
+        || durable_binding.observation_scope != journaled_incarnation.observation_scope
+        || durable_binding.watchdog_epoch.value() != journaled_incarnation.watchdog_epoch.sequence
+        || durable_binding.wake_policy != journaled_incarnation.wake_policy
+    {
+        return Err(SpoolError::LeaseFenced(
+            "Kernel ORS head is not bound to the reconstructed Host journal incarnation".to_owned(),
+        ));
+    }
     let bundle_path = binding.host_state_root().join(format!(
         "{WATCHDOG_PUBLICATION_DIRECTORY_PREFIX}{}",
         durable_current.receipt.receipt_sha256
@@ -2984,7 +3105,11 @@ fn load_content_addressed_supervision_lease_bound(
     }
     let durable_after = read_manifest_selected_ors_current(&selected_manifest, &lease_id)?;
     let publication_after = observe_watchdog_publication(&bundle_path)?;
-    if durable_after.as_ref() != Some(&durable_current) || publication_after != publication {
+    let journaled_after = read_journaled_current_supervision(binding, config)?;
+    if durable_after.as_ref() != Some(&durable_current)
+        || publication_after != publication
+        || journaled_after != (journaled_incarnation, journaled_supervision)
+    {
         return Err(SpoolError::LeaseFenced(
             "Watchdog publication or ORS head changed during verification".to_owned(),
         ));
@@ -3445,6 +3570,10 @@ mod tests {
         (approval, request)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the manifest fixture explicitly initializes the full deny-unknown production contract"
+    )]
     fn manifest_fixture(
         bootstrap: &ServiceBootstrapArguments,
         generation: &str,

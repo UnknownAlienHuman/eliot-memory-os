@@ -563,8 +563,8 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
             ResourceGeneration::genesis(),
         ),
         supervision_authority: SupervisionAuthorityBinding::Pending {
-            supervision_lease_id: fixture_handle(format!(
-                "eliot-supervision-lease:v1:{}:{}",
+            supervision_lease_scope_id: fixture_handle(format!(
+                "eliot-supervision-scope:v1:{}:{}",
                 installation_epoch.installation, generation
             )),
         },

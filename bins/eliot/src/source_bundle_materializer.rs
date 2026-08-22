@@ -675,11 +675,11 @@ fn build_typed_bundle(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let supervision_lease_id = PlatformHandle::new(format!(
-        "eliot-supervision-lease:v1:{}:{}",
+    let supervision_lease_scope_id = PlatformHandle::new(format!(
+        "eliot-supervision-scope:v1:{}:{}",
         input.installation_epoch.installation, input.generation
     ))
-    .map_err(|error| MaterializeError::Contract(format!("supervision lease id: {error}")))?;
+    .map_err(|error| MaterializeError::Contract(format!("supervision scope id: {error}")))?;
     let runtime_launch = RuntimeLaunchDescriptor {
         profile: input.profile,
         portable_root: (input.profile == InstallationProfile::PortableDev)
@@ -689,7 +689,7 @@ fn build_typed_bundle(
         authority_generation,
         authority_state_fence,
         supervision_authority: SupervisionAuthorityBinding::Pending {
-            supervision_lease_id,
+            supervision_lease_scope_id,
         },
         authority_descriptor_path: authority_path,
         authority_descriptor_digest: PlatformHandle::new(PHASE_B_PENDING_MARKER)

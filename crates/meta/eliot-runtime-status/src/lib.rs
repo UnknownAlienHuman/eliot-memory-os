@@ -9,7 +9,8 @@ use eliot_installation::InstallationError;
 use eliot_installation::InstallationTransactionStore;
 use eliot_installation::{ApprovedGenerationRegistry, CandidateManifest, InstallerServiceRole};
 use eliot_runtime_contracts::{
-    HealthDimension, SUPERVISION_LEASE_FILE_NAME, SignedSupervisionLease,
+    HealthDimension, KernelActivationState, SUPERVISION_LEASE_FILE_NAME, SignedSupervisionLease,
+    SupervisionLeaseIncarnationBinding, SupervisionLeasePredecessorIdentity,
     SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionTrustAnchor,
     WATCHDOG_ADMISSION_FILE_NAME, WATCHDOG_PUBLICATION_DIRECTORY_PREFIX,
     WATCHDOG_PUBLICATION_FILE_NAME, WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate,
@@ -18,6 +19,7 @@ use eliot_runtime_contracts::{
 use serde::{Deserialize, Serialize};
 
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
+const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ComponentState {
@@ -1145,6 +1147,74 @@ fn scan_status_watchdog_publications(
 }
 
 #[cfg(windows)]
+fn read_status_journaled_current_supervision(
+    root: &Path,
+    manifest: &CandidateManifest,
+    template: &WatchdogAdmissionTemplate,
+) -> Result<
+    (
+        SupervisionLeaseIncarnationBinding,
+        SupervisionLeasePredecessorIdentity,
+    ),
+    String,
+> {
+    let journal_path = root.join(HOST_JOURNAL_FILE_NAME);
+    let journal_lease =
+        eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(&journal_path)
+            .map_err(|error| format!("Host journal open failed: {error}"))?;
+    if !eliot_platform_windows::windows_paths_equal(journal_lease.path(), &journal_path) {
+        return Err("Host journal path is not the exact retained child".to_owned());
+    }
+    journal_lease
+        .verify_stable_identity()
+        .and_then(|()| journal_lease.verify_path_identity())
+        .map_err(|error| format!("Host journal identity failed: {error}"))?;
+    let inspection = eliot_host_state::RedbJournalBackend::inspect_existing_at(&journal_path)
+        .map_err(|error| format!("Host journal inspection failed: {error}"))?
+        .ok_or_else(|| "Host journal is missing".to_owned())?;
+    let state = eliot_host_state::readonly_project_host_state(&inspection.image)
+        .map_err(|error| format!("Host journal replay failed: {error}"))?;
+    let kernel = state
+        .kernel
+        .as_ref()
+        .filter(|kernel| kernel.state == KernelActivationState::Active)
+        .ok_or_else(|| "Host journal has no active Kernel".to_owned())?;
+    let readiness = state
+        .readiness_observations
+        .last()
+        .ok_or_else(|| "Host journal has no admitted readiness observation".to_owned())?;
+    let expected_checksum = eliot_host_state::record_checksum(
+        &eliot_host_state::HostStateRecord::Kernel(kernel.clone()),
+    )
+    .map_err(|error| error.to_string())?;
+    if state.prior_kernel_unknown
+        || readiness.fence != kernel.fence
+        || readiness.active_kernel_record_checksum.as_str() != expected_checksum
+        || state.host.installation != manifest.runtime_launch.installation_epoch.installation
+    {
+        return Err(
+            "latest readiness is not bound to the selected current Kernel contour".to_owned(),
+        );
+    }
+    let reconstructed = eliot_host_state::reconstruct_current_supervision_incarnation(
+        &state,
+        &template.supervision_lease_scope_id,
+        &template.observation_scope,
+        &template.wake_policy,
+    )
+    .map_err(|error| error.to_string())?;
+    if journal_lease.verify_stable_identity().is_err()
+        || journal_lease.verify_path_identity().is_err()
+    {
+        return Err("Host journal changed during supervision selection".to_owned());
+    }
+    Ok(reconstructed)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the read-only status verifier keeps registry, Host journal, ORS, publication, signature, retention, and final readback checks ordered"
+)]
 fn verify_host_supervision_bundle(
     root: &Path,
     manifest: &CandidateManifest,
@@ -1229,14 +1299,43 @@ fn verify_host_supervision_bundle(
     ors.verify_stable_identity()
         .and_then(|()| ors.verify_path_identity())
         .map_err(|error| format!("retained Kernel ORS identity failed: {error}"))?;
-    let lease_id = eliot_ors::OperationIdentity::new(authority.supervision_lease_scope_id.clone())
-        .map_err(|error| format!("supervision lease identity invalid: {error}"))?;
+    let (journaled_incarnation, journaled_supervision) =
+        read_status_journaled_current_supervision(&canonical_root, manifest, &admission)?;
+    let lease_id =
+        eliot_ors::OperationIdentity::new(journaled_supervision.supervision_lease_id.clone())
+            .map_err(|error| format!("supervision lease identity invalid: {error}"))?;
     let current = eliot_ors::read_current_supervision_lease_read_only(ors.path(), &lease_id)
         .map_err(|error| format!("current supervision ORS read failed: {error}"))?
         .ok_or_else(|| "current supervision ORS record is missing".to_owned())?;
     current
         .validate()
         .map_err(|error| format!("current supervision ORS snapshot invalid: {error}"))?;
+    if current.receipt.receipt_sha256 != journaled_supervision.ors_receipt_sha256 {
+        return Err(
+            "current supervision ORS head is not the journaled readiness receipt".to_owned(),
+        );
+    }
+    let derived_scope_ref = journaled_incarnation
+        .derived_scope_ref()
+        .map_err(|error| format!("journaled supervision scope is invalid: {error}"))?;
+    let current_binding = &current.record.binding;
+    if current.record.lease_id.as_str() != journaled_incarnation.supervision_lease_id
+        || current_binding.scope_ref.as_str() != derived_scope_ref
+        || current_binding.installation_id.as_str() != journaled_incarnation.installation_id
+        || current_binding.host_epoch.value() != journaled_incarnation.host_epoch.sequence
+        || current_binding.activation_id.as_str() != journaled_incarnation.activation_id
+        || current_binding.activation_generation.value()
+            != journaled_incarnation.activation_generation.sequence
+        || current_binding.kernel_epoch.value() != journaled_incarnation.kernel_generation.sequence
+        || current_binding.observation_scope != journaled_incarnation.observation_scope
+        || current_binding.watchdog_epoch.value() != journaled_incarnation.watchdog_epoch.sequence
+        || current_binding.wake_policy != journaled_incarnation.wake_policy
+    {
+        return Err(
+            "current supervision ORS head is not bound to the reconstructed Host journal incarnation"
+                .to_owned(),
+        );
+    }
 
     let publication_path = canonical_root.join(format!(
         "{WATCHDOG_PUBLICATION_DIRECTORY_PREFIX}{}",
@@ -1303,9 +1402,12 @@ fn verify_host_supervision_bundle(
     let current_after = eliot_ors::read_current_supervision_lease_read_only(ors.path(), &lease_id)
         .map_err(|error| format!("current supervision ORS re-read failed: {error}"))?;
     let publication_after = observe_status_watchdog_publication(&publication_path)?;
+    let journaled_after =
+        read_status_journaled_current_supervision(&canonical_root, manifest, &admission)?;
     if authority_after != &authority
         || current_after.as_ref() != Some(&current)
         || publication_after != publication
+        || journaled_after != (journaled_incarnation, journaled_supervision)
         || retained_root.verify_stable_identity().is_err()
         || ors.verify_stable_identity().is_err()
         || ors.verify_path_identity().is_err()

@@ -1398,7 +1398,7 @@ mod tests {
             authority_generation,
             authority_state_fence,
             supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
-                supervision_lease_id: handle("test-supervision-lease"),
+                supervision_lease_scope_id: handle("test-supervision-scope"),
             },
             authority_descriptor_path: handle(r"C:\ProgramData\Eliot\authority.json"),
             authority_descriptor_digest: handle("7".repeat(64)),
