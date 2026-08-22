@@ -1255,6 +1255,20 @@ fn persist_unknown_publication(
     ))
 }
 
+fn load_verified_published_receipt(
+    store: &RedbInstallationTransactionStore,
+    operation_id: &PlatformHandle,
+) -> Result<CanarySourceBundleReceipt, MaterializeError> {
+    let journal = store
+        .load_verified_published_source_bundle_publication(operation_id)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    reconcile_journal_destination(&journal)?.ok_or_else(|| {
+        MaterializeError::Invalid(
+            "durable Published journal has no exact verified destination".to_owned(),
+        )
+    })
+}
+
 fn resume_intent_publication(
     store: &RedbInstallationTransactionStore,
     journal: &SourceBundlePublicationJournal,
@@ -1336,14 +1350,20 @@ fn resume_intent_publication(
                 diagnostic: None,
                 ..journal.clone()
             };
-            let recorded = store
-                .record_source_bundle_publication(&published)
-                .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-            let receipt = reconcile_journal_destination(&recorded)?.ok_or_else(|| {
-                MaterializeError::Invalid(
-                    "resumed publication destination disappeared after durable receipt".to_owned(),
-                )
-            })?;
+            let recorded = match store.record_source_bundle_publication(&published) {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    return persist_unknown_publication(
+                        store,
+                        journal,
+                        precommit_files,
+                        format!(
+                            "published destination failed durable authority verification: {error}"
+                        ),
+                    );
+                }
+            };
+            let receipt = load_verified_published_receipt(store, &recorded.operation_id)?;
             Ok(CanarySourceBundleMaterializeOutcome::Published(receipt))
         }
         DirectoryPublicationOutcome::CommittedUnknown(receipt) => persist_unknown_publication(
@@ -1399,13 +1419,13 @@ fn reconcile_existing_publication(
         ));
     }
     let precommit_files = precommit_from_journal(&journal.precommit_files);
+    if journal.state == SourceBundlePublicationJournalState::Published {
+        return Ok(Some(CanarySourceBundleMaterializeOutcome::Published(
+            load_verified_published_receipt(&store, &operation_id)?,
+        )));
+    }
     match reconcile_journal_destination(&journal) {
         Ok(Some(receipt)) => {
-            if journal.state == SourceBundlePublicationJournalState::Published {
-                return Ok(Some(CanarySourceBundleMaterializeOutcome::Published(
-                    receipt,
-                )));
-            }
             let updated = SourceBundlePublicationJournal {
                 state: SourceBundlePublicationJournalState::Published,
                 destination_identity: Some(receipt.directory_publication.destination_identity),
@@ -1413,11 +1433,30 @@ fn reconcile_existing_publication(
                 diagnostic: None,
                 ..journal.clone()
             };
-            store
-                .record_source_bundle_publication(&updated)
-                .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+            let recorded = match store.record_source_bundle_publication(&updated) {
+                Ok(recorded) => recorded,
+                Err(error) if journal.state == SourceBundlePublicationJournalState::Intent => {
+                    return Ok(Some(persist_unknown_publication(
+                        &store,
+                        &journal,
+                        precommit_files,
+                        format!(
+                            "reconciled destination failed durable authority verification: {error}"
+                        ),
+                    )?));
+                }
+                Err(error) => {
+                    return Ok(Some(journal_unknown_outcome(
+                        &journal,
+                        precommit_files,
+                        format!(
+                            "unknown destination failed durable authority verification: {error}"
+                        ),
+                    )));
+                }
+            };
             Ok(Some(CanarySourceBundleMaterializeOutcome::Published(
-                receipt,
+                load_verified_published_receipt(&store, &recorded.operation_id)?,
             )))
         }
         Ok(None) if journal.state == SourceBundlePublicationJournalState::Intent => Ok(Some(
@@ -1428,6 +1467,14 @@ fn reconcile_existing_publication(
             precommit_files,
             "durable publication journal exists but its destination is absent".to_owned(),
         ))),
+        Err(error) if journal.state == SourceBundlePublicationJournalState::Intent => {
+            Ok(Some(persist_unknown_publication(
+                &store,
+                &journal,
+                precommit_files,
+                format!("durable publication reconciliation rejected: {error}"),
+            )?))
+        }
         Err(error) => Ok(Some(journal_unknown_outcome(
             &journal,
             precommit_files,
@@ -1633,11 +1680,7 @@ fn materialize_with_executables(
             resume_intent_publication(&store, &existing_journal, precommit_files)
         }
         SourceBundlePublicationJournalState::Published => {
-            let receipt = reconcile_journal_destination(&existing_journal)?.ok_or_else(|| {
-                MaterializeError::Invalid(
-                    "durable Published journal has no exact destination".to_owned(),
-                )
-            })?;
+            let receipt = load_verified_published_receipt(&store, &existing_journal.operation_id)?;
             Ok(CanarySourceBundleMaterializeOutcome::Published(receipt))
         }
         SourceBundlePublicationJournalState::CommittedUnknown => Ok(journal_unknown_outcome(
@@ -1740,11 +1783,11 @@ mod tests {
                 pe,
                 authenticode: AuthenticodeEvidence {
                     verdict: eliot_platform_windows::AuthenticodeVerdict::Valid,
-                    signer_certificate_sha256: None,
-                    signer_subject: None,
-                    signer_not_before_unix_seconds: None,
-                    signer_not_after_unix_seconds: None,
-                    verification_time_unix_seconds: None,
+                    signer_certificate_sha256: Some("a".repeat(64)),
+                    signer_subject: Some("ELIOT test-support unsigned fixture".to_owned()),
+                    signer_not_before_unix_seconds: Some(1),
+                    signer_not_after_unix_seconds: Some(2),
+                    verification_time_unix_seconds: Some(1),
                     countersigner_certificate_sha256: None,
                     trust_status: 0,
                 },
@@ -2059,6 +2102,41 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn rejected_destination_reconciliation_is_durably_unknown() {
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let input = test_input(&source_parent, &anchor, &staging);
+        let journal = crash_after_publication_intent(&input);
+        fs::create_dir(&journal.output_bundle).unwrap();
+        fs::write(journal.output_bundle.join("foreign.txt"), b"foreign").unwrap();
+
+        let outcome = materialize_canary_source_bundle(&input).unwrap();
+        assert!(matches!(
+            outcome,
+            CanarySourceBundleMaterializeOutcome::CommittedUnknown(_)
+        ));
+        let store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path).unwrap();
+        let recorded = store
+            .load_source_bundle_publication(&journal.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorded.state,
+            SourceBundlePublicationJournalState::CommittedUnknown
+        );
+        assert!(
+            recorded
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("reconciliation rejected"))
+        );
+        assert!(journal.temporary_path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn response_loss_destination_reconciliation_promotes_the_same_operation() {
         let source_parent = TempDir::new().unwrap();
         let anchor = TempDir::new().unwrap();
@@ -2106,6 +2184,98 @@ mod tests {
         );
         assert_eq!(recovered.operation_id, journal.operation_id);
         assert_eq!(recovered.source_identity, journal.source_identity);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_published_forged_valid_authenticode_is_not_materialized() {
+        let (_source_parent, _anchor, _staging, input, _receipt) = materialized_fixture();
+        let operation_id = source_bundle_publication_operation_id(
+            &input.transaction_id,
+            &input.output_bundle,
+            &input.generation,
+        )
+        .unwrap();
+        let store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path).unwrap();
+        store
+            .corrupt_source_bundle_authenticode_fixture(&operation_id)
+            .unwrap();
+        drop(store);
+
+        let error = materialize_canary_source_bundle(&input)
+            .expect_err("forged stale Valid evidence must not materialize");
+        assert!(
+            error.to_string().contains("Authenticode readback"),
+            "the sealed WinTrust verifier must reject forged stale evidence: {error}"
+        );
+        let store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path).unwrap();
+        let recorded = store
+            .load_source_bundle_publication(&operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorded.state,
+            SourceBundlePublicationJournalState::Published
+        );
+        assert_eq!(
+            recorded.precommit_files[0]
+                .authenticode
+                .as_ref()
+                .and_then(|evidence| evidence.signer_subject.as_deref()),
+            Some("ELIOT forged stale Valid fixture")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn response_loss_with_stale_authenticode_is_durably_unknown() {
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let input = test_input(&source_parent, &anchor, &staging);
+        let journal = crash_after_publication_intent(&input);
+        let store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path).unwrap();
+        store
+            .corrupt_source_bundle_authenticode_fixture(&journal.operation_id)
+            .unwrap();
+        drop(store);
+        let publication = OwnedDirectoryPublication::resume(
+            &journal.output_bundle,
+            &journal.temporary_path,
+            &journal.temporary_name,
+            journal.parent_identity,
+            journal.source_identity,
+        )
+        .unwrap();
+        assert!(matches!(
+            publication.publish(journal.source_identity).unwrap(),
+            DirectoryPublicationOutcome::Published(_)
+        ));
+
+        let outcome = materialize_canary_source_bundle(&input).unwrap();
+        assert!(matches!(
+            outcome,
+            CanarySourceBundleMaterializeOutcome::CommittedUnknown(_)
+        ));
+        let store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path).unwrap();
+        let recorded = store
+            .load_source_bundle_publication(&journal.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorded.state,
+            SourceBundlePublicationJournalState::CommittedUnknown
+        );
+        assert!(
+            recorded
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("authority verification"))
+        );
     }
 
     #[cfg(windows)]
