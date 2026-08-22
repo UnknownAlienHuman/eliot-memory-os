@@ -24,10 +24,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CANARY_SCHEMA: &str = "eliot.runtime.live-canary.v3";
+pub const CANARY_SCHEMA: &str = "eliot.runtime.live-canary.v4";
 pub const DEFAULT_DEADLINE_MS: u64 = 30_000;
 pub const MAX_DEADLINE_MS: u64 = 120_000;
 const MAX_EVIDENCE_BYTES: usize = 128 * 1024;
+const MAX_STORE_ATTESTATION_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 const PULSE_FIVE_CLEANUP_GRACE_MS: u64 = 30_000;
 pub const HOST_RUNTIME_CONTROL_PIPE: &str = r"\\.\pipe\eliot\host\runtime-control-v1";
@@ -129,6 +130,30 @@ pub struct ScmRuntimeSnapshot {
     pub process: Option<ScmProcessSnapshot>,
 }
 
+/// Retained, no-follow proof that the live Store bridge and materialized
+/// configuration match the exact active installer approval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PulseFiveStoreArtifactEvidence {
+    pub approved_generation: String,
+    pub candidate_manifest_digest: String,
+    pub authority_generation: u64,
+    pub approved_executable_path: String,
+    pub observed_executable_path: String,
+    pub approved_executable_digest: String,
+    pub observed_executable_digest: String,
+    pub executable_file_identity: eliot_platform_windows::FileIdentity,
+    pub process: ProcessSnapshot,
+    pub approved_config_path: String,
+    pub observed_config_path: String,
+    pub approved_config_digest: String,
+    pub observed_config_digest: String,
+    pub config_file_identity: eliot_platform_windows::FileIdentity,
+    pub phase_b_receipt_digest: String,
+    pub phase_b_host_epoch_lineage: String,
+    pub phase_b_host_epoch_sequence: u64,
+    pub phase_b_host_process_nonce_digest: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PulseFiveScmEvidence {
     pub approved_generation: String,
@@ -141,6 +166,8 @@ pub struct PulseFiveScmEvidence {
     pub stopped_runtime_status: String,
     pub stopped_runtime_status_digest: String,
     pub owner_release_digest: String,
+    pub store_before: PulseFiveStoreArtifactEvidence,
+    pub store_after: PulseFiveStoreArtifactEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -995,12 +1022,32 @@ fn validate_runtime_live_contour(report: &RuntimeStatusReport) -> Result<(), Str
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PulseFiveStoreApproval {
+    approved_generation: String,
+    candidate_manifest_digest: String,
+    authority_generation: u64,
+    executable_path: PathBuf,
+    executable_digest: PlatformHandle,
+    working_directory: PathBuf,
+    config_path: PathBuf,
+    config_digest: PlatformHandle,
+    phase_b_receipt_digest: PlatformHandle,
+    phase_b_host_epoch_lineage: String,
+    phase_b_host_epoch_sequence: u64,
+    phase_b_host_process_nonce_digest: String,
+    profile_anchor_root: PathBuf,
+}
+
+#[cfg(windows)]
 struct PulseFiveAuthority {
     platform: eliot_platform_windows::WindowsPlatform,
+    store_platform: eliot_platform_windows::WindowsPlatform,
     host_request: eliot_platform_windows::ServiceRegistrationRequest,
     watchdog_request: eliot_platform_windows::ServiceRegistrationRequest,
     installation_id: PlatformHandle,
     approved_generation: String,
+    store_approval: PulseFiveStoreApproval,
     _host_root_lease: eliot_platform_windows::ProtectedRootLease,
 }
 
@@ -1155,11 +1202,10 @@ fn resolve_post_stop_reconcile<T, O>(
 }
 
 #[cfg(windows)]
-fn load_pulse_five_authority(
+fn inspect_pulse_five_registry(
     root: &Path,
-    before: &RuntimeObservation,
-) -> Result<PulseFiveAuthority, String> {
-    use eliot_installation::{InstallerServiceRole, RedbInstallationRegistry};
+) -> Result<(PathBuf, eliot_installation::ApprovedGenerationRegistry), String> {
+    use eliot_installation::RedbInstallationRegistry;
     use eliot_platform_windows::ProtectedRootLease;
 
     let registry_root = ProtectedRootLease::open_existing(root)
@@ -1176,6 +1222,146 @@ fn load_pulse_five_authority(
     let registry = RedbInstallationRegistry::inspect_existing_at(registry_root)
         .map_err(|error| format!("inspect retained installation registry: {error}"))?
         .ok_or_else(|| "retained installation registry is absent".to_owned())?;
+    registry
+        .validate()
+        .map_err(|error| format!("validate retained installation registry: {error}"))?;
+    Ok((canonical, registry))
+}
+
+#[cfg(windows)]
+fn pulse_five_store_approval(
+    registry: &eliot_installation::ApprovedGenerationRegistry,
+    contour: &ContourSnapshot,
+) -> Result<PulseFiveStoreApproval, String> {
+    use eliot_installation::InstallationProfile;
+
+    let active = registry
+        .active()
+        .ok_or_else(|| "installation registry has no exact active generation".to_owned())?;
+    let manifest = &active.manifest;
+    manifest
+        .validate()
+        .map_err(|error| format!("validate active candidate manifest: {error}"))?;
+    if manifest.runtime_launch.profile != InstallationProfile::SystemService {
+        return Err("Pulse 5 SCM recovery requires the active SystemService profile".to_owned());
+    }
+    let manifest_digest = manifest
+        .compute_digest()
+        .map_err(|error| format!("digest active candidate manifest: {error}"))?;
+    let committed = registry
+        .last_committed_activation_fence()
+        .ok_or_else(|| "active generation has no committed activation fence".to_owned())?;
+    if committed.generation != manifest.generation
+        || committed.config_digest != manifest.config_digest
+        || committed.authority_generation != manifest.runtime_launch.authority_generation
+    {
+        return Err("active manifest and committed activation authority disagree".to_owned());
+    }
+    let (
+        config_digest,
+        phase_b_receipt_digest,
+        phase_b_host_epoch_lineage,
+        phase_b_host_epoch_sequence,
+        phase_b_host_process_nonce_digest,
+    ) = if let Some(rebind) = registry.active_phase_b_rebind() {
+        rebind
+            .validate()
+            .map_err(|error| format!("validate current active Phase-B rebind: {error}"))?;
+        let receipt = rebind
+            .receipt
+            .as_ref()
+            .ok_or_else(|| "active Phase-B rebind lacks its exact no-follow receipt".to_owned())?;
+        if receipt.manifest_digest != manifest_digest {
+            return Err("active Phase-B rebind names a foreign manifest".to_owned());
+        }
+        (
+            receipt.config_file_digest.clone(),
+            receipt.receipt_digest.clone(),
+            receipt.host_epoch_lineage.as_str().to_owned(),
+            receipt.host_epoch_sequence,
+            receipt.host_process_nonce_digest.as_str().to_owned(),
+        )
+    } else {
+        let binding = committed.phase_b_live_binding.as_ref().ok_or_else(|| {
+            "committed activation lacks its exact Phase-B live binding".to_owned()
+        })?;
+        if binding.manifest_digest != manifest_digest
+            || binding.config_file_digest != committed.materialized_config_digest
+        {
+            return Err("committed Phase-B config binding is inconsistent".to_owned());
+        }
+        (
+            binding.config_file_digest.clone(),
+            binding.receipt_digest.clone(),
+            binding.host_epoch_lineage.as_str().to_owned(),
+            binding.host_epoch_sequence,
+            binding.host_process_nonce_digest.as_str().to_owned(),
+        )
+    };
+    if phase_b_host_epoch_lineage != contour.host_epoch_lineage
+        || phase_b_host_epoch_sequence != contour.host_epoch_sequence
+        || phase_b_host_process_nonce_digest != contour.host_process_nonce_digest
+    {
+        return Err(
+            "current Phase-B config receipt is not bound to the observed Host epoch/nonce"
+                .to_owned(),
+        );
+    }
+    let authority_generation = manifest.runtime_launch.authority_generation.value();
+    let store_generation = contour
+        .store_generation
+        .as_deref()
+        .ok_or_else(|| "current StoreRebind generation is absent".to_owned())?
+        .parse::<u64>()
+        .map_err(|_| "current StoreRebind generation is not an integer".to_owned())?;
+    if store_generation != authority_generation {
+        return Err(
+            "current StoreRebind generation differs from the active manifest authority generation"
+                .to_owned(),
+        );
+    }
+    let (_, executable_digest) = manifest
+        .host_child_artifact_digests()
+        .map_err(|error| format!("read approved Store bridge digest: {error}"))?;
+    let (_, executable_path, config_path) = manifest.host_child_paths();
+    Ok(PulseFiveStoreApproval {
+        approved_generation: manifest.generation.as_str().to_owned(),
+        candidate_manifest_digest: manifest_digest.as_str().to_owned(),
+        authority_generation,
+        executable_path: PathBuf::from(executable_path.as_str()),
+        executable_digest: executable_digest.clone(),
+        working_directory: PathBuf::from(
+            manifest
+                .runtime_launch
+                .runtime_state_roots
+                .store_work_root
+                .as_str(),
+        ),
+        config_path: PathBuf::from(config_path.as_str()),
+        config_digest,
+        phase_b_receipt_digest,
+        phase_b_host_epoch_lineage,
+        phase_b_host_epoch_sequence,
+        phase_b_host_process_nonce_digest,
+        profile_anchor_root: PathBuf::from(
+            manifest
+                .runtime_launch
+                .runtime_state_roots
+                .profile_anchor_root
+                .as_str(),
+        ),
+    })
+}
+
+#[cfg(windows)]
+fn load_pulse_five_authority(
+    root: &Path,
+    before: &RuntimeObservation,
+) -> Result<PulseFiveAuthority, String> {
+    use eliot_installation::InstallerServiceRole;
+    use eliot_platform_windows::ProtectedRootLease;
+
+    let (canonical, registry) = inspect_pulse_five_registry(root)?;
     let active = registry
         .active()
         .ok_or_else(|| "installation registry has no exact active generation".to_owned())?;
@@ -1221,6 +1407,7 @@ fn load_pulse_five_authority(
                 .to_owned(),
         );
     }
+    let store_approval = pulse_five_store_approval(&registry, &before.contour)?;
     let host_request = registry
         .service_registration_approval(&generation, InstallerServiceRole::Host)
         .ok_or_else(|| "active generation has no installer-owned EliotHost approval".to_owned())?
@@ -1240,14 +1427,238 @@ fn load_pulse_five_authority(
         .map_err(|error| format!("verify Pulse 5 Host root lifetime lease: {error}"))?;
     let platform = eliot_platform_windows::WindowsPlatform::new(canonical)
         .map_err(|error| format!("bind Windows adapter to retained Host root: {error}"))?;
+    let store_platform =
+        eliot_platform_windows::WindowsPlatform::new(store_approval.profile_anchor_root.clone())
+            .map_err(|error| {
+                format!("bind Windows adapter to retained Store profile root: {error}")
+            })?;
     Ok(PulseFiveAuthority {
         platform,
+        store_platform,
         host_request,
         watchdog_request,
         installation_id: journal_state.host.installation,
         approved_generation: generation.as_str().to_owned(),
+        store_approval,
         _host_root_lease: retained,
     })
+}
+
+#[cfg(windows)]
+fn validate_pulse_five_store_artifact_evidence(
+    evidence: &PulseFiveStoreArtifactEvidence,
+    contour: &ContourSnapshot,
+) -> Result<(), String> {
+    let store = contour
+        .store
+        .as_ref()
+        .ok_or_else(|| "Store artifact evidence has no journaled process/Job contour".to_owned())?;
+    let generation = contour
+        .store_generation
+        .as_deref()
+        .ok_or_else(|| "Store artifact evidence has no journaled authority generation".to_owned())?
+        .parse::<u64>()
+        .map_err(|_| "journaled Store authority generation is not an integer".to_owned())?;
+    if evidence.approved_generation.trim().is_empty()
+        || !is_lower_hex(&evidence.candidate_manifest_digest)
+        || evidence.authority_generation == 0
+        || generation != evidence.authority_generation
+        || !Path::new(&evidence.approved_executable_path).is_absolute()
+        || !Path::new(&evidence.observed_executable_path).is_absolute()
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(&evidence.approved_executable_path),
+            Path::new(&evidence.observed_executable_path),
+        )
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(&evidence.observed_executable_path),
+            Path::new(&evidence.process.image_path),
+        )
+        || evidence.approved_executable_digest != evidence.observed_executable_digest
+        || !is_lower_hex(&evidence.approved_executable_digest)
+        || !Path::new(&evidence.approved_config_path).is_absolute()
+        || !Path::new(&evidence.observed_config_path).is_absolute()
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(&evidence.approved_config_path),
+            Path::new(&evidence.observed_config_path),
+        )
+        || evidence.approved_config_digest != evidence.observed_config_digest
+        || !is_lower_hex(&evidence.approved_config_digest)
+        || !is_lower_hex(&evidence.phase_b_receipt_digest)
+        || evidence.phase_b_host_epoch_lineage != contour.host_epoch_lineage
+        || evidence.phase_b_host_epoch_sequence != contour.host_epoch_sequence
+        || evidence.phase_b_host_process_nonce_digest != contour.host_process_nonce_digest
+        || &evidence.process != store
+    {
+        return Err(
+            "Store artifact/config evidence is not the exact active manifest, Phase-B and journal contour"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_pulse_five_store_artifact_transition(
+    before: &PulseFiveStoreArtifactEvidence,
+    after: &PulseFiveStoreArtifactEvidence,
+) -> Result<(), String> {
+    if before.approved_generation != after.approved_generation
+        || before.candidate_manifest_digest != after.candidate_manifest_digest
+        || before.authority_generation != after.authority_generation
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(&before.approved_executable_path),
+            Path::new(&after.approved_executable_path),
+        )
+        || before.approved_executable_digest != after.approved_executable_digest
+        || before.executable_file_identity != after.executable_file_identity
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(&before.approved_config_path),
+            Path::new(&after.approved_config_path),
+        )
+        || before.approved_config_digest == after.approved_config_digest
+        || before.config_file_identity == after.config_file_identity
+        || before.phase_b_receipt_digest == after.phase_b_receipt_digest
+    {
+        return Err(
+            "post-start Store artifact/config proof changed immutable approval, replaced the retained executable, or reused the prior config/Phase-B receipt"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn observed_protected_file_digest(
+    lease: &eliot_platform_windows::ProtectedPathLease,
+    expected: &PlatformHandle,
+    label: &str,
+) -> Result<String, String> {
+    if !is_lower_hex(expected.as_str()) {
+        return Err(format!("{label} approval digest is not exact SHA-256"));
+    }
+    lease
+        .verify_stable_identity()
+        .and_then(|()| lease.verify_path_identity())
+        .map_err(|error| format!("verify retained {label} identity: {error}"))?;
+    let bytes = lease
+        .read_bounded(MAX_STORE_ATTESTATION_FILE_BYTES)
+        .map_err(|error| format!("read retained {label} bytes: {error}"))?;
+    let observed = digest_bytes(&bytes);
+    if observed != expected.as_str() {
+        return Err(format!(
+            "retained {label} bytes differ from active installer approval"
+        ));
+    }
+    Ok(observed)
+}
+
+#[cfg(windows)]
+fn attest_pulse_five_store_artifacts(
+    executable_lease: &eliot_platform_windows::RetainedProcessPathLease,
+    approval: &PulseFiveStoreApproval,
+    contour: &ContourSnapshot,
+) -> Result<PulseFiveStoreArtifactEvidence, String> {
+    use eliot_platform_windows::{ProtectedPathLease, observe_named_pipe_peer_process_in_job};
+
+    let store = contour
+        .store
+        .as_ref()
+        .ok_or_else(|| "journaled Store process/Job contour is absent".to_owned())?;
+    let process = executable_lease
+        .validate_process_identity(
+            store.process_id,
+            &approval.executable_path,
+            &approval.working_directory,
+            approval.executable_digest.as_str(),
+        )
+        .map_err(|error| format!("verify retained Store executable/process identity: {error}"))?;
+    let job = observe_named_pipe_peer_process_in_job(&store.job_name, store.process_id)
+        .map_err(|error| format!("verify live Store Job membership: {error}"))?;
+    if job.process_binding().identity() != &process
+        || job.job_name() != store.job_name
+        || process.process_id != store.process_id
+        || process.start_time_100ns != store.start_time_100ns
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(&process.image_path),
+            Path::new(&store.image_path),
+        )
+    {
+        return Err("live Store process/Job differs from the journaled contour".to_owned());
+    }
+
+    let executable_file_lease =
+        ProtectedPathLease::open_existing_absolute(&approval.executable_path)
+            .map_err(|error| format!("retain approved Store executable bytes: {error}"))?;
+    let executable_canonical = executable_file_lease
+        .canonical_path()
+        .map_err(|error| format!("resolve retained Store executable: {error}"))?;
+    if !eliot_platform_windows::windows_paths_equal(
+        &approval.executable_path,
+        &executable_canonical,
+    ) || executable_file_lease.identity() != executable_lease.executable_identity()
+    {
+        return Err("retained Store executable path/object identity was substituted".to_owned());
+    }
+    let observed_executable_digest = observed_protected_file_digest(
+        &executable_file_lease,
+        &approval.executable_digest,
+        "Store executable",
+    )?;
+
+    let config_lease = ProtectedPathLease::open_existing_absolute(&approval.config_path)
+        .map_err(|error| format!("retain materialized Store config: {error}"))?;
+    let config_canonical = config_lease
+        .canonical_path()
+        .map_err(|error| format!("resolve retained Store config: {error}"))?;
+    if !eliot_platform_windows::windows_paths_equal(&approval.config_path, &config_canonical) {
+        return Err("materialized Store config differs from the approved path".to_owned());
+    }
+    let observed_config_digest = observed_protected_file_digest(
+        &config_lease,
+        &approval.config_digest,
+        "materialized Store config",
+    )?;
+    let approved_executable_path = approval
+        .executable_path
+        .to_str()
+        .ok_or_else(|| "approved Store executable path is not Unicode".to_owned())?
+        .to_owned();
+    let approved_config_path = approval
+        .config_path
+        .to_str()
+        .ok_or_else(|| "approved Store config path is not Unicode".to_owned())?
+        .to_owned();
+    let observed_config_path = config_canonical
+        .to_str()
+        .ok_or_else(|| "retained Store config path is not Unicode".to_owned())?
+        .to_owned();
+    let evidence = PulseFiveStoreArtifactEvidence {
+        approved_generation: approval.approved_generation.clone(),
+        candidate_manifest_digest: approval.candidate_manifest_digest.clone(),
+        authority_generation: approval.authority_generation,
+        approved_executable_path,
+        observed_executable_path: process.image_path.clone(),
+        approved_executable_digest: approval.executable_digest.as_str().to_owned(),
+        observed_executable_digest,
+        executable_file_identity: executable_lease.executable_identity(),
+        process: ProcessSnapshot {
+            process_id: process.process_id,
+            start_time_100ns: process.start_time_100ns,
+            image_path: process.image_path,
+            job_name: job.job_name().to_owned(),
+        },
+        approved_config_path,
+        observed_config_path,
+        approved_config_digest: approval.config_digest.as_str().to_owned(),
+        observed_config_digest,
+        config_file_identity: config_lease.identity(),
+        phase_b_receipt_digest: approval.phase_b_receipt_digest.as_str().to_owned(),
+        phase_b_host_epoch_lineage: approval.phase_b_host_epoch_lineage.clone(),
+        phase_b_host_epoch_sequence: approval.phase_b_host_epoch_sequence,
+        phase_b_host_process_nonce_digest: approval.phase_b_host_process_nonce_digest.clone(),
+    };
+    validate_pulse_five_store_artifact_evidence(&evidence, contour)?;
+    Ok(evidence)
 }
 
 #[cfg(windows)]
@@ -1547,6 +1958,14 @@ fn validate_fresh_pulse_five_contour(
     validate_runtime_live_contour(&after.report)?;
     let old = &before.contour;
     let new = &after.contour;
+    if scm.store_before.approved_generation != scm.approved_generation
+        || scm.store_after.approved_generation != scm.approved_generation
+    {
+        return Err("Store artifact evidence names a foreign active generation".to_owned());
+    }
+    validate_pulse_five_store_artifact_evidence(&scm.store_before, old)?;
+    validate_pulse_five_store_artifact_evidence(&scm.store_after, new)?;
+    validate_pulse_five_store_artifact_transition(&scm.store_before, &scm.store_after)?;
     if before.report.active_generation.as_deref() != Some(scm.approved_generation.as_str())
         || after.report.active_generation != before.report.active_generation
         || !eliot_platform_windows::windows_paths_equal(
@@ -1608,32 +2027,18 @@ fn validate_fresh_pulse_five_contour(
     ) {
         return Err("post-start Store changed the approved executable path".to_owned());
     }
-    let old_store_generation = old
-        .store_generation
-        .as_deref()
-        .ok_or_else(|| "baseline StoreRebind generation is absent".to_owned())?
-        .parse::<u64>()
-        .map_err(|_| "baseline StoreRebind generation is not an integer".to_owned())?;
-    let new_store_generation = new
-        .store_generation
-        .as_deref()
-        .ok_or_else(|| "post-start StoreRebind generation is absent".to_owned())?
-        .parse::<u64>()
-        .map_err(|_| "post-start StoreRebind generation is not an integer".to_owned())?;
-    if new_store_generation <= old_store_generation
-        || new.store_fence.as_ref().is_none_or(|fence| {
-            old.store_fence
-                .as_ref()
-                .is_some_and(|old_fence| old_fence == fence)
-        })
-        || new.store_request_digest.as_ref().is_none_or(|request| {
-            old.store_request_digest
-                .as_ref()
-                .is_some_and(|old_request| old_request == request)
-        })
-    {
+    if new.store_fence.as_ref().is_none_or(|fence| {
+        old.store_fence
+            .as_ref()
+            .is_some_and(|old_fence| old_fence == fence)
+    }) || new.store_request_digest.as_ref().is_none_or(|request| {
+        old.store_request_digest
+            .as_ref()
+            .is_some_and(|old_request| old_request == request)
+    }) {
         return Err(
-            "post-start Store did not produce a causally fresh generation/fence/request".to_owned(),
+            "post-start Store did not preserve the approved static generation with a causally fresh fence/request"
+                .to_owned(),
         );
     }
     let old_supervision = before
@@ -1749,10 +2154,24 @@ async fn run_windows_pulse_five(
     let fresh_before = observe_runtime(root, deadline).map_err(|error| error.to_string())?;
     if fresh_before.status_digest != before.status_digest
         || fresh_before.journal_digest != before.journal_digest
+        || fresh_before.contour != before.contour
         || fresh_before.dynamic_supervision != before.dynamic_supervision
     {
         return Err("runtime changed after baseline and before the Host stop boundary".to_owned());
     }
+    let store_executable_lease = authority
+        .store_platform
+        .retain_process_path_lease(
+            &authority.store_approval.executable_path,
+            &authority.store_approval.working_directory,
+            authority.store_approval.executable_digest.as_str(),
+        )
+        .map_err(|error| format!("retain approved Store executable contour: {error}"))?;
+    let store_before = attest_pulse_five_store_artifacts(
+        &store_executable_lease,
+        &authority.store_approval,
+        &before.contour,
+    )?;
     let host_before = require_running_scm(&authority, &authority.host_request, "EliotHost")?;
     let watchdog_before =
         require_running_scm(&authority, &authority.watchdog_request, "EliotWatchdog")?;
@@ -1884,6 +2303,29 @@ async fn run_windows_pulse_five(
         &watchdog_after,
         "EliotWatchdog",
     )?;
+    let (post_registry_root, post_registry) = inspect_pulse_five_registry(root)?;
+    if !eliot_platform_windows::windows_paths_equal(root, &post_registry_root) {
+        return Err("post-start registry inspection selected a foreign Host root".to_owned());
+    }
+    let post_store_approval = pulse_five_store_approval(&post_registry, &after.contour)?;
+    if post_store_approval.approved_generation != authority.approved_generation
+        || post_store_approval.candidate_manifest_digest
+            != authority.store_approval.candidate_manifest_digest
+        || post_store_approval.authority_generation != authority.store_approval.authority_generation
+        || !eliot_platform_windows::windows_paths_equal(
+            &post_store_approval.profile_anchor_root,
+            &authority.store_approval.profile_anchor_root,
+        )
+    {
+        return Err(
+            "post-start Store approval differs from the pre-stop active manifest".to_owned(),
+        );
+    }
+    let store_after = attest_pulse_five_store_artifacts(
+        &store_executable_lease,
+        &post_store_approval,
+        &after.contour,
+    )?;
     mutations.validate_complete()?;
     let scm_evidence = PulseFiveScmEvidence {
         approved_generation: authority.approved_generation,
@@ -1896,6 +2338,8 @@ async fn run_windows_pulse_five(
         stopped_runtime_status,
         stopped_runtime_status_digest: stopped_status_digest,
         owner_release_digest,
+        store_before,
+        store_after,
     };
     validate_fresh_pulse_five_contour(before, &stop_boundary, &after, &scm_evidence)?;
     let request_digest = digest_json(&(
@@ -2816,6 +3260,11 @@ mod tests {
     }
 
     fn contour() -> ContourSnapshot {
+        let store_image = if cfg!(windows) {
+            r"C:\Program Files\Eliot\eliot-store-bridge.exe"
+        } else {
+            "/opt/eliot/eliot-store-bridge"
+        };
         ContourSnapshot {
             host_epoch_lineage: "host-lineage".to_owned(),
             host_epoch_sequence: 3,
@@ -2832,7 +3281,7 @@ mod tests {
             kernel_generation_digest: Some(digest_bytes(b"kernel-before")),
             kernel_activation_nonce_digest: Some(digest_bytes(b"kernel-nonce-before")),
             kernel_state: Some("Active".to_owned()),
-            store: Some(process(20, 200, "store.exe", "store-job")),
+            store: Some(process(20, 200, store_image, "store-job")),
             store_generation: Some("3".to_owned()),
             store_fence: Some("b".repeat(64)),
             store_request_digest: Some("c".repeat(64)),
@@ -2919,6 +3368,46 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn store_artifact_evidence(
+        contour: &ContourSnapshot,
+        phase_seed: char,
+        config_seed: char,
+        config_file_index: u64,
+    ) -> PulseFiveStoreArtifactEvidence {
+        let store = contour
+            .store
+            .as_ref()
+            .unwrap_or_else(|| unreachable!())
+            .clone();
+        PulseFiveStoreArtifactEvidence {
+            approved_generation: "g".to_owned(),
+            candidate_manifest_digest: "c".repeat(64),
+            authority_generation: 3,
+            approved_executable_path: store.image_path.clone(),
+            observed_executable_path: store.image_path.clone(),
+            approved_executable_digest: "d".repeat(64),
+            observed_executable_digest: "d".repeat(64),
+            executable_file_identity: eliot_platform_windows::FileIdentity {
+                volume_serial_number: 10,
+                file_index: 20,
+            },
+            process: store,
+            approved_config_path: r"C:\ProgramData\Eliot\runtime\store\config.json".to_owned(),
+            observed_config_path: r"C:\ProgramData\Eliot\runtime\store\config.json".to_owned(),
+            approved_config_digest: config_seed.to_string().repeat(64),
+            observed_config_digest: config_seed.to_string().repeat(64),
+            config_file_identity: eliot_platform_windows::FileIdentity {
+                volume_serial_number: 10,
+                file_index: config_file_index,
+            },
+            phase_b_receipt_digest: phase_seed.to_string().repeat(64),
+            phase_b_host_epoch_lineage: contour.host_epoch_lineage.clone(),
+            phase_b_host_epoch_sequence: contour.host_epoch_sequence,
+            phase_b_host_process_nonce_digest: contour.host_process_nonce_digest.clone(),
+        }
+    }
+
+    #[cfg(windows)]
     fn pulse_five_fixture() -> (
         RuntimeObservation,
         ContourSnapshot,
@@ -2944,8 +3433,15 @@ mod tests {
         after.contour.kernel_generation = Some("kernel-lineage:4".to_owned());
         after.contour.kernel_generation_digest = Some(digest_bytes(b"kernel-after"));
         after.contour.kernel_activation_nonce_digest = Some(digest_bytes(b"kernel-nonce-after"));
-        after.contour.store = Some(process(21, 300, "store.exe", "store-job-after"));
-        after.contour.store_generation = Some("4".to_owned());
+        after.contour.store = Some(process(
+            21,
+            300,
+            r"C:\Program Files\Eliot\eliot-store-bridge.exe",
+            "store-job-after",
+        ));
+        // Store's authority generation is the immutable manifest generation;
+        // Host restart freshness comes from process/Job and rebind fence/request.
+        after.contour.store_generation = before.contour.store_generation.clone();
         after.contour.store_fence = Some("3".repeat(64));
         after.contour.store_request_digest = Some("4".repeat(64));
         after.contour.ready_receipt_digest = Some("1".repeat(64));
@@ -2979,6 +3475,8 @@ mod tests {
             Some('7'),
             Some((200, 500, r"C:\Program Files\Eliot\eliot-watchdog.exe")),
         );
+        let store_before = store_artifact_evidence(&before.contour, 'a', 'e', 30);
+        let store_after = store_artifact_evidence(&after.contour, 'b', 'f', 31);
         let scm = PulseFiveScmEvidence {
             approved_generation: "g".to_owned(),
             host_before,
@@ -2990,6 +3488,8 @@ mod tests {
             stopped_runtime_status: "READINESS_DEGRADED".to_owned(),
             stopped_runtime_status_digest: "8".repeat(64),
             owner_release_digest: "9".repeat(64),
+            store_before,
+            store_after,
         };
         (before, stopped, after, scm)
     }
@@ -3137,6 +3637,13 @@ mod tests {
         assert!(production.contains("EffectUnknown =>"));
         assert!(production.contains("reconcile_host_running_after_start"));
         assert!(production.contains("resolve_post_stop_reconcile("));
+        assert_eq!(
+            production
+                .matches("attest_pulse_five_store_artifacts(")
+                .count(),
+            2
+        );
+        assert!(production.contains("inspect_pulse_five_registry(root)"));
         assert!(!production.contains("ServiceOperation::Stop"));
         assert!(!production.contains("ServiceOperation::Start"));
     }
@@ -3214,10 +3721,7 @@ mod tests {
         );
 
         let mut stale_generation = after.clone();
-        stale_generation
-            .contour
-            .store_generation
-            .clone_from(&before.contour.store_generation);
+        stale_generation.contour.store_generation = Some("4".to_owned());
         assert!(
             validate_fresh_pulse_five_contour(&before, &stopped, &stale_generation, &scm).is_err()
         );
@@ -3275,6 +3779,72 @@ mod tests {
         assert!(
             validate_fresh_pulse_five_contour(&before, &stopped, &foreign_approval, &scm).is_err()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pulse_five_static_store_generation_passes_only_with_dynamic_freshness() {
+        let (before, stopped, after, scm) = pulse_five_fixture();
+        assert_eq!(
+            before.contour.store_generation,
+            after.contour.store_generation
+        );
+        assert_eq!(scm.store_before.authority_generation, 3);
+        assert_eq!(scm.store_after.authority_generation, 3);
+        assert!(validate_fresh_pulse_five_contour(&before, &stopped, &after, &scm).is_ok());
+
+        let mut substituted = after.clone();
+        substituted.contour.store_generation = Some("4".to_owned());
+        assert!(validate_fresh_pulse_five_contour(&before, &stopped, &substituted, &scm).is_err());
+
+        let mut stale_fence = after;
+        stale_fence
+            .contour
+            .store_fence
+            .clone_from(&before.contour.store_fence);
+        assert!(validate_fresh_pulse_five_contour(&before, &stopped, &stale_fence, &scm).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pulse_five_rejects_same_path_store_binary_replacement() {
+        let (before, stopped, after, scm) = pulse_five_fixture();
+
+        let mut changed_bytes = scm.clone();
+        changed_bytes.store_after.observed_executable_digest = "a".repeat(64);
+        assert_eq!(
+            changed_bytes.store_after.approved_executable_path,
+            changed_bytes.store_after.observed_executable_path
+        );
+        assert!(
+            validate_fresh_pulse_five_contour(&before, &stopped, &after, &changed_bytes).is_err()
+        );
+
+        let mut replaced_identity = scm;
+        replaced_identity
+            .store_after
+            .executable_file_identity
+            .file_index += 1;
+        assert_eq!(
+            replaced_identity.store_before.approved_executable_digest,
+            replaced_identity.store_after.approved_executable_digest
+        );
+        assert!(
+            validate_fresh_pulse_five_contour(&before, &stopped, &after, &replaced_identity)
+                .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pulse_five_rejects_same_path_materialized_config_substitution() {
+        let (before, stopped, after, mut scm) = pulse_five_fixture();
+        scm.store_after.observed_config_digest = "a".repeat(64);
+        assert_eq!(
+            scm.store_after.approved_config_path,
+            scm.store_after.observed_config_path
+        );
+        assert!(validate_fresh_pulse_five_contour(&before, &stopped, &after, &scm).is_err());
     }
 
     fn kernel_receipt(
