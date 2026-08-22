@@ -4,6 +4,8 @@
 
 - Repository: `UnknownAlienHuman/eliot-memory-os`
 - Branch: `codex/runtime-live-v3-integration-staging`
+- Accepted local release-handoff candidate: `4bf70d9fd0454923c7fbd4da3661b76dbb1e1707` before the documentation merge.
+- Current pushed staging ref: `origin/codex/runtime-live-v3-integration-staging` at `1e2d2cfdcf3592a4910eb82206b434e4985645ca`; it must not be called current until the accepted candidate is fast-forwarded and the remote SHA is read back.
 - Source task: `C:\Users\kleym\Downloads\ELIOT_CODEX_RUNTIME_LIVE_V3_2026-08-18.md`
 - This branch is an integration staging branch. It is not a `RUNTIME_LIVE_CANARY` completion claim.
 - Longstanding untracked `.eliot/inbox/*.surql` files are preserved and are not part of the Git tree.
@@ -33,6 +35,14 @@
 - `7faacee` — Pulse 5 installer-approved Store executable/materialized-config attestation with production-reachable static authority generation.
 - `7cc1730` — read-only runtime leases for Store attestation; canary never repairs or rewrites ACLs.
 - `4c2b7c7` — production `eliot runtime canary`, exact active-manifest evidence root, retained Host/evidence object identity and marker-last authoritative completion.
+- `2117967` — fail-closed six-PE Authenticode/RFC3161 release finalizer with typed `COMMITTED_UNKNOWN` reconciliation.
+- `c28757f` — materializer publication receipt bound to the generation plan.
+- `80174b8` — retained-handle Authenticode verification and certificate evidence hardening.
+- `9c9c426`, `a63ea6c`, `ac7cc63` — unbound Generate/Auth paths removed; generation planning requires published source authority.
+- `f7135aa` — durable `StagePackage` source observations and strict transaction wire v21.
+- `1a80462`, `18745e7`, `78d56e6` — retained publication identity, Redb recovery and handle-relative no-replace publication.
+- `59a07ac`, `80346fe` — durable source-publication journal v3 with exact old-temp restart authority and store admission gates.
+- `4bf70d9f` — atomic same-parent Redb journal publication; monotonic single-write-transaction journal CAS; and independent sealed WinTrust revalidation of all six executable roles, including existing/response-loss fast paths, before privileged installation effects.
 
 ## Verified in focused source gates
 
@@ -41,6 +51,9 @@
 - Production canary invocation: `eliot` bin 23/23; `eliot-live-canary` 23/23; all-target `eliot` check; strict no-deps Clippy; formatting/diff. Independent audit rejected the first publication ordering, then accepted the corrected marker-last and exact snapshot-to-retained-handle identity chain.
 - First-install roots: focused all-target checks; 12 Windows installer-root primitive tests; SystemService planner test; v18-to-v19 migration test; formatting/diff.
 - Earlier integrated milestones carry their own focused test and strict lint evidence in Git history.
+- Signed finalizer: both PowerShell 7 and Windows PowerShell 5.1 provider-free suites pass; the release-security smoke passes. The tests cover exact six-role signing, RFC3161 evidence, retained identity/hash contours, no-replace publication, partial-output quarantine and exit 75 for `COMMITTED_UNKNOWN`.
+- Source authority candidate `4bf70d9f`: metadata/fmt/diff pass; all-target check for `eliot-installation`, `eliot-platform-windows` and `eliot`; Redb publication tests 18/18; `eliot` bin 38/38; package-staging tests 32/32; strict no-deps Clippy passes with the repository's established baseline lint waivers. The production dependency graph does not enable `eliot-installation/test-support`.
+- The unfiltered installation suite remains 202/209 on this host: four Windows Credential/provider tests fail with the pre-existing `ProviderError::Unavailable`, and three following shared-mutex failures pass independently. They are machine-provider gaps, not live acceptance evidence.
 
 These checks prove source behavior only. They do not prove live service installation or `RUNTIME_LIVE_CANARY`.
 
@@ -48,27 +61,28 @@ These checks prove source behavior only. They do not prove live service installa
 
 ### Signed runtime bundle
 
-The release pipeline intentionally emits unsigned binaries, while the source-bundle materializer correctly requires `AuthenticodeVerdict::Valid` for all six runtime executables. No certificate combining a Code Signing EKU with `HasPrivateKey=true` was found in `Cert:\CurrentUser\My` or `Cert:\LocalMachine\My`. `signtool.exe` is installed at `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe`, but the repository has no approved signer selection, RFC3161 timestamp endpoint or signed-manifest finalization/readback command. The current release script explicitly emits `signed=false` and `signature_evidence=not-issued`.
+The unsigned builder remains intentionally separate from the implemented fail-closed finalizer. The finalizer selects an explicit certificate with a private key and Code Signing EKU, invokes `signtool.exe` for exactly six runtime PE roles with an explicit RFC3161 endpoint, independently rereads signer/timestamp/hash evidence, and never promotes a mutable published directory to installation authority. The Rust materializer then performs the first authoritative nine-role handoff and independently reruns sealed WinTrust checks.
 
-Do not weaken Authenticode or invent a self-signed production trust root. The next source slice is an exact fail-closed signing/finalization procedure; the next external prerequisite is a trusted OV/EV code-signing identity with an available private key and approved RFC3161 service. A signed and independently verified exact bundle is required before Pulse 1.
+No real certificate has yet been installed/selected and no release binary has yet been signed in this handoff. The next external step is to provision the user-approved development signing certificate, choose the RFC3161 endpoint, sign the exact built candidate, run public-certificate `-VerifyBundle`, and feed that verified snapshot to `eliot installation materialize-source-bundle`. A source-only green finalizer is not a signed release.
 
 ### Live Windows evidence
 
 No real SCM/service mutation was executed in these source lanes. Required next live sequence is:
 
-1. Build/sign the exact bundle and materialize the nine-role Phase-A source bundle.
-2. Run elevated installation plan/apply for a disposable SystemService installation.
-3. Run and persist Pulses 1–5 against the same installation identity.
-4. Verify remote/result digests, journal/registry readback, Store filesystem placement, SCM identities and absence of the legacy writer.
+1. Build the exact unsigned release and finalize/sign its six PE roles with the selected certificate and RFC3161 timestamp.
+2. Run public-certificate `-VerifyBundle`; reconcile `COMMITTED_UNKNOWN` read-only and materialize the exact nine-role Phase-A source bundle until `SOURCE_BUNDLE_MATERIALIZED` is durably read back.
+3. Run elevated installation plan/apply for a disposable SystemService installation.
+4. Run and persist Pulses 1–5 against the same installation identity.
+5. Verify remote/result digests, journal/registry readback, Store filesystem placement, SCM identities and absence of the legacy writer.
 
 Pulses 6–8 remain post-canary recovery/removal work. They may report exact blockers, but may not be silently marked complete.
 
 ## Repository cleanup state
 
-The 2026-08-22 exact inventory found 269 registered worktrees and 253 local `codex/*` refs before cleanup: 44 local tips were ancestors of staging, two were tree-equivalent, 209 were unique non-ancestors and the remainder were dirty, live-process-bound or otherwise unknown. Eight clean, non-live, staging-contained superseded worktrees and their local branches were removed without force; 183,023,726 bytes (174.55 MiB) were reclaimed. Current readback is 262 worktrees and 246 local `codex/*` refs because one new active Pulse 5 correction worktree appeared during cleanup.
+The historical 2026-08-22 cleanup note reported eight clean staging-contained worktrees removed and 183,023,726 bytes reclaimed, but no independent cleanup report is currently available; treat those numbers as historical, not acceptance evidence. The fresh pre-push readback is 273 registered worktrees and 257 local `codex/*` refs; only 39 local refs are ancestors of accepted base `80346fe`. Counts may change while agents are active.
 
-The remaining unique non-ancestor tips are not classified as garbage. Recompute reachability and liveness before every later deletion; archive or integrate unique commits first. Cargo target directories account for about 17.11 GiB but were not removed while agents were compiling. Preserve all `.eliot/inbox` evidence until its owning ingestion/disposition is explicit.
+The remaining unique non-ancestor tips are not classified as garbage. Recompute reachability, patch equivalence, dirty state and process liveness before every deletion; archive or integrate unique commits first. Do not repeat the old Cargo-target size estimate without a fresh scan. Preserve all `.eliot/inbox` evidence until its owning ingestion/disposition is explicit.
 
 ## Exact restart point
 
-Resume from `origin/codex/runtime-live-v3-integration-staging`. The canonical manifest-bound `eliot runtime canary` source seam is complete. Implement and verify the fail-closed signed-bundle finalization procedure, obtain the approved external signing/timestamp authority, and only then begin the elevated disposable installation and live Pulses 1–5.
+Accept `4bf70d9fd0454923c7fbd4da3661b76dbb1e1707` plus this handoff update only after independent authority/recovery re-audits, then fast-forward and read back `origin/codex/runtime-live-v3-integration-staging`. The canonical canary, finalizer and durable source-publication seams are source-complete. Next: provision the approved development signing identity, produce and verify the exact signed bundle, materialize it, perform the elevated disposable installation, and obtain live Pulses 1–5 evidence. Do not claim `RUNTIME_LIVE_CANARY` before that sequence succeeds.
