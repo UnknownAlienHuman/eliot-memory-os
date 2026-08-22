@@ -36,13 +36,13 @@ use eliot_platform_windows::{
     ServiceAccount, ServiceBootstrapArguments, ServiceControlGrantReadback,
     ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
     ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection, ServiceStartMode,
-    ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
-    SupervisionAuthorityKeyStoreRequest, TrustedSourceBundle, UserOwnedPathLease,
-    UserOwnedRootReadLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
-    WindowsPlatform, WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
-    current_user_local_app_data_root, fresh_service_registration_nonce,
-    observe_running_eliot_host_process, protected_program_data_root,
-    require_protected_program_data_path, resolve_service_sid,
+    ServiceStartOutcome, ServiceStopOutcome, StagePackageAuthorization, StagePackageExpectedFile,
+    StagingReceipt, SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
+    TrustedSourceBundle, UserOwnedPathLease, UserOwnedRootReadLease, WindowsInstallerRootPrimitive,
+    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
+    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
+    fresh_service_registration_nonce, observe_running_eliot_host_process,
+    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
     watchdog_service_security_descriptor_digest,
 };
 pub use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
@@ -120,7 +120,12 @@ pub use credential_provision::{
     validate_store_credential_target,
 };
 pub use package_planner::{GenerationPackagePlanInput, GenerationPackagePlanner};
-pub use redb_state::RedbInstallationTransactionStore;
+pub use redb_state::{
+    RedbInstallationTransactionStore, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
+    SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
+    SourceBundlePublicationRole, require_published_source_bundle_journal,
+    source_bundle_publication_operation_id,
+};
 
 /// Stable wire name for the installation contract.
 pub const CONTRACT_NAME: &str = "eliot.kernel.installation";
@@ -1563,7 +1568,8 @@ pub struct InstallationRoots {
 
 impl InstallationRoots {
     /// Creates and validates a root set for one profile.
-    pub fn new(
+    #[allow(dead_code, reason = "retained for crate-local root composition")]
+    pub(crate) fn new(
         profile: InstallationProfile,
         immutable_binaries: impl Into<String>,
         durable_data: impl Into<String>,
@@ -10574,16 +10580,35 @@ pub struct InstallationTransaction {
     pub recovery_command: PlatformHandle,
     /// Monotonic state revision.
     revision: u64,
+    /// In-memory proof that this value came from the planner constructor.
+    ///
+    /// This is deliberately skipped from the wire representation. A value
+    /// decoded from diagnostic JSON or the durable store can be inspected and
+    /// reconciled, but cannot be used to create a new production store.
+    #[serde(skip)]
+    planner_construction_proof: PlannerConstructionProof,
 }
+
+#[derive(Clone, Copy, Debug)]
+enum PlannerConstructionProof {
+    Bound,
+    Unbound,
+}
+
+// The binding is an in-memory capability and is intentionally excluded from
+// transaction value equality, which compares the durable wire projection.
+impl PartialEq for PlannerConstructionProof {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PlannerConstructionProof {}
 
 impl InstallationTransaction {
     /// Creates a validated immutable plan at `PLANNED`.
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        reason = "constructor validates the complete immutable installation transaction boundary"
-    )]
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         transaction_id: PlatformHandle,
         installation_epoch: InstallationEpoch,
         profile: InstallationProfile,
@@ -10596,6 +10621,87 @@ impl InstallationTransaction {
         minimum_store_available_bytes: u64,
         precondition_evidence: Vec<PlatformHandle>,
         recovery_command: PlatformHandle,
+    ) -> Result<Self, InstallationError> {
+        Self::new_with_construction_proof(
+            transaction_id,
+            installation_epoch,
+            profile,
+            request,
+            current_active_manifest,
+            candidate_manifest,
+            staging_root,
+            planned_changes,
+            installer_effects,
+            minimum_store_available_bytes,
+            precondition_evidence,
+            recovery_command,
+            PlannerConstructionProof::Bound,
+        )
+    }
+
+    /// Creates a validated, unbound transaction projection for read-only
+    /// fixture and diagnostic consumers.
+    ///
+    /// The returned value is intentionally not accepted by
+    /// [`RedbInstallationTransactionStore::create_planned_at_exact_path`].
+    /// Production plans must come from the in-crate generation planner, which
+    /// retains the sealed construction proof.
+    #[doc(hidden)]
+    #[allow(
+        dead_code,
+        reason = "diagnostic fixture seam; store admission remains bound"
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_unbound_for_fixture(
+        transaction_id: PlatformHandle,
+        installation_epoch: InstallationEpoch,
+        profile: InstallationProfile,
+        request: ManagedEnvironmentChangeRequest,
+        current_active_manifest: Option<CandidateManifest>,
+        candidate_manifest: CandidateManifest,
+        staging_root: PlatformHandle,
+        planned_changes: Vec<PlannedChange>,
+        installer_effects: Vec<InstallerEffectPlan>,
+        minimum_store_available_bytes: u64,
+        precondition_evidence: Vec<PlatformHandle>,
+        recovery_command: PlatformHandle,
+    ) -> Result<Self, InstallationError> {
+        Self::new_with_construction_proof(
+            transaction_id,
+            installation_epoch,
+            profile,
+            request,
+            current_active_manifest,
+            candidate_manifest,
+            staging_root,
+            planned_changes,
+            installer_effects,
+            minimum_store_available_bytes,
+            precondition_evidence,
+            recovery_command,
+            PlannerConstructionProof::Unbound,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "constructor validates the complete immutable installation transaction boundary"
+    )]
+    fn new_with_construction_proof(
+        transaction_id: PlatformHandle,
+        installation_epoch: InstallationEpoch,
+        profile: InstallationProfile,
+        request: ManagedEnvironmentChangeRequest,
+        current_active_manifest: Option<CandidateManifest>,
+        candidate_manifest: CandidateManifest,
+        staging_root: PlatformHandle,
+        planned_changes: Vec<PlannedChange>,
+        installer_effects: Vec<InstallerEffectPlan>,
+        minimum_store_available_bytes: u64,
+        precondition_evidence: Vec<PlatformHandle>,
+        recovery_command: PlatformHandle,
+        planner_construction_proof: PlannerConstructionProof,
     ) -> Result<Self, InstallationError> {
         handle(&transaction_id, "transaction_id")?;
         installation_epoch.validate()?;
@@ -10710,6 +10816,7 @@ impl InstallationTransaction {
             activation_projection_intent: None,
             recovery_command,
             revision: 1,
+            planner_construction_proof,
         })
     }
 
@@ -11598,8 +11705,16 @@ impl InstallationTransaction {
                     },
                     InstallerEffectPlan::StagePackage { .. },
                     Some(precondition),
-                    None,
-                ) if precondition.package_snapshot.is_some() => {}
+                    ownership,
+                ) if precondition.package_snapshot.is_some()
+                    && ownership.as_ref().is_none_or(|ownership| {
+                        ownership.lifecycle != InstallationSecretLifecycle::Deleted
+                            && matches!(
+                                ownership.create_disposition,
+                                InstallationCreateDisposition::NotAttempted
+                                    | InstallationCreateDisposition::Created
+                            )
+                    }) => {}
                 (
                     InstallationEffectProgressState::IntentCommitted { .. }
                     | InstallationEffectProgressState::Unknown { .. }
@@ -11790,7 +11905,10 @@ impl InstallationTransaction {
     }
 
     fn is_constructor_planned(&self) -> bool {
-        self.transaction_wire_version == INSTALLATION_TRANSACTION_WIRE_VERSION
+        matches!(
+            self.planner_construction_proof,
+            PlannerConstructionProof::Bound
+        ) && self.transaction_wire_version == INSTALLATION_TRANSACTION_WIRE_VERSION
             && self.stage == InstallationStage::Planned
             && self.revision == 1
             && self.completed_stage_refs.is_empty()
@@ -12100,13 +12218,25 @@ impl InstallationTransactionWire {
             activation_projection_intent: self.activation_projection_intent,
             recovery_command: self.recovery_command,
             revision: self.revision,
+            planner_construction_proof: PlannerConstructionProof::Unbound,
         }
     }
 }
 
-/// Decodes the canonical transaction JSON and classifies pre-v21 records as an
-/// explicit migration requirement rather than synthesizing missing progress.
-pub fn decode_installation_transaction_json(
+/// Validates the canonical transaction JSON without exposing a deserialized
+/// transaction authority object to another crate. Pre-v21 records are
+/// classified as an explicit migration requirement rather than synthesizing
+/// missing progress.
+pub fn validate_installation_transaction_json(bytes: &[u8]) -> Result<(), InstallationError> {
+    decode_installation_transaction_json_with_policy(bytes, false).map(|_| ())
+}
+
+/// Decodes canonical transaction JSON for installation-internal callers and
+/// tests. The returned value is unbound unless it was produced by the
+/// planner; callers outside this crate must use
+/// [`validate_installation_transaction_json`].
+#[cfg(test)]
+fn decode_installation_transaction_json(
     bytes: &[u8],
 ) -> Result<InstallationTransaction, InstallationError> {
     decode_installation_transaction_json_with_policy(bytes, false)
@@ -12115,7 +12245,7 @@ pub fn decode_installation_transaction_json(
 /// Decodes a transaction record from the ACL-protected redb store. This
 /// private replay lane may restore an already advanced transaction so the
 /// store can compare it with a freshly read registry receipt. Untrusted JSON
-/// callers must use [`decode_installation_transaction_json`], which rejects
+/// callers must use [`validate_installation_transaction_json`], which rejects
 /// advanced runtime states before any caller can present them as installer
 /// authority.
 fn decode_installation_transaction_json_from_store(
@@ -12731,10 +12861,30 @@ impl InstallationEffectRequest {
                 InstallationEffectAction::Rollback,
                 None,
             ) if self.precondition.package_snapshot.is_some() => {}
+            (
+                InstallerEffectPlan::StagePackage { .. },
+                InstallationEffectAction::Rollback,
+                Some(ownership),
+            ) if self.precondition.package_snapshot.is_some()
+                && self.staging_receipt.is_some()
+                && ownership.lifecycle != InstallationSecretLifecycle::Deleted => {}
             (InstallerEffectPlan::StagePackage { .. }, InstallationEffectAction::Apply, None)
                 if self.precondition.package_snapshot.is_some()
                     && self.precondition.os_snapshot.is_none()
                     && self.precondition.credential_snapshot.is_none() => {}
+            (
+                InstallerEffectPlan::StagePackage { .. },
+                InstallationEffectAction::Apply,
+                Some(ownership),
+            ) if self.precondition.package_snapshot.is_some()
+                && self.precondition.os_snapshot.is_none()
+                && self.precondition.credential_snapshot.is_none()
+                && ownership.lifecycle != InstallationSecretLifecycle::Deleted
+                && matches!(
+                    ownership.create_disposition,
+                    InstallationCreateDisposition::NotAttempted
+                        | InstallationCreateDisposition::Created
+                ) => {}
             (
                 InstallerEffectPlan::RegisterService { .. }
                 | InstallerEffectPlan::StartService { .. },
@@ -13204,7 +13354,7 @@ pub struct InstallationEffectExecution {
 }
 
 /// Object-safe adapter seam for bounded installation effects.
-pub trait InstallationEffectPort: Send {
+pub(crate) trait InstallationEffectPort: Send {
     /// Issues an unpredictable public nonce before an SCM registration intent
     /// is committed. The call must not mutate SCM or the protected state root.
     fn fresh_service_registration_nonce(
@@ -14773,6 +14923,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             request.plan,
             InstallerEffectPlan::CreateRoot { .. }
                 | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                | InstallerEffectPlan::StagePackage { .. }
         ) || request.precondition.os_snapshot.is_some()
             || request.precondition.credential_snapshot.is_some()
         {
@@ -14797,11 +14948,13 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         &mut self,
         request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationCreateDisposition> {
-        if !matches!(
+        let valid_stage = matches!(request.plan, InstallerEffectPlan::StagePackage { .. })
+            && request.precondition.package_snapshot.is_some();
+        let valid_credential = matches!(
             request.plan,
             InstallerEffectPlan::ProvisionStoreCredential { .. }
-        ) || request.precondition.credential_snapshot.is_none()
-        {
+        ) && request.precondition.credential_snapshot.is_some();
+        if !valid_stage && !valid_credential {
             return PortOutcome::Error(PortError::InvalidRequestMetadata);
         }
         match self.ensure_secret(request) {
@@ -14819,7 +14972,12 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationEffectExecution> {
         if matches!(&request.plan, InstallerEffectPlan::StagePackage { .. }) {
-            return execute_package(request);
+            let key = match self.credential_secret(request) {
+                Ok(key) => key,
+                Err(error) => return PortOutcome::Error(error),
+            };
+            let outcome = execute_package(request, &key);
+            return outcome;
         }
         if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
             return self.execute_service(request);
@@ -15152,7 +15310,11 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         } else if matches!(&request.plan, InstallerEffectPlan::StartService { .. }) {
             self.service_start_reconcile(request)
         } else if matches!(&request.plan, InstallerEffectPlan::StagePackage { .. }) {
-            reconcile_package(request).map_err(|error| package_port_error(&error))
+            let key = match self.credential_secret(request) {
+                Ok(key) => key,
+                Err(error) => return PortOutcome::Error(error),
+            };
+            reconcile_package(request, &key).map_err(|error| package_port_error(&error))
         } else if matches!(
             request.plan,
             InstallerEffectPlan::ProvisionStoreCredential { .. }
@@ -15848,6 +16010,65 @@ fn package_stager(
     Ok((stager, manifest.clone()))
 }
 
+fn stage_package_authorization(
+    request: &InstallationEffectRequest,
+    installation_root_identity: Option<FileIdentity>,
+) -> Result<StagePackageAuthorization, PackageStagingError> {
+    let InstallerEffectPlan::StagePackage {
+        source_bundle_identity,
+        generation,
+        manifest,
+        staging_root,
+        ..
+    } = &request.plan
+    else {
+        return Err(PackageStagingError::Io);
+    };
+    let snapshot = request
+        .precondition
+        .package_snapshot
+        .as_ref()
+        .ok_or(PackageStagingError::IdentityMismatch)?;
+    let ownership = request
+        .ownership_secret
+        .as_ref()
+        .ok_or(PackageStagingError::IdentityMismatch)?;
+    let marker_nonce = sha256_hex(
+        format!(
+            "eliot-stage-package-marker-nonce-v1\0{}\0{}\0{}\0{}",
+            request.transaction_id.as_str(),
+            request.effect_id.as_str(),
+            request.plan_digest.as_str(),
+            ownership.reference.target.as_str(),
+        )
+        .as_bytes(),
+    );
+    let expected_files = snapshot
+        .files
+        .iter()
+        .map(|file| StagePackageExpectedFile {
+            relative_path: file.relative_path.clone(),
+            source_identity: file.identity,
+            size: file.size,
+            sha256: file.sha256.as_str().to_owned(),
+        })
+        .collect();
+    let authorization = StagePackageAuthorization {
+        transaction_id: request.transaction_id.as_str().to_owned(),
+        effect_id: request.effect_id.as_str().to_owned(),
+        plan_digest: request.plan_digest.as_str().to_owned(),
+        source_bundle_identity: *source_bundle_identity,
+        source_snapshot_digest: snapshot.digest.as_str().to_owned(),
+        staging_root: PathBuf::from(staging_root.as_str()),
+        installation_root_identity,
+        generation: generation.as_str().to_owned(),
+        manifest_sha256: manifest.canonical_digest(),
+        marker_nonce,
+        expected_files,
+    };
+    Ok(authorization)
+}
+
 fn package_port_error(error: &PackageStagingError) -> PortError {
     match error {
         PackageStagingError::InvalidRelativePath
@@ -16137,6 +16358,7 @@ fn inspect_package(
 
 fn reconcile_package(
     request: &InstallationEffectRequest,
+    ownership_key: &[u8],
 ) -> Result<InstallationEffectObservation, PackageStagingError> {
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
@@ -16185,6 +16407,31 @@ fn reconcile_package(
         };
     }
 
+    // A committed StagePackage intent with an ownership key is recovered from
+    // its pre-authorised marker and the destination only.  The source bundle
+    // is deliberately not opened here: it may have been removed after the
+    // caller published the bundle or after the provider completed the copy.
+    if request.ownership_secret.as_ref().is_some_and(|ownership| {
+        ownership.create_disposition == InstallationCreateDisposition::Created
+            && ownership.lifecycle != InstallationSecretLifecycle::Deleted
+    }) {
+        let authorization = stage_package_authorization(request, None)?;
+        return match PackageStager::reconcile_prepared_destination_only(
+            Path::new(staging_root.as_str()),
+            manifest,
+            &authorization,
+            ownership_key,
+        )? {
+            PackageStagingObservation::Absent => Ok(package_absent_observation(request)),
+            PackageStagingObservation::Matching(receipt) => {
+                package_matching_observation(request, receipt)
+                    .map_err(|_| PackageStagingError::IdentityMismatch)
+            }
+            PackageStagingObservation::Mismatch(error) => Ok(package_pending(&error)),
+            PackageStagingObservation::Unknown(error) => Err(error),
+        };
+    }
+
     let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
     if persisted.source_bundle_identity != stager.source().identity() {
         return Err(PackageStagingError::IdentityMismatch);
@@ -16218,81 +16465,43 @@ fn reconcile_package(
 
 fn execute_package(
     request: &InstallationEffectRequest,
+    ownership_key: &[u8],
 ) -> PortOutcome<InstallationEffectExecution> {
-    let (stager, manifest) = match package_stager(request) {
-        Ok(value) => value,
-        Err(error) => return PortOutcome::Error(error),
-    };
     let Some(snapshot) = request.precondition.package_snapshot.as_ref() else {
         return PortOutcome::Error(PortError::InvalidRequestMetadata);
     };
     let InstallerEffectPlan::StagePackage {
-        expected_file_digests,
+        expected_file_digests: _,
         generation,
         candidate_manifest_digest,
+        manifest,
+        staging_root,
         ..
     } = &request.plan
     else {
         return PortOutcome::Error(PortError::InvalidRequestMetadata);
     };
-    if manifest.generation != generation.as_str()
-        || manifest.canonical_digest() != candidate_manifest_digest.as_str()
-        || snapshot.generation != *generation
-        || snapshot.manifest_digest.as_str() != manifest.canonical_digest()
-        || snapshot.source_bundle_identity != stager.source().identity()
-    {
-        return PortOutcome::Unknown(UnknownReason::Indeterminate);
-    }
-    let observed = match stager.source().observe() {
-        Ok(observed) => observed,
-        Err(error) => return package_staging_outcome(&error),
-    };
-    if validate_observed_against_plan(&observed, &manifest, expected_file_digests).is_err() {
-        return PortOutcome::Unknown(UnknownReason::Indeterminate);
-    }
-    let Ok(fresh) = build_package_snapshot(
-        stager.source().identity(),
-        generation.clone(),
-        snapshot.manifest_digest.clone(),
-        &observed,
-    ) else {
-        return PortOutcome::Unknown(UnknownReason::Indeterminate);
-    };
-    if fresh != *snapshot {
-        return PortOutcome::Unknown(UnknownReason::Indeterminate);
-    }
-    let rollback_invalid_receipt = |receipt: &StagingReceipt| match stager.rollback(receipt) {
-        Ok(()) => PortOutcome::Error(PortError::IdentityConflict),
-        Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
-    };
     match request.action {
-        InstallationEffectAction::Apply => match stager.stage(&manifest) {
-            Ok(receipt) => {
-                if validate_staging_receipt_for_plan(&request.plan, &receipt).is_err()
-                    || validate_staging_receipt_for_observation(snapshot, &receipt).is_err()
-                {
-                    return rollback_invalid_receipt(&receipt);
-                }
-                let Ok(digest) = PlatformHandle::new(receipt.digest()) else {
-                    return rollback_invalid_receipt(&receipt);
-                };
-                PortOutcome::Known(InstallationEffectExecution {
-                    evidence: vec![digest],
-                    create_disposition: None,
-                    credential_receipt: None,
-                    staging_receipt: Some(receipt),
-                    phase_b_receipt: None,
-                    service_start_disposition: None,
-                    service_runtime_lineage: None,
-                })
-            }
-            Err(error) => package_staging_outcome(&error),
-        },
         InstallationEffectAction::Rollback => {
             let Some(receipt) = request.staging_receipt.as_ref() else {
                 return PortOutcome::Error(PortError::InvalidRequestMetadata);
             };
-            match stager.rollback(receipt) {
+            if validate_staging_receipt_for_plan(&request.plan, receipt).is_err()
+                || validate_staging_receipt_for_observation(snapshot, receipt).is_err()
+            {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            }
+            let Ok((_, expected_external_identity, _)) = package_receipt_binding(request, receipt)
+            else {
+                return PortOutcome::Error(PortError::InvalidRequestMetadata);
+            };
+            if request.expected_external_identity.as_ref() != Some(&expected_external_identity) {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            }
+            match PackageStager::rollback_destination_only(
+                Path::new(staging_root.as_str()),
+                receipt,
+            ) {
                 Ok(()) => PortOutcome::Known(InstallationEffectExecution {
                     evidence: vec![
                         PlatformHandle::new(sha256_hex(
@@ -16307,6 +16516,58 @@ fn execute_package(
                     service_start_disposition: None,
                     service_runtime_lineage: None,
                 }),
+                Err(error) => package_staging_outcome(&error),
+            }
+        }
+        InstallationEffectAction::Apply => {
+            if ownership_key.is_empty()
+                || manifest.generation != generation.as_str()
+                || manifest.canonical_digest() != candidate_manifest_digest.as_str()
+                || snapshot.generation != *generation
+                || snapshot.manifest_digest.as_str() != manifest.canonical_digest()
+            {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            }
+            let (stager, _) = match package_stager(request) {
+                Ok(value) => value,
+                Err(error) => return PortOutcome::Error(error),
+            };
+            if snapshot.source_bundle_identity != stager.source().identity() {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            }
+            let authorization = match stage_package_authorization(
+                request,
+                Some(stager.installation_root_identity()),
+            ) {
+                Ok(authorization) => authorization,
+                Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+            };
+            match stager.stage_authorized(manifest, &authorization, ownership_key) {
+                Ok(receipt) => {
+                    if validate_staging_receipt_for_plan(&request.plan, &receipt).is_err()
+                        || validate_staging_receipt_for_observation(snapshot, &receipt).is_err()
+                    {
+                        return match PackageStager::rollback_destination_only(
+                            Path::new(staging_root.as_str()),
+                            &receipt,
+                        ) {
+                            Ok(()) => PortOutcome::Error(PortError::IdentityConflict),
+                            Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+                        };
+                    }
+                    let Ok(digest) = PlatformHandle::new(receipt.digest()) else {
+                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    };
+                    PortOutcome::Known(InstallationEffectExecution {
+                        evidence: vec![digest],
+                        create_disposition: None,
+                        credential_receipt: None,
+                        staging_receipt: Some(receipt),
+                        phase_b_receipt: None,
+                        service_start_disposition: None,
+                        service_runtime_lineage: None,
+                    })
+                }
                 Err(error) => package_staging_outcome(&error),
             }
         }
@@ -16503,7 +16764,7 @@ pub enum InstallationStepOutcome {
 }
 
 /// Coordinates one durable installation transaction without owning platform mechanics.
-pub struct InstallationCoordinator<P, S> {
+pub(crate) struct InstallationCoordinator<P, S> {
     port: P,
     store: S,
 }
@@ -16523,19 +16784,19 @@ where
 {
     /// Creates a coordinator around one platform effect port and durable store.
     #[must_use]
-    pub const fn new(port: P, store: S) -> Self {
+    pub(crate) const fn new(port: P, store: S) -> Self {
         Self { port, store }
     }
 
     /// Borrows the underlying effect port for composition or inspection.
     #[must_use]
-    pub const fn port(&self) -> &P {
+    pub(crate) const fn port(&self) -> &P {
         &self.port
     }
 
     /// Borrows the underlying durable store.
     #[must_use]
-    pub const fn store(&self) -> &S {
+    pub(crate) const fn store(&self) -> &S {
         &self.store
     }
 
@@ -16817,6 +17078,7 @@ where
             && matches!(
                 transaction.installer_effects[index],
                 InstallerEffectPlan::ProvisionStoreCredential { .. }
+                    | InstallerEffectPlan::StagePackage { .. }
             )
             && transaction.effect_progress[index]
                 .ownership_secret
@@ -17099,6 +17361,7 @@ where
                         transaction.installer_effects[index],
                         InstallerEffectPlan::CreateRoot { .. }
                             | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                            | InstallerEffectPlan::StagePackage { .. }
                     ) {
                         let reference = match self.port.fresh_ownership_secret_reference(&request) {
                             PortOutcome::Known(reference) => reference,
@@ -17146,6 +17409,7 @@ where
                 if matches!(
                     transaction.installer_effects[index],
                     InstallerEffectPlan::ProvisionStoreCredential { .. }
+                        | InstallerEffectPlan::StagePackage { .. }
                 ) && transaction.effect_progress[index]
                     .ownership_secret
                     .as_ref()

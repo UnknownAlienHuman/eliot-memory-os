@@ -102,10 +102,10 @@ pub use package_staging::{
     AuthenticodeError, AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier,
     MAX_ENUMERATED_ENTRIES, PackageFileSpec, PackageManifest, PackageRelativePath,
     PackageSourceFileObservation, PackageSourceObservation, PackageStager, PackageStagingError,
-    PackageStagingObservation, PeCoffError, PeCoffEvidence, StagedDirectoryReceipt,
-    StagedFileReceipt, StagingReceipt, TrustedSourceBundle, WindowsAuthenticodeVerifier,
-    ordinal_cmp_str, ordinal_component_cmp, ordinal_eq_str, ordinal_path_cmp, parse_pe_coff,
-    validate_package_relative_path,
+    PackageStagingObservation, PeCoffError, PeCoffEvidence, StagePackageAuthorization,
+    StagePackageExpectedFile, StagedDirectoryReceipt, StagedFileReceipt, StagingReceipt,
+    TrustedSourceBundle, WindowsAuthenticodeVerifier, ordinal_cmp_str, ordinal_component_cmp,
+    ordinal_eq_str, ordinal_path_cmp, parse_pe_coff, validate_package_relative_path,
 };
 pub use supervision_authority_key::{
     SealedSupervisionAuthorityKey, SupervisionAuthorityKeyError,

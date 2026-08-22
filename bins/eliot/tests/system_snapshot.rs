@@ -8,15 +8,18 @@ use std::{
 };
 
 use eliot_installation::{
-    AuthorityEpoch, CandidateManifest, INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationEpoch,
-    InstallationProfile, InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan,
-    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER,
-    PlannedChange, RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
+    AuthorityEpoch, CandidateManifest, GenerationPackagePlanInput, GenerationPackagePlanner,
+    INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationEpoch, InstallationProfile,
+    InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, ManagedEnvironmentAction,
+    ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange,
+    RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
     RuntimeStateRoots, StateFence, SupervisionAuthorityBinding, UserOwnedRootLease,
     parse_installation_transaction_id,
 };
 #[cfg(windows)]
-use eliot_platform_windows::protected_program_data_root;
+use eliot_platform_windows::{
+    PackageFileSpec, PackageManifest, TrustedSourceBundle, protected_program_data_root,
+};
 use serde_json::Value;
 
 fn repository_root() -> PathBuf {
@@ -531,6 +534,99 @@ fn fixture_path(root: &Path, name: &str) -> eliot_installation::PlatformHandle {
     fixture_handle(root.join(name).to_string_lossy().into_owned())
 }
 
+#[cfg(windows)]
+fn planner_bound_status_transaction(root: &Path) -> InstallationTransaction {
+    let source_root = root.join("source-bundle");
+    fs::create_dir_all(&source_root).expect("create planner source root");
+    for (name, executable) in [
+        ("eliot-host.exe", true),
+        ("eliot-watchdog.exe", true),
+        ("eliot-kernel.exe", true),
+        ("eliot-store-surreal.exe", true),
+        ("surreal.exe", true),
+        ("eliotd.exe", true),
+        ("generation.json", false),
+        ("eliotd-governor.json", false),
+        ("eliotd.json", false),
+    ] {
+        let bytes = if executable {
+            minimal_pe(name)
+        } else {
+            format!("descriptor:{name}").into_bytes()
+        };
+        fs::write(source_root.join(name), bytes).expect("write planner source role");
+    }
+    let source = TrustedSourceBundle::open(&source_root).expect("retain planner source");
+    let observed = source.observe().expect("observe planner source");
+    let generation = fixture_handle("cli-status");
+    let role_order = [
+        "eliot-host.exe",
+        "eliot-watchdog.exe",
+        "eliot-kernel.exe",
+        "eliot-store-surreal.exe",
+        "surreal.exe",
+        "eliotd.exe",
+        "generation.json",
+        "eliotd-governor.json",
+        "eliotd.json",
+    ];
+    let role_facts = role_order
+        .iter()
+        .map(|role| {
+            observed
+                .files
+                .iter()
+                .find(|file| file.relative_path == *role)
+                .expect("planner role observation")
+        })
+        .collect::<Vec<_>>();
+    let files = role_facts
+        .iter()
+        .map(|file| PackageArtifactDigest {
+            relative_path: file.relative_path.clone(),
+            expected_size: file.size,
+            sha256: fixture_handle(file.sha256.clone()),
+        })
+        .collect::<Vec<_>>();
+    let manifest = PackageManifest::new(
+        generation.as_str(),
+        role_facts
+            .iter()
+            .map(|file| {
+                PackageFileSpec::new(&file.relative_path, file.pe.is_some(), file.size)
+                    .expect("planner package file")
+            })
+            .collect(),
+    )
+    .expect("planner package manifest");
+    let evidence = GenerationPackagePlanner::artifact_set_evidence_digest(&manifest, &files)
+        .expect("planner evidence digest");
+    let installation_epoch = InstallationEpoch {
+        installation: fixture_handle("installation:cli-status"),
+        lineage_id: fixture_handle("lineage:cli-status"),
+        sequence: 1,
+    };
+    let input = GenerationPackagePlanInput {
+        transaction_id: fixture_handle("transaction:cli-status"),
+        installation_epoch,
+        profile: InstallationProfile::PortableDev,
+        profile_anchor_root: fixture_handle(root.to_string_lossy().into_owned()),
+        installation_key: None,
+        generation,
+        source_root: fixture_handle(source_root.to_string_lossy().into_owned()),
+        staging_root: fixture_path(root, "staging"),
+        minimum_store_available_bytes: 1,
+        recovery_command: fixture_handle("recover:cli-status"),
+    };
+    GenerationPackagePlanner::plan_with_source_publication_binding(
+        input,
+        source.identity(),
+        files,
+        evidence,
+    )
+    .expect("planner-bound status transaction")
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the positive CLI fixture spells out the constructor's complete durable contract"
@@ -719,7 +815,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
             ],
         });
     }
-    InstallationTransaction::new(
+    InstallationTransaction::new_unbound_for_fixture(
         fixture_handle("transaction:cli-positive"),
         installation_epoch,
         InstallationProfile::PortableDev,
@@ -888,6 +984,7 @@ fn installation_apply_rejects_removed_raw_approval_ref_without_writing() {
     let _ = fs::remove_dir_all(temp_root);
 }
 
+#[cfg(windows)]
 #[test]
 fn installation_transaction_status_reads_existing_store_without_inventing_transaction() {
     let temp_root = std::env::temp_dir().join(format!(
@@ -904,9 +1001,7 @@ fn installation_transaction_status_reads_existing_store_without_inventing_transa
             .expect("protect portable fixture root");
         (portable_root, lease)
     };
-    #[cfg(not(windows))]
-    let fixture_root = temp_root.clone();
-    let transaction = portable_cli_transaction(&fixture_root);
+    let transaction = planner_bound_status_transaction(&fixture_root);
     RedbInstallationTransactionStore::create_planned_at_exact_path(&store_path, &transaction)
         .expect("create planned transaction store");
 

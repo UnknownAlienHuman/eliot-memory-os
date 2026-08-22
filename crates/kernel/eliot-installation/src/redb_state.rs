@@ -7,26 +7,141 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    ActivationCommitReceipt, INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationError,
-    InstallationStage, InstallationStepOutcome, InstallationTransaction,
-    InstallationTransactionStore, decode_installation_transaction_json_from_store,
+    ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
+    InstallationError, InstallationStage, InstallationStepOutcome, InstallationTransaction,
+    InstallationTransactionStore, InstallerEffectPlan,
+    decode_installation_transaction_json_from_store,
     transaction_store_private::{self, TransactionVersion},
 };
 use eliot_contracts::ContractVersion;
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
-    FileIdentity, delete_owned_file_handle, file_identity_for_open_handle,
-    open_no_follow_directory, open_no_follow_file,
+    AuthenticodeEvidence, DirectoryPublicationReceipt, FileIdentity, PeCoffEvidence,
+    delete_owned_file_handle, file_identity_for_open_handle, open_no_follow_directory,
+    open_no_follow_file, validate_package_relative_path,
 };
 
 const TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("installation_transactions_v7");
+const PUBLICATION_JOURNAL_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("source_bundle_publication_journal_v1");
 const TRANSACTION_TEMP_CREATE_ATTEMPTS: usize = 16;
 static NEXT_TRANSACTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Typed durable state of one source-bundle directory publication.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SourceBundlePublicationJournalState {
+    /// Intent was persisted and read back before the native directory move.
+    Intent,
+    /// The move and exact destination readback completed.
+    Published,
+    /// The move may have completed, but the caller must reconcile the exact
+    /// operation before planning or retrying it.
+    CommittedUnknown,
+}
+
+/// Durable source-bundle publication journal bound to one exact transaction,
+/// output path and complete precommit inventory digest.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBundlePublicationJournal {
+    /// Explicit journal wire discriminator.
+    pub wire_version: u32,
+    /// Deterministic operation identity used for exact replay.
+    pub operation_id: PlatformHandle,
+    /// Planned installation transaction identity.
+    pub transaction_id: PlatformHandle,
+    /// Exact destination bundle path.
+    pub output_bundle: PathBuf,
+    /// Candidate generation identity.
+    pub generation: PlatformHandle,
+    /// Canonical package manifest digest.
+    pub manifest_digest: PlatformHandle,
+    /// Complete nine-role artifact evidence digest.
+    pub evidence_digest: PlatformHandle,
+    /// Digest of the complete typed precommit role inventory.
+    pub precommit_digest: PlatformHandle,
+    /// Complete typed role inventory retained for destination-only restart
+    /// reconciliation. This is the journal's authority evidence; a retry
+    /// must not reopen the original source bundle to reconstruct it.
+    pub precommit_files: Vec<SourceBundlePublicationRole>,
+    /// Identity of the owned temporary publication directory.
+    pub source_identity: FileIdentity,
+    /// Durable operation state.
+    pub state: SourceBundlePublicationJournalState,
+    /// Exact destination identity after a successful move/readback.
+    pub destination_identity: Option<FileIdentity>,
+    /// Complete native publication receipt, retained for restart recovery.
+    pub directory_receipt: Option<DirectoryPublicationReceipt>,
+    /// Bounded operator diagnostic for an unknown outcome.
+    pub diagnostic: Option<String>,
+}
+
+/// One source-bundle role fact retained in the durable publication journal.
+///
+/// The fact is intentionally independent of the source pathname. It lets a
+/// restart reconstruct the exact published receipt from the durable journal
+/// and a destination-only readback, even when the original release files were
+/// removed or changed.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBundlePublicationRole {
+    /// Canonical nine-role relative path.
+    pub relative_path: String,
+    /// Whether this role is an executable PE.
+    pub executable: bool,
+    /// Exact bytes measured before the move.
+    pub size: u64,
+    /// Lowercase SHA-256 of the exact bytes measured before the move.
+    pub sha256: PlatformHandle,
+    /// Identity of the caller-supplied release file, or generated role.
+    pub source_identity: FileIdentity,
+    /// Identity of the role in the owned temporary tree.
+    pub temporary_identity: FileIdentity,
+    /// PE evidence for executable roles.
+    pub pe: Option<PeCoffEvidence>,
+    /// Authenticode evidence for executable roles.
+    pub authenticode: Option<AuthenticodeEvidence>,
+}
+
+/// Current source-bundle publication journal wire version.
+pub const SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION: u32 = 2;
+
+/// Derive the stable operation key for one exact source-bundle publication.
+pub fn source_bundle_publication_operation_id(
+    transaction_id: &PlatformHandle,
+    output_bundle: &Path,
+    generation: &PlatformHandle,
+) -> Result<PlatformHandle, InstallationError> {
+    PlatformHandle::new(eliot_contracts::sha256_hex(
+        &serde_json::to_vec(&(
+            "eliot-source-bundle-publication-v1",
+            transaction_id,
+            output_bundle,
+            generation,
+        ))
+        .map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?,
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "publication.operation_id".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationJournalEnvelope {
+    wire_version: u32,
+    journal: SourceBundlePublicationJournal,
+}
 
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +167,134 @@ pub struct RedbInstallationTransactionStore {
 }
 
 impl RedbInstallationTransactionStore {
+    /// Persist and read back a source-bundle publication intent in the exact
+    /// caller-selected store before any native directory move occurs.
+    pub fn begin_source_bundle_publication_at_exact_path(
+        path: impl AsRef<Path>,
+        journal: &SourceBundlePublicationJournal,
+    ) -> Result<SourceBundlePublicationJournal, InstallationError> {
+        validate_publication_journal(journal)?;
+        let path = path.as_ref();
+        require_existing_parent(path)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                let store = Self::open_existing_exact_path(path)?;
+                let current = store
+                    .load_source_bundle_publication(&journal.operation_id)?
+                    .ok_or_else(|| InstallationError::MigrationRequired {
+                        reason: "existing store has no matching source publication journal"
+                            .to_owned(),
+                    })?;
+                validate_publication_journal(&current)?;
+                if !publication_journal_identity_matches(&current, journal) {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Ok(current)
+            }
+            Ok(_) => Err(existing_path_error()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let database = Database::create(path)
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+                insert_publication_journal(&database, journal)?;
+                drop(database);
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+                sync_parent_directory(path.parent().ok_or_else(|| {
+                    InstallationError::InvalidField {
+                        field: "transaction_store.path".to_owned(),
+                        reason: "path must have a parent".to_owned(),
+                    }
+                })?)?;
+                let store = Self::open_existing_exact_path(path)?;
+                store
+                    .load_source_bundle_publication(&journal.operation_id)?
+                    .ok_or_else(|| InstallationError::UnknownOutcome {
+                        stage: InstallationStage::Planned,
+                    })
+            }
+            Err(error) => Err(InstallationError::Platform(error.to_string())),
+        }
+    }
+
+    /// Read one exact durable source-bundle publication journal.
+    pub fn load_source_bundle_publication(
+        &self,
+        operation_id: &PlatformHandle,
+    ) -> Result<Option<SourceBundlePublicationJournal>, InstallationError> {
+        let database = self.open_read_only()?;
+        read_publication_journal(&database, operation_id)
+    }
+
+    /// Advance a publication journal after the native move.  The operation
+    /// identity is immutable and a second move is never authorized by this
+    /// method; only `INTENT -> PUBLISHED/COMMITTED_UNKNOWN` and
+    /// `COMMITTED_UNKNOWN -> PUBLISHED` are accepted.
+    pub fn record_source_bundle_publication(
+        &self,
+        journal: &SourceBundlePublicationJournal,
+    ) -> Result<SourceBundlePublicationJournal, InstallationError> {
+        validate_publication_journal(journal)?;
+        let database = self.open_for_mutation()?;
+        let current =
+            read_publication_journal(&database, &journal.operation_id)?.ok_or_else(|| {
+                InstallationError::TransactionNotFound {
+                    transaction_id: journal.transaction_id.as_str().to_owned(),
+                }
+            })?;
+        if !publication_journal_identity_matches(&current, journal) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if matches!(
+            (&current.state, &journal.state),
+            (
+                SourceBundlePublicationJournalState::Published,
+                SourceBundlePublicationJournalState::Published
+            ) | (
+                SourceBundlePublicationJournalState::CommittedUnknown,
+                SourceBundlePublicationJournalState::CommittedUnknown
+            )
+        ) && current != journal.clone()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let allowed = match (&current.state, &journal.state) {
+            (SourceBundlePublicationJournalState::Intent, state)
+                if matches!(
+                    state,
+                    SourceBundlePublicationJournalState::Published
+                        | SourceBundlePublicationJournalState::CommittedUnknown
+                ) =>
+            {
+                true
+            }
+            (
+                SourceBundlePublicationJournalState::CommittedUnknown,
+                SourceBundlePublicationJournalState::Published
+                | SourceBundlePublicationJournalState::CommittedUnknown,
+            ) => true,
+            (
+                SourceBundlePublicationJournalState::Published,
+                SourceBundlePublicationJournalState::Published,
+            ) => true,
+            _ => false,
+        };
+        if !allowed {
+            return Err(InstallationError::IdentityConflict);
+        }
+        write_publication_journal(&database, journal)?;
+        drop(database);
+        let reopened = Self::open_existing_exact_path(&self.path)?;
+        reopened
+            .load_source_bundle_publication(&journal.operation_id)?
+            .ok_or(InstallationError::UnknownOutcome {
+                stage: InstallationStage::Planned,
+            })
+    }
+
     /// Creates a new database at `path` without creating its parent directory.
     #[cfg(test)]
     pub(crate) fn create_at_exact_path(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
@@ -93,6 +336,12 @@ impl RedbInstallationTransactionStore {
         let path = path.as_ref();
         require_existing_parent(path)?;
         match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                let store = Self::open_existing_exact_path(path)?;
+                let database = store.open_for_mutation()?;
+                insert_planned(&database, transaction)?;
+                return Ok(store);
+            }
             Ok(_) => return Err(existing_path_error()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(InstallationError::Platform(error.to_string())),
@@ -768,6 +1017,299 @@ fn insert_planned(
         .map_err(|error| InstallationError::Platform(error.to_string()))
 }
 
+fn validate_publication_journal(
+    journal: &SourceBundlePublicationJournal,
+) -> Result<(), InstallationError> {
+    if journal.wire_version != SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION
+        || !journal.output_bundle.is_absolute()
+        || journal.output_bundle.to_str().is_none()
+        || journal.source_identity.volume_serial_number == 0
+        || journal.source_identity.file_index == 0
+    {
+        return Err(InstallationError::InvalidField {
+            field: "publication.journal".to_owned(),
+            reason: "invalid publication journal identity or path".to_owned(),
+        });
+    }
+    for (value, field) in [
+        (&journal.operation_id, "publication.operation_id"),
+        (&journal.transaction_id, "publication.transaction_id"),
+        (&journal.generation, "publication.generation"),
+        (&journal.manifest_digest, "publication.manifest_digest"),
+        (&journal.evidence_digest, "publication.evidence_digest"),
+        (&journal.precommit_digest, "publication.precommit_digest"),
+    ] {
+        if value.as_str().is_empty() {
+            return Err(InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason: "publication journal handle cannot be blank".to_owned(),
+            });
+        }
+    }
+    for (value, field) in [
+        (&journal.manifest_digest, "publication.manifest_digest"),
+        (&journal.evidence_digest, "publication.evidence_digest"),
+        (&journal.precommit_digest, "publication.precommit_digest"),
+    ] {
+        let value = value.as_str();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason: "publication journal digest must be lowercase SHA-256".to_owned(),
+            });
+        }
+    }
+    if journal.precommit_files.len() != 9 {
+        return Err(InstallationError::InvalidField {
+            field: "publication.precommit_files".to_owned(),
+            reason: "publication journal must retain the exact nine-role inventory".to_owned(),
+        });
+    }
+    let mut role_names = std::collections::BTreeSet::new();
+    for role in &journal.precommit_files {
+        validate_package_relative_path(Path::new(&role.relative_path)).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "publication.precommit_files.relative_path".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        if !role_names.insert(role.relative_path.clone())
+            || role.sha256.as_str().len() != 64
+            || !role
+                .sha256
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || role.source_identity.volume_serial_number == 0
+            || role.source_identity.file_index == 0
+            || role.temporary_identity.volume_serial_number == 0
+            || role.temporary_identity.file_index == 0
+            || (role.executable && (role.pe.is_none() || role.authenticode.is_none()))
+            || (!role.executable && (role.pe.is_some() || role.authenticode.is_some()))
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    let precommit_bytes = serde_json::to_vec(&journal.precommit_files).map_err(|error| {
+        InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        }
+    })?;
+    if format!("{:x}", Sha256::digest(precommit_bytes)) != journal.precommit_digest.as_str() {
+        return Err(InstallationError::IdentityConflict);
+    }
+    match journal.state {
+        SourceBundlePublicationJournalState::Intent => {
+            if journal.destination_identity.is_some()
+                || journal.directory_receipt.is_some()
+                || journal.diagnostic.is_some()
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        SourceBundlePublicationJournalState::Published => {
+            if journal.destination_identity.is_none()
+                || journal.directory_receipt.is_none()
+                || journal.diagnostic.is_some()
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        SourceBundlePublicationJournalState::CommittedUnknown => {
+            if journal.diagnostic.as_ref().is_none_or(|diagnostic| {
+                diagnostic.trim().is_empty() || diagnostic.chars().any(char::is_control)
+            }) {
+                return Err(InstallationError::InvalidField {
+                    field: "publication.diagnostic".to_owned(),
+                    reason: "unknown publication requires a bounded diagnostic".to_owned(),
+                });
+            }
+        }
+    }
+    if journal
+        .destination_identity
+        .is_some_and(|identity| identity.volume_serial_number == 0 || identity.file_index == 0)
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    if let Some(receipt) = &journal.directory_receipt {
+        if Some(receipt.destination_identity) != journal.destination_identity
+            || receipt.source_identity != journal.source_identity
+            || receipt.destination_path != journal.output_bundle.to_string_lossy()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    Ok(())
+}
+
+fn publication_journal_identity_matches(
+    left: &SourceBundlePublicationJournal,
+    right: &SourceBundlePublicationJournal,
+) -> bool {
+    left.wire_version == right.wire_version
+        && left.operation_id == right.operation_id
+        && left.transaction_id == right.transaction_id
+        && left.output_bundle == right.output_bundle
+        && left.generation == right.generation
+        && left.manifest_digest == right.manifest_digest
+        && left.evidence_digest == right.evidence_digest
+        && left.precommit_digest == right.precommit_digest
+        && left.source_identity == right.source_identity
+}
+
+fn insert_publication_journal(
+    database: &Database,
+    journal: &SourceBundlePublicationJournal,
+) -> Result<(), InstallationError> {
+    let bytes = serde_json::to_vec(&PublicationJournalEnvelope {
+        wire_version: SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
+        journal: journal.clone(),
+    })
+    .map_err(|error| InstallationError::CorruptRegistry {
+        reason: error.to_string(),
+    })?;
+    let write = database
+        .begin_write()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    {
+        let mut table = write
+            .open_table(PUBLICATION_JOURNAL_TABLE)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if table
+            .get(journal.operation_id.as_str())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+            .is_some()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        table
+            .insert(journal.operation_id.as_str(), bytes.as_slice())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    }
+    write
+        .commit()
+        .map_err(|error| InstallationError::Platform(error.to_string()))
+}
+
+fn write_publication_journal(
+    database: &Database,
+    journal: &SourceBundlePublicationJournal,
+) -> Result<(), InstallationError> {
+    let bytes = serde_json::to_vec(&PublicationJournalEnvelope {
+        wire_version: SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
+        journal: journal.clone(),
+    })
+    .map_err(|error| InstallationError::CorruptRegistry {
+        reason: error.to_string(),
+    })?;
+    let write = database
+        .begin_write()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    {
+        let mut table = write
+            .open_table(PUBLICATION_JOURNAL_TABLE)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        table
+            .insert(journal.operation_id.as_str(), bytes.as_slice())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    }
+    write
+        .commit()
+        .map_err(|error| InstallationError::Platform(error.to_string()))
+}
+
+fn read_publication_journal(
+    database: &impl ReadableDatabase,
+    operation_id: &PlatformHandle,
+) -> Result<Option<SourceBundlePublicationJournal>, InstallationError> {
+    let read = database
+        .begin_read()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let table = match read.open_table(PUBLICATION_JOURNAL_TABLE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(error) => return Err(InstallationError::Platform(error.to_string())),
+    };
+    let Some(value) = table
+        .get(operation_id.as_str())
+        .map_err(|error| InstallationError::Platform(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let envelope: PublicationJournalEnvelope =
+        serde_json::from_slice(value.value()).map_err(|error| {
+            InstallationError::CorruptRegistry {
+                reason: error.to_string(),
+            }
+        })?;
+    if envelope.wire_version != SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION
+        || envelope.journal.operation_id != *operation_id
+    {
+        return Err(InstallationError::MigrationRequired {
+            reason: "source publication journal wire discriminator is unsupported".to_owned(),
+        });
+    }
+    validate_publication_journal(&envelope.journal)?;
+    Ok(Some(envelope.journal))
+}
+
+/// Require the durable source publication journal that must precede a
+/// source-publication-bound generation plan. This check is intentionally
+/// performed by the bound Generate path, where the exact transaction store is
+/// available; generic store fixtures and non-materializer callers may still
+/// construct a validated transaction for inspection without pretending that
+/// it has crossed the publication boundary.
+pub fn require_published_source_bundle_journal(
+    store: &RedbInstallationTransactionStore,
+    transaction: &InstallationTransaction,
+) -> Result<(), InstallationError> {
+    let Some((source_bundle, generation, manifest, expected)) = transaction
+        .installer_effects
+        .iter()
+        .find_map(|effect| match effect {
+            InstallerEffectPlan::StagePackage {
+                source_bundle,
+                generation,
+                manifest,
+                expected_file_digests,
+                ..
+            } => Some((source_bundle, generation, manifest, expected_file_digests)),
+            _ => None,
+        })
+    else {
+        return Err(InstallationError::InvalidField {
+            field: "transaction.publication".to_owned(),
+            reason: "planned transaction has no StagePackage publication binding".to_owned(),
+        });
+    };
+    let output = PathBuf::from(source_bundle.as_str());
+    let operation_id =
+        source_bundle_publication_operation_id(&transaction.transaction_id, &output, generation)?;
+    let journal = store
+        .load_source_bundle_publication(&operation_id)?
+        .ok_or_else(|| InstallationError::MigrationRequired {
+            reason: "planned transaction requires a durable source publication journal".to_owned(),
+        })?;
+    if journal.state != SourceBundlePublicationJournalState::Published
+        || journal.destination_identity.is_none()
+        || journal.directory_receipt.is_none()
+        || journal.output_bundle != output
+        || journal.transaction_id != transaction.transaction_id
+        || journal.generation != *generation
+        || journal.manifest_digest.as_str() != manifest.canonical_digest()
+        || journal.evidence_digest
+            != GenerationPackagePlanner::artifact_set_evidence_digest(manifest, expected)?
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(())
+}
+
 fn classify_v7_table(database: &impl ReadableDatabase) -> Result<bool, InstallationError> {
     let read = database
         .begin_read()
@@ -783,17 +1325,18 @@ fn classify_v7_table(database: &impl ReadableDatabase) -> Result<bool, Installat
 }
 
 fn classify_missing_v7_table(read: &redb::ReadTransaction) -> Result<(), InstallationError> {
-    let has_standard_tables = read
+    let standard_table_count = read
         .list_tables()
         .map_err(|error| InstallationError::Platform(error.to_string()))?
-        .next()
-        .is_some();
-    let has_multimap_tables = read
+        .count();
+    let multimap_table_count = read
         .list_multimap_tables()
         .map_err(|error| InstallationError::Platform(error.to_string()))?
-        .next()
-        .is_some();
-    if has_standard_tables || has_multimap_tables {
+        .count();
+    let publication_only = standard_table_count == 1
+        && multimap_table_count == 0
+        && read.open_table(PUBLICATION_JOURNAL_TABLE).is_ok();
+    if (standard_table_count != 0 || multimap_table_count != 0) && !publication_only {
         return Err(InstallationError::MigrationRequired {
             reason: "existing nonempty redb store has no installation_transactions_v7 table"
                 .to_owned(),
@@ -911,6 +1454,193 @@ mod tests {
             "eliot-installation-transaction-{name}-{}.redb",
             std::process::id()
         ))
+    }
+
+    fn publication_journal_fixture(
+        output_bundle: &std::path::Path,
+    ) -> SourceBundlePublicationJournal {
+        let source_identity = FileIdentity {
+            volume_serial_number: 11,
+            file_index: 101,
+        };
+        let precommit_files = [
+            ("eliot-host.exe", true),
+            ("eliot-watchdog.exe", true),
+            ("eliot-kernel.exe", true),
+            ("eliot-store-surreal.exe", true),
+            ("surreal.exe", true),
+            ("eliotd.exe", true),
+            ("generation.json", false),
+            ("eliotd-governor.json", false),
+            ("eliotd.json", false),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (relative_path, executable))| SourceBundlePublicationRole {
+                relative_path: relative_path.to_owned(),
+                executable,
+                size: 1,
+                sha256: PlatformHandle::new(format!("{:064x}", index + 1))
+                    .expect("journal role digest"),
+                source_identity: FileIdentity {
+                    volume_serial_number: 11,
+                    file_index: 1000 + index as u64,
+                },
+                temporary_identity: FileIdentity {
+                    volume_serial_number: 11,
+                    file_index: 2000 + index as u64,
+                },
+                pe: executable.then_some(PeCoffEvidence {
+                    machine: 0x8664,
+                    optional_header_magic: 0x20b,
+                    characteristics: 0x0002,
+                    sections: 1,
+                    pe32_plus: true,
+                }),
+                authenticode: executable.then_some(AuthenticodeEvidence {
+                    verdict: eliot_platform_windows::AuthenticodeVerdict::Valid,
+                    signer_certificate_sha256: Some("a".repeat(64)),
+                    signer_subject: Some("fixture".to_owned()),
+                    signer_not_before_unix_seconds: Some(1),
+                    signer_not_after_unix_seconds: Some(2),
+                    verification_time_unix_seconds: Some(1),
+                    countersigner_certificate_sha256: None,
+                    trust_status: 0,
+                }),
+            },
+        )
+        .collect::<Vec<_>>();
+        let precommit_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&precommit_files).expect("serialize journal inventory"),
+            )
+        );
+        SourceBundlePublicationJournal {
+            wire_version: SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
+            operation_id: PlatformHandle::new("operation:publication-fixture")
+                .expect("journal operation"),
+            transaction_id: PlatformHandle::new("transaction:publication-fixture")
+                .expect("journal transaction"),
+            output_bundle: output_bundle.to_path_buf(),
+            generation: PlatformHandle::new("generation:publication-fixture")
+                .expect("journal generation"),
+            manifest_digest: PlatformHandle::new("b".repeat(64)).expect("manifest digest"),
+            evidence_digest: PlatformHandle::new("c".repeat(64)).expect("evidence digest"),
+            precommit_digest: PlatformHandle::new(precommit_digest).expect("inventory digest"),
+            precommit_files,
+            source_identity,
+            state: SourceBundlePublicationJournalState::Intent,
+            destination_identity: None,
+            directory_receipt: None,
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn source_publication_journal_is_readback_bound_and_replay_safe() {
+        let directory = std::env::temp_dir().join(format!(
+            "eliot-installation-source-publication-journal-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create journal directory");
+        let path = directory.join("transactions.redb");
+        let output_bundle = directory.join("bundle");
+        let intent = publication_journal_fixture(&output_bundle);
+        let first =
+            RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
+                &path, &intent,
+            )
+            .expect("persist publication intent");
+        assert_eq!(first, intent);
+        let store = RedbInstallationTransactionStore::open_existing_exact_path(&path)
+            .expect("reopen publication store");
+        assert_eq!(
+            store
+                .load_source_bundle_publication(&intent.operation_id)
+                .expect("read publication journal"),
+            Some(intent.clone())
+        );
+
+        let mut forged_inventory = intent.clone();
+        forged_inventory.precommit_files[0].size = 2;
+        assert!(matches!(
+            store.record_source_bundle_publication(&forged_inventory),
+            Err(InstallationError::IdentityConflict) | Err(InstallationError::InvalidField { .. })
+        ));
+
+        let destination_identity = FileIdentity {
+            volume_serial_number: 11,
+            file_index: 202,
+        };
+        let published = SourceBundlePublicationJournal {
+            state: SourceBundlePublicationJournalState::Published,
+            destination_identity: Some(destination_identity),
+            directory_receipt: Some(DirectoryPublicationReceipt {
+                destination_path: output_bundle.to_string_lossy().into_owned(),
+                canonical_parent_path: directory.to_string_lossy().into_owned(),
+                parent_identity: FileIdentity {
+                    volume_serial_number: 11,
+                    file_index: 303,
+                },
+                source_identity: intent.source_identity,
+                destination_identity,
+            }),
+            ..intent.clone()
+        };
+        let committed = store
+            .record_source_bundle_publication(&published)
+            .expect("persist publication receipt");
+        assert_eq!(committed, published);
+
+        let mut replay = published.clone();
+        replay
+            .directory_receipt
+            .as_mut()
+            .expect("receipt")
+            .parent_identity
+            .file_index += 1;
+        assert!(matches!(
+            store.record_source_bundle_publication(&replay),
+            Err(InstallationError::IdentityConflict)
+        ));
+        drop(store);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn source_publication_journal_rejects_wrong_wire_and_inventory_digest() {
+        let directory = std::env::temp_dir().join(format!(
+            "eliot-installation-source-publication-invalid-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create invalid journal directory");
+        let path = directory.join("transactions.redb");
+        let output_bundle = directory.join("bundle");
+        let mut wrong_wire = publication_journal_fixture(&output_bundle);
+        wrong_wire.wire_version -= 1;
+        assert!(matches!(
+            RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
+                &path,
+                &wrong_wire,
+            ),
+            Err(InstallationError::InvalidField { .. })
+        ));
+        let mut forged_digest = publication_journal_fixture(&output_bundle);
+        forged_digest.precommit_digest = PlatformHandle::new("d".repeat(64)).expect("digest");
+        assert!(matches!(
+            RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
+                &path,
+                &forged_digest,
+            ),
+            Err(InstallationError::IdentityConflict)
+        ));
+        assert!(!path.exists(), "invalid journal must not create a store");
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

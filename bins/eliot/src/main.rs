@@ -12,7 +12,8 @@ use eliot_installation::{
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, PlatformHandle, RedbInstallationRegistry,
     RedbInstallationTransactionStore, WindowsInstallationCoordinator,
-    decode_installation_transaction_json, parse_installation_transaction_id,
+    parse_installation_transaction_id, require_published_source_bundle_journal,
+    validate_installation_transaction_json,
 };
 use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
@@ -883,8 +884,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
                     return Ok(INVALID_REQUEST_EXIT);
                 }
             };
-            let transaction = match decode_installation_transaction_json(&bytes) {
-                Ok(transaction) => transaction,
+            match validate_installation_transaction_json(&bytes) {
+                Ok(()) => {}
                 Err(error @ InstallationError::MigrationRequired { .. }) => {
                     write_installation_error(
                         "INSTALLATION_PLAN_MIGRATION_REQUIRED",
@@ -897,7 +898,14 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
                     return Ok(INVALID_REQUEST_EXIT);
                 }
             };
-            println!("{}", serde_json::to_string_pretty(&transaction)?);
+            let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(error) => {
+                    write_installation_error("INSTALLATION_PLAN_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(0)
         }
         InstallationCommand::Create { input, store } => Ok(run_installation_create(&input, &store)),
@@ -1088,6 +1096,25 @@ where
             ));
         }
     };
+    let source_store = match RedbInstallationTransactionStore::open_existing_exact_path(&store_path)
+    {
+        Ok(store) => store,
+        Err(error) => {
+            write_installation_error("INSTALLATION_GENERATION_STORE_REJECTED", &error.to_string());
+            return Ok(InstallationGenerationOutcome::Rejected(
+                INVALID_REQUEST_EXIT,
+            ));
+        }
+    };
+    if let Err(error) = require_published_source_bundle_journal(&source_store, &transaction) {
+        write_installation_error(
+            "INSTALLATION_GENERATION_PUBLICATION_REJECTED",
+            &error.to_string(),
+        );
+        return Ok(InstallationGenerationOutcome::Rejected(
+            INVALID_REQUEST_EXIT,
+        ));
+    }
     if let Err(error) =
         RedbInstallationTransactionStore::create_planned_at_exact_path(&store_path, &transaction)
     {
@@ -1181,6 +1208,7 @@ fn run_installation_materialize_source_bundle(
         surreal_exe: surreal,
         eliotd_exe: eliotd,
         output_bundle: output_bundle.clone(),
+        store_path: store.clone(),
         generation: cli_handle(generation.clone(), "generation")?,
         installation_epoch: InstallationEpoch {
             installation: cli_handle(installation.clone(), "installation")?,
@@ -2281,9 +2309,13 @@ fn write_transaction_artifact(
             "diagnostic transaction output readback differs from the exact written bytes",
         ));
     }
-    let decoded = decode_installation_transaction_json(&readback)
+    validate_installation_transaction_json(&readback)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if decoded != *transaction {
+    let readback_value: serde_json::Value = serde_json::from_slice(&readback)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let expected_value = serde_json::to_value(transaction)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if readback_value != expected_value {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "diagnostic transaction output does not deserialize to the committed transaction",

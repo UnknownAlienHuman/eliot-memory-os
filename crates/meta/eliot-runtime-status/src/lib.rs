@@ -5479,7 +5479,7 @@ mod honest_tests {
                 ],
             });
         }
-        eliot_installation::InstallationTransaction::new(
+        eliot_installation::InstallationTransaction::new_unbound_for_fixture(
             fixture_handle("transaction:txn-stage-test"),
             installation_epoch,
             eliot_installation::InstallationProfile::PortableDev,

@@ -35,6 +35,185 @@ const MAX_AUTHENTICODE_PROVIDER_CHAIN_ELEMENTS: u32 = 1024;
 /// Maximum number of files plus directories walked from one source root.
 pub const MAX_ENUMERATED_ENTRIES: usize = MAX_PACKAGE_FILES * 2 + MAX_PACKAGE_PATH_DEPTH;
 
+/// One source-file fact retained in a durable `StagePackage` preparation
+/// capability.  The fact is intentionally independent of any source path;
+/// recovery uses it to validate only the authorised destination.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagePackageExpectedFile {
+    /// Canonical package-relative path.
+    pub relative_path: String,
+    /// Source object identity observed before the stage intent was committed.
+    pub source_identity: FileIdentity,
+    /// Exact source byte length.
+    pub size: u64,
+    /// Lowercase source SHA-256.
+    pub sha256: String,
+}
+
+/// Durable, HMAC-bound capability for one `StagePackage` mutation/recovery.
+///
+/// The installation coordinator persists the source snapshot and ownership
+/// secret reference before the provider receives an apply request.  The
+/// provider then persists an HMAC-protected marker containing this capability
+/// before creating the generation tree.  A recovery that has no receipt can
+/// therefore inspect only the exact marker-authorised destination; it never
+/// adopts a destination by path or reopens the source bundle.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagePackageAuthorization {
+    /// Stable transaction identity.
+    pub transaction_id: String,
+    /// Stable `StagePackage` effect identity.
+    pub effect_id: String,
+    /// Immutable installer-plan digest.
+    pub plan_digest: String,
+    /// Exact source bundle identity captured in the precondition.
+    pub source_bundle_identity: FileIdentity,
+    /// Digest of the complete durable source observation.
+    pub source_snapshot_digest: String,
+    /// Exact protected destination contour.
+    pub staging_root: PathBuf,
+    /// Destination contour identity, when known by the mutating call.  The
+    /// recovery path obtains the value from the authenticated marker and then
+    /// compares it with a fresh protected-root readback.
+    pub installation_root_identity: Option<FileIdentity>,
+    /// Candidate generation identity.
+    pub generation: String,
+    /// Canonical manifest digest.
+    pub manifest_sha256: String,
+    /// Unpredictable marker nonce derived from the provider-owned reference.
+    pub marker_nonce: String,
+    /// Exact source file inventory bound into the capability.
+    pub expected_files: Vec<StagePackageExpectedFile>,
+}
+
+impl StagePackageAuthorization {
+    fn validate(&self) -> Result<(), PackageStagingError> {
+        if self.transaction_id.trim().is_empty()
+            || self.effect_id.trim().is_empty()
+            || self.plan_digest.len() != 64
+            || !self
+                .plan_digest
+                .chars()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.source_bundle_identity.volume_serial_number == 0
+            || self.source_bundle_identity.file_index == 0
+            || self.source_snapshot_digest.len() != 64
+            || !super::valid_sha256_hex(&self.source_snapshot_digest)
+            || !self.staging_root.is_absolute()
+            || self.generation.is_empty()
+            || self.manifest_sha256.len() != 64
+            || !super::valid_sha256_hex(&self.manifest_sha256)
+            || self.marker_nonce.len() != 64
+            || !super::valid_sha256_hex(&self.marker_nonce)
+            || self.expected_files.is_empty()
+        {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        if self
+            .installation_root_identity
+            .is_some_and(|identity| identity.volume_serial_number == 0 || identity.file_index == 0)
+        {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        for file in &self.expected_files {
+            validate_relative_text(&file.relative_path)?;
+            if file.source_identity.volume_serial_number == 0
+                || file.source_identity.file_index == 0
+                || file.size == 0
+                || !super::valid_sha256_hex(&file.sha256)
+                || !paths.insert(file.relative_path.to_ascii_lowercase())
+            {
+                return Err(PackageStagingError::IdentityMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    fn marker_path(&self) -> PathBuf {
+        let name = format!(
+            ".eliot-stage-{}-{}.prepared",
+            sha256_marker_name(self),
+            self.marker_nonce
+        );
+        self.staging_root.join(name)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StagePackagePreparedMarker {
+    version: u32,
+    authorization: StagePackageAuthorization,
+    mac: String,
+}
+
+const STAGE_PACKAGE_MARKER_VERSION: u32 = 1;
+
+fn sha256_marker_name(authorization: &StagePackageAuthorization) -> String {
+    let bytes = serde_json::to_vec(&(
+        "eliot-stage-package-marker-name-v1",
+        &authorization.transaction_id,
+        &authorization.effect_id,
+        &authorization.plan_digest,
+        &authorization.staging_root,
+        &authorization.generation,
+        &authorization.marker_nonce,
+    ))
+    .unwrap_or_default();
+    hex_digest(&bytes)
+}
+
+fn stage_package_marker_mac(
+    authorization: &StagePackageAuthorization,
+    key: &[u8],
+) -> Result<String, PackageStagingError> {
+    let bytes = serde_json::to_vec(&(STAGE_PACKAGE_MARKER_VERSION, authorization))
+        .map_err(|_| PackageStagingError::Io)?;
+    Ok(hmac_sha256_hex(key, &bytes))
+}
+
+fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    const BLOCK_BYTES: usize = 64;
+    let mut normalized = [0_u8; BLOCK_BYTES];
+    if key.len() > BLOCK_BYTES {
+        normalized[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; BLOCK_BYTES];
+    let mut outer_pad = [0x5c_u8; BLOCK_BYTES];
+    for index in 0..BLOCK_BYTES {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    normalized.fill(0);
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    inner_pad.fill(0);
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer_pad.fill(0);
+    format!("{:x}", outer.finalize())
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
 fn provider_chain_is_bounded<T>(count: u32, chain: *const T) -> bool {
     count != 0 && count <= MAX_AUTHENTICODE_PROVIDER_CHAIN_ELEMENTS && !chain.is_null()
 }
@@ -1507,7 +1686,7 @@ pub struct PackageStager {
     source: TrustedSourceBundle,
     installation_root: PathBuf,
     #[cfg(windows)]
-    _installation_lease: super::ProtectedRootLease,
+    installation_lease: super::ProtectedRootLease,
 }
 
 impl fmt::Debug for PackageStager {
@@ -1728,6 +1907,90 @@ fn inspect_published_destination_at_installation_root(
     Ok(PackageStagingObservation::Matching(receipt))
 }
 
+fn write_or_validate_prepared_marker(
+    authorization: &StagePackageAuthorization,
+    ownership_key: &[u8],
+) -> Result<(), PackageStagingError> {
+    let marker_path = authorization.marker_path();
+    if path_exists(&marker_path)? {
+        let marker = read_prepared_marker(&marker_path, ownership_key)?;
+        let mut expected = authorization.clone();
+        let mut observed = marker.authorization;
+        if expected.installation_root_identity != observed.installation_root_identity {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        expected.installation_root_identity = None;
+        observed.installation_root_identity = None;
+        if expected != observed {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        return Ok(());
+    }
+    let mac = stage_package_marker_mac(authorization, ownership_key)?;
+    let marker = StagePackagePreparedMarker {
+        version: STAGE_PACKAGE_MARKER_VERSION,
+        authorization: authorization.clone(),
+        mac,
+    };
+    let bytes = serde_json::to_vec(&marker).map_err(|_| PackageStagingError::Io)?;
+    let (mut file, _) = match create_destination_file(&marker_path) {
+        Ok(file) => file,
+        Err(PackageStagingError::GenerationExists) => {
+            let marker = read_prepared_marker(&marker_path, ownership_key)?;
+            let mut expected = authorization.clone();
+            let mut observed = marker.authorization;
+            if expected.installation_root_identity != observed.installation_root_identity {
+                return Err(PackageStagingError::IdentityMismatch);
+            }
+            expected.installation_root_identity = None;
+            observed.installation_root_identity = None;
+            if expected != observed {
+                return Err(PackageStagingError::IdentityMismatch);
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    file.write_all(&bytes)
+        .map_err(|_| PackageStagingError::Io)?;
+    flush_file_buffers(&file)?;
+    Ok(())
+}
+
+fn read_prepared_marker(
+    path: &Path,
+    ownership_key: &[u8],
+) -> Result<StagePackagePreparedMarker, PackageStagingError> {
+    if ownership_key.is_empty() {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let file = open_existing_file(path)?;
+    #[cfg(windows)]
+    {
+        let canonical = final_path_from_handle(&file)?;
+        if !super::windows_paths_equal(&canonical, path) {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024)
+        .read_to_end(&mut bytes)
+        .map_err(|_| PackageStagingError::Io)?;
+    let marker: StagePackagePreparedMarker =
+        serde_json::from_slice(&bytes).map_err(|_| PackageStagingError::IdentityMismatch)?;
+    if marker.version != STAGE_PACKAGE_MARKER_VERSION {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    marker.authorization.validate()?;
+    let expected = stage_package_marker_mac(&marker.authorization, ownership_key)?;
+    if !constant_time_equal(expected.as_bytes(), marker.mac.as_bytes())
+        || marker.authorization.marker_path() != path
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    Ok(marker)
+}
+
 impl PackageStager {
     /// Retain a trusted source bundle and an existing protected installation
     /// root.  The installation root must already be below the OS-protected
@@ -1752,7 +2015,7 @@ impl PackageStager {
             Ok(Self {
                 source,
                 installation_root: canonical,
-                _installation_lease: lease,
+                installation_lease: lease,
             })
         }
         #[cfg(not(windows))]
@@ -1774,6 +2037,67 @@ impl PackageStager {
         &self.installation_root
     }
 
+    /// Returns the identity of the retained protected installation root.
+    #[must_use]
+    pub const fn installation_root_identity(&self) -> FileIdentity {
+        #[cfg(windows)]
+        {
+            self.installation_lease.identity()
+        }
+        #[cfg(not(windows))]
+        {
+            FileIdentity {
+                volume_serial_number: 0,
+                file_index: 0,
+            }
+        }
+    }
+
+    /// Persist the exact HMAC-bound `StagePackage` preparation marker and then
+    /// perform the normal create-only stage.  The marker is deliberately
+    /// retained after success so a process that loses the response can
+    /// reconstruct the exact receipt from the destination alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns a staging error when the authorization, ownership key, source
+    /// snapshot or protected destination cannot be proven exact.
+    pub fn stage_authorized(
+        &self,
+        manifest: &PackageManifest,
+        authorization: &StagePackageAuthorization,
+        ownership_key: &[u8],
+    ) -> Result<StagingReceipt, PackageStagingError> {
+        authorization.validate()?;
+        if ownership_key.is_empty()
+            || !super::windows_paths_equal(&authorization.staging_root, &self.installation_root)
+            || authorization.source_bundle_identity != self.source.identity()
+            || authorization.generation != manifest.generation
+            || authorization.manifest_sha256 != manifest.canonical_digest()
+            || authorization.installation_root_identity != Some(self.installation_root_identity())
+        {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        let observed = self.source.observe()?;
+        if observed.files.len() != authorization.expected_files.len()
+            || observed.files.iter().any(|actual| {
+                authorization
+                    .expected_files
+                    .iter()
+                    .find(|expected| ordinal_eq_str(&expected.relative_path, &actual.relative_path))
+                    .is_none_or(|expected| {
+                        expected.source_identity != actual.identity
+                            || expected.size != actual.size
+                            || expected.sha256 != actual.sha256
+                    })
+            })
+        {
+            return Err(PackageStagingError::HashMismatch);
+        }
+        write_or_validate_prepared_marker(authorization, ownership_key)?;
+        self.stage_with_expected_inventory(manifest, &authorization.expected_files)
+    }
+
     /// Create one immutable generation with the official `WinTrust` verifier.
     ///
     /// Existing generation roots are never adopted, replaced or overwritten.
@@ -1785,6 +2109,14 @@ impl PackageStager {
     /// Returns a typed error for invalid manifests, tree mismatches, identity
     /// or security races, failed trust, or refused exact-owned rollback.
     pub fn stage(&self, manifest: &PackageManifest) -> Result<StagingReceipt, PackageStagingError> {
+        self.stage_with_expected_inventory(manifest, &[])
+    }
+
+    fn stage_with_expected_inventory(
+        &self,
+        manifest: &PackageManifest,
+        expected_sources: &[StagePackageExpectedFile],
+    ) -> Result<StagingReceipt, PackageStagingError> {
         let manifest = manifest.validate()?;
         let generation = validate_relative_text(&manifest.generation)?;
         let parent = self.retain_generation_parent(&generation)?;
@@ -1805,7 +2137,8 @@ impl PackageStager {
             directories: Vec::new(),
             files: Vec::with_capacity(manifest.files.len()),
         };
-        let result = self.copy_and_measure(&manifest, &generation_root, &mut created);
+        let result =
+            self.copy_and_measure(&manifest, &generation_root, &mut created, expected_sources);
         match result {
             Ok(files) => {
                 let finalized = (|| {
@@ -1886,25 +2219,90 @@ impl PackageStager {
         reconcile_receipt_at_installation_root(installation_root, receipt)
     }
 
-    /// Inspect a published generation and reconstruct its immutable receipt
-    /// from destination evidence plus the durable source precondition.
-    ///
-    /// No source path is opened. This is used when publication completed but
-    /// the caller crashed before persisting the returned [`StagingReceipt`].
+    /// Reconcile an intent whose receipt was lost after the provider had
+    /// persisted its preparation marker.  This method opens no source path;
+    /// the marker's HMAC and exact source observations are the only admission
+    /// authority for reconstructing a receipt.
     ///
     /// # Errors
     ///
-    /// Returns a typed staging error when the destination root or retained
-    /// source precondition cannot be validated.
-    pub fn inspect_published_destination(
+    /// Returns a staging error when the marker, ownership key, destination
+    /// identity or manifest-bound tree cannot be proven exact.
+    pub fn reconcile_prepared_destination_only(
         installation_root: &Path,
         manifest: &PackageManifest,
-        expectations: &[StagedFileReceipt],
+        authorization: &StagePackageAuthorization,
+        ownership_key: &[u8],
     ) -> Result<PackageStagingObservation, PackageStagingError> {
+        authorization.validate()?;
+        if ownership_key.is_empty()
+            || !super::windows_paths_equal(&authorization.staging_root, installation_root)
+            || authorization.generation != manifest.generation
+            || authorization.manifest_sha256 != manifest.canonical_digest()
+        {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        let marker_path = authorization.marker_path();
+        let marker = match read_prepared_marker(&marker_path, ownership_key) {
+            Ok(marker) => marker,
+            Err(PackageStagingError::RootUnavailable) => {
+                return Ok(PackageStagingObservation::Unknown(
+                    PackageStagingError::PartialTree,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let mut expected_authorization = authorization.clone();
+        if expected_authorization.installation_root_identity.is_some()
+            && expected_authorization.installation_root_identity
+                != marker.authorization.installation_root_identity
+        {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        expected_authorization.installation_root_identity = None;
+        let mut marker_authorization = marker.authorization.clone();
+        let marker_root_identity = marker_authorization
+            .installation_root_identity
+            .ok_or(PackageStagingError::IdentityMismatch)?;
+        marker_authorization.installation_root_identity = None;
+        if expected_authorization != marker_authorization {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        #[cfg(windows)]
+        {
+            let root = open_existing_directory(installation_root)?;
+            if file_identity_from_open_handle(&root)? != marker_root_identity {
+                return Err(PackageStagingError::IdentityMismatch);
+            }
+            verify_system_security(&root, true)?;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = marker_root_identity;
+            return Err(PackageStagingError::UnsupportedPlatform);
+        }
+        let expectations = marker
+            .authorization
+            .expected_files
+            .iter()
+            .map(|file| StagedFileReceipt {
+                relative_path: file.relative_path.clone(),
+                source_identity: file.source_identity,
+                destination_identity: FileIdentity {
+                    volume_serial_number: 0,
+                    file_index: 0,
+                },
+                size: file.size,
+                sha256: file.sha256.clone(),
+                security_descriptor_sha256: String::new(),
+                pe: None,
+                authenticode: None,
+            })
+            .collect::<Vec<_>>();
         inspect_published_destination_at_installation_root(
             installation_root,
             manifest,
-            expectations,
+            &expectations,
         )
     }
 
@@ -1953,6 +2351,21 @@ impl PackageStager {
     /// Returns an error when any file/root identity, tree, security descriptor
     /// or exact delete operation is not proven to match the receipt.
     pub fn rollback(&self, receipt: &StagingReceipt) -> Result<(), PackageStagingError> {
+        Self::rollback_destination_only(&self.installation_root, receipt)
+    }
+
+    /// Roll back an exact receipt without opening or validating the source
+    /// bundle.  This is the only rollback path permitted after a receipt has
+    /// been durably persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a staging error when the receipt, destination identity, tree,
+    /// security descriptors or exact deletion cannot be proven.
+    pub fn rollback_destination_only(
+        installation_root: &Path,
+        receipt: &StagingReceipt,
+    ) -> Result<(), PackageStagingError> {
         validate_receipt_file_grammar(&receipt.files)?;
         let manifest = PackageManifest::new(
             &receipt.generation,
@@ -1971,7 +2384,15 @@ impl PackageStager {
         }
         validate_receipt_directories(receipt, &manifest)?;
         let generation = validate_relative_text(&manifest.generation)?;
-        let parent = self.retain_generation_parent(&generation)?;
+        let parent_components = generation
+            .components
+            .get(..generation.components.len().saturating_sub(1))
+            .unwrap_or(&[]);
+        let mut parent_path = installation_root.to_path_buf();
+        for component in parent_components {
+            parent_path.push(component);
+        }
+        let parent = retain_destination_parent(&parent_path)?;
         let root_path = generation.join_to(&parent.path);
         if !receipt.root_path.is_absolute()
             || !super::windows_paths_equal(&receipt.root_path, &root_path)
@@ -2125,6 +2546,7 @@ impl PackageStager {
         manifest: &PackageManifest,
         destination_root: &Path,
         created: &mut CreatedTree,
+        expected_sources: &[StagePackageExpectedFile],
     ) -> Result<Vec<StagedFileReceipt>, PackageStagingError> {
         for entry in expected_tree(manifest)? {
             if entry.kind != TreeEntryKind::Directory {
@@ -2143,7 +2565,13 @@ impl PackageStager {
         let mut total = 0_u64;
         let mut files = Vec::with_capacity(manifest.files.len());
         for spec in &manifest.files {
-            files.push(self.copy_one_file(spec, destination_root, &mut total, created)?);
+            files.push(self.copy_one_file(
+                spec,
+                destination_root,
+                &mut total,
+                created,
+                expected_sources,
+            )?);
         }
         Ok(files)
     }
@@ -2154,11 +2582,24 @@ impl PackageStager {
         destination_root: &Path,
         total: &mut u64,
         created: &mut CreatedTree,
+        expected_sources: &[StagePackageExpectedFile],
     ) -> Result<StagedFileReceipt, PackageStagingError> {
         let relative = validate_relative_text(&spec.relative_path)?;
         let source = relative.join_to(self.source.path());
         let destination = relative.join_to(destination_root);
         let source_snapshot = snapshot_source_file(&source, spec.expected_size)?;
+        if !expected_sources.is_empty() {
+            let expected = expected_sources
+                .iter()
+                .find(|expected| ordinal_eq_str(&expected.relative_path, &spec.relative_path))
+                .ok_or(PackageStagingError::IdentityMismatch)?;
+            if expected.source_identity != source_snapshot.identity
+                || expected.size != source_snapshot.size
+                || expected.sha256 != source_snapshot.sha256
+            {
+                return Err(PackageStagingError::HashMismatch);
+            }
+        }
         *total = total
             .checked_add(source_snapshot.size)
             .ok_or(PackageStagingError::BoundExceeded)?;

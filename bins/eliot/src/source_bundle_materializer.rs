@@ -9,15 +9,19 @@ use eliot_governor::{GovernorLaunchConfig, KernelGenerationExpectation};
 use eliot_installation::{
     AuthorityEpoch, GenerationPackagePlanner, InstallationEpoch, InstallationError,
     InstallationProfile, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
-    PlatformHandle, ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
-    SupervisionAuthorityBinding,
+    PlatformHandle, RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
+    RuntimeStateRoots, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
+    SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
+    SourceBundlePublicationRole, StateFence, SupervisionAuthorityBinding,
+    source_bundle_publication_operation_id,
 };
 use eliot_kernel_service::EliotdLaunchDescriptor;
 use eliot_platform_windows::{
     AuthenticodeEvidence, AuthenticodeVerifier, DirectoryPublicationOutcome,
     DirectoryPublicationReceipt, FileIdentity, OwnedDirectoryPublication, PackageFileSpec,
     PackageManifest, PeCoffEvidence, TrustedSourceBundle, WindowsAuthenticodeVerifier,
-    parse_pe_coff, validate_package_relative_path,
+    canonical_windows_path, open_no_follow_directory, parse_pe_coff,
+    validate_package_relative_path,
 };
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
 use serde::Serialize;
@@ -59,6 +63,8 @@ pub struct CanarySourceBundleMaterializeInput {
     pub eliotd_exe: PathBuf,
     /// Absent absolute directory to create exactly once.
     pub output_bundle: PathBuf,
+    /// Exact redb store that owns the publication intent/outcome journal.
+    pub store_path: PathBuf,
     /// Canonical relative generation identity.
     pub generation: PlatformHandle,
     /// Installation lineage used by the typed launch contracts.
@@ -1003,6 +1009,303 @@ fn validate_published_observation(
     Ok(by_role)
 }
 
+fn journal_roles_from_precommit(
+    files: &[MaterializedRolePrecommitReceipt],
+) -> Result<Vec<SourceBundlePublicationRole>, MaterializeError> {
+    files
+        .iter()
+        .map(|file| {
+            Ok(SourceBundlePublicationRole {
+                relative_path: file.relative_path.clone(),
+                executable: file.executable,
+                size: file.size,
+                sha256: PlatformHandle::new(file.sha256.clone()).map_err(|error| {
+                    MaterializeError::Contract(format!(
+                        "publication role digest {}: {error}",
+                        file.relative_path
+                    ))
+                })?,
+                source_identity: file.source_identity,
+                temporary_identity: file.temporary_identity,
+                pe: file.pe.clone(),
+                authenticode: file.authenticode.clone(),
+            })
+        })
+        .collect()
+}
+
+fn precommit_from_journal(
+    files: &[SourceBundlePublicationRole],
+) -> Vec<MaterializedRolePrecommitReceipt> {
+    files
+        .iter()
+        .map(|file| MaterializedRolePrecommitReceipt {
+            relative_path: file.relative_path.clone(),
+            executable: file.executable,
+            size: file.size,
+            sha256: file.sha256.as_str().to_owned(),
+            source_identity: file.source_identity,
+            temporary_identity: file.temporary_identity,
+            pe: file.pe.clone(),
+            authenticode: file.authenticode.clone(),
+        })
+        .collect()
+}
+
+fn typed_bundle_from_journal(
+    journal: &SourceBundlePublicationJournal,
+) -> Result<
+    (
+        PackageManifest,
+        Vec<PackageArtifactDigest>,
+        Vec<MaterializedRolePrecommitReceipt>,
+    ),
+    MaterializeError,
+> {
+    if journal.precommit_files.len() != REQUIRED_ROLES.len() {
+        return Err(MaterializeError::Invalid(
+            "publication journal does not retain the complete nine-role inventory".to_owned(),
+        ));
+    }
+    let mut manifest_files = Vec::with_capacity(REQUIRED_ROLES.len());
+    let mut expected = Vec::with_capacity(REQUIRED_ROLES.len());
+    for (role, executable) in REQUIRED_ROLES {
+        let fact = journal
+            .precommit_files
+            .iter()
+            .find(|fact| fact.relative_path == role)
+            .ok_or_else(|| MaterializeError::Invalid(format!("journal role missing: {role}")))?;
+        if fact.executable != executable {
+            return Err(MaterializeError::Invalid(format!(
+                "journal executable binding differs for {role}"
+            )));
+        }
+        manifest_files.push(
+            PackageFileSpec::new(role, executable, fact.size)
+                .map_err(|error| MaterializeError::Contract(error.to_string()))?,
+        );
+        expected.push(PackageArtifactDigest {
+            relative_path: role.to_owned(),
+            expected_size: fact.size,
+            sha256: PlatformHandle::new(fact.sha256.as_str().to_owned())
+                .map_err(|error| MaterializeError::Contract(error.to_string()))?,
+        });
+    }
+    let manifest = PackageManifest::new(Path::new(journal.generation.as_str()), manifest_files)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    if manifest.canonical_digest() != journal.manifest_digest.as_str() {
+        return Err(MaterializeError::Invalid(
+            "publication journal manifest digest does not match its role inventory".to_owned(),
+        ));
+    }
+    let evidence = GenerationPackagePlanner::artifact_set_evidence_digest(&manifest, &expected)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    if evidence != journal.evidence_digest {
+        return Err(MaterializeError::Invalid(
+            "publication journal evidence digest does not match its role inventory".to_owned(),
+        ));
+    }
+    Ok((
+        manifest,
+        expected,
+        precommit_from_journal(&journal.precommit_files),
+    ))
+}
+
+fn reconcile_journal_destination(
+    journal: &SourceBundlePublicationJournal,
+) -> Result<Option<CanarySourceBundleReceipt>, MaterializeError> {
+    let (manifest, expected, precommit_files) = typed_bundle_from_journal(journal)?;
+    let destination = &journal.output_bundle;
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(MaterializeError::Invalid(
+                "published bundle path is not a directory".to_owned(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(MaterializeError::Platform(error.to_string())),
+    }
+    let (destination_identity, _destination_handle) = open_no_follow_directory(destination)
+        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+    if destination_identity != journal.source_identity {
+        return Err(MaterializeError::Invalid(
+            "published bundle directory identity differs from the durable journal".to_owned(),
+        ));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        MaterializeError::Invalid("published bundle has no destination parent".to_owned())
+    })?;
+    let canonical_parent = canonical_windows_path(parent)
+        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+    let (parent_identity, _parent_handle) = open_no_follow_directory(&canonical_parent)
+        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+    let bundle = TrustedSourceBundle::open(destination)
+        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+    if bundle.identity() != destination_identity {
+        return Err(MaterializeError::Invalid(
+            "published bundle retained identity differs from readback".to_owned(),
+        ));
+    }
+    let observed = validate_published_observation(&bundle, &manifest, &expected)?;
+    let mut files = Vec::with_capacity(REQUIRED_ROLES.len());
+    for prepared in &precommit_files {
+        let actual = observed.get(&prepared.relative_path).ok_or_else(|| {
+            MaterializeError::Invalid(format!(
+                "published role missing during journal reconciliation: {}",
+                prepared.relative_path
+            ))
+        })?;
+        if actual.identity != prepared.temporary_identity {
+            return Err(MaterializeError::Invalid(format!(
+                "published role identity differs during journal reconciliation: {}",
+                prepared.relative_path
+            )));
+        }
+        files.push(MaterializedRoleReceipt {
+            relative_path: prepared.relative_path.clone(),
+            executable: prepared.executable,
+            size: prepared.size,
+            sha256: prepared.sha256.clone(),
+            source_identity: prepared.source_identity,
+            destination_identity: actual.identity,
+            pe: prepared.pe.clone(),
+            authenticode: prepared.authenticode.clone(),
+        });
+    }
+    let directory_publication = DirectoryPublicationReceipt {
+        destination_path: destination.to_string_lossy().into_owned(),
+        canonical_parent_path: canonical_parent.to_string_lossy().into_owned(),
+        parent_identity,
+        source_identity: journal.source_identity,
+        destination_identity,
+    };
+    if journal
+        .directory_receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt != &directory_publication)
+    {
+        return Err(MaterializeError::Invalid(
+            "published bundle directory receipt differs from the durable journal".to_owned(),
+        ));
+    }
+    Ok(Some(CanarySourceBundleReceipt {
+        bundle_path: destination.to_string_lossy().into_owned(),
+        generation: journal.generation.as_str().to_owned(),
+        evidence_digest: journal.evidence_digest.as_str().to_owned(),
+        files,
+        source_identity: journal.source_identity,
+        directory_publication,
+    }))
+}
+
+fn journal_unknown_outcome(
+    journal: &SourceBundlePublicationJournal,
+    precommit_files: Vec<MaterializedRolePrecommitReceipt>,
+    diagnostic: String,
+) -> CanarySourceBundleMaterializeOutcome {
+    CanarySourceBundleMaterializeOutcome::CommittedUnknown(CanarySourceBundleReconciliation {
+        bundle_path: journal.output_bundle.to_string_lossy().into_owned(),
+        generation: journal.generation.as_str().to_owned(),
+        evidence_digest: journal.evidence_digest.as_str().to_owned(),
+        precommit_files,
+        directory_publication: DirectoryPublicationOutcome::CommittedUnknown(
+            eliot_platform_windows::DirectoryPublicationUnknownReceipt {
+                reason: eliot_platform_windows::DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
+                destination_path: journal.output_bundle.to_string_lossy().into_owned(),
+                canonical_parent_path: journal
+                    .output_bundle
+                    .parent()
+                    .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+                parent_identity: FileIdentity {
+                    volume_serial_number: 0,
+                    file_index: 0,
+                },
+                source_identity: journal.source_identity,
+            },
+        ),
+        reason: CanarySourceBundleReconciliationReason::DirectoryPublicationUnknown,
+        diagnostic,
+    })
+}
+
+fn reconcile_existing_publication(
+    input: &CanarySourceBundleMaterializeInput,
+) -> Result<Option<CanarySourceBundleMaterializeOutcome>, MaterializeError> {
+    validate_absolute(&input.output_bundle, "output_bundle")?;
+    validate_absolute(&input.store_path, "store_path")?;
+    let operation_id = source_bundle_publication_operation_id(
+        &input.transaction_id,
+        &input.output_bundle,
+        &input.generation,
+    )
+    .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    match fs::symlink_metadata(&input.store_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(MaterializeError::Invalid(
+                "publication store path is not a regular file".to_owned(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(MaterializeError::Platform(error.to_string())),
+    }
+    let store = RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    let Some(journal) = store
+        .load_source_bundle_publication(&operation_id)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    if journal.transaction_id != input.transaction_id
+        || journal.generation != input.generation
+        || !eliot_platform_windows::windows_paths_equal(
+            &journal.output_bundle,
+            &input.output_bundle,
+        )
+    {
+        return Err(MaterializeError::Invalid(
+            "publication journal identity differs from the requested operation".to_owned(),
+        ));
+    }
+    let precommit_files = precommit_from_journal(&journal.precommit_files);
+    match reconcile_journal_destination(&journal) {
+        Ok(Some(receipt)) => {
+            if journal.state == SourceBundlePublicationJournalState::Published {
+                return Ok(Some(CanarySourceBundleMaterializeOutcome::Published(
+                    receipt,
+                )));
+            }
+            let updated = SourceBundlePublicationJournal {
+                state: SourceBundlePublicationJournalState::Published,
+                destination_identity: Some(receipt.directory_publication.destination_identity),
+                directory_receipt: Some(receipt.directory_publication.clone()),
+                diagnostic: None,
+                ..journal.clone()
+            };
+            store
+                .record_source_bundle_publication(&updated)
+                .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+            Ok(Some(CanarySourceBundleMaterializeOutcome::Published(
+                receipt,
+            )))
+        }
+        Ok(None) if journal.state == SourceBundlePublicationJournalState::Intent => Ok(None),
+        Ok(None) => Ok(Some(journal_unknown_outcome(
+            &journal,
+            precommit_files,
+            "durable publication journal exists but its destination is absent".to_owned(),
+        ))),
+        Err(error) => Ok(Some(journal_unknown_outcome(
+            &journal,
+            precommit_files,
+            format!("durable publication reconciliation rejected: {error}"),
+        ))),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "publication keeps validation, immutable writes, readback and receipt binding together"
@@ -1018,6 +1321,7 @@ fn materialize_with_executables(
         "profile_anchor_root",
     )?;
     validate_absolute(Path::new(input.staging_root.as_str()), "staging_root")?;
+    validate_absolute(&input.store_path, "store_path")?;
     validate_package_relative_path(Path::new(input.generation.as_str()))
         .map_err(|error| MaterializeError::Invalid(format!("generation: {error}")))?;
     if input.transaction_id.as_str().trim().is_empty()
@@ -1142,9 +1446,99 @@ fn materialize_with_executables(
     }
     drop(precommit_bundle);
 
+    let operation_id = source_bundle_publication_operation_id(
+        &input.transaction_id,
+        &input.output_bundle,
+        &input.generation,
+    )
+    .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    let precommit_digest = sha256_hex(
+        &serde_json::to_vec(&precommit_files)
+            .map_err(|error| MaterializeError::Contract(error.to_string()))?,
+    );
+    let journal_precommit_files = journal_roles_from_precommit(&precommit_files)?;
+    let journal_intent = SourceBundlePublicationJournal {
+        wire_version: SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
+        operation_id,
+        transaction_id: input.transaction_id.clone(),
+        output_bundle: input.output_bundle.clone(),
+        generation: input.generation.clone(),
+        manifest_digest: PlatformHandle::new(typed.manifest.canonical_digest())
+            .map_err(|error| MaterializeError::Contract(error.to_string()))?,
+        evidence_digest: typed.evidence_digest.clone(),
+        precommit_digest: PlatformHandle::new(precommit_digest)
+            .map_err(|error| MaterializeError::Contract(error.to_string()))?,
+        precommit_files: journal_precommit_files,
+        source_identity: precommit_directory_identity,
+        state: SourceBundlePublicationJournalState::Intent,
+        destination_identity: None,
+        directory_receipt: None,
+        diagnostic: None,
+    };
+    let existing_journal =
+        RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
+            &input.store_path,
+            &journal_intent,
+        )
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    if existing_journal.state != SourceBundlePublicationJournalState::Intent {
+        return Ok(CanarySourceBundleMaterializeOutcome::CommittedUnknown(
+            CanarySourceBundleReconciliation {
+                bundle_path: existing_journal
+                    .output_bundle
+                    .to_string_lossy()
+                    .into_owned(),
+                generation: existing_journal.generation.as_str().to_owned(),
+                evidence_digest: existing_journal.evidence_digest.as_str().to_owned(),
+                precommit_files,
+                directory_publication: DirectoryPublicationOutcome::CommittedUnknown(
+                    eliot_platform_windows::DirectoryPublicationUnknownReceipt {
+                        reason: eliot_platform_windows::DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
+                        destination_path: existing_journal.output_bundle.to_string_lossy().into_owned(),
+                        canonical_parent_path: existing_journal
+                            .output_bundle
+                            .parent()
+                            .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+                        parent_identity: FileIdentity {
+                            volume_serial_number: 0,
+                            file_index: 0,
+                        },
+                        source_identity: existing_journal.source_identity,
+                    },
+                ),
+                reason: CanarySourceBundleReconciliationReason::DirectoryPublicationUnknown,
+                diagnostic: "durable publication journal already crossed the native move boundary; reconcile the exact journal before retrying"
+                    .to_owned(),
+            },
+        ));
+    }
+
     let directory_publication = publication
         .publish(precommit_directory_identity)
         .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+    let journal_after_move = match &directory_publication {
+        DirectoryPublicationOutcome::Published(receipt) => SourceBundlePublicationJournal {
+            state: SourceBundlePublicationJournalState::Published,
+            destination_identity: Some(receipt.destination_identity),
+            directory_receipt: Some(receipt.clone()),
+            diagnostic: None,
+            ..journal_intent.clone()
+        },
+        DirectoryPublicationOutcome::CommittedUnknown(receipt) => SourceBundlePublicationJournal {
+            state: SourceBundlePublicationJournalState::CommittedUnknown,
+            destination_identity: None,
+            directory_receipt: None,
+            diagnostic: Some(format!(
+                "directory publication committed unknown: {:?}",
+                receipt.reason
+            )),
+            ..journal_intent.clone()
+        },
+    };
+    RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?
+        .record_source_bundle_publication(&journal_after_move)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
     let destination_path = match &directory_publication {
         DirectoryPublicationOutcome::Published(receipt) => receipt.destination_path.clone(),
         DirectoryPublicationOutcome::CommittedUnknown(receipt) => receipt.destination_path.clone(),
@@ -1241,6 +1635,9 @@ fn materialize_with_executables(
 pub fn materialize_canary_source_bundle(
     input: &CanarySourceBundleMaterializeInput,
 ) -> Result<CanarySourceBundleMaterializeOutcome, InstallationError> {
+    if let Some(existing) = reconcile_existing_publication(input).map_err(to_installation_error)? {
+        return Ok(existing);
+    }
     let executable_inputs = [
         (input.eliot_host_exe.clone(), "eliot-host.exe"),
         (input.eliot_watchdog_exe.clone(), "eliot-watchdog.exe"),
@@ -1269,7 +1666,7 @@ mod tests {
     use super::*;
     use eliot_installation::{
         GenerationPackagePlanInput, InstallationTransactionStore, RedbInstallationTransactionStore,
-        decode_installation_transaction_json,
+        validate_installation_transaction_json,
     };
     use tempfile::TempDir;
 
@@ -1358,6 +1755,7 @@ mod tests {
             surreal_exe: PathBuf::new(),
             eliotd_exe: PathBuf::new(),
             output_bundle: source_parent.path().join("bundle"),
+            store_path: source_parent.path().join("transaction.redb"),
             generation: handle("generation-test"),
             installation_epoch: InstallationEpoch {
                 installation: handle("installation-test"),
@@ -1560,11 +1958,12 @@ mod tests {
         );
         let output_bytes = fs::read(&output).unwrap();
         assert_eq!(output_bytes.last(), Some(&b'\n'));
-        let diagnostic = decode_installation_transaction_json(&output_bytes).unwrap();
+        validate_installation_transaction_json(&output_bytes).unwrap();
+        let diagnostic: serde_json::Value = serde_json::from_slice(&output_bytes).unwrap();
         let durable_store =
             RedbInstallationTransactionStore::open_existing_exact_path(&store).unwrap();
         let durable = durable_store.load(&transaction_id).unwrap().unwrap();
-        assert_eq!(diagnostic, durable);
+        assert_eq!(diagnostic, serde_json::to_value(&durable).unwrap());
     }
 
     #[cfg(windows)]
@@ -1607,7 +2006,7 @@ mod tests {
             "durable store was removed after output failure"
         );
         assert_eq!(fs::read(&output).unwrap(), b"{\"partial\":");
-        assert!(decode_installation_transaction_json(&fs::read(&output).unwrap()).is_err());
+        assert!(validate_installation_transaction_json(&fs::read(&output).unwrap()).is_err());
         let durable_store =
             RedbInstallationTransactionStore::open_existing_exact_path(&store).unwrap();
         assert!(durable_store.load(&transaction_id).unwrap().is_some());
