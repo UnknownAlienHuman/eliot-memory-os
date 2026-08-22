@@ -1,0 +1,78 @@
+# ELIOT Runtime Live V3 — integration handoff (2026-08-22)
+
+## Canonical integration point
+
+- Repository: `UnknownAlienHuman/eliot-memory-os`
+- Branch: `codex/runtime-live-v3-integration-staging`
+- Source task: `C:\Users\kleym\Downloads\ELIOT_CODEX_RUNTIME_LIVE_V3_2026-08-18.md`
+- This branch is an integration staging branch. It is not a `RUNTIME_LIVE_CANARY` completion claim.
+- Longstanding untracked `.eliot/inbox/*.surql` files are preserved and are not part of the Git tree.
+
+## Project map
+
+| Contour | Canonical implementation | Current state |
+|---|---|---|
+| Installer transaction and registry | `crates/kernel/eliot-installation` | Durable plan/apply/recover, strict wire migrations, Phase-A/Phase-B, approved generation and SCM receipts are integrated. |
+| Windows installation effects | `crates/kernel/eliot-platform-windows` | Protected roots, service registration/readback, EliotHost-to-Watchdog service-control DACL, supervision authority and exact process/Job observations are integrated. |
+| Host operational authority | `bins/eliot-host`, `crates/kernel/eliot-host-state`, `crates/surfaces/eliot-host-service` | HostStateJournal is the operational owner; Kernel/Store recovery and authenticated runtime-control are integrated. |
+| Kernel and eliotd | `bins/eliot-kernel`, `bins/eliotd`, `crates/kernel/eliot-kernel-service` | Durable activation, physical process authority, supervision signing/reconciliation and authenticated ProbeReady are integrated. |
+| Store | `bins/eliot-store-surreal`, `crates/storage/eliot-store-surreal-adapter` | Canonical runtime roots, provider process/socket identity and recovery contour are integrated. |
+| Watchdog and runtime status | `bins/eliot-watchdog`, `workspace/tools/eliot-runtime-status` | Installer-owned registration, verified ORS/publication consumption and fail-closed status projection are integrated. |
+| Live canary | `workspace/tools/eliot-live-canary` | Pulses 1–4 and a source-complete Pulse 5 candidate are integrated; Pulse 5 still has the P1s below and no live machine evidence exists. |
+
+## Integrated milestone lineage
+
+- `4004564` — provisioned supervision authority.
+- `07f1b65` — supervision consumers bound to current ORS authority.
+- `5a3e26e` — supervision/readiness lifecycle composition.
+- `99677cd` — honest source paths for live canary Pulses 1–4.
+- `075fadd` — installer-owned Watchdog service-control grant.
+- `334bf60` — bounded SCM Host stop/start Pulse 5 candidate.
+- `7dcdf43` — first-install profiled root hierarchy, exact staging root and protected `canary-evidence` root.
+
+## Verified in focused source gates
+
+- Pulse 5 candidate: all-target check; canary 14/14; Host-state 104/104; focused Windows enabled-Administrators read-only test; formatting/diff; touched-crate no-deps Clippy.
+- First-install roots: focused all-target checks; 12 Windows installer-root primitive tests; SystemService planner test; v18-to-v19 migration test; formatting/diff.
+- Earlier integrated milestones carry their own focused test and strict lint evidence in Git history.
+
+These checks prove source behavior only. They do not prove live service installation or `RUNTIME_LIVE_CANARY`.
+
+## Mandatory remaining work
+
+### P1 — Pulse 5 acceptance correction
+
+The current Pulse 5 candidate proves a fresh Host epoch/process nonce, fresh Kernel activation nonce, readiness, ORS evidence and eliotd return. It does not yet require a fresh post-restart Store process/generation/fence/request contour. Add a production-bound stale-Store negative and reject a post-restart contour that retained predecessor Store authority.
+
+The current error path can also return after SCM has confirmed Host stop but before the single Host start. Add a bounded stop-owned cleanup/reconciliation disposition so an observation failure does not silently strand the canary Host while still forbidding blind resend after `EffectUnknown`.
+
+### Production canary invocation and evidence
+
+`eliot-live-canary` is currently a workspace binary. Publish one canonical operator invocation, preferably through the already shipped `eliot.exe` CLI, without adding a tenth runtime role to the exact nine-role generation bundle.
+
+Bind evidence output to `RuntimeStateRoots::canary_evidence_root()` from the active manifest and retain/verify the protected root. Do not accept an arbitrary caller-provided directory as production authority.
+
+### Signed runtime bundle
+
+The release pipeline intentionally emits unsigned binaries, while the source-bundle materializer correctly requires `AuthenticodeVerdict::Valid` for runtime executables. No usable code-signing certificate with private key was observed in the machine certificate stores during this run. Do not weaken Authenticode. A signed and timestamped exact bundle, or an explicitly approved development-signing trust setup, is required before Pulse 1.
+
+### Live Windows evidence
+
+No real SCM/service mutation was executed in these source lanes. Required next live sequence is:
+
+1. Build/sign the exact bundle and materialize the nine-role Phase-A source bundle.
+2. Run elevated installation plan/apply for a disposable SystemService installation.
+3. Run and persist Pulses 1–5 against the same installation identity.
+4. Verify remote/result digests, journal/registry readback, Store filesystem placement, SCM identities and absence of the legacy writer.
+
+Pulses 6–8 remain post-canary recovery/removal work. They may report exact blockers, but may not be silently marked complete.
+
+## Repository cleanup state
+
+Cleanup was deliberately not executed while active worktrees still contained unique changes. The last read-only inventory was approximately 267 worktrees, 269 local branches and 223 tips not ancestors of staging. Several historical tips are known patch-equivalent or superseded, but the complete safe-delete classification is not yet trusted.
+
+Before deletion, recompute reachability against this branch, exclude every live agent worktree, archive unique commits, then delete only confirmed patch-equivalent/superseded worktrees and their dedicated build caches. Preserve all `.eliot/inbox` evidence until its owning ingestion/disposition is explicit.
+
+## Exact restart point
+
+Resume from `origin/codex/runtime-live-v3-integration-staging`. First fix and audit the two Pulse 5 P1s, then wire the canonical canary invocation/evidence root. Only after those source gates pass should the signed-bundle decision and live Pulses 1–5 begin.
