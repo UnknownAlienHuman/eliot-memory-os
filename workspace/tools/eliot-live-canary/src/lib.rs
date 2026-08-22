@@ -1529,7 +1529,7 @@ fn validate_pulse_five_store_artifact_transition(
 
 #[cfg(windows)]
 fn observed_protected_file_digest(
-    lease: &eliot_platform_windows::ProtectedPathLease,
+    lease: &eliot_platform_windows::ProtectedRuntimePathLease,
     expected: &PlatformHandle,
     label: &str,
 ) -> Result<String, String> {
@@ -1558,7 +1558,9 @@ fn attest_pulse_five_store_artifacts(
     approval: &PulseFiveStoreApproval,
     contour: &ContourSnapshot,
 ) -> Result<PulseFiveStoreArtifactEvidence, String> {
-    use eliot_platform_windows::{ProtectedPathLease, observe_named_pipe_peer_process_in_job};
+    use eliot_platform_windows::{
+        ProtectedRuntimePathLease, observe_named_pipe_peer_process_in_job,
+    };
 
     let store = contour
         .store
@@ -1587,15 +1589,11 @@ fn attest_pulse_five_store_artifacts(
     }
 
     let executable_file_lease =
-        ProtectedPathLease::open_existing_absolute(&approval.executable_path)
+        ProtectedRuntimePathLease::open_existing_absolute(&approval.executable_path)
             .map_err(|error| format!("retain approved Store executable bytes: {error}"))?;
-    let executable_canonical = executable_file_lease
-        .canonical_path()
-        .map_err(|error| format!("resolve retained Store executable: {error}"))?;
-    if !eliot_platform_windows::windows_paths_equal(
-        &approval.executable_path,
-        &executable_canonical,
-    ) || executable_file_lease.identity() != executable_lease.executable_identity()
+    let executable_canonical = executable_file_lease.path();
+    if !eliot_platform_windows::windows_paths_equal(&approval.executable_path, executable_canonical)
+        || executable_file_lease.identity() != executable_lease.executable_identity()
     {
         return Err("retained Store executable path/object identity was substituted".to_owned());
     }
@@ -1605,12 +1603,10 @@ fn attest_pulse_five_store_artifacts(
         "Store executable",
     )?;
 
-    let config_lease = ProtectedPathLease::open_existing_absolute(&approval.config_path)
+    let config_lease = ProtectedRuntimePathLease::open_existing_absolute(&approval.config_path)
         .map_err(|error| format!("retain materialized Store config: {error}"))?;
-    let config_canonical = config_lease
-        .canonical_path()
-        .map_err(|error| format!("resolve retained Store config: {error}"))?;
-    if !eliot_platform_windows::windows_paths_equal(&approval.config_path, &config_canonical) {
+    let config_canonical = config_lease.path();
+    if !eliot_platform_windows::windows_paths_equal(&approval.config_path, config_canonical) {
         return Err("materialized Store config differs from the approved path".to_owned());
     }
     let observed_config_digest = observed_protected_file_digest(
@@ -3646,6 +3642,27 @@ mod tests {
         assert!(production.contains("inspect_pulse_five_registry(root)"));
         assert!(!production.contains("ServiceOperation::Stop"));
         assert!(!production.contains("ServiceOperation::Start"));
+    }
+
+    #[test]
+    fn pulse_five_store_attestation_uses_read_only_runtime_leases_without_acl_mutation() {
+        let source = include_str!("lib.rs");
+        let attestation = source
+            .split_once("fn attest_pulse_five_store_artifacts")
+            .and_then(|(_, rest)| rest.split_once("\n#[cfg(windows)]\nfn scm_state_name"))
+            .map_or("", |(body, _)| body);
+        let read_only_lease = ["Protected", "Runtime", "PathLease"].concat();
+        let legacy_lease = ["Protected", "PathLease"].concat();
+        let set_security_info = ["Set", "SecurityInfo"].concat();
+        let write_dac = ["WRITE", "_DAC"].concat();
+
+        assert_eq!(attestation.matches(&read_only_lease).count(), 3);
+        assert!(!attestation.contains(&legacy_lease));
+        assert!(!attestation.contains(&set_security_info));
+        assert!(!attestation.contains(&write_dac));
+        assert!(!source.contains(&legacy_lease));
+        assert!(!source.contains(&set_security_info));
+        assert!(!source.contains(&write_dac));
     }
 
     #[cfg(windows)]
