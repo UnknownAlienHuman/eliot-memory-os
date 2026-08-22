@@ -31,11 +31,29 @@ pub const MAX_PACKAGE_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_PE_HEADER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_AUTHENTICODE_CERT_DER_BYTES: usize = 16 * 1024 * 1024;
+const MAX_AUTHENTICODE_PROVIDER_CHAIN_ELEMENTS: u32 = 1024;
 /// Maximum number of files plus directories walked from one source root.
 pub const MAX_ENUMERATED_ENTRIES: usize = MAX_PACKAGE_FILES * 2 + MAX_PACKAGE_PATH_DEPTH;
 
 fn provider_chain_is_bounded<T>(count: u32, chain: *const T) -> bool {
-    count != 0 && !chain.is_null()
+    count != 0 && count <= MAX_AUTHENTICODE_PROVIDER_CHAIN_ELEMENTS && !chain.is_null()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderCounterSignerState {
+    Absent,
+    Present,
+    Malformed,
+}
+
+fn provider_countersigner_state<T>(count: u32, chain: *const T) -> ProviderCounterSignerState {
+    if count == 0 {
+        ProviderCounterSignerState::Absent
+    } else if count > MAX_AUTHENTICODE_PROVIDER_CHAIN_ELEMENTS || chain.is_null() {
+        ProviderCounterSignerState::Malformed
+    } else {
+        ProviderCounterSignerState::Present
+    }
 }
 
 fn provider_der_length(pointer: *const u8, length: u32) -> Option<usize> {
@@ -615,26 +633,6 @@ impl AuthenticodeVerifier for WindowsAuthenticodeVerifier {
     }
 }
 
-enum StagingAuthenticodeVerifier<'a> {
-    Generic(&'a dyn AuthenticodeVerifier),
-    Official,
-}
-
-impl StagingAuthenticodeVerifier<'_> {
-    fn verify(
-        &self,
-        path: &Path,
-        file: &mut std::fs::File,
-        identity: FileIdentity,
-        sha256: &str,
-    ) -> Result<AuthenticodeEvidence, AuthenticodeError> {
-        match self {
-            Self::Generic(verifier) => verifier.verify(path, identity, sha256),
-            Self::Official => verify_authenticode_handle(path, file, identity, sha256),
-        }
-    }
-}
-
 #[cfg(not(windows))]
 fn verify_authenticode_platform(
     _path: &Path,
@@ -923,41 +921,56 @@ fn provider_evidence(
         std::slice::from_raw_parts(context.pbCertEncoded, der_length)
     };
     let (signer_subject, not_before, not_after) = certificate_evidence(context);
-    let countersigner = unsafe {
-        // SAFETY: provider is live; the optional countersigner is provider-owned.
-        WTHelperGetProvSignerFromChain(provider, 0, 1, 0)
+    let (counter_count, counter_chain) = unsafe {
+        // SAFETY: signer is provider-owned and live until CLOSE; these fields
+        // describe the provider's optional countersigner chain.
+        ((*signer).csCounterSigners, (*signer).pasCounterSigners)
     };
-    let countersigner_certificate_sha256 = if countersigner.is_null() {
-        None
-    } else {
-        let (cert_count, cert_chain) = unsafe {
-            // SAFETY: countersigner is provider-owned and live until CLOSE;
-            // these are its chain count and first-element pointer.
-            ((*countersigner).csCertChain, (*countersigner).pasCertChain)
+    let countersigner_certificate_sha256 =
+        match provider_countersigner_state(counter_count, counter_chain.cast_const()) {
+            ProviderCounterSignerState::Absent => None,
+            // A non-zero countersigner count is a mandatory evidence claim.  Any
+            // malformed provider state must therefore fail closed instead of
+            // silently degrading to the optional-absent representation.
+            ProviderCounterSignerState::Malformed => return None,
+            ProviderCounterSignerState::Present => {
+                let countersigner = unsafe {
+                    // SAFETY: provider is live; the provider chain was bounded and
+                    // non-null before asking WinTrust for its first countersigner.
+                    WTHelperGetProvSignerFromChain(provider, 0, 1, 0)
+                };
+                if countersigner.is_null() {
+                    return None;
+                }
+                let (cert_count, cert_chain) = unsafe {
+                    // SAFETY: countersigner is provider-owned and live until CLOSE;
+                    // these are its chain count and first-element pointer.
+                    ((*countersigner).csCertChain, (*countersigner).pasCertChain)
+                };
+                if !provider_chain_is_bounded(cert_count, cert_chain.cast_const()) {
+                    return None;
+                }
+                let cert = unsafe {
+                    // SAFETY: countersigner is provider-owned and live.
+                    WTHelperGetProvCertFromChain(countersigner, 0)
+                };
+                if cert.is_null() {
+                    return None;
+                }
+                let context = unsafe {
+                    // SAFETY: cert remains live until provider CLOSE.
+                    (*cert).pCert
+                };
+                let context = (!context.is_null()).then(|| unsafe { &*context })?;
+                let der_length = provider_der_length(context.pbCertEncoded, context.cbCertEncoded)?;
+                let der = unsafe {
+                    // SAFETY: the provider pointer is non-null and the byte length
+                    // is explicitly bounded before constructing the DER slice.
+                    std::slice::from_raw_parts(context.pbCertEncoded, der_length)
+                };
+                Some(hex_digest(der))
+            }
         };
-        if !provider_chain_is_bounded(cert_count, cert_chain.cast_const()) {
-            return None;
-        }
-        let cert = unsafe {
-            // SAFETY: countersigner is provider-owned and live.
-            WTHelperGetProvCertFromChain(countersigner, 0)
-        };
-        if cert.is_null() {
-            return None;
-        }
-        let context = unsafe {
-            // SAFETY: cert remains live until provider CLOSE.
-            (*cert).pCert
-        };
-        let context = (!context.is_null()).then(|| unsafe { &*context })?;
-        let der_length = provider_der_length(context.pbCertEncoded, context.cbCertEncoded)?;
-        let der = unsafe {
-            // SAFETY: the provider pointer is non-null and the byte length is
-            // explicitly bounded before constructing the DER slice.
-            std::slice::from_raw_parts(context.pbCertEncoded, der_length)
-        };
-        Some(hex_digest(der))
-    };
 
     Some(AuthenticodeEvidence {
         verdict: AuthenticodeVerdict::Valid,
@@ -1723,28 +1736,6 @@ impl PackageStager {
     /// Returns a typed error for invalid manifests, tree mismatches, identity
     /// or security races, failed trust, or refused exact-owned rollback.
     pub fn stage(&self, manifest: &PackageManifest) -> Result<StagingReceipt, PackageStagingError> {
-        self.stage_internal(manifest, &StagingAuthenticodeVerifier::Official)
-    }
-
-    /// Same operation with the sealed Authenticode injection seam.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed error when any bounded source, destination, parser or
-    /// verifier observation cannot be classified as a complete stage.
-    pub fn stage_with_verifier<V: AuthenticodeVerifier>(
-        &self,
-        manifest: &PackageManifest,
-        verifier: &V,
-    ) -> Result<StagingReceipt, PackageStagingError> {
-        self.stage_internal(manifest, &StagingAuthenticodeVerifier::Generic(verifier))
-    }
-
-    fn stage_internal(
-        &self,
-        manifest: &PackageManifest,
-        verifier: &StagingAuthenticodeVerifier<'_>,
-    ) -> Result<StagingReceipt, PackageStagingError> {
         let manifest = manifest.validate()?;
         let generation = validate_relative_text(&manifest.generation)?;
         let parent = self.retain_generation_parent(&generation)?;
@@ -1765,7 +1756,7 @@ impl PackageStager {
             directories: Vec::new(),
             files: Vec::with_capacity(manifest.files.len()),
         };
-        let result = self.copy_and_measure(&manifest, &generation_root, verifier, &mut created);
+        let result = self.copy_and_measure(&manifest, &generation_root, &mut created);
         match result {
             Ok(files) => {
                 let finalized = (|| {
@@ -2020,7 +2011,6 @@ impl PackageStager {
         manifest: &PackageManifest,
         expected_files: &[StagedFileReceipt],
     ) -> Result<Vec<StagedFileReceipt>, PackageStagingError> {
-        let verifier = StagingAuthenticodeVerifier::Official;
         let mut files = Vec::with_capacity(manifest.files.len());
         for spec in &manifest.files {
             let relative = validate_relative_text(&spec.relative_path)?;
@@ -2045,14 +2035,13 @@ impl PackageStager {
                 None
             };
             let authenticode = if spec.executable {
-                let evidence = verifier
-                    .verify(
-                        &destination,
-                        &mut destination_file,
-                        destination_identity,
-                        &destination_snapshot.sha256,
-                    )
-                    .map_err(PackageStagingError::Authenticode)?;
+                let evidence = verify_authenticode_handle(
+                    &destination,
+                    &mut destination_file,
+                    destination_identity,
+                    &destination_snapshot.sha256,
+                )
+                .map_err(PackageStagingError::Authenticode)?;
                 if evidence.verdict != AuthenticodeVerdict::Valid {
                     return Err(PackageStagingError::AuthenticodeRejected(evidence.verdict));
                 }
@@ -2086,7 +2075,6 @@ impl PackageStager {
         &self,
         manifest: &PackageManifest,
         destination_root: &Path,
-        verifier: &StagingAuthenticodeVerifier<'_>,
         created: &mut CreatedTree,
     ) -> Result<Vec<StagedFileReceipt>, PackageStagingError> {
         for entry in expected_tree(manifest)? {
@@ -2106,13 +2094,7 @@ impl PackageStager {
         let mut total = 0_u64;
         let mut files = Vec::with_capacity(manifest.files.len());
         for spec in &manifest.files {
-            files.push(self.copy_one_file(
-                spec,
-                destination_root,
-                verifier,
-                &mut total,
-                created,
-            )?);
+            files.push(self.copy_one_file(spec, destination_root, &mut total, created)?);
         }
         Ok(files)
     }
@@ -2121,7 +2103,6 @@ impl PackageStager {
         &self,
         spec: &PackageFileSpec,
         destination_root: &Path,
-        verifier: &StagingAuthenticodeVerifier<'_>,
         total: &mut u64,
         created: &mut CreatedTree,
     ) -> Result<StagedFileReceipt, PackageStagingError> {
@@ -2143,7 +2124,7 @@ impl PackageStager {
         let (mut destination_file, destination_identity, destination_readback) =
             copy_destination_bytes(&source_snapshot, &destination, spec.expected_size)?;
         let authenticode = if spec.executable {
-            let evidence = match verifier.verify(
+            let evidence = match verify_authenticode_handle(
                 &destination,
                 &mut destination_file,
                 destination_identity,
@@ -3791,11 +3772,42 @@ mod tests {
     }
 
     #[test]
+    fn package_staging_authenticode_dispatch_is_official_only() {
+        let source = include_str!("package_staging.rs");
+        let generic_stage_method = ["stage_", "with_verifier"].concat();
+        let generic_dispatch_type = ["Staging", "Authenticode", "Verifier"].concat();
+        let generic_variant = ["Generic", "("].concat();
+        assert!(!source.contains(&generic_stage_method));
+        assert!(!source.contains(&generic_dispatch_type));
+        assert!(!source.contains(&generic_variant));
+    }
+
+    #[test]
     fn malformed_authenticode_provider_buffers_fail_closed_before_der_slice() {
         let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr();
         assert!(!provider_chain_is_bounded(0, dangling));
         assert!(!provider_chain_is_bounded(1, std::ptr::null::<u8>()));
         assert!(provider_chain_is_bounded(1, dangling));
+        assert_eq!(
+            provider_countersigner_state(0, std::ptr::null::<u8>()),
+            ProviderCounterSignerState::Absent
+        );
+        assert_eq!(
+            provider_countersigner_state(0, dangling),
+            ProviderCounterSignerState::Absent
+        );
+        assert_eq!(
+            provider_countersigner_state(1, std::ptr::null::<u8>()),
+            ProviderCounterSignerState::Malformed
+        );
+        assert_eq!(
+            provider_countersigner_state(MAX_AUTHENTICODE_PROVIDER_CHAIN_ELEMENTS + 1, dangling,),
+            ProviderCounterSignerState::Malformed
+        );
+        assert_eq!(
+            provider_countersigner_state(1, dangling),
+            ProviderCounterSignerState::Present
+        );
         assert_eq!(provider_der_length(std::ptr::null(), 1), None);
         assert_eq!(provider_der_length(dangling, 0), None);
         assert_eq!(
