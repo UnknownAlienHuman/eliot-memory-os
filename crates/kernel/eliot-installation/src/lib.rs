@@ -183,8 +183,11 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 /// sealed supervision authority plan and Phase-B public provision receipt.
 /// Version 18 makes the exact EliotHost-to-EliotWatchdog service-object grant
 /// receipt mandatory for every applied Watchdog registration.
+/// Version 19 binds the exact profiled root hierarchy, shared immutable
+/// package contour, and per-installation canary-evidence root. Older wires
+/// cannot be interpreted as this effect set.
 /// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(18, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(19, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -1225,6 +1228,111 @@ impl RuntimeStateRoots {
             ("store_temp_root", &self.store_temp_root),
             ("watchdog_state_root", &self.watchdog_state_root),
         ]
+    }
+
+    fn installer_profile_root(&self) -> Result<PlatformHandle, InstallationError> {
+        match self.profile {
+            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+                PlatformHandle::new(joined_windows_path(
+                    self.profile_anchor_root.as_str(),
+                    "Eliot",
+                ))
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "runtime_state_roots.profile_root".to_owned(),
+                    reason: error.to_string(),
+                })
+            }
+            InstallationProfile::PortableDev => Ok(self.installation_root.clone()),
+        }
+    }
+
+    fn expected_staging_root(&self) -> Result<Option<PlatformHandle>, InstallationError> {
+        if self.profile == InstallationProfile::PortableDev {
+            return Ok(None);
+        }
+        let profile_root = self.installer_profile_root()?;
+        PlatformHandle::new(joined_windows_path(profile_root.as_str(), "packages"))
+            .map(Some)
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.staging_root".to_owned(),
+                reason: error.to_string(),
+            })
+    }
+
+    /// Derives the exact per-installation evidence root used by the live
+    /// canary harness. The path is derived from the already validated
+    /// installation root and is not an independently serialized authority.
+    pub fn canary_evidence_root(&self) -> Result<PlatformHandle, InstallationError> {
+        PlatformHandle::new(joined_windows_path(
+            self.installation_root.as_str(),
+            "canary-evidence",
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "runtime_state_roots.canary_evidence_root".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// Returns the exact one-leaf-at-a-time hierarchy admitted by the
+    /// installer. System/User plans include every missing shared and runtime
+    /// parent; PortableDev intentionally retains its pre-existing contour.
+    fn installer_root_hierarchy(
+        &self,
+    ) -> Result<Vec<(&'static str, PlatformHandle)>, InstallationError> {
+        let mut hierarchy = Vec::new();
+        if self.profile != InstallationProfile::PortableDev {
+            let profile_root = self.installer_profile_root()?;
+            let packages_root = self.expected_staging_root()?.ok_or_else(|| {
+                InstallationError::ProfileViolation(
+                    "profiled roots require a deterministic packages root".to_owned(),
+                )
+            })?;
+            let installations_root =
+                PlatformHandle::new(joined_windows_path(profile_root.as_str(), "installations"))
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "runtime_state_roots.installations_root".to_owned(),
+                        reason: error.to_string(),
+                    })?;
+            hierarchy.push(("profile_root", profile_root));
+            hierarchy.push(("packages_root", packages_root));
+            hierarchy.push(("installations_root", installations_root));
+        }
+        hierarchy.push(("installation_root", self.installation_root.clone()));
+        if self.profile != InstallationProfile::PortableDev {
+            hierarchy.push(("canary_evidence_root", self.canary_evidence_root()?));
+            let kernel_root = PlatformHandle::new(joined_windows_path(
+                self.installation_root.as_str(),
+                "kernel",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.kernel_root".to_owned(),
+                reason: error.to_string(),
+            })?;
+            let store_root = PlatformHandle::new(joined_windows_path(
+                self.installation_root.as_str(),
+                "store",
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_state_roots.store_root".to_owned(),
+                reason: error.to_string(),
+            })?;
+            hierarchy.push(("host_state_root", self.host_state_root.clone()));
+            hierarchy.push(("kernel_root", kernel_root));
+            hierarchy.push(("kernel_ors_root", self.kernel_ors_root.clone()));
+            hierarchy.push(("kernel_work_root", self.kernel_work_root.clone()));
+            hierarchy.push(("store_root", store_root));
+            hierarchy.push(("store_data_root", self.store_data_root.clone()));
+            hierarchy.push(("store_work_root", self.store_work_root.clone()));
+            hierarchy.push(("store_temp_root", self.store_temp_root.clone()));
+            hierarchy.push(("watchdog_state_root", self.watchdog_state_root.clone()));
+        } else {
+            hierarchy.extend(
+                self.root_fields()
+                    .into_iter()
+                    .map(|(field, root)| (field, root.clone())),
+            );
+        }
+        Ok(hierarchy)
     }
 
     fn reject_mutable_alias(
@@ -8520,6 +8628,18 @@ fn validate_package_binding(
     transaction_staging_root: &PlatformHandle,
     effects: &[InstallerEffectPlan],
 ) -> Result<(), InstallationError> {
+    let roots = &candidate_manifest.runtime_launch.runtime_state_roots;
+    if let Some(expected_staging_root) = roots.expected_staging_root()? {
+        if !same_windows_root(
+            transaction_staging_root.as_str(),
+            expected_staging_root.as_str(),
+        )? {
+            return Err(InstallationError::ProfileViolation(
+                "SystemService/UserMode staging_root must equal profile_anchor_root\\Eliot\\packages"
+                    .to_owned(),
+            ));
+        }
+    }
     let expected_manifest_digest = candidate_manifest_digest(candidate_manifest)?;
     let mut package_count = 0_u8;
     for effect in effects {
@@ -9649,10 +9769,40 @@ fn validate_installer_effects(
         }
         match effect {
             InstallerEffectPlan::CreateRoot { root, .. } => {
-                created_roots.insert(WindowsPathIdentity::parse_root(
-                    root.as_str(),
-                    "installer_effect.root",
-                )?);
+                let root_identity =
+                    WindowsPathIdentity::parse_root(root.as_str(), "installer_effect.root")?;
+                if !created_roots.insert(root_identity.clone()) {
+                    return Err(InstallationError::Duplicate {
+                        kind: "installer root effect".to_owned(),
+                        identity: root.as_str().to_owned(),
+                    });
+                }
+                if profile != InstallationProfile::PortableDev {
+                    let parent = root_identity
+                        .components
+                        .len()
+                        .checked_sub(1)
+                        .map(|length| WindowsPathIdentity {
+                            prefix: root_identity.prefix.clone(),
+                            components: root_identity.components[..length].to_vec(),
+                        })
+                        .ok_or(InstallationError::InvalidField {
+                            field: "installer_effect.root".to_owned(),
+                            reason: "root must have one exact parent component".to_owned(),
+                        })?;
+                    let profile_anchor = WindowsPathIdentity::parse_root(
+                        roots.profile_anchor_root.as_str(),
+                        "runtime_state_roots.profile_anchor_root",
+                    )?;
+                    if parent != profile_anchor
+                        && (!created_roots.contains(&parent) || !acl_roots.contains(&parent))
+                    {
+                        return Err(InstallationError::IncompleteObservation(
+                            "root and ACL effects must complete each parent before its child"
+                                .to_owned(),
+                        ));
+                    }
+                }
             }
             InstallerEffectPlan::ApplyAcl {
                 root, principals, ..
@@ -9678,10 +9828,19 @@ fn validate_installer_effects(
                         "runtime ACL differs from the exact profile principal set".to_owned(),
                     ));
                 }
-                acl_roots.insert(WindowsPathIdentity::parse_root(
-                    root.as_str(),
-                    "installer_effect.root",
-                )?);
+                let root_identity =
+                    WindowsPathIdentity::parse_root(root.as_str(), "installer_effect.root")?;
+                if !created_roots.contains(&root_identity) {
+                    return Err(InstallationError::IncompleteObservation(
+                        "ACL effects must follow their exact CreateRoot effect".to_owned(),
+                    ));
+                }
+                if !acl_roots.insert(root_identity) {
+                    return Err(InstallationError::Duplicate {
+                        kind: "installer ACL effect".to_owned(),
+                        identity: root.as_str().to_owned(),
+                    });
+                }
             }
             InstallerEffectPlan::StagePackage { .. } => {
                 if package_index.replace(index).is_some() {
@@ -9838,13 +9997,14 @@ fn validate_installer_effects(
     if planned_ids != effect_ids {
         return Err(InstallationError::IdentityConflict);
     }
-    let required_roots = std::iter::once(&roots.installation_root)
-        .chain(roots.root_fields().into_iter().map(|(_, root)| root))
-        .map(|root| WindowsPathIdentity::parse_root(root.as_str(), "required_root"))
+    let required_roots = roots
+        .installer_root_hierarchy()?
+        .into_iter()
+        .map(|(_, root)| WindowsPathIdentity::parse_root(root.as_str(), "required_root"))
         .collect::<Result<BTreeSet<_>, _>>()?;
     if created_roots != required_roots || acl_roots != required_roots {
         return Err(InstallationError::IncompleteObservation(
-            "transaction plan must create and ACL exactly the declared runtime roots".to_owned(),
+            "transaction plan must create and ACL exactly the declared root hierarchy".to_owned(),
         ));
     }
     let required_services = [InstallerServiceRole::Host, InstallerServiceRole::Watchdog]
@@ -11739,7 +11899,7 @@ impl InstallationTransaction {
 
     /// Advances from `Activating` to `ActiveVerified` using the exact
     /// read-only registry terminal proof. The proof is consumed and its
-    /// complete binding is persisted in the v18 transaction projection.
+    /// complete binding is persisted in the v19 transaction projection.
     pub fn advance_to_active_verified(
         &mut self,
         receipt: ActivationCommitReceipt,
@@ -11893,7 +12053,7 @@ impl InstallationTransactionWire {
     }
 }
 
-/// Decodes the canonical transaction JSON and classifies pre-v18 records as an
+/// Decodes the canonical transaction JSON and classifies pre-v19 records as an
 /// explicit migration requirement rather than synthesizing missing progress.
 pub fn decode_installation_transaction_json(
     bytes: &[u8],
@@ -11923,7 +12083,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v18 discriminator".to_owned(),
+            reason: "installation transaction predates the required v19 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -12252,6 +12412,26 @@ impl InstallationEffectRequest {
         self.plan.validate()?;
         validate_effect_profile(self.profile, &self.plan)?;
         approved_path(&self.installation_root, "effect.installation_root")?;
+        let installation_root = WindowsPathIdentity::parse_root(
+            self.installation_root.as_str(),
+            "effect.installation_root",
+        )?;
+        match self.profile {
+            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+                let Some(key) = installation_root.components.last() else {
+                    return Err(InstallationError::ProfileViolation(
+                        "profiled effect installation root is incomplete".to_owned(),
+                    ));
+                };
+                validate_installation_key(key)?;
+                if !installation_root.ends_with(&["eliot", "installations", key]) {
+                    return Err(InstallationError::ProfileViolation(
+                        "effect installation_root is not the exact profiled contour".to_owned(),
+                    ));
+                }
+            }
+            InstallationProfile::PortableDev => {}
+        }
         handle(&self.effect_id, "effect.effect_id")?;
         if self.effect_id != *self.plan.effect_id() {
             return Err(InstallationError::IdentityConflict);
@@ -18562,9 +18742,11 @@ mod tests {
         roots: &RuntimeStateRoots,
     ) -> (Vec<PlannedChange>, Vec<InstallerEffectPlan>) {
         let mut effects = Vec::new();
-        let declared = std::iter::once(&roots.installation_root)
-            .chain(roots.root_fields().into_iter().map(|(_, root)| root))
-            .cloned()
+        let declared = roots
+            .installer_root_hierarchy()
+            .unwrap_or_else(|_| unreachable!())
+            .into_iter()
+            .map(|(_, root)| root)
             .collect::<Vec<_>>();
         for (index, root) in declared.into_iter().enumerate() {
             effects.push(InstallerEffectPlan::CreateRoot {
@@ -19011,6 +19193,7 @@ mod tests {
         manifest.runtime_launch = descriptor;
 
         let (mut planned_changes, mut installer_effects) = installer_plan_parts(&roots);
+        let staging_root = must(roots.expected_staging_root()).unwrap_or_else(|| unreachable!());
         let package_manifest = must(PackageManifest::new("candidate", Vec::new()));
         let package_effect = InstallerEffectPlan::StagePackage {
             effect_id: test_handle("effect:package-stage"),
@@ -19021,14 +19204,14 @@ mod tests {
             },
             generation: manifest.generation.clone(),
             manifest: package_manifest.clone(),
-            staging_root: system_path("staging"),
+            staging_root: staging_root.clone(),
             expected_file_digests: Vec::new(),
             candidate_manifest_digest: must(candidate_manifest_digest(&manifest)),
             package_manifest_digest: must(PlatformHandle::new(package_manifest.canonical_digest())),
         };
         let package_change = PlannedChange {
             change_id: package_effect.effect_id().clone(),
-            target: system_path("staging"),
+            target: staging_root.clone(),
             precondition_refs: vec![test_handle("evidence:installer-precondition")],
             postcondition_refs: vec![test_handle("evidence:installer-postcondition")],
         };
@@ -19128,7 +19311,7 @@ mod tests {
             portable.request,
             portable.current_active_manifest,
             manifest,
-            system_path("staging"),
+            staging_root,
             planned_changes,
             ordered_effects,
             portable.minimum_store_available_bytes,
@@ -20070,7 +20253,10 @@ mod tests {
                     installation_key: Some(test_handle("b".repeat(64))),
                     generation: test_handle("candidate"),
                     source_root: test_handle(source_dir.path().to_string_lossy().into_owned()),
-                    staging_root: test_handle(source_dir.path().to_string_lossy().into_owned()),
+                    staging_root: test_handle(format!(
+                        r"{}\Eliot\packages",
+                        protected_program_data_root().unwrap().to_string_lossy()
+                    )),
                     minimum_store_available_bytes: 1,
                     recovery_command: test_handle("recovery:command"),
                 }));
@@ -21958,7 +22144,13 @@ mod tests {
             std::fs::write(root.join(executable_name), [])
                 .unwrap_or_else(|error| panic!("create service image: {error}"));
         }
-        let installation_root = test_handle(root.to_string_lossy().into_owned());
+        let installation_path = root
+            .join("Eliot")
+            .join("installations")
+            .join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        std::fs::create_dir_all(&installation_path)
+            .unwrap_or_else(|error| panic!("create installation fixture: {error}"));
+        let installation_root = test_handle(installation_path.to_string_lossy().into_owned());
         let precondition = must(InstallationEffectPrecondition::new(
             vec![test_handle("evidence:service-precondition")],
             None,
@@ -21994,7 +22186,10 @@ mod tests {
                     descriptor_digest: test_handle("b".repeat(64)),
                     installation_id: test_handle("installation:service"),
                     plan_generation: 7,
-                    host_state_root: test_handle(root.join("host").to_string_lossy().into_owned()),
+                    host_state_root: test_handle(joined_windows_path(
+                        installation_root.as_str(),
+                        "host",
+                    )),
                 }),
                 registration_nonce: Some(test_handle("c".repeat(64))),
             };
@@ -22012,7 +22207,7 @@ mod tests {
             ELIOT_HOST_SERVICE_NAME,
             "eliot-host.exe",
         );
-        let host_root = root.join("host").to_string_lossy().into_owned();
+        let host_root = joined_windows_path(installation_root.as_str(), "host");
         assert_eq!(
             host_argv,
             vec![
@@ -22048,7 +22243,7 @@ mod tests {
                 "--tx-plan-generation".to_owned(),
                 "7".to_owned(),
                 "--host-state-root".to_owned(),
-                root.join("host").to_string_lossy().into_owned(),
+                joined_windows_path(installation_root.as_str(), "host"),
                 "--registration-nonce".to_owned(),
                 "c".repeat(64),
             ]
@@ -23263,7 +23458,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_transaction_json_requires_explicit_migration_to_v18() {
+    fn v8_transaction_json_requires_explicit_migration_to_v19() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -23277,7 +23472,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 18.0.0")
+                if reason.contains("requires explicit migration to 19.0.0")
         ));
     }
 
@@ -23326,7 +23521,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("wire 9.0.0 requires explicit migration to 18.0.0")
+                if reason.contains("wire 9.0.0 requires explicit migration to 19.0.0")
         ));
     }
 
@@ -23346,7 +23541,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_transaction_json_requires_explicit_migration_to_v18() {
+    fn v10_transaction_json_requires_explicit_migration_to_v19() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -23372,12 +23567,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 10.0.0 requires explicit migration to 18.0.0")
+                if reason.contains("wire 10.0.0 requires explicit migration to 19.0.0")
         ));
     }
 
     #[test]
-    fn v13_transaction_json_requires_explicit_migration_to_v18() {
+    fn v13_transaction_json_requires_explicit_migration_to_v19() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -23388,12 +23583,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 13.0.0 requires explicit migration to 18.0.0")
+                if reason.contains("wire 13.0.0 requires explicit migration to 19.0.0")
         ));
     }
 
     #[test]
-    fn v14_transaction_json_requires_explicit_migration_to_v18() {
+    fn v14_transaction_json_requires_explicit_migration_to_v19() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -23404,12 +23599,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 14.0.0 requires explicit migration to 18.0.0")
+                if reason.contains("wire 14.0.0 requires explicit migration to 19.0.0")
         ));
     }
 
     #[test]
-    fn v15_transaction_json_requires_explicit_migration_to_v18() {
+    fn v15_transaction_json_requires_explicit_migration_to_v19() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         legacy["transaction_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(15, 0, 0)));
@@ -23417,12 +23612,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 15.0.0 requires explicit migration to 18.0.0")
+                if reason.contains("wire 15.0.0 requires explicit migration to 19.0.0")
         ));
     }
 
     #[test]
-    fn v16_transaction_json_requires_explicit_migration_to_v18() {
+    fn v16_transaction_json_requires_explicit_migration_to_v19() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         legacy["transaction_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(16, 0, 0)));
@@ -23430,12 +23625,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 16.0.0") && reason.contains("18.0.0")
+                if reason.contains("wire 16.0.0") && reason.contains("19.0.0")
         ));
     }
 
     #[test]
-    fn v17_transaction_json_requires_explicit_migration_to_v18() {
+    fn v17_transaction_json_requires_explicit_migration_to_v19() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         legacy["transaction_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(17, 0, 0)));
@@ -23452,7 +23647,23 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 17.0.0") && reason.contains("18.0.0")
+                if reason.contains("wire 17.0.0") && reason.contains("19.0.0")
+        ));
+    }
+
+    #[test]
+    fn v18_transaction_json_requires_explicit_migration_to_v19() {
+        let mut legacy = must(serde_json::to_value(planned_transaction()));
+        legacy["transaction_wire_version"] =
+            must(serde_json::to_value(ContractVersion::new(18, 0, 0)));
+        let bytes = must(serde_json::to_vec(&legacy));
+        let Err(error) = decode_installation_transaction_json(&bytes) else {
+            panic!("v18 transaction must require migration after the root-contour split");
+        };
+        assert!(matches!(
+            error,
+            InstallationError::MigrationRequired { reason }
+                if reason.contains("wire 18.0.0") && reason.contains("19.0.0")
         ));
     }
 

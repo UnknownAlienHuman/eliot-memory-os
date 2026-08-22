@@ -808,6 +808,17 @@ impl GenerationPackagePlanner {
                 )?
             }
         };
+        if let Some(expected_staging_root) = roots.expected_staging_root()? {
+            if !crate::same_windows_root(
+                input.staging_root.as_str(),
+                expected_staging_root.as_str(),
+            )? {
+                return Err(InstallationError::ProfileViolation(
+                    "SystemService/UserMode staging_root must equal profile_anchor_root\\Eliot\\packages"
+                        .to_owned(),
+                ));
+            }
+        }
         let source =
             TrustedSourceBundle::open(Path::new(input.source_root.as_str())).map_err(|error| {
                 InstallationError::Platform(format!("trusted source open failed: {error}"))
@@ -1160,9 +1171,7 @@ impl GenerationPackagePlanner {
                 reason: error.to_string(),
             })?;
         let mut effects = Vec::new();
-        for (field, root) in std::iter::once(("installation_root", &roots.installation_root))
-            .chain(roots.root_fields())
-        {
+        for (field, root) in roots.installer_root_hierarchy()? {
             let create_id =
                 PlatformHandle::new(format!("effect:create:{field}")).map_err(|error| {
                     InstallationError::InvalidField {
@@ -1194,7 +1203,7 @@ impl GenerationPackagePlanner {
             };
             effects.push(InstallerEffectPlan::ApplyAcl {
                 effect_id: acl_id,
-                root: root.clone(),
+                root,
                 principals,
             });
         }
@@ -2032,9 +2041,7 @@ mod tests {
     ) -> (Vec<PlannedChange>, Vec<InstallerEffectPlan>) {
         let mut changes = Vec::new();
         let mut effects = Vec::new();
-        for (field, root) in std::iter::once(("installation_root", &roots.installation_root))
-            .chain(roots.root_fields().into_iter().map(|(f, r)| (f, r)))
-        {
+        for (field, root) in roots.installer_root_hierarchy().unwrap() {
             let eff = InstallerEffectPlan::CreateRoot {
                 effect_id: h(format!("effect:create:{field}")),
                 root: root.clone(),
@@ -2734,11 +2741,134 @@ mod tests {
             .to_string_lossy()
             .into_owned());
         input.installation_key = Some(h("a".repeat(64)));
+        input.staging_root = h(format!(
+            r"{}\Eliot\packages",
+            input.profile_anchor_root.as_str()
+        ));
         let transaction = GenerationPackagePlanner::plan(input)
             .expect("trusted SystemService generation planner should build");
         assert!(candidate_has_nonplaceholder_package_digests(
             &transaction.candidate_manifest
         ));
+        let roots = &transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots;
+        let hierarchy = roots
+            .installer_root_hierarchy()
+            .expect("SystemService root hierarchy must derive");
+        let package_index = transaction
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::StagePackage { .. }))
+            .expect("package staging effect");
+        assert_eq!(
+            hierarchy.len() * 2,
+            package_index,
+            "every exact root CreateRoot+ApplyAcl pair must precede StagePackage"
+        );
+        let expected_acl = vec![
+            InstallerAclPrincipal::Administrators,
+            InstallerAclPrincipal::LocalService,
+            InstallerAclPrincipal::LocalSystem,
+        ];
+        for (index, (field, root)) in hierarchy.iter().enumerate() {
+            let create = &transaction.installer_effects[index * 2];
+            let acl = &transaction.installer_effects[index * 2 + 1];
+            assert!(
+                matches!(
+                    create,
+                    InstallerEffectPlan::CreateRoot { root: actual, .. }
+                        if actual == root
+                ),
+                "CreateRoot must bind exact {field}"
+            );
+            assert!(
+                matches!(
+                    acl,
+                    InstallerEffectPlan::ApplyAcl {
+                        root: actual,
+                        principals,
+                        ..
+                    } if actual == root && principals == &expected_acl
+                ),
+                "ApplyAcl must bind exact protected {field}"
+            );
+        }
+        let canary_root = roots
+            .canary_evidence_root()
+            .expect("canary evidence root must derive");
+        assert!(canary_root.as_str().ends_with(r"\canary-evidence"));
+        let canary_index = hierarchy
+            .iter()
+            .position(|(field, root)| *field == "canary_evidence_root" && *root == canary_root)
+            .expect("exact canary evidence root in hierarchy");
+        assert!(canary_index < hierarchy.len());
+
+        let mut missing_canary = transaction.clone();
+        missing_canary
+            .installer_effects
+            .retain(|effect| match effect {
+                InstallerEffectPlan::CreateRoot { root, .. }
+                | InstallerEffectPlan::ApplyAcl { root, .. } => root != &canary_root,
+                _ => true,
+            });
+        missing_canary
+            .planned_changes
+            .retain(|change| change.target != canary_root);
+        assert!(
+            crate::validate_installer_effects(
+                missing_canary.profile,
+                &missing_canary
+                    .candidate_manifest
+                    .runtime_launch
+                    .runtime_state_roots,
+                &missing_canary
+                    .candidate_manifest
+                    .runtime_launch
+                    .store_credential_target,
+                &missing_canary.planned_changes,
+                &missing_canary.installer_effects,
+            )
+            .is_err(),
+            "omitting canary-evidence must fail closed"
+        );
+
+        let substituted_canary = h(format!(r"{}-sibling", canary_root.as_str()));
+        let mut substituted = transaction.clone();
+        for effect in &mut substituted.installer_effects {
+            match effect {
+                InstallerEffectPlan::CreateRoot { root, .. }
+                | InstallerEffectPlan::ApplyAcl { root, .. }
+                    if root == &canary_root =>
+                {
+                    *root = substituted_canary.clone()
+                }
+                _ => {}
+            }
+        }
+        for change in &mut substituted.planned_changes {
+            if change.target == canary_root {
+                change.target = substituted_canary.clone();
+            }
+        }
+        assert!(
+            crate::validate_installer_effects(
+                substituted.profile,
+                &substituted
+                    .candidate_manifest
+                    .runtime_launch
+                    .runtime_state_roots,
+                &substituted
+                    .candidate_manifest
+                    .runtime_launch
+                    .store_credential_target,
+                &substituted.planned_changes,
+                &substituted.installer_effects,
+            )
+            .is_err(),
+            "substituting canary-evidence must fail closed"
+        );
         let host_start = transaction
             .installer_effects
             .iter()

@@ -201,7 +201,33 @@ impl WindowsInstallerRootExecutor {
                     return Err(InstallerRootError::InvalidPath);
                 }
                 let expected = profile_base.join("Eliot");
-                if !windows_paths_equal(&request.installation_root, &expected) {
+                let installations = expected.join("installations");
+                let installation_parent = request.installation_root.parent();
+                let installation_key = request
+                    .installation_root
+                    .file_name()
+                    .and_then(|name| name.to_str());
+                if installation_parent
+                    .is_none_or(|parent| !windows_paths_equal(parent, &installations))
+                    || installation_key.is_none_or(|key| {
+                        key.len() != 64
+                            || !key
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                    })
+                    || !windows_path_is_within(&request.root, &expected)
+                {
+                    return Err(InstallerRootError::InvalidPath);
+                }
+                let root_is_profile = windows_paths_equal(&request.root, &expected);
+                let root_is_installations = windows_paths_equal(&request.root, &installations);
+                let packages = expected.join("packages");
+                let root_is_packages = windows_paths_equal(&request.root, &packages);
+                if !root_is_profile
+                    && !root_is_installations
+                    && !root_is_packages
+                    && !windows_path_is_within(&request.root, &request.installation_root)
+                {
                     return Err(InstallerRootError::InvalidPath);
                 }
                 expected
@@ -1511,28 +1537,45 @@ mod primitive_tests {
         }
 
         fn user_spec(&self, leaf: &str) -> InstallerRootPrimitiveSpec {
+            let profile_root = self.user.join("Eliot");
+            let installation_root = profile_root
+                .join("installations")
+                .join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
             InstallerRootPrimitiveSpec {
-                root: self.user.join("Eliot").join(leaf),
-                installation_root: self.user.join("Eliot"),
+                root: installation_root.join(leaf),
+                installation_root,
                 profile_anchor: self.user.clone(),
                 profile: InstallerRootProfile::UserMode,
             }
         }
 
         fn system_spec(&self, leaf: &str) -> InstallerRootPrimitiveSpec {
+            let profile_root = self.system.join("Eliot");
+            let installation_root = profile_root
+                .join("installations")
+                .join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
             InstallerRootPrimitiveSpec {
-                root: self.system.join("Eliot").join(leaf),
-                installation_root: self.system.join("Eliot"),
+                root: installation_root.join(leaf),
+                installation_root,
                 profile_anchor: self.system.clone(),
                 profile: InstallerRootProfile::SystemService,
             }
         }
 
         fn ensure_user_parent(&self) {
-            let created =
-                create_directory_atomic(InstallerRootProfile::UserMode, &self.user.join("Eliot"))
+            let profile_root = self.user.join("Eliot");
+            let installation_root = profile_root
+                .join("installations")
+                .join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+            for path in [
+                profile_root,
+                self.user.join("Eliot").join("installations"),
+                installation_root,
+            ] {
+                let created = create_directory_atomic(InstallerRootProfile::UserMode, &path)
                     .unwrap_or_else(|error| panic!("failed to create user parent: {error}"));
-            assert!(created);
+                assert!(created);
+            }
         }
     }
 
@@ -1743,7 +1786,7 @@ mod primitive_tests {
             Err(InstallerRootError::InvalidPath)
         );
 
-        let junction_root = fixture.user.join("Eliot").join("read-junction");
+        let junction_root = fixture.user_spec("read-junction").root;
         let junction_target = fixture.root.join("read-junction-target");
         std::fs::create_dir(&junction_target)
             .unwrap_or_else(|error| panic!("junction target create: {error}"));
@@ -1812,6 +1855,133 @@ mod primitive_tests {
             Err(InstallerRootError::NotElevated),
             "read-only inspection must not inherit the installer mutation elevation gate"
         );
+    }
+
+    #[test]
+    fn profiled_installation_root_is_one_direct_hex_child_of_installations() {
+        let fixture = Fixture::new();
+        fixture.ensure_user_parent();
+        let primitive = fixture.primitive(true);
+        let spec = fixture.user_spec("state");
+
+        let mut nested = spec.clone();
+        nested.installation_root = spec.installation_root.join("nested");
+        nested.root = nested.installation_root.join("state");
+        assert_eq!(
+            primitive.inspect(&nested),
+            Err(InstallerRootError::InvalidPath)
+        );
+
+        let mut short = spec.clone();
+        short.installation_root = spec
+            .installation_root
+            .parent()
+            .unwrap_or_else(|| unreachable!())
+            .join("abc");
+        short.root = short.installation_root.join("state");
+        assert_eq!(
+            primitive.inspect(&short),
+            Err(InstallerRootError::InvalidPath)
+        );
+
+        let mut non_hex = spec.clone();
+        non_hex.installation_root = spec
+            .installation_root
+            .parent()
+            .unwrap_or_else(|| unreachable!())
+            .join(format!("{}g", "a".repeat(63)));
+        non_hex.root = non_hex.installation_root.join("state");
+        assert_eq!(
+            primitive.inspect(&non_hex),
+            Err(InstallerRootError::InvalidPath)
+        );
+
+        let mut uppercase = spec.clone();
+        uppercase.installation_root = spec
+            .installation_root
+            .parent()
+            .unwrap_or_else(|| unreachable!())
+            .join("ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789");
+        uppercase.root = uppercase.installation_root.join("state");
+        assert_eq!(
+            primitive.inspect(&uppercase),
+            Err(InstallerRootError::InvalidPath)
+        );
+
+        let mut sibling = spec;
+        sibling.installation_root = sibling
+            .profile_anchor
+            .join("Eliot")
+            .join("installations-sibling")
+            .join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        sibling.root = sibling.installation_root.join("state");
+        assert_eq!(
+            primitive.inspect(&sibling),
+            Err(InstallerRootError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn fresh_user_profile_hierarchy_is_created_leaf_by_leaf_in_parent_order() {
+        let fixture = Fixture::new();
+        let primitive = fixture.primitive(true);
+        let profile_root = fixture.user.join("Eliot");
+        let packages_root = profile_root.join("packages");
+        let installations_dir = profile_root.join("installations");
+        let installation_root = installations_dir
+            .join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let kernel_root = installation_root.join("kernel");
+        let store_root = installation_root.join("store");
+        let roots = [
+            profile_root.clone(),
+            packages_root.clone(),
+            installations_dir.clone(),
+            installation_root.clone(),
+            installation_root.join("canary-evidence"),
+            installation_root.join("host"),
+            kernel_root.clone(),
+            kernel_root.join("state"),
+            kernel_root.join("work"),
+            store_root.clone(),
+            store_root.join("data"),
+            store_root.join("work"),
+            store_root.join("tmp"),
+            installation_root.join("watchdog"),
+        ];
+        let missing_parent_spec = InstallerRootPrimitiveSpec {
+            root: packages_root.clone(),
+            installation_root: installation_root.clone(),
+            profile_anchor: fixture.user.clone(),
+            profile: InstallerRootProfile::UserMode,
+        };
+        assert_eq!(
+            primitive.inspect(&missing_parent_spec),
+            Err(InstallerRootError::MissingParent),
+            "a child must not synthesize its missing profile parent"
+        );
+
+        for root in roots {
+            let spec = InstallerRootPrimitiveSpec {
+                root: root.clone(),
+                installation_root: installation_root.clone(),
+                profile_anchor: fixture.user.clone(),
+                profile: InstallerRootProfile::UserMode,
+            };
+            let snapshot = absent(&primitive, &spec);
+            let created = primitive.create(&spec, &snapshot).unwrap_or_else(|error| {
+                panic!("fresh hierarchy create {}: {error}", root.display())
+            });
+            assert_eq!(created.disposition, InstallerRootCreateDisposition::Created);
+            assert!(
+                root.is_dir(),
+                "one leaf must be created: {}",
+                root.display()
+            );
+            assert!(matches!(
+                primitive.inspect(&spec),
+                Ok(InstallerRootPrimitiveObservation::Matching(_))
+            ));
+        }
     }
 
     #[test]
