@@ -18,7 +18,7 @@
 | Kernel and eliotd | `bins/eliot-kernel`, `bins/eliotd`, `crates/kernel/eliot-kernel-service` | Durable activation, physical process authority, supervision signing/reconciliation and authenticated ProbeReady are integrated. |
 | Store | `bins/eliot-store-surreal`, `crates/storage/eliot-store-surreal-adapter` | Canonical runtime roots, provider process/socket identity and recovery contour are integrated. |
 | Watchdog and runtime status | `bins/eliot-watchdog`, `workspace/tools/eliot-runtime-status` | Installer-owned registration, verified ORS/publication consumption and fail-closed status projection are integrated. |
-| Live canary | `workspace/tools/eliot-live-canary` | Pulses 1–4 and a source-complete Pulse 5 candidate are integrated; Pulse 5 still has the P1s below and no live machine evidence exists. |
+| Live canary | `workspace/tools/eliot-live-canary` | Source paths for Pulses 1–5 are integrated. Pulse 5 requires a fresh Store/Host/Kernel/readiness/supervision contour and owns bounded post-Stop cleanup. No live machine evidence exists yet. |
 
 ## Integrated milestone lineage
 
@@ -29,22 +29,18 @@
 - `075fadd` — installer-owned Watchdog service-control grant.
 - `334bf60` — bounded SCM Host stop/start Pulse 5 candidate.
 - `7dcdf43` — first-install profiled root hierarchy, exact staging root and protected `canary-evidence` root.
+- `facc3c0` — Pulse 5 fresh Store proof and stop-owned single-start reconciliation correction.
 
 ## Verified in focused source gates
 
-- Pulse 5 candidate: all-target check; canary 14/14; Host-state 104/104; focused Windows enabled-Administrators read-only test; formatting/diff; touched-crate no-deps Clippy.
+- Pulse 5 foundation: all-target check; canary 14/14; Host-state 104/104; focused Windows enabled-Administrators read-only test; formatting/diff; touched-crate no-deps Clippy.
+- Pulse 5 correction: canary all-target check; 17/17 tests; strict no-deps Clippy; formatting and diff checks.
 - First-install roots: focused all-target checks; 12 Windows installer-root primitive tests; SystemService planner test; v18-to-v19 migration test; formatting/diff.
 - Earlier integrated milestones carry their own focused test and strict lint evidence in Git history.
 
 These checks prove source behavior only. They do not prove live service installation or `RUNTIME_LIVE_CANARY`.
 
 ## Mandatory remaining work
-
-### P1 — Pulse 5 acceptance correction
-
-The current Pulse 5 candidate proves a fresh Host epoch/process nonce, fresh Kernel activation nonce, readiness, ORS evidence and eliotd return. It does not yet require a fresh post-restart Store process/generation/fence/request contour. Add a production-bound stale-Store negative and reject a post-restart contour that retained predecessor Store authority.
-
-The current error path can also return after SCM has confirmed Host stop but before the single Host start. Add a bounded stop-owned cleanup/reconciliation disposition so an observation failure does not silently strand the canary Host while still forbidding blind resend after `EffectUnknown`.
 
 ### Production canary invocation and evidence
 
@@ -75,4 +71,4 @@ Before deletion, recompute reachability against this branch, exclude every live 
 
 ## Exact restart point
 
-Resume from `origin/codex/runtime-live-v3-integration-staging`. First fix and audit the two Pulse 5 P1s, then wire the canonical canary invocation/evidence root. Only after those source gates pass should the signed-bundle decision and live Pulses 1–5 begin.
+Resume from `origin/codex/runtime-live-v3-integration-staging`. Wire the canonical manifest-bound canary invocation/evidence root through `eliot.exe`, then complete the signed-bundle decision. Only after those source gates pass should live Pulses 1–5 begin.
