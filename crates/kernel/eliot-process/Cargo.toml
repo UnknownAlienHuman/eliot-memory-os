@@ -8,6 +8,7 @@ description = "Provider-neutral, Kernel-authorized ProcessExecutor contract"
 
 [dependencies]
 blake3.workspace = true
+eliot-contracts.workspace = true
 eliot-instrument-api.workspace = true
 eliot-platform.workspace = true
 schemars.workspace = true

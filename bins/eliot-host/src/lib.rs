@@ -653,11 +653,14 @@ use eliot_platform_windows::{
 };
 
 #[cfg(windows)]
-const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 4] = [
+const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 7] = [
     "ELIOT_KERNEL_CONTROL_PIPE",
     "ELIOT_HOST_PROCESS_ID",
     "ELIOT_HOST_PROCESS_START",
     "ELIOT_HOST_PROCESS_IMAGE",
+    "ELIOT_KERNEL_RECEIPT_ROOT",
+    "ELIOT_KERNEL_ORS_ROOT",
+    "ELIOT_RUNTIME_STATE_ROOTS_DIGEST",
 ];
 
 #[cfg(windows)]
@@ -3481,6 +3484,7 @@ impl HostJobBranches {
         config_path: &Path,
         job_identity: &JobObjectIdentity,
         kernel_launch_binding: Option<&KernelLaunchBinding>,
+        receipt_binding: Option<(&Path, &Path, &PlatformHandle)>,
     ) -> Vec<(OsString, OsString)>
     where
         I: IntoIterator<Item = (OsString, OsString)>,
@@ -3553,6 +3557,22 @@ impl HostJobBranches {
                     OsString::from(&binding.host_process.image_path),
                 ),
             ]);
+            if let Some((receipt_root, ors_root, roots_digest)) = receipt_binding {
+                environment.extend([
+                    (
+                        OsString::from(KERNEL_BOOTSTRAP_ENVIRONMENT[4]),
+                        receipt_root.as_os_str().to_owned(),
+                    ),
+                    (
+                        OsString::from(KERNEL_BOOTSTRAP_ENVIRONMENT[5]),
+                        ors_root.as_os_str().to_owned(),
+                    ),
+                    (
+                        OsString::from(KERNEL_BOOTSTRAP_ENVIRONMENT[6]),
+                        OsString::from(roots_digest.as_str()),
+                    ),
+                ]);
+            }
         }
         environment
     }
@@ -3565,6 +3585,7 @@ impl HostJobBranches {
         config_path: &Path,
         job_identity: &JobObjectIdentity,
         kernel_launch_binding: Option<&KernelLaunchBinding>,
+        receipt_binding: Option<(&Path, &Path, &PlatformHandle)>,
     ) -> Vec<(OsString, OsString)> {
         Self::environment_from(
             std::env::vars_os(),
@@ -3575,6 +3596,7 @@ impl HostJobBranches {
             config_path,
             job_identity,
             kernel_launch_binding,
+            receipt_binding,
         )
     }
 
@@ -5004,6 +5026,7 @@ impl HostJobBranches {
         arguments: &[eliot_platform::PlatformHandle],
         working_directory: &Path,
         kernel_launch_binding: Option<&KernelLaunchBinding>,
+        receipt_binding: Option<(&Path, &Path, &PlatformHandle)>,
     ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
         if executable_lease.path() != executable || config_lease.path() != config_path {
             return Err(HostError::ProcessContour(
@@ -5068,6 +5091,7 @@ impl HostJobBranches {
                 config_path,
                 identity,
                 kernel_launch_binding,
+                receipt_binding,
             ),
         )
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -5338,6 +5362,7 @@ impl HostJobBranches {
                     &launch.store_bridge_arguments,
                     &store_working_directory,
                     None,
+                    None,
                 )
             },
             |store| -> Result<(), StoreLivenessEvidence> {
@@ -5383,6 +5408,11 @@ impl HostJobBranches {
                     &launch.kernel_arguments,
                     &kernel_working_directory,
                     self.kernel_launch_binding.as_ref(),
+                    Some((
+                        Path::new(launch.runtime_state_roots.host_state_root.as_str()),
+                        Path::new(launch.runtime_state_roots.kernel_ors_root.as_str()),
+                        &launch.runtime_state_roots.roots_digest,
+                    )),
                 )
             },
             |mut store| {
@@ -5558,6 +5588,11 @@ impl HostJobBranches {
             &launch.kernel_arguments,
             &kernel_working_directory,
             self.kernel_launch_binding.as_ref(),
+            Some((
+                Path::new(launch.runtime_state_roots.host_state_root.as_str()),
+                Path::new(launch.runtime_state_roots.kernel_ors_root.as_str()),
+                &launch.runtime_state_roots.roots_digest,
+            )),
         )?;
         Ok(child)
     }
@@ -5664,6 +5699,7 @@ impl HostJobBranches {
             host,
             &launch.store_bridge_arguments,
             &store_working_directory,
+            None,
             None,
         )?;
         Ok(child)
@@ -20357,6 +20393,14 @@ mod tests {
             None,
         )
         .expect("host epoch");
+        let roots_digest = PlatformHandle::new("a".repeat(64)).expect("roots digest");
+        let receipt_binding = kernel.map(|_| {
+            (
+                Path::new(r"C:\\ProgramData\\Eliot"),
+                Path::new(r"C:\\ProgramData\\Eliot\\kernel\\state"),
+                &roots_digest,
+            )
+        });
         HostJobBranches::environment_from(
             [
                 (OsString::from("Path"), OsString::from(r"C:\\Windows")),
@@ -20377,6 +20421,26 @@ mod tests {
                     OsString::from("ambient.exe"),
                 ),
                 (
+                    OsString::from("ELIOT_KERNEL_RECEIPT_ROOT"),
+                    OsString::from(r"C:\\ambient\\host"),
+                ),
+                (
+                    OsString::from("ELIOT_KERNEL_ORS_ROOT"),
+                    OsString::from(r"C:\\ambient\\ors"),
+                ),
+                (
+                    OsString::from("ELIOT_RUNTIME_STATE_ROOTS_DIGEST"),
+                    OsString::from("b".repeat(64)),
+                ),
+                (
+                    OsString::from("ELIOT_HOST_INSTALLATION"),
+                    OsString::from("ambient-installation"),
+                ),
+                (
+                    OsString::from("ELIOT_APPROVED_GENERATION"),
+                    OsString::from("ambient-generation"),
+                ),
+                (
                     OsString::from("ELIOT_ACTIVATION_NONCE"),
                     OsString::from("must-not-cross-process-boundary"),
                 ),
@@ -20388,6 +20452,7 @@ mod tests {
             Path::new(r"C:\\eliot\\config.json"),
             &JobObjectIdentity::new(r"Local\Eliot-Host-Test").expect("job"),
             kernel,
+            receipt_binding,
         )
         .into_iter()
         .map(|(key, value)| {
@@ -20489,6 +20554,34 @@ mod tests {
                 .get("ELIOT_HOST_PROCESS_IMAGE")
                 .map(String::as_str),
             Some(r"C:\\eliot\\eliot-host.exe")
+        );
+        assert_eq!(
+            environment
+                .get("ELIOT_KERNEL_RECEIPT_ROOT")
+                .map(String::as_str),
+            Some(r"C:\\ProgramData\\Eliot")
+        );
+        assert_eq!(
+            environment.get("ELIOT_KERNEL_ORS_ROOT").map(String::as_str),
+            Some(r"C:\\ProgramData\\Eliot\\kernel\\state")
+        );
+        assert_eq!(
+            environment
+                .get("ELIOT_RUNTIME_STATE_ROOTS_DIGEST")
+                .map(String::as_str),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            environment
+                .get("ELIOT_HOST_INSTALLATION")
+                .map(String::as_str),
+            Some("launch-test-installation")
+        );
+        assert_eq!(
+            environment
+                .get("ELIOT_APPROVED_GENERATION")
+                .map(String::as_str),
+            Some("generation")
         );
         assert!(!environment.contains_key("ELIOT_ACTIVATION_NONCE"));
     }

@@ -2,7 +2,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use eliot_kernel::{AuthorityDescriptorContour, KernelBuildError, KernelComposition, KernelConfig};
+#[cfg(windows)]
+use eliot_kernel::SupervisionLeaseReceiptVerifierConfig;
+use eliot_kernel::{
+    AuthorityDescriptorContour, EliotdReceiptRootBinding, KernelBuildError, KernelComposition,
+    KernelConfig,
+};
 use eliot_kernel_service::{EliotdLaunchDescriptor, HostStoreBootstrapRequirement};
 #[cfg(windows)]
 use eliot_kernel_service::{
@@ -28,8 +33,28 @@ use eliot_contracts::sha256_hex;
 #[cfg(windows)]
 use eliot_platform_windows::{
     NamedPipePeerProcessBinding, ProtectedRuntimePathLease, UserOwnedPathLease, UserOwnedRootLease,
-    current_process_named_pipe_expectation, observe_named_pipe_peer_process,
+    current_process_named_pipe_expectation, observe_named_pipe_peer_process, windows_paths_equal,
 };
+#[cfg(windows)]
+use eliot_runtime_contracts::{SupervisionLeaseVerificationContext, SupervisionTrustAnchor};
+
+#[cfg(windows)]
+const WATCHDOG_ADMISSION_FILE_NAME: &str = "watchdog-admission.json";
+#[cfg(windows)]
+const WATCHDOG_ADMISSION_SCHEMA: &str = "eliot.watchdog-admission.v1";
+#[cfg(windows)]
+const WATCHDOG_ADMISSION_LIMIT: u64 = 1024 * 1024;
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KernelReceiptAdmissionConfig {
+    schema: String,
+    installation_id: String,
+    approved_generation: String,
+    trust_anchor: SupervisionTrustAnchor,
+    context: SupervisionLeaseVerificationContext,
+}
 
 #[cfg(windows)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +63,12 @@ struct KernelStartupBinding {
     host_process_id: u32,
     host_process_start: u64,
     host_process_image: String,
+    receipt_root: PathBuf,
+    kernel_ors_root: PathBuf,
+    runtime_state_roots_digest: String,
+    generation_config_digest: String,
+    installation_id: String,
+    approved_generation: String,
 }
 
 #[cfg(windows)]
@@ -48,14 +79,27 @@ impl KernelStartupBinding {
             std::env::var("ELIOT_HOST_PROCESS_ID").ok(),
             std::env::var("ELIOT_HOST_PROCESS_START").ok(),
             std::env::var("ELIOT_HOST_PROCESS_IMAGE").ok(),
+            std::env::var("ELIOT_KERNEL_RECEIPT_ROOT").ok(),
+            std::env::var("ELIOT_KERNEL_ORS_ROOT").ok(),
+            std::env::var("ELIOT_RUNTIME_STATE_ROOTS_DIGEST").ok(),
+            std::env::var("ELIOT_GENERATION_CONFIG_DIGEST").ok(),
+            std::env::var("ELIOT_HOST_INSTALLATION").ok(),
+            std::env::var("ELIOT_APPROVED_GENERATION").ok(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn parse(
         control_pipe: Option<String>,
         host_process_id: Option<String>,
         host_process_start: Option<String>,
         host_process_image: Option<String>,
+        receipt_root: Option<String>,
+        kernel_ors_root: Option<String>,
+        runtime_state_roots_digest: Option<String>,
+        generation_config_digest: Option<String>,
+        installation_id: Option<String>,
+        approved_generation: Option<String>,
     ) -> Result<Self, String> {
         let control_pipe = control_pipe
             .filter(|pipe| pipe == KERNEL_CONTROL_PIPE)
@@ -84,11 +128,60 @@ impl KernelStartupBinding {
             .ok_or_else(|| {
                 "Host launch context did not inject a canonical Host process image".to_owned()
             })?;
+        let exact_root = |value: Option<String>, label: &str| {
+            value
+                .map(PathBuf::from)
+                .filter(|root| {
+                    root.is_absolute()
+                        && !root.as_os_str().is_empty()
+                        && !root.to_string_lossy().chars().any(char::is_control)
+                })
+                .ok_or_else(|| format!("Host launch context did not inject the exact {label}"))
+        };
+        let receipt_root = exact_root(receipt_root, "Kernel receipt root")?;
+        let kernel_ors_root = exact_root(kernel_ors_root, "Kernel ORS root")?;
+        let runtime_state_roots_digest = runtime_state_roots_digest
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| {
+                "Host launch context did not inject the RuntimeStateRoots digest".to_owned()
+            })?;
+        let generation_config_digest = generation_config_digest
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| {
+                "Host launch context did not inject the approved admission-config digest".to_owned()
+            })?;
+        let exact_identity = |value: Option<String>, label: &str| {
+            value
+                .filter(|value| {
+                    !value.trim().is_empty()
+                        && value == value.trim()
+                        && !value.chars().any(char::is_control)
+                })
+                .ok_or_else(|| format!("Host launch context did not inject the exact {label}"))
+        };
+        let installation_id = exact_identity(installation_id, "installation identity")?;
+        let approved_generation = exact_identity(approved_generation, "approved generation")?;
         Ok(Self {
             control_pipe,
             host_process_id,
             host_process_start,
             host_process_image,
+            receipt_root,
+            kernel_ors_root,
+            runtime_state_roots_digest,
+            generation_config_digest,
+            installation_id,
+            approved_generation,
         })
     }
 
@@ -109,6 +202,68 @@ impl KernelStartupBinding {
         self.host_process_id == process_id
             && self.host_process_start == start_time_100ns
             && self.host_process_image == image_path
+    }
+
+    fn load_supervision_receipt_verifier(
+        &self,
+    ) -> Result<(SupervisionLeaseReceiptVerifierConfig, String), String> {
+        let admission_path = self.receipt_root.join(WATCHDOG_ADMISSION_FILE_NAME);
+        let admission = ProtectedRuntimePathLease::open_existing_absolute(&admission_path)
+            .map_err(|error| {
+                format!("installer-owned watchdog admission is unavailable: {error}")
+            })?;
+        if !windows_paths_equal(admission.path(), &admission_path)
+            || admission.verify_stable_identity().is_err()
+            || admission.verify_path_identity().is_err()
+        {
+            return Err(
+                "installer-owned watchdog admission identity does not match its fixed Host path"
+                    .to_owned(),
+            );
+        }
+        let bytes = admission
+            .read_bounded(WATCHDOG_ADMISSION_LIMIT)
+            .map_err(|error| format!("watchdog admission read failed: {error}"))?;
+        if sha256_hex(&bytes) != self.generation_config_digest {
+            return Err(
+                "watchdog admission bytes do not match the Host-approved manifest digest"
+                    .to_owned(),
+            );
+        }
+        let config: KernelReceiptAdmissionConfig = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("watchdog admission decode failed: {error}"))?;
+        if config.schema != WATCHDOG_ADMISSION_SCHEMA
+            || config.installation_id != self.installation_id
+            || config.approved_generation != self.approved_generation
+            || config.trust_anchor.installation_id != self.installation_id
+            || config.context.public_key_fingerprint != config.trust_anchor.public_key_fingerprint()
+        {
+            return Err(
+                "watchdog admission is not bound to the active installation/generation authority"
+                    .to_owned(),
+            );
+        }
+        config
+            .trust_anchor
+            .validate()
+            .map_err(|error| format!("watchdog admission trust anchor is invalid: {error}"))?;
+        let mut context = config.context;
+        context.now_ms = 1;
+        context
+            .validate()
+            .map_err(|error| format!("watchdog admission lease context is invalid: {error}"))?;
+        if admission.verify_stable_identity().is_err() || admission.verify_path_identity().is_err()
+        {
+            return Err("watchdog admission identity changed during validation".to_owned());
+        }
+        let lease_id = context.lease_id.clone();
+        Ok((
+            SupervisionLeaseReceiptVerifierConfig {
+                trust_anchor: config.trust_anchor,
+                verification_context: context,
+            },
+            lease_id,
+        ))
     }
 }
 
@@ -145,6 +300,18 @@ async fn main() {
     #[cfg(not(windows))]
     let pipe_name = std::env::var("ELIOT_KERNEL_CONTROL_PIPE").unwrap_or_default();
     kernel_config = kernel_config.with_pipe_name(pipe_name);
+    #[cfg(windows)]
+    {
+        let receipt_binding = EliotdReceiptRootBinding::new(
+            startup_binding.receipt_root.clone(),
+            startup_binding.kernel_ors_root.clone(),
+            startup_binding.runtime_state_roots_digest.clone(),
+            startup_binding.installation_id.clone(),
+            startup_binding.approved_generation.clone(),
+        )
+        .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
+        kernel_config = kernel_config.with_eliotd_receipt_binding(receipt_binding);
+    }
     if let Some(prepared) = &prepared_store {
         kernel_config = kernel_config.with_store_bootstrap(prepared.requirement.clone());
     }
@@ -158,6 +325,14 @@ async fn main() {
         );
     };
     kernel_config = kernel_config.with_kernel_artifact_sha256(kernel_artifact_sha256);
+    let Some(eliotd_descriptor_artifact_sha256) = options.daemon_sha256.clone() else {
+        exit_error(
+            "ELIOTD_LAUNCH_CONTRACT_REQUIRED",
+            "Host launch must inject the exact eliotd descriptor file digest",
+        );
+    };
+    kernel_config =
+        kernel_config.with_eliotd_descriptor_artifact_sha256(eliotd_descriptor_artifact_sha256);
     let authority_path = options.authority_descriptor.clone();
     let authority_contour = authority_contour(&options.work_root, &authority_path);
     let kernel = Arc::new(
@@ -829,79 +1004,72 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn exact_startup_binding() -> KernelStartupBinding {
-        KernelStartupBinding::parse(
+    fn exact_startup_values() -> [Option<String>; 10] {
+        [
             Some(KERNEL_CONTROL_PIPE.to_owned()),
             Some("41".to_owned()),
             Some("73".to_owned()),
             Some(r"C:\eliot\eliot-host.exe".to_owned()),
+            Some(r"C:\ProgramData\Eliot\installations\a\host".to_owned()),
+            Some(r"C:\ProgramData\Eliot\installations\a\kernel\state".to_owned()),
+            Some("a".repeat(64)),
+            Some("b".repeat(64)),
+            Some("installation-a".to_owned()),
+            Some("generation-a".to_owned()),
+        ]
+    }
+
+    #[cfg(windows)]
+    fn parse_startup_values(values: &[Option<String>; 10]) -> Result<KernelStartupBinding, String> {
+        KernelStartupBinding::parse(
+            values[0].clone(),
+            values[1].clone(),
+            values[2].clone(),
+            values[3].clone(),
+            values[4].clone(),
+            values[5].clone(),
+            values[6].clone(),
+            values[7].clone(),
+            values[8].clone(),
+            values[9].clone(),
         )
-        .expect("exact startup binding")
+    }
+
+    #[cfg(windows)]
+    fn exact_startup_binding() -> KernelStartupBinding {
+        parse_startup_values(&exact_startup_values()).expect("exact startup binding")
     }
 
     #[cfg(windows)]
     #[test]
     fn kernel_startup_binding_requires_every_exact_launch_value() {
-        let exact = [
-            Some(KERNEL_CONTROL_PIPE.to_owned()),
-            Some("41".to_owned()),
-            Some("73".to_owned()),
-            Some(r"C:\eliot\eliot-host.exe".to_owned()),
-        ];
+        let exact = exact_startup_values();
         for missing in 0..exact.len() {
             let mut values = exact.clone();
             values[missing] = None;
-            assert!(
-                KernelStartupBinding::parse(
-                    values[0].clone(),
-                    values[1].clone(),
-                    values[2].clone(),
-                    values[3].clone(),
-                )
-                .is_err()
-            );
+            assert!(parse_startup_values(&values).is_err());
         }
     }
 
     #[cfg(windows)]
     #[test]
-    fn kernel_startup_binding_rejects_substituted_pipe_pid_start_and_image() {
-        assert!(
-            KernelStartupBinding::parse(
-                Some(r"\\.\pipe\eliot\kernel\substitute".to_owned()),
-                Some("41".to_owned()),
-                Some("73".to_owned()),
-                Some(r"C:\eliot\eliot-host.exe".to_owned()),
-            )
-            .is_err()
-        );
-        assert!(
-            KernelStartupBinding::parse(
-                Some(KERNEL_CONTROL_PIPE.to_owned()),
-                Some("0".to_owned()),
-                Some("73".to_owned()),
-                Some(r"C:\eliot\eliot-host.exe".to_owned()),
-            )
-            .is_err()
-        );
-        assert!(
-            KernelStartupBinding::parse(
-                Some(KERNEL_CONTROL_PIPE.to_owned()),
-                Some("41".to_owned()),
-                Some("0".to_owned()),
-                Some(r"C:\eliot\eliot-host.exe".to_owned()),
-            )
-            .is_err()
-        );
-        assert!(
-            KernelStartupBinding::parse(
-                Some(KERNEL_CONTROL_PIPE.to_owned()),
-                Some("41".to_owned()),
-                Some("73".to_owned()),
-                Some("eliot-host.exe".to_owned()),
-            )
-            .is_err()
-        );
+    fn kernel_startup_binding_rejects_substituted_authority_values() {
+        for (index, substitute) in [
+            (0, r"\\.\pipe\eliot\kernel\substitute".to_owned()),
+            (1, "0".to_owned()),
+            (2, "0".to_owned()),
+            (3, "eliot-host.exe".to_owned()),
+            (4, "relative-host-root".to_owned()),
+            (5, "relative-ors-root".to_owned()),
+            (6, "A".repeat(64)),
+            (7, "B".repeat(64)),
+            (8, " substituted-installation".to_owned()),
+            (9, "substituted-generation\n".to_owned()),
+        ] {
+            let mut values = exact_startup_values();
+            values[index] = Some(substitute);
+            assert!(parse_startup_values(&values).is_err(), "index {index}");
+        }
     }
 
     #[cfg(windows)]
@@ -912,5 +1080,107 @@ mod tests {
         assert!(!binding.matches_observed(42, 73, r"C:\eliot\eliot-host.exe"));
         assert!(!binding.matches_observed(41, 74, r"C:\eliot\eliot-host.exe"));
         assert!(!binding.matches_observed(41, 73, r"C:\eliot\replacement.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_startup_loads_public_receipt_verifier_from_manifest_bound_admission() {
+        use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+        use eliot_runtime_contracts::{
+            Ed25519SupervisionLeaseSigner, LeaseState, SupervisionLeaseActiveStateBinding,
+            SupervisionLeaseSigner, SupervisionObservationScope, SupervisionOrsMirrorBinding,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-receipt-admission-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test root");
+        let root_override = eliot_platform_windows::test_support::override_protected_root(&root);
+        let host = root.join("host");
+        eliot_platform_windows::prepare_protected_directory(&host).expect("protected host root");
+
+        let signer = Ed25519SupervisionLeaseSigner::from_secret_key(
+            "kernel-supervision",
+            "kernel-supervision-key",
+            [7; 32],
+        )
+        .expect("signer");
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-a",
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .expect("trust anchor");
+        let generation = ResourceGeneration::new(1).expect("generation");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+        let context = SupervisionLeaseVerificationContext {
+            now_ms: 1,
+            lease_id: "lease-a".to_owned(),
+            host_epoch: epoch,
+            activation_id: "activation-a".to_owned(),
+            activation_generation: generation,
+            kernel_epoch: epoch,
+            watchdog_epoch: epoch,
+            state_fence: StateFence::new(epoch, generation),
+            scope_ref: "scope-a".to_owned(),
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["target-a".to_owned()],
+                sensor_profile: "kernel-heartbeat".to_owned(),
+                claimed_coverage: vec!["process".to_owned()],
+                governance_axis: "runtime-live".to_owned(),
+            },
+            target_id: "target-a".to_owned(),
+            module_id: "eliotd".to_owned(),
+            process_id: "process-a".to_owned(),
+            target_generation: generation,
+            module_generation: generation,
+            process_generation: generation,
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: SupervisionOrsMirrorBinding {
+                record_id: "record-a".to_owned(),
+                subject_lease_id: "lease-a".to_owned(),
+                lease_revision: 1,
+                ticket_sha256: "c".repeat(64),
+                previous_receipt_sha256: None,
+            },
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: LeaseState::Active,
+                revocation_id: None,
+                revocation_epoch: None,
+            },
+        };
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": WATCHDOG_ADMISSION_SCHEMA,
+            "installation_id": "installation-a",
+            "approved_generation": "generation-a",
+            "trust_anchor": anchor.clone(),
+            "context": context.clone(),
+        }))
+        .expect("admission bytes");
+        std::fs::write(host.join(WATCHDOG_ADMISSION_FILE_NAME), &bytes).expect("admission file");
+
+        let mut binding = exact_startup_binding();
+        binding.receipt_root = host;
+        binding.generation_config_digest = sha256_hex(&bytes);
+        let (verifier, lease_id) = binding
+            .load_supervision_receipt_verifier()
+            .expect("manifest-bound receipt verifier");
+        assert_eq!(lease_id, "lease-a");
+        assert_eq!(
+            verifier.trust_anchor.public_key_fingerprint(),
+            context.public_key_fingerprint
+        );
+        assert_eq!(verifier.verification_context, context);
+
+        binding.generation_config_digest = "d".repeat(64);
+        assert!(binding.load_supervision_receipt_verifier().is_err());
+        drop(root_override);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

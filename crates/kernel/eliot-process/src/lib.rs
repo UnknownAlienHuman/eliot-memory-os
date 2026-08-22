@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hash;
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{Assertability, EvidenceAxes, EvidenceStatus};
 use eliot_platform::ClockObservation;
 use schemars::JsonSchema;
@@ -2728,6 +2729,329 @@ impl ProcessStartReceipt {
     }
 }
 
+/// Stable wire identity for the Kernel-owned durable eliotd live receipt.
+pub const ELIOTD_LIVE_RECEIPT_WIRE_ID: &str = "eliot.eliotd-live-receipt";
+/// Current durable eliotd live receipt revision.
+pub const ELIOTD_LIVE_RECEIPT_WIRE_VERSION: u16 = 2;
+
+/// Exact current supervision authority evidence copied from the verified ORS
+/// snapshot.  These values are evidence references, not a second authority
+/// envelope; consumers must still read the selected ORS record and compare all
+/// references before treating the process as live.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EliotdLiveSupervisionEvidence {
+    /// Current ORS lease identity.
+    pub lease_id: String,
+    /// Current ORS record identity.
+    pub record_id: String,
+    /// Current ORS revision.
+    pub revision: u64,
+    /// Canonical ORS receipt digest.
+    pub receipt_sha256: String,
+    /// Signed supervision envelope digest.
+    pub envelope_sha256: String,
+    /// Signed supervision payload digest.
+    pub payload_sha256: String,
+    /// Installation-pinned trust-anchor fingerprint.
+    pub public_key_fingerprint: String,
+}
+
+impl EliotdLiveSupervisionEvidence {
+    /// Validates the bounded evidence references without granting authority.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_opaque_id("eliotd_supervision_lease_id", self.lease_id.clone())?;
+        validate_opaque_id("eliotd_supervision_record_id", self.record_id.clone())?;
+        if self.revision == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "eliotd_supervision_revision",
+                reason: "must be non-zero",
+            });
+        }
+        for (field, digest) in [
+            ("eliotd_supervision_receipt_sha256", &self.receipt_sha256),
+            ("eliotd_supervision_envelope_sha256", &self.envelope_sha256),
+            ("eliotd_supervision_payload_sha256", &self.payload_sha256),
+            (
+                "eliotd_supervision_public_key_fingerprint",
+                &self.public_key_fingerprint,
+            ),
+        ] {
+            validate_hex_digest(field, digest)?;
+        }
+        Ok(())
+    }
+}
+
+/// Exact request/session evidence attached to one authenticated `daemon_ready`
+/// publication.  The request payload is represented by its canonical digest;
+/// the raw request remains on the authenticated transport only.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EliotdLiveReadyEvidence {
+    /// Authenticated request identity.
+    pub request_id: String,
+    /// Canonical digest of the ready request payload.
+    pub request_payload_sha256: String,
+    /// Authenticated transport connection identity.
+    pub connection_id: String,
+    /// Monotonic authenticated session fence.
+    pub session_epoch: u64,
+    /// Session authority epoch.
+    pub authority_epoch: u64,
+    /// Session resource generation.
+    pub generation: u64,
+    /// Digest of the authenticated launch nonce.
+    pub launch_nonce_sha256: String,
+}
+
+impl EliotdLiveReadyEvidence {
+    /// Validates the bounded request/session evidence.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_opaque_id("eliotd_ready_request_id", self.request_id.clone())?;
+        validate_hex_digest(
+            "eliotd_ready_request_payload_sha256",
+            &self.request_payload_sha256,
+        )?;
+        validate_opaque_id("eliotd_ready_connection_id", self.connection_id.clone())?;
+        if self.session_epoch == 0 || self.authority_epoch == 0 || self.generation == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "eliotd_ready_session_fence",
+                reason: "session epoch, authority epoch, and generation must be non-zero",
+            });
+        }
+        validate_hex_digest(
+            "eliotd_ready_launch_nonce_sha256",
+            &self.launch_nonce_sha256,
+        )?;
+        Ok(())
+    }
+}
+
+/// Kernel-owned durable receipt proving that the exact eliotd process passed
+/// authenticated readiness and was observed in its executor Job.  This is an
+/// inert evidence record: status consumers must independently re-read the
+/// manifest, receipt file, ORS, and live process contour.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EliotdLiveReceipt {
+    /// Stable wire discriminator.
+    pub wire_id: String,
+    /// Durable receipt wire revision.
+    pub wire_version: u16,
+    /// Manifest-selected Host state root that owns this receipt.
+    pub receipt_root: String,
+    /// Stable identity digest of the selected Host state root.
+    pub receipt_root_identity_sha256: String,
+    /// Installer-owned digest of the complete `RuntimeStateRoots` topology.
+    pub runtime_state_roots_digest: String,
+    /// Exact installation identity selected by the active manifest.
+    pub installation_id: String,
+    /// Exact active manifest generation identity.
+    pub approved_generation: String,
+    /// Approved resource generation.
+    pub generation: u64,
+    /// Approved authority epoch.
+    pub authority_epoch: u64,
+    /// Approved eliotd Governor configuration digest.
+    pub config_descriptor_sha256: String,
+    /// Approved eliotd launch descriptor digest.
+    pub descriptor_sha256: String,
+    /// Approved Kernel executable digest that authorizes this writer domain.
+    pub kernel_artifact_sha256: String,
+    /// Exact physical process-start receipt returned by the executor.
+    pub process: ProcessStartReceipt,
+    /// Exact current supervision/ORS references.
+    pub supervision: EliotdLiveSupervisionEvidence,
+    /// Exact authenticated ready request/session references.
+    pub ready: EliotdLiveReadyEvidence,
+    /// Kernel-observed publication time.
+    pub published_at_unix_ms: u64,
+    /// Digest of the canonical receipt with this field omitted.
+    pub receipt_sha256: String,
+}
+
+#[derive(Serialize)]
+struct EliotdLiveReceiptUnsigned<'a> {
+    wire_id: &'a str,
+    wire_version: u16,
+    receipt_root: &'a str,
+    receipt_root_identity_sha256: &'a str,
+    runtime_state_roots_digest: &'a str,
+    installation_id: &'a str,
+    approved_generation: &'a str,
+    generation: u64,
+    authority_epoch: u64,
+    config_descriptor_sha256: &'a str,
+    descriptor_sha256: &'a str,
+    kernel_artifact_sha256: &'a str,
+    process: &'a ProcessStartReceipt,
+    supervision: &'a EliotdLiveSupervisionEvidence,
+    ready: &'a EliotdLiveReadyEvidence,
+    published_at_unix_ms: u64,
+}
+
+impl EliotdLiveReceipt {
+    /// Computes one receipt from exact validated evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        receipt_root: impl Into<String>,
+        receipt_root_identity_sha256: impl Into<String>,
+        runtime_state_roots_digest: impl Into<String>,
+        installation_id: impl Into<String>,
+        approved_generation: impl Into<String>,
+        generation: u64,
+        authority_epoch: u64,
+        config_descriptor_sha256: impl Into<String>,
+        descriptor_sha256: impl Into<String>,
+        kernel_artifact_sha256: impl Into<String>,
+        process: ProcessStartReceipt,
+        supervision: EliotdLiveSupervisionEvidence,
+        ready: EliotdLiveReadyEvidence,
+        published_at_unix_ms: u64,
+    ) -> Result<Self, ContractError> {
+        let mut receipt = Self {
+            wire_id: ELIOTD_LIVE_RECEIPT_WIRE_ID.to_owned(),
+            wire_version: ELIOTD_LIVE_RECEIPT_WIRE_VERSION,
+            receipt_root: receipt_root.into(),
+            receipt_root_identity_sha256: receipt_root_identity_sha256.into(),
+            runtime_state_roots_digest: runtime_state_roots_digest.into(),
+            installation_id: installation_id.into(),
+            approved_generation: approved_generation.into(),
+            generation,
+            authority_epoch,
+            config_descriptor_sha256: config_descriptor_sha256.into(),
+            descriptor_sha256: descriptor_sha256.into(),
+            kernel_artifact_sha256: kernel_artifact_sha256.into(),
+            process,
+            supervision,
+            ready,
+            published_at_unix_ms,
+            receipt_sha256: String::new(),
+        };
+        receipt.validate_shape()?;
+        receipt.receipt_sha256 = receipt.compute_digest()?;
+        Ok(receipt)
+    }
+
+    fn unsigned(&self) -> EliotdLiveReceiptUnsigned<'_> {
+        EliotdLiveReceiptUnsigned {
+            wire_id: &self.wire_id,
+            wire_version: self.wire_version,
+            receipt_root: &self.receipt_root,
+            receipt_root_identity_sha256: &self.receipt_root_identity_sha256,
+            runtime_state_roots_digest: &self.runtime_state_roots_digest,
+            installation_id: &self.installation_id,
+            approved_generation: &self.approved_generation,
+            generation: self.generation,
+            authority_epoch: self.authority_epoch,
+            config_descriptor_sha256: &self.config_descriptor_sha256,
+            descriptor_sha256: &self.descriptor_sha256,
+            kernel_artifact_sha256: &self.kernel_artifact_sha256,
+            process: &self.process,
+            supervision: &self.supervision,
+            ready: &self.ready,
+            published_at_unix_ms: self.published_at_unix_ms,
+        }
+    }
+
+    fn validate_shape(&self) -> Result<(), ContractError> {
+        if self.wire_id != ELIOTD_LIVE_RECEIPT_WIRE_ID {
+            return Err(ContractError::SchemaVersion {
+                expected: ELIOTD_LIVE_RECEIPT_WIRE_ID,
+                observed: self.wire_id.clone(),
+            });
+        }
+        if self.wire_version != ELIOTD_LIVE_RECEIPT_WIRE_VERSION {
+            return Err(ContractError::SchemaVersion {
+                expected: "eliotd-live-receipt-v2",
+                observed: self.wire_version.to_string(),
+            });
+        }
+        if self.receipt_root.trim().is_empty()
+            || !std::path::Path::new(&self.receipt_root).is_absolute()
+            || self.receipt_root.chars().any(char::is_control)
+        {
+            return Err(ContractError::InvalidValue {
+                field: "eliotd_receipt_root",
+                reason: "must be an absolute control-free path",
+            });
+        }
+        if self.generation == 0 || self.authority_epoch == 0 || self.published_at_unix_ms == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "eliotd_receipt_fence",
+                reason: "generation, authority epoch, and publication time must be non-zero",
+            });
+        }
+        validate_opaque_id(
+            "eliotd_receipt_installation_id",
+            self.installation_id.clone(),
+        )?;
+        validate_opaque_id(
+            "eliotd_receipt_approved_generation",
+            self.approved_generation.clone(),
+        )?;
+        for (field, digest) in [
+            (
+                "eliotd_receipt_root_identity_sha256",
+                &self.receipt_root_identity_sha256,
+            ),
+            (
+                "eliotd_runtime_state_roots_digest",
+                &self.runtime_state_roots_digest,
+            ),
+            (
+                "eliotd_config_descriptor_sha256",
+                &self.config_descriptor_sha256,
+            ),
+            ("eliotd_descriptor_sha256", &self.descriptor_sha256),
+            (
+                "eliotd_kernel_artifact_sha256",
+                &self.kernel_artifact_sha256,
+            ),
+        ] {
+            validate_hex_digest(field, digest)?;
+        }
+        self.process.validate()?;
+        self.supervision.validate()?;
+        self.ready.validate()?;
+        if self.ready.generation != self.generation
+            || self.ready.authority_epoch != self.authority_epoch
+        {
+            return Err(ContractError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    fn compute_digest(&self) -> Result<String, ContractError> {
+        let bytes =
+            canonical_json_bytes(&self.unsigned()).map_err(|_| ContractError::InvalidValue {
+                field: "eliotd_receipt",
+                reason: "canonical serialization failed",
+            })?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Revalidates structure and the canonical receipt digest.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.validate_shape()?;
+        let expected = self.compute_digest()?;
+        if expected != self.receipt_sha256 {
+            return Err(ContractError::DigestMismatch {
+                field: "eliotd_receipt_sha256",
+                expected,
+                observed: self.receipt_sha256.clone(),
+            });
+        }
+        validate_hex_digest("eliotd_receipt_sha256", &self.receipt_sha256)
+    }
+
+    /// Returns the canonical receipt digest.
+    pub fn receipt_sha256(&self) -> &str {
+        &self.receipt_sha256
+    }
+}
+
 /// Receives immutable evidence from a physical executor.
 pub trait ProcessEvidenceSink: Send + Sync {
     /// Persists or forwards one evidence record without granting authority.
@@ -3527,6 +3851,58 @@ mod tests {
         );
         assert_eq!(receipt.identity().resumed_at_unix_ms(), 151);
         assert_eq!(receipt.binding().validation_revision(), 41);
+        Ok(())
+    }
+
+    #[test]
+    fn eliotd_live_receipt_round_trips_and_rejects_fence_substitution() -> TestResult {
+        let process = ProcessStartReceipt::new(&running_state()?)?;
+        let supervision = EliotdLiveSupervisionEvidence {
+            lease_id: "supervision-lease-1".to_owned(),
+            record_id: "supervision-record-1".to_owned(),
+            revision: 1,
+            receipt_sha256: "a".repeat(64),
+            envelope_sha256: "b".repeat(64),
+            payload_sha256: "c".repeat(64),
+            public_key_fingerprint: "d".repeat(64),
+        };
+        let ready = EliotdLiveReadyEvidence {
+            request_id: "daemon-ready-1".to_owned(),
+            request_payload_sha256: "e".repeat(64),
+            connection_id: "connection-1".to_owned(),
+            session_epoch: 2,
+            authority_epoch: 3,
+            generation: 1,
+            launch_nonce_sha256: "f".repeat(64),
+        };
+        let root = std::env::temp_dir().join("eliot-live-receipt-test");
+        let receipt = EliotdLiveReceipt::new(
+            root.to_string_lossy(),
+            "1".repeat(64),
+            "0".repeat(64),
+            "installation-1",
+            "generation-1",
+            1,
+            3,
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
+            process,
+            supervision,
+            ready,
+            4,
+        )?;
+        let bytes = eliot_contracts::canonical_json_bytes(&receipt)?;
+        let restored: EliotdLiveReceipt = serde_json::from_slice(&bytes)?;
+        assert_eq!(restored, receipt);
+        restored.validate()?;
+
+        let mut substituted = restored;
+        substituted.generation = 2;
+        assert!(matches!(
+            substituted.validate(),
+            Err(ContractError::FenceMismatch | ContractError::DigestMismatch { .. })
+        ));
         Ok(())
     }
 

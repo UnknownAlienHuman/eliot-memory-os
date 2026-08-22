@@ -35,6 +35,10 @@ tokio.workspace = true
 [dev-dependencies]
 eliot-ipc = { workspace = true, features = ["test-support"] }
 eliot-ors = { workspace = true, features = ["test-support"] }
+eliot-platform-windows = { workspace = true, features = ["test-support"] }
+eliot-runtime-status.workspace = true
+eliot-installation.workspace = true
+redb.workspace = true
 
 [lints]
 workspace = true

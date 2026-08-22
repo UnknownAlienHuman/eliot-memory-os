@@ -1348,6 +1348,7 @@ name = "eliot-kernel"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-installation",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",
@@ -1359,7 +1360,9 @@ dependencies = [
  "eliot-protocol",
  "eliot-runtime",
  "eliot-runtime-contracts",
+ "eliot-runtime-status",
  "eliot-store-api",
+ "redb",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1639,6 +1642,7 @@ name = "eliot-process"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
  "eliot-instrument-api",
  "eliot-platform",
  "schemars",

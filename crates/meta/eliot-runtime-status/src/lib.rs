@@ -1760,20 +1760,23 @@ fn inspect_store_live(
             ),
         );
     }
-    if current.authority_epoch != manifest.runtime_launch.authority_generation.value()
-        && current.authority_epoch
-            != manifest
-                .runtime_launch
-                .authority_state_fence
-                .authority_epoch
-                .value()
+    if current.authority_epoch
+        != manifest
+            .runtime_launch
+            .authority_state_fence
+            .authority_epoch
+            .value()
     {
         return unknown_component(
             "Store",
             format!(
-                "StoreRebind authority_epoch {} does not equal manifest authority_generation {}",
+                "StoreRebind authority_epoch {} does not equal manifest authority_state_fence epoch {}",
                 current.authority_epoch,
-                manifest.runtime_launch.authority_generation.value()
+                manifest
+                    .runtime_launch
+                    .authority_state_fence
+                    .authority_epoch
+                    .value()
             ),
         );
     }
@@ -2337,13 +2340,23 @@ fn inspect_eliotd_live(
             "eliotd daemon_ready is false; not ready".to_owned(),
         );
     }
-    if snapshot.supervision_epoch != manifest.runtime_launch.authority_generation.value() {
+    if snapshot.supervision_epoch
+        != manifest
+            .runtime_launch
+            .authority_state_fence
+            .authority_epoch
+            .value()
+    {
         return unknown_component(
             "eliotd",
             format!(
-                "eliotd supervision_epoch {} does not equal manifest authority_generation {}",
+                "eliotd supervision_epoch {} does not equal manifest authority_state_fence epoch {}",
                 snapshot.supervision_epoch,
-                manifest.runtime_launch.authority_generation.value()
+                manifest
+                    .runtime_launch
+                    .authority_state_fence
+                    .authority_epoch
+                    .value()
             ),
         );
     }
@@ -2476,7 +2489,8 @@ impl ProductionWatchdogLiveObserver {
 }
 
 impl ProductionEliotdLiveObserver {
-    fn for_root(host_state_root: &Path) -> Self {
+    /// Selects the exact manifest-owned Host state root for observation.
+    pub fn for_root(host_state_root: &Path) -> Self {
         Self {
             host_state_root: host_state_root.to_path_buf(),
         }
@@ -2655,6 +2669,9 @@ impl EliotdLiveObserver for ProductionEliotdLiveObserver {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
+        if !eliot_platform_windows::windows_paths_equal(&canonical, &self.host_state_root) {
+            return Ok(None);
+        }
         if retained.verify_stable_identity().is_err() {
             return Ok(None);
         }
@@ -2831,11 +2848,86 @@ impl EliotdLiveObserver for ProductionEliotdLiveObserver {
                 Err(_) => return Ok(None),
             }
         };
-        let receipt: eliot_process::ProcessStartReceipt =
+        #[cfg(windows)]
+        let live_receipt: eliot_process::EliotdLiveReceipt =
             match serde_json::from_slice(&receipt_bytes) {
                 Ok(r) => r,
                 Err(_) => return Ok(None),
             };
+        #[cfg(windows)]
+        {
+            let canonical_receipt_bytes = match eliot_contracts::canonical_json_bytes(&live_receipt)
+            {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(None),
+            };
+            if canonical_receipt_bytes != receipt_bytes
+                || live_receipt.validate().is_err()
+                || !eliot_platform_windows::windows_paths_equal(
+                    Path::new(&live_receipt.receipt_root),
+                    &canonical,
+                )
+                || !eliot_platform_windows::windows_paths_equal(
+                    Path::new(
+                        manifest
+                            .runtime_launch
+                            .runtime_state_roots
+                            .host_state_root
+                            .as_str(),
+                    ),
+                    &canonical,
+                )
+                || live_receipt.generation != manifest.runtime_launch.authority_generation.value()
+                || live_receipt.runtime_state_roots_digest
+                    != manifest.runtime_state_roots_digest.as_str()
+                || live_receipt.runtime_state_roots_digest
+                    != manifest
+                        .runtime_launch
+                        .runtime_state_roots
+                        .roots_digest
+                        .as_str()
+                || live_receipt.installation_id
+                    != manifest
+                        .runtime_launch
+                        .installation_epoch
+                        .installation
+                        .as_str()
+                || live_receipt.approved_generation != manifest.generation.as_str()
+                || live_receipt.authority_epoch
+                    != manifest
+                        .runtime_launch
+                        .authority_state_fence
+                        .authority_epoch
+                        .value()
+                || live_receipt.config_descriptor_sha256
+                    != manifest.runtime_launch.eliotd_config_digest.as_str()
+                || live_receipt.descriptor_sha256 != expected_descriptor_digest
+                || live_receipt.kernel_artifact_sha256
+                    != manifest.runtime_launch.kernel_artifact_digest.as_str()
+                || live_receipt.kernel_artifact_sha256 != manifest.kernel_artifact_digest.as_str()
+                || live_receipt.receipt_root_identity_sha256
+                    != sha256_hex(&match serde_json::to_vec(&retained.identity()) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return Ok(None),
+                    })
+                || !eliotd_live_receipt_ors_matches(&manifest, &live_receipt, &canonical, deadline)
+            {
+                return Ok(None);
+            }
+        }
+        let receipt: eliot_process::ProcessStartReceipt = {
+            #[cfg(windows)]
+            {
+                live_receipt.process.clone()
+            }
+            #[cfg(not(windows))]
+            {
+                match serde_json::from_slice(&receipt_bytes) {
+                    Ok(receipt) => receipt,
+                    Err(_) => return Ok(None),
+                }
+            }
+        };
         if receipt.validate().is_err() {
             return Ok(None);
         }
@@ -2843,6 +2935,13 @@ impl EliotdLiveObserver for ProductionEliotdLiveObserver {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
+        #[cfg(windows)]
+        if live_receipt.published_at_unix_ms == 0
+            || live_receipt.published_at_unix_ms > now_ms.saturating_add(5_000)
+            || now_ms.saturating_sub(live_receipt.published_at_unix_ms) > 60_000
+        {
+            return Ok(None);
+        }
         let resumed = receipt.identity().resumed_at_unix_ms();
         if resumed == 0
             || resumed > now_ms.saturating_add(5_000)
@@ -2870,16 +2969,13 @@ impl EliotdLiveObserver for ProductionEliotdLiveObserver {
             return Ok(None);
         }
         if receipt.binding().state_fence().authority_epoch()
-            != manifest.runtime_launch.authority_generation.value()
-        {
-            let fence_epoch = manifest
+            != manifest
                 .runtime_launch
                 .authority_state_fence
                 .authority_epoch
-                .value();
-            if receipt.binding().state_fence().authority_epoch() != fence_epoch {
-                return Ok(None);
-            }
+                .value()
+        {
+            return Ok(None);
         }
         let observed_at = now_ms;
         #[cfg(windows)]
@@ -2962,7 +3058,11 @@ impl EliotdLiveObserver for ProductionEliotdLiveObserver {
                 .to_owned(),
             descriptor_digest: expected_descriptor_digest.to_owned(),
             daemon_ready: true,
-            supervision_epoch: manifest.runtime_launch.authority_generation.value(),
+            supervision_epoch: manifest
+                .runtime_launch
+                .authority_state_fence
+                .authority_epoch
+                .value(),
             observed_at_unix_ms: observed_at,
             ready_binding_digest: ready_binding,
         };
@@ -4260,6 +4360,75 @@ fn inspect_ors_retained(
             gap: ors_gap(),
         }
     }
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_lines)]
+fn eliotd_live_receipt_ors_matches(
+    manifest: &eliot_installation::CandidateManifest,
+    receipt: &eliot_process::EliotdLiveReceipt,
+    host_root: &Path,
+    deadline: Instant,
+) -> bool {
+    if Instant::now() >= deadline {
+        return false;
+    }
+    let now_ms = match current_unix_ms() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let bundle = match verify_host_supervision_bundle(host_root, manifest, now_ms, deadline) {
+        Ok(bundle) => bundle,
+        Err(_) => return false,
+    };
+    let current = &bundle.current;
+    let expected_fingerprint = bundle.trust_anchor.public_key_fingerprint();
+    if current.record.state != eliot_runtime_contracts::LeaseState::Active
+        || current.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+        || current.record.lease_id.as_str() != receipt.supervision.lease_id
+        || current
+            .record
+            .binding
+            .state_fence
+            .resource_generation
+            .value()
+            != receipt.generation
+        || current.record.binding.state_fence.authority_epoch.value() != receipt.authority_epoch
+        || current.record.record_id.as_str() != receipt.supervision.record_id
+        || current.record.revision != receipt.supervision.revision
+        || current.record.receipt_sha256 != receipt.supervision.receipt_sha256
+        || current.record.artifact.payload_sha256 != receipt.supervision.payload_sha256
+        || current
+            .record
+            .artifact
+            .envelope_digest()
+            .map_or(true, |digest| digest != receipt.supervision.envelope_sha256)
+        || receipt.supervision.public_key_fingerprint != expected_fingerprint
+    {
+        return false;
+    }
+    let verified = match bundle
+        .trust_anchor
+        .verify(&current.record.artifact, &bundle.context)
+    {
+        Ok(verified) => verified,
+        Err(_) => return false,
+    };
+    let verified_payload_digest = match verified.payload_digest() {
+        Ok(digest) => digest,
+        Err(_) => return false,
+    };
+    if verified.payload() != &current.record.artifact.payload
+        || verified_payload_digest != receipt.supervision.payload_sha256
+        || verified.envelope_digest() != receipt.supervision.envelope_sha256
+        || verified.public_key_fingerprint() != expected_fingerprint
+        || current.record.artifact.payload.issued_at_ms == 0
+        || now_ms < current.record.artifact.payload.issued_at_ms
+        || now_ms >= current.record.artifact.payload.expires_at_ms
+    {
+        return false;
+    }
+    Instant::now() < deadline
 }
 
 fn canonical_service_name(role: InstallerServiceRole) -> &'static str {

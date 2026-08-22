@@ -46,7 +46,7 @@ use eliot_ors::{
     ProcessStartReplayState as OrsReplayState,
 };
 use eliot_ors::{
-    OperationalRecoveryStore, RedbRecoveryStore, SupervisionLeaseCommitTicket,
+    OperationIdentity, OperationalRecoveryStore, RedbRecoveryStore, SupervisionLeaseCommitTicket,
     SupervisionLeaseOperation, SupervisionLeasePrepareRequest, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt,
 };
@@ -57,8 +57,14 @@ use eliot_platform_windows::{
     UserOwnedRootLease, WindowsPlatform, WindowsSupervisionAuthorityKeyStore,
     protected_program_data_root,
 };
+#[cfg(windows)]
+use eliot_platform_windows::{
+    ProtectedRootLease, ProtectedRuntimePathLease, PublicationOutcome, PublicationPrecondition,
+    publish_atomic_owned_runtime_receipt, windows_paths_equal,
+};
 use eliot_process::{
     ActionLeaseRef, CancellationStatus, DispatchAuthorityId, DispatchValidationContext,
+    EliotdLiveReadyEvidence, EliotdLiveReceipt, EliotdLiveSupervisionEvidence,
     EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
     KernelDispatchKey, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
     ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor, ProcessIntent,
@@ -245,11 +251,132 @@ pub struct SupervisionLeaseAuthorityConfig {
     pub authority: ProvisionedSupervisionAuthority,
 }
 
+/// Installation-pinned public authority used only to authenticate the current
+/// ORS lease embedded in an eliotd live receipt. This deliberately carries no
+/// signing credential reference: receipt publication must not require or
+/// fabricate Kernel signing authority.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupervisionLeaseReceiptVerifierConfig {
+    pub trust_anchor: SupervisionTrustAnchor,
+    pub verification_context: SupervisionLeaseVerificationContext,
+}
+
+/// Host-injected, manifest-bound roots and generation identity for the
+/// Kernel-owned eliotd live receipt.  The absolute paths are not authority on
+/// their own: the full `RuntimeStateRoots` digest and active manifest identities
+/// are mandatory members of the same launch binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EliotdReceiptRootBinding {
+    receipt_root: PathBuf,
+    kernel_ors_root: PathBuf,
+    runtime_state_roots_digest: String,
+    installation_id: String,
+    approved_generation: String,
+}
+
+impl EliotdReceiptRootBinding {
+    /// Constructs the complete manifest-derived publication binding.
+    pub fn new(
+        receipt_root: impl Into<PathBuf>,
+        kernel_ors_root: impl Into<PathBuf>,
+        runtime_state_roots_digest: impl Into<String>,
+        installation_id: impl Into<String>,
+        approved_generation: impl Into<String>,
+    ) -> Result<Self, String> {
+        let binding = Self {
+            receipt_root: receipt_root.into(),
+            kernel_ors_root: kernel_ors_root.into(),
+            runtime_state_roots_digest: runtime_state_roots_digest.into(),
+            installation_id: installation_id.into(),
+            approved_generation: approved_generation.into(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for (name, path) in [
+            ("receipt_root", &self.receipt_root),
+            ("kernel_ors_root", &self.kernel_ors_root),
+        ] {
+            if !path.is_absolute()
+                || path.as_os_str().is_empty()
+                || path.to_string_lossy().chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "eliotd {name} must be an absolute control-free path"
+                ));
+            }
+        }
+        if !is_lower_sha256(&self.runtime_state_roots_digest) {
+            return Err("RuntimeStateRoots digest must be lowercase SHA-256".to_owned());
+        }
+        for (name, value) in [
+            ("installation identity", &self.installation_id),
+            ("approved generation", &self.approved_generation),
+        ] {
+            if value.trim().is_empty()
+                || value != value.trim()
+                || value.chars().any(char::is_control)
+            {
+                return Err(format!("eliotd {name} is empty or contains control"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the manifest-selected Host state root.
+    pub fn receipt_root(&self) -> &Path {
+        &self.receipt_root
+    }
+
+    /// Returns the manifest-selected Kernel ORS root.
+    pub fn kernel_ors_root(&self) -> &Path {
+        &self.kernel_ors_root
+    }
+
+    /// Returns the installer-owned `RuntimeStateRoots` digest.
+    pub fn runtime_state_roots_digest(&self) -> &str {
+        &self.runtime_state_roots_digest
+    }
+
+    /// Returns the active installation identity.
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    /// Returns the active manifest generation identity.
+    pub fn approved_generation(&self) -> &str {
+        &self.approved_generation
+    }
+}
+
 #[cfg(windows)]
 impl SupervisionLeaseAuthorityConfig {
     /// Validates the installer receipt before any ciphertext file is opened.
     pub fn validate(&self) -> Result<(), String> {
         self.authority.validate().map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(windows)]
+impl SupervisionLeaseReceiptVerifierConfig {
+    /// Validates the installer-pinned public trust contour before the ORS is
+    /// opened. No secret provider is consulted by this verifier.
+    pub fn validate(&self) -> Result<(), String> {
+        self.trust_anchor
+            .validate()
+            .map_err(|error| error.to_string())?;
+        let mut context = self.verification_context.clone();
+        context.now_ms = 1;
+        context.validate().map_err(|error| error.to_string())?;
+        if context.public_key_fingerprint != self.trust_anchor.public_key_fingerprint() {
+            return Err(
+                "receipt-verifier context fingerprint does not match its trust anchor".to_owned(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -270,6 +397,13 @@ pub struct KernelConfig {
     /// daemon's generation snapshot. This is a different artifact domain
     /// from the `eliotd` child executable digest.
     pub kernel_artifact_sha256: Option<String>,
+    /// Digest of the exact retained eliotd descriptor file bytes supplied by
+    /// Host. This is distinct from the descriptor's internal unsigned digest.
+    pub eliotd_descriptor_artifact_sha256: Option<String>,
+    /// Host-owned manifest root where the Kernel must publish the eliotd
+    /// receipt. This is intentionally separate from `work_root`: integrated
+    /// manifests use distinct Kernel and Host state roots.
+    pub eliotd_receipt_binding: Option<EliotdReceiptRootBinding>,
     /// Host-approved protected supervision signing authority.  The absence of
     /// this binding keeps the lease surface unavailable; no in-memory or test
     /// signer is fabricated by the production composition.
@@ -292,6 +426,8 @@ impl KernelConfig {
             store_bootstrap: None,
             daemon_launch: None,
             kernel_artifact_sha256: None,
+            eliotd_descriptor_artifact_sha256: None,
+            eliotd_receipt_binding: None,
             #[cfg(windows)]
             supervision_lease_authority: None,
             #[cfg(windows)]
@@ -326,6 +462,21 @@ impl KernelConfig {
     #[must_use]
     pub fn with_kernel_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
         self.kernel_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the Host-verified digest of the exact eliotd descriptor file.
+    #[must_use]
+    pub fn with_eliotd_descriptor_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.eliotd_descriptor_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the exact Host-owned manifest root for the durable eliotd
+    /// receipt. No environment or current-directory fallback is permitted.
+    #[must_use]
+    pub fn with_eliotd_receipt_binding(mut self, binding: EliotdReceiptRootBinding) -> Self {
+        self.eliotd_receipt_binding = Some(binding);
         self
     }
 
@@ -473,11 +624,13 @@ pub struct KernelComposition {
     process_gateway: Option<Arc<ProcessExecutionGateway>>,
     store_bootstrap: Option<HostStoreBootstrapRequirement>,
     daemon_launch: Option<EliotdLaunchDescriptor>,
+    eliotd_receipt_binding: Option<EliotdReceiptRootBinding>,
     /// The current immutable launch binding. Recovery replaces this only
     /// after the previous process effect is known terminal; the original
     /// Host-approved descriptor remains retained in `daemon_launch`.
     daemon_active_launch: Mutex<Option<EliotdLaunchDescriptor>>,
     kernel_artifact_sha256: Option<String>,
+    eliotd_descriptor_artifact_sha256: Option<String>,
     daemon_runtime: Mutex<DaemonRuntimeState>,
     daemon_status_changed: tokio::sync::Notify,
     #[cfg(windows)]
@@ -761,15 +914,86 @@ impl KernelSupervisionLeaseAuthority {
     }
 
     /// Returns the exact authoritative ORS head selected by the provisioned
-    /// lease identity.  ProbeReady callers must fail closed when this is
-    /// absent or no longer Active; no receipt is synthesized in memory.
+    /// lease identity. ProbeReady callers fail closed when this is absent.
     pub fn current_snapshot(
         &self,
     ) -> Result<Option<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
-        let lease_id = eliot_ors::OperationIdentity::new(self.supervision_lease_id.clone())?;
+        let lease_id = OperationIdentity::new(self.supervision_lease_id.clone())?;
         self.ors
             .load_current_supervision_lease(&lease_id)
             .map_err(Into::into)
+    }
+
+    /// Reads and authenticates the exact active ORS head embedded in the
+    /// Kernel-owned eliotd receipt. Missing, terminal, stale, foreign, or
+    /// differently fenced records are never projected as readiness evidence.
+    pub fn current_eliotd_live_evidence(
+        &self,
+        expected_generation: u64,
+        expected_authority_epoch: u64,
+    ) -> Result<EliotdLiveSupervisionEvidence, SupervisionLeaseAuthorityError> {
+        let current = self
+            .current_snapshot()?
+            .ok_or(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ))?;
+        current
+            .validate()
+            .map_err(SupervisionLeaseAuthorityError::Ors)?;
+        if current.record.state != LeaseState::Active
+            || current.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+            || current.record.lease_id.as_str() != self.supervision_lease_id
+            || current
+                .record
+                .binding
+                .state_fence
+                .resource_generation
+                .value()
+                != expected_generation
+            || current.record.binding.state_fence.authority_epoch.value()
+                != expected_authority_epoch
+        {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ));
+        }
+        let payload = &current.record.artifact.payload;
+        let now_ms = unix_ms();
+        if payload.installation_id != self.trust_anchor.installation_id
+            || payload.issued_at_ms == 0
+            || now_ms < payload.issued_at_ms
+            || now_ms >= payload.expires_at_ms
+            || payload.ors_mirror.record_id != current.record.record_id.as_str()
+            || payload.ors_mirror.lease_revision != current.record.revision
+        {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            ));
+        }
+        let context = self.verification_context(payload, now_ms);
+        let verified = self
+            .trust_anchor
+            .verify(&current.record.artifact, &context)
+            .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+        if verified.payload() != payload {
+            return Err(SupervisionLeaseAuthorityError::Contract(
+                "verified supervision payload diverged from the durable ORS artifact".to_owned(),
+            ));
+        }
+        let envelope_sha256 = current
+            .record
+            .artifact
+            .envelope_digest()
+            .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+        Ok(EliotdLiveSupervisionEvidence {
+            lease_id: current.record.lease_id.as_str().to_owned(),
+            record_id: current.record.record_id.as_str().to_owned(),
+            revision: current.record.revision,
+            receipt_sha256: current.receipt.receipt_sha256.clone(),
+            envelope_sha256,
+            payload_sha256: current.record.artifact.payload_sha256.clone(),
+            public_key_fingerprint: self.trust_anchor.public_key_fingerprint().to_owned(),
+        })
     }
 
     fn validate_binding(
@@ -2936,6 +3160,35 @@ fn update_handshake_policy(
 
 #[cfg(windows)]
 impl KernelComposition {
+    fn ors_path_for_config(config: &KernelConfig) -> Result<PathBuf, KernelBuildError> {
+        let Some(binding) = config.eliotd_receipt_binding.as_ref() else {
+            return Ok(config.work_root.join(".eliot").join("kernel-ors.redb"));
+        };
+        binding.validate().map_err(KernelBuildError::Service)?;
+        #[cfg(windows)]
+        {
+            let lease = ProtectedRootLease::open_existing(binding.kernel_ors_root())
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+            let canonical = lease
+                .canonical_path()
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+            if !windows_paths_equal(&canonical, binding.kernel_ors_root())
+                || lease.verify_stable_identity().is_err()
+            {
+                return Err(KernelBuildError::Service(
+                    "manifest-bound Kernel ORS root identity is unavailable".to_owned(),
+                ));
+            }
+            Ok(canonical.join("kernel-ors.redb"))
+        }
+        #[cfg(not(windows))]
+        {
+            Err(KernelBuildError::Service(
+                "manifest-bound Kernel ORS root requires Windows retained-path proof".to_owned(),
+            ))
+        }
+    }
+
     /// Returns the discriminator bound to the production Kernel composition.
     #[must_use]
     pub const fn production_store_rebind_discriminator() -> &'static str {
@@ -3088,7 +3341,7 @@ impl KernelComposition {
         let work_root = config.work_root.clone();
         let platform =
             Arc::new(WindowsPlatform::new(work_root.clone()).map_err(KernelBuildError::Platform)?);
-        let ors_path = work_root.join(".eliot").join("kernel-ors.redb");
+        let ors_path = Self::ors_path_for_config(&config)?;
         let ors = Arc::new(
             RedbRecoveryStore::open(&ors_path)
                 .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
@@ -3108,7 +3361,7 @@ impl KernelComposition {
         let work_root = config.work_root.clone();
         let platform =
             Arc::new(WindowsPlatform::new(work_root.clone()).map_err(KernelBuildError::Platform)?);
-        let ors_path = work_root.join(".eliot").join("kernel-ors.redb");
+        let ors_path = Self::ors_path_for_config(&config)?;
         let ors = Arc::new(
             RedbRecoveryStore::open(&ors_path)
                 .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
@@ -3173,7 +3426,7 @@ impl KernelComposition {
         let work_root = config.work_root.clone();
         let platform =
             Arc::new(WindowsPlatform::new(work_root.clone()).map_err(KernelBuildError::Platform)?);
-        let ors_path = work_root.join(".eliot").join("kernel-ors.redb");
+        let ors_path = Self::ors_path_for_config(&config)?;
         let ors = Arc::new(
             RedbRecoveryStore::open(&ors_path)
                 .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
@@ -3520,6 +3773,11 @@ impl KernelComposition {
         let store_bootstrap = config.store_bootstrap.clone();
         let daemon_launch = config.daemon_launch.clone();
         let kernel_artifact_sha256 = config.kernel_artifact_sha256.clone();
+        let eliotd_descriptor_artifact_sha256 = config.eliotd_descriptor_artifact_sha256.clone();
+        let eliotd_receipt_binding = config.eliotd_receipt_binding.clone();
+        if let Some(binding) = &eliotd_receipt_binding {
+            binding.validate().map_err(KernelBuildError::Service)?;
+        }
         #[cfg(windows)]
         if config.require_descriptor_supervision_authority
             && config.supervision_lease_authority.is_none()
@@ -3547,6 +3805,13 @@ impl KernelComposition {
         {
             return Err(KernelBuildError::Service(
                 "Kernel artifact digest must be lowercase SHA-256".to_owned(),
+            ));
+        }
+        if let Some(digest) = &eliotd_descriptor_artifact_sha256
+            && !is_lower_sha256(digest)
+        {
+            return Err(KernelBuildError::Service(
+                "eliotd descriptor artifact digest must be lowercase SHA-256".to_owned(),
             ));
         }
         if daemon_launch.is_some() && kernel_artifact_sha256.is_none() {
@@ -3716,7 +3981,9 @@ impl KernelComposition {
             store_bootstrap,
             daemon_active_launch: Mutex::new(daemon_launch.clone()),
             daemon_launch,
+            eliotd_receipt_binding,
             kernel_artifact_sha256,
+            eliotd_descriptor_artifact_sha256,
             daemon_runtime: Mutex::new(DaemonRuntimeState {
                 status: DaemonRuntimeStatus::NotLaunched,
                 receipt: None,
@@ -6008,6 +6275,232 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    #[allow(clippy::too_many_lines)]
+    fn publish_eliotd_live_receipt(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        process: &ProcessStartReceipt,
+        session: &Session,
+        request_id: &RequestId,
+        payload: &serde_json::Value,
+    ) -> Result<(), KernelServiceError> {
+        let runtime_binding = self
+            .eliotd_receipt_binding
+            .as_ref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        runtime_binding
+            .validate()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let receipt_root = runtime_binding.receipt_root();
+        if !receipt_root.is_absolute() {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let root_lease = ProtectedRootLease::open_existing(receipt_root)
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let canonical_root = root_lease
+            .canonical_path()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        if !windows_paths_equal(&canonical_root, receipt_root)
+            || root_lease.verify_stable_identity().is_err()
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let kernel_artifact = self
+            .kernel_artifact_sha256
+            .as_deref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let descriptor_artifact = self
+            .eliotd_descriptor_artifact_sha256
+            .as_deref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let supervision_authority = self
+            .supervision_lease_authority
+            .as_ref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let supervision = supervision_authority
+            .current_eliotd_live_evidence(launch.generation.value(), launch.authority_epoch.value())
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let ready = EliotdLiveReadyEvidence {
+            request_id: request_id.as_str().to_owned(),
+            request_payload_sha256: sha256_json(payload)
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?,
+            connection_id: session.connection_id.clone(),
+            session_epoch: session.session_epoch,
+            authority_epoch: session.authority_epoch,
+            generation: session.module_generation.generation.value(),
+            launch_nonce_sha256: format!("{:x}", Sha256::digest(session.launch_nonce.as_bytes())),
+        };
+        let receipt = EliotdLiveReceipt::new(
+            canonical_root.to_string_lossy(),
+            sha256_json(&root_lease.identity())
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?,
+            runtime_binding.runtime_state_roots_digest(),
+            runtime_binding.installation_id(),
+            runtime_binding.approved_generation(),
+            launch.generation.value(),
+            launch.authority_epoch.value(),
+            launch.config_descriptor_sha256.as_str(),
+            descriptor_artifact,
+            kernel_artifact,
+            process.clone(),
+            supervision.clone(),
+            ready,
+            unix_ms(),
+        )
+        .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        receipt
+            .validate()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let bytes = eliot_contracts::canonical_json_bytes(&receipt)
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let path = canonical_root.join("eliotd-receipt.json");
+
+        let existing = match ProtectedRuntimePathLease::open_existing_absolute(&path) {
+            Ok(lease) => {
+                if lease.verify_stable_identity().is_err() || lease.verify_path_identity().is_err()
+                {
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
+                let old_bytes = lease
+                    .read_bounded(1024 * 1024)
+                    .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+                let old: EliotdLiveReceipt = serde_json::from_slice(&old_bytes)
+                    .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+                old.validate()
+                    .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+                if eliot_contracts::canonical_json_bytes(&old)
+                    .map_err(|_| KernelServiceError::ReadinessNotProven)?
+                    != old_bytes
+                {
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
+                if !windows_paths_equal(Path::new(&old.receipt_root), &canonical_root)
+                    || old.receipt_root_identity_sha256
+                        != sha256_json(&root_lease.identity())
+                            .map_err(|_| KernelServiceError::ReadinessNotProven)?
+                {
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
+                // A prior receipt is replaceable only as a stale physical
+                // daemon instance inside this exact immutable launch contour.
+                // A foreign installation/generation/root/artifact or lease
+                // identity is not a CAS predecessor and must never be adopted
+                // or overwritten just because it occupies the destination.
+                if old.runtime_state_roots_digest != receipt.runtime_state_roots_digest
+                    || old.installation_id != receipt.installation_id
+                    || old.approved_generation != receipt.approved_generation
+                    || old.generation != receipt.generation
+                    || old.authority_epoch != receipt.authority_epoch
+                    || old.config_descriptor_sha256 != receipt.config_descriptor_sha256
+                    || old.descriptor_sha256 != receipt.descriptor_sha256
+                    || old.kernel_artifact_sha256 != receipt.kernel_artifact_sha256
+                    || old.supervision.lease_id != receipt.supervision.lease_id
+                    || old.supervision.public_key_fingerprint
+                        != receipt.supervision.public_key_fingerprint
+                {
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
+                Some((
+                    old_bytes.clone(),
+                    PublicationPrecondition::from_bytes(lease.identity(), &old_bytes),
+                ))
+            }
+            Err(_) => match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                _ => return Err(KernelServiceError::ReadinessNotProven),
+            },
+        };
+
+        let status_is_ready = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?
+            .status
+            == DaemonRuntimeStatus::Ready;
+        if let Some((old_bytes, _)) = &existing {
+            let old: EliotdLiveReceipt = serde_json::from_slice(old_bytes)
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+            if old.process != *process
+                || old.generation != receipt.generation
+                || old.authority_epoch != receipt.authority_epoch
+                || old.runtime_state_roots_digest != receipt.runtime_state_roots_digest
+                || old.installation_id != receipt.installation_id
+                || old.approved_generation != receipt.approved_generation
+                || old.config_descriptor_sha256 != receipt.config_descriptor_sha256
+                || old.descriptor_sha256 != receipt.descriptor_sha256
+                || old.kernel_artifact_sha256 != receipt.kernel_artifact_sha256
+                || old.supervision != receipt.supervision
+                || old.ready != receipt.ready
+            {
+                if status_is_ready {
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
+            } else {
+                // Only the already-Ready in-memory state proves that this
+                // Kernel previously accepted the exact publication. A file
+                // left by a failed/unknown attempt is never destination-only
+                // recovery authority.
+                return if status_is_ready {
+                    Ok(())
+                } else {
+                    Err(KernelServiceError::ReadinessNotProven)
+                };
+            }
+        } else if status_is_ready {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        if status_is_ready {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+
+        let expected_existing = existing.as_ref().map(|(_, fence)| fence);
+        let outcome = publish_atomic_owned_runtime_receipt(&path, &bytes, expected_existing)
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let published_identity = match outcome {
+            PublicationOutcome::Published(receipt) => receipt.identity,
+            PublicationOutcome::Unknown(unknown) => unknown.expected_identity,
+        };
+        let lease = ProtectedRuntimePathLease::open_existing_absolute(&path)
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        if lease.identity() != published_identity
+            || lease.verify_stable_identity().is_err()
+            || lease.verify_path_identity().is_err()
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let readback = lease
+            .read_bounded(1024 * 1024)
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        if readback != bytes {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        if root_lease.verify_stable_identity().is_err()
+            || lease.verify_stable_identity().is_err()
+            || lease.verify_path_identity().is_err()
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let post_root = root_lease
+            .canonical_path()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        if !windows_paths_equal(&post_root, &canonical_root)
+            || root_lease.verify_stable_identity().is_err()
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        // Re-read the protected ORS identity and exact active signature after
+        // the receipt CAS. A successful destination readback alone must not
+        // outlive a concurrent authority rotation or ORS root substitution.
+        let post_supervision = supervision_authority
+            .current_eliotd_live_evidence(launch.generation.value(), launch.authority_epoch.value())
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        if post_supervision != supervision {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     async fn validate_authenticated_daemon_ready(&self) -> Result<(), KernelServiceError> {
         let Some(launch) = self.active_daemon_launch()? else {
             return Ok(());
@@ -7541,6 +8034,213 @@ mod tests {
         }
         .with_computed_digest()
         .expect("descriptor digest")
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code, clippy::too_many_lines)]
+    fn live_receipt_manifest(
+        root: &Path,
+        roots: &eliot_installation::RuntimeStateRoots,
+        launch: &EliotdLaunchDescriptor,
+        descriptor_artifact_sha256: &str,
+        supervision_key_fingerprint: &str,
+    ) -> eliot_installation::CandidateManifest {
+        let handle = |value: String| PlatformHandle::new(value).expect("manifest handle");
+        let path = |name: &str| {
+            handle(
+                root.join("artifacts")
+                    .join(name)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        let installation_epoch = eliot_installation::InstallationEpoch {
+            installation: handle("installation-1".to_owned()),
+            lineage_id: handle("lineage-live-receipt-1".to_owned()),
+            sequence: 1,
+        };
+        let generation = handle("generation-live-1".to_owned());
+        let store_config_path = path("generation.json");
+        let authority_descriptor_path = path("authority.json");
+        let store_bootstrap_descriptor_path = path("store-bootstrap.json");
+        let store_bridge_executable_path = path("eliot-store-surreal.exe");
+        let canonical_store_executable_path = path("surreal.exe");
+        let host_executable_path = path("eliot-host.exe");
+        let watchdog_executable_path = path("eliot-watchdog.exe");
+        let kernel_executable_path = path("eliot-kernel.exe");
+        let authority_descriptor_digest = handle("7".repeat(64));
+        let store_bootstrap_descriptor_digest = handle("6".repeat(64));
+        let kernel_artifact_digest = handle("c".repeat(64));
+        let store_bridge_artifact_digest = handle("1".repeat(64));
+        let canonical_store_artifact_digest = handle("5".repeat(64));
+        let host_artifact_digest = handle("8".repeat(64));
+        let mut runtime_launch = eliot_installation::RuntimeLaunchDescriptor {
+            profile: eliot_installation::InstallationProfile::PortableDev,
+            portable_root: Some(handle(root.to_string_lossy().into_owned())),
+            installation_epoch,
+            generation: generation.clone(),
+            authority_generation: ResourceGeneration::genesis(),
+            authority_state_fence: StateFence::new(
+                AuthorityEpoch::genesis(),
+                ResourceGeneration::genesis(),
+            ),
+            authority_descriptor_path: authority_descriptor_path.clone(),
+            authority_descriptor_digest: authority_descriptor_digest.clone(),
+            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
+                supervision_lease_id: handle("supervision-lease-live-receipt".to_owned()),
+            },
+            runtime_state_roots: roots.clone(),
+            kernel_work_root: roots.kernel_work_root.clone(),
+            kernel_artifact_digest: kernel_artifact_digest.clone(),
+            eliotd_executable_path: launch.executable.clone(),
+            eliotd_artifact_digest: handle(launch.executable_sha256.clone()),
+            eliotd_config_path: launch.config_descriptor.clone(),
+            eliotd_config_digest: handle(launch.config_descriptor_sha256.clone()),
+            eliotd_descriptor_path: path("eliotd.json"),
+            eliotd_descriptor_digest: handle(descriptor_artifact_sha256.to_owned()),
+            eliotd_launch_nonce: launch.launch_nonce.clone(),
+            store_config_path: store_config_path.clone(),
+            store_credential_target: handle(
+                "eliot/store/v1/0123456789abcdef0123456789abcdef".to_owned(),
+            ),
+            store_bridge_executable_path: store_bridge_executable_path.clone(),
+            store_bridge_artifact_digest: store_bridge_artifact_digest.clone(),
+            store_bootstrap_descriptor_path: store_bootstrap_descriptor_path.clone(),
+            store_bootstrap_descriptor_digest: store_bootstrap_descriptor_digest.clone(),
+            canonical_store_executable_path: canonical_store_executable_path.clone(),
+            canonical_store_artifact_digest: canonical_store_artifact_digest.clone(),
+            kernel_arguments: vec![
+                handle("--work-root".to_owned()),
+                roots.kernel_work_root.clone(),
+                handle("--store-bootstrap".to_owned()),
+                store_bootstrap_descriptor_path,
+                handle("--store-bootstrap-sha256".to_owned()),
+                store_bootstrap_descriptor_digest,
+                handle("--authority-descriptor".to_owned()),
+                authority_descriptor_path,
+                handle("--authority-descriptor-sha256".to_owned()),
+                authority_descriptor_digest,
+                handle("--kernel-artifact-sha256".to_owned()),
+                kernel_artifact_digest.clone(),
+                handle("--eliotd-descriptor".to_owned()),
+                path("eliotd.json"),
+                handle("--eliotd-descriptor-sha256".to_owned()),
+                handle(descriptor_artifact_sha256.to_owned()),
+            ],
+            store_bridge_arguments: vec![
+                handle("--portable-dev-root".to_owned()),
+                handle(root.to_string_lossy().into_owned()),
+                handle("--config".to_owned()),
+                store_config_path.clone(),
+            ],
+            canonical_store_arguments: vec![
+                handle("start".to_owned()),
+                handle("--no-banner".to_owned()),
+                handle("--bind".to_owned()),
+                handle("127.0.0.1:8000".to_owned()),
+                handle("--temporary-directory".to_owned()),
+                roots.store_temp_root.clone(),
+                handle("--log-file-enabled".to_owned()),
+                handle("--log-file-path".to_owned()),
+                roots.store_work_root.clone(),
+                handle("--log-file-name".to_owned()),
+                handle("surrealdb.log".to_owned()),
+                handle(format!(
+                    "surrealkv://{}",
+                    roots.store_data_root.as_str().replace('\\', "/")
+                )),
+            ],
+            host_executable_path: host_executable_path.clone(),
+            host_artifact_digest: host_artifact_digest.clone(),
+            watchdog_executable_path,
+            watchdog_artifact_digest: handle("4".repeat(64)),
+            descriptor_digest: handle("0".repeat(64)),
+        };
+        runtime_launch = runtime_launch
+            .with_computed_digest()
+            .expect("sealed live receipt runtime launch");
+        let manifest = eliot_installation::CandidateManifest {
+            generation,
+            components: vec![
+                handle("component:kernel".to_owned()),
+                handle("component:store".to_owned()),
+            ],
+            kernel_artifact_digest,
+            store_bridge_artifact_digest,
+            canonical_store_artifact_digest,
+            host_artifact_digest,
+            kernel_executable_path,
+            store_bridge_executable_path,
+            canonical_store_executable_path,
+            host_executable_path,
+            config_path: store_config_path,
+            dependency_closure_refs: vec![handle("evidence:dependency-closure".to_owned())],
+            license_refs: vec![handle("evidence:licenses".to_owned())],
+            config_digest: handle("2".repeat(64)),
+            store_credential_target: handle(
+                "eliot/store/v1/0123456789abcdef0123456789abcdef".to_owned(),
+            ),
+            supervision_key_fingerprint: handle(supervision_key_fingerprint.to_owned()),
+            signature_ref: handle("evidence:signature".to_owned()),
+            runtime_state_roots_digest: roots.roots_digest.clone(),
+            runtime_launch,
+        };
+        manifest.validate().expect("live receipt manifest");
+        manifest
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    fn write_active_manifest_registry(
+        host_root: &Path,
+        manifest: &eliot_installation::CandidateManifest,
+    ) {
+        let candidate_digest = manifest.compute_digest().expect("candidate digest");
+        let generation = manifest.generation.as_str();
+        let registry = serde_json::json!({
+            "registry_wire_version": { "major": 10, "minor": 0, "patch": 0 },
+            "revision": 2,
+            "generations": [{
+                "manifest": manifest,
+                "approval": {
+                    "approval_ref": "approval:live-receipt",
+                    "transaction_id": "transaction:live-receipt",
+                    "installer_plan_digest": "d".repeat(64),
+                    "generation": generation,
+                    "candidate_manifest_digest": candidate_digest.as_str(),
+                    "runtime_descriptor_digest": manifest.runtime_launch.descriptor_digest.as_str(),
+                    "required_owner": "owner:installation",
+                    "signature_ref": manifest.signature_ref.as_str(),
+                    "authority_descriptor_path": manifest.runtime_launch.authority_descriptor_path.as_str(),
+                    "authority_descriptor_digest": manifest.runtime_launch.authority_descriptor_digest.as_str(),
+                    "authority_generation": manifest.runtime_launch.authority_generation,
+                    "authority_state_fence": manifest.runtime_launch.authority_state_fence,
+                },
+                "active": true,
+                "last_known_good": true,
+            }],
+            "service_registration_approvals": [],
+            "active_generation": generation,
+            "last_known_good_generation": generation,
+            "pending_activation": null,
+            "last_terminal_activation": null,
+            "active_phase_b_rebind": null,
+        });
+        let path = host_root.join("installation-registry.redb");
+        let database = redb::Database::create(&path).expect("create active registry");
+        let write = database.begin_write().expect("begin active registry write");
+        {
+            let mut table = write
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                    "eliot_approved_generations_v2",
+                ))
+                .expect("open active registry table");
+            let bytes = serde_json::to_vec(&registry).expect("active registry bytes");
+            table
+                .insert("registry", bytes.as_slice())
+                .expect("insert active registry");
+        }
+        write.commit().expect("commit active registry");
     }
 
     #[cfg(windows)]
