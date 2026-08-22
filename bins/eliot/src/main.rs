@@ -1561,10 +1561,24 @@ fn run_installation_effect(
             }
         }
     }
+    if activation_projection_state_is_invalid(
+        preflight_transaction.profile,
+        preflight_transaction.stage(),
+        preflight_transaction.has_activation_projection_intent(),
+    ) {
+        write_installation_error(
+            "INSTALLATION_STATE_INVALID",
+            "SystemService Activating transaction is missing its durable activation projection intent",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
     let preflight_status = installation_preflight_status(preflight_transaction.stage(), recover);
-    let should_query_host_terminal =
-        should_query_host_terminal(preflight_transaction.profile, preflight_transaction.stage());
-    if let Some(status) = preflight_status.filter(|_| !should_query_host_terminal) {
+    let should_query_host_terminal_now = should_query_host_terminal(
+        preflight_transaction.profile,
+        preflight_transaction.stage(),
+        preflight_transaction.has_activation_projection_intent(),
+    );
+    if let Some(status) = preflight_status.filter(|_| !should_query_host_terminal_now) {
         let staging = InstallationStagingDisposition::not_attempted(if status == "ROLLED_BACK" {
             "transaction is already rolled back; no recovery effect was attempted"
         } else {
@@ -1590,22 +1604,26 @@ fn run_installation_effect(
     // enter rollback; otherwise a perfectly good live generation would remain
     // stranded in Activating.  The query is deliberately read/reconcile-only:
     // it does not resend any effect or touch SCM/registry projection.
-    if should_query_host_terminal {
-        let host_terminal_outcome =
-            match reconcile_host_activation_terminal(store_path, &preflight_transaction) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    write_installation_error(
-                        if recover {
-                            "INSTALLATION_RECOVER_ERROR"
-                        } else {
-                            "INSTALLATION_APPLY_ERROR"
-                        },
-                        &format!("Host activation terminal query failed: {error}"),
-                    );
-                    return Ok(INVALID_REQUEST_EXIT);
-                }
-            };
+    if should_query_host_terminal_now {
+        let host_terminal_outcome = match reconcile_host_activation_terminal_if_required(
+            preflight_transaction.profile,
+            preflight_transaction.stage(),
+            preflight_transaction.has_activation_projection_intent(),
+            || reconcile_host_activation_terminal(store_path, &preflight_transaction),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                write_installation_error(
+                    if recover {
+                        "INSTALLATION_RECOVER_ERROR"
+                    } else {
+                        "INSTALLATION_APPLY_ERROR"
+                    },
+                    &format!("Host activation terminal query failed: {error}"),
+                );
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+        };
         if let Some(outcome) = host_terminal_outcome {
             let store = match RedbInstallationTransactionStore::open_existing_exact_path(store_path)
             {
@@ -1813,21 +1831,31 @@ fn run_installation_effect(
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
-    let host_terminal_outcome = if transaction.profile == InstallationProfile::SystemService
-        && matches!(transaction.stage(), InstallationStage::Activating)
-    {
-        match reconcile_host_activation_terminal(store_path, &transaction) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                write_installation_error(
-                    "INSTALLATION_STATE_INVALID",
-                    &format!("Host activation terminal reconciliation failed: {error}"),
-                );
-                return Ok(INVALID_REQUEST_EXIT);
-            }
+    if activation_projection_state_is_invalid(
+        transaction.profile,
+        transaction.stage(),
+        transaction.has_activation_projection_intent(),
+    ) {
+        write_installation_error(
+            "INSTALLATION_STATE_INVALID",
+            "SystemService Activating transaction is missing its durable activation projection intent",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    let host_terminal_outcome = match reconcile_host_activation_terminal_if_required(
+        transaction.profile,
+        transaction.stage(),
+        transaction.has_activation_projection_intent(),
+        || reconcile_host_activation_terminal(store_path, &transaction),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            write_installation_error(
+                "INSTALLATION_STATE_INVALID",
+                &format!("Host activation terminal reconciliation failed: {error}"),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
         }
-    } else {
-        None
     };
     let transaction = if host_terminal_outcome.is_some() {
         match RedbInstallationTransactionStore::open_existing_exact_path(store_path)
@@ -2103,12 +2131,43 @@ fn installation_preflight_status(stage: InstallationStage, recover: bool) -> Opt
     }
 }
 
-fn should_query_host_terminal(profile: InstallationProfile, stage: InstallationStage) -> bool {
+fn should_query_host_terminal(
+    profile: InstallationProfile,
+    stage: InstallationStage,
+    has_activation_projection_intent: bool,
+) -> bool {
     profile == InstallationProfile::SystemService
+        && has_activation_projection_intent
         && matches!(
             stage,
             InstallationStage::Activating | InstallationStage::RollbackRequired
         )
+}
+
+fn activation_projection_state_is_invalid(
+    profile: InstallationProfile,
+    stage: InstallationStage,
+    has_activation_projection_intent: bool,
+) -> bool {
+    profile == InstallationProfile::SystemService
+        && stage == InstallationStage::Activating
+        && !has_activation_projection_intent
+}
+
+fn reconcile_host_activation_terminal_if_required<F>(
+    profile: InstallationProfile,
+    stage: InstallationStage,
+    has_activation_projection_intent: bool,
+    query: F,
+) -> Result<Option<InstallationStepOutcome>, InstallationError>
+where
+    F: FnOnce() -> Result<Option<InstallationStepOutcome>, InstallationError>,
+{
+    if should_query_host_terminal(profile, stage, has_activation_projection_intent) {
+        query()
+    } else {
+        Ok(None)
+    }
 }
 
 fn print_transaction_projection(
@@ -2671,19 +2730,31 @@ mod tests {
     }
 
     #[test]
-    fn host_terminal_query_precedes_apply_and_recover_rollback_paths() {
-        for stage in [
-            InstallationStage::Activating,
+    fn host_terminal_query_requires_durable_activation_projection() {
+        assert!(!should_query_host_terminal(
+            InstallationProfile::SystemService,
             InstallationStage::RollbackRequired,
-        ] {
-            assert!(should_query_host_terminal(
-                InstallationProfile::SystemService,
-                stage,
-            ));
-        }
+            false,
+        ));
+        assert!(!should_query_host_terminal(
+            InstallationProfile::SystemService,
+            InstallationStage::Activating,
+            false,
+        ));
+        assert!(should_query_host_terminal(
+            InstallationProfile::SystemService,
+            InstallationStage::Activating,
+            true,
+        ));
+        assert!(should_query_host_terminal(
+            InstallationProfile::SystemService,
+            InstallationStage::RollbackRequired,
+            true,
+        ));
         assert!(!should_query_host_terminal(
             InstallationProfile::PortableDev,
             InstallationStage::RollbackRequired,
+            true,
         ));
         // A missing terminal still leaves the original preflight disposition;
         // the query is read-only and must not turn RollbackRequired into a
@@ -2696,6 +2767,64 @@ mod tests {
             installation_preflight_status(InstallationStage::RollbackRequired, true),
             None
         );
+    }
+
+    #[test]
+    fn early_rollback_required_skips_host_query_and_preserves_recovery_path() {
+        let queried = std::cell::Cell::new(false);
+        let outcome = reconcile_host_activation_terminal_if_required(
+            InstallationProfile::SystemService,
+            InstallationStage::RollbackRequired,
+            false,
+            || {
+                queried.set(true);
+                Ok(None)
+            },
+        )
+        .expect("early rollback must not fail while skipping Host query");
+        assert!(outcome.is_none());
+        assert!(!queried.get());
+        assert!(!activation_projection_state_is_invalid(
+            InstallationProfile::SystemService,
+            InstallationStage::RollbackRequired,
+            false,
+        ));
+    }
+
+    #[test]
+    fn activating_response_loss_with_projection_keeps_host_query() {
+        let queried = std::cell::Cell::new(false);
+        let outcome = reconcile_host_activation_terminal_if_required(
+            InstallationProfile::SystemService,
+            InstallationStage::Activating,
+            true,
+            || {
+                queried.set(true);
+                Ok(None)
+            },
+        )
+        .expect("activating response-loss query must remain available");
+        assert!(outcome.is_none());
+        assert!(queried.get());
+        assert!(!activation_projection_state_is_invalid(
+            InstallationProfile::SystemService,
+            InstallationStage::Activating,
+            true,
+        ));
+    }
+
+    #[test]
+    fn activating_without_projection_is_rejected_before_any_host_query() {
+        assert!(activation_projection_state_is_invalid(
+            InstallationProfile::SystemService,
+            InstallationStage::Activating,
+            false,
+        ));
+        assert!(!should_query_host_terminal(
+            InstallationProfile::SystemService,
+            InstallationStage::Activating,
+            false,
+        ));
     }
 
     #[test]

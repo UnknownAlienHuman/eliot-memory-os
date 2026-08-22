@@ -10841,6 +10841,13 @@ impl InstallationTransaction {
         self.activation_projection_intent.as_ref()
     }
 
+    /// Reports whether the signed activation projection boundary is durably
+    /// present without exposing its authority-bearing payload.
+    #[must_use]
+    pub fn has_activation_projection_intent(&self) -> bool {
+        self.activation_projection_intent.is_some()
+    }
+
     /// Requires authoritative readback for every immutable installer effect.
     ///
     /// This is the core admission gate for any registry or approval
@@ -28733,6 +28740,7 @@ mod tests {
     #[test]
     fn mark_unknown_activating_is_rejected_without_mutation() {
         let mut transaction = registering_transaction();
+        assert!(!transaction.has_activation_projection_intent());
         transaction.stage = InstallationStage::Activating;
         transaction.pending_external_changes.clear();
         transaction.revision = 5;
@@ -28743,6 +28751,12 @@ mod tests {
             .expect_err("Activating must not become RollbackRequired");
         assert!(matches!(err, InstallationError::IllegalTransition { .. }));
         assert_eq!(transaction, before);
+    }
+
+    #[test]
+    fn activation_projection_intent_presence_is_read_only() {
+        let registering = registering_transaction();
+        assert!(!registering.has_activation_projection_intent());
     }
 
     #[test]
@@ -28938,6 +28952,37 @@ mod tests {
         transaction.pending_external_changes.clear();
         transaction.revision = 4;
         must(transaction.validate());
+        let transaction_id = transaction.transaction_id.clone();
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(transaction))),
+            ..SharedStore::default()
+        };
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let mut coordinator = InstallationCoordinator::new(
+            fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone()),
+            store.clone(),
+        );
+        let outcome = must(coordinator.rollback(&transaction_id));
+        assert!(matches!(
+            outcome,
+            InstallationStepOutcome::Quarantined { .. }
+        ));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage(), InstallationStage::Quarantined);
+    }
+
+    #[test]
+    fn rollback_required_first_effect_unknown_quarantines_before_external_effects() {
+        let mut transaction = planned_transaction();
+        transaction.effect_progress[0].state = InstallationEffectProgressState::Unknown {
+            pending_ref: test_handle("pending:first-effect-unknown"),
+        };
+        transaction.stage = InstallationStage::RollbackRequired;
+        transaction.pending_external_changes = vec![test_handle("pending:first-effect-unknown")];
+        transaction.revision = 4;
+        must(transaction.validate());
+        assert!(!transaction.has_activation_projection_intent());
         let transaction_id = transaction.transaction_id.clone();
         let store = SharedStore {
             state: Arc::new(Mutex::new(Some(transaction))),
