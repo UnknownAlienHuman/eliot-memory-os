@@ -11,6 +11,7 @@ default = []
 test-support = []
 
 [dependencies]
+eliot-contracts.workspace = true
 eliot-windows-ipc.workspace = true
 eliot-platform.workspace = true
 eliot-runtime-contracts.workspace = true

@@ -51,8 +51,8 @@ use eliot_installation::{
     HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, InstallationEpoch,
     InstallationError, InstallationProfile, InstallerServiceRegistrationApproval,
     InstallerServiceRole, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PendingActivationState,
-    PhaseBLiveBinding, RedbInstallationRegistry, RuntimeLaunchDescriptor, StoreCredentialProvider,
-    StoreCredentialScope,
+    PhaseBLiveBinding, ProvisionedSupervisionAuthority, RedbInstallationRegistry,
+    RuntimeLaunchDescriptor, StoreCredentialProvider, StoreCredentialScope,
     phase_b_credential_receipt_digest as installation_phase_b_credential_receipt_digest,
     phase_b_host_state_root_digest as installation_phase_b_host_state_root_digest,
     phase_b_scm_selector, phase_b_static_template_for_candidate,
@@ -1098,6 +1098,7 @@ fn phase_b_public_receipt(
             .store_bootstrap_descriptor_digest
             .clone(),
         eliotd_descriptor_digest: materialization.eliotd_descriptor_digest.clone(),
+        provisioned_supervision_authority: intent.provisioned_supervision_authority.clone(),
         receipt_digest: PlatformHandle::new("pending")
             .map_err(|error| HostError::Platform(error.to_string()))?,
     };
@@ -1125,6 +1126,7 @@ fn phase_b_public_receipt_from_binding(
         || binding.request_digest != intent.request_digest
         || binding.host_owner_epoch != credential_receipt.host_owner_epoch
         || binding.host_process_identity != credential_receipt.host_process_identity
+        || binding.provisioned_supervision_authority != intent.provisioned_supervision_authority
         || phase_b_credential_receipt_digest(credential_receipt)?
             != binding.credential_receipt_digest
     {
@@ -1143,6 +1145,7 @@ fn phase_b_public_receipt_from_binding(
         config_file_digest: binding.config_file_digest.clone(),
         store_bootstrap_descriptor_digest: binding.store_bootstrap_descriptor_digest.clone(),
         eliotd_descriptor_digest: binding.eliotd_descriptor_digest.clone(),
+        provisioned_supervision_authority: binding.provisioned_supervision_authority.clone(),
         receipt_digest: binding.public_receipt_digest.clone(),
     };
     receipt
@@ -1210,6 +1213,7 @@ fn phase_b_build_authority_descriptor(
         generation: runtime.authority_generation,
         revision_policy_binding: intent.static_template.revision_policy_binding.clone(),
         dispatch_key,
+        supervision_authority: intent.provisioned_supervision_authority.clone(),
         descriptor_sha256: String::new(),
         issued_at_ms: now_ms,
         expires_at_ms: now_ms.saturating_add(86_400_000),
@@ -1237,6 +1241,7 @@ fn phase_b_build_authority_descriptor_for_rebind(
     host: &HostInstallationEpoch,
     activation_generation: &EpochIdentity,
     intent: &ActivePhaseBRebindIntent,
+    provisioned_supervision_authority: &ProvisionedSupervisionAuthority,
 ) -> Result<Vec<u8>, HostError> {
     let runtime = &manifest.runtime_launch;
     let authority_id = DispatchAuthorityId::new(intent.static_template.authority_id.as_str())
@@ -1290,6 +1295,7 @@ fn phase_b_build_authority_descriptor_for_rebind(
         generation: runtime.authority_generation,
         revision_policy_binding: intent.static_template.revision_policy_binding.clone(),
         dispatch_key,
+        supervision_authority: provisioned_supervision_authority.clone(),
         descriptor_sha256: String::new(),
         issued_at_ms: now_ms,
         expires_at_ms: now_ms.saturating_add(86_400_000),
@@ -1979,6 +1985,7 @@ fn phase_b_previous_live_launch(
     template: &RuntimeLaunchDescriptor,
     previous: &PhaseBPreviousBinding,
     previous_eliotd_digest: Option<&PlatformHandle>,
+    provisioned_supervision_authority: &ProvisionedSupervisionAuthority,
 ) -> Result<RuntimeLaunchDescriptor, HostError> {
     phase_b_live_launch(
         template,
@@ -1986,6 +1993,7 @@ fn phase_b_previous_live_launch(
         &previous.authority,
         &previous.authority_digest,
         previous_eliotd_digest.unwrap_or(&template.eliotd_descriptor_digest),
+        provisioned_supervision_authority,
     )
 }
 
@@ -1995,12 +2003,18 @@ fn phase_b_previous_config_value(
     template: &RuntimeLaunchDescriptor,
     previous: &PhaseBPreviousBinding,
     previous_eliotd_digest: Option<&PlatformHandle>,
+    provisioned_supervision_authority: &ProvisionedSupervisionAuthority,
 ) -> Result<serde_json::Value, HostError> {
     let mut config =
         serde_json::from_slice::<serde_json::Value>(template_bytes).map_err(|error| {
             HostError::RecoveryRequired(format!("read prior Store config template: {error}"))
         })?;
-    let launch = phase_b_previous_live_launch(template, previous, previous_eliotd_digest)?;
+    let launch = phase_b_previous_live_launch(
+        template,
+        previous,
+        previous_eliotd_digest,
+        provisioned_supervision_authority,
+    )?;
     {
         let object = config.as_object_mut().ok_or_else(|| {
             HostError::RecoveryRequired(
@@ -2052,6 +2066,7 @@ fn phase_b_previous_config_digest(
     template: &RuntimeLaunchDescriptor,
     previous: Option<&PhaseBPreviousBinding>,
     previous_eliotd_digest: Option<&PlatformHandle>,
+    provisioned_supervision_authority: &ProvisionedSupervisionAuthority,
 ) -> Result<Option<PlatformHandle>, HostError> {
     let lease = phase_b_open_existing(profile, portable_root, path)?;
     lease.verify().map_err(HostError::RecoveryRequired)?;
@@ -2079,6 +2094,7 @@ fn phase_b_previous_config_digest(
             template,
             previous,
             previous_eliotd_digest,
+            provisioned_supervision_authority,
         )?
     {
         return Err(HostError::RecoveryRequired(
@@ -2240,6 +2256,7 @@ fn phase_b_live_launch(
     descriptor: &ProcessAuthorityHandoffDescriptor,
     authority_descriptor_digest: &PlatformHandle,
     eliotd_descriptor_digest: &PlatformHandle,
+    provisioned_supervision_authority: &ProvisionedSupervisionAuthority,
 ) -> Result<RuntimeLaunchDescriptor, HostError> {
     let live = template
         .with_phase_b_pending_bootstrap_overlay(
@@ -2247,6 +2264,7 @@ fn phase_b_live_launch(
             descriptor.state_fence.clone(),
             authority_descriptor_digest.clone(),
             eliotd_descriptor_digest.clone(),
+            provisioned_supervision_authority.clone(),
         )
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let mut live = live;
@@ -9512,6 +9530,11 @@ impl HostComposition {
             host_owner_epoch: receipt.host_owner_epoch.clone(),
             host_process_identity: receipt.host_process_identity.clone(),
             public_receipt_digest: receipt.receipt_digest.clone(),
+            provisioned_supervision_authority: prepared
+                .launch
+                .provisioned_supervision_authority()
+                .map_err(HostError::Installation)?
+                .clone(),
         })
     }
 
@@ -11639,6 +11662,47 @@ impl HostComposition {
         }
         Self::validate_launch_options_for_manifest(&self.launch_options, manifest)?;
         let launch_template = &manifest.runtime_launch;
+        let provisioned_supervision_authority =
+            if let Some(pending) = self.registry.pending_activation() {
+                pending
+                    .phase_b_intent
+                    .as_ref()
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "pending Phase-B activation has no supervision authority receipt"
+                                .to_owned(),
+                        )
+                    })?
+                    .provisioned_supervision_authority
+                    .clone()
+            } else {
+                durable_prior_binding
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "active Phase-B rebind requires the committed supervision authority"
+                                .to_owned(),
+                        )
+                    })?
+                    .provisioned_supervision_authority
+                    .clone()
+            };
+        provisioned_supervision_authority
+            .validate()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        if provisioned_supervision_authority.candidate_generation != manifest.generation.as_str()
+            || provisioned_supervision_authority.authority_generation
+                != launch_template.authority_generation
+            || provisioned_supervision_authority
+                .trust_anchor
+                .installation_id
+                != launch_template.installation_epoch.installation.as_str()
+            || provisioned_supervision_authority.supervision_lease_id
+                != launch_template.supervision_lease_id()
+        {
+            return Err(HostError::RecoveryRequired(
+                "supervision authority is foreign to the approved Phase-A launch".to_owned(),
+            ));
+        }
         let portable_root = if launch_template.profile == InstallationProfile::PortableDev {
             Some(
                 UserOwnedRootLease::open_existing(Path::new(
@@ -11785,6 +11849,7 @@ impl HostComposition {
             &authority,
             &authority_descriptor_digest,
             &launch_template.eliotd_descriptor_digest,
+            &provisioned_supervision_authority,
         )?;
         eliotd_descriptor.authority_epoch =
             live_launch_template.authority_state_fence.authority_epoch;
@@ -11825,6 +11890,7 @@ impl HostComposition {
             &authority,
             &authority_descriptor_digest,
             &eliotd_descriptor_digest,
+            &provisioned_supervision_authority,
         )?;
 
         {
@@ -11881,6 +11947,7 @@ impl HostComposition {
             launch_template,
             previous_binding.as_ref(),
             previous_eliotd_digest.as_ref(),
+            &provisioned_supervision_authority,
         )?;
         if let Some(durable) = durable_prior_binding
             && previous_config_digest
@@ -11963,6 +12030,7 @@ impl HostComposition {
                     launch_template,
                     previous,
                     previous_eliotd_digest.as_ref(),
+                    &provisioned_supervision_authority,
                 )
             })
             .transpose()?;
@@ -11973,6 +12041,7 @@ impl HostComposition {
                     launch_template,
                     previous,
                     previous_eliotd_digest.as_ref(),
+                    &provisioned_supervision_authority,
                 )
             })
             .transpose()?;
@@ -12382,6 +12451,7 @@ impl HostComposition {
             &self.host,
             &self.activation_generation.current,
             &intent,
+            prior_binding.provisioned_supervision_authority(),
         )?;
         let mut materialization = self.materialize_phase_b(
             manifest,
@@ -13866,6 +13936,11 @@ impl HostComposition {
                         "Phase-B commit is missing its public receipt digest".to_owned(),
                     )
                 })?,
+                provisioned_supervision_authority: phase_b
+                    .launch
+                    .provisioned_supervision_authority()
+                    .map_err(HostError::Installation)?
+                    .clone(),
             }),
             authority_generation: phase_b.launch.authority_generation,
             authority_state_fence: phase_b.launch.authority_state_fence.clone(),
@@ -15020,6 +15095,47 @@ fn owner_lease_release_error(error: HostOwnerLeaseReleaseError) -> HostError {
     ))
 }
 
+#[cfg(test)]
+fn test_provisioned_supervision_authority(
+    installation_id: &str,
+    candidate_generation: &str,
+    authority_generation: ResourceGeneration,
+) -> ProvisionedSupervisionAuthority {
+    let signer = eliot_runtime_contracts::Ed25519SupervisionLeaseSigner::from_secret_key(
+        "eliot-kernel",
+        "test-supervision-key",
+        [0x39; 32],
+    )
+    .unwrap_or_else(|_| unreachable!());
+    let trust_anchor = eliot_runtime_contracts::SupervisionTrustAnchor::new(
+        installation_id,
+        "eliot-kernel",
+        "test-supervision-key",
+        signer.public_key().to_vec(),
+    )
+    .unwrap_or_else(|_| unreachable!());
+    let key_reference = eliot_runtime_contracts::SupervisionSealedKeyReference::new(
+        "test-supervision-authority.sealed",
+        "S-1-5-80-1-2-3-4-5",
+        eliot_runtime_contracts::SupervisionSealedKeyFileIdentity {
+            canonical_path_digest: "1".repeat(64),
+            volume_serial_number: 7,
+            file_index: 11,
+            security_descriptor_digest: "2".repeat(64),
+        },
+        "3".repeat(64),
+    )
+    .unwrap_or_else(|_| unreachable!());
+    ProvisionedSupervisionAuthority::new(
+        "test-supervision-lease",
+        candidate_generation,
+        authority_generation,
+        key_reference,
+        trust_anchor,
+    )
+    .unwrap_or_else(|_| unreachable!())
+}
+
 #[cfg(all(test, windows))]
 mod watchdog_service_tests {
     use super::*;
@@ -15619,6 +15735,11 @@ mod watchdog_service_tests {
                 pending_scm_launch.authority_state_fence.clone(),
                 launch.authority_descriptor_digest.clone(),
                 launch.eliotd_descriptor_digest.clone(),
+                test_provisioned_supervision_authority(
+                    launch.installation_epoch.installation.as_str(),
+                    launch.generation.as_str(),
+                    launch.authority_generation,
+                ),
             )
             .unwrap_or_else(|_| unreachable!());
         let live_overlay = intermediate
@@ -16446,6 +16567,9 @@ mod journal_tests {
                 AuthorityEpoch::genesis(),
                 ResourceGeneration::genesis(),
             ),
+            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
+                supervision_lease_id: handle("test-supervision-lease"),
+            },
             authority_descriptor_path: authority_path.clone(),
             authority_descriptor_digest: handle("9".repeat(64)),
             runtime_state_roots: runtime_state_roots.clone(),
@@ -17789,6 +17913,11 @@ mod journal_tests {
             host_owner_epoch: handle("prior-owner"),
             host_process_identity: handle(&"4".repeat(64)),
             public_receipt_digest: handle(&"e".repeat(64)),
+            provisioned_supervision_authority: test_provisioned_supervision_authority(
+                "installation",
+                "candidate",
+                ResourceGeneration::genesis(),
+            ),
         };
         let fresh_intent = ActivePhaseBRebindIntent::new(
             handle(&"b".repeat(64)),

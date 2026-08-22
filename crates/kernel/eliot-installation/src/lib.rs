@@ -35,12 +35,17 @@ use eliot_platform_windows::{
     ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
     ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
     ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection, ServiceStartMode,
-    ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, TrustedSourceBundle,
-    UserOwnedPathLease, UserOwnedRootReadLease, WindowsInstallerRootPrimitive,
-    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
+    ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
+    SupervisionAuthorityKeyStoreRequest, TrustedSourceBundle, UserOwnedPathLease,
+    UserOwnedRootReadLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
+    WindowsPlatform, WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
     current_user_local_app_data_root, fresh_service_registration_nonce,
     observe_running_eliot_host_process, protected_program_data_root,
-    require_protected_program_data_path,
+    require_protected_program_data_path, resolve_service_sid,
+};
+pub use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
+use eliot_runtime_contracts::{
+    SUPERVISION_AUTHORITY_HOST_SERVICE, SUPERVISION_AUTHORITY_SERVICE_SID_TYPE,
 };
 use redb::{
     Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, TableHandle,
@@ -50,6 +55,47 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+
+#[cfg(test)]
+fn test_provisioned_supervision_authority(
+    installation_id: &str,
+    candidate_generation: &str,
+    authority_generation: ResourceGeneration,
+) -> ProvisionedSupervisionAuthority {
+    let signer = eliot_runtime_contracts::Ed25519SupervisionLeaseSigner::from_secret_key(
+        "eliot-kernel",
+        "test-supervision-key",
+        [0x39; 32],
+    )
+    .unwrap_or_else(|_| unreachable!());
+    let trust_anchor = eliot_runtime_contracts::SupervisionTrustAnchor::new(
+        installation_id,
+        "eliot-kernel",
+        "test-supervision-key",
+        signer.public_key().to_vec(),
+    )
+    .unwrap_or_else(|_| unreachable!());
+    let key_reference = eliot_runtime_contracts::SupervisionSealedKeyReference::new(
+        "test-supervision-authority.sealed",
+        "S-1-5-80-1-2-3-4-5",
+        eliot_runtime_contracts::SupervisionSealedKeyFileIdentity {
+            canonical_path_digest: "1".repeat(64),
+            volume_serial_number: 7,
+            file_index: 11,
+            security_descriptor_digest: "2".repeat(64),
+        },
+        "3".repeat(64),
+    )
+    .unwrap_or_else(|_| unreachable!());
+    ProvisionedSupervisionAuthority::new(
+        "test-supervision-lease",
+        candidate_generation,
+        authority_generation,
+        key_reference,
+        trust_anchor,
+    )
+    .unwrap_or_else(|_| unreachable!())
+}
 
 mod credential_provision;
 mod package_planner;
@@ -91,9 +137,9 @@ const LEGACY_PHASE_B_ZERO_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 /// Current installation contract revision.
 ///
-/// Version 3 makes the approved Host executable path and content digest
-/// required members of the CandidateManifest/RuntimeLaunchDescriptor wire.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
+/// Version 4 makes the typed pending/provisioned supervision authority a
+/// mandatory member of every RuntimeLaunchDescriptor projection.
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 /// Breaking wire revision for durable [`InstallationTransaction`] records.
 ///
 /// This discriminator is intentionally independent from [`CONTRACT_VERSION`]
@@ -106,18 +152,17 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 /// Version 13 adds the durable, ordered SCM start effects and their
 /// convergence deadline; version 15 is the canonical installer-owned SCM
 /// composition with Watchdog then Host Automatic `LocalService` starts and
-/// authoritative readback. Older wires require explicit migration and are
-/// never synthesized. Old transaction plans are never synthesized with those
-/// bindings; they require an explicit migration/re-stage.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(15, 0, 0);
+/// authoritative readback. Version 16 binds the installer-owned service-SID
+/// sealed supervision authority plan and Phase-B public provision receipt.
+/// Older wires require explicit migration and are never synthesized.
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(16, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
-/// Registry wire version 11 binds the Host-owned `ActiveVerified` Phase-B
-/// rebind lifecycle to the sequence-bound owner-epoch/digest v2 domain. V10
-/// and older projections are never defaulted into current activation
-/// authority; they require explicit re-stage.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(11, 0, 0);
+/// Registry wire version 12 binds the provisioned supervision authority into
+/// pending Phase-B receipts and committed/rebound live bindings. V11 and older
+/// projections are never defaulted into current authority.
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(12, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -1726,6 +1771,71 @@ pub struct CandidateManifest {
     pub runtime_launch: RuntimeLaunchDescriptor,
 }
 
+/// Strict Phase-B state for the installer-provisioned supervision authority.
+///
+/// Phase A retains only the stable lease identity selected by the immutable
+/// plan. The Host-owned Phase-B overlay may replace it exactly once with the
+/// installer receipt; serde never defaults or synthesizes an absent binding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum SupervisionAuthorityBinding {
+    /// Immutable Phase-A plan state. This state cannot sign or verify a lease.
+    Pending {
+        /// Stable lease identity selected by the generation planner.
+        supervision_lease_id: PlatformHandle,
+    },
+    /// Exact public receipt returned by the installer-owned key effect.
+    Provisioned {
+        /// Public authority binding. Only Kernel consumes `key_reference`.
+        authority: ProvisionedSupervisionAuthority,
+    },
+}
+
+impl SupervisionAuthorityBinding {
+    fn validate_for_launch(
+        &self,
+        launch: &RuntimeLaunchDescriptor,
+    ) -> Result<(), InstallationError> {
+        match self {
+            Self::Pending {
+                supervision_lease_id,
+            } => handle(
+                supervision_lease_id,
+                "runtime_launch.supervision_authority.supervision_lease_id",
+            ),
+            Self::Provisioned { authority } => {
+                authority
+                    .validate()
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "runtime_launch.supervision_authority".to_owned(),
+                        reason: error.to_string(),
+                    })?;
+                if authority.candidate_generation != launch.generation.as_str()
+                    || authority.authority_generation != launch.authority_generation
+                    || authority.trust_anchor.installation_id
+                        != launch.installation_epoch.installation.as_str()
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn lease_id(&self) -> &str {
+        match self {
+            Self::Pending {
+                supervision_lease_id,
+            } => supervision_lease_id.as_str(),
+            Self::Provisioned { authority } => &authority.supervision_lease_id,
+        }
+    }
+}
+
 /// Immutable, digest-bound process launch inputs owned by Host.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1750,6 +1860,10 @@ pub struct RuntimeLaunchDescriptor {
     /// replaces that typed pending state only with the digest of exact
     /// published authority bytes before child admission.
     pub authority_descriptor_digest: PlatformHandle,
+    /// Typed pending/provisioned supervision authority state. The immutable
+    /// candidate remains Pending; only a transaction-bound Phase-B overlay
+    /// carries the provisioned public receipt.
+    pub supervision_authority: SupervisionAuthorityBinding,
     /// Explicit profile-bound mutable runtime root topology.
     pub runtime_state_roots: RuntimeStateRoots,
     /// Explicit Kernel working directory.
@@ -1874,6 +1988,7 @@ impl RuntimeLaunchDescriptor {
             store_bootstrap_descriptor_digest,
             eliotd_descriptor_digest,
             false,
+            None,
         )
     }
 
@@ -1892,6 +2007,7 @@ impl RuntimeLaunchDescriptor {
         authority_state_fence: StateFence,
         authority_descriptor_digest: PlatformHandle,
         eliotd_descriptor_digest: PlatformHandle,
+        provisioned_supervision_authority: ProvisionedSupervisionAuthority,
     ) -> Result<Self, InstallationError> {
         if self.phase_b_digest_state()? != (PhaseBDigestState::Pending, PhaseBDigestState::Pending)
         {
@@ -1914,6 +2030,7 @@ impl RuntimeLaunchDescriptor {
             pending_bootstrap,
             eliotd_descriptor_digest,
             true,
+            Some(provisioned_supervision_authority),
         )
     }
 
@@ -1937,7 +2054,12 @@ impl RuntimeLaunchDescriptor {
     /// Requires both Host-owned Phase-B destinations to be live physical
     /// publications before a child process can be admitted.
     pub fn require_phase_b_live(&self) -> Result<(), InstallationError> {
-        if self.phase_b_digest_state()? == (PhaseBDigestState::Live, PhaseBDigestState::Live) {
+        if self.phase_b_digest_state()? == (PhaseBDigestState::Live, PhaseBDigestState::Live)
+            && matches!(
+                &self.supervision_authority,
+                SupervisionAuthorityBinding::Provisioned { .. }
+            )
+        {
             return Ok(());
         }
         Err(InstallationError::InvalidField {
@@ -1960,6 +2082,7 @@ impl RuntimeLaunchDescriptor {
         store_bootstrap_descriptor_digest: PlatformHandle,
         eliotd_descriptor_digest: PlatformHandle,
         allow_pending_bootstrap: bool,
+        provisioned_supervision_authority: Option<ProvisionedSupervisionAuthority>,
     ) -> Result<Self, InstallationError> {
         for (digest, field) in [
             (
@@ -1993,6 +2116,28 @@ impl RuntimeLaunchDescriptor {
             });
         }
         let mut overlay = self.clone();
+        match (
+            &self.supervision_authority,
+            provisioned_supervision_authority,
+        ) {
+            (
+                SupervisionAuthorityBinding::Pending {
+                    supervision_lease_id,
+                },
+                Some(authority),
+            ) if supervision_lease_id.as_str() == authority.supervision_lease_id => {
+                overlay.supervision_authority =
+                    SupervisionAuthorityBinding::Provisioned { authority };
+            }
+            (SupervisionAuthorityBinding::Provisioned { .. }, None) => {}
+            _ => {
+                return Err(InstallationError::InvalidField {
+                    field: "runtime_launch.supervision_authority".to_owned(),
+                    reason: "Phase-B overlay requires the exact planned lease identity and permits only Pending-to-Provisioned"
+                        .to_owned(),
+                });
+            }
+        }
         overlay.authority_generation = authority_generation;
         overlay.authority_state_fence = authority_state_fence;
         overlay.authority_descriptor_digest = authority_descriptor_digest;
@@ -2015,6 +2160,28 @@ impl RuntimeLaunchDescriptor {
             }
         })?;
         overlay.with_computed_digest()
+    }
+
+    /// Returns the exact installer-provisioned public authority after all
+    /// launch invariants have been checked. Pending candidates fail closed.
+    pub fn provisioned_supervision_authority(
+        &self,
+    ) -> Result<&ProvisionedSupervisionAuthority, InstallationError> {
+        self.validate()?;
+        match &self.supervision_authority {
+            SupervisionAuthorityBinding::Provisioned { authority } => Ok(authority),
+            SupervisionAuthorityBinding::Pending { .. } => {
+                Err(InstallationError::IncompleteObservation(
+                    "supervision authority is not provisioned".to_owned(),
+                ))
+            }
+        }
+    }
+
+    /// Returns the stable lease identity in either strict binding state.
+    #[must_use]
+    pub fn supervision_lease_id(&self) -> &str {
+        self.supervision_authority.lease_id()
     }
 
     fn expected_store_bridge_arguments(&self, config_path: &PlatformHandle) -> Vec<String> {
@@ -2171,6 +2338,7 @@ impl RuntimeLaunchDescriptor {
             authority_state_fence: &'a StateFence,
             authority_descriptor_path: &'a PlatformHandle,
             authority_descriptor_digest: &'a PlatformHandle,
+            supervision_authority: &'a SupervisionAuthorityBinding,
             runtime_state_roots: &'a RuntimeStateRoots,
             kernel_work_root: &'a PlatformHandle,
             kernel_artifact_digest: &'a PlatformHandle,
@@ -2206,6 +2374,7 @@ impl RuntimeLaunchDescriptor {
             authority_state_fence: &self.authority_state_fence,
             authority_descriptor_path: &self.authority_descriptor_path,
             authority_descriptor_digest: &self.authority_descriptor_digest,
+            supervision_authority: &self.supervision_authority,
             runtime_state_roots: &self.runtime_state_roots,
             kernel_work_root: &self.kernel_work_root,
             kernel_artifact_digest: &self.kernel_artifact_digest,
@@ -2277,6 +2446,26 @@ impl RuntimeLaunchDescriptor {
             &self.authority_descriptor_digest,
             "runtime_launch.authority_descriptor_digest",
         )?;
+        self.supervision_authority.validate_for_launch(self)?;
+        match self.phase_b_digest_state()? {
+            (PhaseBDigestState::Pending, PhaseBDigestState::Pending)
+                if matches!(
+                    &self.supervision_authority,
+                    SupervisionAuthorityBinding::Pending { .. }
+                ) => {}
+            (PhaseBDigestState::Live, _)
+                if matches!(
+                    &self.supervision_authority,
+                    SupervisionAuthorityBinding::Provisioned { .. }
+                ) => {}
+            _ => {
+                return Err(InstallationError::InvalidField {
+                    field: "runtime_launch.supervision_authority".to_owned(),
+                    reason: "authority state must be Pending only on the immutable Phase-A pair and Provisioned for every live authority overlay"
+                        .to_owned(),
+                });
+            }
+        }
         self.runtime_state_roots.validate()?;
         if self.runtime_state_roots.profile != self.profile {
             return Err(InstallationError::ProfileViolation(
@@ -3444,7 +3633,7 @@ impl HostPhaseBPreparedMaterialization {
     /// persisted v1 preparation therefore cannot be replayed as a current
     /// proof after a Host restart; its discriminator is rejected before any
     /// destination readback or mutation.
-    pub const WIRE: &'static str = "eliot.host.phase-b-prepared.v2";
+    pub const WIRE: &'static str = "eliot.host.phase-b-prepared.v3";
 
     /// Recomputes the prepared record digest without its self-reference.
     pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
@@ -3617,10 +3806,14 @@ pub struct PhaseBLiveBinding {
     pub host_process_identity: PlatformHandle,
     /// Digest of the public, secret-free Phase-B receipt.
     pub public_receipt_digest: PlatformHandle,
+    /// Exact installer-provisioned public authority retained after Pending is
+    /// consumed, so verifier-only processes never consult ambient state.
+    pub provisioned_supervision_authority: ProvisionedSupervisionAuthority,
 }
 
 impl PhaseBLiveBinding {
-    fn validate(&self) -> Result<(), InstallationError> {
+    /// Validates the complete physical receipt and public authority binding.
+    pub fn validate(&self) -> Result<(), InstallationError> {
         sha256_handle(&self.manifest_digest, "phase_b.manifest_digest")?;
         if phase_b_digest_state(
             &self.authority_descriptor_digest,
@@ -3669,7 +3862,19 @@ impl PhaseBLiveBinding {
         sha256_handle(&self.request_digest, "phase_b.request_digest")?;
         handle(&self.host_owner_epoch, "phase_b.host_owner_epoch")?;
         sha256_handle(&self.host_process_identity, "phase_b.host_process_identity")?;
-        sha256_handle(&self.public_receipt_digest, "phase_b.public_receipt_digest")
+        sha256_handle(&self.public_receipt_digest, "phase_b.public_receipt_digest")?;
+        self.provisioned_supervision_authority
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "phase_b.provisioned_supervision_authority".to_owned(),
+                reason: error.to_string(),
+            })
+    }
+
+    /// Returns the exact public authority retained by the active registry
+    /// terminal. Consumers must ignore its Kernel-only key reference.
+    pub const fn provisioned_supervision_authority(&self) -> &ProvisionedSupervisionAuthority {
+        &self.provisioned_supervision_authority
     }
 }
 
@@ -4589,7 +4794,6 @@ pub struct ActivationCommitFence {
     /// Exact Host-owned Phase-B authority/bootstrap/epoch proof. This is
     /// separate from the immutable candidate manifest and is mandatory for
     /// every committed activation.
-    #[serde(default)]
     pub phase_b_live_binding: Option<PhaseBLiveBinding>,
     /// Runtime authority resource generation.
     pub authority_generation: ResourceGeneration,
@@ -4637,11 +4841,17 @@ impl ActivationCommitFence {
                 )
             })?
             .validate()?;
-        if self
-            .phase_b_live_binding
-            .as_ref()
-            .is_some_and(|binding| binding.config_file_digest != self.materialized_config_digest)
-        {
+        if self.phase_b_live_binding.as_ref().is_some_and(|binding| {
+            binding.config_file_digest != self.materialized_config_digest
+                || binding
+                    .provisioned_supervision_authority
+                    .candidate_generation
+                    != self.generation.as_str()
+                || binding
+                    .provisioned_supervision_authority
+                    .authority_generation
+                    != self.authority_generation
+        }) {
             return Err(InstallationError::IdentityConflict);
         }
         if self.authority_generation.value() == 0 {
@@ -5775,7 +5985,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
         .and_then(serde_json::Value::as_u64);
     if declared_major == Some(10) {
         return Err(InstallationError::MigrationRequired {
-            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v11; nested authority is never synthesized or adopted"
+            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v12; nested authority is never synthesized or adopted"
                 .to_owned(),
         });
     }
@@ -5783,7 +5993,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
         && current_registry_wire_missing_field(&value)
     {
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v11 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v12 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
@@ -5821,7 +6031,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             });
         }
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v11 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v12 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
@@ -7203,6 +7413,70 @@ impl ApprovedGenerationRegistry {
         self.pending_activation.as_ref()
     }
 
+    /// Returns the exact durable public supervision authority for one selected
+    /// generation. Pending candidates are exposed only after intent,
+    /// preparation and physical receipt all agree on a live Phase-B launch.
+    /// Active candidates resolve from the committed fence, or from a fully
+    /// receipted active rebind that preserves that exact authority.
+    pub fn provisioned_supervision_authority_for_generation(
+        &self,
+        generation: &PlatformHandle,
+    ) -> Result<Option<&ProvisionedSupervisionAuthority>, InstallationError> {
+        self.validate()?;
+        if let Some(pending) = self
+            .pending_activation
+            .as_ref()
+            .filter(|pending| pending.manifest.generation == *generation)
+        {
+            let (Some(intent), Some(prepared), Some(receipt)) = (
+                pending.phase_b_intent.as_ref(),
+                pending.phase_b_prepared.as_ref(),
+                pending.phase_b_receipt.as_ref(),
+            ) else {
+                return Ok(None);
+            };
+            prepared.launch.require_phase_b_live()?;
+            let launch_authority = prepared.launch.provisioned_supervision_authority()?;
+            if launch_authority != &intent.provisioned_supervision_authority
+                || launch_authority != &receipt.provisioned_supervision_authority
+                || launch_authority.candidate_generation != generation.as_str()
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            return Ok(Some(&receipt.provisioned_supervision_authority));
+        }
+        if self.active_generation.as_ref() != Some(generation) {
+            return Ok(None);
+        }
+        let committed = self
+            .last_committed_activation_fence()
+            .and_then(|fence| fence.phase_b_live_binding.as_ref())
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "active generation has no committed Phase-B authority".to_owned(),
+                )
+            })?;
+        let committed_authority = committed.provisioned_supervision_authority();
+        if committed_authority.candidate_generation != generation.as_str() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if let Some(rebind) = self.active_phase_b_rebind.as_ref()
+            && rebind.receipt.is_some()
+        {
+            let rebound_authority = rebind
+                .prepared
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?
+                .launch
+                .provisioned_supervision_authority()?;
+            if rebound_authority != committed_authority {
+                return Err(InstallationError::IdentityConflict);
+            }
+            return Ok(Some(rebound_authority));
+        }
+        Ok(Some(committed_authority))
+    }
+
     /// Returns the durable `ActiveVerified` Phase-B rebind lifecycle, if one has
     /// been started by the Host owner.
     #[must_use]
@@ -8137,6 +8411,14 @@ impl ApprovedGenerationRegistry {
             rebind
                 .intent
                 .validate_against_prior_binding(prior_binding)?;
+            if let Some(prepared) = rebind.prepared.as_ref() {
+                prepared.launch.require_phase_b_live()?;
+                if prepared.launch.provisioned_supervision_authority()?
+                    != prior_binding.provisioned_supervision_authority()
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
             for recovery in &rebind.recovery_history {
                 if recovery.prior_terminal_digest != terminal_digest {
                     return Err(InstallationError::IdentityConflict);
@@ -8687,6 +8969,85 @@ pub struct PackageArtifactDigest {
     pub sha256: PlatformHandle,
 }
 
+/// Immutable installer plan for one service-SID sealed supervision signer.
+///
+/// The exact SID text is resolved from the already registered canonical Host
+/// service immediately before create and is retained in the resulting public
+/// receipt. No private key or ambient path crosses this plan boundary.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionAuthorityProvisionPlan {
+    /// Installation identity pinned into the trust anchor.
+    pub installation_id: PlatformHandle,
+    /// Exact candidate generation that owns the key.
+    pub candidate_generation: PlatformHandle,
+    /// Authority lifecycle generation.
+    pub authority_generation: ResourceGeneration,
+    /// Stable lease identity selected in the Phase-A launch template.
+    pub supervision_lease_id: PlatformHandle,
+    /// Exact Kernel signer identity.
+    pub signer_id: PlatformHandle,
+    /// Generation-specific external key identity.
+    pub key_id: PlatformHandle,
+    /// Approved Kernel work root used as the sole resolution base.
+    pub kernel_root: PlatformHandle,
+    /// Single canonical file name below `kernel_root`.
+    pub sealed_key_relative_path: PlatformHandle,
+    /// Canonical SCM service whose SID is the DPAPI-NG principal.
+    pub host_service_name: PlatformHandle,
+    /// Required SCM service SID type (`UNRESTRICTED`).
+    pub service_sid_type: u32,
+}
+
+impl SupervisionAuthorityProvisionPlan {
+    fn validate(&self) -> Result<(), InstallationError> {
+        for (value, field) in [
+            (
+                &self.installation_id,
+                "supervision_authority.installation_id",
+            ),
+            (
+                &self.candidate_generation,
+                "supervision_authority.candidate_generation",
+            ),
+            (
+                &self.supervision_lease_id,
+                "supervision_authority.supervision_lease_id",
+            ),
+            (&self.signer_id, "supervision_authority.signer_id"),
+            (&self.key_id, "supervision_authority.key_id"),
+            (
+                &self.host_service_name,
+                "supervision_authority.host_service_name",
+            ),
+        ] {
+            handle(value, field)?;
+        }
+        approved_path(&self.kernel_root, "supervision_authority.kernel_root")?;
+        let relative = self.sealed_key_relative_path.as_str();
+        handle(
+            &self.sealed_key_relative_path,
+            "supervision_authority.sealed_key_relative_path",
+        )?;
+        if Path::new(relative).components().count() != 1
+            || relative.contains(['/', '\\', ':'])
+            || matches!(relative, "." | "..")
+        {
+            return Err(InstallationError::InvalidField {
+                field: "supervision_authority.sealed_key_relative_path".to_owned(),
+                reason: "must be one canonical component below the Kernel root".to_owned(),
+            });
+        }
+        if self.authority_generation.value() == 0
+            || self.host_service_name.as_str() != SUPERVISION_AUTHORITY_HOST_SERVICE
+            || self.service_sid_type != SUPERVISION_AUTHORITY_SERVICE_SID_TYPE
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
 /// One immutable installer effect owned by the enclosing
 /// [`InstallationTransaction`]. The elevated adapter reports observations
 /// through the existing transaction coordinator.
@@ -8785,6 +9146,8 @@ pub enum InstallerEffectPlan {
         host_state_root_digest: PlatformHandle,
         /// Exact immutable Watchdog selector binding.
         watchdog_selector_digest: PlatformHandle,
+        /// Installer-owned service-SID sealed signing-key effect plan.
+        supervision_authority: SupervisionAuthorityProvisionPlan,
         /// Exact bundled credential provision contract repeated for Host
         /// admission; no secret bytes cross this boundary.
         provision: StoreCredentialProvisionPlan,
@@ -8917,6 +9280,7 @@ impl InstallerEffectPlan {
                 static_template,
                 host_state_root_digest,
                 watchdog_selector_digest,
+                supervision_authority,
                 provision,
                 ..
             } => {
@@ -8933,6 +9297,7 @@ impl InstallerEffectPlan {
                     watchdog_selector_digest,
                     "installer_effect.watchdog_selector_digest",
                 )?;
+                supervision_authority.validate()?;
                 provision.validate()
             }
         }
@@ -9007,12 +9372,21 @@ fn validate_phase_b_effect_bindings(
             static_template,
             host_state_root_digest,
             watchdog_selector_digest,
+            supervision_authority,
             ..
         } = effect
             && (candidate_manifest_digest != &expected_manifest_digest
                 || static_template != &expected_template
                 || host_state_root_digest != &expected_root_digest
-                || watchdog_selector_digest != &expected_watchdog_digest)
+                || watchdog_selector_digest != &expected_watchdog_digest
+                || supervision_authority.installation_id
+                    != candidate.runtime_launch.installation_epoch.installation
+                || supervision_authority.candidate_generation != candidate.generation
+                || supervision_authority.authority_generation
+                    != candidate.runtime_launch.authority_generation
+                || supervision_authority.supervision_lease_id.as_str()
+                    != candidate.runtime_launch.supervision_lease_id()
+                || supervision_authority.kernel_root != candidate.runtime_launch.kernel_work_root)
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -10733,6 +11107,16 @@ impl InstallationTransaction {
                     reason: "applied Phase-B effect requires its typed receipt".to_owned(),
                 });
             }
+            if self.stage == InstallationStage::RolledBack
+                && matches!(effect, InstallerEffectPlan::MaterializePhaseB { .. })
+                && !matches!(progress.state, InstallationEffectProgressState::Pending)
+            {
+                return Err(InstallationError::InvalidField {
+                    field: "effect_progress.phase_b_receipt".to_owned(),
+                    reason: "a transaction with any Phase-B authority intent or live binding cannot be reported RolledBack"
+                        .to_owned(),
+                });
+            }
             match (
                 &progress.state,
                 effect,
@@ -11709,9 +12093,11 @@ impl InstallationEffectRequest {
             (
                 InstallerEffectPlan::MaterializePhaseB { .. },
                 InstallationEffectAction::Apply,
-                None,
+                Some(ownership),
             ) if self.precondition.credential_snapshot.is_none()
-                && self.store_credential.is_some() => {}
+                && self.store_credential.is_some()
+                && ownership.lifecycle == InstallationSecretLifecycle::Active
+                && ownership.create_disposition == InstallationCreateDisposition::Created => {}
             _ => {
                 return Err(InstallationError::InvalidField {
                     field: "effect.ownership_secret".to_owned(),
@@ -11755,7 +12141,10 @@ impl InstallationEffectRequest {
                 InstallationEffectAction::Apply,
                 Some(progress),
             ) if progress.lifecycle == StoreCredentialLifecycle::Active
-                && self.ownership_secret.is_none()
+                && self.ownership_secret.as_ref().is_some_and(|ownership| {
+                    ownership.lifecycle == InstallationSecretLifecycle::Active
+                        && ownership.create_disposition == InstallationCreateDisposition::Created
+                })
                 && self.precondition.credential_snapshot.is_none() => {}
             (InstallerEffectPlan::ProvisionStoreCredential { .. }, _, _) => {
                 return Err(InstallationError::InvalidField {
@@ -12176,6 +12565,7 @@ struct WindowsInstallationEffectPort {
     primitive: WindowsInstallerRootPrimitive,
     secrets: WindowsInstallerSecretProvider,
     store_target_generator: WindowsStoreCredentialTargetGenerator,
+    supervision_keys: WindowsSupervisionAuthorityKeyStore,
 }
 
 impl WindowsInstallationEffectPort {
@@ -12184,6 +12574,7 @@ impl WindowsInstallationEffectPort {
             primitive: WindowsInstallerRootPrimitive::new(),
             secrets: WindowsInstallerSecretProvider::new(),
             store_target_generator: WindowsStoreCredentialTargetGenerator::new(),
+            supervision_keys: WindowsSupervisionAuthorityKeyStore::new(),
         }
     }
 
@@ -12509,6 +12900,7 @@ impl WindowsInstallationEffectPort {
     }
 
     fn phase_b_request(
+        &self,
         request: &InstallationEffectRequest,
         operation: HostCredentialControlOperation,
     ) -> Result<HostCredentialControlRequest, PortError> {
@@ -12517,6 +12909,7 @@ impl WindowsInstallationEffectPort {
             static_template,
             host_state_root_digest,
             watchdog_selector_digest,
+            supervision_authority,
             provision,
             ..
         } = &request.plan
@@ -12533,6 +12926,54 @@ impl WindowsInstallationEffectPort {
             .map_err(|_| PortError::InvalidRequestMetadata)?;
         let credential_receipt_digest = phase_b_credential_receipt_digest(receipt)
             .map_err(|_| PortError::InvalidRequestMetadata)?;
+        let mut ownership_key = self.credential_secret(request)?;
+        let host_service_sid =
+            resolve_service_sid(supervision_authority.host_service_name.as_str())
+                .map_err(secret_port_error)?;
+        let profile_anchor =
+            protected_program_data_root().map_err(|_| PortError::InvalidRequestMetadata)?;
+        let spec = InstallerRootPrimitiveSpec {
+            root: PathBuf::from(supervision_authority.kernel_root.as_str()),
+            installation_root: PathBuf::from(request.installation_root.as_str()),
+            profile_anchor,
+            profile: InstallerRootProfile::SystemService,
+        };
+        let key_request = SupervisionAuthorityKeyStoreRequest {
+            transaction_id: request.transaction_id.as_str().to_owned(),
+            effect_id: request.effect_id.as_str().to_owned(),
+            installation_plan_digest: request.plan_digest.as_str().to_owned(),
+            installation_id: supervision_authority.installation_id.as_str().to_owned(),
+            candidate_generation: supervision_authority
+                .candidate_generation
+                .as_str()
+                .to_owned(),
+            authority_generation: supervision_authority.authority_generation,
+            supervision_lease_id: supervision_authority
+                .supervision_lease_id
+                .as_str()
+                .to_owned(),
+            signer_id: supervision_authority.signer_id.as_str().to_owned(),
+            key_id: supervision_authority.key_id.as_str().to_owned(),
+            kernel_root: PathBuf::from(supervision_authority.kernel_root.as_str()),
+            relative_path: supervision_authority
+                .sealed_key_relative_path
+                .as_str()
+                .to_owned(),
+            expected_host_service_sid: host_service_sid,
+        };
+        let provisioned_result = match operation {
+            HostCredentialControlOperation::MaterializePhaseB => self
+                .supervision_keys
+                .create_or_reconcile(&spec, &key_request, &ownership_key),
+            HostCredentialControlOperation::ReconcilePhaseB => {
+                self.supervision_keys
+                    .inspect(&spec, &key_request, &ownership_key)
+            }
+            _ => return Err(PortError::InvalidRequestMetadata),
+        };
+        ownership_key.fill(0);
+        let provisioned_supervision_authority =
+            provisioned_result.map_err(supervision_key_port_error)?;
         let phase_b = HostPhaseBMaterializationIntent::new(
             request.transaction_id.clone(),
             request.effect_id.clone(),
@@ -12543,6 +12984,7 @@ impl WindowsInstallationEffectPort {
             host_state_root_digest.clone(),
             static_template.clone(),
             watchdog_selector_digest.clone(),
+            provisioned_supervision_authority,
         )
         .map_err(|_| PortError::InvalidRequestMetadata)?;
         let intent = HostCredentialControlIntent::new(
@@ -12570,7 +13012,7 @@ impl WindowsInstallationEffectPort {
         request: &InstallationEffectRequest,
         operation: HostCredentialControlOperation,
     ) -> PortOutcome<HostPhaseBMaterializationReceipt> {
-        let host_request = match Self::phase_b_request(request, operation) {
+        let host_request = match self.phase_b_request(request, operation) {
             Ok(request) => request,
             Err(error) => return PortOutcome::Error(error),
         };
@@ -12584,6 +13026,8 @@ impl WindowsInstallationEffectPort {
                     || receipt.effect_id != intent.effect_id
                     || receipt.candidate_manifest_digest != intent.candidate_manifest_digest
                     || receipt.request_digest != intent.request_digest
+                    || receipt.provisioned_supervision_authority
+                        != intent.provisioned_supervision_authority
                 {
                     return PortOutcome::Unknown(UnknownReason::Indeterminate);
                 }
@@ -14831,6 +15275,21 @@ fn secret_port_error(_error: eliot_platform_windows::WindowsAdapterError) -> Por
     })
 }
 
+fn supervision_key_port_error(error: SupervisionAuthorityKeyError) -> PortError {
+    let code = match error {
+        SupervisionAuthorityKeyError::InvalidBinding | SupervisionAuthorityKeyError::KeyInvalid => {
+            ProviderErrorCode::InvalidRequest
+        }
+        SupervisionAuthorityKeyError::AccessDenied => ProviderErrorCode::PermissionDenied,
+        SupervisionAuthorityKeyError::RandomUnavailable
+        | SupervisionAuthorityKeyError::ProviderUnavailable => ProviderErrorCode::Unavailable,
+    };
+    PortError::Provider(ProviderError {
+        code,
+        retryable: false,
+    })
+}
+
 fn host_port_error() -> PortError {
     PortError::Provider(ProviderError {
         code: ProviderErrorCode::Unavailable,
@@ -16294,6 +16753,31 @@ where
         if let Some(pending_ref) = unreconciled {
             return self.persist_quarantined(transaction, pending_ref);
         }
+        let retained_phase_b_effect = transaction
+            .installer_effects
+            .iter()
+            .zip(&transaction.effect_progress)
+            .find_map(|(effect, progress)| {
+                matches!(effect, InstallerEffectPlan::MaterializePhaseB { .. })
+                    .then_some(progress)
+                    .filter(|progress| {
+                        matches!(
+                            progress.state,
+                            InstallationEffectProgressState::Applied { .. }
+                        )
+                    })
+                    .map(|progress| progress.effect_id.clone())
+            });
+        if let Some(effect_id) = retained_phase_b_effect {
+            return self.persist_quarantined(
+                transaction,
+                PlatformHandle::new(format!(
+                    "quarantine:phase-b-authority-retained:{}",
+                    effect_id.as_str()
+                ))
+                .map_err(|error| platform_error(&error))?,
+            );
+        }
         let mut credential_absence_refs = Vec::new();
         for index in (0..transaction.effect_progress.len()).rev() {
             let InstallationEffectProgressState::Applied {
@@ -16971,6 +17455,19 @@ fn effect_request(
                 })
         })
         .flatten();
+    let inherited_ownership_secret = matches!(&plan, InstallerEffectPlan::MaterializePhaseB { .. })
+        .then(|| {
+            transaction
+                .installer_effects
+                .iter()
+                .zip(&transaction.effect_progress)
+                .find_map(|(effect, progress)| {
+                    matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
+                        .then(|| progress.ownership_secret.clone())
+                        .flatten()
+                })
+        })
+        .flatten();
     let is_service = matches!(
         &plan,
         InstallerEffectPlan::RegisterService { .. } | InstallerEffectPlan::StartService { .. }
@@ -16992,7 +17489,10 @@ fn effect_request(
             Some(precondition) => precondition.clone(),
             None => InstallationEffectPrecondition::from_change(change)?,
         },
-        ownership_secret: progress.ownership_secret.clone(),
+        ownership_secret: progress
+            .ownership_secret
+            .clone()
+            .or(inherited_ownership_secret),
         store_credential: progress
             .store_credential
             .clone()
@@ -17592,6 +18092,11 @@ mod tests {
                 host_owner_epoch: test_handle("host-owner:test"),
                 host_process_identity: test_handle("7".repeat(64)),
                 public_receipt_digest: test_handle("8".repeat(64)),
+                provisioned_supervision_authority: test_provisioned_supervision_authority(
+                    runtime.installation_epoch.installation.as_str(),
+                    manifest.generation.as_str(),
+                    runtime.authority_generation,
+                ),
             }),
             authority_generation: runtime.authority_generation,
             authority_state_fence: runtime.authority_state_fence.clone(),
@@ -17743,6 +18248,20 @@ mod tests {
                 },
                 host_state_root_digest: test_handle("b".repeat(64)),
                 watchdog_selector_digest: test_handle("c".repeat(64)),
+                supervision_authority: SupervisionAuthorityProvisionPlan {
+                    installation_id: test_handle("installation:test"),
+                    candidate_generation: test_handle("generation:candidate"),
+                    authority_generation: ResourceGeneration::genesis(),
+                    supervision_lease_id: test_handle("test-supervision-lease"),
+                    signer_id: test_handle("eliot-kernel"),
+                    key_id: test_handle("supervision-key:generation:candidate"),
+                    kernel_root: roots.kernel_work_root.clone(),
+                    sealed_key_relative_path: test_handle(
+                        "supervision-authority-generation-candidate.sealed",
+                    ),
+                    host_service_name: test_handle(SUPERVISION_AUTHORITY_HOST_SERVICE),
+                    service_sid_type: SUPERVISION_AUTHORITY_SERVICE_SID_TYPE,
+                },
                 provision,
             });
         }
@@ -17872,6 +18391,9 @@ mod tests {
                         eliot_contracts::AuthorityEpoch::genesis(),
                         ResourceGeneration::genesis(),
                     ),
+                    supervision_authority: SupervisionAuthorityBinding::Pending {
+                        supervision_lease_id: test_handle("test-supervision-lease"),
+                    },
                     authority_descriptor_path: test_path(&root, "authority.json"),
                     authority_descriptor_digest: test_handle("7".repeat(64)),
                     runtime_state_roots: runtime_state_roots.clone(),
@@ -17944,6 +18466,13 @@ mod tests {
                     watchdog_artifact_digest: test_handle("4".repeat(64)),
                     descriptor_digest: test_handle("0".repeat(64)),
                 };
+                descriptor.authority_descriptor_digest = test_handle(PHASE_B_PENDING_MARKER);
+                descriptor.store_bootstrap_descriptor_digest = test_handle(PHASE_B_PENDING_MARKER);
+                descriptor.kernel_arguments = descriptor
+                    .expected_kernel_arguments(&descriptor.store_config_path)
+                    .into_iter()
+                    .map(test_handle)
+                    .collect();
                 descriptor.descriptor_digest =
                     test_handle(sha256_hex(&must(descriptor.unsigned_bytes())));
                 descriptor
@@ -18273,10 +18802,12 @@ mod tests {
                 InstallerServiceRole::Host => "a".repeat(64),
                 InstallerServiceRole::Watchdog => "b".repeat(64),
             });
+            let descriptor_digest =
+                must(phase_b_scm_selector(&bootstrap.authority_descriptor_digest));
             let arguments = must(
                 ServiceBootstrapArguments::new(
                     Path::new(bootstrap.authority_descriptor_path.as_str()).to_path_buf(),
-                    bootstrap.authority_descriptor_digest.as_str(),
+                    descriptor_digest.as_str(),
                     bootstrap.installation_epoch.installation.as_str(),
                     bootstrap.authority_generation.value(),
                     Vec::<String>::new(),
@@ -18450,6 +18981,19 @@ mod tests {
                         config_file_digest: test_handle("8".repeat(64)),
                         store_bootstrap_descriptor_digest: test_handle("9".repeat(64)),
                         eliotd_descriptor_digest: test_handle("a".repeat(64)),
+                        provisioned_supervision_authority: test_provisioned_supervision_authority(
+                            transaction
+                                .candidate_manifest
+                                .runtime_launch
+                                .installation_epoch
+                                .installation
+                                .as_str(),
+                            transaction.candidate_manifest.generation.as_str(),
+                            transaction
+                                .candidate_manifest
+                                .runtime_launch
+                                .authority_generation,
+                        ),
                         receipt_digest: test_handle("0".repeat(64)),
                     };
                     receipt.receipt_digest = must(receipt.computed_digest());
@@ -22262,7 +22806,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_transaction_json_requires_explicit_migration_to_v15() {
+    fn v8_transaction_json_requires_explicit_migration_to_v16() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22276,7 +22820,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 15.0.0")
+                if reason.contains("requires explicit migration to 16.0.0")
         ));
     }
 
@@ -22325,7 +22869,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("wire 9.0.0 requires explicit migration to 15.0.0")
+                if reason.contains("wire 9.0.0 requires explicit migration to 16.0.0")
         ));
     }
 
@@ -22345,7 +22889,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_transaction_json_requires_explicit_migration_to_v15() {
+    fn v10_transaction_json_requires_explicit_migration_to_v16() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22371,12 +22915,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 10.0.0 requires explicit migration to 15.0.0")
+                if reason.contains("wire 10.0.0 requires explicit migration to 16.0.0")
         ));
     }
 
     #[test]
-    fn v13_transaction_json_requires_explicit_migration_to_v15() {
+    fn v13_transaction_json_requires_explicit_migration_to_v16() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22387,12 +22931,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 13.0.0 requires explicit migration to 15.0.0")
+                if reason.contains("wire 13.0.0 requires explicit migration to 16.0.0")
         ));
     }
 
     #[test]
-    fn v14_transaction_json_requires_explicit_migration_to_v15() {
+    fn v14_transaction_json_requires_explicit_migration_to_v16() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22403,7 +22947,20 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 14.0.0 requires explicit migration to 15.0.0")
+                if reason.contains("wire 14.0.0 requires explicit migration to 16.0.0")
+        ));
+    }
+
+    #[test]
+    fn v15_transaction_json_requires_explicit_migration_to_v16() {
+        let mut legacy = must(serde_json::to_value(planned_transaction()));
+        legacy["transaction_wire_version"] =
+            must(serde_json::to_value(ContractVersion::new(15, 0, 0)));
+        let bytes = must(serde_json::to_vec(&legacy));
+        assert!(matches!(
+            decode_installation_transaction_json(&bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("wire 15.0.0 requires explicit migration to 16.0.0")
         ));
     }
 
@@ -23128,6 +23685,19 @@ mod tests {
             must(phase_b_watchdog_selector_digest(
                 &transaction.candidate_manifest,
             )),
+            test_provisioned_supervision_authority(
+                transaction
+                    .candidate_manifest
+                    .runtime_launch
+                    .installation_epoch
+                    .installation
+                    .as_str(),
+                transaction.candidate_manifest.generation.as_str(),
+                transaction
+                    .candidate_manifest
+                    .runtime_launch
+                    .authority_generation,
+            ),
         ));
         let (_lease, capability) = live_host_capability();
         must(registry.record_pending_phase_b_intent(
@@ -23153,6 +23723,7 @@ mod tests {
                 phase_a_runtime_launch.authority_state_fence.clone(),
                 test_handle("3".repeat(64)),
                 test_handle("5".repeat(64)),
+                intent.provisioned_supervision_authority.clone(),
             ),
         );
         let phase_b_launch = must(phase_b_intermediate.with_phase_b_materialization(
@@ -23233,6 +23804,7 @@ mod tests {
             intent.host_state_root_digest.clone(),
             intent.static_template.clone(),
             intent.watchdog_selector_digest.clone(),
+            intent.provisioned_supervision_authority.clone(),
         )
         .unwrap_or_else(|_| unreachable!());
         assert!(matches!(
@@ -23746,7 +24318,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_registry_wire_requires_explicit_migration_to_v11() {
+    fn v9_registry_wire_requires_explicit_migration_to_v12() {
         let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object["registry_wire_version"] = serde_json::json!({
@@ -23763,7 +24335,7 @@ mod tests {
             matches!(
                 error,
                 InstallationError::MigrationRequired { ref reason }
-                    if reason.contains("registry wire 9.0.0") && reason.contains("11.0.0")
+                    if reason.contains("registry wire 9.0.0") && reason.contains("12.0.0")
             ),
             "unexpected raw v9 classification: {error:?}"
         );
@@ -23816,26 +24388,39 @@ mod tests {
             error,
             InstallationError::MigrationRequired { reason }
                 if reason.contains("wire v10")
-                    && reason.contains("re-stage as v11")
+                    && reason.contains("re-stage as v12")
                     && reason.contains("never synthesized or adopted")
         ));
     }
 
     #[test]
-    fn v11_registry_wire_round_trips_without_synthesizing_rebind_state() {
+    fn v11_registry_wire_requires_explicit_migration_to_v12() {
+        let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+        legacy["registry_wire_version"] =
+            must(serde_json::to_value(ContractVersion::new(11, 0, 0)));
+        let bytes = must(serde_json::to_vec(&legacy));
+        assert!(matches!(
+            decode_registry_bytes(&bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("registry wire 11.0.0") && reason.contains("12.0.0")
+        ));
+    }
+
+    #[test]
+    fn v12_registry_wire_round_trips_without_synthesizing_rebind_state() {
         let current = ApprovedGenerationRegistry::new();
         let bytes = must(serde_json::to_vec(&current));
         let decoded = must(decode_registry_bytes(&bytes));
         assert_eq!(decoded, current);
         assert_eq!(
             decoded.registry_wire_version(),
-            ContractVersion::new(11, 0, 0)
+            ContractVersion::new(12, 0, 0)
         );
         assert!(decoded.active_phase_b_rebind().is_none());
     }
 
     #[test]
-    fn v11_registry_wire_rejects_omitted_mandatory_rebind_member() {
+    fn v12_registry_wire_rejects_omitted_mandatory_rebind_member() {
         let mut current = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         current
             .as_object_mut()
@@ -26065,11 +26650,17 @@ mod tests {
         let authority_digest = test_handle("a".repeat(64));
         let eliotd_digest = test_handle("b".repeat(64));
         let bootstrap_digest = test_handle("c".repeat(64));
+        let provisioned_supervision_authority = test_provisioned_supervision_authority(
+            phase_a.installation_epoch.installation.as_str(),
+            phase_a.generation.as_str(),
+            phase_a.authority_generation,
+        );
         let intermediate = must(phase_a.with_phase_b_pending_bootstrap_overlay(
             phase_a.authority_generation,
             phase_a.authority_state_fence.clone(),
             authority_digest.clone(),
             eliotd_digest.clone(),
+            provisioned_supervision_authority,
         ));
         assert_eq!(
             must(intermediate.phase_b_digest_state()),
@@ -26452,6 +27043,44 @@ mod tests {
                 .completed_stage_refs
                 .iter()
                 .all(|r| !r.as_str().contains("recovery:rejected-to-rollback"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rollback_with_live_phase_b_authority_quarantines_without_external_effects() {
+        let mut transaction = fully_applied_system_registration_transaction();
+        transaction.stage = InstallationStage::RollbackRequired;
+        transaction.pending_external_changes = vec![test_handle("pending:phase-b-rollback")];
+        transaction.revision += 1;
+        must(transaction.validate());
+        let transaction_id = transaction.transaction_id.clone();
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(transaction))),
+            ..SharedStore::default()
+        };
+        let execute_count = Arc::new(Mutex::new(0usize));
+        let mut coordinator = InstallationCoordinator::new(
+            fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone()),
+            store.clone(),
+        );
+
+        let outcome = must(coordinator.rollback(&transaction_id));
+        assert!(matches!(
+            outcome,
+            InstallationStepOutcome::Quarantined { ref pending_refs }
+                if pending_refs.iter().any(|pending| {
+                    pending
+                        .as_str()
+                        .starts_with("quarantine:phase-b-authority-retained:")
+                })
+        ));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        assert_eq!(
+            must(store.load(&transaction_id))
+                .unwrap_or_else(|| unreachable!())
+                .stage(),
+            InstallationStage::Quarantined
         );
     }
 

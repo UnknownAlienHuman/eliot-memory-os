@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod installation_activation;
+mod supervision_authority;
 mod supervision_lease;
+mod watchdog_admission;
 
 pub use installation_activation::{
     Ed25519InstallationActivationApprovalSigner, INSTALLATION_ACTIVATION_CONTRACT_NAME,
@@ -33,6 +35,12 @@ pub use installation_activation::{
     VerifiedInstallationActivationApproval,
 };
 
+pub use supervision_authority::{
+    ProvisionedSupervisionAuthority, SUPERVISION_AUTHORITY_HOST_SERVICE,
+    SUPERVISION_AUTHORITY_SERVICE_SID_TYPE, SupervisionSealedKeyFileIdentity,
+    SupervisionSealedKeyReference, WINDOWS_SERVICE_SID_DPAPI_NG_PROVIDER,
+};
+
 pub use supervision_lease::{
     Ed25519SupervisionLeaseSigner, RegisteredActivityWakePolicy, SUPERVISION_LEASE_CONTRACT_NAME,
     SUPERVISION_LEASE_CONTRACT_VERSION, SUPERVISION_LEASE_PUBLIC_KEY_BYTES,
@@ -43,6 +51,10 @@ pub use supervision_lease::{
     SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionObservationScope,
     SupervisionOrsMirrorBinding, SupervisionTrustAnchor, VerifiedSupervisionLease,
     VerifiedSupervisionLeaseTerminalTransition,
+};
+pub use watchdog_admission::{
+    WATCHDOG_ADMISSION_SCHEMA, WATCHDOG_PUBLICATION_SCHEMA, WatchdogAdmissionTemplate,
+    WatchdogPublicationBundle, WatchdogPublicationError,
 };
 
 /// Stable wire name for this contract family.

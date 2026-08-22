@@ -16,7 +16,7 @@ use crate::{
     ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange,
     ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
     StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
-    candidate_manifest_digest as candidate_digest_fn, handle,
+    SupervisionAuthorityProvisionPlan, candidate_manifest_digest as candidate_digest_fn, handle,
     phase_b_static_template_for_candidate,
 };
 
@@ -1003,6 +1003,14 @@ impl GenerationPackagePlanner {
             "--eliotd-descriptor-sha256".to_owned(),
             eliotd_descriptor_digest.as_str().to_owned(),
         ])?;
+        let supervision_lease_id = PlatformHandle::new(format!(
+            "eliot-supervision-lease:v1:{}:{}",
+            input.installation_epoch.installation, input.generation
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "generation.supervision_lease_id".to_owned(),
+            reason: error.to_string(),
+        })?;
         let store_bridge_arguments = handle_vec(match input.profile {
             InstallationProfile::PortableDev => vec![
                 "--portable-dev-root".to_owned(),
@@ -1041,6 +1049,9 @@ impl GenerationPackagePlanner {
             authority_state_fence,
             authority_descriptor_path: authority_path,
             authority_descriptor_digest: phase_b_marker.clone(),
+            supervision_authority: crate::SupervisionAuthorityBinding::Pending {
+                supervision_lease_id: supervision_lease_id.clone(),
+            },
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
             kernel_artifact_digest: kernel_digest.clone(),
@@ -1308,6 +1319,52 @@ impl GenerationPackagePlanner {
                 static_template: phase_b_static_template.clone(),
                 host_state_root_digest: crate::phase_b_host_state_root_digest(&candidate)?,
                 watchdog_selector_digest: crate::phase_b_watchdog_selector_digest(&candidate)?,
+                supervision_authority: SupervisionAuthorityProvisionPlan {
+                    installation_id: input.installation_epoch.installation.clone(),
+                    candidate_generation: input.generation.clone(),
+                    authority_generation,
+                    supervision_lease_id: supervision_lease_id.clone(),
+                    signer_id: PlatformHandle::new("eliot-kernel").map_err(|error| {
+                        InstallationError::InvalidField {
+                            field: "generation.supervision_signer_id".to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?,
+                    key_id: PlatformHandle::new(format!(
+                        "eliot-supervision-key:v1:{}",
+                        input.generation
+                    ))
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "generation.supervision_key_id".to_owned(),
+                        reason: error.to_string(),
+                    })?,
+                    kernel_root: roots.kernel_work_root.clone(),
+                    sealed_key_relative_path: PlatformHandle::new(format!(
+                        "supervision-authority-{}.sealed",
+                        &hex_digest(
+                            format!(
+                                "{}\0{}\0{}",
+                                input.installation_epoch.installation,
+                                input.generation,
+                                authority_generation.value()
+                            )
+                            .as_bytes()
+                        )[..32]
+                    ))
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "generation.supervision_key_relative_path".to_owned(),
+                        reason: error.to_string(),
+                    })?,
+                    host_service_name: PlatformHandle::new(
+                        eliot_runtime_contracts::SUPERVISION_AUTHORITY_HOST_SERVICE,
+                    )
+                    .map_err(|error| InstallationError::InvalidField {
+                        field: "generation.supervision_host_service".to_owned(),
+                        reason: error.to_string(),
+                    })?,
+                    service_sid_type:
+                        eliot_runtime_contracts::SUPERVISION_AUTHORITY_SERVICE_SID_TYPE,
+                },
                 provision: StoreCredentialProvisionPlan {
                     host_state_root: roots.host_state_root.clone(),
                     expected_host_executable: candidate.host_executable_path.clone(),
@@ -1865,6 +1922,9 @@ mod tests {
                 eliot_contracts::AuthorityEpoch::genesis(),
                 eliot_contracts::ResourceGeneration::genesis(),
             ),
+            supervision_authority: crate::SupervisionAuthorityBinding::Pending {
+                supervision_lease_id: h("test-supervision-lease"),
+            },
             authority_descriptor_path: test_path(portable_root.as_str(), "authority.json"),
             authority_descriptor_digest: h("7".repeat(64)),
             runtime_state_roots: roots.clone(),

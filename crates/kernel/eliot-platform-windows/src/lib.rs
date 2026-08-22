@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 mod installer_authority_key;
 mod installer_root;
 mod package_staging;
+mod supervision_authority_key;
 mod tcp_listener_owner;
 
 pub use installer_authority_key::{
@@ -54,6 +55,11 @@ pub use package_staging::{
     StagedFileReceipt, StagingReceipt, TrustedSourceBundle, WindowsAuthenticodeVerifier,
     ordinal_cmp_str, ordinal_component_cmp, ordinal_eq_str, ordinal_path_cmp, parse_pe_coff,
     validate_package_relative_path,
+};
+pub use supervision_authority_key::{
+    SealedSupervisionAuthorityKey, SupervisionAuthorityKeyError,
+    SupervisionAuthorityKeyStoreRequest, WindowsSupervisionAuthorityKeyProvider,
+    WindowsSupervisionAuthorityKeyStore,
 };
 pub use tcp_listener_owner::{
     TcpListenerOwnerError, TcpListenerOwnerObservation, observe_loopback_tcp_listener_owner,
@@ -4579,6 +4585,24 @@ pub enum ServiceStartMode {
     Disabled,
 }
 
+/// Exact SCM service-SID mode admitted by the installation adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceSidType {
+    /// The service has no service SID in its process token.
+    None,
+    /// SCM adds the deterministic `NT SERVICE\\<name>` SID to the token.
+    Unrestricted,
+}
+
+impl ServiceSidType {
+    const fn raw(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Unrestricted => 1,
+        }
+    }
+}
+
 /// Canonical SCM names owned by the Runtime Live installer.
 pub const ELIOT_HOST_SERVICE_NAME: &str = "EliotHost";
 pub const ELIOT_WATCHDOG_SERVICE_NAME: &str = "EliotWatchdog";
@@ -4893,6 +4917,7 @@ pub struct ServiceRegistrationRequest {
     binary_path: PathBuf,
     start_mode: ServiceStartMode,
     account: ServiceAccount,
+    service_sid_type: ServiceSidType,
     bootstrap: Option<ServiceBootstrapArguments>,
     expected_current: Option<ServiceRegistrationCurrent>,
     expected_runtime_identity_digest: Option<String>,
@@ -4927,12 +4952,18 @@ impl ServiceRegistrationRequest {
         {
             return Err(WindowsAdapterError::InvalidInput);
         }
+        let service_sid_type = if service_name == ELIOT_HOST_SERVICE_NAME {
+            ServiceSidType::Unrestricted
+        } else {
+            ServiceSidType::None
+        };
         Ok(Self {
             service_name,
             display_name,
             binary_path,
             start_mode,
             account,
+            service_sid_type,
             bootstrap: None,
             expected_current: None,
             expected_runtime_identity_digest: None,
@@ -4998,6 +5029,12 @@ impl ServiceRegistrationRequest {
         self.account
     }
 
+    /// Returns the exact SCM service-SID mode required by this registration.
+    #[must_use]
+    pub const fn service_sid_type(&self) -> ServiceSidType {
+        self.service_sid_type
+    }
+
     #[must_use]
     pub fn bootstrap(&self) -> Option<&ServiceBootstrapArguments> {
         self.bootstrap.as_ref()
@@ -5047,6 +5084,7 @@ impl ServiceRegistrationRequest {
             0,
             &[],
             &[],
+            self.service_sid_type.raw(),
         )
     }
 
@@ -9104,7 +9142,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 #[cfg(windows)]
-fn fill_system_random(bytes: &mut [u8]) -> Result<(), WindowsAdapterError> {
+pub(crate) fn fill_system_random(bytes: &mut [u8]) -> Result<(), WindowsAdapterError> {
     use windows_sys::Win32::Security::Cryptography::{
         BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
     };
@@ -9127,7 +9165,7 @@ fn fill_system_random(bytes: &mut [u8]) -> Result<(), WindowsAdapterError> {
 }
 
 #[cfg(not(windows))]
-fn fill_system_random(_bytes: &mut [u8]) -> Result<(), WindowsAdapterError> {
+pub(crate) fn fill_system_random(_bytes: &mut [u8]) -> Result<(), WindowsAdapterError> {
     Err(WindowsAdapterError::Unavailable)
 }
 
@@ -10177,6 +10215,7 @@ fn service_configuration_digest(
     tag_id: u32,
     load_order_group: &[u16],
     dependencies: &[Vec<u16>],
+    service_sid_type: u32,
 ) -> String {
     let mut bytes = Vec::new();
     for (tag, value) in [(b'b', binary), (b'd', display), (b'a', account)] {
@@ -10206,6 +10245,7 @@ fn service_configuration_digest(
         (b's', start_type),
         (b'e', error_control),
         (b'g', tag_id),
+        (b'i', service_sid_type),
     ] {
         bytes.push(tag);
         bytes.extend(value.to_le_bytes());
@@ -10286,6 +10326,82 @@ fn sid_to_string(sid: windows_sys::Win32::Security::PSID) -> Result<String, Wind
     } else {
         Err(WindowsAdapterError::Failed)
     }
+}
+
+/// Resolves the exact deterministic SID for one canonical ELIOT SCM service.
+///
+/// The account alias is used only as an input to `LookupAccountNameW`; callers
+/// receive and persist the canonical `S-1-5-80-...` SID string. No DPAPI-NG
+/// descriptor is ever built from the alias.
+#[cfg(windows)]
+pub fn resolve_service_sid(service_name: &str) -> Result<String, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError};
+    use windows_sys::Win32::Security::{IsValidSid, LookupAccountNameW, SID_NAME_USE};
+    if !canonical_runtime_service_name(service_name) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let account = format!("NT SERVICE\\{service_name}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut sid_bytes = 0_u32;
+    let mut domain_chars = 0_u32;
+    let mut sid_use: SID_NAME_USE = 0;
+    let first = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            account.as_ptr(),
+            std::ptr::null_mut(),
+            &raw mut sid_bytes,
+            std::ptr::null_mut(),
+            &raw mut domain_chars,
+            &raw mut sid_use,
+        )
+    };
+    if first != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || sid_bytes == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    let mut sid = vec![0_u8; usize::try_from(sid_bytes).map_err(|_| WindowsAdapterError::Failed)?];
+    let domain_len = usize::try_from(domain_chars).map_err(|_| WindowsAdapterError::Failed)?;
+    let mut domain = vec![0_u16; domain_len.max(1)];
+    if unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            account.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &raw mut sid_bytes,
+            domain.as_mut_ptr(),
+            &raw mut domain_chars,
+            &raw mut sid_use,
+        )
+    } == 0
+        || unsafe { IsValidSid(sid.as_ptr().cast_mut().cast()) } == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+    let sid = sid_to_string(sid.as_mut_ptr().cast())?;
+    if !valid_service_sid_text(&sid) {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(sid)
+}
+
+#[cfg(not(windows))]
+pub fn resolve_service_sid(_service_name: &str) -> Result<String, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
+fn valid_service_sid_text(value: &str) -> bool {
+    let Some(tail) = value.strip_prefix("S-1-5-80-") else {
+        return false;
+    };
+    let parts = tail.split('-').collect::<Vec<_>>();
+    parts.len() == 5
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && part.parse::<u32>().is_ok()
+        })
 }
 
 #[cfg(windows)]
@@ -10646,6 +10762,26 @@ fn dpapi_unprotect(_protected: &[u8]) -> Result<CredentialSecret, WindowsAdapter
 }
 
 #[cfg(windows)]
+fn set_service_sid_type(
+    service: windows_sys::Win32::Foundation::HANDLE,
+    sid_type: ServiceSidType,
+) -> bool {
+    use windows_sys::Win32::System::Services::{
+        ChangeServiceConfig2W, SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_SID_INFO,
+    };
+    let info = SERVICE_SID_INFO {
+        dwServiceSidType: sid_type.raw(),
+    };
+    unsafe {
+        ChangeServiceConfig2W(
+            service,
+            SERVICE_CONFIG_SERVICE_SID_INFO,
+            (&raw const info).cast(),
+        ) != 0
+    }
+}
+
+#[cfg(windows)]
 fn register_service(
     request: &ServiceRegistrationRequest,
 ) -> Result<ServiceRegistrationOutcome, WindowsAdapterError> {
@@ -10654,8 +10790,9 @@ fn register_service(
     use windows_sys::Win32::Foundation::{ERROR_SERVICE_EXISTS, ERROR_SERVICE_MARKED_FOR_DELETE};
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, CreateServiceW, OpenSCManagerW, SC_MANAGER_CREATE_SERVICE,
-        SERVICE_AUTO_START, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_ERROR_NORMAL,
-        SERVICE_QUERY_STATUS, SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_DEMAND_START, SERVICE_DISABLED,
+        SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
+        SERVICE_WIN32_OWN_PROCESS,
     };
 
     if request.bootstrap().is_none() {
@@ -10712,7 +10849,7 @@ fn register_service(
             manager,
             service_name.as_ptr(),
             display_name.as_ptr(),
-            SERVICE_QUERY_STATUS,
+            SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
             SERVICE_WIN32_OWN_PROCESS,
             start_type,
             SERVICE_ERROR_NORMAL,
@@ -10739,6 +10876,13 @@ fn register_service(
             return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
         }
         return Err(windows_adapter_from_io(&error));
+    }
+    if !set_service_sid_type(service, request.service_sid_type()) {
+        unsafe {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+        }
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
     unsafe {
         CloseServiceHandle(service);
@@ -10835,11 +10979,12 @@ fn update_service_registration(
             display.as_ptr(),
         )
     };
+    let sid_changed = changed != 0 && set_service_sid_type(service, request.service_sid_type());
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
     }
-    if changed == 0 {
+    if !sid_changed {
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
     match inspect_service_registration(request) {
@@ -10955,6 +11100,7 @@ struct ServiceConfigurationReadback {
     start_type: u32,
     error_control: u32,
     tag_id: u32,
+    service_sid_type: u32,
 }
 
 #[cfg(windows)]
@@ -10972,6 +11118,7 @@ fn exact_service_configuration_matches(
         && configuration.load_order_group.is_empty()
         && configuration.dependencies.is_empty()
         && utf16_eq_ignore_ascii_case(&configuration.account, &expected_account)
+        && configuration.service_sid_type == request.service_sid_type().raw()
 }
 
 #[cfg(windows)]
@@ -10991,6 +11138,7 @@ fn service_current_matches(
             configuration.tag_id,
             &configuration.load_order_group,
             &configuration.dependencies,
+            configuration.service_sid_type,
         ) == expected.configuration_digest()
 }
 
@@ -11043,7 +11191,36 @@ fn query_service_configuration(
         start_type: config.dwStartType,
         error_control: config.dwErrorControl,
         tag_id: config.dwTagId,
+        service_sid_type: query_service_sid_type(service)?,
     })
+}
+
+#[cfg(windows)]
+fn query_service_sid_type(service: windows_sys::Win32::Foundation::HANDLE) -> Option<u32> {
+    use windows_sys::Win32::System::Services::{
+        QueryServiceConfig2W, SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_SID_INFO,
+        SERVICE_SID_TYPE_NONE, SERVICE_SID_TYPE_UNRESTRICTED,
+    };
+    let mut info = SERVICE_SID_INFO::default();
+    let mut required = 0_u32;
+    let size = u32::try_from(std::mem::size_of::<SERVICE_SID_INFO>()).ok()?;
+    if unsafe {
+        QueryServiceConfig2W(
+            service,
+            SERVICE_CONFIG_SERVICE_SID_INFO,
+            (&raw mut info).cast(),
+            size,
+            &raw mut required,
+        )
+    } == 0
+        || !matches!(
+            info.dwServiceSidType,
+            SERVICE_SID_TYPE_NONE | SERVICE_SID_TYPE_UNRESTRICTED
+        )
+    {
+        return None;
+    }
+    Some(info.dwServiceSidType)
 }
 
 #[cfg(windows)]
@@ -11688,7 +11865,11 @@ fn inspect_service_registration(
         }
         return ServiceRegistrationInspection::Unknown;
     };
-    let matches = exact_service_configuration_matches(request, &configuration);
+    let matches = exact_service_configuration_matches(request, &configuration)
+        && match request.service_sid_type() {
+            ServiceSidType::None => true,
+            ServiceSidType::Unrestricted => resolve_service_sid(request.service_name()).is_ok(),
+        };
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
@@ -13380,6 +13561,17 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("LocalService plan failed: {error}"));
         assert_eq!(request.account(), ServiceAccount::LocalService);
+        assert_eq!(request.service_sid_type(), ServiceSidType::Unrestricted);
+
+        let watchdog = ServiceRegistrationRequest::new(
+            ELIOT_WATCHDOG_SERVICE_NAME,
+            ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing")),
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+        )
+        .unwrap_or_else(|error| panic!("Watchdog LocalService plan failed: {error}"));
+        assert_eq!(watchdog.service_sid_type(), ServiceSidType::None);
     }
 
     #[test]
@@ -13573,6 +13765,7 @@ mod tests {
                 0,
                 &[],
                 &[],
+                request.service_sid_type().raw(),
             ),
             request.expected_configuration_digest()
         );
@@ -13731,6 +13924,7 @@ mod tests {
             start_type: 0x0000_0002,
             error_control: 0x0000_0001,
             tag_id: 0,
+            service_sid_type: request.service_sid_type().raw(),
         };
         let expected = ServiceRegistrationCurrent::new(
             ELIOT_HOST_SERVICE_NAME,
@@ -13744,6 +13938,7 @@ mod tests {
                 matching.tag_id,
                 &matching.load_order_group,
                 &matching.dependencies,
+                matching.service_sid_type,
             ),
         )
         .unwrap_or_else(|error| panic!("current failed: {error}"));
@@ -13804,6 +13999,7 @@ mod tests {
             start_type: 0x0000_0002,
             error_control: 0x0000_0001,
             tag_id: 0,
+            service_sid_type: request.service_sid_type().raw(),
         };
         assert!(exact_service_configuration_matches(&request, &matching));
         let mut wrong_binary = matching.clone();
@@ -13833,6 +14029,12 @@ mod tests {
         let mut wrong_tag = matching.clone();
         wrong_tag.tag_id = 7;
         assert!(!exact_service_configuration_matches(&request, &wrong_tag));
+        let mut wrong_sid_type = matching.clone();
+        wrong_sid_type.service_sid_type = 0;
+        assert!(!exact_service_configuration_matches(
+            &request,
+            &wrong_sid_type
+        ));
         let mut wrong_load_order_group = matching.clone();
         wrong_load_order_group.load_order_group = utf16_text("EliotGroup");
         assert!(!exact_service_configuration_matches(

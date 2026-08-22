@@ -11,7 +11,7 @@ use eliot_process::{
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
 };
-use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
+use eliot_runtime_contracts::{HealthVector, ProvisionedSupervisionAuthority, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -991,6 +991,9 @@ pub struct ProcessAuthorityHandoffDescriptor {
     pub generation: ResourceGeneration,
     pub revision_policy_binding: PlatformHandle,
     pub dispatch_key: SecretReference,
+    /// Installer-provisioned public supervision authority. The reference is
+    /// Kernel-root-relative and contains no signing bytes.
+    pub supervision_authority: ProvisionedSupervisionAuthority,
     pub descriptor_sha256: String,
     pub issued_at_ms: i64,
     pub expires_at_ms: i64,
@@ -999,7 +1002,7 @@ pub struct ProcessAuthorityHandoffDescriptor {
 
 impl ProcessAuthorityHandoffDescriptor {
     /// Current descriptor schema revision.
-    pub const CONTRACT_VERSION: u16 = 1;
+    pub const CONTRACT_VERSION: u16 = 2;
     /// Maximum number of contour references admitted in one handoff.
     pub const MAX_CONTOUR_REFS: usize = 32;
 
@@ -1123,6 +1126,17 @@ impl ProcessAuthorityHandoffDescriptor {
             });
         }
         handle(&self.dispatch_key.key, "dispatch_key.key")?;
+        self.supervision_authority
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "supervision_authority",
+                reason: "invalid installer-provisioned supervision authority",
+            })?;
+        if self.supervision_authority.authority_generation != self.generation {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "supervision_authority.authority_generation",
+            });
+        }
         if self.descriptor_sha256.len() != 64
             || !self
                 .descriptor_sha256
@@ -1162,6 +1176,42 @@ mod descriptor_tests {
         EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, StateFenceSnapshot,
     };
 
+    fn supervision_authority() -> ProvisionedSupervisionAuthority {
+        let signer = eliot_runtime_contracts::Ed25519SupervisionLeaseSigner::from_secret_key(
+            "eliot-kernel",
+            "supervision-key-1",
+            [0x39; 32],
+        )
+        .expect("test signer");
+        let anchor = eliot_runtime_contracts::SupervisionTrustAnchor::new(
+            "installation-1",
+            "eliot-kernel",
+            "supervision-key-1",
+            signer.public_key().to_vec(),
+        )
+        .expect("test trust anchor");
+        let reference = eliot_runtime_contracts::SupervisionSealedKeyReference::new(
+            "supervision-key-1.sealed",
+            "S-1-5-80-1-2-3-4-5",
+            eliot_runtime_contracts::SupervisionSealedKeyFileIdentity {
+                canonical_path_digest: "1".repeat(64),
+                volume_serial_number: 7,
+                file_index: 11,
+                security_descriptor_digest: "2".repeat(64),
+            },
+            "3".repeat(64),
+        )
+        .expect("test key reference");
+        ProvisionedSupervisionAuthority::new(
+            "supervision-lease-1",
+            "candidate-1",
+            ResourceGeneration::genesis(),
+            reference,
+            anchor,
+        )
+        .expect("test provisioned authority")
+    }
+
     fn descriptor() -> ProcessAuthorityHandoffDescriptor {
         let authority_id =
             eliot_process::DispatchAuthorityId::new("authority-1").expect("authority");
@@ -1195,6 +1245,7 @@ mod descriptor_tests {
             revision_policy_binding: PlatformHandle::new("policy-1").expect("policy"),
             dispatch_key: SecretReference::new("windows-credential-manager", "dispatch-key-1")
                 .expect("reference"),
+            supervision_authority: supervision_authority(),
             descriptor_sha256: String::new(),
             issued_at_ms: 100,
             expires_at_ms: 1_000,
@@ -1231,17 +1282,27 @@ mod descriptor_tests {
     }
 
     #[test]
-    fn contract_v1_digest_preserves_legacy_json_field_order() {
+    fn contract_v2_digest_binds_the_mandatory_supervision_authority() {
         let descriptor = descriptor();
         assert_eq!(
             descriptor.compute_digest().expect("legacy digest"),
-            "7df4185c6311ec6f0f9395076f8dde4c55dd0a4c0c578af23b18f3a14544b570"
+            "265d5db706b25550cf62599bdd749a8259f1cdffff8765bf09daf364f98670bf"
         );
     }
 
     #[test]
     fn descriptor_rejects_unknown_duplicate_blank_and_malformed_inputs() {
         let descriptor = descriptor().with_computed_digest().expect("digest");
+        let mut legacy = serde_json::to_value(&descriptor).expect("legacy value");
+        legacy["contract_version"] = serde_json::json!(1);
+        legacy
+            .as_object_mut()
+            .expect("descriptor object")
+            .remove("supervision_authority");
+        assert!(
+            serde_json::from_value::<ProcessAuthorityHandoffDescriptor>(legacy).is_err(),
+            "v1 bytes without the provisioned authority must require explicit migration"
+        );
         let mut unknown = serde_json::to_value(&descriptor).expect("value");
         unknown["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<ProcessAuthorityHandoffDescriptor>(unknown).is_err());

@@ -1397,6 +1397,9 @@ mod tests {
             generation: handle("generation-test"),
             authority_generation,
             authority_state_fence,
+            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
+                supervision_lease_id: handle("test-supervision-lease"),
+            },
             authority_descriptor_path: handle(r"C:\ProgramData\Eliot\authority.json"),
             authority_descriptor_digest: handle("7".repeat(64)),
             runtime_state_roots: roots.clone(),

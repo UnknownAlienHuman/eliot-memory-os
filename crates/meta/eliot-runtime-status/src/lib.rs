@@ -4798,6 +4798,9 @@ mod honest_tests {
                 eliot_installation::AuthorityEpoch::genesis(),
                 eliot_installation::ResourceGeneration::genesis(),
             ),
+            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
+                supervision_lease_id: fixture_handle("test-supervision-lease"),
+            },
             authority_descriptor_path: fixture_path(&portable_root, "authority.json"),
             authority_descriptor_digest: fixture_handle("7".repeat(64)),
             runtime_state_roots: runtime_state_roots.clone(),
@@ -5426,6 +5429,9 @@ mod store_currentness_production_tests {
                     eliot_installation::AuthorityEpoch::genesis(),
                     eliot_installation::ResourceGeneration::genesis(),
                 ),
+                supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
+                    supervision_lease_id: h("test-supervision-lease"),
+                },
                 authority_descriptor_path: h(&format!("{portable}/authority.json")),
                 authority_descriptor_digest: h(&"a".repeat(64)),
                 runtime_state_roots: roots.clone(),
@@ -5935,6 +5941,10 @@ mod live_production_observer_tests {
                         eliot_installation::AuthorityEpoch::genesis(),
                         eliot_installation::ResourceGeneration::genesis(),
                     ),
+                    supervision_authority:
+                        eliot_installation::SupervisionAuthorityBinding::Pending {
+                            supervision_lease_id: h("test-supervision-lease"),
+                        },
                     authority_descriptor_path: h(&format!("{portable}/authority.json")),
                     authority_descriptor_digest: h(&"a".repeat(64)),
                     runtime_state_roots: roots.clone(),

@@ -6,6 +6,7 @@ use eliot_platform::PlatformHandle;
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
 };
+use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -144,13 +145,15 @@ pub struct HostPhaseBMaterializationIntent {
     pub static_template_digest: PlatformHandle,
     /// Digest of the immutable Watchdog selector domain.
     pub watchdog_selector_digest: PlatformHandle,
+    /// Exact public receipt of the installer-owned sealed signing-key effect.
+    pub provisioned_supervision_authority: ProvisionedSupervisionAuthority,
     /// Digest of these fields excluding itself.
     pub request_digest: PlatformHandle,
 }
 
 impl HostPhaseBMaterializationIntent {
     /// Current Phase-B operation wire.
-    pub const WIRE: &'static str = "eliot.host.phase-b.v2";
+    pub const WIRE: &'static str = "eliot.host.phase-b.v3";
 
     /// Creates a fully bound Phase-B request from transaction-owned values.
     #[allow(clippy::too_many_arguments)]
@@ -164,6 +167,7 @@ impl HostPhaseBMaterializationIntent {
         host_state_root_digest: PlatformHandle,
         static_template: HostPhaseBStaticTemplate,
         watchdog_selector_digest: PlatformHandle,
+        provisioned_supervision_authority: ProvisionedSupervisionAuthority,
     ) -> Result<Self, InstallationError> {
         let static_template_digest = static_template.digest()?;
         let mut value = Self {
@@ -183,6 +187,7 @@ impl HostPhaseBMaterializationIntent {
             static_template,
             static_template_digest,
             watchdog_selector_digest,
+            provisioned_supervision_authority,
             request_digest: PlatformHandle::new("pending").map_err(|error| {
                 InstallationError::InvalidField {
                     field: "phase_b.request_digest".to_owned(),
@@ -203,6 +208,7 @@ impl HostPhaseBMaterializationIntent {
                 &value.static_template,
                 value.static_template_digest.as_str(),
                 value.watchdog_selector_digest.as_str(),
+                &value.provisioned_supervision_authority,
             ),
             "phase_b.request_digest",
         )?;
@@ -249,6 +255,12 @@ impl HostPhaseBMaterializationIntent {
             &self.watchdog_selector_digest,
             "phase_b.watchdog_selector_digest",
         )?;
+        self.provisioned_supervision_authority
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "phase_b.provisioned_supervision_authority".to_owned(),
+                reason: error.to_string(),
+            })?;
         sha256_handle(&self.request_digest, "phase_b.request_digest")?;
         let expected = digest_json(
             &(
@@ -263,6 +275,7 @@ impl HostPhaseBMaterializationIntent {
                 &self.static_template,
                 self.static_template_digest.as_str(),
                 self.watchdog_selector_digest.as_str(),
+                &self.provisioned_supervision_authority,
             ),
             "phase_b.request_digest",
         )?;
@@ -299,6 +312,8 @@ pub struct HostPhaseBMaterializationReceipt {
     pub store_bootstrap_descriptor_digest: PlatformHandle,
     /// Physical eliotd descriptor digest.
     pub eliotd_descriptor_digest: PlatformHandle,
+    /// Exact public supervision authority retained by the Host receipt.
+    pub provisioned_supervision_authority: ProvisionedSupervisionAuthority,
     /// Digest of the complete Host-owned Phase-B receipt.
     pub receipt_digest: PlatformHandle,
 }
@@ -318,6 +333,7 @@ impl HostPhaseBMaterializationReceipt {
                 self.config_file_digest.as_str(),
                 self.store_bootstrap_descriptor_digest.as_str(),
                 self.eliotd_descriptor_digest.as_str(),
+                &self.provisioned_supervision_authority,
             ),
             "phase_b.receipt_digest",
         )
@@ -358,10 +374,21 @@ impl HostPhaseBMaterializationReceipt {
         ] {
             sha256_handle(value, field)?;
         }
+        self.provisioned_supervision_authority
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "phase_b_receipt.provisioned_supervision_authority".to_owned(),
+                reason: error.to_string(),
+            })?;
         if self.receipt_digest != self.computed_digest()? {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(())
+    }
+
+    /// Returns the exact public authority bound by this receipt.
+    pub const fn provisioned_supervision_authority(&self) -> &ProvisionedSupervisionAuthority {
+        &self.provisioned_supervision_authority
     }
 }
 
@@ -1317,6 +1344,11 @@ mod tests {
             handle("d".repeat(64)),
             template.clone(),
             handle("e".repeat(64)),
+            crate::test_provisioned_supervision_authority(
+                "installation:test",
+                "candidate:test",
+                ResourceGeneration::genesis(),
+            ),
         )
         .unwrap_or_else(|_| unreachable!());
         let second = HostPhaseBMaterializationIntent::new(
@@ -1329,6 +1361,7 @@ mod tests {
             first.host_state_root_digest.clone(),
             template,
             first.watchdog_selector_digest.clone(),
+            first.provisioned_supervision_authority.clone(),
         )
         .unwrap_or_else(|_| unreachable!());
         assert_ne!(first.credential_effect_id, second.credential_effect_id);
@@ -1350,6 +1383,11 @@ mod tests {
             config_file_digest: handle("e".repeat(64)),
             store_bootstrap_descriptor_digest: handle("f".repeat(64)),
             eliotd_descriptor_digest: handle("1".repeat(64)),
+            provisioned_supervision_authority: crate::test_provisioned_supervision_authority(
+                "installation:test",
+                "candidate:test",
+                ResourceGeneration::genesis(),
+            ),
             receipt_digest: handle("pending"),
         };
         receipt.receipt_digest = receipt.computed_digest().unwrap_or_else(|_| unreachable!());

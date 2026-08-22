@@ -1608,6 +1608,7 @@ dependencies = [
 name = "eliot-platform-windows"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-platform",
  "eliot-runtime-contracts",
  "eliot-security-contracts",

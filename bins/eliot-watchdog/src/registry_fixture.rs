@@ -539,6 +539,9 @@ impl RegistryFixture {
                 ResourceGeneration::new(generation)
                     .unwrap_or_else(|error| panic!("invalid state generation: {error}")),
             ),
+            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
+                supervision_lease_id: handle(format!("supervision-lease-{generation}")),
+            },
             authority_descriptor_path: path_handle(&authority_descriptor_path),
             authority_descriptor_digest: handle(authority_digest),
             runtime_state_roots: roots.clone(),

@@ -11,8 +11,8 @@ use eliot_installation::{
     AuthorityEpoch, CandidateManifest, InstallationEpoch, InstallationProfile,
     InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, ManagedEnvironmentAction,
     ManagedEnvironmentChangeRequest, PlannedChange, RedbInstallationTransactionStore,
-    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, UserOwnedRootLease,
-    parse_installation_transaction_id,
+    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
+    SupervisionAuthorityBinding, UserOwnedRootLease, parse_installation_transaction_id,
 };
 #[cfg(windows)]
 use eliot_platform_windows::protected_program_data_root;
@@ -562,6 +562,12 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
             AuthorityEpoch::genesis(),
             ResourceGeneration::genesis(),
         ),
+        supervision_authority: SupervisionAuthorityBinding::Pending {
+            supervision_lease_id: fixture_handle(format!(
+                "eliot-supervision-lease:v1:{}:{}",
+                installation_epoch.installation, generation
+            )),
+        },
         authority_descriptor_path: fixture_path(root, "authority.json"),
         authority_descriptor_digest: fixture_handle("7".repeat(64)),
         runtime_state_roots: runtime_state_roots.clone(),

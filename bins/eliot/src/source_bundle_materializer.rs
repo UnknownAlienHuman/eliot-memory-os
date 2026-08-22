@@ -10,6 +10,7 @@ use eliot_installation::{
     AuthorityEpoch, GenerationPackagePlanner, InstallationEpoch, InstallationError,
     InstallationProfile, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
     PlatformHandle, ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
+    SupervisionAuthorityBinding,
 };
 use eliot_kernel_service::EliotdLaunchDescriptor;
 use eliot_platform_windows::{
@@ -674,6 +675,11 @@ fn build_typed_bundle(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let supervision_lease_id = PlatformHandle::new(format!(
+        "eliot-supervision-lease:v1:{}:{}",
+        input.installation_epoch.installation, input.generation
+    ))
+    .map_err(|error| MaterializeError::Contract(format!("supervision lease id: {error}")))?;
     let runtime_launch = RuntimeLaunchDescriptor {
         profile: input.profile,
         portable_root: (input.profile == InstallationProfile::PortableDev)
@@ -682,6 +688,9 @@ fn build_typed_bundle(
         generation: input.generation.clone(),
         authority_generation,
         authority_state_fence,
+        supervision_authority: SupervisionAuthorityBinding::Pending {
+            supervision_lease_id,
+        },
         authority_descriptor_path: authority_path,
         authority_descriptor_digest: PlatformHandle::new(PHASE_B_PENDING_MARKER)
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,

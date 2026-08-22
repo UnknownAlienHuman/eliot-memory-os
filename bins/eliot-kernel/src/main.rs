@@ -138,7 +138,8 @@ async fn main() {
         ),
         Err(error) => exit_error("INVALID_ELIOTD_LAUNCH", &error),
     };
-    let mut kernel_config = KernelConfig::new(options.work_root.clone());
+    let mut kernel_config =
+        KernelConfig::new(options.work_root.clone()).require_descriptor_supervision_authority();
     #[cfg(windows)]
     let pipe_name = startup_binding.control_pipe.clone();
     #[cfg(not(windows))]
@@ -174,6 +175,12 @@ async fn main() {
         exit_error(
             "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED",
             "Host/installation must inject the external process authority handoff before Kernel readiness",
+        );
+    }
+    if kernel.supervision_lease_authority().is_none() {
+        exit_error(
+            "SUPERVISION_AUTHORITY_CONFIGURATION_REQUIRED",
+            "Host/installation must inject the installer-provisioned supervision authority before Kernel readiness",
         );
     }
     #[cfg(windows)]
