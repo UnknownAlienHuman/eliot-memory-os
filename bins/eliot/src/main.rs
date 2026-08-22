@@ -1215,7 +1215,7 @@ fn run_installation_materialize_source_bundle(
                         "reconciliation": reconciliation,
                     }))?
                 );
-                return Ok(INVALID_REQUEST_EXIT);
+                return Ok(UNKNOWN_OUTCOME_EXIT);
             }
             Err(error) => {
                 write_installation_error(
@@ -2472,6 +2472,11 @@ fn init_tracing() {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_unknown_materialization_uses_reconciliation_exit() {
+        assert_eq!(UNKNOWN_OUTCOME_EXIT, 75);
+    }
 
     fn applied_outcome() -> InstallationStepOutcome {
         InstallationStepOutcome::Applied {

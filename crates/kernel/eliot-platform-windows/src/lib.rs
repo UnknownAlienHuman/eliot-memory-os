@@ -2555,6 +2555,287 @@ pub fn file_identity_for_path(path: &Path) -> Result<FileIdentity, ProtectedPath
     }
 }
 
+/// Reads the stable identity from one caller-retained file handle.  This
+/// deliberately avoids reopening the associated pathname.
+///
+/// # Errors
+///
+/// Returns `Io` when Windows cannot query the handle identity, or
+/// `UnsupportedPlatform` on non-Windows targets.
+pub fn file_identity_for_open_handle(
+    file: &std::fs::File,
+) -> Result<FileIdentity, ProtectedPathError> {
+    #[cfg(windows)]
+    {
+        file_identity_from_handle(file).map_err(|_| ProtectedPathError::Io)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Err(ProtectedPathError::UnsupportedPlatform)
+    }
+}
+
+/// Opens one existing regular file without following a reparse point and
+/// retains DELETE access for a later handle-bound disposition operation.
+/// The returned identity belongs to the retained handle, not to a pathname
+/// metadata query.
+///
+/// # Errors
+///
+/// Returns a typed protected-path error when the path is relative, missing,
+/// a reparse point, not a regular file, or its stable identity cannot be
+/// observed.
+pub fn open_no_follow_file_for_delete(
+    path: &Path,
+) -> Result<(FileIdentity, std::fs::File), ProtectedPathError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        if !path.is_absolute() {
+            return Err(ProtectedPathError::InvalidPath);
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(FILE_GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+        let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ProtectedPathError::ReparsePoint);
+        }
+        if !metadata.is_file() {
+            return Err(ProtectedPathError::InvalidPath);
+        }
+        let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
+        if identity.volume_serial_number == 0 || identity.file_index == 0 {
+            return Err(ProtectedPathError::Io);
+        }
+        Ok((identity, file))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(ProtectedPathError::UnsupportedPlatform)
+    }
+}
+
+/// Opens one existing regular file read-only without following a reparse
+/// point and retains the exact object identity for a caller's validation
+/// contour. The handle deliberately does not request DELETE access.
+///
+/// # Errors
+///
+/// Returns a typed protected-path error when the path is relative, missing,
+/// a reparse point, not a regular file, or its stable identity cannot be
+/// observed.
+pub fn open_no_follow_file(
+    path: &Path,
+) -> Result<(FileIdentity, std::fs::File), ProtectedPathError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        if !path.is_absolute() {
+            return Err(ProtectedPathError::InvalidPath);
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(FILE_GENERIC_READ)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+        let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ProtectedPathError::ReparsePoint);
+        }
+        if !metadata.is_file() {
+            return Err(ProtectedPathError::InvalidPath);
+        }
+        let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
+        if identity.volume_serial_number == 0 || identity.file_index == 0 {
+            return Err(ProtectedPathError::Io);
+        }
+        Ok((identity, file))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(ProtectedPathError::UnsupportedPlatform)
+    }
+}
+
+/// Creates one absent regular file without following a reparse point and
+/// retains DELETE access plus the exact object identity from the create call.
+/// This is the create-new counterpart of [`open_no_follow_file_for_delete`].
+///
+/// # Errors
+///
+/// Returns a typed protected-path error when the path is relative, already
+/// exists, is a reparse point, is not a regular file, or its stable identity
+/// cannot be observed.
+pub fn create_no_follow_file_for_delete(
+    path: &Path,
+) -> Result<(FileIdentity, std::fs::File), ProtectedPathError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        if !path.is_absolute() {
+            return Err(ProtectedPathError::InvalidPath);
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+        let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ProtectedPathError::ReparsePoint);
+        }
+        if !metadata.is_file() {
+            return Err(ProtectedPathError::InvalidPath);
+        }
+        let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
+        if identity.volume_serial_number == 0 || identity.file_index == 0 {
+            return Err(ProtectedPathError::Io);
+        }
+        Ok((identity, file))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(ProtectedPathError::UnsupportedPlatform)
+    }
+}
+
+/// Opens one existing directory without following a reparse point and keeps
+/// its parent-object identity pinned for the duration of the caller's
+/// operation.
+///
+/// # Errors
+///
+/// Returns a typed protected-path error when the path is relative, missing,
+/// a reparse point, not a directory, or its stable identity cannot be
+/// observed.
+pub fn open_no_follow_directory(
+    path: &Path,
+) -> Result<(FileIdentity, std::fs::File), ProtectedPathError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        if !path.is_absolute() {
+            return Err(ProtectedPathError::InvalidPath);
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(FILE_GENERIC_READ)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+        let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ProtectedPathError::ReparsePoint);
+        }
+        if !metadata.is_dir() {
+            return Err(ProtectedPathError::InvalidPath);
+        }
+        let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
+        if identity.volume_serial_number == 0 || identity.file_index == 0 {
+            return Err(ProtectedPathError::Io);
+        }
+        Ok((identity, file))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(ProtectedPathError::UnsupportedPlatform)
+    }
+}
+
+/// Deletes one retained regular file object by handle after checking its
+/// exact volume/file identity.  The operation never re-resolves a pathname,
+/// so a replacement at the former name cannot redirect deletion to a foreign
+/// object.
+///
+/// The handle must have been opened with `DELETE` access.  Callers that cannot
+/// retain a suitable handle must fail closed rather than fall back to
+/// `remove_file(path)`.
+///
+/// # Errors
+///
+/// Returns a typed protected-path error when the handle is not a regular
+/// non-reparse file, its identity differs from the expected object, or the
+/// handle-bound disposition cannot be applied.
+pub fn delete_owned_file_handle(
+    file: std::fs::File,
+    expected_identity: FileIdentity,
+) -> Result<(), ProtectedPathError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FileDispositionInfo,
+            SetFileInformationByHandle,
+        };
+
+        let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ProtectedPathError::ReparsePoint);
+        }
+        if file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?
+            != expected_identity
+        {
+            return Err(ProtectedPathError::InvalidPath);
+        }
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let ok = unsafe {
+            // SAFETY: the caller supplied a live handle with DELETE access;
+            // the disposition buffer has the documented layout and size.
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                FileDispositionInfo,
+                (&raw const disposition).cast(),
+                u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>())
+                    .map_err(|_| ProtectedPathError::Io)?,
+            )
+        };
+        if ok == 0 {
+            return Err(ProtectedPathError::Io);
+        }
+        drop(file);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (file, expected_identity);
+        Err(ProtectedPathError::UnsupportedPlatform)
+    }
+}
+
 /// Result of publishing bytes through the Windows atomic replacement path.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2897,6 +3178,13 @@ pub struct OwnedDirectoryPublication {
     initial_temporary_identity: FileIdentity,
     #[cfg(windows)]
     contour: DirectoryPublicationContour,
+    /// The source directory object is retained from construction through the
+    /// move.  It is opened no-follow with delete sharing so existing staging
+    /// readback can coexist with the retained authority, while all
+    /// identity/readback observations remain bound to this exact object rather
+    /// than a later pathname lookup.
+    #[cfg(windows)]
+    temporary_handle: Option<std::fs::File>,
     committed: bool,
 }
 
@@ -2982,22 +3270,13 @@ impl Drop for OwnedDirectoryPublication {
         }
         #[cfg(windows)]
         {
-            let Ok(temporary) = open_publication_directory(&self.temporary, false) else {
-                return;
-            };
-            let Ok(path) = final_windows_path_from_handle(&temporary) else {
-                return;
-            };
-            let Ok(identity) = file_identity_from_handle(&temporary) else {
-                return;
-            };
-            if !windows_paths_equal(&path, &self.temporary)
-                || identity != self.initial_temporary_identity
-            {
-                return;
-            }
-            drop(temporary);
-            let _ = std::fs::remove_dir_all(&self.temporary);
+            // Recursive directory deletion cannot be made identity-bound by
+            // checking a pathname, closing the check handle, and then calling
+            // `remove_dir_all`: a replacement can win that gap.  Keep the
+            // retained source/contour handles as the authority and quarantine
+            // an uncommitted tree instead.  The caller's bounded cleanup layer
+            // may remove it later through its own handle-bound protocol; this
+            // destructor never deletes by an unbound pathname.
         }
     }
 }
@@ -9925,14 +10204,17 @@ fn open_movable_publication_directory(
 ) -> Result<std::fs::File, DirectoryPublicationError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     let mut options = std::fs::OpenOptions::new();
     options
         .read(true)
-        .access_mode(FILE_GENERIC_READ | DELETE)
+        // The retained directory is an identity/readback authority, not a
+        // deletion handle.  Sharing delete lets the materializer's existing
+        // no-follow directory sync handle open while this source remains
+        // retained; publication itself still uses the create-new move.
+        .access_mode(FILE_GENERIC_READ)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options
@@ -10081,7 +10363,7 @@ fn prepare_owned_directory_publication(
                     validate_owned_temporary_name(&temporary, &canonical_destination)?;
                     verify_directory_publication_contour(&contour)?;
                     require_directory_publication_absent(&canonical_destination)?;
-                    let source = open_publication_directory(&temporary, false)?;
+                    let source = open_movable_publication_directory(&temporary)?;
                     let source_path = final_windows_path_from_handle(&source)
                         .map_err(|_| DirectoryPublicationError::Io)?;
                     let source_identity = file_identity_from_handle(&source)
@@ -10097,12 +10379,10 @@ fn prepare_owned_directory_publication(
                         destination: canonical_destination.clone(),
                         initial_temporary_identity: source_identity,
                         contour,
+                        temporary_handle: Some(source),
                         committed: false,
                     })
                 })();
-                if prepared.is_err() {
-                    let _ = std::fs::remove_dir_all(&temporary);
-                }
                 return prepared;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -10137,11 +10417,14 @@ impl OwnedDirectoryPublication {
         verify_directory_publication_contour(&self.contour)?;
         let canonical_parent_path = publication_path_text(&self.contour.canonical_parent)?;
         let destination_path = publication_path_text(&self.destination)?;
-        let source = open_movable_publication_directory(&self.temporary)?;
+        let source = self
+            .temporary_handle
+            .as_ref()
+            .ok_or(DirectoryPublicationError::IdentityMismatch)?;
         let source_path =
-            final_windows_path_from_handle(&source).map_err(|_| DirectoryPublicationError::Io)?;
+            final_windows_path_from_handle(source).map_err(|_| DirectoryPublicationError::Io)?;
         let source_identity =
-            file_identity_from_handle(&source).map_err(|_| DirectoryPublicationError::Io)?;
+            file_identity_from_handle(source).map_err(|_| DirectoryPublicationError::Io)?;
         if !windows_paths_equal(&source_path, &self.temporary)
             || source_identity != precommit_temporary_identity
         {
@@ -10150,15 +10433,19 @@ impl OwnedDirectoryPublication {
         require_directory_publication_absent(&self.destination)?;
         verify_directory_publication_contour(&self.contour)?;
         let source_path =
-            final_windows_path_from_handle(&source).map_err(|_| DirectoryPublicationError::Io)?;
+            final_windows_path_from_handle(source).map_err(|_| DirectoryPublicationError::Io)?;
         let source_identity =
-            file_identity_from_handle(&source).map_err(|_| DirectoryPublicationError::Io)?;
+            file_identity_from_handle(source).map_err(|_| DirectoryPublicationError::Io)?;
         if !windows_paths_equal(&source_path, &self.temporary)
             || source_identity != precommit_temporary_identity
         {
             return Err(DirectoryPublicationError::IdentityMismatch);
         }
         before_move();
+        let source = self
+            .temporary_handle
+            .take()
+            .ok_or(DirectoryPublicationError::IdentityMismatch)?;
         move_directory_create_new_durable(&self.temporary, &self.destination)?;
         self.committed = true;
 
@@ -10215,7 +10502,6 @@ impl OwnedDirectoryPublication {
                 DirectoryPublicationUnknown::PostCommitIdentityChanged,
             ));
         }
-        drop(source);
         let Ok(destination_pin) = open_publication_directory(&self.destination, false) else {
             return Ok(unknown(
                 DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
@@ -16198,7 +16484,40 @@ mod tests {
         );
         assert!(temporary.exists(), "pre-commit failure retains owned temp");
         drop(publication);
-        assert!(!temporary.exists(), "owned temp is rolled back exactly");
+        assert!(
+            temporary.exists(),
+            "uncommitted temp is quarantined; Drop must not delete by pathname"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_publication_drop_never_deletes_a_substituted_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-directory-publication-drop-substitution-{}",
+            unique_suffix()
+        ));
+        std::fs::create_dir(&root).unwrap_or_else(|error| panic!("create fixture: {error}"));
+        let destination = root.join("bundle");
+        let publication = OwnedDirectoryPublication::create(&destination)
+            .unwrap_or_else(|error| panic!("prepare publication: {error}"));
+        let temporary = publication.temporary_path().to_path_buf();
+        let retired = root.join("retired");
+        std::fs::rename(&temporary, &retired)
+            .unwrap_or_else(|error| panic!("substitute source name: {error}"));
+        std::fs::create_dir(&temporary)
+            .unwrap_or_else(|error| panic!("create foreign substitute: {error}"));
+        std::fs::write(temporary.join("foreign.txt"), b"foreign-owner")
+            .unwrap_or_else(|error| panic!("write foreign substitute: {error}"));
+
+        drop(publication);
+
+        assert_eq!(
+            std::fs::read(temporary.join("foreign.txt"))
+                .unwrap_or_else(|error| panic!("foreign tree was deleted: {error}")),
+            b"foreign-owner"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
