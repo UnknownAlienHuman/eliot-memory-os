@@ -15,6 +15,7 @@ anyhow.workspace = true
 clap.workspace = true
 eliot-bootstrap.workspace = true
 eliot-cli.workspace = true
+eliot-live-canary = { path = "../../workspace/tools/eliot-live-canary", version = "0.1.0" }
 eliot-governor.workspace = true
 eliot-kernel-service.workspace = true
 eliot-host-state.workspace = true
@@ -28,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 windows-sys = { version = "0.61.2", features = [

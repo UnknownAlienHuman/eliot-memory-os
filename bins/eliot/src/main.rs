@@ -7,19 +7,31 @@ use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
 use eliot_installation::{
+    ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, PlatformHandle, RedbInstallationRegistry,
     RedbInstallationTransactionStore, WindowsInstallationCoordinator,
     decode_installation_transaction_json, parse_installation_transaction_id,
 };
-use eliot_platform_windows::{InstallerRootError, ProtectedRootLease, is_process_elevated};
+use eliot_live_canary::{
+    CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
+    ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
+};
+use eliot_platform_windows::{
+    FileIdentity, InstallerRootError, InstallerRootObjectSnapshot,
+    InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
+    ProtectedRootLease, WindowsInstallerRootPrimitive, is_process_elevated,
+    windows_path_identity_digest,
+};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::{
     fs,
     io::{Read, Write},
     path::Path,
+    time::Duration,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -234,6 +246,23 @@ enum RuntimeCommand {
         #[arg(long, default_value = "2000")]
         deadline_ms: u64,
     },
+    /// Run one bounded Runtime Live Pulse against the exact active
+    /// `SystemService` manifest. Evidence is always written below the
+    /// manifest-derived canary-evidence root; callers cannot select it.
+    Canary {
+        /// Absolute path to the retained per-installation Host state root.
+        #[arg(long, value_parser = absolute_path)]
+        host_state_root: PathBuf,
+        /// Pulse number 1 through 5.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+        pulse: u8,
+        /// Bounded deadline in milliseconds from now (default 30000).
+        #[arg(long, default_value = "30000")]
+        deadline_ms: u64,
+        /// Required before any Kernel/Store mutation or Host SCM restart.
+        #[arg(long)]
+        execute_faults: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -306,7 +335,526 @@ fn run_runtime(command: RuntimeCommand) -> Result<i32> {
             }
             run_installation_runtime_status(&host_state_root, deadline_ms)
         }
+        RuntimeCommand::Canary {
+            host_state_root,
+            pulse,
+            deadline_ms,
+            execute_faults,
+        } => Ok(run_manifest_bound_canary(
+            &host_state_root,
+            pulse,
+            deadline_ms,
+            execute_faults,
+        )),
     }
+}
+
+fn run_manifest_bound_canary(
+    host_state_root: &Path,
+    pulse_number: u8,
+    deadline_ms: u64,
+    execute_faults: bool,
+) -> i32 {
+    let pulse = match Pulse::try_from(pulse_number) {
+        Ok(pulse) => pulse,
+        Err(error) => {
+            write_manifest_canary_error(pulse_number, "CANARY_INVALID_PULSE", &error.to_string());
+            return INVALID_REQUEST_EXIT;
+        }
+    };
+    if deadline_ms == 0 || deadline_ms > eliot_live_canary::MAX_DEADLINE_MS {
+        write_manifest_canary_error(
+            pulse_number,
+            "CANARY_INVALID_DEADLINE",
+            &format!(
+                "deadline must be between 1 and {} milliseconds",
+                eliot_live_canary::MAX_DEADLINE_MS
+            ),
+        );
+        return INVALID_REQUEST_EXIT;
+    }
+    #[cfg(windows)]
+    {
+        match run_manifest_bound_canary_windows(host_state_root, pulse, deadline_ms, execute_faults)
+        {
+            Ok(code) => code,
+            Err(error) => {
+                write_manifest_canary_error(
+                    pulse_number,
+                    "CANARY_PREFLIGHT_OR_EVIDENCE_FAILED",
+                    &error.to_string(),
+                );
+                INVALID_REQUEST_EXIT
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (host_state_root, pulse, deadline_ms, execute_faults);
+        write_manifest_canary_error(
+            pulse_number,
+            "CANARY_UNSUPPORTED_PLATFORM",
+            "production manifest-bound canary requires the Windows retained-root and SCM adapter",
+        );
+        INVALID_REQUEST_EXIT
+    }
+}
+
+#[cfg(windows)]
+struct ManifestBoundCanaryBinding {
+    host_lease: ProtectedRootLease,
+    evidence_lease: ProtectedRootLease,
+    host_spec: InstallerRootPrimitiveSpec,
+    evidence_spec: InstallerRootPrimitiveSpec,
+    evidence_root: PathBuf,
+    host_before: InstallerRootObjectSnapshot,
+    evidence_before: InstallerRootObjectSnapshot,
+    registry: ApprovedGenerationRegistry,
+    manifest: CandidateManifest,
+    fence: ActivationCommitFence,
+}
+
+#[cfg(windows)]
+fn require_matching_installer_root(
+    observation: InstallerRootPrimitiveObservation,
+    label: &str,
+) -> Result<InstallerRootObjectSnapshot> {
+    match observation {
+        InstallerRootPrimitiveObservation::Matching(snapshot) => Ok(snapshot),
+        InstallerRootPrimitiveObservation::Absent(_) => {
+            anyhow::bail!("{label} is absent")
+        }
+        InstallerRootPrimitiveObservation::Mismatch => {
+            anyhow::bail!("{label} has a reparse/ACL/profile mismatch")
+        }
+    }
+}
+
+#[cfg(windows)]
+fn validate_root_snapshot_values(
+    expected_path: &Path,
+    retained_path: &Path,
+    retained_identity: FileIdentity,
+    snapshot: &InstallerRootObjectSnapshot,
+    label: &str,
+) -> Result<()> {
+    if !eliot_platform_windows::windows_paths_equal(expected_path, retained_path) {
+        anyhow::bail!("{label} path differs from the retained handle path");
+    }
+    if snapshot.canonical_path_digest != windows_path_identity_digest(retained_path) {
+        anyhow::bail!("{label} canonical path digest differs from the retained handle path");
+    }
+    if snapshot.volume_serial_number != retained_identity.volume_serial_number
+        || snapshot.file_index != retained_identity.file_index
+    {
+        anyhow::bail!("{label} object identity differs from the retained handle identity");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_snapshot_matches_lease(
+    expected_path: &Path,
+    snapshot: &InstallerRootObjectSnapshot,
+    lease: &ProtectedRootLease,
+    label: &str,
+) -> Result<PathBuf> {
+    lease
+        .verify_stable_identity()
+        .map_err(|error| anyhow::anyhow!("verify retained {label} identity: {error}"))?;
+    let canonical = lease
+        .canonical_path()
+        .map_err(|error| anyhow::anyhow!("resolve retained {label} path: {error}"))?;
+    validate_root_snapshot_values(expected_path, &canonical, lease.identity(), snapshot, label)?;
+    Ok(canonical)
+}
+
+#[cfg(windows)]
+fn validate_unchanged_root_snapshot(
+    expected_path: &Path,
+    before: &InstallerRootObjectSnapshot,
+    after: &InstallerRootObjectSnapshot,
+    lease: &ProtectedRootLease,
+    label: &str,
+) -> Result<()> {
+    let _canonical = validate_snapshot_matches_lease(expected_path, after, lease, label)?;
+    validate_snapshot_stability_values(before, after, label)
+}
+
+#[cfg(windows)]
+fn validate_snapshot_stability_values(
+    before: &InstallerRootObjectSnapshot,
+    after: &InstallerRootObjectSnapshot,
+    label: &str,
+) -> Result<()> {
+    if after == before {
+        Ok(())
+    } else {
+        anyhow::bail!("{label} ACL/profile/object snapshot changed during canary publication")
+    }
+}
+
+#[cfg(windows)]
+fn canonical_json_digest<T: serde::Serialize>(value: &T, label: &str) -> Result<String> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| anyhow::anyhow!("serialize {label} for digest: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(windows)]
+fn validate_active_phase_b_runtime_binding(
+    registry: &ApprovedGenerationRegistry,
+    manifest: &CandidateManifest,
+    fence: &ActivationCommitFence,
+) -> Result<()> {
+    let manifest_digest = manifest
+        .compute_digest()
+        .map_err(|error| anyhow::anyhow!("compute active manifest digest: {error}"))?;
+    if let Some(rebind) = registry.active_phase_b_rebind() {
+        let prepared = rebind.prepared.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("active Phase-B rebind has no prepared materialization")
+        })?;
+        let receipt = rebind.receipt.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("active Phase-B rebind has no exact destination receipt")
+        })?;
+        prepared.launch.require_phase_b_live().map_err(|error| {
+            anyhow::anyhow!("active Phase-B prepared launch is not live: {error}")
+        })?;
+        if receipt.manifest_digest != manifest_digest {
+            anyhow::bail!("active Phase-B rebind receipt names a foreign manifest");
+        }
+    } else if fence
+        .phase_b_live_binding
+        .as_ref()
+        .is_none_or(|binding| binding.manifest_digest != manifest_digest)
+    {
+        anyhow::bail!("committed activation fence has no exact current Phase-B manifest binding");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_lines)]
+fn load_manifest_bound_canary_binding(
+    host_state_root: &Path,
+) -> Result<ManifestBoundCanaryBinding> {
+    if !host_state_root.is_absolute() {
+        anyhow::bail!("Host state root must be absolute");
+    }
+    let registry_root = ProtectedRootLease::open_existing(host_state_root)
+        .map_err(|error| anyhow::anyhow!("retain Host state root: {error}"))?;
+    let registry_root_identity = registry_root.identity();
+    let canonical_host_root = registry_root
+        .canonical_path()
+        .map_err(|error| anyhow::anyhow!("resolve Host state root: {error}"))?;
+    registry_root
+        .verify_stable_identity()
+        .map_err(|error| anyhow::anyhow!("verify Host state root identity: {error}"))?;
+    if !eliot_platform_windows::windows_paths_equal(host_state_root, &canonical_host_root) {
+        anyhow::bail!("caller Host state root differs from retained OS identity");
+    }
+    let registry = RedbInstallationRegistry::inspect_existing_at(registry_root)
+        .map_err(|error| anyhow::anyhow!("inspect retained installation registry: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("retained installation registry is absent"))?;
+    registry
+        .validate()
+        .map_err(|error| anyhow::anyhow!("validate retained installation registry: {error}"))?;
+    let active = registry
+        .active()
+        .ok_or_else(|| anyhow::anyhow!("installation registry has no exact active generation"))?;
+    let manifest = active.manifest.clone();
+    manifest
+        .validate()
+        .map_err(|error| anyhow::anyhow!("validate active candidate manifest: {error}"))?;
+    if manifest.runtime_launch.profile != InstallationProfile::SystemService {
+        anyhow::bail!("production Runtime Live canary requires the active SystemService profile");
+    }
+    if !eliot_platform_windows::windows_paths_equal(
+        Path::new(
+            manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root
+                .as_str(),
+        ),
+        &canonical_host_root,
+    ) {
+        anyhow::bail!("active manifest Host state root does not equal the retained caller root");
+    }
+    let fence = registry
+        .last_committed_activation_fence()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("active generation has no committed activation fence"))?;
+    fence
+        .validate()
+        .map_err(|error| anyhow::anyhow!("validate committed activation fence: {error}"))?;
+    if fence.generation != manifest.generation
+        || fence.config_digest != manifest.config_digest
+        || fence.authority_generation != manifest.runtime_launch.authority_generation
+    {
+        anyhow::bail!("active manifest and committed activation fence disagree");
+    }
+    validate_active_phase_b_runtime_binding(&registry, &manifest, &fence)?;
+    let roots = &manifest.runtime_launch.runtime_state_roots;
+    roots
+        .validate()
+        .map_err(|error| anyhow::anyhow!("validate active runtime roots: {error}"))?;
+    let evidence_root = PathBuf::from(
+        roots
+            .canary_evidence_root()
+            .map_err(|error| anyhow::anyhow!("derive canary evidence root: {error}"))?
+            .as_str(),
+    );
+    let host_spec = InstallerRootPrimitiveSpec {
+        root: canonical_host_root.clone(),
+        installation_root: PathBuf::from(roots.installation_root.as_str()),
+        profile_anchor: PathBuf::from(roots.profile_anchor_root.as_str()),
+        profile: InstallerRootProfile::SystemService,
+    };
+    let evidence_spec = InstallerRootPrimitiveSpec {
+        root: evidence_root.clone(),
+        installation_root: PathBuf::from(roots.installation_root.as_str()),
+        profile_anchor: PathBuf::from(roots.profile_anchor_root.as_str()),
+        profile: InstallerRootProfile::SystemService,
+    };
+    let primitive = WindowsInstallerRootPrimitive::new();
+    let host_before = require_matching_installer_root(
+        primitive
+            .inspect(&host_spec)
+            .map_err(|error| anyhow::anyhow!("inspect Host state root: {error}"))?,
+        "manifest-bound Host state root",
+    )?;
+    validate_root_snapshot_values(
+        &canonical_host_root,
+        &canonical_host_root,
+        registry_root_identity,
+        &host_before,
+        "manifest-bound Host state root",
+    )?;
+    let evidence_lease = ProtectedRootLease::open_existing(&evidence_root)
+        .map_err(|error| anyhow::anyhow!("retain canary evidence root: {error}"))?;
+    let evidence_before = require_matching_installer_root(
+        primitive
+            .inspect(&evidence_spec)
+            .map_err(|error| anyhow::anyhow!("inspect canary evidence root: {error}"))?,
+        "manifest-derived canary evidence root",
+    )?;
+    validate_snapshot_matches_lease(
+        &evidence_root,
+        &evidence_before,
+        &evidence_lease,
+        "manifest-derived canary evidence root",
+    )?;
+    // The registry still retains the first Host root handle here.  Acquire the
+    // long-lived canary lease before that registry is dropped and require the
+    // same volume/file object, not merely the same path spelling.
+    let host_lease = ProtectedRootLease::open_existing(&canonical_host_root)
+        .map_err(|error| anyhow::anyhow!("retain Host state root for canary: {error}"))?;
+    validate_snapshot_matches_lease(
+        &canonical_host_root,
+        &host_before,
+        &host_lease,
+        "manifest-bound Host state root",
+    )?;
+    if host_lease.identity() != registry_root_identity {
+        anyhow::bail!("Host state root changed between registry retention and canary retention");
+    }
+    Ok(ManifestBoundCanaryBinding {
+        host_lease,
+        evidence_lease,
+        host_spec,
+        evidence_spec,
+        evidence_root,
+        host_before,
+        evidence_before,
+        registry: registry.clone(),
+        manifest,
+        fence,
+    })
+}
+
+#[cfg(windows)]
+fn revalidate_manifest_bound_canary_binding(
+    retained_host: &ProtectedRootLease,
+    expected_host_snapshot: &InstallerRootObjectSnapshot,
+    expected_registry: &ApprovedGenerationRegistry,
+    expected_manifest: &CandidateManifest,
+    expected_fence: &ActivationCommitFence,
+) -> Result<()> {
+    let canonical_host_root = validate_snapshot_matches_lease(
+        &PathBuf::from(
+            expected_manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root
+                .as_str(),
+        ),
+        expected_host_snapshot,
+        retained_host,
+        "retained Host registry root",
+    )?;
+    let lease = ProtectedRootLease::open_existing(&canonical_host_root)
+        .map_err(|error| anyhow::anyhow!("open exact Host registry readback lease: {error}"))?;
+    validate_snapshot_matches_lease(
+        &canonical_host_root,
+        expected_host_snapshot,
+        &lease,
+        "Host registry readback root",
+    )?;
+    if lease.identity() != retained_host.identity() {
+        anyhow::bail!("Host registry readback reopened a path-same replacement");
+    }
+    let registry = RedbInstallationRegistry::inspect_existing_at(lease)
+        .map_err(|error| anyhow::anyhow!("reinspect installation registry: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("installation registry disappeared during canary"))?;
+    registry
+        .validate()
+        .map_err(|error| anyhow::anyhow!("revalidate installation registry: {error}"))?;
+    if &registry != expected_registry {
+        anyhow::bail!("active installation registry changed during canary");
+    }
+    let active = registry
+        .active()
+        .ok_or_else(|| anyhow::anyhow!("active generation disappeared during canary"))?;
+    if &active.manifest != expected_manifest {
+        anyhow::bail!("active manifest changed during canary");
+    }
+    let Some(fence) = registry.last_committed_activation_fence() else {
+        anyhow::bail!("committed activation fence disappeared during canary");
+    };
+    if fence != expected_fence {
+        anyhow::bail!("committed activation fence changed during canary");
+    }
+    validate_active_phase_b_runtime_binding(&registry, &active.manifest, fence)?;
+    retained_host
+        .verify_stable_identity()
+        .map_err(|error| anyhow::anyhow!("retained Host root changed during readback: {error}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_manifest_bound_canary_state(binding: &ManifestBoundCanaryBinding) -> Result<()> {
+    let primitive = WindowsInstallerRootPrimitive::new();
+    let host_after = require_matching_installer_root(
+        primitive
+            .inspect(&binding.host_spec)
+            .map_err(|error| anyhow::anyhow!("inspect Host state root after canary: {error}"))?,
+        "manifest-bound Host state root",
+    )?;
+    validate_unchanged_root_snapshot(
+        &binding.host_spec.root,
+        &binding.host_before,
+        &host_after,
+        &binding.host_lease,
+        "manifest-bound Host state root",
+    )?;
+    let evidence_after = require_matching_installer_root(
+        primitive.inspect(&binding.evidence_spec).map_err(|error| {
+            anyhow::anyhow!("inspect canary evidence root after write: {error}")
+        })?,
+        "manifest-derived canary evidence root",
+    )?;
+    validate_unchanged_root_snapshot(
+        &binding.evidence_root,
+        &binding.evidence_before,
+        &evidence_after,
+        &binding.evidence_lease,
+        "manifest-derived canary evidence root",
+    )?;
+    revalidate_manifest_bound_canary_binding(
+        &binding.host_lease,
+        &binding.host_before,
+        &binding.registry,
+        &binding.manifest,
+        &binding.fence,
+    )
+}
+
+#[cfg(windows)]
+fn run_manifest_bound_canary_windows(
+    host_state_root: &Path,
+    pulse: Pulse,
+    deadline_ms: u64,
+    execute_faults: bool,
+) -> Result<i32> {
+    let binding = load_manifest_bound_canary_binding(host_state_root)?;
+    let config = CanaryConfig {
+        host_state_root: binding.host_spec.root.clone(),
+        evidence_dir: binding.evidence_root.clone(),
+        pulse,
+        deadline: Duration::from_millis(deadline_ms),
+        execute_faults,
+    };
+    let canary = ProductionCanary::new(config.clone())
+        .map_err(|error| anyhow::anyhow!("construct production canary: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build current-thread canary runtime")?;
+    let disposition = runtime.block_on(canary.run());
+    // Do not create even a pending artifact from a state that already drifted.
+    validate_manifest_bound_canary_state(&binding)?;
+    let completion_binding = ProductionCanaryCompletionBinding {
+        active_registry_digest: canonical_json_digest(&binding.registry, "active registry")?,
+        active_manifest_digest: binding
+            .manifest
+            .compute_digest()
+            .map_err(|error| anyhow::anyhow!("compute active manifest digest: {error}"))?
+            .as_str()
+            .to_owned(),
+        activation_fence_digest: canonical_json_digest(&binding.fence, "activation fence")?,
+        host_root: binding.host_before.clone(),
+        evidence_root: binding.evidence_before.clone(),
+    };
+    let publication = publish_production_evidence(
+        &binding.evidence_root,
+        pulse,
+        &disposition,
+        completion_binding,
+        |_| {
+            validate_manifest_bound_canary_state(&binding).map_err(|error| {
+                CanaryError::Evidence(format!(
+                    "post-pending retained root/registry validation failed: {error}"
+                ))
+            })
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("publish marker-last canary evidence: {error}"))?;
+    let result = json!({
+        "schema": CANARY_COMPLETION_SCHEMA,
+        "authority": "PRODUCTION_COMPLETION",
+        "pulse": pulse as u8,
+        "disposition": disposition,
+        "evidence_path": publication.completion.path,
+        "evidence_digest": publication.completion.digest,
+        "pending_evidence_path": publication.pending.path,
+        "pending_evidence_digest": publication.pending.digest,
+    });
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(
+        if result["disposition"]["disposition"].as_str() == Some("PASS") {
+            0
+        } else if result["disposition"]["disposition"].as_str() == Some("BLOCKED") {
+            75
+        } else {
+            INVALID_REQUEST_EXIT
+        },
+    )
+}
+
+fn write_manifest_canary_error(pulse: u8, code: &str, detail: &str) {
+    println!(
+        "{}",
+        json!({
+            "schema": eliot_live_canary::CANARY_SCHEMA,
+            "pulse": pulse,
+            "disposition": "FAIL_CLOSED",
+            "status": "ERROR",
+            "code": code,
+            "detail": detail,
+            "completed": false,
+        })
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2099,9 +2647,116 @@ mod tests {
                     assert_eq!(host_state_root, root);
                     assert_eq!(deadline_ms, 2000);
                 }
+                RuntimeCommand::Canary { .. } => {
+                    panic!("expected runtime status command")
+                }
             },
             _ => panic!("expected runtime command"),
         }
+    }
+
+    #[test]
+    fn runtime_canary_cli_is_manifest_bound_and_has_no_evidence_dir_argument() {
+        let root = std::env::temp_dir().join("eliot-runtime-canary-production");
+        let root_arg = root.to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "eliot",
+            "runtime",
+            "canary",
+            "--host-state-root",
+            root_arg.as_str(),
+            "--pulse",
+            "2",
+            "--deadline-ms",
+            "9000",
+        ])
+        .expect("manifest-bound canary surface must parse");
+        match cli.command {
+            Command::Runtime {
+                command:
+                    RuntimeCommand::Canary {
+                        host_state_root,
+                        pulse,
+                        deadline_ms,
+                        execute_faults,
+                    },
+            } => {
+                assert_eq!(host_state_root, root);
+                assert_eq!(pulse, 2);
+                assert_eq!(deadline_ms, 9000);
+                assert!(!execute_faults);
+            }
+            _ => panic!("expected runtime canary command"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "eliot",
+                "runtime",
+                "canary",
+                "--host-state-root",
+                root_arg.as_str(),
+                "--pulse",
+                "2",
+                "--evidence-dir",
+                root_arg.as_str(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canary_root_snapshot_binding_rejects_path_object_acl_and_profile_substitution() {
+        let path = PathBuf::from(r"C:\ProgramData\Eliot\runtime\host");
+        let identity = FileIdentity {
+            volume_serial_number: 17,
+            file_index: 29,
+        };
+        let snapshot = InstallerRootObjectSnapshot {
+            canonical_path_digest: windows_path_identity_digest(&path),
+            volume_serial_number: identity.volume_serial_number,
+            file_index: identity.file_index,
+            security_descriptor_digest: "a".repeat(64),
+        };
+        assert!(
+            validate_root_snapshot_values(&path, &path, identity, &snapshot, "test root").is_ok()
+        );
+
+        let substituted_path = PathBuf::from(r"C:\ProgramData\Eliot\runtime\hosт");
+        assert!(
+            validate_root_snapshot_values(
+                &path,
+                &substituted_path,
+                identity,
+                &snapshot,
+                "test root",
+            )
+            .is_err()
+        );
+        let substituted_identity = FileIdentity {
+            volume_serial_number: identity.volume_serial_number,
+            file_index: identity.file_index + 1,
+        };
+        assert!(
+            validate_root_snapshot_values(
+                &path,
+                &path,
+                substituted_identity,
+                &snapshot,
+                "test root",
+            )
+            .is_err()
+        );
+        let mut acl_drift = snapshot.clone();
+        acl_drift.security_descriptor_digest = "b".repeat(64);
+        assert!(validate_snapshot_stability_values(&snapshot, &acl_drift, "test root").is_err());
+        assert!(
+            require_matching_installer_root(
+                InstallerRootPrimitiveObservation::Mismatch,
+                "profile-substituted test root",
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -25,6 +25,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const CANARY_SCHEMA: &str = "eliot.runtime.live-canary.v4";
+pub const CANARY_PENDING_SCHEMA: &str = "eliot.runtime.live-canary.pending.v1";
+pub const CANARY_COMPLETION_SCHEMA: &str = "eliot.runtime.live-canary.completion.v1";
+pub const CANARY_DEVELOPMENT_SCHEMA: &str = "eliot.runtime.live-canary.development.v1";
 pub const DEFAULT_DEADLINE_MS: u64 = 30_000;
 pub const MAX_DEADLINE_MS: u64 = 120_000;
 const MAX_EVIDENCE_BYTES: usize = 128 * 1024;
@@ -267,6 +270,78 @@ pub struct CanaryRun {
     pub disposition: PulseDisposition,
     pub evidence_path: String,
     pub evidence_digest: String,
+}
+
+/// Classification carried by every persisted canary artifact.  Only
+/// `ProductionCompletion` is an authority-bearing production receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CanaryEvidenceAuthority {
+    NonAuthoritativePending,
+    ProductionCompletion,
+    NonProductionDevelopment,
+}
+
+/// Exact create-new artifact publication and its byte digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanaryEvidencePublication {
+    pub path: PathBuf,
+    pub digest: String,
+}
+
+/// Immutable production facts included in the marker-last completion receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionCanaryCompletionBinding {
+    pub active_registry_digest: String,
+    pub active_manifest_digest: String,
+    pub activation_fence_digest: String,
+    pub host_root: eliot_platform_windows::InstallerRootObjectSnapshot,
+    pub evidence_root: eliot_platform_windows::InstallerRootObjectSnapshot,
+}
+
+/// Both artifacts emitted by a successful marker-last production publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionCanaryPublication {
+    pub pending: CanaryEvidencePublication,
+    pub completion: CanaryEvidencePublication,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingCanaryEvidence {
+    schema: String,
+    authority: CanaryEvidenceAuthority,
+    pulse: Pulse,
+    disposition: PulseDisposition,
+}
+
+struct RetainedPendingCanaryEvidence {
+    publication: CanaryEvidencePublication,
+    #[cfg(windows)]
+    file: eliot_windows_ipc::PinnedFile,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProductionCanaryCompletion {
+    schema: String,
+    authority: CanaryEvidenceAuthority,
+    pulse: Pulse,
+    disposition: PulseDisposition,
+    pending_evidence_path: String,
+    pending_evidence_path_digest: String,
+    pending_evidence_digest: String,
+    binding: ProductionCanaryCompletionBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevelopmentCanaryEvidence {
+    schema: String,
+    authority: CanaryEvidenceAuthority,
+    pulse: Pulse,
+    disposition: PulseDisposition,
 }
 
 #[derive(Clone, Debug)]
@@ -3059,25 +3134,170 @@ fn operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
     }
 }
 
-pub fn write_evidence(
+/// Writes a standalone development artifact.  Its typed schema and authority
+/// classification are deliberately disjoint from production completion
+/// receipts, even when the enclosed pulse disposition is `PASS`.
+pub fn write_development_evidence(
     evidence_dir: &Path,
     pulse: Pulse,
     disposition: &PulseDisposition,
-) -> Result<(PathBuf, String), CanaryError> {
+) -> Result<CanaryEvidencePublication, CanaryError> {
+    ensure_disposition_pulse(pulse, disposition)?;
+    let evidence = DevelopmentCanaryEvidence {
+        schema: CANARY_DEVELOPMENT_SCHEMA.to_owned(),
+        authority: CanaryEvidenceAuthority::NonProductionDevelopment,
+        pulse,
+        disposition: disposition.clone(),
+    };
+    write_typed_evidence(
+        evidence_dir,
+        format!(
+            "pulse-{}-development-{}.json",
+            pulse.number(),
+            Uuid::new_v4()
+        ),
+        &evidence,
+    )
+}
+
+/// Publishes non-authoritative pending evidence, performs the caller's exact
+/// retained-root/registry validation, and only then publishes the create-new
+/// authority-bearing completion receipt.  If validation fails, no completion
+/// marker is attempted and the pending artifact cannot be interpreted as a
+/// production `PASS`.
+pub fn publish_production_evidence<F>(
+    evidence_dir: &Path,
+    pulse: Pulse,
+    disposition: &PulseDisposition,
+    binding: ProductionCanaryCompletionBinding,
+    validate_after_pending: F,
+) -> Result<ProductionCanaryPublication, CanaryError>
+where
+    F: FnOnce(&CanaryEvidencePublication) -> Result<(), CanaryError>,
+{
+    ensure_disposition_pulse(pulse, disposition)?;
+    validate_completion_binding(&binding)?;
+    let mut pending = write_pending_evidence(evidence_dir, pulse, disposition)?;
+    validate_after_pending(&pending.publication)?;
+    verify_retained_pending_evidence(&mut pending)?;
+    let completion = write_completion_marker(
+        evidence_dir,
+        pulse,
+        disposition,
+        &pending.publication,
+        binding,
+    )?;
+    let pending_publication = pending.publication.clone();
+    drop(pending);
+    Ok(ProductionCanaryPublication {
+        pending: pending_publication,
+        completion,
+    })
+}
+
+fn write_pending_evidence(
+    evidence_dir: &Path,
+    pulse: Pulse,
+    disposition: &PulseDisposition,
+) -> Result<RetainedPendingCanaryEvidence, CanaryError> {
+    let evidence = PendingCanaryEvidence {
+        schema: CANARY_PENDING_SCHEMA.to_owned(),
+        authority: CanaryEvidenceAuthority::NonAuthoritativePending,
+        pulse,
+        disposition: disposition.clone(),
+    };
+    let publication = write_typed_evidence(
+        evidence_dir,
+        format!("pulse-{}-pending-{}.json", pulse.number(), Uuid::new_v4()),
+        &evidence,
+    )?;
+    #[cfg(windows)]
+    let mut file = eliot_windows_ipc::PinnedFile::open(&publication.path)
+        .map_err(|error| CanaryError::Evidence(format!("retain pending evidence: {error}")))?;
+    #[cfg(windows)]
+    {
+        let retained = file.read_all().map_err(|error| {
+            CanaryError::Evidence(format!("read retained pending evidence: {error}"))
+        })?;
+        if digest_bytes(&retained) != publication.digest {
+            return Err(CanaryError::Evidence(
+                "retained pending evidence differs from its create-new readback".to_owned(),
+            ));
+        }
+    }
+    Ok(RetainedPendingCanaryEvidence {
+        publication,
+        #[cfg(windows)]
+        file,
+    })
+}
+
+fn verify_retained_pending_evidence(
+    pending: &mut RetainedPendingCanaryEvidence,
+) -> Result<(), CanaryError> {
+    #[cfg(windows)]
+    let bytes = pending.file.read_all().map_err(|error| {
+        CanaryError::Evidence(format!("final retained pending evidence readback: {error}"))
+    })?;
+    #[cfg(not(windows))]
+    let bytes = std::fs::read(&pending.publication.path).map_err(|error| {
+        CanaryError::Evidence(format!("final pending evidence readback: {error}"))
+    })?;
+    if digest_bytes(&bytes) != pending.publication.digest {
+        return Err(CanaryError::Evidence(
+            "pending evidence changed before completion publication".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_completion_marker(
+    evidence_dir: &Path,
+    pulse: Pulse,
+    disposition: &PulseDisposition,
+    pending: &CanaryEvidencePublication,
+    binding: ProductionCanaryCompletionBinding,
+) -> Result<CanaryEvidencePublication, CanaryError> {
+    if pending.path.parent() != Some(evidence_dir) || !is_lower_hex(&pending.digest) {
+        return Err(CanaryError::Evidence(
+            "pending evidence is not an exact artifact in the completion directory".to_owned(),
+        ));
+    }
+    let completion = ProductionCanaryCompletion {
+        schema: CANARY_COMPLETION_SCHEMA.to_owned(),
+        authority: CanaryEvidenceAuthority::ProductionCompletion,
+        pulse,
+        disposition: disposition.clone(),
+        pending_evidence_path: pending.path.to_string_lossy().into_owned(),
+        pending_evidence_path_digest: exact_path_identity_digest(&pending.path),
+        pending_evidence_digest: pending.digest.clone(),
+        binding,
+    };
+    write_typed_evidence(
+        evidence_dir,
+        format!(
+            "pulse-{}-completion-{}.json",
+            pulse.number(),
+            Uuid::new_v4()
+        ),
+        &completion,
+    )
+}
+
+fn write_typed_evidence<T: Serialize>(
+    evidence_dir: &Path,
+    file_name: String,
+    evidence: &T,
+) -> Result<CanaryEvidencePublication, CanaryError> {
     let _evidence_contour = validate_evidence_dir(evidence_dir)?;
-    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
-        "schema": CANARY_SCHEMA,
-        "pulse": pulse.number(),
-        "disposition": disposition,
-    }))
-    .map_err(|error| CanaryError::Evidence(error.to_string()))?;
+    let bytes = serde_json::to_vec_pretty(evidence)
+        .map_err(|error| CanaryError::Evidence(error.to_string()))?;
     if bytes.len() > MAX_EVIDENCE_BYTES {
         return Err(CanaryError::Evidence(
             "evidence exceeds bounded size".to_owned(),
         ));
     }
-    let final_name = format!("pulse-{}-{}.json", pulse.number(), Uuid::new_v4());
-    let final_path = evidence_dir.join(final_name);
+    let final_path = evidence_dir.join(file_name);
     write_new_evidence_file(&final_path, &bytes).map_err(|error| {
         CanaryError::Evidence(format!("create-new no-follow evidence: {error}"))
     })?;
@@ -3088,7 +3308,53 @@ pub fn write_evidence(
             "evidence readback differs from synced bytes".to_owned(),
         ));
     }
-    Ok((final_path, digest_bytes(&persisted)))
+    Ok(CanaryEvidencePublication {
+        path: final_path,
+        digest: digest_bytes(&persisted),
+    })
+}
+
+fn ensure_disposition_pulse(
+    pulse: Pulse,
+    disposition: &PulseDisposition,
+) -> Result<(), CanaryError> {
+    let disposition_pulse = match disposition {
+        PulseDisposition::Pass(evidence) => evidence.pulse,
+        PulseDisposition::Blocked(evidence) => evidence.pulse,
+        PulseDisposition::FailClosed(evidence) => evidence.pulse,
+    };
+    if disposition_pulse != pulse {
+        return Err(CanaryError::Evidence(
+            "evidence pulse differs from the requested pulse".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_completion_binding(
+    binding: &ProductionCanaryCompletionBinding,
+) -> Result<(), CanaryError> {
+    if !is_lower_hex(&binding.active_registry_digest)
+        || !is_lower_hex(&binding.active_manifest_digest)
+        || !is_lower_hex(&binding.activation_fence_digest)
+    {
+        return Err(CanaryError::Evidence(
+            "completion binding has an invalid registry, manifest, or fence digest".to_owned(),
+        ));
+    }
+    for (label, snapshot) in [
+        ("Host", &binding.host_root),
+        ("evidence", &binding.evidence_root),
+    ] {
+        if !is_lower_hex(&snapshot.canonical_path_digest)
+            || !is_lower_hex(&snapshot.security_descriptor_digest)
+        {
+            return Err(CanaryError::Evidence(format!(
+                "completion binding has an invalid {label} root snapshot"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -3252,6 +3518,42 @@ mod tests {
             start_time_100ns: start,
             image_path: image.to_owned(),
             job_name: job.to_owned(),
+        }
+    }
+
+    fn pass_disposition(pulse: Pulse) -> PulseDisposition {
+        PulseDisposition::Pass(Box::new(PulseEvidence {
+            schema: CANARY_SCHEMA.to_owned(),
+            pulse,
+            outcome: "PASS".to_owned(),
+            host_state_root_digest: "a".repeat(64),
+            status_digest: "b".repeat(64),
+            journal_digest: "c".repeat(64),
+            status: "READY".to_owned(),
+            before: None,
+            after: None,
+            stop_boundary: None,
+            pulse_five_scm: None,
+            request_digest: None,
+            receipt_digest: None,
+            dynamic_supervision: None,
+            redaction: "test".to_owned(),
+        }))
+    }
+
+    fn completion_binding() -> ProductionCanaryCompletionBinding {
+        let snapshot = eliot_platform_windows::InstallerRootObjectSnapshot {
+            canonical_path_digest: "d".repeat(64),
+            volume_serial_number: 1,
+            file_index: 2,
+            security_descriptor_digest: "e".repeat(64),
+        };
+        ProductionCanaryCompletionBinding {
+            active_registry_digest: "0".repeat(64),
+            active_manifest_digest: "f".repeat(64),
+            activation_fence_digest: "1".repeat(64),
+            host_root: snapshot.clone(),
+            evidence_root: snapshot,
         }
     }
 
@@ -4118,27 +4420,91 @@ mod tests {
     }
 
     #[test]
-    fn evidence_publication_is_create_new_and_no_clobber() {
+    fn development_evidence_is_non_production_create_new_and_no_clobber() {
         let directory = tempfile::tempdir().unwrap_or_else(|_| unreachable!());
-        let disposition = PulseDisposition::Blocked(BlockedPulse {
-            pulse: Pulse::One,
-            reason: "test".to_owned(),
-            seam: "test".to_owned(),
-            host_state_root_digest: "a".repeat(64),
-            status_digest: None,
-            journal_digest: None,
-            redaction: "test".to_owned(),
-        });
-        let (path, digest) = write_evidence(directory.path(), Pulse::One, &disposition)
+        let disposition = pass_disposition(Pulse::One);
+        let publication = write_development_evidence(directory.path(), Pulse::One, &disposition)
             .unwrap_or_else(|_| unreachable!());
-        assert!(path.is_file());
-        assert_eq!(digest.len(), 64);
-        let bytes = std::fs::read(path).unwrap_or_else(|_| unreachable!());
-        assert!(String::from_utf8_lossy(&bytes).contains("BLOCKED"));
+        assert!(publication.path.is_file());
+        assert_eq!(publication.digest.len(), 64);
+        let bytes = std::fs::read(publication.path).unwrap_or_else(|_| unreachable!());
+        assert!(String::from_utf8_lossy(&bytes).contains("PASS"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| unreachable!());
+        assert_eq!(value["schema"], CANARY_DEVELOPMENT_SCHEMA);
+        assert_eq!(value["authority"], "NON_PRODUCTION_DEVELOPMENT");
 
         let fixed = directory.path().join("fixed-evidence.json");
         assert!(write_new_evidence_file(&fixed, b"first").is_ok());
         assert!(write_new_evidence_file(&fixed, b"second").is_err());
+    }
+
+    #[test]
+    fn post_pending_drift_leaves_no_authoritative_pass_marker() {
+        let directory = tempfile::tempdir().unwrap_or_else(|_| unreachable!());
+        let disposition = pass_disposition(Pulse::One);
+
+        let result = publish_production_evidence(
+            directory.path(),
+            Pulse::One,
+            &disposition,
+            completion_binding(),
+            |_| {
+                Err(CanaryError::Evidence(
+                    "simulated retained-root post-write drift".to_owned(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+
+        let entries = std::fs::read_dir(directory.path())
+            .unwrap_or_else(|_| unreachable!())
+            .map(|entry| entry.unwrap_or_else(|_| unreachable!()).path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].to_string_lossy().contains("-pending-"));
+        assert!(!entries[0].to_string_lossy().contains("-completion-"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&entries[0]).unwrap_or_else(|_| unreachable!()))
+                .unwrap_or_else(|_| unreachable!());
+        assert_eq!(value["schema"], CANARY_PENDING_SCHEMA);
+        assert_eq!(value["authority"], "NON_AUTHORITATIVE_PENDING");
+        assert_eq!(value["disposition"]["disposition"], "PASS");
+    }
+
+    #[test]
+    fn successful_production_publication_is_marker_last_and_binds_pending() {
+        let directory = tempfile::tempdir().unwrap_or_else(|_| unreachable!());
+        let disposition = pass_disposition(Pulse::Two);
+        let publication = publish_production_evidence(
+            directory.path(),
+            Pulse::Two,
+            &disposition,
+            completion_binding(),
+            |_| Ok(()),
+        )
+        .unwrap_or_else(|_| unreachable!());
+
+        let entries = std::fs::read_dir(directory.path())
+            .unwrap_or_else(|_| unreachable!())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(entries.len(), 2);
+        let completion: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&publication.completion.path).unwrap_or_else(|_| unreachable!()),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(completion["schema"], CANARY_COMPLETION_SCHEMA);
+        assert_eq!(completion["authority"], "PRODUCTION_COMPLETION");
+        assert_eq!(
+            completion["pending_evidence_digest"],
+            publication.pending.digest
+        );
+        assert_eq!(
+            completion["pending_evidence_path"],
+            publication.pending.path.to_string_lossy().as_ref()
+        );
+        assert_eq!(completion["disposition"]["disposition"], "PASS");
     }
 
     #[cfg(windows)]

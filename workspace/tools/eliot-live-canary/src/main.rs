@@ -4,7 +4,8 @@
 
 use clap::Parser;
 use eliot_live_canary::{
-    CanaryConfig, DEFAULT_DEADLINE_MS, MAX_DEADLINE_MS, ProductionCanary, Pulse, write_evidence,
+    CANARY_DEVELOPMENT_SCHEMA, CanaryConfig, CanaryEvidenceAuthority, DEFAULT_DEADLINE_MS,
+    MAX_DEADLINE_MS, ProductionCanary, Pulse, write_development_evidence,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,12 +14,13 @@ use std::time::Duration;
 #[command(
     name = "eliot-live-canary",
     version,
-    about = "Bounded, fail-closed ELIOT runtime-live canary Pulses 1-5"
+    about = "Non-production development runner for bounded ELIOT canary Pulses 1-5"
 )]
 struct Args {
     #[arg(long)]
     host_state_root: PathBuf,
     #[arg(long)]
+    /// Arbitrary development/test output only; never a production authority location.
     evidence_dir: PathBuf,
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
     pulse: u8,
@@ -42,15 +44,15 @@ async fn main() -> anyhow::Result<()> {
     };
     let canary = ProductionCanary::new(config.clone()).map_err(|error| anyhow::anyhow!(error))?;
     let disposition = canary.run().await;
-    let (evidence_path, evidence_digest) =
-        write_evidence(&config.evidence_dir, pulse, &disposition)
-            .map_err(|error| anyhow::anyhow!(error))?;
+    let publication = write_development_evidence(&config.evidence_dir, pulse, &disposition)
+        .map_err(|error| anyhow::anyhow!(error))?;
     let result = serde_json::json!({
-        "schema": eliot_live_canary::CANARY_SCHEMA,
+        "schema": CANARY_DEVELOPMENT_SCHEMA,
+        "authority": CanaryEvidenceAuthority::NonProductionDevelopment,
         "pulse": pulse,
         "disposition": disposition,
-        "evidence_path": evidence_path,
-        "evidence_digest": evidence_digest,
+        "evidence_path": publication.path,
+        "evidence_digest": publication.digest,
     });
     println!("{}", serde_json::to_string_pretty(&result)?);
     if result
