@@ -896,8 +896,19 @@ fn installation_transaction_status_reads_existing_store_without_inventing_transa
     ));
     fs::create_dir_all(&temp_root).expect("create transaction status fixture");
     let store_path = temp_root.join("transactions.redb");
-    RedbInstallationTransactionStore::create_at_exact_path(&store_path)
-        .expect("create empty transaction store");
+    #[cfg(windows)]
+    let (fixture_root, _portable_lease) = {
+        let portable_root = temp_root.join("portable");
+        fs::create_dir_all(&portable_root).expect("create portable fixture root");
+        let lease = UserOwnedRootLease::open_existing(&portable_root)
+            .expect("protect portable fixture root");
+        (portable_root, lease)
+    };
+    #[cfg(not(windows))]
+    let fixture_root = temp_root.clone();
+    let transaction = portable_cli_transaction(&fixture_root);
+    RedbInstallationTransactionStore::create_planned_at_exact_path(&store_path, &transaction)
+        .expect("create planned transaction store");
 
     let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
         .current_dir(&temp_root)

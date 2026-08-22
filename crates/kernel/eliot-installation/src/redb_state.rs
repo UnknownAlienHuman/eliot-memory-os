@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
@@ -20,7 +20,7 @@ use eliot_contracts::ContractVersion;
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     FileIdentity, delete_owned_file_handle, file_identity_for_open_handle,
-    open_no_follow_directory, open_no_follow_file, open_no_follow_file_for_delete,
+    open_no_follow_directory, open_no_follow_file,
 };
 
 const TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
@@ -35,14 +35,26 @@ struct TransactionEnvelope {
     transaction: InstallationTransaction,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecodedTransactionEnvelope {
+    wire_version: ContractVersion,
+    transaction: serde_json::Value,
+}
+
 /// Production redb transaction store rooted at one caller-selected exact path.
 pub struct RedbInstallationTransactionStore {
     path: PathBuf,
+    #[cfg(windows)]
+    parent: RetainedTransactionDirectory,
+    #[cfg(windows)]
+    file: RetainedTransactionFile,
 }
 
 impl RedbInstallationTransactionStore {
     /// Creates a new database at `path` without creating its parent directory.
-    pub fn create_at_exact_path(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
+    #[cfg(test)]
+    pub(crate) fn create_at_exact_path(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
         let path = path.as_ref();
         require_existing_parent(path)?;
         match fs::symlink_metadata(path) {
@@ -53,9 +65,7 @@ impl RedbInstallationTransactionStore {
         let database = Database::create(path)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         drop(database);
-        Ok(Self {
-            path: path.to_path_buf(),
-        })
+        Self::open_existing_exact_path(path)
     }
 
     /// Creates and atomically publishes a new exact-path database containing
@@ -75,8 +85,9 @@ impl RedbInstallationTransactionStore {
         if !transaction.is_constructor_planned() {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
-                reason: "create_planned accepts only constructor-produced Planned/Pending v9 state"
-                    .to_owned(),
+                reason:
+                    "create_planned accepts only constructor-produced Planned/Pending v21 state"
+                        .to_owned(),
             });
         }
         let path = path.as_ref();
@@ -113,17 +124,13 @@ impl RedbInstallationTransactionStore {
                 }
                 other => other,
             })?;
-        let store = Self {
-            path: path.to_path_buf(),
-        };
         let reopened = Self::open_existing_exact_path(path).map_err(|error| match error {
             InstallationError::Platform(reason) => {
                 InstallationError::Platform(format!("published reopen: {reason}"))
             }
             other => other,
         })?;
-        drop(reopened);
-        Ok(store)
+        Ok(reopened)
     }
 
     /// Opens an existing regular database file without creating any path.
@@ -173,18 +180,46 @@ impl RedbInstallationTransactionStore {
                 return Err(InstallationError::IdentityConflict);
             }
         }
+        #[cfg(windows)]
+        let file = RetainedTransactionFile {
+            identity: expected_identity,
+            file,
+        };
         Ok(Self {
             path: path.to_path_buf(),
+            #[cfg(windows)]
+            parent,
+            #[cfg(windows)]
+            file,
         })
     }
 
     fn open_read_only(&self) -> Result<ReadOnlyDatabase, InstallationError> {
+        self.verify_bound_path()?;
         ReadOnlyDatabase::open(&self.path)
             .map_err(|error| InstallationError::Platform(error.to_string()))
     }
 
     fn open_for_mutation(&self) -> Result<Database, InstallationError> {
+        self.verify_bound_path()?;
         Database::open(&self.path).map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    fn verify_bound_path(&self) -> Result<(), InstallationError> {
+        #[cfg(windows)]
+        {
+            verify_transaction_parent(&self.parent)?;
+            verify_retained_transaction_file(&self.file)?;
+            let (identity, file) =
+                open_no_follow_file(&self.path).map_err(|_| InstallationError::UnknownOutcome {
+                    stage: InstallationStage::Planned,
+                })?;
+            if identity != self.file.identity {
+                return Err(InstallationError::IdentityConflict);
+            }
+            drop(file);
+        }
+        Ok(())
     }
 }
 
@@ -199,7 +234,7 @@ struct PendingTransactionStorePublication {
 #[cfg(windows)]
 struct RetainedTransactionDirectory {
     identity: FileIdentity,
-    _file: File,
+    file: File,
 }
 
 #[cfg(windows)]
@@ -331,7 +366,23 @@ impl PendingTransactionStorePublication {
             });
         }
         let expected_bytes = encode(transaction)?;
-        verify_published_transaction(destination, &transaction.transaction_id, &expected_bytes)?;
+        #[cfg(windows)]
+        let expected_identity = self
+            .temporary_file
+            .as_ref()
+            .ok_or(InstallationError::UnknownOutcome {
+                stage: InstallationStage::Planned,
+            })?
+            .identity;
+        verify_published_transaction(
+            destination,
+            &transaction.transaction_id,
+            &expected_bytes,
+            #[cfg(windows)]
+            Some(expected_identity),
+            #[cfg(not(windows))]
+            None,
+        )?;
         #[cfg(windows)]
         {
             let retained = self
@@ -370,17 +421,14 @@ fn retain_transaction_directory(
             field: "transaction_store.path".to_owned(),
             reason: format!("existing non-reparse parent directory required: {error}"),
         })?;
-    Ok(RetainedTransactionDirectory {
-        identity,
-        _file: file,
-    })
+    Ok(RetainedTransactionDirectory { identity, file })
 }
 
 #[cfg(windows)]
 fn verify_transaction_parent(
     parent: &RetainedTransactionDirectory,
 ) -> Result<(), InstallationError> {
-    let identity = file_identity_for_open_handle(&parent._file).map_err(|_| {
+    let identity = file_identity_for_open_handle(&parent.file).map_err(|_| {
         InstallationError::UnknownOutcome {
             stage: InstallationStage::Planned,
         }
@@ -414,15 +462,25 @@ fn verify_published_transaction(
     destination: &Path,
     expected_transaction_id: &PlatformHandle,
     expected_bytes: &[u8],
+    expected_identity: Option<FileIdentity>,
 ) -> Result<(), InstallationError> {
     #[cfg(windows)]
-    let (published_identity, published_file) = open_no_follow_file_for_delete(destination)
-        .map_err(|_| InstallationError::UnknownOutcome {
+    let (published_identity, published_file) =
+        open_no_follow_file(destination).map_err(|_| InstallationError::UnknownOutcome {
             stage: InstallationStage::Planned,
         })?;
-    let store = RedbInstallationTransactionStore {
-        path: destination.to_path_buf(),
-    };
+    #[cfg(windows)]
+    if expected_identity != Some(published_identity) {
+        return Err(InstallationError::UnknownOutcome {
+            stage: InstallationStage::Planned,
+        });
+    }
+    let store =
+        RedbInstallationTransactionStore::open_existing_exact_path(destination).map_err(|_| {
+            InstallationError::UnknownOutcome {
+                stage: InstallationStage::Planned,
+            }
+        })?;
     let actual = store
         .load(expected_transaction_id)
         .map_err(|_| InstallationError::UnknownOutcome {
@@ -435,7 +493,7 @@ fn verify_published_transaction(
         stage: InstallationStage::Planned,
     })?;
     let expected_digest = format!("{:x}", Sha256::digest(expected_bytes));
-    let actual_digest = format!("{:x}", Sha256::digest(&actual_bytes));
+    let actual_digest = format!("{:x}", Sha256::digest(actual_bytes.as_slice()));
     if actual_bytes != expected_bytes || actual_digest != expected_digest {
         return Err(InstallationError::UnknownOutcome {
             stage: InstallationStage::Planned,
@@ -508,8 +566,9 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
         if !transaction.is_constructor_planned() {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
-                reason: "create_planned accepts only constructor-produced Planned/Pending v9 state"
-                    .to_owned(),
+                reason:
+                    "create_planned accepts only constructor-produced Planned/Pending v21 state"
+                        .to_owned(),
             });
         }
         let database = self.open_for_mutation()?;
@@ -538,7 +597,11 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
         else {
             return Ok(None);
         };
-        decode(value.value()).map(Some)
+        let transaction = decode(value.value())?;
+        if transaction.transaction_id != *transaction_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(Some(transaction))
     }
 
     fn reconcile_active_verified(
@@ -800,12 +863,19 @@ fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
             ),
         });
     }
-    let transaction_value =
-        value
-            .get("transaction")
-            .ok_or_else(|| InstallationError::MigrationRequired {
-                reason: "transaction envelope predates the required transaction payload".to_owned(),
-            })?;
+    let envelope: DecodedTransactionEnvelope =
+        serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
+            reason: format!("transaction envelope is not the strict current shape: {error}"),
+        })?;
+    if envelope.wire_version != INSTALLATION_TRANSACTION_WIRE_VERSION {
+        return Err(InstallationError::MigrationRequired {
+            reason: format!(
+                "transaction envelope wire {} requires explicit migration to {}",
+                envelope.wire_version, INSTALLATION_TRANSACTION_WIRE_VERSION
+            ),
+        });
+    }
+    let transaction_value = &envelope.transaction;
     let transaction_bytes = serde_json::to_vec(transaction_value).map_err(|error| {
         InstallationError::CorruptRegistry {
             reason: error.to_string(),
@@ -919,7 +989,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("create transaction id fixture: {error}"));
         let expected = br#"exact-serialized-transaction-bytes"#;
         assert!(matches!(
-            verify_published_transaction(&path, &expected_transaction_id, expected),
+            verify_published_transaction(&path, &expected_transaction_id, expected, None),
             Err(InstallationError::UnknownOutcome {
                 stage: InstallationStage::Planned
             })
@@ -1051,6 +1121,16 @@ mod tests {
     }
 
     #[test]
+    fn current_transaction_envelope_rejects_unknown_outer_members() {
+        let bytes = br#"{"wire_version":{"major":21,"minor":0,"patch":0},"transaction":{},"unexpected":true}"#;
+        assert!(matches!(
+            decode(bytes),
+            Err(InstallationError::CorruptRegistry { reason })
+                if reason.contains("unknown field")
+        ));
+    }
+
+    #[test]
     fn explicit_path_api_does_not_create_missing_parent() {
         let parent = std::env::temp_dir().join(format!(
             "eliot-installation-missing-parent-{}",
@@ -1120,5 +1200,42 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_store_handles_fence_parent_and_destination_replacement() {
+        let directory = std::env::temp_dir().join(format!(
+            "eliot-installation-retained-store-fence-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap_or_else(|error| panic!("create fixture: {error}"));
+        let path = directory.join("transactions.redb");
+        let store = RedbInstallationTransactionStore::create_at_exact_path(&path)
+            .unwrap_or_else(|error| panic!("create store: {error}"));
+
+        let replacement = directory.join("replacement.redb");
+        fs::write(&replacement, b"foreign")
+            .unwrap_or_else(|error| panic!("write replacement: {error}"));
+        assert!(
+            fs::rename(&replacement, &path).is_err(),
+            "retained destination handle must deny replacement"
+        );
+        assert!(
+            fs::remove_file(&path).is_err(),
+            "retained destination handle must deny deletion"
+        );
+        let renamed_parent = directory.with_extension("renamed");
+        assert!(
+            fs::rename(&directory, &renamed_parent).is_err(),
+            "retained parent handle must deny parent replacement"
+        );
+
+        drop(store);
+        let _ = fs::remove_file(replacement);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(renamed_parent);
+        let _ = fs::remove_dir_all(directory);
     }
 }

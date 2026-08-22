@@ -184,10 +184,12 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 /// Version 18 makes the exact EliotHost-to-EliotWatchdog service-object grant
 /// receipt mandatory for every applied Watchdog registration.
 /// Version 19 binds the exact profiled root hierarchy, shared immutable
-/// package contour, and per-installation canary-evidence root. Older wires
-/// cannot be interpreted as this effect set.
+/// package contour, and per-installation canary-evidence root. Version 21
+/// makes the durable registration nonce and service-start deadline members
+/// mandatory on the current wire; v20 records require explicit migration.
+/// Older wires cannot be interpreted as this effect set.
 /// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(20, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(21, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -10468,7 +10470,6 @@ pub struct InstallationEffectProgress {
     /// Credential Manager reference retained across restart and recovery.
     pub ownership_secret: Option<InstallationOwnershipSecret>,
     /// Unpredictable public nonce retained for one SCM registration effect.
-    #[serde(default)]
     pub registration_nonce: Option<PlatformHandle>,
     /// Typed authoritative SCM DACL receipt for the Watchdog registration.
     /// This member is mandatory on the current wire and is `None` for every
@@ -10478,7 +10479,6 @@ pub struct InstallationEffectProgress {
     /// convergence window.  The deadline is created before the start intent
     /// is persisted and retained across restart; it never authorizes a second
     /// `StartServiceW` call.
-    #[serde(default)]
     pub service_start_deadline_ms: Option<u64>,
     /// Exact proof that the provider issued this transaction's `StartServiceW`
     /// call.  It is paired with the `IntentCommitted.intent_digest`; a
@@ -11950,7 +11950,7 @@ impl InstallationTransaction {
 
     /// Advances from `Activating` to `ActiveVerified` using the exact
     /// read-only registry terminal proof. The proof is consumed and its
-    /// complete binding is persisted in the v20 transaction projection.
+    /// complete binding is persisted in the v21 transaction projection.
     pub fn advance_to_active_verified(
         &mut self,
         receipt: ActivationCommitReceipt,
@@ -12104,7 +12104,7 @@ impl InstallationTransactionWire {
     }
 }
 
-/// Decodes the canonical transaction JSON and classifies pre-v20 records as an
+/// Decodes the canonical transaction JSON and classifies pre-v21 records as an
 /// explicit migration requirement rather than synthesizing missing progress.
 pub fn decode_installation_transaction_json(
     bytes: &[u8],
@@ -12124,6 +12124,61 @@ fn decode_installation_transaction_json_from_store(
     decode_installation_transaction_json_with_policy(bytes, true)
 }
 
+fn validate_current_transaction_progress(
+    value: &serde_json::Value,
+) -> Result<(), InstallationError> {
+    let effect_progress = value
+        .get("effect_progress")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| InstallationError::CorruptRegistry {
+            reason: "installation transaction wire is missing mandatory effect progress array"
+                .to_owned(),
+        })?;
+    for (index, progress) in effect_progress.iter().enumerate() {
+        let progress = progress
+            .as_object()
+            .ok_or_else(|| InstallationError::CorruptRegistry {
+                reason: format!(
+                    "installation transaction effect progress entry {index} is not an object"
+                ),
+            })?;
+        for (field, label) in [
+            ("service_control_grant", "service control grant"),
+            ("registration_nonce", "registration nonce"),
+            ("service_start_deadline_ms", "service start deadline"),
+            ("service_start_proof", "service start proof"),
+        ] {
+            if !progress.contains_key(field) {
+                return Err(InstallationError::CorruptRegistry {
+                    reason: format!(
+                        "installation transaction effect progress entry {index} is missing mandatory {label} member"
+                    ),
+                });
+            }
+        }
+        if let Some(proof) = progress
+            .get("service_start_proof")
+            .filter(|proof| !proof.is_null())
+        {
+            let proof = proof
+                .as_object()
+                .ok_or_else(|| InstallationError::CorruptRegistry {
+                    reason: format!(
+                        "installation transaction effect progress entry {index} service start proof is not an object"
+                    ),
+                })?;
+            if !proof.contains_key("process_lineage") {
+                return Err(InstallationError::CorruptRegistry {
+                    reason: format!(
+                        "installation transaction effect progress entry {index} service start proof is missing mandatory process lineage member"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn decode_installation_transaction_json_with_policy(
     bytes: &[u8],
     allow_advanced_state: bool,
@@ -12134,7 +12189,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v20 discriminator".to_owned(),
+            reason: "installation transaction predates the required v21 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -12158,55 +12213,7 @@ fn decode_installation_transaction_json_with_policy(
                 .to_owned(),
         });
     }
-    let effect_progress = value
-        .get("effect_progress")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| InstallationError::CorruptRegistry {
-            reason: "installation transaction wire is missing mandatory effect progress array"
-                .to_owned(),
-        })?;
-    for (index, progress) in effect_progress.iter().enumerate() {
-        let progress = progress
-            .as_object()
-            .ok_or_else(|| InstallationError::CorruptRegistry {
-                reason: format!(
-                    "installation transaction effect progress entry {index} is not an object"
-                ),
-            })?;
-        if !progress.contains_key("service_control_grant") {
-            return Err(InstallationError::CorruptRegistry {
-                reason: format!(
-                    "installation transaction effect progress entry {index} is missing mandatory service control grant member"
-                ),
-            });
-        }
-        if !progress.contains_key("service_start_proof") {
-            return Err(InstallationError::CorruptRegistry {
-                reason: format!(
-                    "installation transaction effect progress entry {index} is missing mandatory service start proof member"
-                ),
-            });
-        }
-        if let Some(proof) = progress
-            .get("service_start_proof")
-            .filter(|proof| !proof.is_null())
-        {
-            let proof = proof
-                .as_object()
-                .ok_or_else(|| InstallationError::CorruptRegistry {
-                    reason: format!(
-                        "installation transaction effect progress entry {index} service start proof is not an object"
-                    ),
-                })?;
-            if !proof.contains_key("process_lineage") {
-                return Err(InstallationError::CorruptRegistry {
-                    reason: format!(
-                        "installation transaction effect progress entry {index} service start proof is missing mandatory process lineage member"
-                    ),
-                });
-            }
-        }
-    }
+    validate_current_transaction_progress(&value)?;
     let transaction: InstallationTransactionWire =
         serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
             reason: error.to_string(),
@@ -16131,11 +16138,12 @@ fn inspect_package(
 fn reconcile_package(
     request: &InstallationEffectRequest,
 ) -> Result<InstallationEffectObservation, PackageStagingError> {
-    let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
         generation,
         candidate_manifest_digest,
+        manifest,
+        staging_root,
         ..
     } = &request.plan
     else {
@@ -16150,8 +16158,35 @@ fn reconcile_package(
         || manifest.canonical_digest() != candidate_manifest_digest.as_str()
         || persisted.generation != *generation
         || persisted.manifest_digest.as_str() != manifest.canonical_digest()
-        || persisted.source_bundle_identity != stager.source().identity()
     {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+
+    // Once the exact staging receipt is durable, it is the source-independent
+    // recovery authority.  Reopen only the retained destination contour; the
+    // source bundle may have been removed after publication and must never be
+    // required for destination reconciliation.
+    if let Some(receipt) = &request.staging_receipt {
+        validate_staging_receipt_for_plan(&request.plan, receipt)
+            .map_err(|_| PackageStagingError::IdentityMismatch)?;
+        validate_staging_receipt_for_observation(persisted, receipt)
+            .map_err(|_| PackageStagingError::IdentityMismatch)?;
+        return match PackageStager::reconcile_destination_only(
+            Path::new(staging_root.as_str()),
+            receipt,
+        )? {
+            PackageStagingObservation::Absent => Ok(package_absent_observation(request)),
+            PackageStagingObservation::Matching(receipt) => {
+                package_matching_observation(request, receipt)
+                    .map_err(|_| PackageStagingError::IdentityMismatch)
+            }
+            PackageStagingObservation::Mismatch(error) => Ok(package_pending(&error)),
+            PackageStagingObservation::Unknown(error) => Err(error),
+        };
+    }
+
+    let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
+    if persisted.source_bundle_identity != stager.source().identity() {
         return Err(PackageStagingError::IdentityMismatch);
     }
     let observed = stager.source().observe()?;
@@ -16165,13 +16200,11 @@ fn reconcile_package(
     if fresh != *persisted {
         return Err(PackageStagingError::HashMismatch);
     }
-    let observation = if let Some(receipt) = &request.staging_receipt {
-        stager.reconcile(receipt)?
-    } else {
-        // A committed intent without a receipt cannot adopt a tree.  Inspect
-        // only classifies it; the coordinator will persist rollback-required.
-        stager.inspect(&manifest)?
-    };
+    // A committed intent without a receipt may only be reobserved when the
+    // exact source bundle is still present and matches the durable snapshot.
+    // If the source disappeared, package_stager above fails closed and no
+    // destination-only adoption path is reachable.
+    let observation = stager.inspect(&manifest)?;
     match observation {
         PackageStagingObservation::Absent => Ok(package_absent_observation(request)),
         PackageStagingObservation::Matching(receipt) => {
@@ -24002,7 +24035,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_transaction_json_requires_explicit_migration_to_v20() {
+    fn v8_transaction_json_requires_explicit_migration_to_v21() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -24016,7 +24049,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 20.0.0")
+                if reason.contains("requires explicit migration to 21.0.0")
         ));
     }
 
@@ -24065,7 +24098,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("wire 9.0.0 requires explicit migration to 20.0.0")
+                if reason.contains("wire 9.0.0 requires explicit migration to 21.0.0")
         ));
     }
 
@@ -24085,7 +24118,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_transaction_json_requires_explicit_migration_to_v20() {
+    fn v10_transaction_json_requires_explicit_migration_to_v21() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -24111,12 +24144,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 10.0.0 requires explicit migration to 20.0.0")
+                if reason.contains("wire 10.0.0 requires explicit migration to 21.0.0")
         ));
     }
 
     #[test]
-    fn v13_transaction_json_requires_explicit_migration_to_v20() {
+    fn v13_transaction_json_requires_explicit_migration_to_v21() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -24127,12 +24160,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 13.0.0 requires explicit migration to 20.0.0")
+                if reason.contains("wire 13.0.0 requires explicit migration to 21.0.0")
         ));
     }
 
     #[test]
-    fn v14_transaction_json_requires_explicit_migration_to_v20() {
+    fn v14_transaction_json_requires_explicit_migration_to_v21() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -24143,12 +24176,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 14.0.0 requires explicit migration to 20.0.0")
+                if reason.contains("wire 14.0.0 requires explicit migration to 21.0.0")
         ));
     }
 
     #[test]
-    fn v15_transaction_json_requires_explicit_migration_to_v20() {
+    fn v15_transaction_json_requires_explicit_migration_to_v21() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         legacy["transaction_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(15, 0, 0)));
@@ -24156,12 +24189,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 15.0.0 requires explicit migration to 20.0.0")
+                if reason.contains("wire 15.0.0 requires explicit migration to 21.0.0")
         ));
     }
 
     #[test]
-    fn v16_transaction_json_requires_explicit_migration_to_v20() {
+    fn v16_transaction_json_requires_explicit_migration_to_v21() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         legacy["transaction_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(16, 0, 0)));
@@ -24169,12 +24202,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 16.0.0") && reason.contains("20.0.0")
+                if reason.contains("wire 16.0.0") && reason.contains("21.0.0")
         ));
     }
 
     #[test]
-    fn v17_transaction_json_requires_explicit_migration_to_v20() {
+    fn v17_transaction_json_requires_explicit_migration_to_v21() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         legacy["transaction_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(17, 0, 0)));
@@ -24191,12 +24224,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 17.0.0") && reason.contains("20.0.0")
+                if reason.contains("wire 17.0.0") && reason.contains("21.0.0")
         ));
     }
 
     #[test]
-    fn v18_transaction_json_requires_explicit_migration_to_v20() {
+    fn v18_transaction_json_requires_explicit_migration_to_v21() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         legacy["transaction_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(18, 0, 0)));
@@ -24207,8 +24240,42 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("wire 18.0.0") && reason.contains("20.0.0")
+                if reason.contains("wire 18.0.0") && reason.contains("21.0.0")
         ));
+    }
+
+    #[test]
+    fn v20_transaction_json_requires_explicit_migration_to_v21() {
+        let mut legacy = must(serde_json::to_value(planned_transaction()));
+        legacy["transaction_wire_version"] =
+            must(serde_json::to_value(ContractVersion::new(20, 0, 0)));
+        let bytes = must(serde_json::to_vec(&legacy));
+        assert!(matches!(
+            decode_installation_transaction_json(&bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("wire 20.0.0") && reason.contains("21.0.0")
+        ));
+    }
+
+    #[test]
+    fn current_transaction_missing_nonce_or_deadline_is_corrupt_not_synthesized() {
+        for field in ["registration_nonce", "service_start_deadline_ms"] {
+            let mut value = must(serde_json::to_value(planned_transaction()));
+            let progress = value["effect_progress"]
+                .as_array_mut()
+                .unwrap_or_else(|| unreachable!());
+            progress[0]
+                .as_object_mut()
+                .unwrap_or_else(|| unreachable!())
+                .remove(field);
+            let bytes = must(serde_json::to_vec(&value));
+            let Err(InstallationError::CorruptRegistry { reason }) =
+                decode_installation_transaction_json(&bytes)
+            else {
+                panic!("missing {field} must be rejected without synthesis");
+            };
+            assert!(reason.contains("missing mandatory"), "{field}: {reason}");
+        }
     }
 
     #[test]
