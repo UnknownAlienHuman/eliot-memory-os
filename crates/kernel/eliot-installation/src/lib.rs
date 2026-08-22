@@ -21204,7 +21204,7 @@ mod tests {
         let _ = std::fs::remove_file(&transaction_path);
         let _ = std::fs::remove_file(&registry_path);
         let mut transaction_store = must(
-            RedbInstallationTransactionStore::create_planned_at_exact_path(
+            RedbInstallationTransactionStore::create_unpublished_stage_fixture_at_exact_path(
                 &transaction_path,
                 &planned,
             ),
@@ -21406,7 +21406,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&transaction_path);
         let mut transaction_store = must(
-            RedbInstallationTransactionStore::create_planned_at_exact_path(
+            RedbInstallationTransactionStore::create_unpublished_stage_fixture_at_exact_path(
                 &transaction_path,
                 &planned,
             ),
@@ -21504,7 +21504,7 @@ mod tests {
         let _ = std::fs::remove_file(&transaction_path);
         let _ = std::fs::remove_file(&registry_path);
         let mut transaction_store = must(
-            RedbInstallationTransactionStore::create_planned_at_exact_path(
+            RedbInstallationTransactionStore::create_unpublished_stage_fixture_at_exact_path(
                 &transaction_path,
                 &planned,
             ),
@@ -21537,7 +21537,9 @@ mod tests {
         drop(transaction_store);
 
         let mut transaction_store = must(
-            RedbInstallationTransactionStore::open_existing_exact_path(&transaction_path),
+            RedbInstallationTransactionStore::open_unpublished_stage_fixture_exact_path(
+                &transaction_path,
+            ),
         );
         let registry =
             RedbInstallationRegistry::from_database_for_test(must(Database::open(&registry_path)));
@@ -21567,7 +21569,9 @@ mod tests {
             &registry_path,
         )));
         let mut transaction_store = must(
-            RedbInstallationTransactionStore::open_existing_exact_path(&transaction_path),
+            RedbInstallationTransactionStore::open_unpublished_stage_fixture_exact_path(
+                &transaction_path,
+            ),
         );
         must(registry.stage_pending_activation_with_verified_approval(
             &mut transaction_store,
@@ -21638,7 +21642,7 @@ mod tests {
         let _ = std::fs::remove_file(&transaction_path);
         let _ = std::fs::remove_file(&registry_path);
         let mut transaction_store = must(
-            RedbInstallationTransactionStore::create_planned_at_exact_path(
+            RedbInstallationTransactionStore::create_unpublished_stage_fixture_at_exact_path(
                 &transaction_path,
                 &planned,
             ),
@@ -21688,7 +21692,9 @@ mod tests {
             )
         }));
         let mut transaction_store = must(
-            RedbInstallationTransactionStore::open_existing_exact_path(&transaction_path),
+            RedbInstallationTransactionStore::open_unpublished_stage_fixture_exact_path(
+                &transaction_path,
+            ),
         );
         assert!(
             registry
@@ -22492,8 +22498,11 @@ mod tests {
             NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&path);
-        let mut physical =
-            must(RedbInstallationTransactionStore::create_planned_at_exact_path(&path, &planned));
+        let mut physical = must(
+            RedbInstallationTransactionStore::create_unpublished_stage_fixture_at_exact_path(
+                &path, &planned,
+            ),
+        );
         let expected = must(TransactionVersion::of(&planned));
         let mut registering = transaction.clone();
         registering.revision = expected.revision + 1;
@@ -22568,9 +22577,9 @@ mod tests {
         );
         drop(coordinator);
 
-        let reopened = must(RedbInstallationTransactionStore::open_existing_exact_path(
-            &path,
-        ));
+        let reopened = must(
+            RedbInstallationTransactionStore::open_unpublished_stage_fixture_exact_path(&path),
+        );
         let reopened_state = must(reopened.load(&transaction_id)).unwrap_or_else(|| unreachable!());
         assert!(
             reopened_state.effect_progress[index]
@@ -22673,8 +22682,11 @@ mod tests {
             NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&path);
-        let mut physical =
-            must(RedbInstallationTransactionStore::create_planned_at_exact_path(&path, &planned));
+        let mut physical = must(
+            RedbInstallationTransactionStore::create_unpublished_stage_fixture_at_exact_path(
+                &path, &planned,
+            ),
+        );
         let expected = must(TransactionVersion::of(&planned));
         let mut persisted = transaction.clone();
         persisted.revision = expected.revision + 1;
@@ -22684,9 +22696,9 @@ mod tests {
             &persisted,
         ));
         drop(physical);
-        let physical = must(RedbInstallationTransactionStore::open_existing_exact_path(
-            &path,
-        ));
+        let physical = must(
+            RedbInstallationTransactionStore::open_unpublished_stage_fixture_exact_path(&path),
+        );
         let execute_count = Arc::new(Mutex::new(0));
         let port = fake_port(
             SharedStore::default(),
@@ -25504,7 +25516,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&transaction_path);
         let mut transaction_store = must(
-            RedbInstallationTransactionStore::create_planned_at_exact_path(
+            RedbInstallationTransactionStore::create_unpublished_stage_fixture_at_exact_path(
                 &transaction_path,
                 &planned,
             ),
@@ -29191,8 +29203,11 @@ mod tests {
             NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&path);
-        let store =
-            must(RedbInstallationTransactionStore::create_planned_at_exact_path(&path, &planned));
+        let store = must(
+            RedbInstallationTransactionStore::create_unpublished_stage_fixture_at_exact_path(
+                &path, &planned,
+            ),
+        );
         forged.revision = activating.revision + 1;
         {
             let database = must(redb::Database::open(&path));

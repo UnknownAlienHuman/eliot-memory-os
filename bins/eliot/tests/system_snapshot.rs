@@ -12,9 +12,8 @@ use eliot_installation::{
     INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationEpoch, InstallationProfile,
     InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, ManagedEnvironmentAction,
     ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange,
-    RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
-    RuntimeStateRoots, StateFence, SupervisionAuthorityBinding, UserOwnedRootLease,
-    parse_installation_transaction_id,
+    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
+    SupervisionAuthorityBinding, UserOwnedRootLease, parse_installation_transaction_id,
 };
 #[cfg(windows)]
 use eliot_platform_windows::{
@@ -535,6 +534,10 @@ fn fixture_path(root: &Path, name: &str) -> eliot_installation::PlatformHandle {
 }
 
 #[cfg(windows)]
+#[allow(
+    dead_code,
+    reason = "retained planner fixture documents the rejected unjournaled StagePackage shape"
+)]
 fn planner_bound_status_transaction(root: &Path) -> InstallationTransaction {
     let source_root = root.join("source-bundle");
     fs::create_dir_all(&source_root).expect("create planner source root");
@@ -986,24 +989,15 @@ fn installation_apply_rejects_removed_raw_approval_ref_without_writing() {
 
 #[cfg(windows)]
 #[test]
-fn installation_transaction_status_reads_existing_store_without_inventing_transaction() {
+fn installation_transaction_status_rejects_removed_selector_without_touching_existing_file() {
     let temp_root = std::env::temp_dir().join(format!(
         "eliot-installation-transaction-status-{}",
         std::process::id()
     ));
     fs::create_dir_all(&temp_root).expect("create transaction status fixture");
     let store_path = temp_root.join("transactions.redb");
-    #[cfg(windows)]
-    let (fixture_root, _portable_lease) = {
-        let portable_root = temp_root.join("portable");
-        fs::create_dir_all(&portable_root).expect("create portable fixture root");
-        let lease = UserOwnedRootLease::open_existing(&portable_root)
-            .expect("protect portable fixture root");
-        (portable_root, lease)
-    };
-    let transaction = planner_bound_status_transaction(&fixture_root);
-    RedbInstallationTransactionStore::create_planned_at_exact_path(&store_path, &transaction)
-        .expect("create planned transaction store");
+    let original = b"caller-owned-existing-file";
+    fs::write(&store_path, original).expect("create existing status fixture");
 
     let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
         .current_dir(&temp_root)
@@ -1026,6 +1020,7 @@ fn installation_transaction_status_reads_existing_store_without_inventing_transa
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(store_path.exists(), "status removed the transaction store");
+    assert_eq!(fs::read(&store_path).expect("read existing file"), original);
     let _ = fs::remove_dir_all(temp_root);
 }
 

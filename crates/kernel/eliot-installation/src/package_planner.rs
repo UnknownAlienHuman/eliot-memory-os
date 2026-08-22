@@ -3629,7 +3629,7 @@ mod tests {
         assert!(crate::decode_installation_transaction_json(bad).is_err());
     }
     #[test]
-    fn retained_handle_redb_reopen_positive() {
+    fn public_planner_cannot_create_redb_without_published_journal() {
         let (_tmp, portable, roots) = temp_portable_root();
         let source_dir = tempfile::TempDir::new().unwrap();
         let hashes = populate_source_with_roles(source_dir.path());
@@ -3668,14 +3668,26 @@ mod tests {
         assert!(SealedPackagePlanner::reopen_and_validate(&tx).is_ok());
         let dir = tempfile::TempDir::new().unwrap();
         let store_path = dir.path().join("tx.redb");
-        let store =
-            crate::RedbInstallationTransactionStore::create_planned_at_exact_path(&store_path, &tx)
-                .unwrap();
-        drop(store);
-        let store2 =
-            crate::RedbInstallationTransactionStore::open_existing_exact_path(&store_path).unwrap();
-        let loaded = store2.load(&h("transaction:positive")).unwrap().unwrap();
-        assert_eq!(loaded.transaction_id, tx.transaction_id);
-        assert!(SealedPackagePlanner::reopen_and_validate(&loaded).is_ok());
+        assert!(matches!(
+            crate::RedbInstallationTransactionStore::create_planned_at_exact_path(
+                &store_path,
+                &tx
+            ),
+            Err(crate::InstallationError::MigrationRequired { reason })
+                if reason.contains("Published source publication journal")
+        ));
+        assert!(
+            !store_path.exists(),
+            "an unjournaled StagePackage plan must not create a redb authority"
+        );
+        let existing_path = dir.path().join("existing.redb");
+        let mut existing =
+            crate::RedbInstallationTransactionStore::create_at_exact_path(&existing_path).unwrap();
+        assert!(matches!(
+            existing.create_planned(&tx),
+            Err(crate::InstallationError::MigrationRequired { reason })
+                if reason.contains("publication journal")
+        ));
+        assert!(existing.load(&tx.transaction_id).unwrap().is_none());
     }
 }

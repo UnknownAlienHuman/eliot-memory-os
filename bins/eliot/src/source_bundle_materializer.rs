@@ -206,6 +206,10 @@ pub enum CanarySourceBundleReconciliationReason {
     DirectoryPublicationUnknown,
     /// Directory publication was exact, but the complete nine-role
     /// post-commit source-bundle readback was rejected.
+    #[allow(
+        dead_code,
+        reason = "retained wire value for older reconciliation receipts"
+    )]
     PostCommitBundleReadbackRejected,
 }
 
@@ -1218,16 +1222,140 @@ fn journal_unknown_outcome(
                     .output_bundle
                     .parent()
                     .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
-                parent_identity: FileIdentity {
-                    volume_serial_number: 0,
-                    file_index: 0,
-                },
+                parent_identity: journal.parent_identity,
                 source_identity: journal.source_identity,
             },
         ),
         reason: CanarySourceBundleReconciliationReason::DirectoryPublicationUnknown,
         diagnostic,
     })
+}
+
+fn persist_unknown_publication(
+    store: &RedbInstallationTransactionStore,
+    journal: &SourceBundlePublicationJournal,
+    precommit_files: Vec<MaterializedRolePrecommitReceipt>,
+    diagnostic: impl AsRef<str>,
+) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
+    let diagnostic = diagnostic.as_ref().chars().take(1024).collect::<String>();
+    let unknown = SourceBundlePublicationJournal {
+        state: SourceBundlePublicationJournalState::CommittedUnknown,
+        destination_identity: None,
+        directory_receipt: None,
+        diagnostic: Some(diagnostic.clone()),
+        ..journal.clone()
+    };
+    let recorded = store
+        .record_source_bundle_publication(&unknown)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    Ok(journal_unknown_outcome(
+        &recorded,
+        precommit_files,
+        diagnostic,
+    ))
+}
+
+fn resume_intent_publication(
+    store: &RedbInstallationTransactionStore,
+    journal: &SourceBundlePublicationJournal,
+    precommit_files: Vec<MaterializedRolePrecommitReceipt>,
+) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
+    let publication = match OwnedDirectoryPublication::resume(
+        &journal.output_bundle,
+        &journal.temporary_path,
+        &journal.temporary_name,
+        journal.parent_identity,
+        journal.source_identity,
+    ) {
+        Ok(publication) => publication,
+        Err(error) => {
+            return persist_unknown_publication(
+                store,
+                journal,
+                precommit_files,
+                format!("recorded temporary publication cannot be resumed: {error}"),
+            );
+        }
+    };
+    let (manifest, expected, _) = typed_bundle_from_journal(journal)?;
+    let verification = (|| {
+        let bundle = publication.trusted_source_bundle().map_err(|error| {
+            MaterializeError::Platform(format!("open resumed source bundle: {error}"))
+        })?;
+        if bundle.identity() != journal.source_identity {
+            return Err(MaterializeError::Invalid(
+                "resumed temporary directory identity differs from the durable journal".to_owned(),
+            ));
+        }
+        let observed = validate_published_observation(&bundle, &manifest, &expected)?;
+        for prepared in &precommit_files {
+            let actual = observed.get(&prepared.relative_path).ok_or_else(|| {
+                MaterializeError::Invalid(format!(
+                    "resumed role missing: {}",
+                    prepared.relative_path
+                ))
+            })?;
+            if actual.identity != prepared.temporary_identity
+                || actual.size != prepared.size
+                || actual.sha256 != prepared.sha256
+                || actual.pe != prepared.pe
+            {
+                return Err(MaterializeError::Invalid(format!(
+                    "resumed role differs from the durable journal: {}",
+                    prepared.relative_path
+                )));
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = verification {
+        return persist_unknown_publication(
+            store,
+            journal,
+            precommit_files,
+            format!("recorded temporary publication readback rejected: {error}"),
+        );
+    }
+    let directory_publication = match publication.publish(journal.source_identity) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return persist_unknown_publication(
+                store,
+                journal,
+                precommit_files,
+                format!("recorded temporary publication move was not authorized: {error}"),
+            );
+        }
+    };
+    match directory_publication {
+        DirectoryPublicationOutcome::Published(receipt) => {
+            let published = SourceBundlePublicationJournal {
+                state: SourceBundlePublicationJournalState::Published,
+                destination_identity: Some(receipt.destination_identity),
+                directory_receipt: Some(receipt),
+                diagnostic: None,
+                ..journal.clone()
+            };
+            let recorded = store
+                .record_source_bundle_publication(&published)
+                .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+            let receipt = reconcile_journal_destination(&recorded)?.ok_or_else(|| {
+                MaterializeError::Invalid(
+                    "resumed publication destination disappeared after durable receipt".to_owned(),
+                )
+            })?;
+            Ok(CanarySourceBundleMaterializeOutcome::Published(receipt))
+        }
+        DirectoryPublicationOutcome::CommittedUnknown(receipt) => persist_unknown_publication(
+            store,
+            journal,
+            precommit_files,
+            format!(
+                "recorded temporary publication committed with unknown outcome: {:?}",
+                receipt.reason
+            ),
+        ),
+    }
 }
 
 fn reconcile_existing_publication(
@@ -1292,7 +1420,9 @@ fn reconcile_existing_publication(
                 receipt,
             )))
         }
-        Ok(None) if journal.state == SourceBundlePublicationJournalState::Intent => Ok(None),
+        Ok(None) if journal.state == SourceBundlePublicationJournalState::Intent => Ok(Some(
+            resume_intent_publication(&store, &journal, precommit_files)?,
+        )),
         Ok(None) => Ok(Some(journal_unknown_outcome(
             &journal,
             precommit_files,
@@ -1313,6 +1443,7 @@ fn reconcile_existing_publication(
 fn materialize_with_executables(
     input: &CanarySourceBundleMaterializeInput,
     executables: &[ValidatedExecutable],
+    stop_after_durable_intent: bool,
 ) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
     validate_role_inventory(&REQUIRED_ROLES)?;
     validate_absolute(&input.output_bundle, "output_bundle")?;
@@ -1462,6 +1593,9 @@ fn materialize_with_executables(
         operation_id,
         transaction_id: input.transaction_id.clone(),
         output_bundle: input.output_bundle.clone(),
+        temporary_path: publication.temporary_path().to_path_buf(),
+        temporary_name: publication.temporary_name().to_owned(),
+        parent_identity: publication.parent_identity(),
         generation: input.generation.clone(),
         manifest_digest: PlatformHandle::new(typed.manifest.canonical_digest())
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
@@ -1475,158 +1609,41 @@ fn materialize_with_executables(
         directory_receipt: None,
         diagnostic: None,
     };
+    // The durable intent is the only authority allowed to reopen this exact
+    // temporary object after a crash. Drop the creator handle before begin so
+    // begin can independently reopen it with DELETE authority and verify the
+    // complete journal-bound tree. The move is then performed by a second
+    // exact identity-bound resume, never by an unjournaled creator handle.
+    drop(publication);
     let existing_journal =
         RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
             &input.store_path,
             &journal_intent,
         )
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    if existing_journal.state != SourceBundlePublicationJournalState::Intent {
-        return Ok(CanarySourceBundleMaterializeOutcome::CommittedUnknown(
-            CanarySourceBundleReconciliation {
-                bundle_path: existing_journal
-                    .output_bundle
-                    .to_string_lossy()
-                    .into_owned(),
-                generation: existing_journal.generation.as_str().to_owned(),
-                evidence_digest: existing_journal.evidence_digest.as_str().to_owned(),
-                precommit_files,
-                directory_publication: DirectoryPublicationOutcome::CommittedUnknown(
-                    eliot_platform_windows::DirectoryPublicationUnknownReceipt {
-                        reason: eliot_platform_windows::DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
-                        destination_path: existing_journal.output_bundle.to_string_lossy().into_owned(),
-                        canonical_parent_path: existing_journal
-                            .output_bundle
-                            .parent()
-                            .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
-                        parent_identity: FileIdentity {
-                            volume_serial_number: 0,
-                            file_index: 0,
-                        },
-                        source_identity: existing_journal.source_identity,
-                    },
-                ),
-                reason: CanarySourceBundleReconciliationReason::DirectoryPublicationUnknown,
-                diagnostic: "durable publication journal already crossed the native move boundary; reconcile the exact journal before retrying"
-                    .to_owned(),
-            },
+    if stop_after_durable_intent {
+        return Err(MaterializeError::Platform(
+            "injected process loss after durable publication Intent".to_owned(),
         ));
     }
-
-    let directory_publication = publication
-        .publish(precommit_directory_identity)
-        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
-    let journal_after_move = match &directory_publication {
-        DirectoryPublicationOutcome::Published(receipt) => SourceBundlePublicationJournal {
-            state: SourceBundlePublicationJournalState::Published,
-            destination_identity: Some(receipt.destination_identity),
-            directory_receipt: Some(receipt.clone()),
-            diagnostic: None,
-            ..journal_intent.clone()
-        },
-        DirectoryPublicationOutcome::CommittedUnknown(receipt) => SourceBundlePublicationJournal {
-            state: SourceBundlePublicationJournalState::CommittedUnknown,
-            destination_identity: None,
-            directory_receipt: None,
-            diagnostic: Some(format!(
-                "directory publication committed unknown: {:?}",
-                receipt.reason
-            )),
-            ..journal_intent.clone()
-        },
-    };
-    RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path)
-        .map_err(|error| MaterializeError::Contract(error.to_string()))?
-        .record_source_bundle_publication(&journal_after_move)
+    let store = RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    let destination_path = match &directory_publication {
-        DirectoryPublicationOutcome::Published(receipt) => receipt.destination_path.clone(),
-        DirectoryPublicationOutcome::CommittedUnknown(receipt) => receipt.destination_path.clone(),
-    };
-    let DirectoryPublicationOutcome::Published(publication_receipt) = &directory_publication else {
-        return Ok(CanarySourceBundleMaterializeOutcome::CommittedUnknown(
-            CanarySourceBundleReconciliation {
-                bundle_path: destination_path,
-                generation: input.generation.as_str().to_owned(),
-                evidence_digest: typed.evidence_digest.as_str().to_owned(),
-                precommit_files,
-                directory_publication,
-                reason: CanarySourceBundleReconciliationReason::DirectoryPublicationUnknown,
-                diagnostic: "directory move committed without an exact post-commit receipt"
-                    .to_owned(),
-            },
-        ));
-    };
-
-    let postcommit = (|| {
-        let bundle = TrustedSourceBundle::open(Path::new(&publication_receipt.destination_path))
-            .map_err(|error| {
-                MaterializeError::Platform(format!("open published bundle: {error}"))
+    match existing_journal.state {
+        SourceBundlePublicationJournalState::Intent => {
+            resume_intent_publication(&store, &existing_journal, precommit_files)
+        }
+        SourceBundlePublicationJournalState::Published => {
+            let receipt = reconcile_journal_destination(&existing_journal)?.ok_or_else(|| {
+                MaterializeError::Invalid(
+                    "durable Published journal has no exact destination".to_owned(),
+                )
             })?;
-        if bundle.identity() != publication_receipt.destination_identity
-            || publication_receipt.source_identity != publication_receipt.destination_identity
-        {
-            return Err(MaterializeError::Invalid(
-                "published bundle directory identity mismatch".to_owned(),
-            ));
+            Ok(CanarySourceBundleMaterializeOutcome::Published(receipt))
         }
-        let observed = validate_published_observation(&bundle, &typed.manifest, &typed.expected)?;
-        let receipt_evidence = GenerationPackagePlanner::artifact_set_evidence_digest(
-            &typed.manifest,
-            &typed.expected,
-        )
-        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-        if receipt_evidence != typed.evidence_digest {
-            return Err(MaterializeError::Invalid(
-                "artifact evidence digest changed before receipt".to_owned(),
-            ));
-        }
-        let mut files = Vec::with_capacity(REQUIRED_ROLES.len());
-        for prepared in &precommit_files {
-            let actual = observed.get(&prepared.relative_path).ok_or_else(|| {
-                MaterializeError::Invalid(format!(
-                    "published role missing: {}",
-                    prepared.relative_path
-                ))
-            })?;
-            if actual.identity != prepared.temporary_identity {
-                return Err(MaterializeError::Invalid(format!(
-                    "published role identity changed: {}",
-                    prepared.relative_path
-                )));
-            }
-            files.push(MaterializedRoleReceipt {
-                relative_path: prepared.relative_path.clone(),
-                executable: prepared.executable,
-                size: prepared.size,
-                sha256: prepared.sha256.clone(),
-                source_identity: prepared.source_identity,
-                destination_identity: actual.identity,
-                pe: prepared.pe.clone(),
-                authenticode: prepared.authenticode.clone(),
-            });
-        }
-        Ok(CanarySourceBundleReceipt {
-            bundle_path: publication_receipt.destination_path.clone(),
-            generation: input.generation.as_str().to_owned(),
-            evidence_digest: typed.evidence_digest.as_str().to_owned(),
-            files,
-            source_identity: publication_receipt.source_identity,
-            directory_publication: publication_receipt.clone(),
-        })
-    })();
-    match postcommit {
-        Ok(receipt) => Ok(CanarySourceBundleMaterializeOutcome::Published(receipt)),
-        Err(error) => Ok(CanarySourceBundleMaterializeOutcome::CommittedUnknown(
-            CanarySourceBundleReconciliation {
-                bundle_path: destination_path,
-                generation: input.generation.as_str().to_owned(),
-                evidence_digest: typed.evidence_digest.as_str().to_owned(),
-                precommit_files,
-                directory_publication,
-                reason: CanarySourceBundleReconciliationReason::PostCommitBundleReadbackRejected,
-                diagnostic: error.to_string(),
-            },
+        SourceBundlePublicationJournalState::CommittedUnknown => Ok(journal_unknown_outcome(
+            &existing_journal,
+            precommit_files,
+            "durable publication journal requires exact destination reconciliation".to_owned(),
         )),
     }
 }
@@ -1653,7 +1670,7 @@ pub fn materialize_canary_source_bundle(
         .into_iter()
         .map(|(path, role)| validate_executable(&path, role).map_err(to_installation_error))
         .collect::<Result<Vec<_>, _>>()?;
-    materialize_with_executables(input, &executables).map_err(to_installation_error)
+    materialize_with_executables(input, &executables, false).map_err(to_installation_error)
 }
 
 #[cfg(test)]
@@ -1788,11 +1805,35 @@ mod tests {
         let anchor = TempDir::new().unwrap();
         let staging = TempDir::new().unwrap();
         let input = test_input(&source_parent, &anchor, &staging);
-        let outcome = materialize_with_executables(&input, &fake_executables()).unwrap();
+        let outcome = materialize_with_executables(&input, &fake_executables(), false).unwrap();
         let CanarySourceBundleMaterializeOutcome::Published(receipt) = outcome else {
             panic!("exact materializer publication unexpectedly requires reconciliation");
         };
         (source_parent, anchor, staging, input, receipt)
+    }
+
+    #[cfg(windows)]
+    fn crash_after_publication_intent(
+        input: &CanarySourceBundleMaterializeInput,
+    ) -> SourceBundlePublicationJournal {
+        let error = materialize_with_executables(input, &fake_executables(), true).unwrap_err();
+        assert!(error.to_string().contains("injected process loss"));
+        let operation_id = source_bundle_publication_operation_id(
+            &input.transaction_id,
+            &input.output_bundle,
+            &input.generation,
+        )
+        .unwrap();
+        let store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path).unwrap();
+        let journal = store
+            .load_source_bundle_publication(&operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.state, SourceBundlePublicationJournalState::Intent);
+        assert!(journal.temporary_path.exists());
+        assert!(!journal.output_bundle.exists());
+        journal
     }
 
     #[cfg(windows)]
@@ -1851,7 +1892,7 @@ mod tests {
         let anchor = TempDir::new().unwrap();
         let staging = TempDir::new().unwrap();
         let input = test_input(&source_parent, &anchor, &staging);
-        let outcome = materialize_with_executables(&input, &fake_executables()).unwrap();
+        let outcome = materialize_with_executables(&input, &fake_executables(), false).unwrap();
         let CanarySourceBundleMaterializeOutcome::Published(receipt) = outcome else {
             panic!("exact materializer publication unexpectedly requires reconciliation");
         };
@@ -1919,6 +1960,156 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn crash_after_intent_resumes_the_recorded_temporary_without_original_sources() {
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let input = test_input(&source_parent, &anchor, &staging);
+        let journal = crash_after_publication_intent(&input);
+        for source in [
+            &input.eliot_host_exe,
+            &input.eliot_watchdog_exe,
+            &input.eliot_kernel_exe,
+            &input.eliot_store_surreal_exe,
+            &input.surreal_exe,
+            &input.eliotd_exe,
+        ] {
+            assert!(
+                !source.exists(),
+                "fixture original source must be unavailable"
+            );
+        }
+
+        let outcome = materialize_canary_source_bundle(&input).unwrap();
+        let CanarySourceBundleMaterializeOutcome::Published(receipt) = outcome else {
+            panic!("recorded temporary publication was not resumed");
+        };
+        assert_eq!(receipt.source_identity, journal.source_identity);
+        assert_eq!(
+            receipt.directory_publication.destination_identity,
+            journal.source_identity
+        );
+        assert!(!journal.temporary_path.exists());
+        assert!(journal.output_bundle.exists());
+        let store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path).unwrap();
+        assert_eq!(
+            store
+                .load_source_bundle_publication(&journal.operation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            SourceBundlePublicationJournalState::Published
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_or_substituted_recorded_temporary_is_durably_unknown_and_never_resent() {
+        for substituted in [false, true] {
+            let source_parent = TempDir::new().unwrap();
+            let anchor = TempDir::new().unwrap();
+            let staging = TempDir::new().unwrap();
+            let input = test_input(&source_parent, &anchor, &staging);
+            let journal = crash_after_publication_intent(&input);
+            fs::remove_dir_all(&journal.temporary_path).unwrap();
+            if substituted {
+                fs::create_dir(&journal.temporary_path).unwrap();
+                fs::write(journal.temporary_path.join("foreign.txt"), b"foreign").unwrap();
+            }
+
+            let first = materialize_canary_source_bundle(&input).unwrap();
+            assert!(matches!(
+                first,
+                CanarySourceBundleMaterializeOutcome::CommittedUnknown(_)
+            ));
+            assert!(!journal.output_bundle.exists());
+            let store =
+                RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path)
+                    .unwrap();
+            assert_eq!(
+                store
+                    .load_source_bundle_publication(&journal.operation_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                SourceBundlePublicationJournalState::CommittedUnknown
+            );
+            drop(store);
+
+            let second = materialize_canary_source_bundle(&input).unwrap();
+            assert!(matches!(
+                second,
+                CanarySourceBundleMaterializeOutcome::CommittedUnknown(_)
+            ));
+            assert!(!journal.output_bundle.exists());
+            let temporary_count = fs::read_dir(source_parent.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".bundle.tmp.")
+                })
+                .count();
+            assert_eq!(temporary_count, usize::from(substituted));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn response_loss_destination_reconciliation_promotes_the_same_operation() {
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let input = test_input(&source_parent, &anchor, &staging);
+        let journal = crash_after_publication_intent(&input);
+        let store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path).unwrap();
+        let unknown = SourceBundlePublicationJournal {
+            state: SourceBundlePublicationJournalState::CommittedUnknown,
+            destination_identity: None,
+            directory_receipt: None,
+            diagnostic: Some("injected response loss".to_owned()),
+            ..journal.clone()
+        };
+        store.record_source_bundle_publication(&unknown).unwrap();
+        let publication = OwnedDirectoryPublication::resume(
+            &journal.output_bundle,
+            &journal.temporary_path,
+            &journal.temporary_name,
+            journal.parent_identity,
+            journal.source_identity,
+        )
+        .unwrap();
+        assert!(matches!(
+            publication.publish(journal.source_identity).unwrap(),
+            DirectoryPublicationOutcome::Published(_)
+        ));
+        drop(store);
+
+        let outcome = materialize_canary_source_bundle(&input).unwrap();
+        assert!(matches!(
+            outcome,
+            CanarySourceBundleMaterializeOutcome::Published(_)
+        ));
+        let store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path).unwrap();
+        let recovered = store
+            .load_source_bundle_publication(&journal.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.state,
+            SourceBundlePublicationJournalState::Published
+        );
+        assert_eq!(recovered.operation_id, journal.operation_id);
+        assert_eq!(recovered.source_identity, journal.source_identity);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn bound_generation_writes_exact_output_and_store_paths() {
         let (source_parent, _anchor, _staging, input, receipt) = materialized_fixture();
         let output_bundle = PathBuf::from(&receipt.bundle_path);
@@ -1964,6 +2155,14 @@ mod tests {
             RedbInstallationTransactionStore::open_existing_exact_path(&store).unwrap();
         let durable = durable_store.load(&transaction_id).unwrap().unwrap();
         assert_eq!(diagnostic, serde_json::to_value(&durable).unwrap());
+        let generation_path = output_bundle.join("generation.json");
+        let mut substituted = fs::read(&generation_path).unwrap();
+        substituted.push(b' ');
+        fs::write(&generation_path, substituted).unwrap();
+        assert!(matches!(
+            durable_store.load(&transaction_id),
+            Err(InstallationError::IdentityConflict)
+        ));
     }
 
     #[cfg(windows)]
@@ -2113,7 +2312,7 @@ mod tests {
         let mut input = test_input(&source_parent, &anchor, &staging);
         fs::create_dir(input.output_bundle.clone()).unwrap();
         fs::write(input.output_bundle.join("owner.txt"), b"existing").unwrap();
-        let error = materialize_with_executables(&input, &fake_executables()).unwrap_err();
+        let error = materialize_with_executables(&input, &fake_executables(), false).unwrap_err();
         assert!(error.to_string().contains("already exists"));
         assert_eq!(
             fs::read(input.output_bundle.join("owner.txt")).unwrap(),
