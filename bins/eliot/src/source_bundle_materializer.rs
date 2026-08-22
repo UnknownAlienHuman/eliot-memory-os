@@ -72,7 +72,7 @@ pub struct CanarySourceBundleMaterializeInput {
     /// Stable transaction identity used by the planner's launch-template
     /// derivation.
     pub transaction_id: PlatformHandle,
-    /// Explicit destination staging root used by the existing Generate path.
+    /// Explicit destination staging root used by the bound generation planner.
     pub staging_root: PlatformHandle,
 }
 
@@ -1497,6 +1497,89 @@ mod tests {
         );
         assert!(!output_bundle.join("authority.json").exists());
         assert!(!output_bundle.join("store-bootstrap.json").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bound_generation_writes_exact_output_and_store_paths() {
+        let (source_parent, _anchor, _staging, input, receipt) = materialized_fixture();
+        let output_bundle = PathBuf::from(&receipt.bundle_path);
+        let output = source_parent.path().join("generated.json");
+        let store = source_parent.path().join("transaction.redb");
+        let transaction_id = input.transaction_id.clone();
+        let binding = receipt.planner_binding().unwrap();
+
+        let outcome = crate::run_installation_generate_with_output_writer(
+            bound_plan_input(&input, &output_bundle),
+            output.clone(),
+            store.clone(),
+            binding,
+            crate::write_transaction_artifact,
+        )
+        .unwrap();
+
+        match outcome {
+            crate::InstallationGenerationOutcome::Generated {
+                transaction_id: generated_transaction_id,
+                output_path,
+                store_path,
+            } => {
+                assert_eq!(generated_transaction_id, transaction_id);
+                assert_eq!(output_path, output);
+                assert_eq!(store_path, store);
+            }
+            other => panic!("bound generation unexpectedly returned {other:?}"),
+        }
+        assert!(
+            output.exists(),
+            "bound generation omitted exact JSON output"
+        );
+        assert!(
+            store.exists(),
+            "bound generation omitted exact durable store"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_failure_after_store_publication_returns_unknown_and_retains_store() {
+        let (source_parent, _anchor, _staging, input, receipt) = materialized_fixture();
+        let output_bundle = PathBuf::from(&receipt.bundle_path);
+        let output = source_parent.path().join("generated.json");
+        let store = source_parent.path().join("transaction.redb");
+        let transaction_id = input.transaction_id.clone();
+        let binding = receipt.planner_binding().unwrap();
+
+        let outcome = crate::run_installation_generate_with_output_writer(
+            bound_plan_input(&input, &output_bundle),
+            output.clone(),
+            store.clone(),
+            binding,
+            |_path, _transaction| Err(std::io::Error::other("injected output failure")),
+        )
+        .unwrap();
+
+        match outcome {
+            crate::InstallationGenerationOutcome::OutputReconciliationRequired(reconciliation) => {
+                assert_eq!(reconciliation.transaction_id, transaction_id);
+                assert_eq!(reconciliation.store_path, store);
+                assert_eq!(reconciliation.output_path, output);
+                assert!(
+                    reconciliation
+                        .diagnostic
+                        .contains("injected output failure")
+                );
+            }
+            other => panic!("output failure unexpectedly returned {other:?}"),
+        }
+        assert!(
+            store.exists(),
+            "durable store was removed after output failure"
+        );
+        assert!(
+            !output.exists(),
+            "injected output writer unexpectedly created output"
+        );
     }
 
     #[cfg(windows)]

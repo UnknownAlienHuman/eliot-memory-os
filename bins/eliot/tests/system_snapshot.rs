@@ -56,7 +56,7 @@ fn minimal_pe(label: &str) -> Vec<u8> {
 
 #[cfg(windows)]
 #[test]
-fn installation_generate_cli_builds_exact_nine_phase_a_file_transaction() {
+fn installation_generate_cli_is_retired_before_output_or_store_mutation() {
     let temp_root = std::env::temp_dir().join(format!(
         "eliot-installation-generate-{}",
         std::process::id()
@@ -65,6 +65,7 @@ fn installation_generate_cli_builds_exact_nine_phase_a_file_transaction() {
     let source_root = temp_root.join("source");
     let other_cwd = temp_root.join("other-cwd");
     let output = temp_root.join("generated.json");
+    let store = temp_root.join("transaction.redb");
     fs::create_dir_all(&portable_root).expect("create portable root");
     fs::create_dir_all(&source_root).expect("create source root");
     fs::create_dir_all(&other_cwd).expect("create unrelated cwd");
@@ -116,37 +117,28 @@ fn installation_generate_cli_builds_exact_nine_phase_a_file_transaction() {
             "eliot installation recover --transaction-id transaction:cli",
             "--output",
             output.to_str().expect("output is utf8"),
+            "--store",
+            store.to_str().expect("store is utf8"),
         ])
         .output()
-        .expect("run trusted generation command");
+        .expect("run retired generation command");
     assert!(
-        result.status.success(),
-        "generation failed: {}",
-        String::from_utf8_lossy(&result.stdout)
+        !result.status.success(),
+        "retired generation unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&result.stdout),
     );
     let summary: Value = serde_json::from_slice(&result.stdout).expect("generation summary JSON");
-    assert_eq!(summary["status"], "GENERATED");
-    assert_eq!(summary["package_file_count"], 9);
-    let wire = fs::read_to_string(&output).expect("generated transaction artifact");
-    assert!(!wire.contains("host_runtime_activation_nonce"));
-    let transaction: Value = serde_json::from_str(&wire).expect("generated transaction JSON");
-    let package = transaction["installer_effects"]
-        .as_array()
-        .and_then(|effects| {
-            effects.iter().find(|effect| {
-                effect["kind"] == "STAGE_PACKAGE"
-                    && effect["manifest"]["files"].as_array().is_some()
-            })
-        })
-        .expect("one generated StagePackage effect");
-    assert_eq!(
-        package["manifest"]["files"]
-            .as_array()
-            .expect("generated manifest files")
-            .len(),
-        9
+    assert_installation_error(&summary, "INSTALLATION_GENERATE_RETIRED");
+    assert!(
+        summary["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("materialize-source-bundle"))
     );
-    assert_eq!(transaction["transaction_id"], "transaction:cli");
+    assert!(
+        !output.exists(),
+        "retired Generate created an output artifact"
+    );
+    assert!(!store.exists(), "retired Generate created a durable store");
     let _ = fs::remove_dir_all(temp_root);
 }
 

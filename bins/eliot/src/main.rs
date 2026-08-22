@@ -40,6 +40,7 @@ mod source_bundle_materializer;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INVALID_REQUEST_EXIT: i32 = 2;
 const FRONT_DOOR_CLOSED_EXIT: i32 = 69;
+const UNKNOWN_OUTCOME_EXIT: i32 = 75;
 const INSTALLATION_INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 const INSTALLATION_CONTRACT_VERSION: &str = "3.0.0";
 const INSTALLATION_SCOPE: &str = "bounded_all_effects_or_exact_rollback";
@@ -83,8 +84,9 @@ enum Command {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum InstallationCommand {
-    /// Derive one complete trusted generation transaction from explicit roots
-    /// and installation identity. No candidate/package JSON is accepted here.
+    /// Retired compatibility command. It remains parseable but always fails
+    /// closed before the planner, output, or durable store; use
+    /// `installation materialize-source-bundle` for production generation.
     #[command(alias = "plan-generation", alias = "generation-plan")]
     Generate {
         /// Absolute retained source bundle containing the exact nine-file Phase-A inventory.
@@ -138,8 +140,9 @@ enum InstallationCommand {
     },
     /// Retired raw transaction-import compatibility command.
     ///
-    /// Production transaction creation is owned by `installation generate
-    /// --store`; this command always rejects caller-authored JSON.
+    /// Production transaction creation is owned by
+    /// `installation materialize-source-bundle --store`; this command always
+    /// rejects caller-authored JSON.
     Create {
         /// Absolute path to an existing serialized `InstallationTransaction`.
         #[arg(long, value_parser = absolute_path)]
@@ -187,7 +190,8 @@ enum InstallationCommand {
         transaction_id: Option<String>,
     },
     /// Materialize an exact nine-role Phase-A source bundle and feed it through
-    /// the existing trusted Generate/Plan path.
+    /// the publication-bound generation planner. `--store` is required because
+    /// the durable transaction store is the sole authority for a generated plan.
     MaterializeSourceBundle {
         #[arg(long, value_parser = absolute_path)]
         eliot_host: PathBuf,
@@ -206,7 +210,7 @@ enum InstallationCommand {
         #[arg(long, value_parser = absolute_path)]
         output: PathBuf,
         #[arg(long, value_parser = absolute_path)]
-        store: Option<PathBuf>,
+        store: PathBuf,
         #[arg(long)]
         generation: String,
         #[arg(long)]
@@ -860,38 +864,13 @@ fn write_manifest_canary_error(pulse: u8, code: &str, detail: &str) {
 #[allow(clippy::too_many_lines)]
 fn run_installation(command: InstallationCommand) -> Result<i32> {
     match command {
-        InstallationCommand::Generate {
-            source_root,
-            profile,
-            profile_anchor_root,
-            installation_key,
-            installation,
-            lineage_id,
-            sequence,
-            generation,
-            staging_root,
-            transaction_id,
-            minimum_store_available_bytes,
-            recovery_command,
-            output,
-            store,
-        } => run_installation_generate(
-            source_root,
-            profile,
-            profile_anchor_root,
-            installation_key,
-            installation,
-            lineage_id,
-            sequence,
-            generation,
-            staging_root,
-            transaction_id,
-            minimum_store_available_bytes,
-            recovery_command,
-            output,
-            store,
-            None,
-        ),
+        InstallationCommand::Generate { .. } => {
+            write_installation_error(
+                "INSTALLATION_GENERATE_RETIRED",
+                "installation generate is retired and no planner, output, or durable store mutation was attempted; use installation materialize-source-bundle --store",
+            );
+            Ok(INVALID_REQUEST_EXIT)
+        }
         InstallationCommand::Plan { input } => {
             let bytes = match load_input(&input) {
                 Ok(bytes) => bytes,
@@ -996,6 +975,46 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
     }
 }
 
+#[derive(Debug)]
+enum InstallationGenerationOutcome {
+    Rejected(i32),
+    Generated {
+        transaction_id: PlatformHandle,
+        output_path: PathBuf,
+        store_path: PathBuf,
+    },
+    OutputReconciliationRequired(GenerationOutputReconciliation),
+}
+
+#[derive(Debug)]
+struct GenerationOutputReconciliation {
+    transaction_id: PlatformHandle,
+    store_path: PathBuf,
+    output_path: PathBuf,
+    diagnostic: String,
+}
+
+fn write_generation_output_reconciliation(reconciliation: &GenerationOutputReconciliation) {
+    println!(
+        "{}",
+        json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": "INSTALLATION_GENERATION_OUTPUT_RECONCILIATION_REQUIRED",
+            "disposition": "UNKNOWN",
+            "completed": false,
+            "exit_code": UNKNOWN_OUTCOME_EXIT,
+            "transaction_id": reconciliation.transaction_id.as_str(),
+            "store": reconciliation.store_path.display().to_string(),
+            "output": reconciliation.output_path.display().to_string(),
+            "detail": reconciliation.diagnostic,
+            "authority": "DURABLE_TRANSACTION_STORE",
+            "action": "reconcile the exact durable store before treating the JSON output as authoritative",
+            "scope": INSTALLATION_SCOPE,
+        })
+    );
+}
+
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn run_installation_generate(
     source_root: PathBuf,
@@ -1011,53 +1030,81 @@ fn run_installation_generate(
     minimum_store_available_bytes: u64,
     recovery_command: String,
     output: PathBuf,
-    store_path: Option<PathBuf>,
-    source_publication: Option<source_bundle_materializer::SourceBundlePublicationBinding>,
-) -> Result<i32> {
-    let input = GenerationPackagePlanInput {
-        transaction_id: cli_handle(transaction_id, "transaction_id")?,
-        installation_epoch: InstallationEpoch {
-            installation: cli_handle(installation, "installation")?,
-            lineage_id: cli_handle(lineage_id, "lineage_id")?,
-            sequence,
+    store_path: PathBuf,
+    source_publication: source_bundle_materializer::SourceBundlePublicationBinding,
+) -> Result<InstallationGenerationOutcome> {
+    run_installation_generate_with_output_writer(
+        GenerationPackagePlanInput {
+            transaction_id: cli_handle(transaction_id, "transaction_id")?,
+            installation_epoch: InstallationEpoch {
+                installation: cli_handle(installation, "installation")?,
+                lineage_id: cli_handle(lineage_id, "lineage_id")?,
+                sequence,
+            },
+            profile,
+            profile_anchor_root: cli_path_handle(&profile_anchor_root, "profile_anchor_root")?,
+            installation_key: installation_key
+                .map(|value| cli_handle(value, "installation_key"))
+                .transpose()?,
+            generation: cli_handle(generation, "generation")?,
+            source_root: cli_path_handle(&source_root, "source_root")?,
+            staging_root: cli_path_handle(&staging_root, "staging_root")?,
+            minimum_store_available_bytes,
+            recovery_command: cli_handle(recovery_command, "recovery_command")?,
         },
-        profile,
-        profile_anchor_root: cli_path_handle(&profile_anchor_root, "profile_anchor_root")?,
-        installation_key: installation_key
-            .map(|value| cli_handle(value, "installation_key"))
-            .transpose()?,
-        generation: cli_handle(generation, "generation")?,
-        source_root: cli_path_handle(&source_root, "source_root")?,
-        staging_root: cli_path_handle(&staging_root, "staging_root")?,
-        minimum_store_available_bytes,
-        recovery_command: cli_handle(recovery_command, "recovery_command")?,
-    };
-    let source_publication_bound = source_publication.is_some();
-    let plan_result = match source_publication {
-        Some(binding) => GenerationPackagePlanner::plan_with_source_publication_binding(
-            input,
-            binding.source_identity,
-            binding.files,
-            binding.evidence_digest,
-        ),
-        None => GenerationPackagePlanner::plan(input),
-    };
-    let transaction = match plan_result {
+        output,
+        store_path,
+        source_publication,
+        write_transaction_artifact,
+    )
+}
+
+fn run_installation_generate_with_output_writer<F>(
+    input: GenerationPackagePlanInput,
+    output: PathBuf,
+    store_path: PathBuf,
+    source_publication: source_bundle_materializer::SourceBundlePublicationBinding,
+    write_output: F,
+) -> Result<InstallationGenerationOutcome>
+where
+    F: FnOnce(&Path, &InstallationTransaction) -> Result<(), std::io::Error>,
+{
+    let transaction = match GenerationPackagePlanner::plan_with_source_publication_binding(
+        input,
+        source_publication.source_identity,
+        source_publication.files,
+        source_publication.evidence_digest,
+    ) {
         Ok(transaction) => transaction,
         Err(error) => {
             write_installation_error("INSTALLATION_GENERATION_REJECTED", &error.to_string());
-            return Ok(INVALID_REQUEST_EXIT);
+            return Ok(InstallationGenerationOutcome::Rejected(
+                INVALID_REQUEST_EXIT,
+            ));
         }
     };
-    if let Some(store_path) = &store_path
-        && let Err(error) =
-            RedbInstallationTransactionStore::create_planned_at_exact_path(store_path, &transaction)
+    if let Err(error) =
+        RedbInstallationTransactionStore::create_planned_at_exact_path(&store_path, &transaction)
     {
         write_installation_error("INSTALLATION_GENERATION_STORE_REJECTED", &error.to_string());
-        return Ok(INVALID_REQUEST_EXIT);
+        return Ok(InstallationGenerationOutcome::Rejected(
+            INVALID_REQUEST_EXIT,
+        ));
     }
-    write_transaction_artifact(&output, &transaction)
-        .map_err(|error| anyhow::anyhow!("write generated installation transaction: {error}"))?;
+    if let Err(error) = write_output(&output, &transaction) {
+        let reconciliation = GenerationOutputReconciliation {
+            transaction_id: transaction.transaction_id.clone(),
+            store_path,
+            output_path: output,
+            diagnostic: format!(
+                "durable transaction store committed before JSON output write failed: {error}; the store is authoritative and the output must be reconciled without deleting, retrying, or adopting the store"
+            ),
+        };
+        write_generation_output_reconciliation(&reconciliation);
+        return Ok(InstallationGenerationOutcome::OutputReconciliationRequired(
+            reconciliation,
+        ));
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -1079,19 +1126,23 @@ fn run_installation_generate(
                 })
                 .unwrap_or(0),
             "output": output.display().to_string(),
-            "store": store_path.as_ref().map(|path| path.display().to_string()),
-            "scope": if source_publication_bound {
-                "trusted_generation_planner_with_source_publication_binding"
-            } else {
-                "trusted_generation_planner_only_unbound_source"
-            },
-            "source_publication_bound": source_publication_bound,
+            "store": store_path.display().to_string(),
+            "scope": "source_publication_bound_generation_planner",
+            "source_publication_bound": true,
         }))?
     );
-    Ok(0)
+    Ok(InstallationGenerationOutcome::Generated {
+        transaction_id: transaction.transaction_id.clone(),
+        output_path: output,
+        store_path,
+    })
 }
 
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn run_installation_materialize_source_bundle(
     eliot_host: PathBuf,
     eliot_watchdog: PathBuf,
@@ -1101,7 +1152,7 @@ fn run_installation_materialize_source_bundle(
     eliotd: PathBuf,
     output_bundle: PathBuf,
     output: PathBuf,
-    store: Option<PathBuf>,
+    store: PathBuf,
     generation: String,
     installation: String,
     lineage_id: String,
@@ -1182,33 +1233,47 @@ fn run_installation_materialize_source_bundle(
         recovery_command,
         output,
         store,
-        Some(source_publication),
+        source_publication,
     )?;
-    if generated == 0 {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "contract": "eliot.kernel.installation",
-                "contract_version": INSTALLATION_CONTRACT_VERSION,
-                "status": "SOURCE_BUNDLE_MATERIALIZED",
-                "handoff": "SOURCE_PUBLICATION_BOUND_TO_GENERATED_PLAN",
-                "bundle_path": receipt.bundle_path,
-                "generation": receipt.generation,
-                "evidence_digest": receipt.evidence_digest,
-                "file_count": receipt.files.len(),
-                "files": receipt.files,
-                "source_identity": receipt.source_identity,
-                "directory_publication": receipt.directory_publication,
-            }))?
-        );
+    match generated {
+        InstallationGenerationOutcome::Generated {
+            transaction_id,
+            output_path,
+            store_path,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "contract": "eliot.kernel.installation",
+                    "contract_version": INSTALLATION_CONTRACT_VERSION,
+                    "status": "SOURCE_BUNDLE_MATERIALIZED",
+                    "handoff": "SOURCE_PUBLICATION_BOUND_TO_GENERATED_PLAN",
+                    "transaction_id": transaction_id.as_str(),
+                    "output": output_path.display().to_string(),
+                    "store": store_path.display().to_string(),
+                    "bundle_path": receipt.bundle_path,
+                    "generation": receipt.generation,
+                    "evidence_digest": receipt.evidence_digest,
+                    "file_count": receipt.files.len(),
+                    "files": receipt.files,
+                    "source_identity": receipt.source_identity,
+                    "directory_publication": receipt.directory_publication,
+                }))?
+            );
+            Ok(0)
+        }
+        InstallationGenerationOutcome::Rejected(exit_code) => Ok(exit_code),
+        InstallationGenerationOutcome::OutputReconciliationRequired(reconciliation) => {
+            let _ = reconciliation;
+            Ok(UNKNOWN_OUTCOME_EXIT)
+        }
     }
-    Ok(generated)
 }
 
 fn run_installation_create(_input: &Path, _store_path: &Path) -> i32 {
     write_installation_error(
         "INSTALLATION_CREATE_PRODUCTION_DISABLED",
-        "raw transaction import is not a production constructor; use installation generate --store",
+        "raw transaction import is not a production constructor; use installation materialize-source-bundle --store",
     );
     INVALID_REQUEST_EXIT
 }
