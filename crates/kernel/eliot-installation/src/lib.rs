@@ -26,13 +26,14 @@ use eliot_platform::{
 pub use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{
     AuthenticodeVerdict, ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
-    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, FileIdentity,
-    HostOwnerEpochCapability, InstallerRootAbsentSnapshot, InstallerRootCreateDisposition,
-    InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation,
-    InstallerRootPrimitiveSpec, InstallerRootProfile, InstallerSecretCreateDisposition,
-    InstallerSecretObservation, PackageManifest, PackageStager, PackageStagingError,
-    PackageStagingObservation, ProtectedPathError, ProtectedPathLease, ProtectedRootLease,
-    ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
+    ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
+    ELIOT_WATCHDOG_SERVICE_NAME, FileIdentity, HostOwnerEpochCapability,
+    InstallerRootAbsentSnapshot, InstallerRootCreateDisposition, InstallerRootError,
+    InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
+    InstallerRootProfile, InstallerSecretCreateDisposition, InstallerSecretObservation,
+    PackageManifest, PackageStager, PackageStagingError, PackageStagingObservation,
+    ProtectedPathError, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
+    ServiceAccount, ServiceBootstrapArguments, ServiceControlGrantReadback,
     ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
     ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection, ServiceStartMode,
     ServiceStartOutcome, ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
@@ -42,6 +43,7 @@ use eliot_platform_windows::{
     current_user_local_app_data_root, fresh_service_registration_nonce,
     observe_running_eliot_host_process, protected_program_data_root,
     require_protected_program_data_path, resolve_service_sid,
+    watchdog_service_security_descriptor_digest,
 };
 pub use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
 use eliot_runtime_contracts::{
@@ -179,15 +181,18 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 /// composition with Watchdog then Host Automatic `LocalService` starts and
 /// authoritative readback. Version 16 binds the installer-owned service-SID
 /// sealed supervision authority plan and Phase-B public provision receipt.
+/// Version 18 makes the exact EliotHost-to-EliotWatchdog service-object grant
+/// receipt mandatory for every applied Watchdog registration.
 /// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(17, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(18, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
 /// Registry wire version 12 binds the provisioned supervision authority into
-/// pending Phase-B receipts and committed/rebound live bindings. V11 and older
-/// projections are never defaulted into current authority.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(13, 0, 0);
+/// pending Phase-B receipts and committed/rebound live bindings. Version 14
+/// binds each Watchdog approval to the exact installer-read SCM control grant.
+/// Older projections are never defaulted into current authority.
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(14, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -5994,7 +5999,7 @@ fn current_registry_wire_missing_field(value: &serde_json::Value) -> bool {
     let Some(object) = value.as_object() else {
         return true;
     };
-    [
+    let top_level_missing = [
         "registry_wire_version",
         "revision",
         "generations",
@@ -6006,7 +6011,18 @@ fn current_registry_wire_missing_field(value: &serde_json::Value) -> bool {
         "active_phase_b_rebind",
     ]
     .iter()
-    .any(|field| !object.contains_key(*field))
+    .any(|field| !object.contains_key(*field));
+    let approval_binding_missing = object
+        .get("service_registration_approvals")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|approvals| {
+            approvals.iter().any(|approval| {
+                approval
+                    .as_object()
+                    .is_none_or(|approval| !approval.contains_key("service_control_grant"))
+            })
+        });
+    top_level_missing || approval_binding_missing
 }
 
 #[allow(
@@ -6026,7 +6042,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
         .and_then(serde_json::Value::as_u64);
     if declared_major == Some(10) {
         return Err(InstallationError::MigrationRequired {
-            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v13; nested authority is never synthesized or adopted"
+            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v14; nested authority is never synthesized or adopted"
                 .to_owned(),
         });
     }
@@ -6034,7 +6050,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
         && current_registry_wire_missing_field(&value)
     {
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v13 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v14 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
@@ -6072,7 +6088,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             });
         }
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v13 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v14 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
@@ -8818,6 +8834,136 @@ pub enum InstallerServiceRole {
     Watchdog,
 }
 
+/// Durable installer receipt for the one narrow Host-to-Watchdog SCM control
+/// grant. The private service key and SCM mutation handles never cross this
+/// projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallerServiceControlGrantReceipt {
+    /// Canonical service name whose deterministic SID receives the grant.
+    principal_service: PlatformHandle,
+    /// Exact OS-resolved `S-1-5-80-...` service SID.
+    principal_sid: PlatformHandle,
+    /// Concrete minimal service-object rights mask.
+    access_mask: u32,
+    /// Digest of the exact protected service DACL returned by SCM readback.
+    security_descriptor_digest: PlatformHandle,
+}
+
+impl InstallerServiceControlGrantReceipt {
+    fn from_readback(readback: &ServiceControlGrantReadback) -> Result<Self, InstallationError> {
+        readback
+            .validate()
+            .map_err(|_| InstallationError::IdentityConflict)?;
+        let receipt = Self {
+            principal_service: PlatformHandle::new(readback.principal_service()).map_err(
+                |error| InstallationError::InvalidField {
+                    field: "service_control_grant.principal_service".to_owned(),
+                    reason: error.to_string(),
+                },
+            )?,
+            principal_sid: PlatformHandle::new(readback.principal_sid()).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "service_control_grant.principal_sid".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            access_mask: readback.access_mask(),
+            security_descriptor_digest: PlatformHandle::new(readback.security_descriptor_digest())
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "service_control_grant.security_descriptor_digest".to_owned(),
+                    reason: error.to_string(),
+                })?,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    /// Returns the exact service whose SID owns the runtime grant.
+    #[must_use]
+    pub fn principal_service(&self) -> &PlatformHandle {
+        &self.principal_service
+    }
+
+    /// Returns the exact OS service SID observed by the installer.
+    #[must_use]
+    pub fn principal_sid(&self) -> &PlatformHandle {
+        &self.principal_sid
+    }
+
+    /// Returns the concrete allowed service-object rights.
+    #[must_use]
+    pub const fn access_mask(&self) -> u32 {
+        self.access_mask
+    }
+
+    /// Returns the digest of the exact protected SCM security descriptor.
+    #[must_use]
+    pub fn security_descriptor_digest(&self) -> &PlatformHandle {
+        &self.security_descriptor_digest
+    }
+
+    /// Computes the canonical binding used by the ownership marker and effect
+    /// postcondition.
+    pub fn canonical_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        #[derive(Serialize)]
+        struct Shape<'a> {
+            schema: &'static str,
+            principal_service: &'a PlatformHandle,
+            principal_sid: &'a PlatformHandle,
+            access_mask: u32,
+            security_descriptor_digest: &'a PlatformHandle,
+        }
+        self.validate()?;
+        let bytes = serde_json::to_vec(&Shape {
+            schema: "eliot.installer.service-control-grant.v1",
+            principal_service: &self.principal_service,
+            principal_sid: &self.principal_sid,
+            access_mask: self.access_mask,
+            security_descriptor_digest: &self.security_descriptor_digest,
+        })
+        .map_err(|_| InstallationError::IdentityConflict)?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+            field: "service_control_grant.digest".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// Validates the receipt without touching SCM.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        handle(
+            &self.principal_service,
+            "service_control_grant.principal_service",
+        )?;
+        handle(&self.principal_sid, "service_control_grant.principal_sid")?;
+        sha256_handle(
+            &self.security_descriptor_digest,
+            "service_control_grant.security_descriptor_digest",
+        )?;
+        let sid_tail = self
+            .principal_sid
+            .as_str()
+            .strip_prefix("S-1-5-80-")
+            .map(|tail| tail.split('-').collect::<Vec<_>>());
+        if self.principal_service.as_str() != ELIOT_HOST_SERVICE_NAME
+            || sid_tail.as_ref().is_none_or(|parts| {
+                parts.len() != 5
+                    || parts.iter().any(|part| {
+                        part.is_empty()
+                            || !part.bytes().all(|byte| byte.is_ascii_digit())
+                            || part.parse::<u32>().is_err()
+                    })
+            })
+            || self.access_mask != ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
+            || !watchdog_service_security_descriptor_digest(self.principal_sid.as_str())
+                .is_ok_and(|expected| expected == self.security_descriptor_digest.as_str())
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
 /// Installer-owned approval for one exact Host or Watchdog SCM registration.
 ///
 /// The approval is a projection of an [`InstallationTransaction`]'s durable
@@ -8851,6 +8997,8 @@ pub struct InstallerServiceRegistrationApproval {
     registration_nonce: PlatformHandle,
     /// Authoritative SCM configuration digest returned by readback.
     configuration_digest: PlatformHandle,
+    /// Exact Host service-SID grant required only by the Watchdog service.
+    service_control_grant: Option<InstallerServiceControlGrantReceipt>,
 }
 
 impl InstallerServiceRegistrationApproval {
@@ -8870,6 +9018,13 @@ impl InstallerServiceRegistrationApproval {
     #[must_use]
     pub fn configuration_digest(&self) -> &PlatformHandle {
         &self.configuration_digest
+    }
+
+    /// Returns the authoritative Host control grant for the Watchdog
+    /// registration. Host registrations deliberately return `None`.
+    #[must_use]
+    pub fn service_control_grant(&self) -> Option<&InstallerServiceControlGrantReceipt> {
+        self.service_control_grant.as_ref()
     }
 
     pub(crate) fn registration_nonce(&self) -> &PlatformHandle {
@@ -8920,8 +9075,15 @@ impl InstallerServiceRegistrationApproval {
         {
             return Err(InstallationError::ProfileViolation(
                 "service registration approval differs from the canonical Runtime Live service shape"
-                    .to_owned(),
+                .to_owned(),
             ));
+        }
+        match (self.role, &self.service_control_grant) {
+            (InstallerServiceRole::Host, None) => {}
+            (InstallerServiceRole::Watchdog, Some(receipt)) => receipt.validate()?,
+            (InstallerServiceRole::Host, Some(_)) | (InstallerServiceRole::Watchdog, None) => {
+                return Err(InstallationError::IdentityConflict);
+            }
         }
         Ok(())
     }
@@ -8968,6 +9130,9 @@ impl InstallerServiceRegistrationApproval {
             reason: "approved SCM request could not be reconstructed".to_owned(),
         })?;
         if request.expected_configuration_digest() != self.configuration_digest.as_str() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if request.requires_host_service_control_grant() != self.service_control_grant.is_some() {
             return Err(InstallationError::IdentityConflict);
         }
         Ok(request)
@@ -10108,6 +10273,10 @@ pub struct InstallationEffectProgress {
     /// Unpredictable public nonce retained for one SCM registration effect.
     #[serde(default)]
     pub registration_nonce: Option<PlatformHandle>,
+    /// Typed authoritative SCM DACL receipt for the Watchdog registration.
+    /// This member is mandatory on the current wire and is `None` for every
+    /// non-Watchdog-registration effect.
+    pub service_control_grant: Option<InstallerServiceControlGrantReceipt>,
     /// Absolute injected-clock deadline for one bounded SCM start
     /// convergence window.  The deadline is created before the start intent
     /// is persisted and retained across restart; it never authorizes a second
@@ -10309,6 +10478,7 @@ impl InstallationTransaction {
                 admitted_precondition: None,
                 ownership_secret: None,
                 registration_nonce: None,
+                service_control_grant: None,
                 service_start_deadline_ms: None,
                 service_start_proof: None,
                 store_credential: None,
@@ -10637,6 +10807,7 @@ impl InstallationTransaction {
                 },
                 registration_nonce,
                 configuration_digest,
+                service_control_grant: progress.service_control_grant.clone(),
             };
             approval.validate()?;
             approvals.push(approval);
@@ -10918,6 +11089,31 @@ impl InstallationTransaction {
                     return Err(InstallationError::IdentityConflict);
                 }
                 sha256_handle(nonce, "effect_progress.registration_nonce")?;
+            }
+            match (effect, &progress.state, &progress.service_control_grant) {
+                (
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Watchdog,
+                        ..
+                    },
+                    InstallationEffectProgressState::Applied { .. },
+                    Some(receipt),
+                ) => receipt.validate()?,
+                (
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Watchdog,
+                        ..
+                    },
+                    InstallationEffectProgressState::Applied { .. },
+                    None,
+                ) => {
+                    return Err(InstallationError::IncompleteObservation(
+                        "applied Watchdog registration requires its exact Host control grant receipt"
+                            .to_owned(),
+                    ));
+                }
+                (_, _, Some(_)) => return Err(InstallationError::IdentityConflict),
+                (_, _, None) => {}
             }
             if matches!(
                 &progress.state,
@@ -11543,7 +11739,7 @@ impl InstallationTransaction {
 
     /// Advances from `Activating` to `ActiveVerified` using the exact
     /// read-only registry terminal proof. The proof is consumed and its
-    /// complete binding is persisted in the v14 transaction projection.
+    /// complete binding is persisted in the v18 transaction projection.
     pub fn advance_to_active_verified(
         &mut self,
         receipt: ActivationCommitReceipt,
@@ -11697,7 +11893,7 @@ impl InstallationTransactionWire {
     }
 }
 
-/// Decodes the canonical transaction JSON and classifies pre-v14 records as an
+/// Decodes the canonical transaction JSON and classifies pre-v18 records as an
 /// explicit migration requirement rather than synthesizing missing progress.
 pub fn decode_installation_transaction_json(
     bytes: &[u8],
@@ -11727,7 +11923,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v14 discriminator".to_owned(),
+            reason: "installation transaction predates the required v18 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -11766,6 +11962,13 @@ fn decode_installation_transaction_json_with_policy(
                     "installation transaction effect progress entry {index} is not an object"
                 ),
             })?;
+        if !progress.contains_key("service_control_grant") {
+            return Err(InstallationError::CorruptRegistry {
+                reason: format!(
+                    "installation transaction effect progress entry {index} is missing mandatory service control grant member"
+                ),
+            });
+        }
         if !progress.contains_key("service_start_proof") {
             return Err(InstallationError::CorruptRegistry {
                 reason: format!(
@@ -12258,6 +12461,9 @@ pub enum InstallationEffectObservation {
         evidence: Vec<PlatformHandle>,
         /// Digest of the authoritative postcondition.
         postcondition_digest: PlatformHandle,
+        /// Exact service-object DACL receipt, present only for the Watchdog
+        /// registration effect.
+        service_control_grant: Option<Box<InstallerServiceControlGrantReceipt>>,
         /// Typed credential receipt, only for the Store credential effect.
         credential_receipt: Option<CredentialAccessReceipt>,
         /// Typed package receipt, only for the `StagePackage` effect.
@@ -12290,6 +12496,38 @@ impl InstallationEffectObservation {
                 | InstallerEffectPlan::StagePackage { .. }
                 | InstallerEffectPlan::MaterializePhaseB { .. }
         ))?;
+        let matching_control_grant = match self {
+            Self::Matching {
+                service_control_grant,
+                ..
+            } => service_control_grant.as_deref(),
+            Self::Absent { .. } | Self::Mismatch { .. } => None,
+        };
+        match effect {
+            InstallerEffectPlan::RegisterService {
+                role: InstallerServiceRole::Watchdog,
+                ..
+            } if matches!(self, Self::Matching { .. }) => {
+                matching_control_grant.ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "Watchdog registration requires exact Host service-control grant readback"
+                            .to_owned(),
+                    )
+                })?;
+            }
+            InstallerEffectPlan::RegisterService {
+                role: InstallerServiceRole::Host,
+                ..
+            } => {
+                if matching_control_grant.is_some() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            _ if matching_control_grant.is_some() => {
+                return Err(InstallationError::IdentityConflict);
+            }
+            _ => {}
+        }
         if let Self::Matching {
             staging_receipt: Some(receipt),
             ..
@@ -12389,6 +12627,7 @@ impl InstallationEffectObservation {
                 external_identity,
                 evidence,
                 postcondition_digest,
+                service_control_grant,
                 credential_receipt,
                 staging_receipt,
                 phase_b_receipt,
@@ -12398,6 +12637,9 @@ impl InstallationEffectObservation {
                 handle(external_identity, "observation.external_identity")?;
                 handles(evidence, "observation.evidence", true)?;
                 sha256_handle(postcondition_digest, "observation.postcondition_digest")?;
+                if let Some(receipt) = service_control_grant {
+                    receipt.validate()?;
+                }
                 if let Some(receipt) = credential_receipt {
                     receipt.validate()?;
                 }
@@ -13134,6 +13376,7 @@ impl WindowsInstallationEffectPort {
                         receipt.eliotd_descriptor_digest.clone(),
                     ],
                     postcondition_digest: digest,
+                    service_control_grant: None,
                     credential_receipt: None,
                     staging_receipt: None,
                     phase_b_receipt: Some(Box::new(receipt)),
@@ -13357,10 +13600,21 @@ impl WindowsInstallationEffectPort {
                 }
                 service_absent_observation(request)
             }
-            ServiceRegistrationInspection::Matching { .. } => {
+            ServiceRegistrationInspection::Matching { control_grant, .. } => {
                 let digest = registration.expected_configuration_digest();
-                match service_marker_read(&self.primitive, &spec, request, &service_name, &digest)?
-                {
+                let control_grant = control_grant
+                    .as_ref()
+                    .map(InstallerServiceControlGrantReceipt::from_readback)
+                    .transpose()
+                    .map_err(|_| PortError::InvalidRequestMetadata)?;
+                match service_marker_read(
+                    &self.primitive,
+                    &spec,
+                    request,
+                    &service_name,
+                    &digest,
+                    control_grant.as_ref(),
+                )? {
                     Some(_) => Ok(root_mismatch("service-marker-before-intent")),
                     None => service_matching_observation(
                         request,
@@ -13368,6 +13622,7 @@ impl WindowsInstallationEffectPort {
                         &digest,
                         &PlatformHandle::new("service-preexisting-marker-absent")
                             .map_err(|_| PortError::InvalidRequestMetadata)?,
+                        control_grant,
                     ),
                 }
             }
@@ -13385,14 +13640,28 @@ impl WindowsInstallationEffectPort {
         let digest = registration.expected_configuration_digest();
         match platform.inspect_service_registration(&registration) {
             ServiceRegistrationInspection::Absent => service_absent_observation(request),
-            ServiceRegistrationInspection::Matching { .. } => {
-                let marker = if let Some(marker) =
-                    service_marker_read(&self.primitive, &spec, request, &service_name, &digest)?
-                {
+            ServiceRegistrationInspection::Matching { control_grant, .. } => {
+                let control_grant = control_grant
+                    .as_ref()
+                    .map(InstallerServiceControlGrantReceipt::from_readback)
+                    .transpose()
+                    .map_err(|_| PortError::InvalidRequestMetadata)?;
+                let marker = if let Some(marker) = service_marker_read(
+                    &self.primitive,
+                    &spec,
+                    request,
+                    &service_name,
+                    &digest,
+                    control_grant.as_ref(),
+                )? {
                     marker
                 } else {
-                    let marker =
-                        WindowsServiceOwnershipMarker::new(request, &service_name, &digest)?;
+                    let marker = WindowsServiceOwnershipMarker::new(
+                        request,
+                        &service_name,
+                        &digest,
+                        control_grant.as_ref(),
+                    )?;
                     let marker_path = service_marker_path(request);
                     match self
                         .primitive
@@ -13403,8 +13672,15 @@ impl WindowsInstallationEffectPort {
                         Ok(_) | Err(InstallerRootError::ReceiptMismatch) => {}
                         Err(error) => return Err(root_port_error(error)),
                     }
-                    service_marker_read(&self.primitive, &spec, request, &service_name, &digest)?
-                        .ok_or(PortError::InvalidRequestMetadata)?
+                    service_marker_read(
+                        &self.primitive,
+                        &spec,
+                        request,
+                        &service_name,
+                        &digest,
+                        control_grant.as_ref(),
+                    )?
+                    .ok_or(PortError::InvalidRequestMetadata)?
                 };
                 let (_, marker) = marker;
                 let marker_digest = marker.digest()?;
@@ -13413,6 +13689,7 @@ impl WindowsInstallationEffectPort {
                     InstallationEffectDisposition::CreatedByTransaction,
                     &digest,
                     &marker_digest,
+                    control_grant,
                 )
             }
             ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
@@ -13479,6 +13756,7 @@ impl WindowsInstallationEffectPort {
             external_identity,
             evidence: vec![evidence],
             postcondition_digest,
+            service_control_grant: None,
             credential_receipt: None,
             staging_receipt: None,
             phase_b_receipt: None,
@@ -13944,6 +14222,7 @@ impl WindowsInstallationEffectPort {
                     external_identity,
                     evidence: vec![receipt.response_digest.clone()],
                     postcondition_digest: digest,
+                    service_control_grant: None,
                     credential_receipt: Some(receipt),
                     staging_receipt: None,
                     phase_b_receipt: None,
@@ -14331,8 +14610,11 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             });
         }
         let configuration_digest = registration.expected_configuration_digest();
-        match platform.register_service(&registration) {
-            Ok(ServiceRegistrationOutcome::CreatedNow { .. }) => {}
+        let control_grant = match platform.register_service(&registration) {
+            Ok(ServiceRegistrationOutcome::CreatedNow { control_grant, .. }) => control_grant
+                .as_ref()
+                .map(InstallerServiceControlGrantReceipt::from_readback)
+                .transpose(),
             Ok(
                 ServiceRegistrationOutcome::PreexistingMatching { .. }
                 | ServiceRegistrationOutcome::Registered { .. }
@@ -14346,11 +14628,18 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 return PortOutcome::Unknown(UnknownReason::Indeterminate);
             }
             Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+        };
+        let Ok(control_grant) = control_grant else {
+            return PortOutcome::Error(PortError::InvalidRequestMetadata);
+        };
+        if registration.requires_host_service_control_grant() != control_grant.is_some() {
+            return PortOutcome::Unknown(UnknownReason::Indeterminate);
         }
         let marker = match WindowsServiceOwnershipMarker::new(
             request,
             registration.service_name(),
             &configuration_digest,
+            control_grant.as_ref(),
         ) {
             Ok(marker) => marker,
             Err(error) => return PortOutcome::Error(error),
@@ -14841,6 +15130,7 @@ fn matching_preexisting(
             PlatformHandle::new(evidence_digest).map_err(|_| PortError::InvalidRequestMetadata)?,
         ],
         postcondition_digest,
+        service_control_grant: None,
         credential_receipt: None,
         staging_receipt: None,
         phase_b_receipt: None,
@@ -14885,6 +15175,7 @@ fn matching_created(
             PlatformHandle::new(evidence_digest).map_err(|_| PortError::InvalidRequestMetadata)?,
         ],
         postcondition_digest,
+        service_control_grant: None,
         credential_receipt: None,
         staging_receipt: None,
         phase_b_receipt: None,
@@ -14899,7 +15190,7 @@ fn root_mismatch(reason: &str) -> InstallationEffectObservation {
     }
 }
 
-const SERVICE_MARKER_VERSION: u32 = 1;
+const SERVICE_MARKER_VERSION: u32 = 2;
 const SERVICE_MARKER_LIMIT: u64 = 16 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -14912,6 +15203,7 @@ struct WindowsServiceOwnershipMarker {
     service_name: String,
     registration_nonce: String,
     configuration_digest: String,
+    service_control_grant_digest: Option<String>,
 }
 
 impl WindowsServiceOwnershipMarker {
@@ -14919,6 +15211,7 @@ impl WindowsServiceOwnershipMarker {
         request: &InstallationEffectRequest,
         service_name: &str,
         configuration_digest: &str,
+        service_control_grant: Option<&InstallerServiceControlGrantReceipt>,
     ) -> Result<Self, PortError> {
         Ok(Self {
             version: SERVICE_MARKER_VERSION,
@@ -14933,6 +15226,11 @@ impl WindowsServiceOwnershipMarker {
                 .as_str()
                 .to_owned(),
             configuration_digest: configuration_digest.to_owned(),
+            service_control_grant_digest: service_control_grant
+                .map(InstallerServiceControlGrantReceipt::canonical_digest)
+                .transpose()
+                .map_err(|_| PortError::InvalidRequestMetadata)?
+                .map(|digest| digest.as_str().to_owned()),
         })
     }
 
@@ -14941,7 +15239,14 @@ impl WindowsServiceOwnershipMarker {
         request: &InstallationEffectRequest,
         service_name: &str,
         digest: &str,
+        service_control_grant: Option<&InstallerServiceControlGrantReceipt>,
     ) -> bool {
+        let control_grant_digest = service_control_grant
+            .map(InstallerServiceControlGrantReceipt::canonical_digest)
+            .transpose()
+            .ok()
+            .flatten()
+            .map(|digest| digest.as_str().to_owned());
         self.version == SERVICE_MARKER_VERSION
             && self.transaction_id == request.transaction_id.as_str()
             && self.effect_id == request.effect_id.as_str()
@@ -14952,6 +15257,7 @@ impl WindowsServiceOwnershipMarker {
                 .as_ref()
                 .is_some_and(|nonce| self.registration_nonce == nonce.as_str())
             && self.configuration_digest == digest
+            && self.service_control_grant_digest == control_grant_digest
     }
 
     fn digest(&self) -> Result<PlatformHandle, PortError> {
@@ -14965,7 +15271,7 @@ impl WindowsServiceOwnershipMarker {
 fn service_marker_path(request: &InstallationEffectRequest) -> PathBuf {
     let name = sha256_hex(
         format!(
-            "service-marker-v1\0{}\0{}\0{}\0{}",
+            "service-marker-v2\0{}\0{}\0{}\0{}",
             request.transaction_id.as_str(),
             request.effect_id.as_str(),
             request.plan_digest.as_str(),
@@ -14985,6 +15291,7 @@ fn service_marker_read(
     request: &InstallationEffectRequest,
     service_name: &str,
     configuration_digest: &str,
+    service_control_grant: Option<&InstallerServiceControlGrantReceipt>,
 ) -> Result<Option<(InstallerRootObjectSnapshot, WindowsServiceOwnershipMarker)>, PortError> {
     let path = service_marker_path(request);
     match std::fs::symlink_metadata(&path) {
@@ -14997,7 +15304,12 @@ fn service_marker_read(
         .map_err(root_port_error)?;
     let marker: WindowsServiceOwnershipMarker =
         serde_json::from_slice(&readback.bytes).map_err(|_| PortError::InvalidRequestMetadata)?;
-    if !marker.matches(request, service_name, configuration_digest) {
+    if !marker.matches(
+        request,
+        service_name,
+        configuration_digest,
+        service_control_grant,
+    ) {
         return Err(PortError::Provider(ProviderError {
             code: ProviderErrorCode::Failed,
             retryable: false,
@@ -15031,26 +15343,37 @@ fn service_matching_observation(
     disposition: InstallationEffectDisposition,
     configuration_digest: &str,
     marker_digest: &PlatformHandle,
+    service_control_grant: Option<InstallerServiceControlGrantReceipt>,
 ) -> Result<InstallationEffectObservation, PortError> {
     let external_identity =
         PlatformHandle::new(configuration_digest).map_err(|_| PortError::InvalidRequestMetadata)?;
+    let control_grant_digest = service_control_grant
+        .as_ref()
+        .map(InstallerServiceControlGrantReceipt::canonical_digest)
+        .transpose()
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let control_grant_digest_text = control_grant_digest
+        .as_ref()
+        .map_or("none", PlatformHandle::as_str);
     let evidence = PlatformHandle::new(sha256_hex(
         format!(
-            "service-matching-v1\0{}\0{}\0{}\0{}",
+            "service-matching-v2\0{}\0{}\0{}\0{}\0{}",
             request.effect_id.as_str(),
             request.plan_digest.as_str(),
             configuration_digest,
             marker_digest.as_str(),
+            control_grant_digest_text,
         )
         .as_bytes(),
     ))
     .map_err(|_| PortError::InvalidRequestMetadata)?;
     let postcondition_digest = PlatformHandle::new(sha256_hex(
         format!(
-            "service-postcondition-v1\0{}\0{}\0{}",
+            "service-postcondition-v2\0{}\0{}\0{}\0{}",
             request.effect_id.as_str(),
             configuration_digest,
             marker_digest.as_str(),
+            control_grant_digest_text,
         )
         .as_bytes(),
     ))
@@ -15058,8 +15381,11 @@ fn service_matching_observation(
     Ok(InstallationEffectObservation::Matching {
         disposition,
         external_identity,
-        evidence: vec![evidence],
+        evidence: std::iter::once(evidence)
+            .chain(control_grant_digest)
+            .collect(),
         postcondition_digest,
+        service_control_grant: service_control_grant.map(Box::new),
         credential_receipt: None,
         staging_receipt: None,
         phase_b_receipt: None,
@@ -15176,6 +15502,7 @@ fn package_matching_observation(
         external_identity,
         evidence: vec![receipt_digest],
         postcondition_digest,
+        service_control_grant: None,
         credential_receipt: None,
         staging_receipt: Some(receipt),
         phase_b_receipt: None,
@@ -15848,6 +16175,7 @@ where
                 external_identity,
                 evidence,
                 postcondition_digest,
+                service_control_grant,
                 credential_receipt,
                 staging_receipt,
                 phase_b_receipt,
@@ -15957,6 +16285,7 @@ where
                     external_identity,
                     evidence,
                     postcondition_digest,
+                    service_control_grant.map(|receipt| *receipt),
                     credential_receipt,
                     staging_receipt,
                     phase_b_receipt.map(|receipt| *receipt),
@@ -16477,6 +16806,7 @@ where
                         external_identity,
                         evidence,
                         postcondition_digest,
+                        service_control_grant,
                         credential_receipt,
                         staging_receipt,
                         phase_b_receipt,
@@ -16578,6 +16908,7 @@ where
                                 external_identity,
                                 evidence,
                                 postcondition_digest,
+                                service_control_grant.map(|receipt| *receipt),
                                 credential_receipt,
                                 staging_receipt,
                                 phase_b_receipt.map(|receipt| *receipt),
@@ -17134,11 +17465,36 @@ where
         external_identity: PlatformHandle,
         evidence: Vec<PlatformHandle>,
         postcondition_digest: PlatformHandle,
+        service_control_grant: Option<InstallerServiceControlGrantReceipt>,
         credential_receipt: Option<CredentialAccessReceipt>,
         staging_receipt: Option<StagingReceipt>,
         phase_b_receipt: Option<HostPhaseBMaterializationReceipt>,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
+        match (
+            &transaction.installer_effects[index],
+            &service_control_grant,
+        ) {
+            (
+                InstallerEffectPlan::RegisterService {
+                    role: InstallerServiceRole::Watchdog,
+                    ..
+                },
+                Some(receipt),
+            ) => receipt.validate()?,
+            (
+                InstallerEffectPlan::RegisterService {
+                    role: InstallerServiceRole::Host,
+                    ..
+                },
+                None,
+            ) => {}
+            (InstallerEffectPlan::RegisterService { .. }, _) | (_, Some(_)) => {
+                return Err(InstallationError::IdentityConflict);
+            }
+            (_, None) => {}
+        }
+        transaction.effect_progress[index].service_control_grant = service_control_grant;
         if let Some(receipt) = credential_receipt {
             transaction.effect_progress[index]
                 .store_credential
@@ -18073,6 +18429,20 @@ mod tests {
         must(PlatformHandle::new(value.into()))
     }
 
+    fn test_watchdog_control_grant() -> InstallerServiceControlGrantReceipt {
+        let principal_sid = "S-1-5-80-1-2-3-4-5";
+        let receipt = InstallerServiceControlGrantReceipt {
+            principal_service: test_handle(ELIOT_HOST_SERVICE_NAME),
+            principal_sid: test_handle(principal_sid),
+            access_mask: ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+            security_descriptor_digest: test_handle(must(
+                watchdog_service_security_descriptor_digest(principal_sid),
+            )),
+        };
+        must(receipt.validate());
+        receipt
+    }
+
     fn test_activation_approval(
         manifest: &CandidateManifest,
         transaction_id: PlatformHandle,
@@ -18873,10 +19243,17 @@ mod tests {
             ));
             let configuration_digest = test_handle(request.expected_configuration_digest());
             progress.registration_nonce = Some(nonce);
+            let service_control_grant =
+                (*role == InstallerServiceRole::Watchdog).then(test_watchdog_control_grant);
+            progress.service_control_grant = service_control_grant.clone();
+            let mut evidence = vec![test_handle(format!("evidence:service:{role:?}"))];
+            if let Some(receipt) = &service_control_grant {
+                evidence.push(must(receipt.canonical_digest()));
+            }
             progress.state = InstallationEffectProgressState::Applied {
                 disposition: InstallationEffectDisposition::CreatedByTransaction,
                 external_identity: configuration_digest,
-                evidence: vec![test_handle(format!("evidence:service:{role:?}"))],
+                evidence,
                 postcondition_digest: test_handle("c".repeat(64)),
             };
         }
@@ -19431,6 +19808,7 @@ mod tests {
             external_identity: test_handle("external:effect-0"),
             evidence: vec![test_handle("evidence:matching")],
             postcondition_digest: test_handle("a".repeat(64)),
+            service_control_grant: None,
             credential_receipt: None,
             staging_receipt: None,
             phase_b_receipt: None,
@@ -19448,6 +19826,7 @@ mod tests {
             external_identity: test_handle(external_identity),
             evidence: vec![test_handle("evidence:service-runtime")],
             postcondition_digest: test_handle("b".repeat(64)),
+            service_control_grant: None,
             credential_receipt: None,
             staging_receipt: None,
             phase_b_receipt: None,
@@ -19460,14 +19839,24 @@ mod tests {
     }
 
     fn matching_for(
+        effect: &InstallerEffectPlan,
         index: usize,
         disposition: InstallationEffectDisposition,
     ) -> InstallationEffectObservation {
+        let service_control_grant = matches!(
+            effect,
+            InstallerEffectPlan::RegisterService {
+                role: InstallerServiceRole::Watchdog,
+                ..
+            }
+        )
+        .then(test_watchdog_control_grant);
         InstallationEffectObservation::Matching {
             disposition,
             external_identity: test_handle(format!("external:matching-{index}")),
             evidence: vec![test_handle(format!("evidence:matching-{index}"))],
             postcondition_digest: test_handle(format!("{index:064x}")),
+            service_control_grant: service_control_grant.map(Box::new),
             credential_receipt: None,
             staging_receipt: None,
             phase_b_receipt: None,
@@ -20430,6 +20819,7 @@ mod tests {
                     external_identity: external_identity.clone(),
                     evidence: vec![test_handle(format!("evidence:rollback-match:{index}"))],
                     postcondition_digest: test_handle(format!("{index:064x}")),
+                    service_control_grant: None,
                     credential_receipt: None,
                     staging_receipt: None,
                     phase_b_receipt: None,
@@ -20499,6 +20889,7 @@ mod tests {
                     external_identity: test_handle("external:race-running"),
                     evidence: vec![test_handle("evidence:race-running")],
                     postcondition_digest: test_handle("a".repeat(64)),
+                    service_control_grant: None,
                     credential_receipt: None,
                     staging_receipt: None,
                     phase_b_receipt: None,
@@ -21519,12 +21910,36 @@ mod tests {
             &request,
             ELIOT_HOST_SERVICE_NAME,
             &"b".repeat(64),
+            None,
         ));
-        assert!(marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"b".repeat(64)));
-        assert!(!marker.matches(&request, ELIOT_WATCHDOG_SERVICE_NAME, &"b".repeat(64)));
-        assert!(!marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"c".repeat(64)));
+        assert!(marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"b".repeat(64), None,));
+        assert!(!marker.matches(&request, ELIOT_WATCHDOG_SERVICE_NAME, &"b".repeat(64), None,));
+        assert!(!marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"c".repeat(64), None,));
         request.registration_nonce = Some(test_handle("d".repeat(64)));
-        assert!(!marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"b".repeat(64)));
+        assert!(!marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"b".repeat(64), None,));
+
+        request.registration_nonce = Some(test_handle("a".repeat(64)));
+        let control_grant = test_watchdog_control_grant();
+        let watchdog_marker = must(WindowsServiceOwnershipMarker::new(
+            &request,
+            ELIOT_WATCHDOG_SERVICE_NAME,
+            &"e".repeat(64),
+            Some(&control_grant),
+        ));
+        assert!(watchdog_marker.matches(
+            &request,
+            ELIOT_WATCHDOG_SERVICE_NAME,
+            &"e".repeat(64),
+            Some(&control_grant),
+        ));
+        let mut substituted_grant = control_grant;
+        substituted_grant.security_descriptor_digest = test_handle("f".repeat(64));
+        assert!(!watchdog_marker.matches(
+            &request,
+            ELIOT_WATCHDOG_SERVICE_NAME,
+            &"e".repeat(64),
+            Some(&substituted_grant),
+        ));
     }
 
     #[cfg(windows)]
@@ -22468,6 +22883,7 @@ mod tests {
             (0..effect_count)
                 .map(|index| {
                     PortOutcome::Known(matching_for(
+                        &transaction.installer_effects[index],
                         index,
                         InstallationEffectDisposition::PreexistingMatching,
                     ))
@@ -22847,7 +23263,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_transaction_json_requires_explicit_migration_to_v17() {
+    fn v8_transaction_json_requires_explicit_migration_to_v18() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22861,7 +23277,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 17.0.0")
+                if reason.contains("requires explicit migration to 18.0.0")
         ));
     }
 
@@ -22910,7 +23326,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("wire 9.0.0 requires explicit migration to 17.0.0")
+                if reason.contains("wire 9.0.0 requires explicit migration to 18.0.0")
         ));
     }
 
@@ -22930,7 +23346,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_transaction_json_requires_explicit_migration_to_v17() {
+    fn v10_transaction_json_requires_explicit_migration_to_v18() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22956,12 +23372,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 10.0.0 requires explicit migration to 17.0.0")
+                if reason.contains("wire 10.0.0 requires explicit migration to 18.0.0")
         ));
     }
 
     #[test]
-    fn v13_transaction_json_requires_explicit_migration_to_v17() {
+    fn v13_transaction_json_requires_explicit_migration_to_v18() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22972,12 +23388,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 13.0.0 requires explicit migration to 17.0.0")
+                if reason.contains("wire 13.0.0 requires explicit migration to 18.0.0")
         ));
     }
 
     #[test]
-    fn v14_transaction_json_requires_explicit_migration_to_v17() {
+    fn v14_transaction_json_requires_explicit_migration_to_v18() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22988,12 +23404,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 14.0.0 requires explicit migration to 17.0.0")
+                if reason.contains("wire 14.0.0 requires explicit migration to 18.0.0")
         ));
     }
 
     #[test]
-    fn v15_transaction_json_requires_explicit_migration_to_v17() {
+    fn v15_transaction_json_requires_explicit_migration_to_v18() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         legacy["transaction_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(15, 0, 0)));
@@ -23001,12 +23417,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 15.0.0 requires explicit migration to 17.0.0")
+                if reason.contains("wire 15.0.0 requires explicit migration to 18.0.0")
         ));
     }
 
     #[test]
-    fn v16_transaction_json_requires_explicit_migration_to_v17() {
+    fn v16_transaction_json_requires_explicit_migration_to_v18() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         legacy["transaction_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(16, 0, 0)));
@@ -23014,7 +23430,29 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 16.0.0") && reason.contains("17.0.0")
+                if reason.contains("wire 16.0.0") && reason.contains("18.0.0")
+        ));
+    }
+
+    #[test]
+    fn v17_transaction_json_requires_explicit_migration_to_v18() {
+        let mut legacy = must(serde_json::to_value(planned_transaction()));
+        legacy["transaction_wire_version"] =
+            must(serde_json::to_value(ContractVersion::new(17, 0, 0)));
+        for progress in legacy["effect_progress"]
+            .as_array_mut()
+            .unwrap_or_else(|| unreachable!())
+        {
+            progress
+                .as_object_mut()
+                .unwrap_or_else(|| unreachable!())
+                .remove("service_control_grant");
+        }
+        let bytes = must(serde_json::to_vec(&legacy));
+        assert!(matches!(
+            decode_installation_transaction_json(&bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("wire 17.0.0") && reason.contains("18.0.0")
         ));
     }
 
@@ -23248,6 +23686,23 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::CorruptRegistry { .. })
+        ));
+    }
+
+    #[test]
+    fn current_transaction_without_service_control_grant_member_is_corrupt_registry() {
+        let mut value = must(serde_json::to_value(planned_transaction()));
+        value["effect_progress"]
+            .as_array_mut()
+            .and_then(|progress| progress.first_mut())
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap_or_else(|| unreachable!())
+            .remove("service_control_grant");
+        let bytes = must(serde_json::to_vec(&value));
+        assert!(matches!(
+            decode_installation_transaction_json(&bytes),
+            Err(InstallationError::CorruptRegistry { reason })
+                if reason.contains("service control grant")
         ));
     }
 
@@ -23597,6 +24052,43 @@ mod tests {
             approvals[0].configuration_digest,
             approvals[1].configuration_digest
         );
+        assert!(approvals[0].service_control_grant().is_none());
+        let watchdog_grant = approvals[1]
+            .service_control_grant()
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            watchdog_grant.principal_service().as_str(),
+            ELIOT_HOST_SERVICE_NAME
+        );
+        assert_eq!(
+            watchdog_grant.access_mask(),
+            ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
+        );
+        assert_eq!(
+            watchdog_grant.security_descriptor_digest().as_str(),
+            must(watchdog_service_security_descriptor_digest(
+                watchdog_grant.principal_sid().as_str()
+            ))
+        );
+        for substituted in [
+            {
+                let mut value = watchdog_grant.clone();
+                value.access_mask |= 0x0004_0000;
+                value
+            },
+            {
+                let mut value = watchdog_grant.clone();
+                value.principal_sid = test_handle("S-1-5-80-6-7-8-9-10");
+                value
+            },
+            {
+                let mut value = watchdog_grant.clone();
+                value.security_descriptor_digest = test_handle("f".repeat(64));
+                value
+            },
+        ] {
+            assert!(substituted.validate().is_err());
+        }
 
         let transaction_store = SharedStore::default();
         *transaction_store
@@ -23631,6 +24123,15 @@ mod tests {
         assert_eq!(pending.transaction_id, transaction.transaction_id);
         assert_eq!(pending.plan_digest, transaction.installer_plan_digest);
         assert_eq!(pending.approval, approval);
+        let mut substituted_registry = loaded.clone();
+        substituted_registry
+            .service_registration_approvals
+            .iter_mut()
+            .find(|approval| approval.role == InstallerServiceRole::Watchdog)
+            .and_then(|approval| approval.service_control_grant.as_mut())
+            .unwrap_or_else(|| unreachable!())
+            .access_mask |= 0x0004_0000;
+        assert!(substituted_registry.validate().is_err());
         for role in [InstallerServiceRole::Host, InstallerServiceRole::Watchdog] {
             let approval = loaded
                 .service_registration_approval(&transaction.candidate_manifest.generation, role)
@@ -24221,6 +24722,7 @@ mod tests {
         {
             if matches!(effect, InstallerEffectPlan::RegisterService { .. }) {
                 progress.registration_nonce = Some(test_handle("d".repeat(64)));
+                progress.service_control_grant = None;
                 progress.state = InstallationEffectProgressState::Pending;
             }
         }
@@ -24238,6 +24740,7 @@ mod tests {
         {
             if let InstallerEffectPlan::RegisterService { role, .. } = effect {
                 progress.registration_nonce = Some(test_handle("e".repeat(64)));
+                progress.service_control_grant = None;
                 progress.state = if *role == InstallerServiceRole::Host {
                     InstallationEffectProgressState::Unknown {
                         pending_ref: test_handle("reconcile:service"),
@@ -24334,6 +24837,46 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn current_registry_rejects_omitted_watchdog_service_control_grant_member() {
+        let transaction = system_registration_transaction();
+        let registry = ApprovedGenerationRegistry {
+            generations: vec![ApprovedGeneration {
+                manifest: transaction.candidate_manifest.clone(),
+                approval: test_transaction_activation_approval(
+                    &transaction,
+                    test_handle("approval:control-grant-wire"),
+                ),
+                active: false,
+                last_known_good: false,
+            }],
+            service_registration_approvals: must(transaction.service_registration_approvals()),
+            active_generation: None,
+            last_known_good_generation: None,
+            pending_activation: None,
+            last_terminal_activation: None,
+            ..ApprovedGenerationRegistry::new()
+        };
+        must(registry.validate());
+        let mut value = must(serde_json::to_value(&registry));
+        for approval in value["service_registration_approvals"]
+            .as_array_mut()
+            .unwrap_or_else(|| unreachable!())
+        {
+            approval
+                .as_object_mut()
+                .unwrap_or_else(|| unreachable!())
+                .remove("service_control_grant");
+        }
+        let bytes = must(serde_json::to_vec(&value));
+        assert!(matches!(
+            decode_registry_bytes(&bytes),
+            Err(InstallationError::CorruptRegistry { reason })
+                if reason.contains("wire v14")
+        ));
+    }
+
     #[test]
     fn legacy_registry_table_requires_explicit_migration() {
         let path = std::env::temp_dir().join(format!(
@@ -24372,7 +24915,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_registry_wire_requires_explicit_migration_to_v13() {
+    fn v9_registry_wire_requires_explicit_migration_to_v14() {
         let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object["registry_wire_version"] = serde_json::json!({
@@ -24389,7 +24932,7 @@ mod tests {
             matches!(
                 error,
                 InstallationError::MigrationRequired { ref reason }
-                    if reason.contains("registry wire 9.0.0") && reason.contains("13.0.0")
+                    if reason.contains("registry wire 9.0.0") && reason.contains("14.0.0")
             ),
             "unexpected raw v9 classification: {error:?}"
         );
@@ -24442,13 +24985,13 @@ mod tests {
             error,
             InstallationError::MigrationRequired { reason }
                 if reason.contains("wire v10")
-                    && reason.contains("re-stage as v13")
+                    && reason.contains("re-stage as v14")
                     && reason.contains("never synthesized or adopted")
         ));
     }
 
     #[test]
-    fn v11_registry_wire_requires_explicit_migration_to_v13() {
+    fn v11_registry_wire_requires_explicit_migration_to_v14() {
         let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         legacy["registry_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(11, 0, 0)));
@@ -24456,25 +24999,25 @@ mod tests {
         assert!(matches!(
             decode_registry_bytes(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("registry wire 11.0.0") && reason.contains("13.0.0")
+                if reason.contains("registry wire 11.0.0") && reason.contains("14.0.0")
         ));
     }
 
     #[test]
-    fn v13_registry_wire_round_trips_without_synthesizing_rebind_state() {
+    fn v14_registry_wire_round_trips_without_synthesizing_control_grants() {
         let current = ApprovedGenerationRegistry::new();
         let bytes = must(serde_json::to_vec(&current));
         let decoded = must(decode_registry_bytes(&bytes));
         assert_eq!(decoded, current);
         assert_eq!(
             decoded.registry_wire_version(),
-            ContractVersion::new(13, 0, 0)
+            ContractVersion::new(14, 0, 0)
         );
         assert!(decoded.active_phase_b_rebind().is_none());
     }
 
     #[test]
-    fn v12_registry_wire_requires_explicit_migration_to_v13() {
+    fn v12_registry_wire_requires_explicit_migration_to_v14() {
         let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         legacy["registry_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(12, 0, 0)));
@@ -24482,12 +25025,25 @@ mod tests {
         assert!(matches!(
             decode_registry_bytes(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("registry wire 12.0.0") && reason.contains("13.0.0")
+                if reason.contains("registry wire 12.0.0") && reason.contains("14.0.0")
         ));
     }
 
     #[test]
-    fn v13_registry_wire_rejects_omitted_mandatory_rebind_member() {
+    fn v13_registry_wire_requires_explicit_migration_to_v14() {
+        let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+        legacy["registry_wire_version"] =
+            must(serde_json::to_value(ContractVersion::new(13, 0, 0)));
+        let bytes = must(serde_json::to_vec(&legacy));
+        assert!(matches!(
+            decode_registry_bytes(&bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("registry wire 13.0.0") && reason.contains("14.0.0")
+        ));
+    }
+
+    #[test]
+    fn v14_registry_wire_rejects_omitted_mandatory_rebind_member() {
         let mut current = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         current
             .as_object_mut()

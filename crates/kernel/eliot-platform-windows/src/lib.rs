@@ -4901,6 +4901,90 @@ pub const ELIOT_WATCHDOG_SERVICE_NAME: &str = "EliotWatchdog";
 pub const ELIOT_HOST_SERVICE_DISPLAY_NAME: &str = "Eliot Host";
 pub const ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME: &str = "Eliot Watchdog";
 
+/// Exact service-object rights granted to the `EliotHost` service SID on the
+/// canonical `EliotWatchdog` registration.
+///
+/// The mask is deliberately concrete rather than generic: query-config and
+/// query-status are required for the retained readback contour, start/stop are
+/// the only mutations admitted to Host, and `READ_CONTROL` is required to
+/// reverify the protected DACL. It excludes change-config, delete, write-DACL,
+/// write-owner, pause/continue and user-defined control rights.
+pub const ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK: u32 =
+    0x0000_0001 | 0x0000_0004 | 0x0000_0010 | 0x0000_0020 | 0x0002_0000;
+
+/// Authoritative readback of the one narrow service-object grant installed by
+/// the privileged installer for the non-elevated Host service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceControlGrantReadback {
+    principal_service: String,
+    principal_sid: String,
+    access_mask: u32,
+    security_descriptor_digest: String,
+}
+
+impl ServiceControlGrantReadback {
+    fn new(
+        principal_service: impl Into<String>,
+        principal_sid: impl Into<String>,
+        access_mask: u32,
+        security_descriptor_digest: impl Into<String>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let value = Self {
+            principal_service: principal_service.into(),
+            principal_sid: principal_sid.into(),
+            access_mask,
+            security_descriptor_digest: security_descriptor_digest.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Returns the canonical service whose deterministic SID receives the
+    /// grant.
+    #[must_use]
+    pub fn principal_service(&self) -> &str {
+        &self.principal_service
+    }
+
+    /// Returns the OS-resolved `S-1-5-80-...` service SID.
+    #[must_use]
+    pub fn principal_sid(&self) -> &str {
+        &self.principal_sid
+    }
+
+    /// Returns the exact concrete service-object access mask.
+    #[must_use]
+    pub const fn access_mask(&self) -> u32 {
+        self.access_mask
+    }
+
+    /// Returns the digest of the protected, byte-exact service DACL contour.
+    #[must_use]
+    pub fn security_descriptor_digest(&self) -> &str {
+        &self.security_descriptor_digest
+    }
+
+    /// Validates the typed readback without touching SCM.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WindowsAdapterError::IdentityMismatch`] when the principal,
+    /// concrete access mask, or descriptor digest differs from the canonical
+    /// Host-to-Watchdog control grant.
+    pub fn validate(&self) -> Result<(), WindowsAdapterError> {
+        if self.principal_service != ELIOT_HOST_SERVICE_NAME
+            || !valid_service_sid_text(&self.principal_sid)
+            || self.access_mask != ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
+            || !valid_sha256_hex(&self.security_descriptor_digest)
+            || !watchdog_service_security_descriptor_digest(&self.principal_sid)
+                .is_ok_and(|expected| expected == self.security_descriptor_digest)
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// Provider-neutral, typed authority passed to an SCM service through argv.
 ///
 /// The four named values are deliberately not read from ambient environment
@@ -5327,6 +5411,13 @@ impl ServiceRegistrationRequest {
         self.service_sid_type
     }
 
+    /// Returns whether this registration requires the installer-owned
+    /// `EliotHost` service-control grant and exact DACL readback.
+    #[must_use]
+    pub fn requires_host_service_control_grant(&self) -> bool {
+        self.service_name == ELIOT_WATCHDOG_SERVICE_NAME
+    }
+
     #[must_use]
     pub fn bootstrap(&self) -> Option<&ServiceBootstrapArguments> {
         self.bootstrap.as_ref()
@@ -5417,19 +5508,24 @@ pub enum ServiceRegistrationOutcome {
     /// The SCM object was absent and this call created it successfully.
     CreatedNow {
         observation: ServiceObservation,
+        control_grant: Option<ServiceControlGrantReadback>,
     },
     /// The exact object was already present before this call.
     PreexistingMatching {
         observation: ServiceObservation,
+        control_grant: Option<ServiceControlGrantReadback>,
     },
     Registered {
         observation: ServiceObservation,
+        control_grant: Option<ServiceControlGrantReadback>,
     },
     Updated {
         observation: ServiceObservation,
+        control_grant: Option<ServiceControlGrantReadback>,
     },
     Unchanged {
         observation: ServiceObservation,
+        control_grant: Option<ServiceControlGrantReadback>,
     },
     Deleted,
     AlreadyAbsent,
@@ -5445,7 +5541,10 @@ pub enum ServiceRegistrationOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServiceRegistrationInspection {
     /// Exact configuration and current service state were observed.
-    Matching { observation: ServiceObservation },
+    Matching {
+        observation: ServiceObservation,
+        control_grant: Option<ServiceControlGrantReadback>,
+    },
     /// The canonical service name is not registered.
     Absent,
     /// A service exists at the canonical name with different configuration.
@@ -5695,6 +5794,18 @@ impl OwnedSecurityDescriptor {
         // marker.  Host (LocalService) and recovery-capable LocalSystem are
         // sufficient owners for this protected file.
         Self::from_sddl("O:LSD:P(A;;FA;;;SY)(A;;FA;;;LS)")
+    }
+
+    /// Exact protected service DACL for Host-owned Watchdog lifecycle control.
+    /// SYSTEM and Administrators retain installer/OS authority; the resolved
+    /// `EliotHost` service SID receives only the concrete minimal runtime mask.
+    fn for_watchdog_host_control(host_service_sid: &str) -> Result<Self, WindowsAdapterError> {
+        if !valid_service_sid_text(host_service_sid) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Self::from_sddl(&format!(
+            "D:P(A;;0x000F01FF;;;SY)(A;;0x000F01FF;;;BA)(A;;0x{ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK:08X};;;{host_service_sid})"
+        ))
     }
 
     fn for_user_owned_storage(sid: &str, directory: bool) -> Result<Self, WindowsAdapterError> {
@@ -11165,7 +11276,162 @@ fn set_service_sid_type(
     }
 }
 
+/// Computes the canonical digest of the exact protected Watchdog service DACL
+/// for one resolved `EliotHost` service SID.
+///
+/// The physical readback must first prove byte equality with the same DACL;
+/// this portable semantic digest then lets durable installer records reject a
+/// SID, mask, protection-mode or administrator/SYSTEM-rights substitution.
+///
+/// # Errors
+///
+/// Returns [`WindowsAdapterError::InvalidInput`] unless `host_service_sid` is
+/// an exact service-SID string.
+pub fn watchdog_service_security_descriptor_digest(
+    host_service_sid: &str,
+) -> Result<String, WindowsAdapterError> {
+    if !valid_service_sid_text(host_service_sid) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    Ok(sha256_hex(
+        format!(
+            "eliot-watchdog-service-dacl:v1\0protected\0SY:000F01FF\0BA:000F01FF\0{host_service_sid}:{ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK:08X}"
+        )
+        .as_bytes(),
+    ))
+}
+
 #[cfg(windows)]
+fn service_registration_mutation_access(request: &ServiceRegistrationRequest) -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+    use windows_sys::Win32::System::Services::{
+        SERVICE_CHANGE_CONFIG, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
+    };
+
+    SERVICE_CHANGE_CONFIG
+        | SERVICE_QUERY_CONFIG
+        | SERVICE_QUERY_STATUS
+        | READ_CONTROL
+        | if request.requires_host_service_control_grant() {
+            WRITE_DAC
+        } else {
+            0
+        }
+}
+
+#[cfg(windows)]
+fn read_watchdog_host_control_grant(
+    service: windows_sys::Win32::Foundation::HANDLE,
+    request: &ServiceRegistrationRequest,
+) -> Result<Option<ServiceControlGrantReadback>, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_SERVICE};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR,
+        SE_DACL_PROTECTED,
+    };
+
+    if !request.requires_host_service_control_grant() {
+        return Ok(None);
+    }
+    let host_service_sid = resolve_service_sid(ELIOT_HOST_SERVICE_NAME)?;
+    let expected = OwnedSecurityDescriptor::for_watchdog_host_control(&host_service_sid)?;
+    let expected_dacl = expected.dacl()?;
+    let mut actual_dacl = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // `PROTECTED_DACL_SECURITY_INFORMATION` is a SetSecurityInfo-only flag.
+    // Query the DACL under READ_CONTROL, then prove protection from the
+    // returned descriptor's `SE_DACL_PROTECTED` control bit below.
+    let status = unsafe {
+        GetSecurityInfo(
+            service,
+            SE_SERVICE,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut actual_dacl,
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() || actual_dacl.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(if status == ERROR_ACCESS_DENIED {
+            WindowsAdapterError::PermissionDenied
+        } else {
+            WindowsAdapterError::Failed
+        });
+    }
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    let protected = unsafe {
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0
+    };
+    let dacl_matches = unsafe {
+        (*actual_dacl).AclSize == (*expected_dacl).AclSize
+            && std::slice::from_raw_parts(
+                actual_dacl.cast::<u8>(),
+                usize::from((*actual_dacl).AclSize),
+            ) == std::slice::from_raw_parts(
+                expected_dacl.cast::<u8>(),
+                usize::from((*expected_dacl).AclSize),
+            )
+    };
+    let digest = watchdog_service_security_descriptor_digest(&host_service_sid);
+    unsafe { LocalFree(descriptor.cast()) };
+    if !protected || !dacl_matches {
+        return Err(WindowsAdapterError::AclMismatch);
+    }
+    ServiceControlGrantReadback::new(
+        ELIOT_HOST_SERVICE_NAME,
+        host_service_sid,
+        ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+        digest?,
+    )
+    .map(Some)
+}
+
+#[cfg(windows)]
+fn install_watchdog_host_control_grant(
+    service: windows_sys::Win32::Foundation::HANDLE,
+    request: &ServiceRegistrationRequest,
+) -> Result<Option<ServiceControlGrantReadback>, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SE_SERVICE, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    if !request.requires_host_service_control_grant() {
+        return Ok(None);
+    }
+    let host_service_sid = resolve_service_sid(ELIOT_HOST_SERVICE_NAME)?;
+    let expected = OwnedSecurityDescriptor::for_watchdog_host_control(&host_service_sid)?;
+    let status = unsafe {
+        SetSecurityInfo(
+            service,
+            SE_SERVICE,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            expected.dacl()?,
+            std::ptr::null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(WindowsAdapterError::PermissionDenied);
+    }
+    read_watchdog_host_control_grant(service, request)
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "creation, exact DACL installation and authoritative readback form one fail-closed SCM effect"
+)]
 fn register_service(
     request: &ServiceRegistrationRequest,
 ) -> Result<ServiceRegistrationOutcome, WindowsAdapterError> {
@@ -11174,8 +11440,7 @@ fn register_service(
     use windows_sys::Win32::Foundation::{ERROR_SERVICE_EXISTS, ERROR_SERVICE_MARKED_FOR_DELETE};
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, CreateServiceW, OpenSCManagerW, SC_MANAGER_CREATE_SERVICE,
-        SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_DEMAND_START, SERVICE_DISABLED,
-        SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
+        SERVICE_AUTO_START, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_ERROR_NORMAL,
         SERVICE_WIN32_OWN_PROCESS,
     };
 
@@ -11184,8 +11449,14 @@ fn register_service(
     }
 
     match inspect_service_registration(request) {
-        ServiceRegistrationInspection::Matching { observation } => {
-            return Ok(ServiceRegistrationOutcome::PreexistingMatching { observation });
+        ServiceRegistrationInspection::Matching {
+            observation,
+            control_grant,
+        } => {
+            return Ok(ServiceRegistrationOutcome::PreexistingMatching {
+                observation,
+                control_grant,
+            });
         }
         ServiceRegistrationInspection::Mismatched => {
             return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
@@ -11228,12 +11499,13 @@ fn register_service(
     if manager.is_null() {
         return Err(last_windows_adapter_error());
     }
+    let desired_access = service_registration_mutation_access(request);
     let service = unsafe {
         CreateServiceW(
             manager,
             service_name.as_ptr(),
             display_name.as_ptr(),
-            SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+            desired_access,
             SERVICE_WIN32_OWN_PROCESS,
             start_type,
             SERVICE_ERROR_NORMAL,
@@ -11268,14 +11540,25 @@ fn register_service(
         }
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
+    if install_watchdog_host_control_grant(service, request).is_err() {
+        unsafe {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+        }
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
+    }
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
     }
     match inspect_service_registration(request) {
-        ServiceRegistrationInspection::Matching { observation } => {
-            Ok(ServiceRegistrationOutcome::CreatedNow { observation })
-        }
+        ServiceRegistrationInspection::Matching {
+            observation,
+            control_grant,
+        } => Ok(ServiceRegistrationOutcome::CreatedNow {
+            observation,
+            control_grant,
+        }),
         ServiceRegistrationInspection::Absent
         | ServiceRegistrationInspection::Mismatched
         | ServiceRegistrationInspection::Unknown => Ok(ServiceRegistrationOutcome::EffectUnknown),
@@ -11283,7 +11566,11 @@ fn register_service(
 }
 
 #[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    reason = "configuration replacement, DACL replacement and exact readback form one fail-closed SCM effect"
+)]
 fn update_service_registration(
     request: &ServiceRegistrationRequest,
 ) -> Result<ServiceRegistrationOutcome, WindowsAdapterError> {
@@ -11291,8 +11578,7 @@ fn update_service_registration(
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Services::{
         ChangeServiceConfigW, CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
-        SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG,
-        SERVICE_QUERY_STATUS, SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, SERVICE_WIN32_OWN_PROCESS,
     };
     if request.bootstrap().is_none() {
         return Err(WindowsAdapterError::InvalidInput);
@@ -11323,13 +11609,8 @@ fn update_service_registration(
     if manager.is_null() {
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
-    let service = unsafe {
-        OpenServiceW(
-            manager,
-            name.as_ptr(),
-            SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
-        )
-    };
+    let desired_access = service_registration_mutation_access(request);
+    let service = unsafe { OpenServiceW(manager, name.as_ptr(), desired_access) };
     if service.is_null() {
         unsafe { CloseServiceHandle(manager) };
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
@@ -11364,17 +11645,23 @@ fn update_service_registration(
         )
     };
     let sid_changed = changed != 0 && set_service_sid_type(service, request.service_sid_type());
+    let grant_changed =
+        sid_changed && install_watchdog_host_control_grant(service, request).is_ok();
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
     }
-    if !sid_changed {
+    if !grant_changed {
         return Ok(ServiceRegistrationOutcome::EffectUnknown);
     }
     match inspect_service_registration(request) {
-        ServiceRegistrationInspection::Matching { observation } => {
-            Ok(ServiceRegistrationOutcome::Updated { observation })
-        }
+        ServiceRegistrationInspection::Matching {
+            observation,
+            control_grant,
+        } => Ok(ServiceRegistrationOutcome::Updated {
+            observation,
+            control_grant,
+        }),
         ServiceRegistrationInspection::Absent
         | ServiceRegistrationInspection::Mismatched
         | ServiceRegistrationInspection::Unknown => Ok(ServiceRegistrationOutcome::EffectUnknown),
@@ -11755,6 +12042,7 @@ fn inspect_service_registration_runtime(
 ) -> ServiceRegistrationRuntimeInspection {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+    use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
         SC_STATUS_PROCESS_INFO, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
@@ -11775,7 +12063,7 @@ fn inspect_service_registration_runtime(
         OpenServiceW(
             manager,
             name.as_ptr(),
-            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL,
         )
     };
     if service.is_null() {
@@ -11794,6 +12082,13 @@ fn inspect_service_registration_runtime(
         };
         if !exact_service_configuration_matches(request, &configuration) {
             return ServiceRegistrationRuntimeInspection::Mismatched;
+        }
+        match read_watchdog_host_control_grant(service, request) {
+            Ok(_) => {}
+            Err(WindowsAdapterError::AclMismatch | WindowsAdapterError::IdentityMismatch) => {
+                return ServiceRegistrationRuntimeInspection::Mismatched;
+            }
+            Err(_) => return ServiceRegistrationRuntimeInspection::Unknown,
         }
         let mut status = SERVICE_STATUS_PROCESS::default();
         let mut needed = 0;
@@ -12219,6 +12514,7 @@ fn inspect_service_registration(
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+    use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_CONFIG,
     };
@@ -12231,7 +12527,8 @@ fn inspect_service_registration(
     if manager.is_null() {
         return ServiceRegistrationInspection::Unknown;
     }
-    let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_CONFIG) };
+    let service =
+        unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_CONFIG | READ_CONTROL) };
     if service.is_null() {
         let error = std::io::Error::last_os_error();
         unsafe { CloseServiceHandle(manager) };
@@ -12254,14 +12551,32 @@ fn inspect_service_registration(
             ServiceSidType::None => true,
             ServiceSidType::Unrestricted => resolve_service_sid(request.service_name()).is_ok(),
         };
+    let control_grant = if matches {
+        match read_watchdog_host_control_grant(service, request) {
+            Ok(value) => Some(value),
+            Err(WindowsAdapterError::AclMismatch | WindowsAdapterError::IdentityMismatch) => None,
+            Err(_) => {
+                unsafe {
+                    CloseServiceHandle(service);
+                    CloseServiceHandle(manager);
+                }
+                return ServiceRegistrationInspection::Unknown;
+            }
+        }
+    } else {
+        None
+    };
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
     }
-    if !matches {
+    if !matches || control_grant.is_none() {
         return ServiceRegistrationInspection::Mismatched;
     }
-    service_registration_inspection_from_status(inspect_service(request.service_name()))
+    service_registration_inspection_from_status(
+        inspect_service(request.service_name()),
+        control_grant.unwrap_or_default(),
+    )
 }
 
 #[cfg(not(windows))]
@@ -12273,9 +12588,13 @@ fn inspect_service_registration(
 
 fn service_registration_inspection_from_status(
     status: PortOutcome<ServiceObservation>,
+    control_grant: Option<ServiceControlGrantReadback>,
 ) -> ServiceRegistrationInspection {
     match status {
-        PortOutcome::Known(observation) => ServiceRegistrationInspection::Matching { observation },
+        PortOutcome::Known(observation) => ServiceRegistrationInspection::Matching {
+            observation,
+            control_grant,
+        },
         PortOutcome::Partial { .. } | PortOutcome::Unknown(_) | PortOutcome::Error(_) => {
             ServiceRegistrationInspection::Unknown
         }
@@ -14170,6 +14489,137 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("Watchdog LocalService plan failed: {error}"));
         assert_eq!(watchdog.service_sid_type(), ServiceSidType::None);
+        assert!(!request.requires_host_service_control_grant());
+        assert!(watchdog.requires_host_service_control_grant());
+    }
+
+    #[test]
+    fn watchdog_host_control_grant_rejects_rights_escalation_and_shape_substitution() {
+        let required = 0x0000_0001 | 0x0000_0004 | 0x0000_0010 | 0x0000_0020 | 0x0002_0000;
+        let forbidden = 0x0000_0002 | 0x0000_0040 | 0x0000_0100 | 0x0001_0000 | 0x000C_0000;
+        assert_eq!(ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, required);
+        assert_eq!(ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK & forbidden, 0);
+
+        let descriptor_digest = watchdog_service_security_descriptor_digest("S-1-5-80-1-2-3-4-5")
+            .unwrap_or_else(|error| panic!("descriptor digest failed: {error}"));
+        let receipt = ServiceControlGrantReadback::new(
+            ELIOT_HOST_SERVICE_NAME,
+            "S-1-5-80-1-2-3-4-5",
+            ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+            descriptor_digest.clone(),
+        )
+        .unwrap_or_else(|error| panic!("grant receipt failed: {error}"));
+        assert!(receipt.validate().is_ok());
+        for (principal, sid, mask, digest) in [
+            (
+                ELIOT_WATCHDOG_SERVICE_NAME,
+                "S-1-5-80-1-2-3-4-5",
+                ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                descriptor_digest.clone(),
+            ),
+            (
+                ELIOT_HOST_SERVICE_NAME,
+                "S-1-5-80-1-2-3-4",
+                ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                descriptor_digest.clone(),
+            ),
+            (
+                ELIOT_HOST_SERVICE_NAME,
+                "S-1-5-80-1-2-3-4-5",
+                ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK | 0x0004_0000,
+                descriptor_digest,
+            ),
+            (
+                ELIOT_HOST_SERVICE_NAME,
+                "S-1-5-80-1-2-3-4-5",
+                ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                "not-a-digest".to_owned(),
+            ),
+        ] {
+            assert!(ServiceControlGrantReadback::new(principal, sid, mask, digest).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn watchdog_installer_mutation_handle_retains_exact_dacl_readback_authority() {
+        use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+        use windows_sys::Win32::System::Services::{
+            SERVICE_CHANGE_CONFIG, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
+        };
+
+        let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+        let host = ServiceRegistrationRequest::new(
+            ELIOT_HOST_SERVICE_NAME,
+            ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            image.clone(),
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+        )
+        .unwrap_or_else(|error| panic!("Host request failed: {error}"));
+        let watchdog = ServiceRegistrationRequest::new(
+            ELIOT_WATCHDOG_SERVICE_NAME,
+            ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
+            image,
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+        )
+        .unwrap_or_else(|error| panic!("Watchdog request failed: {error}"));
+
+        let readback = SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL;
+        let host_access = service_registration_mutation_access(&host);
+        assert_eq!(host_access & readback, readback);
+        assert_ne!(host_access & SERVICE_CHANGE_CONFIG, 0);
+        assert_eq!(host_access & WRITE_DAC, 0);
+
+        let watchdog_access = service_registration_mutation_access(&watchdog);
+        assert_eq!(watchdog_access & readback, readback);
+        assert_ne!(watchdog_access & SERVICE_CHANGE_CONFIG, 0);
+        assert_eq!(watchdog_access & WRITE_DAC, WRITE_DAC);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn watchdog_service_dacl_is_protected_exact_and_sid_bound_without_scm_mutation() {
+        use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, GetAce};
+        use windows_sys::Win32::System::Services::SERVICE_ALL_ACCESS;
+
+        let host_sid = "S-1-5-80-1-2-3-4-5";
+        let descriptor = OwnedSecurityDescriptor::for_watchdog_host_control(host_sid)
+            .unwrap_or_else(|error| panic!("descriptor failed: {error}"));
+        let dacl = descriptor
+            .dacl()
+            .unwrap_or_else(|error| panic!("DACL failed: {error}"));
+        assert_eq!(unsafe { (*dacl).AceCount }, 3);
+        let mut observed = Vec::new();
+        for index in 0..3_u32 {
+            let mut ace = std::ptr::null_mut();
+            assert_ne!(unsafe { GetAce(dacl, index, &raw mut ace) }, 0);
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid = (&raw const allowed.SidStart).cast_mut().cast();
+            observed.push((
+                sid_to_string(sid).unwrap_or_else(|error| panic!("SID failed: {error}")),
+                allowed.Mask,
+            ));
+        }
+        assert_eq!(
+            observed,
+            vec![
+                ("S-1-5-18".to_owned(), SERVICE_ALL_ACCESS),
+                ("S-1-5-32-544".to_owned(), SERVICE_ALL_ACCESS),
+                (host_sid.to_owned(), ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,),
+            ]
+        );
+        let digest = watchdog_service_security_descriptor_digest(host_sid)
+            .unwrap_or_else(|error| panic!("digest failed: {error}"));
+        let substituted = OwnedSecurityDescriptor::for_watchdog_host_control("S-1-5-80-6-7-8-9-10")
+            .unwrap_or_else(|error| panic!("substituted descriptor failed: {error}"));
+        assert!(substituted.dacl().is_ok());
+        assert_ne!(
+            digest,
+            watchdog_service_security_descriptor_digest("S-1-5-80-6-7-8-9-10")
+                .unwrap_or_else(|error| panic!("substituted digest failed: {error}"))
+        );
     }
 
     #[test]
@@ -14731,7 +15181,10 @@ mod tests {
             &ServiceRegistrationInspection::Unknown
         ));
         assert!(service_readback_is_acceptable(
-            &ServiceRegistrationInspection::Matching { observation }
+            &ServiceRegistrationInspection::Matching {
+                observation,
+                control_grant: None,
+            }
         ));
         assert_eq!(
             ServiceRegistrationOutcome::ExistingRequiresReconciliation,
@@ -14761,10 +15214,13 @@ mod tests {
             process: None,
         };
         assert_eq!(
-            service_registration_inspection_from_status(PortOutcome::Partial {
-                value: observation,
-                missing: vec![handle("authority")],
-            }),
+            service_registration_inspection_from_status(
+                PortOutcome::Partial {
+                    value: observation,
+                    missing: vec![handle("authority")],
+                },
+                None
+            ),
             ServiceRegistrationInspection::Unknown
         );
     }
