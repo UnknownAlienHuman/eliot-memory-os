@@ -13,6 +13,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod runtime_control;
+
 mod service;
 
 pub use service::{

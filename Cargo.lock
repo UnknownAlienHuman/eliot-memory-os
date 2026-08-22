@@ -1152,6 +1152,7 @@ name = "eliot-host"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-host-service",
  "eliot-host-state",
  "eliot-installation",
  "eliot-ipc",
@@ -1182,9 +1183,13 @@ dependencies = [
  "eliot-kernel-service",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-protocol",
+ "eliot-receipts",
  "eliot-runtime-contracts",
  "schemars",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror",
 ]
 
@@ -1408,6 +1413,29 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "eliot-live-canary"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "eliot-host-service",
+ "eliot-host-state",
+ "eliot-installation",
+ "eliot-ipc",
+ "eliot-platform",
+ "eliot-platform-windows",
+ "eliot-runtime-status",
+ "eliot-windows-ipc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -9,12 +9,13 @@ use eliot_installation::InstallationError;
 use eliot_installation::InstallationTransactionStore;
 use eliot_installation::{ApprovedGenerationRegistry, CandidateManifest, InstallerServiceRole};
 use eliot_runtime_contracts::{
-    HealthDimension, KernelActivationState, SUPERVISION_LEASE_FILE_NAME, SignedSupervisionLease,
-    SupervisionLeaseIncarnationBinding, SupervisionLeasePredecessorIdentity,
-    SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionTrustAnchor,
-    WATCHDOG_ADMISSION_FILE_NAME, WATCHDOG_PUBLICATION_DIRECTORY_PREFIX,
-    WATCHDOG_PUBLICATION_FILE_NAME, WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate,
-    WatchdogPublicationBundle, WatchdogPublicationRetentionPlan,
+    HealthDimension, KernelActivationState, LeaseState, SUPERVISION_LEASE_FILE_NAME,
+    SignedSupervisionLease, SupervisionLeaseIncarnationBinding,
+    SupervisionLeasePredecessorIdentity, SupervisionLeaseVerificationContext,
+    SupervisionLeaseVerifier, SupervisionTrustAnchor, WATCHDOG_ADMISSION_FILE_NAME,
+    WATCHDOG_PUBLICATION_DIRECTORY_PREFIX, WATCHDOG_PUBLICATION_FILE_NAME,
+    WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate, WatchdogPublicationBundle,
+    WatchdogPublicationRetentionPlan,
 };
 use serde::{Deserialize, Serialize};
 
@@ -77,7 +78,72 @@ pub struct HostJournalContour {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OrsContour {
     pub state: ComponentState,
+    /// Exact current dynamic supervision evidence projected only after the
+    /// Host journal, ORS head, signature/freshness context and immutable
+    /// Watchdog publication have been verified together.
+    pub current_supervision: Option<CurrentSupervisionEvidence>,
     pub gap: String,
+}
+
+/// Provider-neutral, read-only projection of one fully verified current
+/// supervision incarnation. This value is evidence only and grants no
+/// mutation or lease authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentSupervisionEvidence {
+    pub incarnation: SupervisionLeaseIncarnationBinding,
+    pub incarnation_sha256: String,
+    pub ors_state: LeaseState,
+    pub ors_projection: eliot_ors::SupervisionLeaseProjection,
+    pub ors_record_id: String,
+    pub ors_revision: u64,
+    pub ors_receipt_sha256: String,
+    pub lease_payload_sha256: String,
+    pub lease_envelope_sha256: String,
+    pub trust_anchor_fingerprint: String,
+    pub verification_context_sha256: String,
+    pub watchdog_publication_sha256: String,
+}
+
+impl CurrentSupervisionEvidence {
+    /// Revalidates the public evidence shape without treating it as authority.
+    pub fn validate(&self) -> Result<(), String> {
+        self.incarnation
+            .validate()
+            .map_err(|error| format!("supervision incarnation is invalid: {error}"))?;
+        if self.ors_state != LeaseState::Active
+            || self.ors_projection != eliot_ors::SupervisionLeaseProjection::Active
+            || self.ors_record_id.trim().is_empty()
+            || self.ors_revision == 0
+        {
+            return Err("supervision evidence is not an exact Active ORS head".to_owned());
+        }
+        for (name, value) in [
+            ("incarnation_sha256", &self.incarnation_sha256),
+            ("ors_receipt_sha256", &self.ors_receipt_sha256),
+            ("lease_payload_sha256", &self.lease_payload_sha256),
+            ("lease_envelope_sha256", &self.lease_envelope_sha256),
+            ("trust_anchor_fingerprint", &self.trust_anchor_fingerprint),
+            (
+                "verification_context_sha256",
+                &self.verification_context_sha256,
+            ),
+            (
+                "watchdog_publication_sha256",
+                &self.watchdog_publication_sha256,
+            ),
+        ] {
+            if !is_sha256_hex(value) {
+                return Err(format!("{name} is not a lowercase SHA-256 digest"));
+            }
+        }
+        let incarnation_bytes = serde_json::to_vec(&self.incarnation)
+            .map_err(|error| format!("supervision incarnation encoding failed: {error}"))?;
+        if sha256_hex(&incarnation_bytes) != self.incarnation_sha256 {
+            return Err("incarnation digest does not bind the exact typed value".to_owned());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1035,6 +1101,59 @@ struct VerifiedHostSupervisionBundle {
     trust_anchor: SupervisionTrustAnchor,
     context: SupervisionLeaseVerificationContext,
     current: eliot_ors::SupervisionLeaseSnapshot,
+    incarnation: SupervisionLeaseIncarnationBinding,
+    journaled_supervision: SupervisionLeasePredecessorIdentity,
+    publication: WatchdogPublicationBundle,
+}
+
+#[cfg(windows)]
+impl VerifiedHostSupervisionBundle {
+    fn public_evidence(&self) -> Result<CurrentSupervisionEvidence, String> {
+        let incarnation_bytes = serde_json::to_vec(&self.incarnation)
+            .map_err(|error| format!("supervision incarnation encoding failed: {error}"))?;
+        let context_bytes = serde_json::to_vec(&self.context)
+            .map_err(|error| format!("supervision context encoding failed: {error}"))?;
+        let publication_bytes = self
+            .publication
+            .canonical_bytes()
+            .map_err(|error| format!("Watchdog publication encoding failed: {error}"))?;
+        let evidence = CurrentSupervisionEvidence {
+            incarnation: self.incarnation.clone(),
+            incarnation_sha256: sha256_hex(&incarnation_bytes),
+            ors_state: self.current.record.state,
+            ors_projection: self.current.record.projection,
+            ors_record_id: self.current.record.record_id.as_str().to_owned(),
+            ors_revision: self.current.record.revision,
+            ors_receipt_sha256: self.current.receipt.receipt_sha256.clone(),
+            lease_payload_sha256: self.current.record.artifact.payload_sha256.clone(),
+            lease_envelope_sha256: self
+                .current
+                .record
+                .artifact
+                .envelope_digest()
+                .map_err(|error| format!("supervision envelope digest failed: {error}"))?,
+            trust_anchor_fingerprint: self.trust_anchor.public_key_fingerprint().to_owned(),
+            verification_context_sha256: sha256_hex(&context_bytes),
+            watchdog_publication_sha256: sha256_hex(&publication_bytes),
+        };
+        evidence.validate()?;
+        if evidence.incarnation.supervision_lease_id
+            != self.journaled_supervision.supervision_lease_id
+            || evidence.ors_receipt_sha256 != self.journaled_supervision.ors_receipt_sha256
+            || evidence.incarnation.supervision_lease_id != self.current.record.lease_id.as_str()
+            || evidence.ors_record_id != self.publication.ors_record_id
+            || evidence.ors_revision != self.publication.lease_revision
+            || evidence.ors_receipt_sha256 != self.publication.ors_receipt_sha256
+            || evidence.incarnation.supervision_lease_scope_id
+                != self.publication.supervision_lease_scope_id
+            || evidence.incarnation.supervision_lease_id != self.publication.supervision_lease_id
+        {
+            return Err(
+                "public supervision evidence does not match journal/ORS/publication".to_owned(),
+            );
+        }
+        Ok(evidence)
+    }
 }
 
 #[cfg(windows)]
@@ -1407,7 +1526,8 @@ fn verify_host_supervision_bundle(
     if authority_after != &authority
         || current_after.as_ref() != Some(&current)
         || publication_after != publication
-        || journaled_after != (journaled_incarnation, journaled_supervision)
+        || journaled_after.0 != journaled_incarnation
+        || journaled_after.1 != journaled_supervision
         || retained_root.verify_stable_identity().is_err()
         || ors.verify_stable_identity().is_err()
         || ors.verify_path_identity().is_err()
@@ -1420,6 +1540,9 @@ fn verify_host_supervision_bundle(
         trust_anchor: authority.trust_anchor,
         context,
         current,
+        incarnation: journaled_incarnation,
+        journaled_supervision,
+        publication: publication.marker,
     })
 }
 
@@ -3550,7 +3673,7 @@ pub fn collect_status_with_observers(
 
     Ok(RuntimeStatusReport {
         contract: "eliot.runtime.live".to_owned(),
-        contract_version: "1.0.0".to_owned(),
+        contract_version: "1.1.0".to_owned(),
         status: overall.to_owned(),
         host_state_root: canonical_path.to_string_lossy().into_owned(),
         active_generation: active_gen,
@@ -4313,6 +4436,7 @@ fn unknown_ors(reason: impl Into<String>) -> OrsContour {
             reason: reason.into(),
             gap: ors_gap(),
         },
+        current_supervision: None,
         gap: ors_gap(),
     }
 }
@@ -4446,19 +4570,27 @@ fn inspect_ors_retained(
             return unknown_ors("a retained ORS/admission identity changed during observation");
         }
         let _keep_leases = (ors_root_lease, ors_file_lease);
-        let state = if projection.health == HealthDimension::Healthy {
-            ComponentState::Healthy
+        let (state, current_supervision) = if projection.health == HealthDimension::Healthy {
+            let evidence = match bundle.public_evidence() {
+                Ok(evidence) => evidence,
+                Err(error) => return unknown_ors(error),
+            };
+            (ComponentState::Healthy, Some(evidence))
         } else {
-            ComponentState::Unknown {
-                reason: format!(
-                    "authoritative ORS projection is {:?} ({:?})",
-                    projection.health, projection.reason
-                ),
-                gap: ors_gap(),
-            }
+            (
+                ComponentState::Unknown {
+                    reason: format!(
+                        "authoritative ORS projection is {:?} ({:?})",
+                        projection.health, projection.reason
+                    ),
+                    gap: ors_gap(),
+                },
+                None,
+            )
         };
         OrsContour {
             state,
+            current_supervision,
             gap: ors_gap(),
         }
     }
@@ -4864,7 +4996,7 @@ mod honest_tests {
         let report = collect(&root);
         assert_eq!(report.status, "NOT_HEALTHY");
         assert_eq!(report.contract, "eliot.runtime.live");
-        assert_eq!(report.contract_version, "1.0.0");
+        assert_eq!(report.contract_version, "1.1.0");
         assert!(
             report
                 .gaps
@@ -6605,6 +6737,7 @@ mod live_production_observer_tests {
         let manifest = host_with_kernel_and_store().1;
         let ors = OrsContour {
             state: ComponentState::Healthy,
+            current_supervision: None,
             gap: ors_gap_for(),
         };
         let svc = ServiceRegistrationState {
@@ -6664,6 +6797,7 @@ mod live_production_observer_tests {
         let manifest = host_with_kernel_and_store().1;
         let ors = OrsContour {
             state: ComponentState::Healthy,
+            current_supervision: None,
             gap: ors_gap_for(),
         };
         let svc = ServiceRegistrationState {

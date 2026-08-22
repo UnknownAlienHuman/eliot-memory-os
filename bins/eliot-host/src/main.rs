@@ -611,11 +611,13 @@ fn process_runtime_control_requests(
             Err(_) => None,
         };
         let Some(envelope) = request else { break };
-        let response = match runtime_control_dispatch(&envelope.request.operation) {
-            RuntimeControlDispatch::Kernel => host.handle_kernel_restart_request(&envelope.request),
-            RuntimeControlDispatch::Store => host.handle_store_recovery_request(&envelope.request),
+        let response = match runtime_control_dispatch(&envelope.request().operation) {
+            RuntimeControlDispatch::Kernel => {
+                host.handle_kernel_restart_request(envelope.request())
+            }
+            RuntimeControlDispatch::Store => host.handle_store_recovery_request(envelope.request()),
         };
-        let _ = envelope.reply.send(response);
+        let _ = envelope.respond(response);
     }
 }
 

@@ -20,6 +20,7 @@ test-support = [
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-host-service.workspace = true
 eliot-kernel-core.workspace = true
 eliot-installation.workspace = true
 eliot-ipc.workspace = true

@@ -16,11 +16,15 @@ proof_entrypoint = "cargo test -p eliot-host-service"
 [dependencies]
 eliot-contracts.workspace = true
 eliot-kernel-service.workspace = true
+eliot-protocol.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
+eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 schemars.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [lints]

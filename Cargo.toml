@@ -124,6 +124,7 @@ members = [
   "bins/eliotd",
   "workspace/tools/eliot-runtime-compiler",
   "workspace/tools/eliot-campaign-executor",
+  "workspace/tools/eliot-live-canary",
 ]
 default-members = [
   "bins/eliot",
