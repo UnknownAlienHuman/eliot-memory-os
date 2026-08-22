@@ -64,7 +64,7 @@ pub struct SupervisionObservationScope {
 }
 
 impl SupervisionObservationScope {
-    fn validate(&self) -> Result<(), RuntimeContractError> {
+    pub(crate) fn validate(&self) -> Result<(), RuntimeContractError> {
         non_empty_text_list(&self.targets, "observation_scope.targets")?;
         non_empty_text(&self.sensor_profile, "observation_scope.sensor_profile")?;
         non_empty_text_list(&self.claimed_coverage, "observation_scope.claimed_coverage")?;
@@ -107,7 +107,7 @@ pub struct SupervisionOrsMirrorBinding {
 }
 
 impl SupervisionOrsMirrorBinding {
-    fn validate(&self) -> Result<(), RuntimeContractError> {
+    pub(crate) fn validate(&self) -> Result<(), RuntimeContractError> {
         non_empty_text(&self.record_id, "ors_mirror.record_id")?;
         non_empty_text(&self.subject_lease_id, "ors_mirror.subject_lease_id")?;
         if self.lease_revision == 0 {
@@ -183,7 +183,7 @@ pub enum RegisteredActivityWakePolicy {
 }
 
 impl RegisteredActivityWakePolicy {
-    fn validate(&self) -> Result<(), RuntimeContractError> {
+    pub(crate) fn validate(&self) -> Result<(), RuntimeContractError> {
         match self {
             Self::Disabled => Ok(()),
             Self::Registered {

@@ -3,8 +3,8 @@ use std::fmt;
 use eliot_observation_contracts::ObservationRecordEnvelope;
 use eliot_platform::{HostProcessNonce, KernelActivationNonce, PlatformHandle, PortOutcome};
 use eliot_runtime_contracts::{
-    HealthDimension, KernelActivationState, ServiceProcessRecord, ServiceProcessState, WakeIntent,
-    WakeIntentState,
+    HealthDimension, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
+    SupervisionLeasePredecessorIdentity, WakeIntent, WakeIntentState,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -18,6 +18,15 @@ where
     D: serde::Deserializer<'de>,
 {
     Option::<PlatformHandle>::deserialize(deserializer)
+}
+
+fn deserialize_required_active_supervision_lease<'de, D>(
+    deserializer: D,
+) -> Result<Option<SupervisionLeasePredecessorIdentity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<SupervisionLeasePredecessorIdentity>::deserialize(deserializer)
 }
 
 fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), JournalError> {
@@ -1345,6 +1354,10 @@ pub struct KernelReadinessObservationRecord {
     pub store_fence: PlatformHandle,
     pub observed_at: PlatformHandle,
     pub evidence_refs: Vec<PlatformHandle>,
+    /// Exact active supervision lease and ORS receipt retained for the next
+    /// Host incarnation to fence. Absence is permitted only for genesis.
+    #[serde(deserialize_with = "deserialize_required_active_supervision_lease")]
+    pub active_supervision_lease: Option<SupervisionLeasePredecessorIdentity>,
 }
 
 /// Exact approved/current contour observed by Host immediately before journal admission.
@@ -1410,7 +1423,13 @@ impl KernelReadinessObservationRecord {
             &self.evidence_refs,
             "readiness_observation.evidence_refs",
             true,
-        )
+        )?;
+        if let Some(identity) = &self.active_supervision_lease {
+            identity
+                .validate()
+                .map_err(|error| JournalError::Invalid(error.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn validate_against(

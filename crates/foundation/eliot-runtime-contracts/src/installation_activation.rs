@@ -18,16 +18,16 @@ use eliot_contracts::{
 
 /// Stable schema marker for an authenticated installation activation.
 ///
-/// Version 2 removes the static Kernel activation nonce from the installer
-/// approval.  Host is the sole runtime nonce issuer; its dynamic nonce is
-/// bound later by the Kernel activation/readiness receipts and Host commit
-/// fence.
-pub const INSTALLATION_ACTIVATION_SCHEMA: &str = "eliot.installation-activation.v2";
+/// Version 3 removes the synthetic Phase-A supervision fingerprint from the
+/// signed authority digest set.  Host is the sole runtime nonce issuer; its
+/// dynamic nonce and the actual supervision trust anchor are bound later by
+/// the Kernel activation/readiness and Host Phase-B receipts.
+pub const INSTALLATION_ACTIVATION_SCHEMA: &str = "eliot.installation-activation.v3";
 /// Stable contract identity for the installation activation surface.
 pub const INSTALLATION_ACTIVATION_CONTRACT_NAME: &str =
     "eliot.foundation.runtime-contracts.installation-activation";
 /// Current contract revision for the installation activation surface.
-pub const INSTALLATION_ACTIVATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
+pub const INSTALLATION_ACTIVATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 /// Fixed signature algorithm admitted by this contract.
 pub const INSTALLATION_ACTIVATION_SIGNATURE_ALGORITHM: &str = "Ed25519";
 /// Ed25519 public-key size in bytes.
@@ -940,6 +940,25 @@ mod tests {
     use super::*;
     use eliot_contracts::AuthorityEpoch;
 
+    #[derive(serde::Serialize)]
+    struct LegacyCanonicalPayload<'a> {
+        schema: &'static str,
+        contract_version: ContractVersion,
+        payload: &'a InstallationActivationPayload,
+    }
+
+    #[derive(serde::Serialize)]
+    struct LegacySignedInstallationActivationPreimage<'a> {
+        schema: &'static str,
+        contract_version: ContractVersion,
+        payload: &'a InstallationActivationPayload,
+        payload_sha256: &'a str,
+        signer_id: &'a str,
+        key_id: &'a str,
+        algorithm: &'a str,
+        public_key_fingerprint: &'a str,
+    }
+
     fn digest(byte: char) -> String {
         std::iter::repeat_n(byte, 64).collect()
     }
@@ -1036,6 +1055,14 @@ mod tests {
 
     #[test]
     fn signed_activation_round_trips_through_strict_anchor() {
+        assert_eq!(
+            INSTALLATION_ACTIVATION_SCHEMA,
+            "eliot.installation-activation.v3"
+        );
+        assert_eq!(
+            INSTALLATION_ACTIVATION_CONTRACT_VERSION,
+            ContractVersion::new(3, 0, 0)
+        );
         let payload = payload();
         let signer = signer();
         let signed = payload.sign(&signer).expect("sign");
@@ -1049,6 +1076,45 @@ mod tests {
         assert_eq!(verified.signer_id(), "installer-authority");
         assert_eq!(verified.key_id(), "key-1");
         assert_eq!(verified.payload_digest(), payload.digest().expect("digest"));
+    }
+
+    #[test]
+    fn signed_activation_v2_envelope_is_rejected_by_v3_verifier() {
+        let payload = payload();
+        let signer = signer();
+        let old_payload_bytes = canonical_json_bytes(&LegacyCanonicalPayload {
+            schema: "eliot.installation-activation.v2",
+            contract_version: ContractVersion::new(2, 0, 0),
+            payload: &payload,
+        })
+        .expect("legacy payload bytes");
+        let old_payload_sha256 = sha256_hex(&old_payload_bytes);
+        let old_preimage = canonical_json_bytes(&LegacySignedInstallationActivationPreimage {
+            schema: "eliot.installation-activation.v2",
+            contract_version: ContractVersion::new(2, 0, 0),
+            payload: &payload,
+            payload_sha256: &old_payload_sha256,
+            signer_id: signer.signer_id(),
+            key_id: signer.key_id(),
+            algorithm: signer.algorithm(),
+            public_key_fingerprint: signer.public_key_fingerprint(),
+        })
+        .expect("legacy signed preimage");
+        let legacy = SignedInstallationActivationApproval {
+            payload,
+            payload_sha256: old_payload_sha256,
+            signer_id: signer.signer_id().to_owned(),
+            key_id: signer.key_id().to_owned(),
+            algorithm: signer.algorithm().to_owned(),
+            public_key_fingerprint: signer.public_key_fingerprint().to_owned(),
+            signature: encode_hex(&signer.signing_key.sign(&old_preimage).to_bytes()),
+        };
+        assert!(matches!(
+            anchor().verify(&legacy, &context()),
+            Err(InstallationActivationError::DigestMismatch {
+                field: "payload_sha256"
+            })
+        ));
     }
 
     #[test]

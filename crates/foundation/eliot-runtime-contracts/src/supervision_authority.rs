@@ -7,7 +7,11 @@ use eliot_contracts::{ResourceGeneration, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{SupervisionLeaseError, SupervisionTrustAnchor, WatchdogAdmissionTemplate};
+use crate::{
+    RegisteredActivityWakePolicy, SupervisionLeaseError, SupervisionObservationScope,
+    SupervisionTrustAnchor, WatchdogAdmissionTemplate, canonical_observation_scope,
+    canonical_wake_policy,
+};
 
 /// Current Windows provider used for service-SID-bound key sealing.
 pub const WINDOWS_SERVICE_SID_DPAPI_NG_PROVIDER: &str = "windows-dpapi-ng-service-sid-v1";
@@ -145,8 +149,12 @@ impl SupervisionSealedKeyReference {
 pub struct ProvisionedSupervisionAuthority {
     /// Strict public contract revision.
     pub contract_version: u16,
-    /// Stable lease identity selected by the immutable generation plan.
-    pub supervision_lease_id: String,
+    /// Stable scope identity selected by the immutable generation plan.
+    pub supervision_lease_scope_id: String,
+    /// Immutable observation scope bound by the installer to this authority.
+    pub observation_scope: SupervisionObservationScope,
+    /// Immutable wake policy bound by the installer to this authority.
+    pub wake_policy: RegisteredActivityWakePolicy,
     /// Candidate generation identity that owns this authority.
     pub candidate_generation: String,
     /// Exact lifecycle generation bound to the key and lease.
@@ -163,11 +171,11 @@ pub struct ProvisionedSupervisionAuthority {
 
 impl ProvisionedSupervisionAuthority {
     /// Current strict contract revision.
-    pub const CONTRACT_VERSION: u16 = 1;
+    pub const CONTRACT_VERSION: u16 = 2;
 
     /// Constructs a complete provision result and computes its public receipt.
     pub fn new(
-        supervision_lease_id: impl Into<String>,
+        supervision_lease_scope_id: impl Into<String>,
         candidate_generation: impl Into<String>,
         authority_generation: ResourceGeneration,
         key_reference: SupervisionSealedKeyReference,
@@ -175,7 +183,9 @@ impl ProvisionedSupervisionAuthority {
     ) -> Result<Self, SupervisionLeaseError> {
         let mut value = Self {
             contract_version: Self::CONTRACT_VERSION,
-            supervision_lease_id: supervision_lease_id.into(),
+            supervision_lease_scope_id: supervision_lease_scope_id.into(),
+            observation_scope: canonical_observation_scope(),
+            wake_policy: canonical_wake_policy(),
             candidate_generation: candidate_generation.into(),
             authority_generation,
             key_reference,
@@ -196,20 +206,28 @@ impl ProvisionedSupervisionAuthority {
     pub fn watchdog_admission_template(
         &self,
     ) -> Result<WatchdogAdmissionTemplate, SupervisionLeaseError> {
-        WatchdogAdmissionTemplate::new(
+        let mut template = WatchdogAdmissionTemplate::new(
             self.trust_anchor.installation_id.clone(),
             self.candidate_generation.clone(),
-            self.supervision_lease_id.clone(),
+            self.supervision_lease_scope_id.clone(),
             self.trust_anchor.clone(),
         )
-        .map_err(|error| invalid(error.to_string()))
+        .map_err(|error| invalid(error.to_string()))?;
+        template.observation_scope = self.observation_scope.clone();
+        template.wake_policy = self.wake_policy.clone();
+        template
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
+        Ok(template)
     }
 
     /// Computes the public provision receipt without its self-digest.
     pub fn computed_receipt_digest(&self) -> Result<String, SupervisionLeaseError> {
         let bytes = serde_json::to_vec(&(
             self.contract_version,
-            self.supervision_lease_id.as_str(),
+            self.supervision_lease_scope_id.as_str(),
+            &self.observation_scope,
+            &self.wake_policy,
             self.candidate_generation.as_str(),
             self.authority_generation,
             &self.key_reference,
@@ -231,7 +249,23 @@ impl ProvisionedSupervisionAuthority {
                 "unsupported provisioned supervision authority version",
             ));
         }
-        non_empty(&self.supervision_lease_id, "supervision_lease_id")?;
+        non_empty(
+            &self.supervision_lease_scope_id,
+            "supervision_lease_scope_id",
+        )?;
+        self.observation_scope
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
+        self.wake_policy
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
+        if self.observation_scope != canonical_observation_scope()
+            || self.wake_policy != canonical_wake_policy()
+        {
+            return Err(invalid(
+                "provisioned supervision authority uses a non-canonical observation policy",
+            ));
+        }
         non_empty(&self.candidate_generation, "candidate_generation")?;
         self.key_reference.validate()?;
         self.trust_anchor.validate()?;

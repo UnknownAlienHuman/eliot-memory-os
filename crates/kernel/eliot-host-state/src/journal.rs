@@ -13,7 +13,10 @@ use crate::model::{
 use crate::{JournalBackend, JournalError, ReconcileOutcome};
 
 pub const JOURNAL_MAGIC: &[u8] = b"ELIOT-HOST-STATE\n";
-pub const JOURNAL_VERSION: u16 = 1;
+/// Current journal wire revision. Version 1 readiness records did not retain
+/// the exact supervision predecessor and are therefore never replayed into a
+/// current Host contour.
+pub const JOURNAL_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppendDisposition {

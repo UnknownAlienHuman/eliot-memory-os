@@ -17,7 +17,7 @@ use crate::{
     ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
     StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
     SupervisionAuthorityProvisionPlan, candidate_manifest_digest as candidate_digest_fn, handle,
-    phase_b_static_template_for_candidate,
+    phase_b_static_template_for_candidate, supervision_key_slot_for_scope_id,
 };
 
 /// The immutable package inventory produced by the trusted generation seam.
@@ -1003,12 +1003,12 @@ impl GenerationPackagePlanner {
             "--eliotd-descriptor-sha256".to_owned(),
             eliotd_descriptor_digest.as_str().to_owned(),
         ])?;
-        let supervision_lease_id = PlatformHandle::new(format!(
-            "eliot-supervision-lease:v1:{}:{}",
+        let supervision_lease_scope_id = PlatformHandle::new(format!(
+            "eliot-supervision-scope:v1:{}:{}",
             input.installation_epoch.installation, input.generation
         ))
         .map_err(|error| InstallationError::InvalidField {
-            field: "generation.supervision_lease_id".to_owned(),
+            field: "generation.supervision_lease_scope_id".to_owned(),
             reason: error.to_string(),
         })?;
         let store_bridge_arguments = handle_vec(match input.profile {
@@ -1050,7 +1050,7 @@ impl GenerationPackagePlanner {
             authority_descriptor_path: authority_path,
             authority_descriptor_digest: phase_b_marker.clone(),
             supervision_authority: crate::SupervisionAuthorityBinding::Pending {
-                supervision_lease_id: supervision_lease_id.clone(),
+                supervision_lease_scope_id: supervision_lease_scope_id.clone(),
             },
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
@@ -1126,17 +1126,9 @@ impl GenerationPackagePlanner {
             ],
             config_digest,
             store_credential_target: store_credential_target.clone(),
-            supervision_key_fingerprint: PlatformHandle::new(hex_digest(
-                format!(
-                    "eliot-supervision-key:{}:{}",
-                    input.installation_epoch.installation, input.generation
-                )
-                .as_bytes(),
-            ))
-            .map_err(|error| InstallationError::InvalidField {
-                field: "generation.supervision_key_fingerprint".to_owned(),
-                reason: error.to_string(),
-            })?,
+            supervision_key_slot: supervision_key_slot_for_scope_id(
+                supervision_lease_scope_id.as_str(),
+            )?,
             signature_ref,
             runtime_state_roots_digest: roots.roots_digest.clone(),
             runtime_launch: launch,
@@ -1323,7 +1315,7 @@ impl GenerationPackagePlanner {
                     installation_id: input.installation_epoch.installation.clone(),
                     candidate_generation: input.generation.clone(),
                     authority_generation,
-                    supervision_lease_id: supervision_lease_id.clone(),
+                    supervision_lease_scope_id: supervision_lease_scope_id.clone(),
                     signer_id: PlatformHandle::new("eliot-kernel").map_err(|error| {
                         InstallationError::InvalidField {
                             field: "generation.supervision_signer_id".to_owned(),
@@ -1923,10 +1915,10 @@ mod tests {
                 eliot_contracts::ResourceGeneration::genesis(),
             ),
             supervision_authority: crate::SupervisionAuthorityBinding::Pending {
-                supervision_lease_id: h("test-supervision-lease"),
+                supervision_lease_scope_id: h("test-supervision-scope"),
             },
             authority_descriptor_path: test_path(portable_root.as_str(), "authority.json"),
-            authority_descriptor_digest: h("7".repeat(64)),
+            authority_descriptor_digest: h(crate::PHASE_B_PENDING_MARKER),
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
             kernel_artifact_digest: kernel_artifact_digest.clone(),
@@ -1948,7 +1940,7 @@ mod tests {
                 portable_root.as_str(),
                 "store-bootstrap.json",
             ),
-            store_bootstrap_descriptor_digest: h("6".repeat(64)),
+            store_bootstrap_descriptor_digest: h(crate::PHASE_B_PENDING_MARKER),
             canonical_store_executable_path: test_path(portable_root.as_str(), "surreal.exe"),
             canonical_store_artifact_digest: h("5".repeat(64)),
             kernel_arguments: vec![],
@@ -2003,7 +1995,7 @@ mod tests {
             license_refs: vec![h("evidence:license")],
             config_digest: h("2".repeat(64)),
             store_credential_target: h("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-            supervision_key_fingerprint: h("3".repeat(64)),
+            supervision_key_slot: h("3".repeat(64)),
             signature_ref: h("a".repeat(64)),
             runtime_state_roots_digest: roots.roots_digest.clone(),
             runtime_launch: desc,
@@ -2366,7 +2358,7 @@ mod tests {
         base.store_bridge_artifact_digest = h(get("eliot-store-surreal.exe"));
         base.canonical_store_artifact_digest = h(get("surreal.exe"));
         base.config_digest = h(get("generation.json"));
-        base.supervision_key_fingerprint = h("c".repeat(64));
+        base.supervision_key_slot = h("c".repeat(64));
         base.runtime_launch.kernel_artifact_digest = h(get("eliot-kernel.exe"));
         base.runtime_launch.host_artifact_digest = h(get("eliot-host.exe"));
         base.runtime_launch.watchdog_artifact_digest = h(get("eliot-watchdog.exe"));
@@ -2636,6 +2628,17 @@ mod tests {
                 crate::PhaseBDigestState::Pending
             )
         );
+        assert_eq!(
+            transaction.candidate_manifest.supervision_key_slot.as_str(),
+            supervision_key_slot_for_scope_id(
+                transaction
+                    .candidate_manifest
+                    .runtime_launch
+                    .supervision_lease_scope_id()
+            )
+            .expect("planner emits a lease-bound supervision slot")
+            .as_str()
+        );
         assert!(
             transaction
                 .candidate_manifest
@@ -2654,6 +2657,50 @@ mod tests {
         let wire = serde_json::to_string(&transaction).unwrap();
         assert!(!wire.contains("host_runtime_activation_nonce"));
         assert!(!wire.contains("host_activation_nonce"));
+    }
+
+    #[test]
+    fn supervision_slot_is_lease_bound_and_legacy_fingerprint_is_inert() {
+        let (_tmp, portable, _roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        populate_source_with_roles(source_dir.path());
+        let transaction =
+            GenerationPackagePlanner::plan(production_input(source_dir.path(), portable))
+                .expect("trusted generation planner should build");
+        let mut candidate = transaction.candidate_manifest;
+        let lease_scope_id = candidate
+            .runtime_launch
+            .supervision_lease_scope_id()
+            .to_owned();
+        candidate.supervision_key_slot =
+            supervision_key_slot_for_scope_id(&lease_scope_id).expect("canonical slot");
+        candidate.validate().expect("canonical slot validates");
+        let wire = serde_json::to_value(&candidate).expect("candidate wire");
+        assert_eq!(
+            wire.get("supervision_key_fingerprint")
+                .and_then(serde_json::Value::as_str),
+            Some(candidate.supervision_key_slot.as_str())
+        );
+        assert!(wire.get("supervision_key_slot").is_none());
+        let decoded: CandidateManifest =
+            serde_json::from_value(wire).expect("legacy wire member remains readable");
+        assert_eq!(decoded.supervision_key_slot, candidate.supervision_key_slot);
+
+        candidate.supervision_key_slot =
+            supervision_key_slot_for_scope_id("substituted-supervision-scope")
+                .expect("substituted slot");
+        assert!(candidate.validate().is_err());
+
+        candidate.supervision_key_slot = h("3".repeat(64));
+        candidate
+            .validate()
+            .expect("legacy fingerprint remains an inert compatibility projection");
+        assert!(
+            candidate
+                .runtime_launch
+                .provisioned_supervision_authority()
+                .is_err()
+        );
     }
 
     #[test]

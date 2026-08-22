@@ -2792,7 +2792,8 @@ fn observe_watchdog_publication(path: &Path) -> Result<ObservedWatchdogPublicati
         .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
     if marker.installation_id != admission.installation_id
         || marker.approved_generation != admission.approved_generation
-        || marker.supervision_lease_id != admission.supervision_lease_id
+        || marker.supervision_lease_scope_id != admission.supervision_lease_scope_id
+        || marker.supervision_lease_id != lease.payload.lease_id
     {
         return Err(SpoolError::InvalidLease(
             "Watchdog marker is not bound to its admission template".to_owned(),
@@ -2933,7 +2934,7 @@ fn load_content_addressed_supervision_lease_bound(
             "Watchdog admission is foreign to the selected generation".to_owned(),
         ));
     }
-    let lease_id = eliot_ors::OperationIdentity::new(config.supervision_lease_id.clone())
+    let lease_id = eliot_ors::OperationIdentity::new(config.supervision_lease_scope_id.clone())
         .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
     let durable_current = read_manifest_selected_ors_current(&selected_manifest, &lease_id)?
         .ok_or_else(|| {

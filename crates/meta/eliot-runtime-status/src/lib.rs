@@ -1229,7 +1229,7 @@ fn verify_host_supervision_bundle(
     ors.verify_stable_identity()
         .and_then(|()| ors.verify_path_identity())
         .map_err(|error| format!("retained Kernel ORS identity failed: {error}"))?;
-    let lease_id = eliot_ors::OperationIdentity::new(authority.supervision_lease_id.clone())
+    let lease_id = eliot_ors::OperationIdentity::new(authority.supervision_lease_scope_id.clone())
         .map_err(|error| format!("supervision lease identity invalid: {error}"))?;
     let current = eliot_ors::read_current_supervision_lease_read_only(ors.path(), &lease_id)
         .map_err(|error| format!("current supervision ORS read failed: {error}"))?
@@ -5177,7 +5177,7 @@ mod honest_tests {
             store_credential_target: fixture_handle(
                 "eliot/store/v1/0123456789abcdef0123456789abcdef",
             ),
-            supervision_key_fingerprint: fixture_handle("3".repeat(64)),
+            supervision_key_slot: fixture_handle("3".repeat(64)),
             signature_ref: fixture_handle("evidence:signature"),
             runtime_state_roots_digest: runtime_state_roots.roots_digest.clone(),
             runtime_launch,
@@ -5690,7 +5690,7 @@ mod store_currentness_production_tests {
             license_refs: vec![],
             config_digest: dh('c'),
             store_credential_target: h("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-            supervision_key_fingerprint: h("fingerprint"),
+            supervision_key_slot: h("eliot-supervision-slot:v1:test-supervision-lease"),
             signature_ref: h("sig"),
             runtime_state_roots_digest: roots.roots_digest.clone(),
             runtime_launch: eliot_installation::RuntimeLaunchDescriptor {
@@ -5708,7 +5708,7 @@ mod store_currentness_production_tests {
                     eliot_installation::ResourceGeneration::genesis(),
                 ),
                 supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
-                    supervision_lease_id: h("test-supervision-lease"),
+                    supervision_lease_scope_id: h("test-supervision-scope"),
                 },
                 authority_descriptor_path: h(&format!("{portable}/authority.json")),
                 authority_descriptor_digest: h(&"a".repeat(64)),
@@ -6051,6 +6051,7 @@ mod live_production_observer_tests {
                 h(&format!("{now}"))
             },
             evidence_refs: vec![h("evidence")],
+            active_supervision_lease: None,
         };
         let store = StoreRebindRecord {
             fence: fence.clone(),
@@ -6201,7 +6202,7 @@ mod live_production_observer_tests {
                 license_refs: vec![],
                 config_digest: dh('c'),
                 store_credential_target: h("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-                supervision_key_fingerprint: h("fingerprint"),
+                supervision_key_slot: h("eliot-supervision-slot:v1:test-supervision-lease"),
                 signature_ref: h("sig"),
                 runtime_state_roots_digest: roots.roots_digest.clone(),
                 runtime_launch: eliot_installation::RuntimeLaunchDescriptor {
@@ -6221,7 +6222,7 @@ mod live_production_observer_tests {
                     ),
                     supervision_authority:
                         eliot_installation::SupervisionAuthorityBinding::Pending {
-                            supervision_lease_id: h("test-supervision-lease"),
+                            supervision_lease_scope_id: h("test-supervision-scope"),
                         },
                     authority_descriptor_path: h(&format!("{portable}/authority.json")),
                     authority_descriptor_digest: h(&"a".repeat(64)),
@@ -7443,6 +7444,7 @@ mod host_journal_projection_tests {
             store_fence: h("store-fence-generation-1"),
             observed_at: h(observed_at),
             evidence_refs: vec![h("kernel-authored-probe-ready")],
+            active_supervision_lease: None,
         };
         let approved = ReadinessApprovedContour {
             config_digest: dh('d'),

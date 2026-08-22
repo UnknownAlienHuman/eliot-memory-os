@@ -837,7 +837,7 @@ pub struct KernelSupervisionLeaseAuthority {
     ors: Arc<RedbRecoveryStore>,
     signer: ProtectedSupervisionLeaseSigner,
     trust_anchor: SupervisionTrustAnchor,
-    supervision_lease_id: String,
+    supervision_lease_scope_id: String,
 }
 
 #[cfg(windows)]
@@ -863,7 +863,7 @@ impl KernelSupervisionLeaseAuthority {
             ors,
             signer,
             trust_anchor: config.authority.trust_anchor,
-            supervision_lease_id: config.authority.supervision_lease_id,
+            supervision_lease_scope_id: config.authority.supervision_lease_scope_id,
         })
     }
 
@@ -878,16 +878,17 @@ impl KernelSupervisionLeaseAuthority {
     }
 
     /// Returns the exact lease identity selected by the installer plan.
-    pub fn supervision_lease_id(&self) -> &str {
-        &self.supervision_lease_id
+    pub fn supervision_lease_scope_id(&self) -> &str {
+        &self.supervision_lease_scope_id
     }
 
     /// Returns the exact authoritative ORS head selected by the provisioned
     /// lease identity. ProbeReady callers fail closed when this is absent.
     pub fn current_snapshot(
         &self,
+        supervision_lease_id: &str,
     ) -> Result<Option<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
-        let lease_id = OperationIdentity::new(self.supervision_lease_id.clone())?;
+        let lease_id = OperationIdentity::new(supervision_lease_id.to_owned())?;
         self.ors
             .load_current_supervision_lease(&lease_id)
             .map_err(Into::into)
@@ -7228,7 +7229,12 @@ impl KernelComposition {
                 .supervision_lease_authority
                 .as_ref()
                 .ok_or(TransportError::SessionFenced)?
-                .current_snapshot()
+                .current_snapshot(
+                    &request
+                        .candidate
+                        .supervision_incarnation
+                        .supervision_lease_id,
+                )
                 .map_err(|_| TransportError::SessionFenced)?
                 .ok_or(TransportError::SessionFenced)?;
             if snapshot.record.state != LeaseState::Active
@@ -7433,8 +7439,48 @@ mod tests {
         EnvironmentInheritance, EnvironmentProjection, FencingToken, ImageId, JobId, OperationId,
         PermitIssuance, ProcessTreeId, ResourceLimits, SessionId,
     };
-    use eliot_runtime_contracts::{ModuleContract, SupervisionSealedKeyFileIdentity};
+    use eliot_runtime_contracts::{
+        ModuleContract, RegisteredActivityWakePolicy, SupervisionJournalEpoch,
+        SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
+        SupervisionSealedKeyFileIdentity,
+    };
     use eliot_store_api::{RevisionHead, RevisionKey};
+
+    fn supervision_incarnation() -> SupervisionLeaseIncarnationBinding {
+        SupervisionLeaseIncarnationBinding {
+            supervision_lease_scope_id: "eliot-supervision-scope:v1:test".to_owned(),
+            supervision_lease_id: String::new(),
+            scope_ref_digest: String::new(),
+            installation_id: "installation-1".to_owned(),
+            host_epoch: SupervisionJournalEpoch {
+                lineage_id: "host-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            activation_id: "activation-1".to_owned(),
+            activation_generation: SupervisionJournalEpoch {
+                lineage_id: "activation-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            kernel_generation: SupervisionJournalEpoch {
+                lineage_id: "kernel-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            watchdog_epoch: SupervisionJournalEpoch {
+                lineage_id: "watchdog-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["eliot-kernel".to_owned()],
+                sensor_profile: "eliot-runtime-live-v3".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live-v3".to_owned(),
+            },
+            wake_policy: RegisteredActivityWakePolicy::Disabled,
+            predecessor: None,
+        }
+        .with_derived_ids()
+        .expect("sealed supervision incarnation")
+    }
 
     #[cfg(windows)]
     const BIND_SESSION_CHILD_PIPE_ENV: &str = "ELIOT_TEST_BIND_SESSION_CHILD_PIPE";
@@ -11146,6 +11192,7 @@ mod tests {
                         },
                     },
                 },
+                supervision_incarnation: supervision_incarnation(),
                 restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
                 containment_action: None,
             };
@@ -11353,6 +11400,7 @@ mod tests {
                         },
                     },
                 },
+                supervision_incarnation: supervision_incarnation(),
                 restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
                 containment_action: None,
             };
@@ -11555,6 +11603,7 @@ mod tests {
                         },
                     },
                 },
+                supervision_incarnation: supervision_incarnation(),
                 restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
                 containment_action: None,
             };
@@ -11764,6 +11813,7 @@ mod tests {
                     },
                 },
             },
+            supervision_incarnation: supervision_incarnation(),
             restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
             containment_action: None,
         };
@@ -11862,6 +11912,7 @@ mod tests {
                         },
                     },
                 },
+                supervision_incarnation: supervision_incarnation(),
                 restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
                 containment_action: None,
             };
@@ -12056,6 +12107,7 @@ mod tests {
                         },
                     },
                 },
+                supervision_incarnation: supervision_incarnation(),
                 restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
                 containment_action: None,
             };

@@ -43,7 +43,6 @@ const CONFIG_STORE_BOOTSTRAP: &str = "store_bootstrap_descriptor";
 
 const AUTHORITY_DESCRIPTOR: &str = "authority_descriptor";
 const AUTHORITY_RUNTIME_ROOTS: &str = "runtime_state_roots";
-const AUTHORITY_SUPERVISION_KEY: &str = "supervision_key";
 
 fn activation_error(error: &InstallationActivationError) -> InstallationError {
     InstallationError::InvalidField {
@@ -192,10 +191,6 @@ fn expected_authority_digests(manifest: &CandidateManifest) -> BTreeMap<&'static
         (
             AUTHORITY_RUNTIME_ROOTS,
             manifest.runtime_state_roots_digest.as_str(),
-        ),
-        (
-            AUTHORITY_SUPERVISION_KEY,
-            manifest.supervision_key_fingerprint.as_str(),
         ),
     ])
 }

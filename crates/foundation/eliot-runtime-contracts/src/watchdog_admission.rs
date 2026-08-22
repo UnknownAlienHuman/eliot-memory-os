@@ -3,7 +3,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{SupervisionLeaseError, SupervisionTrustAnchor};
+use crate::{
+    RegisteredActivityWakePolicy, SignedSupervisionLease, SupervisionLeaseError,
+    SupervisionObservationScope, SupervisionTrustAnchor, canonical_observation_scope,
+    canonical_wake_policy,
+};
 
 /// Canonical schema for the immutable, public Watchdog admission template.
 pub const WATCHDOG_ADMISSION_SCHEMA: &str = "eliot.watchdog-admission.v2";
@@ -83,8 +87,12 @@ pub struct WatchdogAdmissionTemplate {
     pub installation_id: String,
     /// Exact approved manifest generation.
     pub approved_generation: String,
-    /// Exact installation-approved supervision lease identity.
-    pub supervision_lease_id: String,
+    /// Exact installation-approved supervision lease scope identity.
+    pub supervision_lease_scope_id: String,
+    /// Immutable observation policy covered by the admission digest.
+    pub observation_scope: SupervisionObservationScope,
+    /// Immutable wake policy covered by the admission digest.
+    pub wake_policy: RegisteredActivityWakePolicy,
     /// Public verifier provisioned by the installer authority lane.
     pub trust_anchor: SupervisionTrustAnchor,
 }
@@ -94,14 +102,16 @@ impl WatchdogAdmissionTemplate {
     pub fn new(
         installation_id: impl Into<String>,
         approved_generation: impl Into<String>,
-        supervision_lease_id: impl Into<String>,
+        supervision_lease_scope_id: impl Into<String>,
         trust_anchor: SupervisionTrustAnchor,
     ) -> Result<Self, WatchdogPublicationError> {
         let template = Self {
             schema: WATCHDOG_ADMISSION_SCHEMA.to_owned(),
             installation_id: installation_id.into(),
             approved_generation: approved_generation.into(),
-            supervision_lease_id: supervision_lease_id.into(),
+            supervision_lease_scope_id: supervision_lease_scope_id.into(),
+            observation_scope: canonical_observation_scope(),
+            wake_policy: canonical_wake_policy(),
             trust_anchor,
         };
         template.validate()?;
@@ -121,9 +131,26 @@ impl WatchdogAdmissionTemplate {
             "watchdog_admission.approved_generation",
         )?;
         validate_text(
-            &self.supervision_lease_id,
-            "watchdog_admission.supervision_lease_id",
+            &self.supervision_lease_scope_id,
+            "watchdog_admission.supervision_lease_scope_id",
         )?;
+        self.observation_scope
+            .validate()
+            .map_err(|_| WatchdogPublicationError::InvalidText {
+                field: "watchdog_admission.observation_scope",
+            })?;
+        self.wake_policy
+            .validate()
+            .map_err(|_| WatchdogPublicationError::InvalidText {
+                field: "watchdog_admission.wake_policy",
+            })?;
+        if self.observation_scope != canonical_observation_scope()
+            || self.wake_policy != canonical_wake_policy()
+        {
+            return Err(WatchdogPublicationError::InvalidText {
+                field: "watchdog_admission.policy",
+            });
+        }
         self.trust_anchor.validate()?;
         if self.trust_anchor.installation_id != self.installation_id {
             return Err(WatchdogPublicationError::InvalidText {
@@ -157,6 +184,8 @@ pub struct WatchdogPublicationBundle {
     pub installation_id: String,
     /// Manifest-bound approved generation.
     pub approved_generation: String,
+    /// Manifest-bound supervision lease scope identity.
+    pub supervision_lease_scope_id: String,
     /// Manifest-bound supervision lease identity.
     pub supervision_lease_id: String,
     /// Exact committed ORS lease revision.
@@ -181,11 +210,17 @@ impl WatchdogPublicationBundle {
         lease_bytes: &[u8],
     ) -> Result<Self, WatchdogPublicationError> {
         let admission_bytes = admission.canonical_bytes()?;
+        let signed: SignedSupervisionLease =
+            serde_json::from_slice(lease_bytes).map_err(|_| WatchdogPublicationError::Encoding)?;
+        signed
+            .validate()
+            .map_err(|_| WatchdogPublicationError::ContentMismatch)?;
         let marker = Self {
             schema: WATCHDOG_PUBLICATION_SCHEMA.to_owned(),
             installation_id: admission.installation_id.clone(),
             approved_generation: admission.approved_generation.clone(),
-            supervision_lease_id: admission.supervision_lease_id.clone(),
+            supervision_lease_scope_id: admission.supervision_lease_scope_id.clone(),
+            supervision_lease_id: signed.payload.lease_id,
             lease_revision,
             ors_record_id: ors_record_id.into(),
             ors_receipt_sha256: ors_receipt_sha256.into(),
@@ -210,6 +245,10 @@ impl WatchdogPublicationBundle {
         validate_text(
             &self.approved_generation,
             "watchdog_publication.approved_generation",
+        )?;
+        validate_text(
+            &self.supervision_lease_scope_id,
+            "watchdog_publication.supervision_lease_scope_id",
         )?;
         validate_text(
             &self.supervision_lease_id,
@@ -292,7 +331,7 @@ impl WatchdogPublicationRetentionPlan {
             marker.validate()?;
             if marker.installation_id != current.installation_id
                 || marker.approved_generation != current.approved_generation
-                || marker.supervision_lease_id != current.supervision_lease_id
+                || marker.supervision_lease_scope_id != current.supervision_lease_scope_id
                 || marker.admission_sha256 != current.admission_sha256
                 || (marker.ors_receipt_sha256 != current.ors_receipt_sha256
                     && marker.lease_revision >= current.lease_revision)
@@ -368,8 +407,61 @@ impl WatchdogPublicationRetentionPlan {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+
+    fn signed_lease_bytes(lease_id: &str) -> Vec<u8> {
+        let signer = crate::Ed25519SupervisionLeaseSigner::from_secret_key(
+            "eliot-kernel",
+            "test-supervision-key",
+            [7; 32],
+        )
+        .expect("signer");
+        let generation = ResourceGeneration::new(1).expect("generation");
+        let kernel_epoch = AuthorityEpoch::new(2).expect("kernel epoch");
+        let lease = crate::SupervisionLease {
+            schema: crate::SUPERVISION_LEASE_SCHEMA.to_owned(),
+            contract_name: crate::SUPERVISION_LEASE_CONTRACT_NAME.to_owned(),
+            contract_version: crate::SUPERVISION_LEASE_CONTRACT_VERSION,
+            lease_id: lease_id.to_owned(),
+            scope_ref: "scope-ref".to_owned(),
+            observation_scope: crate::canonical_observation_scope(),
+            installation_id: "installation-1".to_owned(),
+            host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
+            activation_id: "activation-1".to_owned(),
+            activation_generation: generation,
+            kernel_epoch,
+            watchdog_epoch: AuthorityEpoch::new(1).expect("watchdog epoch"),
+            generation_binding: crate::SupervisionGenerationBinding {
+                target_id: "eliot-kernel".to_owned(),
+                target_generation: generation,
+                module_id: "eliot-kernel".to_owned(),
+                module_generation: generation,
+                process_id: "process-1".to_owned(),
+                process_generation: generation,
+            },
+            state_fence: StateFence::new(kernel_epoch, generation),
+            ors_mirror: crate::SupervisionOrsMirrorBinding {
+                record_id: "record-1".to_owned(),
+                subject_lease_id: lease_id.to_owned(),
+                lease_revision: 1,
+                ticket_sha256: "a".repeat(64),
+                previous_receipt_sha256: None,
+            },
+            issued_at_ms: 1,
+            expires_at_ms: 3,
+            renew_before_ms: 2,
+            wake_policy: crate::canonical_wake_policy(),
+            state: crate::LeaseState::Active,
+            terminal_disposition: None,
+            revocation_reason: None,
+            revocation_id: None,
+            revocation_epoch: None,
+        };
+        serde_json::to_vec(&lease.sign(&signer).expect("signed lease")).expect("lease bytes")
+    }
 
     fn anchor() -> SupervisionTrustAnchor {
         let signer =
@@ -393,22 +485,22 @@ mod tests {
         assert!(is_sha256_hex(&digest));
 
         let mut substituted = template;
-        substituted.supervision_lease_id = "lease-8".to_owned();
+        substituted.supervision_lease_scope_id = "scope-8".to_owned();
         assert_ne!(substituted.digest().expect("substituted digest"), digest);
     }
 
     #[test]
     fn marker_rejects_mixed_admission_and_lease_bytes() {
-        let lease = b"lease-v1";
+        let lease = signed_lease_bytes("lease-v1");
         let template =
             WatchdogAdmissionTemplate::new("installation-1", "generation-7", "lease-7", anchor())
                 .expect("template");
         let marker =
-            WatchdogPublicationBundle::new(&template, 3, "record-3", "a".repeat(64), lease)
+            WatchdogPublicationBundle::new(&template, 3, "record-3", "a".repeat(64), &lease)
                 .expect("marker");
         let admission = template.canonical_bytes().expect("admission bytes");
         marker
-            .verify_bytes(&admission, lease)
+            .verify_bytes(&admission, &lease)
             .expect("exact bundle");
         assert_eq!(
             marker.verify_bytes(&admission, b"lease-v2"),
@@ -432,7 +524,7 @@ mod tests {
                 revision,
                 format!("record-{revision}"),
                 format!("{revision:064x}"),
-                format!("lease-{revision}").as_bytes(),
+                &signed_lease_bytes(&format!("lease-{revision}")),
             )
             .expect("marker");
             durable.push(current.clone());
@@ -463,9 +555,14 @@ mod tests {
         let template =
             WatchdogAdmissionTemplate::new("installation-1", "generation-7", "lease-7", anchor())
                 .expect("template");
-        let current =
-            WatchdogPublicationBundle::new(&template, 7, "record-7", "7".repeat(64), b"lease-7")
-                .expect("current");
+        let current = WatchdogPublicationBundle::new(
+            &template,
+            7,
+            "record-7",
+            "7".repeat(64),
+            &signed_lease_bytes("lease-7"),
+        )
+        .expect("current");
         let foreign_template =
             WatchdogAdmissionTemplate::new("installation-1", "generation-8", "lease-8", anchor())
                 .expect("foreign template");
@@ -474,7 +571,7 @@ mod tests {
             999,
             "foreign-record",
             "f".repeat(64),
-            b"foreign-lease",
+            &signed_lease_bytes("foreign-lease"),
         )
         .expect("foreign marker");
         assert_eq!(
@@ -488,16 +585,21 @@ mod tests {
         let template =
             WatchdogAdmissionTemplate::new("installation-1", "generation-7", "lease-7", anchor())
                 .expect("template");
-        let current =
-            WatchdogPublicationBundle::new(&template, 7, "record-7", "7".repeat(64), b"lease-7")
-                .expect("current");
+        let current = WatchdogPublicationBundle::new(
+            &template,
+            7,
+            "record-7",
+            "7".repeat(64),
+            &signed_lease_bytes("lease-7"),
+        )
+        .expect("current");
         for revision in [7, 8] {
             let forged = WatchdogPublicationBundle::new(
                 &template,
                 revision,
                 format!("record-{revision}-forged"),
                 format!("{revision:064x}"),
-                b"forged",
+                &signed_lease_bytes("forged"),
             )
             .expect("forged marker");
             assert_eq!(
@@ -518,7 +620,7 @@ mod tests {
                 revision,
                 format!("record-{revision}-{digest_byte}"),
                 digest_byte.to_string().repeat(64),
-                format!("lease-{revision}-{digest_byte}").as_bytes(),
+                &signed_lease_bytes(&format!("lease-{revision}-{digest_byte}")),
             )
             .expect("marker")
         };

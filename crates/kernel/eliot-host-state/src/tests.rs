@@ -1226,12 +1226,23 @@ fn replay_rejects_torn_checksum_version_and_sequence_frames() {
         Err(JournalError::Checksum { .. } | JournalError::Invalid(_))
     ));
 
+    let mut legacy_version = bytes.clone();
+    let legacy_version_field = legacy_version
+        .windows(11)
+        .position(|window| window == br#""version":2"#)
+        .map_or_else(|| unreachable!(), |offset| offset + 10);
+    legacy_version[legacy_version_field] = b'1';
+    assert!(matches!(
+        HostStateJournal::<MemoryBackend>::replay_bytes(&legacy_version, host.clone()),
+        Err(JournalError::UnknownVersion { version: 1 })
+    ));
+
     let mut version = bytes.clone();
     let version_field = version
         .windows(11)
-        .position(|window| window == br#""version":1"#)
+        .position(|window| window == br#""version":2"#)
         .map_or_else(|| unreachable!(), |offset| offset + 10);
-    version[version_field] = b'2';
+    version[version_field] = b'3';
     assert!(matches!(
         HostStateJournal::<MemoryBackend>::replay_bytes(&version, host.clone()),
         Err(JournalError::UnknownVersion { .. } | JournalError::Invalid(_))
@@ -2795,7 +2806,28 @@ fn readiness_observation(
         store_fence: h("store-fence-generation-1"),
         observed_at: h("2026-08-19T00:00:00Z"),
         evidence_refs: vec![h("kernel-authored-probe-ready")],
+        active_supervision_lease: None,
     }
+}
+
+#[test]
+fn readiness_observation_wire_requires_explicit_supervision_predecessor_field() {
+    let (journal, _, _) = active_kernel_journal();
+    let active = journal
+        .snapshot()
+        .unwrap_or_else(|_| unreachable!())
+        .kernel
+        .unwrap_or_else(|| unreachable!());
+    let mut value = serde_json::to_value(HostStateRecord::ReadinessObservation(
+        readiness_observation(&active, "readiness-missing-supervision", '1', '2'),
+    ))
+    .unwrap_or_else(|_| unreachable!());
+    value
+        .get_mut("readiness_observation")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap_or_else(|| unreachable!())
+        .remove("active_supervision_lease");
+    assert!(serde_json::from_value::<HostStateRecord>(value).is_err());
 }
 
 #[test]

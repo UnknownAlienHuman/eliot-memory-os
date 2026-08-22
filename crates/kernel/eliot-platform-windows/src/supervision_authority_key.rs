@@ -125,7 +125,7 @@ pub struct SupervisionAuthorityKeyStoreRequest {
     pub installation_id: String,
     pub candidate_generation: String,
     pub authority_generation: ResourceGeneration,
-    pub supervision_lease_id: String,
+    pub supervision_lease_scope_id: String,
     pub signer_id: String,
     pub key_id: String,
     pub kernel_root: PathBuf,
@@ -140,7 +140,7 @@ impl SupervisionAuthorityKeyStoreRequest {
             self.effect_id.as_str(),
             self.installation_id.as_str(),
             self.candidate_generation.as_str(),
-            self.supervision_lease_id.as_str(),
+            self.supervision_lease_scope_id.as_str(),
             self.signer_id.as_str(),
             self.key_id.as_str(),
         ]
@@ -198,7 +198,7 @@ impl SealedKeyEnvelope {
             || self.transaction_id != request.transaction_id
             || self.effect_id != request.effect_id
             || self.installation_plan_digest != request.installation_plan_digest
-            || self.authority.supervision_lease_id != request.supervision_lease_id
+            || self.authority.supervision_lease_scope_id != request.supervision_lease_scope_id
             || self.authority.candidate_generation != request.candidate_generation
             || self.authority.authority_generation != request.authority_generation
             || self.authority.trust_anchor.installation_id != request.installation_id
@@ -274,7 +274,7 @@ impl WindowsSupervisionAuthorityKeyStore {
             )
             .map_err(|_| InstallerRootError::ReceiptMismatch)?;
             let authority = ProvisionedSupervisionAuthority::new(
-                request.supervision_lease_id.clone(),
+                request.supervision_lease_scope_id.clone(),
                 request.candidate_generation.clone(),
                 request.authority_generation,
                 reference,

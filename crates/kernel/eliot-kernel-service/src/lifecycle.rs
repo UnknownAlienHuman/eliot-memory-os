@@ -953,10 +953,49 @@ mod tests {
     };
     use eliot_contracts::StateFence;
     use eliot_platform::{KernelActivationNonce, PlatformHandle};
-    use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
+    use eliot_runtime_contracts::{
+        HealthVector, RegisteredActivityWakePolicy, ServiceProcessState, SupervisionJournalEpoch,
+        SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
+    };
 
     fn handle(value: &str) -> PlatformHandle {
         PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    }
+
+    fn supervision_incarnation() -> SupervisionLeaseIncarnationBinding {
+        SupervisionLeaseIncarnationBinding {
+            supervision_lease_scope_id: "eliot-supervision-scope:v1:test".to_owned(),
+            supervision_lease_id: String::new(),
+            scope_ref_digest: String::new(),
+            installation_id: "installation-1".to_owned(),
+            host_epoch: SupervisionJournalEpoch {
+                lineage_id: "host-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            activation_id: "activation-1".to_owned(),
+            activation_generation: SupervisionJournalEpoch {
+                lineage_id: "activation-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            kernel_generation: SupervisionJournalEpoch {
+                lineage_id: "kernel-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            watchdog_epoch: SupervisionJournalEpoch {
+                lineage_id: "watchdog-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["eliot-kernel".to_owned()],
+                sensor_profile: "eliot-runtime-live-v3".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live-v3".to_owned(),
+            },
+            wake_policy: RegisteredActivityWakePolicy::Disabled,
+            predecessor: None,
+        }
+        .with_derived_ids()
+        .unwrap_or_else(|_| unreachable!())
     }
 
     fn candidate() -> HostKernelCandidateBinding {
@@ -990,6 +1029,7 @@ mod tests {
                     },
                 },
             },
+            supervision_incarnation: supervision_incarnation(),
             restart_budget: RestartBudget::new(1, 1).unwrap_or_else(|_| unreachable!()),
             containment_action: None,
         }

@@ -660,7 +660,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         license_refs: vec![fixture_handle("evidence:licenses")],
         config_digest: fixture_handle("2".repeat(64)),
         store_credential_target: fixture_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-        supervision_key_fingerprint: fixture_handle("3".repeat(64)),
+        supervision_key_slot: fixture_handle("3".repeat(64)),
         signature_ref: fixture_handle("evidence:signature"),
         runtime_state_roots_digest: runtime_state_roots.roots_digest.clone(),
         runtime_launch,

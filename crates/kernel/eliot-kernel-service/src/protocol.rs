@@ -12,7 +12,10 @@ use eliot_process::{
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
 };
-use eliot_runtime_contracts::{HealthVector, ProvisionedSupervisionAuthority, ServiceProcessState};
+use eliot_runtime_contracts::{
+    HealthVector, ProvisionedSupervisionAuthority, ServiceProcessState,
+    SupervisionLeaseIncarnationBinding,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -27,7 +30,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 3;
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 4;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
@@ -1032,7 +1035,7 @@ pub struct ProcessAuthorityHandoffDescriptor {
 
 impl ProcessAuthorityHandoffDescriptor {
     /// Current descriptor schema revision.
-    pub const CONTRACT_VERSION: u16 = 2;
+    pub const CONTRACT_VERSION: u16 = 3;
     /// Maximum number of contour references admitted in one handoff.
     pub const MAX_CONTOUR_REFS: usize = 32;
 
@@ -1312,11 +1315,11 @@ mod descriptor_tests {
     }
 
     #[test]
-    fn contract_v2_digest_binds_the_mandatory_supervision_authority() {
+    fn contract_v3_digest_binds_the_mandatory_supervision_authority() {
         let descriptor = descriptor();
         assert_eq!(
             descriptor.compute_digest().expect("legacy digest"),
-            "265d5db706b25550cf62599bdd749a8259f1cdffff8765bf09daf364f98670bf"
+            "01fb85846a2a7fd4b90960c51d314144c91f9f40fa16663f42a1e0b1b551d0aa"
         );
     }
 
@@ -1332,6 +1335,20 @@ mod descriptor_tests {
         assert!(
             serde_json::from_value::<ProcessAuthorityHandoffDescriptor>(legacy).is_err(),
             "v1 bytes without the provisioned authority must require explicit migration"
+        );
+        let mut legacy_v2 = serde_json::to_value(&descriptor).expect("descriptor value");
+        legacy_v2["contract_version"] = serde_json::json!(2);
+        let authority = legacy_v2
+            .get_mut("supervision_authority")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("authority object");
+        let scope = authority
+            .remove("supervision_lease_scope_id")
+            .expect("scope field");
+        authority.insert("supervision_lease_id".to_owned(), scope);
+        assert!(
+            serde_json::from_value::<ProcessAuthorityHandoffDescriptor>(legacy_v2).is_err(),
+            "v2 bytes with the legacy static lease field must require explicit migration"
         );
         let mut unknown = serde_json::to_value(&descriptor).expect("value");
         unknown["unexpected"] = serde_json::json!(true);
@@ -2029,6 +2046,8 @@ pub struct HostKernelCandidateBinding {
     pub host_process: HostProcessBinding,
     /// Host-retained Kernel Job binding; Kernel must reopen and reobserve it.
     pub job_binding: HostJobBinding,
+    /// Exact Host-journal supervision incarnation and predecessor fence.
+    pub supervision_incarnation: SupervisionLeaseIncarnationBinding,
     /// Restart budget for this lineage.
     pub restart_budget: RestartBudget,
     /// Containment action required if the previous lineage is suspect.
@@ -2060,6 +2079,20 @@ impl HostKernelCandidateBinding {
         }
         self.host_process.validate()?;
         self.job_binding.validate()?;
+        self.supervision_incarnation
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "candidate.supervision_incarnation",
+                reason: "supervision incarnation binding is invalid",
+            })?;
+        if self.supervision_incarnation.installation_id != self.installation_id.as_str()
+            || self.supervision_incarnation.activation_id != self.activation_id.as_str()
+            || self.supervision_incarnation.host_epoch.sequence != self.host_epoch.value()
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "candidate.supervision_incarnation",
+            });
+        }
         if self.host_epoch.value() == 0 || self.kernel_epoch.value() == 0 {
             return Err(KernelServiceError::InvalidField {
                 field: "handshake.epoch",
@@ -2442,6 +2475,42 @@ mod tests {
         PlatformHandle::new(value).expect("test handle")
     }
 
+    fn supervision_incarnation() -> SupervisionLeaseIncarnationBinding {
+        SupervisionLeaseIncarnationBinding {
+            supervision_lease_scope_id: "eliot-supervision-scope:v1:test".to_owned(),
+            supervision_lease_id: String::new(),
+            scope_ref_digest: String::new(),
+            installation_id: "installation-1".to_owned(),
+            host_epoch: eliot_runtime_contracts::SupervisionJournalEpoch {
+                lineage_id: "host-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            activation_id: "activation-1".to_owned(),
+            activation_generation: eliot_runtime_contracts::SupervisionJournalEpoch {
+                lineage_id: "activation-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            kernel_generation: eliot_runtime_contracts::SupervisionJournalEpoch {
+                lineage_id: "kernel-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            watchdog_epoch: eliot_runtime_contracts::SupervisionJournalEpoch {
+                lineage_id: "watchdog-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            observation_scope: eliot_runtime_contracts::SupervisionObservationScope {
+                targets: vec!["eliot-kernel".to_owned()],
+                sensor_profile: "eliot-runtime-live-v3".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live-v3".to_owned(),
+            },
+            wake_policy: eliot_runtime_contracts::RegisteredActivityWakePolicy::Disabled,
+            predecessor: None,
+        }
+        .with_derived_ids()
+        .expect("sealed supervision incarnation")
+    }
+
     fn eliotd_launch_descriptor() -> EliotdLaunchDescriptor {
         let nonce = "eliotd:0123456789abcdef0123456789abcdef";
         let executable_sha256 = "a".repeat(64);
@@ -2607,7 +2676,7 @@ mod tests {
                 "authority_descriptor_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "supervision_authority": {
                     "state": "PENDING",
-                    "supervision_lease_id": "test-supervision-lease"
+                    "supervision_lease_scope_id": "test-supervision-scope"
                 },
                 "runtime_state_roots": {
                     "profile": "portable_dev",
@@ -2692,7 +2761,7 @@ mod tests {
     fn semantic_store_config_hash_binds_supervision_authority() {
         let first_value = semantic_store_config_value("ws://127.0.0.1:8000/rpc", "127.0.0.1:8000");
         let mut second_value = first_value.clone();
-        second_value["runtime_launch"]["supervision_authority"]["supervision_lease_id"] =
+        second_value["runtime_launch"]["supervision_authority"]["supervision_lease_scope_id"] =
             serde_json::Value::String("substituted-supervision-lease".to_owned());
         let first = serde_json::to_vec(&first_value).expect("first bytes");
         let second = serde_json::to_vec(&second_value).expect("second bytes");
@@ -2776,6 +2845,7 @@ mod tests {
                     },
                 },
             },
+            supervision_incarnation: supervision_incarnation(),
             restart_budget: RestartBudget::new(1, 1).expect("budget"),
             containment_action: None,
         }
@@ -2879,6 +2949,16 @@ mod tests {
         let mut old = value;
         old["activation_nonce"] = serde_json::Value::String("legacy-authority".to_owned());
         assert!(serde_json::from_value::<HostKernelCandidateBinding>(old).is_err());
+
+        let mut old_v3 = serde_json::to_value(candidate_binding()).expect("candidate json");
+        old_v3
+            .as_object_mut()
+            .expect("candidate object")
+            .remove("supervision_incarnation");
+        assert!(
+            serde_json::from_value::<HostKernelCandidateBinding>(old_v3).is_err(),
+            "v3 candidate without the mandatory incarnation must require migration"
+        );
     }
 
     #[test]

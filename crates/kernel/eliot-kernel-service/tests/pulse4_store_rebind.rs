@@ -6,6 +6,10 @@ use eliot_kernel_service::{
     StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
 };
 use eliot_platform::PlatformHandle;
+use eliot_runtime_contracts::{
+    RegisteredActivityWakePolicy, SupervisionJournalEpoch, SupervisionLeaseIncarnationBinding,
+    SupervisionObservationScope,
+};
 
 fn handle(v: &str) -> PlatformHandle {
     PlatformHandle::new(v).unwrap()
@@ -60,6 +64,39 @@ fn candidate_binding() -> eliot_kernel_service::HostKernelCandidateBinding {
                 },
             },
         },
+        supervision_incarnation: SupervisionLeaseIncarnationBinding {
+            supervision_lease_scope_id: "eliot-supervision-scope:v1:test".to_owned(),
+            supervision_lease_id: String::new(),
+            scope_ref_digest: String::new(),
+            installation_id: "installation-1".to_owned(),
+            host_epoch: SupervisionJournalEpoch {
+                lineage_id: "host-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            activation_id: "activation-1".to_owned(),
+            activation_generation: SupervisionJournalEpoch {
+                lineage_id: "activation-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            kernel_generation: SupervisionJournalEpoch {
+                lineage_id: "kernel-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            watchdog_epoch: SupervisionJournalEpoch {
+                lineage_id: "watchdog-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["eliot-kernel".to_owned()],
+                sensor_profile: "eliot-runtime-live-v3".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live-v3".to_owned(),
+            },
+            wake_policy: RegisteredActivityWakePolicy::Disabled,
+            predecessor: None,
+        }
+        .with_derived_ids()
+        .unwrap(),
         restart_budget: RestartBudget::new(1, 1).unwrap(),
         containment_action: None,
     }

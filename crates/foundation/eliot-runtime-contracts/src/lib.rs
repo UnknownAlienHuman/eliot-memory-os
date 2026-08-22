@@ -18,6 +18,7 @@ use thiserror::Error;
 
 mod installation_activation;
 mod supervision_authority;
+mod supervision_incarnation;
 mod supervision_lease;
 mod watchdog_admission;
 
@@ -41,6 +42,11 @@ pub use supervision_authority::{
     SupervisionSealedKeyReference, WINDOWS_SERVICE_SID_DPAPI_NG_PROVIDER,
 };
 
+pub use supervision_incarnation::{
+    SUPERVISION_LEASE_ID_DOMAIN, SUPERVISION_LEASE_ID_PREFIX, SUPERVISION_SCOPE_REF_DOMAIN,
+    SUPERVISION_SCOPE_REF_PREFIX, SupervisionJournalEpoch, SupervisionLeaseIncarnationBinding,
+    SupervisionLeasePredecessorIdentity, canonical_observation_scope, canonical_wake_policy,
+};
 pub use supervision_lease::{
     Ed25519SupervisionLeaseSigner, RegisteredActivityWakePolicy, SUPERVISION_LEASE_CONTRACT_NAME,
     SUPERVISION_LEASE_CONTRACT_VERSION, SUPERVISION_LEASE_PUBLIC_KEY_BYTES,

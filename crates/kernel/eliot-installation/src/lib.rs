@@ -88,7 +88,7 @@ fn test_provisioned_supervision_authority(
     )
     .unwrap_or_else(|_| unreachable!());
     ProvisionedSupervisionAuthority::new(
-        "test-supervision-lease",
+        "test-supervision-scope",
         candidate_generation,
         authority_generation,
         key_reference,
@@ -133,6 +133,31 @@ pub const PHASE_B_PENDING_DIGEST: &str = PHASE_B_PENDING_MARKER;
 /// never valid in a [`RuntimeLaunchDescriptor`] Phase-B digest field.
 pub const PHASE_B_PENDING_SCM_DIGEST: &str =
     "287ddc2779dd75cc92d2dadd6f06b4dba2eefa5d63538db7be11523687f7ba8c";
+
+/// Canonical Phase-A descriptor prefix for the selected supervision slot.
+///
+/// The slot names the pending lease selected by the immutable plan.  It is
+/// deliberately not a public-key fingerprint and cannot authorize a lease;
+/// only the Host-owned Phase-B [`ProvisionedSupervisionAuthority`] receipt
+/// carries the live trust anchor.
+pub const SUPERVISION_KEY_SLOT_PREFIX: &str = "eliot-supervision-slot:v1:";
+
+/// Derives the canonical Phase-A supervision slot from its pending lease ID.
+///
+/// This value is an intent descriptor only.  It must never be compared with a
+/// Phase-B public key or used as an authority digest.
+pub fn supervision_key_slot_for_scope_id(
+    supervision_lease_scope_id: &str,
+) -> Result<PlatformHandle, InstallationError> {
+    text(supervision_lease_scope_id, "supervision_lease_scope_id")?;
+    PlatformHandle::new(format!(
+        "{SUPERVISION_KEY_SLOT_PREFIX}{supervision_lease_scope_id}"
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "manifest.supervision_key_slot".to_owned(),
+        reason: error.to_string(),
+    })
+}
 const LEGACY_PHASE_B_ZERO_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 /// Current installation contract revision.
@@ -155,14 +180,14 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 /// authoritative readback. Version 16 binds the installer-owned service-SID
 /// sealed supervision authority plan and Phase-B public provision receipt.
 /// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(16, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(17, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
 /// Registry wire version 12 binds the provisioned supervision authority into
 /// pending Phase-B receipts and committed/rebound live bindings. V11 and older
 /// projections are never defaulted into current authority.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(12, 0, 0);
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(13, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -1757,8 +1782,15 @@ pub struct CandidateManifest {
     pub config_digest: PlatformHandle,
     /// Exact Credential Manager target bound to this candidate generation.
     pub store_credential_target: PlatformHandle,
-    /// Installation-approved public-key fingerprint for supervision leases.
-    pub supervision_key_fingerprint: PlatformHandle,
+    /// Phase-A supervision slot selected by the pending runtime lease.
+    ///
+    /// The JSON member intentionally retains the historical
+    /// `supervision_key_fingerprint` name so current transaction and registry
+    /// wires remain readable.  New values use the canonical slot prefix; a
+    /// legacy lowercase SHA-256 value is accepted only as an inert projection
+    /// and never authorizes a Phase-B trust anchor.
+    #[serde(rename = "supervision_key_fingerprint")]
+    pub supervision_key_slot: PlatformHandle,
     /// Runtime Live canary artifact-set evidence reference.
     ///
     /// This is a content-addressed, domain-separated SHA-256 over the
@@ -1786,7 +1818,7 @@ pub enum SupervisionAuthorityBinding {
     /// Immutable Phase-A plan state. This state cannot sign or verify a lease.
     Pending {
         /// Stable lease identity selected by the generation planner.
-        supervision_lease_id: PlatformHandle,
+        supervision_lease_scope_id: PlatformHandle,
     },
     /// Exact public receipt returned by the installer-owned key effect.
     Provisioned {
@@ -1802,10 +1834,10 @@ impl SupervisionAuthorityBinding {
     ) -> Result<(), InstallationError> {
         match self {
             Self::Pending {
-                supervision_lease_id,
+                supervision_lease_scope_id,
             } => handle(
-                supervision_lease_id,
-                "runtime_launch.supervision_authority.supervision_lease_id",
+                supervision_lease_scope_id,
+                "runtime_launch.supervision_authority.supervision_lease_scope_id",
             ),
             Self::Provisioned { authority } => {
                 authority
@@ -1826,12 +1858,12 @@ impl SupervisionAuthorityBinding {
         }
     }
 
-    fn lease_id(&self) -> &str {
+    fn scope_id(&self) -> &str {
         match self {
             Self::Pending {
-                supervision_lease_id,
-            } => supervision_lease_id.as_str(),
-            Self::Provisioned { authority } => &authority.supervision_lease_id,
+                supervision_lease_scope_id,
+            } => supervision_lease_scope_id.as_str(),
+            Self::Provisioned { authority } => &authority.supervision_lease_scope_id,
         }
     }
 }
@@ -2122,10 +2154,10 @@ impl RuntimeLaunchDescriptor {
         ) {
             (
                 SupervisionAuthorityBinding::Pending {
-                    supervision_lease_id,
+                    supervision_lease_scope_id,
                 },
                 Some(authority),
-            ) if supervision_lease_id.as_str() == authority.supervision_lease_id => {
+            ) if supervision_lease_scope_id.as_str() == authority.supervision_lease_scope_id => {
                 overlay.supervision_authority =
                     SupervisionAuthorityBinding::Provisioned { authority };
             }
@@ -2180,8 +2212,8 @@ impl RuntimeLaunchDescriptor {
 
     /// Returns the stable lease identity in either strict binding state.
     #[must_use]
-    pub fn supervision_lease_id(&self) -> &str {
-        self.supervision_authority.lease_id()
+    pub fn supervision_lease_scope_id(&self) -> &str {
+        self.supervision_authority.scope_id()
     }
 
     fn expected_store_bridge_arguments(&self, config_path: &PlatformHandle) -> Vec<String> {
@@ -2951,10 +2983,19 @@ impl CandidateManifest {
         )?;
         handles(&self.license_refs, "manifest.license_refs", true)?;
         sha256_handle(&self.config_digest, "manifest.config_digest")?;
-        sha256_handle(
-            &self.supervision_key_fingerprint,
-            "manifest.supervision_key_fingerprint",
-        )?;
+        handle(&self.supervision_key_slot, "manifest.supervision_key_slot")?;
+        if !is_lower_sha256(self.supervision_key_slot.as_str()) {
+            let expected = supervision_key_slot_for_scope_id(
+                self.runtime_launch.supervision_lease_scope_id(),
+            )?;
+            if self.supervision_key_slot != expected {
+                return Err(InstallationError::InvalidField {
+                    field: "manifest.supervision_key_slot".to_owned(),
+                    reason: "must exactly describe the RuntimeLaunchDescriptor pending supervision lease"
+                        .to_owned(),
+                });
+            }
+        }
         sha256_handle(
             &self.runtime_state_roots_digest,
             "manifest.runtime_state_roots_digest",
@@ -5985,7 +6026,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
         .and_then(serde_json::Value::as_u64);
     if declared_major == Some(10) {
         return Err(InstallationError::MigrationRequired {
-            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v12; nested authority is never synthesized or adopted"
+            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v13; nested authority is never synthesized or adopted"
                 .to_owned(),
         });
     }
@@ -5993,7 +6034,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
         && current_registry_wire_missing_field(&value)
     {
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v12 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v13 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
@@ -6031,7 +6072,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             });
         }
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v12 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v13 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
@@ -8984,7 +9025,7 @@ pub struct SupervisionAuthorityProvisionPlan {
     /// Authority lifecycle generation.
     pub authority_generation: ResourceGeneration,
     /// Stable lease identity selected in the Phase-A launch template.
-    pub supervision_lease_id: PlatformHandle,
+    pub supervision_lease_scope_id: PlatformHandle,
     /// Exact Kernel signer identity.
     pub signer_id: PlatformHandle,
     /// Generation-specific external key identity.
@@ -9011,8 +9052,8 @@ impl SupervisionAuthorityProvisionPlan {
                 "supervision_authority.candidate_generation",
             ),
             (
-                &self.supervision_lease_id,
-                "supervision_authority.supervision_lease_id",
+                &self.supervision_lease_scope_id,
+                "supervision_authority.supervision_lease_scope_id",
             ),
             (&self.signer_id, "supervision_authority.signer_id"),
             (&self.key_id, "supervision_authority.key_id"),
@@ -9384,8 +9425,8 @@ fn validate_phase_b_effect_bindings(
                 || supervision_authority.candidate_generation != candidate.generation
                 || supervision_authority.authority_generation
                     != candidate.runtime_launch.authority_generation
-                || supervision_authority.supervision_lease_id.as_str()
-                    != candidate.runtime_launch.supervision_lease_id()
+                || supervision_authority.supervision_lease_scope_id.as_str()
+                    != candidate.runtime_launch.supervision_lease_scope_id()
                 || supervision_authority.kernel_root != candidate.runtime_launch.kernel_work_root)
         {
             return Err(InstallationError::IdentityConflict);
@@ -12948,8 +12989,8 @@ impl WindowsInstallationEffectPort {
                 .as_str()
                 .to_owned(),
             authority_generation: supervision_authority.authority_generation,
-            supervision_lease_id: supervision_authority
-                .supervision_lease_id
+            supervision_lease_scope_id: supervision_authority
+                .supervision_lease_scope_id
                 .as_str()
                 .to_owned(),
             signer_id: supervision_authority.signer_id.as_str().to_owned(),
@@ -18252,7 +18293,7 @@ mod tests {
                     installation_id: test_handle("installation:test"),
                     candidate_generation: test_handle("generation:candidate"),
                     authority_generation: ResourceGeneration::genesis(),
-                    supervision_lease_id: test_handle("test-supervision-lease"),
+                    supervision_lease_scope_id: test_handle("test-supervision-scope"),
                     signer_id: test_handle("eliot-kernel"),
                     key_id: test_handle("supervision-key:generation:candidate"),
                     kernel_root: roots.kernel_work_root.clone(),
@@ -18373,7 +18414,7 @@ mod tests {
             license_refs: vec![test_handle("evidence:licenses")],
             config_digest: test_handle("2".repeat(64)),
             store_credential_target: test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-            supervision_key_fingerprint: test_handle("3".repeat(64)),
+            supervision_key_slot: test_handle("3".repeat(64)),
             signature_ref: test_handle("evidence:signature"),
             runtime_state_roots_digest: runtime_state_roots.roots_digest.clone(),
             runtime_launch: {
@@ -18392,7 +18433,7 @@ mod tests {
                         ResourceGeneration::genesis(),
                     ),
                     supervision_authority: SupervisionAuthorityBinding::Pending {
-                        supervision_lease_id: test_handle("test-supervision-lease"),
+                        supervision_lease_scope_id: test_handle("test-supervision-scope"),
                     },
                     authority_descriptor_path: test_path(&root, "authority.json"),
                     authority_descriptor_digest: test_handle("7".repeat(64)),
@@ -22806,7 +22847,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_transaction_json_requires_explicit_migration_to_v16() {
+    fn v8_transaction_json_requires_explicit_migration_to_v17() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22820,7 +22861,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 16.0.0")
+                if reason.contains("requires explicit migration to 17.0.0")
         ));
     }
 
@@ -22869,7 +22910,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("wire 9.0.0 requires explicit migration to 16.0.0")
+                if reason.contains("wire 9.0.0 requires explicit migration to 17.0.0")
         ));
     }
 
@@ -22889,7 +22930,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_transaction_json_requires_explicit_migration_to_v16() {
+    fn v10_transaction_json_requires_explicit_migration_to_v17() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22915,12 +22956,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 10.0.0 requires explicit migration to 16.0.0")
+                if reason.contains("wire 10.0.0 requires explicit migration to 17.0.0")
         ));
     }
 
     #[test]
-    fn v13_transaction_json_requires_explicit_migration_to_v16() {
+    fn v13_transaction_json_requires_explicit_migration_to_v17() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22931,12 +22972,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 13.0.0 requires explicit migration to 16.0.0")
+                if reason.contains("wire 13.0.0 requires explicit migration to 17.0.0")
         ));
     }
 
     #[test]
-    fn v14_transaction_json_requires_explicit_migration_to_v16() {
+    fn v14_transaction_json_requires_explicit_migration_to_v17() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object.insert(
@@ -22947,12 +22988,12 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 14.0.0 requires explicit migration to 16.0.0")
+                if reason.contains("wire 14.0.0 requires explicit migration to 17.0.0")
         ));
     }
 
     #[test]
-    fn v15_transaction_json_requires_explicit_migration_to_v16() {
+    fn v15_transaction_json_requires_explicit_migration_to_v17() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         legacy["transaction_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(15, 0, 0)));
@@ -22960,7 +23001,20 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 15.0.0 requires explicit migration to 16.0.0")
+                if reason.contains("wire 15.0.0 requires explicit migration to 17.0.0")
+        ));
+    }
+
+    #[test]
+    fn v16_transaction_json_requires_explicit_migration_to_v17() {
+        let mut legacy = must(serde_json::to_value(planned_transaction()));
+        legacy["transaction_wire_version"] =
+            must(serde_json::to_value(ContractVersion::new(16, 0, 0)));
+        let bytes = must(serde_json::to_vec(&legacy));
+        assert!(matches!(
+            decode_installation_transaction_json(&bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("wire 16.0.0") && reason.contains("17.0.0")
         ));
     }
 
@@ -24318,7 +24372,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_registry_wire_requires_explicit_migration_to_v12() {
+    fn v9_registry_wire_requires_explicit_migration_to_v13() {
         let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object["registry_wire_version"] = serde_json::json!({
@@ -24335,7 +24389,7 @@ mod tests {
             matches!(
                 error,
                 InstallationError::MigrationRequired { ref reason }
-                    if reason.contains("registry wire 9.0.0") && reason.contains("12.0.0")
+                    if reason.contains("registry wire 9.0.0") && reason.contains("13.0.0")
             ),
             "unexpected raw v9 classification: {error:?}"
         );
@@ -24388,13 +24442,13 @@ mod tests {
             error,
             InstallationError::MigrationRequired { reason }
                 if reason.contains("wire v10")
-                    && reason.contains("re-stage as v12")
+                    && reason.contains("re-stage as v13")
                     && reason.contains("never synthesized or adopted")
         ));
     }
 
     #[test]
-    fn v11_registry_wire_requires_explicit_migration_to_v12() {
+    fn v11_registry_wire_requires_explicit_migration_to_v13() {
         let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         legacy["registry_wire_version"] =
             must(serde_json::to_value(ContractVersion::new(11, 0, 0)));
@@ -24402,25 +24456,38 @@ mod tests {
         assert!(matches!(
             decode_registry_bytes(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("registry wire 11.0.0") && reason.contains("12.0.0")
+                if reason.contains("registry wire 11.0.0") && reason.contains("13.0.0")
         ));
     }
 
     #[test]
-    fn v12_registry_wire_round_trips_without_synthesizing_rebind_state() {
+    fn v13_registry_wire_round_trips_without_synthesizing_rebind_state() {
         let current = ApprovedGenerationRegistry::new();
         let bytes = must(serde_json::to_vec(&current));
         let decoded = must(decode_registry_bytes(&bytes));
         assert_eq!(decoded, current);
         assert_eq!(
             decoded.registry_wire_version(),
-            ContractVersion::new(12, 0, 0)
+            ContractVersion::new(13, 0, 0)
         );
         assert!(decoded.active_phase_b_rebind().is_none());
     }
 
     #[test]
-    fn v12_registry_wire_rejects_omitted_mandatory_rebind_member() {
+    fn v12_registry_wire_requires_explicit_migration_to_v13() {
+        let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+        legacy["registry_wire_version"] =
+            must(serde_json::to_value(ContractVersion::new(12, 0, 0)));
+        let bytes = must(serde_json::to_vec(&legacy));
+        assert!(matches!(
+            decode_registry_bytes(&bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("registry wire 12.0.0") && reason.contains("13.0.0")
+        ));
+    }
+
+    #[test]
+    fn v13_registry_wire_rejects_omitted_mandatory_rebind_member() {
         let mut current = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         current
             .as_object_mut()
@@ -25470,6 +25537,24 @@ mod tests {
             &intent,
         ));
         let launch = transaction.candidate_manifest.runtime_launch.clone();
+        let phase_b_intermediate = must(launch.with_phase_b_pending_bootstrap_overlay(
+            launch.authority_generation,
+            launch.authority_state_fence.clone(),
+            test_handle("7".repeat(64)),
+            test_handle("9".repeat(64)),
+            test_provisioned_supervision_authority(
+                launch.installation_epoch.installation.as_str(),
+                launch.generation.as_str(),
+                launch.authority_generation,
+            ),
+        ));
+        let launch = must(phase_b_intermediate.with_phase_b_materialization(
+            phase_b_intermediate.authority_generation,
+            phase_b_intermediate.authority_state_fence.clone(),
+            phase_b_intermediate.authority_descriptor_digest.clone(),
+            test_handle("6".repeat(64)),
+            phase_b_intermediate.eliotd_descriptor_digest.clone(),
+        ));
         let prepared = HostPhaseBPreparedMaterialization {
             wire: test_handle(HostPhaseBPreparedMaterialization::WIRE),
             transaction_id: intent.transaction_id.clone(),
@@ -25918,6 +26003,24 @@ mod tests {
         must(registry.record_active_phase_b_rebind_intent_unchecked(&intent));
 
         let launch = first.candidate_manifest.runtime_launch.clone();
+        let phase_b_intermediate = must(launch.with_phase_b_pending_bootstrap_overlay(
+            launch.authority_generation,
+            launch.authority_state_fence.clone(),
+            test_handle("7".repeat(64)),
+            test_handle("9".repeat(64)),
+            test_provisioned_supervision_authority(
+                launch.installation_epoch.installation.as_str(),
+                launch.generation.as_str(),
+                launch.authority_generation,
+            ),
+        ));
+        let launch = must(phase_b_intermediate.with_phase_b_materialization(
+            phase_b_intermediate.authority_generation,
+            phase_b_intermediate.authority_state_fence.clone(),
+            phase_b_intermediate.authority_descriptor_digest.clone(),
+            test_handle("6".repeat(64)),
+            phase_b_intermediate.eliotd_descriptor_digest.clone(),
+        ));
         let mut prepared = HostPhaseBPreparedMaterialization {
             wire: test_handle(HostPhaseBPreparedMaterialization::WIRE),
             transaction_id: intent.transaction_id.clone(),

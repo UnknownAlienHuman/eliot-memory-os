@@ -540,7 +540,7 @@ impl RegistryFixture {
                     .unwrap_or_else(|error| panic!("invalid state generation: {error}")),
             ),
             supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
-                supervision_lease_id: handle(format!("supervision-lease-{generation}")),
+                supervision_lease_scope_id: handle(format!("supervision-scope-{generation}")),
             },
             authority_descriptor_path: path_handle(&authority_descriptor_path),
             authority_descriptor_digest: handle(authority_digest),
@@ -626,7 +626,7 @@ impl RegistryFixture {
             license_refs: vec![handle("evidence:licenses")],
             config_digest: handle(Self::digest(19)),
             store_credential_target: runtime_launch.store_credential_target.clone(),
-            supervision_key_fingerprint: handle(Self::digest(20)),
+            supervision_key_slot: handle(Self::digest(20)),
             signature_ref: handle(format!("evidence:signature:generation-{generation}")),
             runtime_state_roots_digest: roots.roots_digest.clone(),
             runtime_launch,

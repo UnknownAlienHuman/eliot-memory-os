@@ -98,7 +98,9 @@ use eliot_platform_windows::{
 #[cfg(windows)]
 use eliot_process::DispatchAuthorityId;
 use eliot_runtime_contracts::{
-    HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
+    HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord,
+    ServiceProcessState, SupervisionJournalEpoch, SupervisionLeaseIncarnationBinding,
+    SupervisionLeasePredecessorIdentity,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -3689,6 +3691,91 @@ impl HostJobBranches {
         job_binding
             .validate()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let journal_state = journal
+            .snapshot()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let activation_record = journal_state.activation.as_ref().ok_or_else(|| {
+            HostError::ProcessContour(
+                "Host journal has no current activation for supervision incarnation".to_owned(),
+            )
+        })?;
+        if activation_record.activation_id != *activation_id {
+            return Err(HostError::ProcessContour(
+                "Host journal activation identity does not match Kernel candidate".to_owned(),
+            ));
+        }
+        let predecessor = match (
+            matches!(
+                prior_kernel_disposition,
+                PriorKernelDisposition::NoPriorKernel
+            ),
+            journal_state.readiness_observations.last(),
+        ) {
+            (true, None) => None,
+            (true, Some(_)) => {
+                return Err(HostError::RecoveryRequired(
+                    "NoPriorKernel is inconsistent with retained readiness history".to_owned(),
+                ));
+            }
+            (false, None) => {
+                return Err(HostError::RecoveryRequired(
+                    "Kernel restart has no retained supervision predecessor observation".to_owned(),
+                ));
+            }
+            (false, Some(observation)) => Some(
+                observation
+                    .active_supervision_lease
+                    .clone()
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "retained readiness observation has no exact supervision predecessor"
+                                .to_owned(),
+                        )
+                    })?,
+            ),
+        };
+        let approved_supervision_authority = launch
+            .provisioned_supervision_authority()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let approved_template = approved_supervision_authority
+            .watchdog_admission_template()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let supervision_incarnation = SupervisionLeaseIncarnationBinding {
+            supervision_lease_scope_id: launch.supervision_lease_scope_id().to_owned(),
+            supervision_lease_id: String::new(),
+            scope_ref_digest: String::new(),
+            installation_id: host.installation.as_str().to_owned(),
+            host_epoch: SupervisionJournalEpoch {
+                lineage_id: host.epoch.current.lineage.as_str().to_owned(),
+                sequence: host.epoch.current.sequence,
+            },
+            activation_id: activation_id.as_str().to_owned(),
+            activation_generation: SupervisionJournalEpoch {
+                lineage_id: activation_generation.current.lineage.as_str().to_owned(),
+                sequence: activation_generation.current.sequence,
+            },
+            kernel_generation: SupervisionJournalEpoch {
+                lineage_id: kernel_generation.current.lineage.as_str().to_owned(),
+                sequence: kernel_generation.current.sequence,
+            },
+            watchdog_epoch: SupervisionJournalEpoch {
+                lineage_id: activation_record
+                    .lineage
+                    .watchdog_epoch
+                    .lineage
+                    .as_str()
+                    .to_owned(),
+                sequence: activation_record.lineage.watchdog_epoch.sequence,
+            },
+            observation_scope: approved_template.observation_scope.clone(),
+            wake_policy: approved_template.wake_policy.clone(),
+            predecessor,
+        }
+        .with_derived_ids()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        supervision_incarnation
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let candidate = HostKernelCandidateBinding {
             installation_id: host.installation.clone(),
             host_epoch: authority_epoch,
@@ -3701,6 +3788,7 @@ impl HostJobBranches {
             pipe_identity: kernel_launch_binding.pipe_identity.clone(),
             host_process: kernel_launch_binding.host_process.clone(),
             job_binding,
+            supervision_incarnation,
             restart_budget: RestartBudget::new(3, 3)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
             containment_action: None,
@@ -6677,7 +6765,8 @@ fn decode_watchdog_publication_observation(
         .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
     if marker.installation_id != admission.installation_id
         || marker.approved_generation != admission.approved_generation
-        || marker.supervision_lease_id != admission.supervision_lease_id
+        || marker.supervision_lease_scope_id != admission.supervision_lease_scope_id
+        || marker.supervision_lease_id != lease.payload.lease_id
     {
         return Err(HostError::RecoveryRequired(
             "Watchdog marker is not bound to its admission template".to_owned(),
@@ -6878,7 +6967,7 @@ fn supervision_publication_identity(
     )
     .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
     Ok(PublishedSupervisionIdentity {
-        lease_id: PlatformHandle::new(template.supervision_lease_id.clone())
+        lease_id: PlatformHandle::new(current.record.lease_id.as_str())
             .map_err(|error| HostError::Platform(error.to_string()))?,
         ors_receipt_digest: PlatformHandle::new(current.receipt.receipt_sha256.clone())
             .map_err(|error| HostError::Platform(error.to_string()))?,
@@ -6907,8 +6996,10 @@ fn publish_current_watchdog_supervision_bundle(
             "Watchdog admission template does not match the provisioned Phase-B digest".to_owned(),
         ));
     }
-    let current =
-        read_manifest_current_supervision_lease(manifest, &template.supervision_lease_id)?;
+    let current = read_manifest_current_supervision_lease(
+        manifest,
+        kernel_snapshot.record.lease_id.as_str(),
+    )?;
     if current != *kernel_snapshot {
         return Err(HostError::RecoveryRequired(
             "Kernel ProbeReady supervision snapshot is not the current ORS head".to_owned(),
@@ -7009,7 +7100,8 @@ fn publish_current_watchdog_supervision_bundle(
 
     let published = observe_host_watchdog_publication(&destination)?;
     verify_exact_current_watchdog_publication(&published, template, &current)?;
-    if read_manifest_current_supervision_lease(manifest, &template.supervision_lease_id)? != current
+    if read_manifest_current_supervision_lease(manifest, kernel_snapshot.record.lease_id.as_str())?
+        != current
     {
         return Err(HostError::RecoveryRequired(
             "Kernel ORS head changed during Watchdog publication".to_owned(),
@@ -7594,6 +7686,10 @@ fn append_authenticated_kernel_readiness<B: JournalBackend>(
             store_fence: proof.store_fence.clone(),
             observed_at: fresh_identity("kernel-readiness-observed-at")?,
             evidence_refs,
+            active_supervision_lease: Some(SupervisionLeasePredecessorIdentity {
+                supervision_lease_id: supervision.lease_id.as_str().to_owned(),
+                ors_receipt_sha256: supervision.ors_receipt_digest.as_str().to_owned(),
+            }),
         },
         &expected,
     )
@@ -12308,8 +12404,8 @@ impl HostComposition {
                 .trust_anchor
                 .installation_id
                 != launch_template.installation_epoch.installation.as_str()
-            || provisioned_supervision_authority.supervision_lease_id
-                != launch_template.supervision_lease_id()
+            || provisioned_supervision_authority.supervision_lease_scope_id
+                != launch_template.supervision_lease_scope_id()
         {
             return Err(HostError::RecoveryRequired(
                 "supervision authority is foreign to the approved Phase-A launch".to_owned(),
@@ -15297,7 +15393,7 @@ impl HostComposition {
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let current_supervision = read_manifest_current_supervision_lease(
             &registry_generation.manifest,
-            &registry_authority.supervision_lease_id,
+            &candidate.supervision_incarnation.supervision_lease_id,
         )?;
         let supervision_identity =
             supervision_publication_identity(&template, &current_supervision)?;
@@ -15424,7 +15520,7 @@ impl HostComposition {
         require_exact_supervision_head(&proof.supervision_lease, || {
             read_manifest_current_supervision_lease(
                 &active.manifest,
-                &registry_authority.supervision_lease_id,
+                proof.supervision_lease.record.lease_id.as_str(),
             )
         })?;
         append_authenticated_kernel_readiness(
@@ -16433,7 +16529,7 @@ mod watchdog_service_tests {
         pending_scm_launch.kernel_arguments[9] = pending_marker;
         pending_scm_launch.supervision_authority =
             eliot_installation::SupervisionAuthorityBinding::Pending {
-                supervision_lease_id: PlatformHandle::new("test-supervision-lease")
+                supervision_lease_scope_id: PlatformHandle::new("test-supervision-scope")
                     .unwrap_or_else(|_| unreachable!()),
             };
         pending_scm_launch = pending_scm_launch
@@ -16718,6 +16814,43 @@ mod journal_tests {
     };
     #[cfg(windows)]
     use eliot_installation::{InstallationEpoch, RuntimeStateRoots};
+
+    #[cfg(windows)]
+    fn test_supervision_incarnation(
+        installation_id: &str,
+        activation_id: &str,
+        host_lineage: &str,
+        kernel_lineage: &str,
+    ) -> SupervisionLeaseIncarnationBinding {
+        SupervisionLeaseIncarnationBinding {
+            supervision_lease_scope_id: "eliot-supervision-scope:v1:test".to_owned(),
+            supervision_lease_id: String::new(),
+            scope_ref_digest: String::new(),
+            installation_id: installation_id.to_owned(),
+            host_epoch: SupervisionJournalEpoch {
+                lineage_id: host_lineage.to_owned(),
+                sequence: 1,
+            },
+            activation_id: activation_id.to_owned(),
+            activation_generation: SupervisionJournalEpoch {
+                lineage_id: "activation-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            kernel_generation: SupervisionJournalEpoch {
+                lineage_id: kernel_lineage.to_owned(),
+                sequence: 1,
+            },
+            watchdog_epoch: SupervisionJournalEpoch {
+                lineage_id: "watchdog-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            observation_scope: eliot_runtime_contracts::canonical_observation_scope(),
+            wake_policy: eliot_runtime_contracts::canonical_wake_policy(),
+            predecessor: None,
+        }
+        .with_derived_ids()
+        .unwrap_or_else(|_| unreachable!())
+    }
 
     struct ImageBackend {
         image: DurableImage,
@@ -17045,6 +17178,12 @@ mod journal_tests {
                     },
                 },
             },
+            supervision_incarnation: test_supervision_incarnation(
+                host.installation.as_str(),
+                activation_id.as_str(),
+                host.epoch.current.lineage.as_str(),
+                "readiness-kernel-lineage",
+            ),
             restart_budget: RestartBudget::new(1, 1).unwrap(),
             containment_action: None,
         };
@@ -17546,7 +17685,7 @@ mod journal_tests {
             license_refs: vec![handle("evidence:licenses")],
             config_digest,
             store_credential_target: handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-            supervision_key_fingerprint: handle("6".repeat(64)),
+            supervision_key_slot: handle("6".repeat(64)),
             signature_ref: handle("evidence:signature"),
             runtime_state_roots_digest: runtime_state_roots.roots_digest.clone(),
             runtime_launch,
@@ -19167,6 +19306,12 @@ mod journal_tests {
                     },
                 },
             },
+            supervision_incarnation: test_supervision_incarnation(
+                host.installation.as_str(),
+                activation_id.as_str(),
+                host.epoch.current.lineage.as_str(),
+                "reconcile-kernel-lineage",
+            ),
             restart_budget: RestartBudget::new(1, 1).unwrap(),
             containment_action: None,
         };
