@@ -3,8 +3,8 @@ use std::path::Path;
 
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
-    PackageManifest, PackageSourceObservation, PackageStagingError, TrustedSourceBundle,
-    validate_package_relative_path,
+    FileIdentity, PackageManifest, PackageSourceObservation, PackageStagingError,
+    TrustedSourceBundle, validate_package_relative_path,
 };
 
 use sha2::{Digest, Sha256};
@@ -696,6 +696,18 @@ fn enumerate_source_tree(
     Ok(set)
 }
 
+/// In-memory proof that a published source bundle is the exact bundle that
+/// the planner is about to observe.  This is deliberately not part of the
+/// transaction wire: the resulting candidate signature/effect digests are the
+/// durable authority, while this proof closes the materializer-to-planner
+/// handoff window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceBundlePublicationBinding {
+    source_identity: FileIdentity,
+    files: Vec<PackageArtifactDigest>,
+    evidence_digest: PlatformHandle,
+}
+
 /// Explicit inputs accepted by the production generation planner.
 ///
 /// Every identity and path is supplied by the caller.  In particular, there
@@ -751,6 +763,32 @@ impl GenerationPackagePlanner {
         phase_a_template_content_digest(expected)
     }
 
+    /// Plan directly from a caller-selected source directory without a
+    /// materializer publication proof.  This remains an explicitly separate
+    /// unbound path; it does not claim release-publication authority.
+    pub fn plan(
+        input: GenerationPackagePlanInput,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        Self::plan_with_binding(input, None)
+    }
+
+    /// Plan from a source directory whose exact materializer publication facts
+    /// must match the planner's fresh retained observation.  The binding is
+    /// consumed in memory and is not a transaction-wire field.
+    pub fn plan_with_source_publication_binding(
+        input: GenerationPackagePlanInput,
+        source_identity: FileIdentity,
+        files: Vec<PackageArtifactDigest>,
+        evidence_digest: PlatformHandle,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        let publication_binding = SourceBundlePublicationBinding {
+            source_identity,
+            files,
+            evidence_digest,
+        };
+        Self::plan_with_binding(input, Some(&publication_binding))
+    }
+
     /// Derive the complete candidate/package/effect graph and create one
     /// immutable `PLANNED` transaction.
     ///
@@ -762,8 +800,9 @@ impl GenerationPackagePlanner {
         clippy::too_many_lines,
         reason = "the production seam keeps candidate, package and effect derivation auditable"
     )]
-    pub fn plan(
+    fn plan_with_binding(
         input: GenerationPackagePlanInput,
+        publication_binding: Option<&SourceBundlePublicationBinding>,
     ) -> Result<InstallationTransaction, InstallationError> {
         handle(&input.transaction_id, "generation.transaction_id")?;
         input.installation_epoch.validate()?;
@@ -895,6 +934,14 @@ impl GenerationPackagePlanner {
             return Err(InstallationError::IncompleteObservation(
                 "trusted source digest set is incomplete".to_owned(),
             ));
+        }
+        if let Some(binding) = publication_binding.as_ref() {
+            validate_source_bundle_publication_binding(
+                binding,
+                source_identity,
+                &package_manifest,
+                &expected_file_digests,
+            )?;
         }
         let digest_for = |name: &str| {
             expected_file_digests
@@ -1496,6 +1543,70 @@ fn validate_exact_source_inventory(
     }
     if actual != expected {
         return Err(InstallationError::IdentityConflict);
+    }
+    Ok(())
+}
+
+fn validate_source_bundle_publication_binding(
+    binding: &SourceBundlePublicationBinding,
+    observed_identity: FileIdentity,
+    manifest: &PackageManifest,
+    expected: &[PackageArtifactDigest],
+) -> Result<(), InstallationError> {
+    if binding.source_identity != observed_identity {
+        return Err(InstallationError::InvalidField {
+            field: "generation.source_publication.source_identity".to_owned(),
+            reason: "published root identity differs from the planner observation".to_owned(),
+        });
+    }
+    if binding.files.len() != REQUIRED_PACKAGE_ROLES.len()
+        || expected.len() != REQUIRED_PACKAGE_ROLES.len()
+        || manifest.files.len() != REQUIRED_PACKAGE_ROLES.len()
+    {
+        return Err(InstallationError::IncompleteObservation(
+            "source publication binding must contain the complete nine-role inventory".to_owned(),
+        ));
+    }
+    for (index, (role, executable)) in REQUIRED_PACKAGE_ROLES.iter().enumerate() {
+        let bound = binding
+            .files
+            .get(index)
+            .ok_or(InstallationError::IncompleteObservation(
+                "source publication binding is missing an ordered role".to_owned(),
+            ))?;
+        let observed = expected
+            .iter()
+            .find(|item| item.relative_path == *role)
+            .ok_or(InstallationError::IncompleteObservation(
+                "planner source observation is missing an ordered role".to_owned(),
+            ))?;
+        let spec = manifest
+            .files
+            .iter()
+            .find(|item| item.relative_path == *role)
+            .ok_or(InstallationError::IncompleteObservation(
+                "planner package manifest is missing an ordered role".to_owned(),
+            ))?;
+        if bound != observed
+            || bound.relative_path != *role
+            || observed.relative_path != *role
+            || spec.relative_path != *role
+            || spec.executable != *executable
+        {
+            return Err(InstallationError::InvalidField {
+                field: format!("generation.source_publication.files[{index}]"),
+                reason: format!(
+                    "published role facts differ for {role}: bound={bound:?}, observed={observed:?}"
+                ),
+            });
+        }
+    }
+    let observed_evidence = artifact_set_evidence_digest(manifest, expected)?;
+    if binding.evidence_digest != observed_evidence {
+        return Err(InstallationError::InvalidField {
+            field: "generation.source_publication.evidence_digest".to_owned(),
+            reason: "published evidence digest differs from the planner observation".to_owned(),
+        });
     }
     Ok(())
 }

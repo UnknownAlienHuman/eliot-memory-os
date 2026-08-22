@@ -890,6 +890,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             recovery_command,
             output,
             store,
+            None,
         ),
         InstallationCommand::Plan { input } => {
             let bytes = match load_input(&input) {
@@ -1011,6 +1012,7 @@ fn run_installation_generate(
     recovery_command: String,
     output: PathBuf,
     store_path: Option<PathBuf>,
+    source_publication: Option<source_bundle_materializer::SourceBundlePublicationBinding>,
 ) -> Result<i32> {
     let input = GenerationPackagePlanInput {
         transaction_id: cli_handle(transaction_id, "transaction_id")?,
@@ -1030,7 +1032,17 @@ fn run_installation_generate(
         minimum_store_available_bytes,
         recovery_command: cli_handle(recovery_command, "recovery_command")?,
     };
-    let transaction = match GenerationPackagePlanner::plan(input) {
+    let source_publication_bound = source_publication.is_some();
+    let plan_result = match source_publication {
+        Some(binding) => GenerationPackagePlanner::plan_with_source_publication_binding(
+            input,
+            binding.source_identity,
+            binding.files,
+            binding.evidence_digest,
+        ),
+        None => GenerationPackagePlanner::plan(input),
+    };
+    let transaction = match plan_result {
         Ok(transaction) => transaction,
         Err(error) => {
             write_installation_error("INSTALLATION_GENERATION_REJECTED", &error.to_string());
@@ -1068,7 +1080,12 @@ fn run_installation_generate(
                 .unwrap_or(0),
             "output": output.display().to_string(),
             "store": store_path.as_ref().map(|path| path.display().to_string()),
-            "scope": "trusted_generation_planner_only",
+            "scope": if source_publication_bound {
+                "trusted_generation_planner_with_source_publication_binding"
+            } else {
+                "trusted_generation_planner_only_unbound_source"
+            },
+            "source_publication_bound": source_publication_bound,
         }))?
     );
     Ok(0)
@@ -1149,22 +1166,8 @@ fn run_installation_materialize_source_bundle(
                 return Ok(INVALID_REQUEST_EXIT);
             }
         };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "contract": "eliot.kernel.installation",
-            "contract_version": INSTALLATION_CONTRACT_VERSION,
-            "status": "SOURCE_BUNDLE_MATERIALIZED",
-            "bundle_path": receipt.bundle_path,
-            "generation": receipt.generation,
-            "evidence_digest": receipt.evidence_digest,
-            "file_count": receipt.files.len(),
-            "files": receipt.files,
-            "source_identity": receipt.source_identity,
-            "directory_publication": receipt.directory_publication,
-        }))?
-    );
-    run_installation_generate(
+    let source_publication = receipt.planner_binding()?;
+    let generated = run_installation_generate(
         output_bundle,
         profile,
         profile_anchor_root,
@@ -1179,7 +1182,27 @@ fn run_installation_materialize_source_bundle(
         recovery_command,
         output,
         store,
-    )
+        Some(source_publication),
+    )?;
+    if generated == 0 {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "contract": "eliot.kernel.installation",
+                "contract_version": INSTALLATION_CONTRACT_VERSION,
+                "status": "SOURCE_BUNDLE_MATERIALIZED",
+                "handoff": "SOURCE_PUBLICATION_BOUND_TO_GENERATED_PLAN",
+                "bundle_path": receipt.bundle_path,
+                "generation": receipt.generation,
+                "evidence_digest": receipt.evidence_digest,
+                "file_count": receipt.files.len(),
+                "files": receipt.files,
+                "source_identity": receipt.source_identity,
+                "directory_publication": receipt.directory_publication,
+            }))?
+        );
+    }
+    Ok(generated)
 }
 
 fn run_installation_create(_input: &Path, _store_path: &Path) -> i32 {

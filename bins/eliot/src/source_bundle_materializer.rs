@@ -139,6 +139,58 @@ pub struct CanarySourceBundleReceipt {
     pub directory_publication: DirectoryPublicationReceipt,
 }
 
+/// The non-wire proof handed directly to the generation planner.  It carries
+/// only the exact published root identity, ordered nine-role byte facts and
+/// full evidence digest; the planner independently reopens and observes the
+/// path before accepting these facts.
+#[derive(Clone, Debug)]
+pub(crate) struct SourceBundlePublicationBinding {
+    pub source_identity: FileIdentity,
+    pub files: Vec<PackageArtifactDigest>,
+    pub evidence_digest: PlatformHandle,
+}
+
+impl CanarySourceBundleReceipt {
+    pub(crate) fn planner_binding(
+        &self,
+    ) -> Result<SourceBundlePublicationBinding, MaterializeError> {
+        if self.files.len() != REQUIRED_ROLES.len()
+            || self.source_identity != self.directory_publication.source_identity
+            || self.source_identity != self.directory_publication.destination_identity
+        {
+            return Err(MaterializeError::Invalid(
+                "published source receipt is not an exact nine-role directory publication"
+                    .to_owned(),
+            ));
+        }
+        let files = self
+            .files
+            .iter()
+            .map(|file| {
+                Ok(PackageArtifactDigest {
+                    relative_path: file.relative_path.clone(),
+                    expected_size: file.size,
+                    sha256: PlatformHandle::new(file.sha256.clone()).map_err(|error| {
+                        MaterializeError::Contract(format!(
+                            "source publication digest {}: {error}",
+                            file.relative_path
+                        ))
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, MaterializeError>>()?;
+        let evidence_digest =
+            PlatformHandle::new(self.evidence_digest.clone()).map_err(|error| {
+                MaterializeError::Contract(format!("source evidence digest: {error}"))
+            })?;
+        Ok(SourceBundlePublicationBinding {
+            source_identity: self.source_identity,
+            files,
+            evidence_digest,
+        })
+    }
+}
+
 /// Materializer-level reason a committed directory cannot yet feed Generate.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1306,6 +1358,61 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn materialized_fixture() -> (
+        TempDir,
+        TempDir,
+        TempDir,
+        CanarySourceBundleMaterializeInput,
+        CanarySourceBundleReceipt,
+    ) {
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let input = test_input(&source_parent, &anchor, &staging);
+        let outcome = materialize_with_executables(&input, &fake_executables()).unwrap();
+        let CanarySourceBundleMaterializeOutcome::Published(receipt) = outcome else {
+            panic!("exact materializer publication unexpectedly requires reconciliation");
+        };
+        (source_parent, anchor, staging, input, receipt)
+    }
+
+    #[cfg(windows)]
+    fn bound_plan_input(
+        input: &CanarySourceBundleMaterializeInput,
+        output_bundle: &Path,
+    ) -> GenerationPackagePlanInput {
+        GenerationPackagePlanInput {
+            transaction_id: input.transaction_id.clone(),
+            installation_epoch: input.installation_epoch.clone(),
+            profile: input.profile,
+            profile_anchor_root: input.profile_anchor_root.clone(),
+            installation_key: None,
+            generation: input.generation.clone(),
+            source_root: handle(output_bundle.to_string_lossy().into_owned()),
+            staging_root: input.staging_root.clone(),
+            minimum_store_available_bytes: 1,
+            recovery_command: handle("eliot recover --transaction-id transaction:test"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_publication_binding_rejects(
+        mutate: impl FnOnce(&mut SourceBundlePublicationBinding, &Path),
+    ) {
+        let (_source_parent, _anchor, _staging, input, receipt) = materialized_fixture();
+        let output_bundle = PathBuf::from(&receipt.bundle_path);
+        let mut binding = receipt.planner_binding().unwrap();
+        mutate(&mut binding, &output_bundle);
+        let result = GenerationPackagePlanner::plan_with_source_publication_binding(
+            bound_plan_input(&input, &output_bundle),
+            binding.source_identity,
+            binding.files,
+            binding.evidence_digest,
+        );
+        assert!(result.is_err());
+    }
+
     #[test]
     fn phase_b_roles_and_reordered_roles_are_rejected() {
         let mut reordered = REQUIRED_ROLES;
@@ -1336,18 +1443,24 @@ mod tests {
             receipt.directory_publication.destination_identity
         );
         let output_bundle = PathBuf::from(&receipt.bundle_path);
-        let transaction = GenerationPackagePlanner::plan(GenerationPackagePlanInput {
-            transaction_id: input.transaction_id.clone(),
-            installation_epoch: input.installation_epoch.clone(),
-            profile: input.profile,
-            profile_anchor_root: input.profile_anchor_root.clone(),
-            installation_key: None,
-            generation: input.generation.clone(),
-            source_root: handle(output_bundle.to_string_lossy().into_owned()),
-            staging_root: input.staging_root.clone(),
-            minimum_store_available_bytes: 1,
-            recovery_command: handle("eliot recover --transaction-id transaction:test"),
-        })
+        let binding = receipt.planner_binding().unwrap();
+        let transaction = GenerationPackagePlanner::plan_with_source_publication_binding(
+            GenerationPackagePlanInput {
+                transaction_id: input.transaction_id.clone(),
+                installation_epoch: input.installation_epoch.clone(),
+                profile: input.profile,
+                profile_anchor_root: input.profile_anchor_root.clone(),
+                installation_key: None,
+                generation: input.generation.clone(),
+                source_root: handle(output_bundle.to_string_lossy().into_owned()),
+                staging_root: input.staging_root.clone(),
+                minimum_store_available_bytes: 1,
+                recovery_command: handle("eliot recover --transaction-id transaction:test"),
+            },
+            binding.source_identity,
+            binding.files,
+            binding.evidence_digest,
+        )
         .expect("materialized bundle must feed the real planner");
         let config_bytes = fs::read(output_bundle.join("generation.json")).unwrap();
         let config: StoreLaunchConfig = serde_json::from_slice(&config_bytes).unwrap();
@@ -1384,6 +1497,56 @@ mod tests {
         );
         assert!(!output_bundle.join("authority.json").exists());
         assert!(!output_bundle.join("store-bootstrap.json").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_binding_rejects_root_identity_mutation() {
+        assert_publication_binding_rejects(|binding, _| {
+            binding.source_identity.file_index =
+                binding.source_identity.file_index.saturating_add(1);
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_binding_rejects_pe_mutation() {
+        assert_publication_binding_rejects(|_, bundle| {
+            let path = bundle.join("eliot-host.exe");
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.push(0xa5);
+            fs::write(path, bytes).unwrap();
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_binding_rejects_json_mutation() {
+        assert_publication_binding_rejects(|_, bundle| {
+            let path = bundle.join("generation.json");
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.push(b' ');
+            fs::write(path, bytes).unwrap();
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_binding_rejects_missing_or_extra_role() {
+        assert_publication_binding_rejects(|_, bundle| {
+            fs::remove_file(bundle.join("generation.json")).unwrap();
+        });
+        assert_publication_binding_rejects(|_, bundle| {
+            fs::write(bundle.join("unexpected.txt"), b"unexpected").unwrap();
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_binding_rejects_evidence_mutation() {
+        assert_publication_binding_rejects(|binding, _| {
+            binding.evidence_digest = handle("0".repeat(64));
+        });
     }
 
     #[cfg(windows)]
