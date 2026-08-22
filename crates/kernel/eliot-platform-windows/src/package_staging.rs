@@ -562,7 +562,23 @@ fn append_text(bytes: &mut Vec<u8>, value: &str) {
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    encode_digest_hex(Sha256::digest(bytes).as_slice())
+}
+
+/// Encode an already-computed digest without hashing the digest bytes again.
+///
+/// Callers that stream file contents into a [`Sha256`] must use this helper on
+/// the finalized output.  [`hex_digest`] is intentionally reserved for raw
+/// content bytes so a content digest cannot accidentally become a SHA-256 of
+/// the digest itself.
+fn encode_digest_hex(digest: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for &byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 /// Pure bounded PE/COFF evidence.
@@ -945,7 +961,7 @@ fn hash_file(file: &mut std::fs::File) -> Result<String, AuthenticodeError> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(hex_digest(&digest.finalize()))
+    Ok(encode_digest_hex(&digest.finalize()))
 }
 
 #[cfg(windows)]
@@ -3779,7 +3795,7 @@ fn snapshot_source_file(
     Ok(SourceSnapshot {
         identity,
         size,
-        sha256: hex_digest(&digest.finalize()),
+        sha256: encode_digest_hex(&digest.finalize()),
         pe_header: header,
         file,
     })
@@ -3856,7 +3872,7 @@ fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
     }
     Ok(ObservedSourceRead {
         size,
-        sha256: format!("{:x}", digest.finalize()),
+        sha256: encode_digest_hex(&digest.finalize()),
         pe: parse_pe_coff(&header).ok(),
     })
 }
@@ -3918,7 +3934,7 @@ fn copy_source_to_destination(
         return Err(PackageStagingError::SizeMismatch);
     }
     flush_file_buffers(destination)?;
-    Ok(hex_digest(&digest.finalize()))
+    Ok(encode_digest_hex(&digest.finalize()))
 }
 
 #[cfg(not(windows))]
@@ -4010,7 +4026,7 @@ fn read_destination_snapshot_handle(
     let security_descriptor_sha256 = verify_system_security(file, false)?;
     Ok(DestinationSnapshot {
         size,
-        sha256: hex_digest(&digest.finalize()),
+        sha256: encode_digest_hex(&digest.finalize()),
         security_descriptor_sha256,
     })
 }
@@ -4118,6 +4134,35 @@ mod tests {
             executable,
             expected_size: 1024,
         }
+    }
+
+    #[test]
+    fn digest_helpers_encode_one_sha256_for_known_vector() {
+        let digest = Sha256::digest(b"abc");
+        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(encode_digest_hex(digest.as_slice()), expected);
+        assert_eq!(hex_digest(b"abc"), expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hash_file_returns_single_sha256_for_file_contents() {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-package-hash-file-{}-{}",
+            std::process::id(),
+            super::super::unique_suffix()
+        ));
+        std::fs::write(&path, b"abc").expect("write");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open");
+        assert_eq!(
+            hash_file(&mut file).expect("hash"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        drop(file);
+        std::fs::remove_file(path).expect("cleanup");
     }
 
     #[test]
@@ -4371,6 +4416,7 @@ mod tests {
         std::fs::write(&path, b"before").expect("write");
         let mut file = open_trusted_source_file(&path).expect("retained handle");
         let before = observe_authenticode_handle(&mut file).expect("before observation");
+        assert_eq!(before.sha256, hex_digest(b"before"));
         assert!(
             std::fs::write(&path, b"after!").is_err(),
             "retained Authenticode handle must block future writes"
@@ -4380,6 +4426,7 @@ mod tests {
             "retained Authenticode handle must block path substitution"
         );
         let after = observe_authenticode_handle(&mut file).expect("after observation");
+        assert_eq!(after.sha256, before.sha256);
         compare_authenticode_observations(&path, &before, &after)
             .expect("same-handle observation remains stable");
         drop(file);
