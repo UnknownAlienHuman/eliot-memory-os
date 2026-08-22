@@ -8,7 +8,8 @@ param(
     [string]$SurrealVersion,
     [switch]$SkipBuild,
     [switch]$PlanOnly,
-    [string]$VerifyBundle
+    [Alias('VerifyBundle')]
+    [string]$BuilderVerifyBundle
 )
 
 $ErrorActionPreference = 'Stop'
@@ -701,8 +702,8 @@ if ($MyInvocation.InvocationName -eq '.') {
     return
 }
 
-if ($VerifyBundle) {
-    Test-ReleaseBundle $VerifyBundle | ConvertTo-Json -Depth 5
+if ($BuilderVerifyBundle) {
+    Test-ReleaseBundle $BuilderVerifyBundle | ConvertTo-Json -Depth 5
     exit 0
 }
 

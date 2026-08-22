@@ -2139,11 +2139,39 @@ function Test-FinalizedReleaseBundle(
     if ($declared.Count -ne $actual.Count) {
         throw "SHA256SUMS.json file count mismatch: declared=$($declared.Count) actual=$($actual.Count)"
     }
-    for ($index = 0; $index -lt $actual.Count; $index++) {
-        if ([string]$declared[$index].path -cne [string]$actual[$index].path -or
-            [string]$declared[$index].sha256 -cne [string]$actual[$index].sha256 -or
-            [int64]$declared[$index].bytes -ne [int64]$actual[$index].bytes) {
-            throw "SHA256SUMS.json does not match final bytes at entry $index"
+    $declaredByPath = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::Ordinal)
+    foreach ($entry in $declared) {
+        $path = [string]$entry.path
+        if ($declaredByPath.ContainsKey($path)) {
+            throw "SHA256SUMS.json contains a duplicate path: $path"
+        }
+        $declaredByPath.Add($path, $entry)
+    }
+    $actualByPath = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::Ordinal)
+    foreach ($entry in $actual) {
+        $path = [string]$entry.path
+        if ($actualByPath.ContainsKey($path)) {
+            throw "release inventory contains a duplicate path: $path"
+        }
+        $actualByPath.Add($path, $entry)
+    }
+    foreach ($entry in $declared) {
+        $path = [string]$entry.path
+        if (-not $actualByPath.ContainsKey($path)) {
+            throw "SHA256SUMS.json path is missing from final bytes: $path"
+        }
+        $observed = $actualByPath[$path]
+        if ([string]$entry.sha256 -cne [string]$observed.sha256 -or
+            [int64]$entry.bytes -ne [int64]$observed.bytes) {
+            throw "SHA256SUMS.json does not match final bytes: $path"
+        }
+    }
+    foreach ($entry in $actual) {
+        $path = [string]$entry.path
+        if (-not $declaredByPath.ContainsKey($path)) {
+            throw "final bytes contain an unmanifested path: $path"
         }
     }
     [void](Assert-RuntimeArtifactBindings $resolved)

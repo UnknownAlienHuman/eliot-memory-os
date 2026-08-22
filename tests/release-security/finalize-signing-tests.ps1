@@ -21,6 +21,23 @@ function Assert-Throws([scriptblock]$Action, [string]$Pattern, [string]$Message)
     }
 }
 
+function Get-PowerShellCliPaths {
+    $candidateNames = if ($PSVersionTable.PSEdition -eq 'Core') {
+        @('pwsh.exe', 'powershell.exe')
+    }
+    else {
+        @('powershell.exe', 'pwsh.exe')
+    }
+    $candidatePaths = foreach ($candidateName in $candidateNames) {
+        $command = Get-Command -Name $candidateName -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($command -and -not [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+            [string]$command.Source
+        }
+    }
+    return @($candidatePaths | Sort-Object -Unique)
+}
+
 function New-FakeSignature([string]$Status, [string]$SignerThumbprint, [string]$SignerSubject, [bool]$WithTimestamp) {
     $timestamp = if ($WithTimestamp) {
         [pscustomobject]@{
@@ -245,6 +262,45 @@ try {
     if ($finalizerSource -match 'Remove-Item[^\r\n]*\$marker') {
         throw 'production finalizer reintroduced pathname marker deletion'
     }
+
+    $cliBoundarySourceBaseline = @(Get-ReleaseFileInventory $source)
+    $cliBoundaryFinalizer = Join-Path $repo 'scripts/finalize-eliot-windows-x64-release.ps1'
+    $cliBoundaryShells = @(Get-PowerShellCliPaths)
+    if ($cliBoundaryShells.Count -eq 0) {
+        throw 'no PowerShell executable is available for the finalizer CLI-boundary test'
+    }
+    foreach ($cliBoundaryShell in $cliBoundaryShells) {
+        # Reusing the unsigned source as VerifyBundle intentionally stops at the
+        # read-only plan's distinct-path guard.  A dot-source collision instead
+        # reaches the signing path and reports missing -SignedBundle first.
+        $cliBoundaryPreviousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $cliBoundaryOutput = @(
+                & $cliBoundaryShell -NoProfile -ExecutionPolicy Bypass -File $cliBoundaryFinalizer `
+                    -UnsignedBundle $source `
+                    -VerifyBundle $source `
+                    -SignToolPath $tool `
+                    -CertificateStoreLocation 'Cert:\CurrentUser\My' `
+                    -CertificateThumbprint $thumbprint `
+                    -TimestampUrl 'http://timestamp.example.test/rfc3161' 2>&1
+            )
+            $cliBoundaryExit = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $cliBoundaryPreviousPreference
+        }
+        $cliBoundaryText = ($cliBoundaryOutput | ForEach-Object { [string]$_ }) -join "`n"
+        if ($cliBoundaryExit -eq 0 -or $cliBoundaryText -match '(?i)-SignedBundle is required') {
+            throw "finalizer CLI VerifyBundle collision regression under $cliBoundaryShell"
+        }
+        if ($cliBoundaryText -notmatch '(?i)VerifyBundle must be distinct from UnsignedBundle') {
+            throw "finalizer CLI did not reach the read-only VerifyBundle guard under $cliBoundaryShell"
+        }
+    }
+    Assert-InventoryEqual $cliBoundarySourceBaseline @(Get-ReleaseFileInventory $source) `
+        'finalizer CLI-boundary source read-only invariant'
+
     $signToolArgs = @(Get-SignToolArguments $plan (Join-Path $source 'runtime/eliot-host.exe'))
     foreach ($requiredArgument in @('/fd', 'sha256', '/td', '/tr', '/sha1', '/s', '/u', $thumbprint)) {
         if (-not ($signToolArgs -contains $requiredArgument)) {
@@ -435,6 +491,55 @@ try {
         $snapshotVerification.durable_install_authority -ne $false -or
         $wrongKey.HasPrivateKey -ne $false) {
         throw 'VerifyBundle snapshot did not accept the exact public certificate without claiming install authority'
+    }
+    $checksumPath = Join-Path $plan.signed_bundle 'SHA256SUMS.json'
+    $checksumOriginalBytes = [System.IO.File]::ReadAllBytes($checksumPath)
+    $checksumOrderPermutationAccepted = $false
+    $checksumCaseOnlyPathRejected = $false
+    try {
+        $checksumOriginalText = [System.Text.Encoding]::UTF8.GetString($checksumOriginalBytes).TrimStart([char]0xFEFF)
+        $checksumOriginal = $checksumOriginalText | ConvertFrom-Json
+        $permutedChecksum = ([string]($checksumOriginal | ConvertTo-Json -Depth 12)) | ConvertFrom-Json
+        $permutedFiles = @($permutedChecksum.files)
+        $originalPathOrder = @($permutedFiles | ForEach-Object { [string]$_.path }) -join '|'
+        $reversedFiles = @()
+        for ($index = $permutedFiles.Count - 1; $index -ge 0; $index--) {
+            $reversedFiles += $permutedFiles[$index]
+        }
+        $permutedChecksum.files = $reversedFiles
+        $reversedPathOrder = @($reversedFiles | ForEach-Object { [string]$_.path }) -join '|'
+        if ($originalPathOrder -ceq $reversedPathOrder) {
+            throw 'checksum order-permutation fixture did not change file order'
+        }
+        [System.IO.File]::WriteAllText(
+            $checksumPath,
+            [string]($permutedChecksum | ConvertTo-Json -Depth 12),
+            [System.Text.UTF8Encoding]::new($false))
+        $permutedVerification = Test-FinalizedReleaseBundle $plan.signed_bundle $signatureReader `
+            (New-ReleaseFinalizationBaseline $source) $plan $wrongKey $signToolVerifier $timestampTokenReader
+        if ([string]$permutedVerification.status -cne 'VERIFIED_SIGNED') {
+            throw 'exact-path SHA256SUMS.json order permutation was rejected'
+        }
+        $checksumOrderPermutationAccepted = $true
+
+        $caseChecksum = ([string]($checksumOriginal | ConvertTo-Json -Depth 12)) | ConvertFrom-Json
+        $caseEntry = @($caseChecksum.files | Where-Object { [string]$_.path -ceq 'runtime/eliot-host.exe' })
+        if ($caseEntry.Count -ne 1) {
+            throw 'case-only SHA256SUMS.json path fixture could not find runtime/eliot-host.exe'
+        }
+        $caseEntry[0].path = 'runtime/Eliot-host.exe'
+        [System.IO.File]::WriteAllText(
+            $checksumPath,
+            [string]($caseChecksum | ConvertTo-Json -Depth 12),
+            [System.Text.UTF8Encoding]::new($false))
+        Assert-Throws {
+            Test-FinalizedReleaseBundle $plan.signed_bundle $signatureReader `
+                (New-ReleaseFinalizationBaseline $source) $plan $wrongKey $signToolVerifier $timestampTokenReader | Out-Null
+        } 'SHA256SUMS.json path is missing|unmanifested' 'case-only SHA256SUMS.json path substitution was accepted'
+        $checksumCaseOnlyPathRejected = $true
+    }
+    finally {
+        [System.IO.File]::WriteAllBytes($checksumPath, $checksumOriginalBytes)
     }
     $mutatedRolePath = Join-Path $plan.signed_bundle 'runtime/eliot-host.exe'
     $mutatedRoleBytes = [System.IO.File]::ReadAllBytes($mutatedRolePath)
@@ -835,6 +940,8 @@ try {
         fake_eku_object_rejected = $true
         public_certificate_verification_accepted = $true
         verify_bundle_is_read_only_snapshot = $true
+        checksum_order_permutation_accepted = $checksumOrderPermutationAccepted
+        checksum_case_only_path_rejected = $checksumCaseOnlyPathRejected
         materializer_role_mutation_rejected = $true
         missing_timestamp_rejected = $true
         missing_rfc3161_token_rejected = $true
