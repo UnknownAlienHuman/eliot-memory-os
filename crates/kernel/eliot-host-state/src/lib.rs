@@ -38,7 +38,7 @@ pub use model::{
     NonceState, OneTimeNonceState, PriorKernelDisposition, PriorKernelSource,
     ReadinessApprovedContour, ReadinessEvidence, RecordFence, RecoveryLineageEvidence,
     RecoveryLineageReason, ServiceSafetyClass, StoreRebindRecord, StoreRebindState,
-    WakeDisposition, WakeRecord,
+    WakeDisposition, WakeRecord, host_owner_epoch_digest,
 };
 pub use redb_journal::{RedbJournalBackend, RedbJournalInspection};
 pub use redb_store::{

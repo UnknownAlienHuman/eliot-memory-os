@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use eliot_host_state::HostInstallationEpoch;
+use eliot_host_state::{HostInstallationEpoch, host_owner_epoch_digest};
 use eliot_installation::{
     CredentialAccessReceipt, CredentialOwnershipMarkerIdentity, HOST_CREDENTIAL_CONTROL_PIPE,
     HostCredentialControlOperation, HostCredentialControlRequest, HostCredentialControlResponse,
@@ -190,10 +190,12 @@ impl HostCredentialControl {
             .ok_or_else(|| "host_state_root has no installation parent".to_owned())?
             .to_path_buf();
         let profile_anchor = protected_program_data_root().map_err(|error| error.to_string())?;
-        // The owner binding is stable across a clean child Host epoch.  The
-        // journal/marker still carries the exact epoch, while Credential
-        // Manager bytes must remain recoverable by the next Host process.
-        let host_epoch_digest = host_owner_epoch_binding(&host_epoch)?;
+        // Credential receipts and Phase-B materialization share the exact
+        // sequence-bound owner discriminator. A direct-child Host must win
+        // the durable recovery CAS before it can issue fresh credential
+        // authority; the old receipt is evidence only.
+        let host_epoch_digest =
+            host_owner_epoch_digest(&host_epoch).map_err(|error| error.to_string())?;
         let process = observe_named_pipe_peer_process(std::process::id())
             .map_err(|error| error.to_string())?;
         let host_process_digest = handle_digest(process.identity().stable_key().as_bytes())?;
@@ -946,16 +948,6 @@ fn path_digest(path: &Path) -> Result<PlatformHandle, String> {
     PlatformHandle::new(windows_path_identity_digest(path)).map_err(|error| error.to_string())
 }
 
-fn host_owner_epoch_binding(host_epoch: &HostInstallationEpoch) -> Result<PlatformHandle, String> {
-    handle_digest(
-        &serde_json::to_vec(&(
-            host_epoch.installation.clone(),
-            host_epoch.epoch.current.lineage.clone(),
-        ))
-        .map_err(|error| format!("serialize Host owner epoch: {error}"))?,
-    )
-}
-
 fn handle_digest(bytes: &[u8]) -> Result<PlatformHandle, String> {
     PlatformHandle::new(sha256_hex(bytes)).map_err(|error| error.to_string())
 }
@@ -1141,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_owner_binding_survives_child_host_epoch() {
+    fn credential_owner_binding_is_bound_to_exact_child_host_epoch() {
         let installation = handle("installation:test");
         let lineage = handle("lineage:test");
         let parent = HostInstallationEpoch {
@@ -1168,9 +1160,9 @@ mod tests {
             nonce: handle("nonce:two"),
             recovery: None,
         };
-        assert_eq!(
-            host_owner_epoch_binding(&parent).unwrap(),
-            host_owner_epoch_binding(&child).unwrap()
+        assert_ne!(
+            host_owner_epoch_digest(&parent).unwrap(),
+            host_owner_epoch_digest(&child).unwrap()
         );
     }
 

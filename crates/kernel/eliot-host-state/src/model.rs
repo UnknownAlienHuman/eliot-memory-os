@@ -7,6 +7,7 @@ use eliot_runtime_contracts::{
     WakeIntentState,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::JournalError;
 
@@ -203,6 +204,31 @@ impl HostInstallationEpoch {
     pub fn host_process_nonce(&self) -> HostProcessNonce {
         HostProcessNonce::new(self.nonce.clone())
     }
+}
+
+/// Computes the canonical sequence-bound Host owner capability digest.
+///
+/// A direct-child Host preserves its epoch lineage, so the monotonic epoch
+/// sequence is part of the owner identity. Consumers must use this function
+/// rather than projecting an installation/lineage pair independently.
+pub fn host_owner_epoch_digest(
+    host_epoch: &HostInstallationEpoch,
+) -> Result<PlatformHandle, JournalError> {
+    host_epoch.validate()?;
+    let bytes = serde_json::to_vec(&(
+        "eliot.host.owner-epoch.v2",
+        &host_epoch.installation,
+        &host_epoch.epoch.current.lineage,
+        host_epoch.epoch.current.sequence,
+    ))
+    .map_err(|error| {
+        JournalError::Invalid(format!("serialize canonical Host owner epoch: {error}"))
+    })?;
+    PlatformHandle::new(format!("{:x}", Sha256::digest(bytes))).map_err(|error| {
+        JournalError::Invalid(format!(
+            "construct canonical Host owner epoch digest: {error}"
+        ))
+    })
 }
 
 /// Stable mutation identity used for replay and conflict detection.

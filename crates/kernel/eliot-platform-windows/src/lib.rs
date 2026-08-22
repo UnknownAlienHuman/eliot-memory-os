@@ -1281,6 +1281,41 @@ impl UserOwnedRootLease {
             Err(ProtectedPathError::UnsupportedPlatform)
         }
     }
+
+    /// Validates the parent contour of one child path below this retained
+    /// root without requiring the final child to exist.
+    ///
+    /// This is used for an atomic publication destination whose final file is
+    /// intentionally absent on the first materialization. Every existing
+    /// directory is opened with no-follow semantics and the same protected
+    /// current-user DACL proof as [`UserOwnedPathLease::open_existing`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is outside the root, its parent contour
+    /// is missing or substituted, or the retained root is no longer stable.
+    pub fn validate_child_parent(&self, path: &Path) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            self.verify_stable_identity()?;
+            if !path.is_absolute() {
+                return Err(ProtectedPathError::InvalidPath);
+            }
+            ensure_user_owned_containment(&self.path, path)?;
+            let parent = path.parent().ok_or(ProtectedPathError::InvalidPath)?;
+            let relative_parent = parent
+                .strip_prefix(&self.path)
+                .map_err(|_| ProtectedPathError::InvalidPath)?;
+            let _directories =
+                open_user_owned_directory_contour(&self.path, relative_parent, &self.sid)?;
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
 }
 
 /// A retained file lease under a [`UserOwnedRootLease`].

@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Windows adapters for the provider-neutral ELIOT platform ports"
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 eliot-windows-ipc.workspace = true
 eliot-platform.workspace = true

@@ -42,12 +42,12 @@ use eliot_host_state::{
     LifecycleTimestamps, NonceState, OneTimeNonceState, PriorKernelDisposition, PriorKernelSource,
     ProductionHostStateJournal, ReadinessApprovedContour, ReadinessEvidence, ReconcileOutcome,
     RecordFence, RecoveryLineageEvidence, RedbJournalBackend, StoreRebindRecord, StoreRebindState,
-    WakeDisposition, record_checksum,
+    WakeDisposition, host_owner_epoch_digest, record_checksum,
 };
 use eliot_installation::{
     ActivationCommitFence, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
-    ApprovedGenerationRegistry, CandidateManifest, CredentialAccessReceipt,
-    HostCredentialControlResponse, HostPhaseBMaterializationIntent,
+    ActivePhaseBRebindRecovery, ApprovedGenerationRegistry, CandidateManifest,
+    CredentialAccessReceipt, HostCredentialControlResponse, HostPhaseBMaterializationIntent,
     HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, InstallationEpoch,
     InstallationError, InstallationProfile, InstallerServiceRegistrationApproval,
     InstallerServiceRole, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PendingActivationState,
@@ -769,6 +769,42 @@ fn approved_locator(
 }
 
 #[cfg(windows)]
+fn approved_phase_b_destination_locator(
+    supplied: &Path,
+    approved: &PlatformHandle,
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+) -> Result<PathBuf, HostError> {
+    if profile != InstallationProfile::PortableDev {
+        return approved_locator(supplied, approved, profile);
+    }
+    let root = portable_root
+        .ok_or_else(|| HostError::ProcessContour("portable root lease is missing".to_owned()))?;
+    if !supplied.is_absolute() {
+        return Err(HostError::ProcessContour(
+            "portable Phase-B destination locator must be absolute".to_owned(),
+        ));
+    }
+    let approved_path = Path::new(approved.as_str());
+    if !approved_path.is_absolute() || !windows_paths_equal(supplied, approved_path) {
+        return Err(HostError::ProcessContour(
+            "portable Phase-B destination locator is not the approved path".to_owned(),
+        ));
+    }
+    match std::fs::symlink_metadata(supplied) {
+        Ok(_) => approved_locator(supplied, approved, profile),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            root.validate_child_parent(supplied)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            Ok(supplied.to_path_buf())
+        }
+        Err(error) => Err(HostError::RecoveryRequired(format!(
+            "Phase-B destination cannot be observed: {error}"
+        ))),
+    }
+}
+
+#[cfg(windows)]
 fn open_launch_lease(
     profile: InstallationProfile,
     root: Option<&UserOwnedRootLease>,
@@ -941,21 +977,6 @@ fn phase_b_manifest_digest(manifest: &CandidateManifest) -> Result<PlatformHandl
 }
 
 #[cfg(windows)]
-fn host_owner_epoch_digest(host: &HostInstallationEpoch) -> Result<PlatformHandle, HostError> {
-    // `EpochTransition::direct_child` preserves lineage by design. Bind the
-    // checked monotonic sequence as well, otherwise a restarted direct child
-    // would collide with the completed receipt's owner capability before the
-    // recovery CAS can retire that receipt.
-    PlatformHandle::new(sha256_json(&(
-        "eliot.host.owner-epoch.v2",
-        host.installation.clone(),
-        host.epoch.current.lineage.clone(),
-        host.epoch.current.sequence,
-    ))?)
-    .map_err(|error| HostError::Platform(error.to_string()))
-}
-
-#[cfg(windows)]
 fn host_process_identity_digest() -> Result<PlatformHandle, HostError> {
     let observed = observe_named_pipe_peer_process(std::process::id())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -964,6 +985,40 @@ fn host_process_identity_digest() -> Result<PlatformHandle, HostError> {
         Sha256::digest(observed.identity().stable_key().as_bytes())
     ))
     .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
+fn host_process_identity_digest_for_host(
+    host: &HostInstallationEpoch,
+) -> Result<PlatformHandle, HostError> {
+    #[cfg(feature = "test-support")]
+    {
+        // The physical test-support graph intentionally has no live Kernel
+        // peer. Keep the production identity domain explicit while deriving
+        // a deterministic process binding from the exact Host epoch, so a
+        // direct-child reopen receives a fresh identity and same-owner retries
+        // remain idempotent.
+        let image = std::env::current_exe()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        PlatformHandle::new(format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "eliot.host.test-support-process.v1\0{}\0{}\0{}",
+                    image.to_string_lossy(),
+                    host.epoch.current.lineage,
+                    host.epoch.current.sequence,
+                )
+                .as_bytes(),
+            )
+        ))
+        .map_err(|error| HostError::Platform(error.to_string()))
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        let _ = host;
+        host_process_identity_digest()
+    }
 }
 
 #[cfg(windows)]
@@ -3223,6 +3278,31 @@ impl HostJobBranches {
             kernel_restart_attempts: 0,
             store_restart_attempts: 0,
         })
+    }
+
+    /// Creates an inert Job projection for feature-gated physical recovery
+    /// tests without requiring a live Kernel named-pipe peer. The production
+    /// constructor above remains the only path that observes the current
+    /// process binding; this helper never launches or adopts a child.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn new_test_support(
+        host: &HostInstallationEpoch,
+    ) -> Result<Self, WindowsAdapterError> {
+        let mut branches = Self::new_fenced(host)?;
+        let image_path = std::env::current_exe()
+            .map_err(|_| WindowsAdapterError::InvalidInput)?
+            .to_string_lossy()
+            .into_owned();
+        branches.kernel_launch_binding = Some(KernelLaunchBinding {
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE)
+                .map_err(|_| WindowsAdapterError::InvalidInput)?,
+            host_process: HostProcessBinding {
+                process_id: std::process::id(),
+                start_time_100ns: 1,
+                image_path,
+            },
+        });
+        Ok(branches)
     }
 
     /// Creates the inert identity projection used while Store recovery is
@@ -7131,6 +7211,32 @@ impl StoreRecoveryStartupFence {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivePhaseBRebindRecoveryKind {
+    /// No active rebind lifecycle was present during journal reopen.
+    None,
+    /// An intent exists but no destination mutation was durably prepared.
+    IntentOnly,
+    /// A prepared record exists without a completed receipt; remain fail-closed.
+    Prepared,
+    /// A completed receipt exists; require a fresh-owner recovery CAS before
+    /// replacing the lifecycle with a new publication intent.
+    CompletedReceipt,
+}
+
+fn active_phase_b_rebind_recovery_kind(
+    active_phase_b_rebind: Option<&eliot_installation::ActivePhaseBRebind>,
+) -> ActivePhaseBRebindRecoveryKind {
+    match active_phase_b_rebind {
+        Some(rebind) if rebind.receipt.is_some() => {
+            ActivePhaseBRebindRecoveryKind::CompletedReceipt
+        }
+        Some(rebind) if rebind.prepared.is_some() => ActivePhaseBRebindRecoveryKind::Prepared,
+        Some(_) => ActivePhaseBRebindRecoveryKind::IntentOnly,
+        None => ActivePhaseBRebindRecoveryKind::None,
+    }
+}
+
 fn reopen_existing_epoch<B: JournalBackend>(
     current: HostStateJournalService<B>,
     last_host: &HostInstallationEpoch,
@@ -7144,6 +7250,7 @@ fn reopen_existing_epoch<B: JournalBackend>(
         HostInstallationEpoch,
         EpochTransition,
         StoreRecoveryStartupFence,
+        ActivePhaseBRebindRecoveryKind,
     ),
     HostError,
 > {
@@ -7175,6 +7282,7 @@ fn reopen_existing_epoch<B: JournalBackend>(
     } else {
         StoreRecoveryStartupFence::Clear
     };
+    let active_phase_b_rebind_recovery = active_phase_b_rebind_recovery_kind(active_phase_b_rebind);
     if pending.is_none()
         && active_phase_b_rebind.is_none()
         && replayed.clean_marker.is_none()
@@ -7222,6 +7330,7 @@ fn reopen_existing_epoch<B: JournalBackend>(
         host,
         activation_generation,
         store_recovery_startup_fence,
+        active_phase_b_rebind_recovery,
     ))
 }
 
@@ -7298,6 +7407,7 @@ fn open_production_epoch(
         EpochTransition,
         PlatformHandle,
         StoreRecoveryStartupFence,
+        ActivePhaseBRebindRecoveryKind,
     ),
     HostError,
 > {
@@ -7324,6 +7434,7 @@ fn open_production_epoch_from_backend(
         EpochTransition,
         PlatformHandle,
         StoreRecoveryStartupFence,
+        ActivePhaseBRebindRecoveryKind,
     ),
     HostError,
 > {
@@ -7334,54 +7445,67 @@ fn open_production_epoch_from_backend(
         .last()
         .map(|epoch| epoch.host.clone());
 
-    let (journal, host, activation_generation, activation_id, store_recovery_startup_fence) =
-        if let Some(last_host) = last_host {
-            let current = HostStateJournalService::from_backend(backend, last_host.clone())?;
-            let retained_activation_id = current
-                .snapshot()?
-                .activation
-                .as_ref()
-                .map(|activation| activation.activation_id.clone());
-            let (journal, host, activation_generation, store_recovery_startup_fence) =
-                reopen_existing_epoch(
-                    current,
-                    &last_host,
-                    &installation,
-                    pending,
-                    active_phase_b_rebind,
-                    store_recovery_fences,
-                )?;
-            let activation_id = if store_recovery_startup_fence.is_fenced() {
-                retained_activation_id.ok_or_else(|| {
-                    HostError::RecoveryRequired(
-                        "Store recovery fence has no retained activation identity".to_owned(),
-                    )
-                })?
-            } else {
-                fresh_identity("activation")?
-            };
-            (
-                journal,
-                host,
-                activation_generation,
-                activation_id,
-                store_recovery_startup_fence,
-            )
-        } else if !store_recovery_fences.is_empty() {
-            return Err(HostError::RecoveryRequired(
-                "Store recovery fence has no prior Host epoch; manual new-lineage recovery is required"
-                    .to_owned(),
-            ));
+    let (
+        journal,
+        host,
+        activation_generation,
+        activation_id,
+        store_recovery_startup_fence,
+        active_phase_b_rebind_recovery,
+    ) = if let Some(last_host) = last_host {
+        let current = HostStateJournalService::from_backend(backend, last_host.clone())?;
+        let retained_activation_id = current
+            .snapshot()?
+            .activation
+            .as_ref()
+            .map(|activation| activation.activation_id.clone());
+        let (
+            journal,
+            host,
+            activation_generation,
+            store_recovery_startup_fence,
+            active_phase_b_rebind_recovery,
+        ) = reopen_existing_epoch(
+            current,
+            &last_host,
+            &installation,
+            pending,
+            active_phase_b_rebind,
+            store_recovery_fences,
+        )?;
+        let activation_id = if store_recovery_startup_fence.is_fenced() {
+            retained_activation_id.ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Store recovery fence has no retained activation identity".to_owned(),
+                )
+            })?
         } else {
-            let host = fresh_host_epoch(installation, None)?;
-            (
-                HostStateJournalService::from_backend(backend, host.clone())?,
-                host,
-                root_epoch(fresh_identity("activation-lineage")?),
-                fresh_identity("activation")?,
-                StoreRecoveryStartupFence::Clear,
-            )
+            fresh_identity("activation")?
         };
+        (
+            journal,
+            host,
+            activation_generation,
+            activation_id,
+            store_recovery_startup_fence,
+            active_phase_b_rebind_recovery,
+        )
+    } else if !store_recovery_fences.is_empty() {
+        return Err(HostError::RecoveryRequired(
+            "Store recovery fence has no prior Host epoch; manual new-lineage recovery is required"
+                .to_owned(),
+        ));
+    } else {
+        let host = fresh_host_epoch(installation, None)?;
+        (
+            HostStateJournalService::from_backend(backend, host.clone())?,
+            host,
+            root_epoch(fresh_identity("activation-lineage")?),
+            fresh_identity("activation")?,
+            StoreRecoveryStartupFence::Clear,
+            ActivePhaseBRebindRecoveryKind::None,
+        )
+    };
     if !store_recovery_startup_fence.is_fenced() {
         append_reconciled(
             &journal,
@@ -7400,6 +7524,48 @@ fn open_production_epoch_from_backend(
         activation_generation,
         activation_id,
         store_recovery_startup_fence,
+        active_phase_b_rebind_recovery,
+    ))
+}
+
+#[cfg(all(windows, feature = "test-support"))]
+fn open_test_support_epoch(
+    path: &Path,
+    installation: PlatformHandle,
+    pending: Option<&eliot_installation::PendingActivation>,
+    active_phase_b_rebind: Option<&eliot_installation::ActivePhaseBRebind>,
+) -> Result<
+    (
+        ProductionHostStateJournal,
+        HostInstallationEpoch,
+        EpochTransition,
+        PlatformHandle,
+        ActivePhaseBRebindRecoveryKind,
+    ),
+    HostError,
+> {
+    let backend =
+        RedbJournalBackend::open_unprotected_for_test(path).map_err(JournalError::Backend)?;
+    let (journal, host, activation_generation, activation_id, startup_fence, recovery_kind) =
+        open_production_epoch_from_backend(
+            backend,
+            installation,
+            pending,
+            active_phase_b_rebind,
+            &[],
+        )?;
+    if startup_fence.is_fenced() {
+        return Err(HostError::RecoveryRequired(
+            "test-support Phase-B epoch unexpectedly opened behind a Store recovery fence"
+                .to_owned(),
+        ));
+    }
+    Ok((
+        journal,
+        host,
+        activation_generation,
+        activation_id,
+        recovery_kind,
     ))
 }
 
@@ -9173,6 +9339,7 @@ pub struct HostComposition {
     runtime_control_queue: HostRuntimeControlQueue,
     #[cfg(windows)]
     store_recovery_startup_fence: StoreRecoveryStartupFence,
+    active_phase_b_rebind_recovery: ActivePhaseBRebindRecoveryKind,
     owner_lease: HostOwnerLease,
     pending_record: Option<HostStateRecord>,
     durable_finalized: bool,
@@ -9310,6 +9477,44 @@ fn start_approved_manifest_contour<P: ApprovedHostStartupPort>(
 }
 
 impl HostComposition {
+    #[cfg(windows)]
+    fn active_phase_b_rebind_binding(
+        rebind: &eliot_installation::ActivePhaseBRebind,
+    ) -> Result<PhaseBLiveBinding, HostError> {
+        rebind.validate().map_err(HostError::Installation)?;
+        let prepared = rebind.prepared.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "completed Active Phase-B rebind has no durable preparation".to_owned(),
+            )
+        })?;
+        let receipt = rebind.receipt.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "completed Active Phase-B rebind has no durable receipt".to_owned(),
+            )
+        })?;
+        receipt
+            .validate_against(&rebind.intent, prepared)
+            .map_err(HostError::Installation)?;
+        Ok(PhaseBLiveBinding {
+            manifest_digest: receipt.manifest_digest.clone(),
+            authority_descriptor_digest: receipt.authority_descriptor_digest.clone(),
+            store_bootstrap_descriptor_digest: receipt.store_bootstrap_descriptor_digest.clone(),
+            config_file_digest: receipt.config_file_digest.clone(),
+            eliotd_descriptor_digest: receipt.eliotd_descriptor_digest.clone(),
+            semantic_config_hash: prepared.semantic_config_hash.clone(),
+            host_epoch_lineage: receipt.host_epoch_lineage.clone(),
+            host_epoch_sequence: receipt.host_epoch_sequence,
+            host_process_nonce_digest: receipt.host_process_nonce_digest.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            effect_id: receipt.effect_id.clone(),
+            credential_receipt_digest: prepared.credential_receipt_digest.clone(),
+            request_digest: receipt.request_digest.clone(),
+            host_owner_epoch: receipt.host_owner_epoch.clone(),
+            host_process_identity: receipt.host_process_identity.clone(),
+            public_receipt_digest: receipt.receipt_digest.clone(),
+        })
+    }
+
     /// Returns the discriminator bound to the production Host composition.
     #[must_use]
     pub const fn production_store_rebind_discriminator() -> &'static str {
@@ -9514,14 +9719,20 @@ impl HostComposition {
             }
         };
         let journal_path = host_state_root.join(HOST_JOURNAL_FILE_NAME);
-        let (journal, host, activation_generation, activation_id, store_recovery_startup_fence) =
-            open_production_epoch(
-                &journal_path,
-                installation,
-                pending_for_reopen.as_ref(),
-                registry.active_phase_b_rebind(),
-                &durable_store_recovery_fences,
-            )?;
+        let (
+            journal,
+            host,
+            activation_generation,
+            activation_id,
+            store_recovery_startup_fence,
+            active_phase_b_rebind_recovery,
+        ) = open_production_epoch(
+            &journal_path,
+            installation,
+            pending_for_reopen.as_ref(),
+            registry.active_phase_b_rebind(),
+            &durable_store_recovery_fences,
+        )?;
         #[cfg(windows)]
         let jobs = if store_recovery_startup_fence.is_fenced() {
             HostJobBranches::new_fenced(&host)
@@ -9554,6 +9765,7 @@ impl HostComposition {
             )),
             #[cfg(windows)]
             store_recovery_startup_fence,
+            active_phase_b_rebind_recovery,
             owner_lease,
             pending_record: None,
             durable_finalized: false,
@@ -9643,7 +9855,8 @@ impl HostComposition {
             // Host restart must mint a fresh owner-bound Phase-B rebind before
             // any approved child contour is admitted; destination bytes alone
             // are never treated as current authority.
-            composition.rebind_active_phase_b(&active)?;
+            composition
+                .rebind_active_phase_b(&active, composition.active_phase_b_rebind_recovery)?;
             start_approved_manifest_contour(
                 &mut composition,
                 &active.manifest,
@@ -11445,10 +11658,11 @@ impl HostComposition {
             None
         };
         let profile = launch_template.profile;
-        let authority_path = approved_locator(
+        let authority_path = approved_phase_b_destination_locator(
             Path::new(launch_template.authority_descriptor_path.as_str()),
             &launch_template.authority_descriptor_path,
             profile,
+            portable_root.as_ref(),
         )?;
         let observed_previous_binding = phase_b_observe_previous_binding(
             manifest,
@@ -11735,10 +11949,11 @@ impl HostComposition {
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let bootstrap_bytes = serde_json::to_vec(&requirement)
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let bootstrap_path = approved_locator(
+        let bootstrap_path = approved_phase_b_destination_locator(
             Path::new(launch_template.store_bootstrap_descriptor_path.as_str()),
             &launch_template.store_bootstrap_descriptor_path,
             profile,
+            portable_root.as_ref(),
         )?;
         let previous_config_value = previous_binding
             .as_ref()
@@ -11824,7 +12039,7 @@ impl HostComposition {
                 request_digest: intent.request_digest.clone(),
                 credential_receipt_digest: intent.credential_receipt_digest.clone(),
                 host_owner_epoch: host_owner_epoch_digest(&self.host)?,
-                host_process_identity: host_process_identity_digest()?,
+                host_process_identity: host_process_identity_digest_for_host(&self.host)?,
                 host_process_nonce_digest: phase_b_bytes_digest(
                     self.host
                         .host_process_nonce()
@@ -11872,7 +12087,7 @@ impl HostComposition {
                 request_digest: rebind.intent.request_digest.clone(),
                 credential_receipt_digest: rebind.intent.prior_phase_b_receipt_digest.clone(),
                 host_owner_epoch: host_owner_epoch_digest(&self.host)?,
-                host_process_identity: host_process_identity_digest()?,
+                host_process_identity: host_process_identity_digest_for_host(&self.host)?,
                 host_process_nonce_digest: phase_b_bytes_digest(
                     self.host
                         .host_process_nonce()
@@ -12011,6 +12226,7 @@ impl HostComposition {
     fn rebind_active_phase_b(
         &mut self,
         active: &eliot_installation::ApprovedGeneration,
+        recovery_kind: ActivePhaseBRebindRecoveryKind,
     ) -> Result<(), HostError> {
         self.ensure_admission_open()?;
         let manifest = &active.manifest;
@@ -12049,7 +12265,7 @@ impl HostComposition {
             ));
         }
         let host_owner_epoch = host_owner_epoch_digest(&self.host)?;
-        let host_process_identity = host_process_identity_digest()?;
+        let host_process_identity = host_process_identity_digest_for_host(&self.host)?;
         let host_process_nonce_digest = phase_b_bytes_digest(
             self.host
                 .host_process_nonce()
@@ -12057,6 +12273,38 @@ impl HostComposition {
                 .as_str()
                 .as_bytes(),
         )?;
+        let host_capability = self.owner_lease.activation_capability();
+        let completed_rebind = match recovery_kind {
+            ActivePhaseBRebindRecoveryKind::CompletedReceipt => {
+                let current = self
+                    .registry
+                    .active_phase_b_rebind()
+                    .cloned()
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "completed Active Phase-B receipt disappeared before recovery CAS"
+                                .to_owned(),
+                        )
+                    })?;
+                // The committed activation binding remains source evidence for
+                // the new intent. The completed receipt is the only durable
+                // proof of the bytes currently present after the crashed
+                // attempt, so carry that exact binding into physical
+                // continuity validation; destination bytes never authorize
+                // themselves.
+                let materialization_prior_binding = Self::active_phase_b_rebind_binding(&current)?;
+                Some((current, materialization_prior_binding))
+            }
+            ActivePhaseBRebindRecoveryKind::Prepared => {
+                return Err(HostError::RecoveryRequired(
+                    "unresolved Active Phase-B preparation is fail-closed; its original owner must complete or roll back it"
+                        .to_owned(),
+                ));
+            }
+            ActivePhaseBRebindRecoveryKind::None | ActivePhaseBRebindRecoveryKind::IntentOnly => {
+                None
+            }
+        };
         let effect_id = PlatformHandle::new(format!(
             "{:x}",
             Sha256::digest(
@@ -12089,8 +12337,26 @@ impl HostComposition {
             static_template,
         )
         .map_err(HostError::Installation)?;
-        let host_capability = self.owner_lease.activation_capability();
-        self.persist_active_phase_b_rebind_intent(&intent, &host_capability)?;
+        let completed_rebind_binding = if let Some((current, binding)) = completed_rebind {
+            let recovery = ActivePhaseBRebindRecovery::new(
+                &current,
+                intent.host_owner_epoch.clone(),
+                intent.host_process_identity.clone(),
+                intent.host_process_nonce_digest.clone(),
+                intent.host_epoch_lineage.clone(),
+                intent.host_epoch_sequence,
+            )
+            .map_err(HostError::Installation)?;
+            self.persist_active_phase_b_rebind_recovery_and_intent(
+                &recovery,
+                &intent,
+                &host_capability,
+            )?;
+            Some(binding)
+        } else {
+            self.persist_active_phase_b_rebind_intent(&intent, &host_capability)?;
+            None
+        };
 
         if let Some(rebind) = self.registry.active_phase_b_rebind().cloned()
             && let (Some(prepared), Some(receipt)) = (rebind.prepared, rebind.receipt)
@@ -12122,7 +12388,7 @@ impl HostComposition {
             &HostPhaseBInput {
                 authority_descriptor_bytes,
             },
-            Some(&prior_binding),
+            Some(completed_rebind_binding.as_ref().unwrap_or(&prior_binding)),
         )?;
         materialization.transaction_id = Some(intent.transaction_id.clone());
         materialization.effect_id = Some(intent.effect_id.clone());
@@ -13213,6 +13479,82 @@ impl HostComposition {
             Err(_error) if exact_readback => Ok(()),
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Active Phase-B rebind intent failed and exact registry readback did not confirm it: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(windows)]
+    fn persist_active_phase_b_rebind_recovery_and_intent(
+        &mut self,
+        recovery: &ActivePhaseBRebindRecovery,
+        intent: &ActivePhaseBRebindIntent,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision =
+            if self
+                .registry
+                .active_phase_b_rebind()
+                .is_some_and(|current| {
+                    current.intent == *intent
+                        && current
+                            .recovery_history
+                            .last()
+                            .is_some_and(|existing| existing == recovery)
+                })
+            {
+                expected_revision
+            } else {
+                expected_revision.checked_add(1).ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Active Phase-B recovery registry revision overflow".to_owned(),
+                    )
+                })?
+            };
+        let outcome = self
+            .registry_store
+            .record_active_phase_b_rebind_recovery_and_intent(
+                host_capability,
+                expected_revision,
+                recovery,
+                intent,
+            );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "Active Phase-B recovery/intent outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable.active_phase_b_rebind().is_some_and(|current| {
+                current.intent == *intent
+                    && current
+                        .recovery_history
+                        .last()
+                        .is_some_and(|existing| existing == recovery)
+            });
+        self.registry = durable;
+        match outcome {
+            Ok(returned)
+                if exact_readback
+                    && returned.intent == *intent
+                    && returned
+                        .recovery_history
+                        .last()
+                        .is_some_and(|existing| existing == recovery) =>
+            {
+                Ok(())
+            }
+            Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
+                "Active Phase-B recovery/intent succeeded but exact registry readback differed"
+                    .to_owned(),
+            )),
+            Ok(_) => Err(HostError::RecoveryRequired(
+                "Active Phase-B recovery/intent succeeded but exact registry readback failed"
+                    .to_owned(),
+            )),
+            Err(_error) if exact_readback => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Active Phase-B recovery/intent failed and exact registry readback did not confirm it: {error}"
             ))),
         }
     }
@@ -16204,6 +16546,39 @@ mod journal_tests {
         (manifest, root)
     }
 
+    #[cfg(all(windows, feature = "test-support"))]
+    fn active_startup_prior_binding(
+        manifest: &CandidateManifest,
+        lineage: &PlatformHandle,
+        sequence: u64,
+    ) -> PhaseBLiveBinding {
+        let handle = |value: String| PlatformHandle::new(value).unwrap_or_else(|_| unreachable!());
+        PhaseBLiveBinding {
+            manifest_digest: phase_b_manifest_digest(manifest).unwrap_or_else(|_| unreachable!()),
+            authority_descriptor_digest: manifest
+                .runtime_launch
+                .authority_descriptor_digest
+                .clone(),
+            store_bootstrap_descriptor_digest: manifest
+                .runtime_launch
+                .store_bootstrap_descriptor_digest
+                .clone(),
+            config_file_digest: manifest.config_digest.clone(),
+            eliotd_descriptor_digest: manifest.runtime_launch.eliotd_descriptor_digest.clone(),
+            semantic_config_hash: handle("1".repeat(64)),
+            host_epoch_lineage: lineage.clone(),
+            host_epoch_sequence: sequence,
+            host_process_nonce_digest: handle("2".repeat(64)),
+            receipt_digest: handle("3".repeat(64)),
+            effect_id: handle("effect:active-startup-prior".to_owned()),
+            credential_receipt_digest: handle("4".repeat(64)),
+            request_digest: handle("5".repeat(64)),
+            host_owner_epoch: handle("host-owner:active-startup-prior".to_owned()),
+            host_process_identity: handle("6".repeat(64)),
+            public_receipt_digest: handle("7".repeat(64)),
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn phase_b_materialization_reuses_exact_bytes_and_rejects_substitution() {
@@ -17258,10 +17633,16 @@ mod journal_tests {
             .fence
             .activation_generation
             .clone();
-        let (reopened, reopened_host, reopened_generation, store_recovery_fenced) =
-            reopen_existing_epoch(fixture.journal, &last_host, &installation, None, None, &[])
-                .unwrap();
+        let (
+            reopened,
+            reopened_host,
+            reopened_generation,
+            store_recovery_fenced,
+            active_rebind_recovery,
+        ) = reopen_existing_epoch(fixture.journal, &last_host, &installation, None, None, &[])
+            .unwrap();
         assert!(!store_recovery_fenced.is_fenced());
+        assert_eq!(active_rebind_recovery, ActivePhaseBRebindRecoveryKind::None);
         assert_ne!(reopened_host, last_host);
         assert_eq!(
             reopened_host.epoch.parent,
@@ -17348,8 +17729,9 @@ mod journal_tests {
             },
             prepared: None,
             receipt: None,
+            recovery_history: Vec::new(),
         };
-        let (_, reopened_host, _, _) = reopen_existing_epoch(
+        let (_, reopened_host, _, _, recovery_kind) = reopen_existing_epoch(
             fixture.journal,
             &last_host,
             &installation,
@@ -17358,6 +17740,7 @@ mod journal_tests {
             &[],
         )
         .unwrap();
+        assert_eq!(recovery_kind, ActivePhaseBRebindRecoveryKind::IntentOnly);
         assert_ne!(reopened_host, last_host);
         assert_eq!(
             reopened_host.epoch.parent,
@@ -17465,6 +17848,7 @@ mod journal_tests {
     #[cfg(windows)]
     #[test]
     fn host_owner_epoch_digest_is_bound_to_exact_direct_child_sequence() {
+        let handle = |value: &str| PlatformHandle::new(value).unwrap();
         let installation = handle("owner-digest-sequence-installation");
         let parent = fresh_host_epoch(installation, None).unwrap();
         let child = child_host_epoch(&parent).unwrap();
@@ -18265,7 +18649,7 @@ mod journal_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "test-support"))]
     #[test]
     #[allow(
         clippy::too_many_lines,
@@ -18286,8 +18670,7 @@ mod journal_tests {
         let activation_generation =
             root_epoch(fresh_identity("store-recovery-physical-generation").unwrap());
         let activation_id = fresh_identity("store-recovery-physical-activation").unwrap();
-        let backend =
-            RedbJournalBackend::open_unprotected_for_integration_test(&journal_path).unwrap();
+        let backend = RedbJournalBackend::open_unprotected_for_test(&journal_path).unwrap();
         let journal = HostStateJournalService::from_backend(backend, host.clone()).unwrap();
         append_reconciled(
             &journal,
@@ -18434,16 +18817,18 @@ mod journal_tests {
         drop(journal);
 
         let reopened_backend =
-            RedbJournalBackend::open_unprotected_for_integration_test(&journal_path).unwrap();
-        let (reopened, reopened_host, _, _, startup_fenced) = open_production_epoch_from_backend(
-            reopened_backend,
-            host.installation.clone(),
-            None,
-            None,
-            &fences,
-        )
-        .unwrap();
+            RedbJournalBackend::open_unprotected_for_test(&journal_path).unwrap();
+        let (reopened, reopened_host, _, _, startup_fenced, active_rebind_recovery) =
+            open_production_epoch_from_backend(
+                reopened_backend,
+                host.installation.clone(),
+                None,
+                None,
+                &fences,
+            )
+            .unwrap();
         assert!(startup_fenced.is_fenced());
+        assert_eq!(active_rebind_recovery, ActivePhaseBRebindRecoveryKind::None);
         assert_eq!(
             reopened_host.epoch.current, host.epoch.current,
             "fenced startup must retain the exact pre-crash host identity"
@@ -18468,6 +18853,418 @@ mod journal_tests {
         );
         drop(reopened);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(all(windows, feature = "test-support"))]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the feature-gated regression carries physical redb epoch/rebind recovery through the production Host composition"
+    )]
+    fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() {
+        let (mut manifest, root) = liveness_manifest_with_distinct_store_digests();
+        let portable = root.join("portable");
+        let portable_lease = UserOwnedRootLease::open_existing(&portable)
+            .expect("temporary protected-equivalent PortableDev root");
+        let installation = manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .clone();
+        let journal_path = portable.join("host-state-journal.redb");
+        let registry_path = portable.join("installation-registry.redb");
+
+        let (root_journal, root_host, root_activation_generation, root_activation_id, root_kind) =
+            open_test_support_epoch(&journal_path, installation.clone(), None, None)
+                .expect("physical root Host epoch");
+        assert_eq!(root_kind, ActivePhaseBRebindRecoveryKind::None);
+        append_clean_marker(
+            &root_journal,
+            &root_host,
+            &root_activation_id,
+            &root_activation_generation,
+        )
+        .expect("root clean marker");
+        drop(root_journal);
+
+        let (
+            first_journal,
+            first_host,
+            first_activation_generation,
+            first_activation_id,
+            first_kind,
+        ) = open_test_support_epoch(&journal_path, installation.clone(), None, None)
+            .expect("physical direct-child Host epoch");
+        assert_eq!(first_kind, ActivePhaseBRebindRecoveryKind::None);
+        assert_eq!(
+            first_host.epoch.parent,
+            Some(root_host.epoch.current.clone())
+        );
+        let descriptor_generation = manifest.runtime_launch.authority_generation;
+        materialize_descriptor_bound_host_fixture(
+            &mut manifest,
+            &first_host,
+            descriptor_generation,
+        );
+
+        // Keep the candidate in its real Phase-A state. Host's first
+        // publication is the only operation allowed to turn these markers
+        // into physical Phase-B authority bytes.
+        let pending_phase_b =
+            PlatformHandle::new(PHASE_B_PENDING_MARKER).expect("Phase-B pending marker");
+        manifest.runtime_launch.authority_descriptor_digest = pending_phase_b.clone();
+        manifest.runtime_launch.store_bootstrap_descriptor_digest = pending_phase_b.clone();
+        manifest.runtime_launch.kernel_arguments[5] = pending_phase_b.clone();
+        manifest.runtime_launch.kernel_arguments[9] = pending_phase_b;
+        manifest.runtime_launch.descriptor_digest = PlatformHandle::new(
+            manifest
+                .runtime_launch
+                .compute_digest()
+                .expect("pending runtime launch digest"),
+        )
+        .expect("pending runtime launch digest handle");
+        let config_path = Path::new(manifest.config_path.as_str());
+        let mut config = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(config_path).expect("Phase-A Store config template"),
+        )
+        .expect("Phase-A Store config JSON");
+        config["runtime_launch"] =
+            serde_json::to_value(&manifest.runtime_launch).expect("pending runtime launch JSON");
+        config["approved_config_hash"] =
+            serde_json::Value::String(STORE_SEMANTIC_CONFIG_HASH_PENDING.to_owned());
+        let semantic_config_hash = semantic_store_config_hash_from_json(
+            &serde_json::to_vec(&config).expect("pending config without semantic hash"),
+        )
+        .expect("pending semantic config hash");
+        config["approved_config_hash"] =
+            serde_json::Value::String(semantic_config_hash.as_str().to_owned());
+        let config_bytes = serde_json::to_vec(&config).expect("pending Store config bytes");
+        manifest.config_digest =
+            PlatformHandle::new(format!("{:x}", Sha256::digest(&config_bytes)))
+                .expect("pending Store config digest");
+        std::fs::write(config_path, config_bytes).expect("rewrite pending Store config template");
+        std::fs::remove_file(Path::new(
+            manifest
+                .runtime_launch
+                .store_bootstrap_descriptor_path
+                .as_str(),
+        ))
+        .expect("Phase-A bootstrap remains an absent first-publication destination");
+        manifest.validate().expect("Phase-A fixture manifest");
+
+        let handle = |value: String| PlatformHandle::new(value).unwrap_or_else(|_| unreachable!());
+        let mut prior = active_startup_prior_binding(
+            &manifest,
+            &first_host.epoch.current.lineage,
+            first_host.epoch.current.sequence - 1,
+        );
+        prior.authority_descriptor_digest = handle("9".repeat(64));
+        prior.store_bootstrap_descriptor_digest = handle("8".repeat(64));
+        let commit_fence = ActivationCommitFence {
+            generation: manifest.generation.clone(),
+            config_digest: manifest.config_digest.clone(),
+            materialized_config_digest: prior.config_file_digest.clone(),
+            phase_b_live_binding: Some(prior.clone()),
+            authority_generation: manifest.runtime_launch.authority_generation,
+            authority_state_fence: manifest.runtime_launch.authority_state_fence.clone(),
+            active_kernel_record_checksum: handle("a".repeat(64)),
+            probe_request_digest: handle("b".repeat(64)),
+            ready_receipt_digest: handle("c".repeat(64)),
+            store_proof_fence: handle("store-proof:physical-test".to_owned()),
+            candidate_binding_digest: handle("d".repeat(64)),
+            store_requirement_digest: handle("e".repeat(64)),
+            readiness_sequence: 1,
+            readiness_journal_checksum: handle("f".repeat(64)),
+        };
+        let transaction_id = handle("transaction:physical-phase-b".to_owned());
+        let plan_digest = handle("8".repeat(64));
+        let owner_lease =
+            HostOwnerLease::acquire(&installation).expect("physical Host owner epoch lease");
+        let registry_store = RedbInstallationRegistry::open_test_support(&registry_path)
+            .expect("physical registry redb");
+        registry_store
+            .seed_active_generation_for_test_support(
+                &owner_lease.activation_capability(),
+                &manifest,
+                &transaction_id,
+                &plan_digest,
+                &commit_fence,
+            )
+            .expect("registry active-generation CAS seed");
+        let registry = registry_store.load().expect("seeded registry readback");
+        let launch_options = HostLaunchOptions {
+            config_descriptor_path: PathBuf::from(
+                manifest.runtime_launch.authority_descriptor_path.as_str(),
+            ),
+            config_descriptor_digest: phase_b_scm_selector(
+                &manifest.runtime_launch.authority_descriptor_digest,
+            )
+            .expect("SCM authority selector"),
+            installation: installation.clone(),
+            transaction_plan_generation: manifest.runtime_launch.authority_generation.value(),
+            host_state_root: PathBuf::from(
+                manifest
+                    .runtime_launch
+                    .runtime_state_roots
+                    .host_state_root
+                    .as_str(),
+            ),
+            registration_nonce: None,
+        };
+        assert_eq!(
+            HostComposition::production_store_rebind_discriminator(),
+            HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR
+        );
+        let build_composition = |journal: ProductionHostStateJournal,
+                                 registry_store: RedbInstallationRegistry,
+                                 registry: ApprovedGenerationRegistry,
+                                 launch_options: HostLaunchOptions,
+                                 host: HostInstallationEpoch,
+                                 activation_generation: EpochTransition,
+                                 activation_id: PlatformHandle,
+                                 owner_lease: HostOwnerLease| {
+            let jobs =
+                HostJobBranches::new_test_support(&host).expect("physical Host Job branches");
+            HostComposition {
+                store_rebind_boundary: HostStoreRebindProductionBoundary,
+                runtime_control_boundary: HostRuntimeControlProductionBoundary,
+                journal,
+                registry_store,
+                registry,
+                launch_options,
+                host,
+                activation_generation,
+                activation_id,
+                running: true,
+                jobs,
+                readiness_gate: HostReadinessGate::with_cadence(ReadinessCadence::default()),
+                phase_b: None,
+                runtime_restarts: std::collections::HashMap::new(),
+                runtime_control_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                store_recovery_startup_fence: StoreRecoveryStartupFence::Clear,
+                active_phase_b_rebind_recovery: ActivePhaseBRebindRecoveryKind::None,
+                owner_lease,
+                pending_record: None,
+                durable_finalized: false,
+                owner_released: false,
+                shutdown_failed: false,
+            }
+        };
+        let mut first = build_composition(
+            first_journal,
+            registry_store,
+            registry,
+            launch_options.clone(),
+            first_host.clone(),
+            first_activation_generation,
+            first_activation_id,
+            owner_lease,
+        );
+        let first_active = first
+            .registry
+            .active()
+            .cloned()
+            .expect("active approved generation");
+        first
+            .rebind_active_phase_b(&first_active, ActivePhaseBRebindRecoveryKind::None)
+            .expect("first physical Phase-B publication");
+        assert!(first.jobs.kernel.is_none());
+        assert!(first.jobs.store.is_none());
+        let first_rebind = first
+            .registry
+            .active_phase_b_rebind()
+            .cloned()
+            .expect("durable first rebind");
+        let first_receipt = first_rebind.receipt.clone().expect("durable first receipt");
+        assert!(
+            ActivePhaseBRebindRecovery::new(
+                &first_rebind,
+                first_receipt.host_owner_epoch.clone(),
+                first_receipt.host_process_identity.clone(),
+                first_receipt.host_process_nonce_digest.clone(),
+                first_receipt.host_epoch_lineage.clone(),
+                first_receipt.host_epoch_sequence + 1,
+            )
+            .is_err(),
+            "the old owner/nonce/process cannot authorize a direct-child recovery"
+        );
+        drop(first);
+
+        // The journal's destination bytes are not an adoption authority when
+        // the registry lifecycle is not supplied to reopen.
+        let destination_only =
+            open_test_support_epoch(&journal_path, installation.clone(), None, None);
+        assert!(matches!(
+            destination_only,
+            Err(HostError::OwnerLeaseRecovery(_))
+        ));
+
+        let registry_after_store = RedbInstallationRegistry::open_test_support(&registry_path)
+            .expect("registry reopen after crash");
+        let registry_after = registry_after_store
+            .load()
+            .expect("registry crash readback");
+        let active_rebind_after_crash = registry_after
+            .active_phase_b_rebind()
+            .cloned()
+            .expect("completed active rebind for recovery");
+        drop(registry_after_store);
+        let (
+            second_journal,
+            second_host,
+            second_activation_generation,
+            second_activation_id,
+            second_kind,
+        ) = open_test_support_epoch(
+            &journal_path,
+            installation.clone(),
+            None,
+            Some(&active_rebind_after_crash),
+        )
+        .expect("direct-child recovery epoch");
+        assert_eq!(
+            second_kind,
+            ActivePhaseBRebindRecoveryKind::CompletedReceipt
+        );
+        assert_eq!(
+            second_host.epoch.parent,
+            Some(first_host.epoch.current.clone())
+        );
+        let recovery_owner_lease =
+            HostOwnerLease::acquire(&installation).expect("fresh Host owner after crash");
+        let recovery_registry_store = RedbInstallationRegistry::open_test_support(&registry_path)
+            .expect("registry redb for fresh owner");
+        let recovery_registry = recovery_registry_store
+            .load()
+            .expect("fresh registry readback");
+        let mut second = build_composition(
+            second_journal,
+            recovery_registry_store,
+            recovery_registry,
+            launch_options,
+            second_host,
+            second_activation_generation,
+            second_activation_id,
+            recovery_owner_lease,
+        );
+        let second_active = second
+            .registry
+            .active()
+            .cloned()
+            .expect("active generation after recovery");
+        second
+            .rebind_active_phase_b(&second_active, second_kind)
+            .expect("fresh-owner exact rebind");
+        assert!(second.jobs.kernel.is_none());
+        assert!(second.jobs.store.is_none());
+        let current_rebind = second
+            .registry
+            .active_phase_b_rebind()
+            .cloned()
+            .expect("current fresh-owner rebind");
+        assert_eq!(current_rebind.recovery_history.len(), 1);
+        assert_eq!(
+            current_rebind.recovery_history[0].prior_receipt,
+            first_receipt
+        );
+        let current_receipt = current_rebind.receipt.clone().expect("fresh receipt");
+        assert_ne!(
+            current_receipt.host_owner_epoch,
+            first_receipt.host_owner_epoch
+        );
+        assert_ne!(
+            current_receipt.host_process_identity,
+            first_receipt.host_process_identity
+        );
+        assert_ne!(
+            current_receipt.host_process_nonce_digest,
+            first_receipt.host_process_nonce_digest
+        );
+        let file_digest = |path: &Path| {
+            format!(
+                "{:x}",
+                Sha256::digest(std::fs::read(path).expect("exact Phase-B readback"))
+            )
+        };
+        assert_eq!(
+            file_digest(Path::new(
+                manifest.runtime_launch.authority_descriptor_path.as_str(),
+            )),
+            current_receipt.authority_descriptor_digest.as_str()
+        );
+        assert_eq!(
+            file_digest(Path::new(manifest.config_path.as_str())),
+            current_receipt.config_file_digest.as_str()
+        );
+        assert_eq!(
+            file_digest(Path::new(
+                manifest
+                    .runtime_launch
+                    .store_bootstrap_descriptor_path
+                    .as_str(),
+            )),
+            current_receipt.store_bootstrap_descriptor_digest.as_str()
+        );
+        assert_eq!(
+            file_digest(Path::new(
+                manifest.runtime_launch.eliotd_descriptor_path.as_str(),
+            )),
+            current_receipt.eliotd_descriptor_digest.as_str()
+        );
+
+        let before = [
+            std::fs::read(Path::new(
+                manifest.runtime_launch.authority_descriptor_path.as_str(),
+            ))
+            .expect("authority bytes before idempotent retry"),
+            std::fs::read(Path::new(manifest.config_path.as_str()))
+                .expect("config bytes before idempotent retry"),
+            std::fs::read(Path::new(
+                manifest
+                    .runtime_launch
+                    .store_bootstrap_descriptor_path
+                    .as_str(),
+            ))
+            .expect("bootstrap bytes before idempotent retry"),
+            std::fs::read(Path::new(
+                manifest.runtime_launch.eliotd_descriptor_path.as_str(),
+            ))
+            .expect("eliotd bytes before idempotent retry"),
+        ];
+        second
+            .rebind_active_phase_b(&second_active, ActivePhaseBRebindRecoveryKind::None)
+            .expect("exact receipt rehydration");
+        let retry_receipt = second
+            .registry
+            .active_phase_b_rebind()
+            .and_then(|rebind| rebind.receipt.as_ref())
+            .expect("receipt after idempotent retry");
+        assert_eq!(retry_receipt.receipt_digest, current_receipt.receipt_digest);
+        let after = [
+            std::fs::read(Path::new(
+                manifest.runtime_launch.authority_descriptor_path.as_str(),
+            ))
+            .expect("authority bytes after idempotent retry"),
+            std::fs::read(Path::new(manifest.config_path.as_str()))
+                .expect("config bytes after idempotent retry"),
+            std::fs::read(Path::new(
+                manifest
+                    .runtime_launch
+                    .store_bootstrap_descriptor_path
+                    .as_str(),
+            ))
+            .expect("bootstrap bytes after idempotent retry"),
+            std::fs::read(Path::new(
+                manifest.runtime_launch.eliotd_descriptor_path.as_str(),
+            ))
+            .expect("eliotd bytes after idempotent retry"),
+        ];
+        assert_eq!(before, after);
+        drop(second);
+        drop(portable_lease);
+        std::fs::remove_dir_all(root).expect("remove physical Phase-B fixture root");
     }
 }
 

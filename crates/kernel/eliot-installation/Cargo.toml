@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Provider-neutral governed installation profiles, discovery and transaction state"
 
+[features]
+default = []
+test-support = []
+
 [package.metadata.eliot]
 work_id = "P-08"
 functional_cell = "installation"

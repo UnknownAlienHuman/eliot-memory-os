@@ -113,10 +113,11 @@ pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersi
 
 /// Current durable approved-generation registry wire revision.
 ///
-/// Registry wire version 10 adds the Host-owned `ActiveVerified` Phase-B rebind
-/// lifecycle. Older projections are never defaulted into the current
-/// activation authority; they require explicit re-stage.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(10, 0, 0);
+/// Registry wire version 11 binds the Host-owned `ActiveVerified` Phase-B
+/// rebind lifecycle to the sequence-bound owner-epoch/digest v2 domain. V10
+/// and older projections are never defaulted into current activation
+/// authority; they require explicit re-stage.
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(11, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -4421,17 +4422,41 @@ impl ActivePhaseBRebindRecovery {
         Ok(())
     }
 
-    /// Returns whether this transition authorizes the supplied fresh intent.
+    /// Returns whether this transition authorizes the exact successor intent.
+    ///
+    /// Immutable installation, source-binding, and template fields must be
+    /// carried forward byte-for-byte. The Host owner/process contour is taken
+    /// only from this recovery transition, while the activation generation is
+    /// the exact direct child of the retired attempt.
     #[must_use]
-    pub fn authorizes_intent(&self, intent: &ActivePhaseBRebindIntent) -> bool {
+    pub fn authorizes_exact_successor_intent(&self, intent: &ActivePhaseBRebindIntent) -> bool {
+        let prior = &self.prior_intent;
         self.transaction_id == intent.transaction_id
+            && prior.wire == intent.wire
+            && prior.transaction_id == intent.transaction_id
+            && prior.plan_digest == intent.plan_digest
             && self.effect_id == intent.effect_id
+            && prior.effect_id == intent.effect_id
             && self.manifest_digest == intent.manifest_digest
+            && prior.manifest_digest == intent.manifest_digest
+            && self.prior_terminal_digest == intent.prior_terminal_digest
+            && prior.prior_terminal_digest == intent.prior_terminal_digest
+            && prior.prior_phase_b_receipt_digest == intent.prior_phase_b_receipt_digest
+            && prior.prior_host_epoch_lineage == intent.prior_host_epoch_lineage
+            && prior.prior_host_epoch_sequence == intent.prior_host_epoch_sequence
+            && prior.prior_host_process_nonce_digest == intent.prior_host_process_nonce_digest
+            && prior.prior_host_owner_epoch == intent.prior_host_owner_epoch
+            && prior.prior_host_process_identity == intent.prior_host_process_identity
             && self.recovery_host_owner_epoch == intent.host_owner_epoch
             && self.recovery_host_process_identity == intent.host_process_identity
             && self.recovery_host_process_nonce_digest == intent.host_process_nonce_digest
             && self.recovery_host_epoch_lineage == intent.host_epoch_lineage
             && self.recovery_host_epoch_sequence == intent.host_epoch_sequence
+            && prior.activation_generation_lineage == intent.activation_generation_lineage
+            && prior.activation_generation_sequence.checked_add(1)
+                == Some(intent.activation_generation_sequence)
+            && prior.static_template == intent.static_template
+            && prior.static_template_digest == intent.static_template_digest
     }
 
     fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
@@ -4510,8 +4535,34 @@ impl ActivePhaseBRebind {
             })?;
             receipt.validate_against(&self.intent, prepared)?;
         }
+        let mut recovery_digests = BTreeSet::new();
+        let mut prior_request_digests = BTreeSet::new();
+        let mut prior_receipt_digests = BTreeSet::new();
+        let mut recovery_owner_epochs = BTreeSet::new();
+        let mut recovery_process_identities = BTreeSet::new();
+        let mut recovery_nonce_digests = BTreeSet::new();
+        let mut previous: Option<&ActivePhaseBRebindRecovery> = None;
         for recovery in &self.recovery_history {
             recovery.validate()?;
+            if previous.is_some_and(|prior| {
+                !prior.authorizes_exact_successor_intent(&recovery.prior_intent)
+            }) || !recovery_digests.insert(recovery.recovery_digest.as_str())
+                || !prior_request_digests.insert(recovery.prior_request_digest.as_str())
+                || !prior_receipt_digests.insert(recovery.prior_receipt_digest.as_str())
+                || !recovery_owner_epochs.insert(recovery.recovery_host_owner_epoch.as_str())
+                || !recovery_process_identities
+                    .insert(recovery.recovery_host_process_identity.as_str())
+                || !recovery_nonce_digests
+                    .insert(recovery.recovery_host_process_nonce_digest.as_str())
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            previous = Some(recovery);
+        }
+        if previous
+            .is_some_and(|recovery| !recovery.authorizes_exact_successor_intent(&self.intent))
+        {
+            return Err(InstallationError::IdentityConflict);
         }
         Ok(())
     }
@@ -5143,7 +5194,27 @@ impl PendingActivationTerminalWire {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RegistryWireV10 {
+struct ActivePhaseBRebindWireV11 {
+    intent: ActivePhaseBRebindIntent,
+    prepared: RequiredOption<HostPhaseBPreparedMaterialization>,
+    receipt: RequiredOption<ActivePhaseBRebindReceipt>,
+    recovery_history: Vec<ActivePhaseBRebindRecovery>,
+}
+
+impl ActivePhaseBRebindWireV11 {
+    fn into_rebind(self) -> ActivePhaseBRebind {
+        ActivePhaseBRebind {
+            intent: self.intent,
+            prepared: self.prepared.0,
+            receipt: self.receipt.0,
+            recovery_history: self.recovery_history,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryWireV11 {
     registry_wire_version: ContractVersion,
     revision: u64,
     generations: Vec<ApprovedGenerationWire>,
@@ -5152,7 +5223,7 @@ struct RegistryWireV10 {
     last_known_good_generation: RequiredOption<PlatformHandle>,
     pending_activation: RequiredOption<PendingActivationWire>,
     last_terminal_activation: RequiredOption<PendingActivationTerminalWire>,
-    active_phase_b_rebind: RequiredOption<ActivePhaseBRebind>,
+    active_phase_b_rebind: RequiredOption<ActivePhaseBRebindWireV11>,
 }
 
 /// An optional wire member whose presence is mandatory.  Explicit `null` is
@@ -5172,7 +5243,7 @@ where
     }
 }
 
-impl RegistryWireV10 {
+impl RegistryWireV11 {
     fn into_registry(self) -> ApprovedGenerationRegistry {
         ApprovedGenerationRegistry {
             registry_wire_version: self.registry_wire_version,
@@ -5193,7 +5264,10 @@ impl RegistryWireV10 {
                 .last_terminal_activation
                 .0
                 .map(PendingActivationTerminalWire::into_terminal),
-            active_phase_b_rebind: self.active_phase_b_rebind.0,
+            active_phase_b_rebind: self
+                .active_phase_b_rebind
+                .0
+                .map(ActivePhaseBRebindWireV11::into_rebind),
         }
     }
 }
@@ -5699,16 +5773,22 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
         .get("registry_wire_version")
         .and_then(|version| version.get("major"))
         .and_then(serde_json::Value::as_u64);
+    if declared_major == Some(10) {
+        return Err(InstallationError::MigrationRequired {
+            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v11; nested authority is never synthesized or adopted"
+                .to_owned(),
+        });
+    }
     if declared_major == Some(u64::from(INSTALLATION_REGISTRY_WIRE_VERSION.major))
         && current_registry_wire_missing_field(&value)
     {
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v10 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v11 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
 
-    if let Ok(wire) = serde_json::from_value::<RegistryWireV10>(value.clone()) {
+    if let Ok(wire) = serde_json::from_value::<RegistryWireV11>(value.clone()) {
         if wire.registry_wire_version != INSTALLATION_REGISTRY_WIRE_VERSION {
             return Err(InstallationError::MigrationRequired {
                 reason: format!(
@@ -5741,7 +5821,7 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             });
         }
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v10 is missing mandatory fields or contains an invalid field"
+            reason: "registry wire v11 is missing mandatory fields or contains an invalid field"
                 .to_owned(),
         });
     }
@@ -5862,7 +5942,7 @@ enum RegistryPathLease {
         _root: ProtectedRootLease,
         _file: ProtectedRuntimePathLease,
     },
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Test,
 }
 
@@ -5873,6 +5953,33 @@ impl RedbInstallationRegistry {
             database,
             _path_lease: RegistryPathLease::Test,
         }
+    }
+
+    /// Opens a physical registry below a caller-owned temporary test root.
+    ///
+    /// This is available only through the non-default `test-support` feature.
+    /// It deliberately does not relax the production [`Self::open`] or
+    /// [`Self::open_at`] ProgramData/root-lease policies; the Host test uses
+    /// this path only to exercise the real redb CAS and rebind callsite without
+    /// requiring an elevated service token.
+    #[cfg(feature = "test-support")]
+    pub fn open_test_support(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            return Err(InstallationError::Platform(
+                "test registry path must be absolute".to_owned(),
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        }
+        let database = Database::create(path)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        Ok(Self {
+            database,
+            _path_lease: RegistryPathLease::Test,
+        })
     }
 
     /// Opens or creates the registry database.
@@ -6101,6 +6208,73 @@ impl RedbInstallationRegistry {
         // partially trusted activation decision.
         registry.validate()?;
         Ok(registry)
+    }
+
+    /// Seeds one physically persisted active generation for a production-bound
+    /// Host recovery test. The helper is feature-gated and constructs the
+    /// same typed approval/fence projection that the installer transaction
+    /// path commits; every subsequent Phase-B mutation goes through the real
+    /// Host-owner CAS methods.
+    #[cfg(feature = "test-support")]
+    pub fn seed_active_generation_for_test_support(
+        &self,
+        host: &HostOwnerEpochCapability,
+        manifest: &CandidateManifest,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        commit_fence: &ActivationCommitFence,
+    ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        manifest.validate()?;
+        let manifest_digest = candidate_manifest_digest(manifest)?;
+        let approval_ref = PlatformHandle::new(sha256_hex(
+            format!(
+                "eliot.test-support.activation-approval.v1\0{}\0{}\0{}",
+                transaction_id.as_str(),
+                plan_digest.as_str(),
+                manifest_digest.as_str(),
+            )
+            .as_bytes(),
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "test_support.approval_ref".to_owned(),
+            reason: error.to_string(),
+        })?;
+        let runtime = &manifest.runtime_launch;
+        let approval = InstallationActivationApproval::from_verified_parts(
+            approval_ref,
+            transaction_id.clone(),
+            plan_digest.clone(),
+            manifest.generation.clone(),
+            manifest_digest,
+            runtime.descriptor_digest.clone(),
+            PlatformHandle::new("owner:test-support").map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "test_support.required_owner".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            manifest.signature_ref.clone(),
+            runtime.authority_descriptor_path.clone(),
+            runtime.authority_descriptor_digest.clone(),
+            runtime.authority_generation,
+            runtime.authority_state_fence.clone(),
+        );
+        approval.validate()?;
+        validate_approval_against_manifest(&approval, manifest, "test_support")?;
+        commit_fence.validate_against_manifest(manifest)?;
+        let expected_revision = self.load()?.revision();
+        self.mutate_atomic(expected_revision, |registry| {
+            registry.stage_pending_activation_unchecked(manifest.clone(), approval, &[])?;
+            registry.commit_pending_activation_unchecked(
+                transaction_id,
+                plan_digest,
+                &manifest.generation,
+                commit_fence,
+            )
+        })
     }
 
     /// Reads one exact committed activation terminal without mutating the
@@ -6556,22 +6730,26 @@ impl RedbInstallationRegistry {
     }
 
     /// Atomically records the fresh-owner CAS that retires one completed
-    /// `ActiveVerified` rebind attempt. The completed receipt remains in the
-    /// registry's forensic recovery history; this transition only authorizes a
-    /// later fresh intent and never adopts destination bytes.
-    pub fn record_active_phase_b_rebind_recovery(
+    /// `ActiveVerified` rebind attempt and installs the exact intent it
+    /// authorizes. The completed receipt remains in the registry's forensic
+    /// recovery history; no durable intermediate can carry a recovery chain
+    /// whose final transition does not authorize the current intent.
+    pub fn record_active_phase_b_rebind_recovery_and_intent(
         &self,
         host: &HostOwnerEpochCapability,
         expected_revision: u64,
         recovery: &ActivePhaseBRebindRecovery,
-    ) -> Result<ActivePhaseBRebindRecovery, InstallationError> {
+        intent: &ActivePhaseBRebindIntent,
+    ) -> Result<ActivePhaseBRebind, InstallationError> {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         recovery.validate()?;
+        intent.validate()?;
         let recovery = recovery.clone();
+        let intent = intent.clone();
         self.mutate_atomic(expected_revision, |registry| {
-            registry.record_active_phase_b_rebind_recovery_unchecked(&recovery)
+            registry.record_active_phase_b_rebind_recovery_and_intent_unchecked(&recovery, &intent)
         })
     }
 
@@ -7158,11 +7336,10 @@ impl ApprovedGenerationRegistry {
         Ok(())
     }
 
-    fn record_active_phase_b_rebind_intent_unchecked(
-        &mut self,
+    fn validate_active_phase_b_rebind_intent_context(
+        &self,
         intent: &ActivePhaseBRebindIntent,
-    ) -> Result<ActivePhaseBRebindIntent, InstallationError> {
-        self.validate()?;
+    ) -> Result<(), InstallationError> {
         if self.pending_activation.is_some() {
             return Err(InstallationError::IdentityConflict);
         }
@@ -7200,7 +7377,15 @@ impl ApprovedGenerationRegistry {
         {
             return Err(InstallationError::IdentityConflict);
         }
-        intent.validate_against_prior_binding(prior_binding)?;
+        intent.validate_against_prior_binding(prior_binding)
+    }
+
+    fn record_active_phase_b_rebind_intent_unchecked(
+        &mut self,
+        intent: &ActivePhaseBRebindIntent,
+    ) -> Result<ActivePhaseBRebindIntent, InstallationError> {
+        self.validate()?;
+        self.validate_active_phase_b_rebind_intent_context(intent)?;
         match self.active_phase_b_rebind.as_ref() {
             None => {
                 self.active_phase_b_rebind = Some(ActivePhaseBRebind {
@@ -7223,19 +7408,13 @@ impl ApprovedGenerationRegistry {
                 if existing.prepared.is_some() && existing.receipt.is_none() {
                     return Err(InstallationError::IdentityConflict);
                 }
-                if existing.receipt.is_some()
-                    && !existing
-                        .recovery_history
-                        .iter()
-                        .any(|recovery| recovery.authorizes_intent(intent))
-                {
+                if existing.receipt.is_some() || !existing.recovery_history.is_empty() {
                     return Err(InstallationError::IdentityConflict);
                 }
-                // A fresh Host owner may retry an intent-only operation, or a
-                // completed operation only after the explicit durable recovery
-                // CAS above. The old completed receipt is retained in the
-                // forensic history and destination bytes are never adopted as
-                // current authority.
+                // A fresh Host owner may retry an intent-only operation before
+                // any recovery history exists. Completed attempts advance only
+                // through the atomic recovery-and-intent transition below, so
+                // every retained chain ends at the current authority.
                 let recovery_history = existing.recovery_history.clone();
                 self.active_phase_b_rebind = Some(ActivePhaseBRebind {
                     intent: intent.clone(),
@@ -7256,36 +7435,54 @@ impl ApprovedGenerationRegistry {
         Ok(recorded)
     }
 
-    fn record_active_phase_b_rebind_recovery_unchecked(
+    fn record_active_phase_b_rebind_recovery_and_intent_unchecked(
         &mut self,
         recovery: &ActivePhaseBRebindRecovery,
-    ) -> Result<ActivePhaseBRebindRecovery, InstallationError> {
+        intent: &ActivePhaseBRebindIntent,
+    ) -> Result<ActivePhaseBRebind, InstallationError> {
         self.validate()?;
-        let rebind = self.active_phase_b_rebind.as_mut().ok_or_else(|| {
+        self.validate_active_phase_b_rebind_intent_context(intent)?;
+        let current = self.active_phase_b_rebind.as_ref().ok_or_else(|| {
             InstallationError::IncompleteObservation(
                 "active Phase-B recovery requires a durable rebind lifecycle".to_owned(),
             )
         })?;
-        recovery.validate_against(rebind)?;
-        if rebind.recovery_history.iter().any(|existing| {
+        if current.intent == *intent
+            && current
+                .recovery_history
+                .last()
+                .is_some_and(|existing| existing == recovery)
+        {
+            return Ok(current.clone());
+        }
+        recovery.validate_against(current)?;
+        if !recovery.authorizes_exact_successor_intent(intent) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if current.recovery_history.iter().any(|existing| {
             existing.recovery_host_owner_epoch == recovery.recovery_host_owner_epoch
                 || existing.recovery_host_process_identity
                     == recovery.recovery_host_process_identity
                 || existing.recovery_host_process_nonce_digest
                     == recovery.recovery_host_process_nonce_digest
+                || existing.recovery_digest == recovery.recovery_digest
+                || existing.prior_request_digest == recovery.prior_request_digest
+                || existing.prior_receipt_digest == recovery.prior_receipt_digest
         }) {
-            if rebind
-                .recovery_history
-                .iter()
-                .any(|existing| existing == recovery)
-            {
-                return Ok(recovery.clone());
-            }
             return Err(InstallationError::IdentityConflict);
         }
+        let rebind = self.active_phase_b_rebind.as_mut().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "active Phase-B recovery requires a durable rebind lifecycle".to_owned(),
+            )
+        })?;
         rebind.recovery_history.push(recovery.clone());
+        rebind.intent = intent.clone();
+        rebind.prepared = None;
+        rebind.receipt = None;
+        let recorded = rebind.clone();
         self.validate()?;
-        Ok(recovery.clone())
+        Ok(recorded)
     }
 
     fn record_active_phase_b_rebind_prepared_unchecked(
@@ -23549,7 +23746,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_registry_wire_requires_explicit_migration_to_v10() {
+    fn v9_registry_wire_requires_explicit_migration_to_v11() {
         let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
         object["registry_wire_version"] = serde_json::json!({
@@ -23566,37 +23763,129 @@ mod tests {
             matches!(
                 error,
                 InstallationError::MigrationRequired { ref reason }
-                    if reason.contains("registry wire 9.0.0") && reason.contains("10.0.0")
+                    if reason.contains("registry wire 9.0.0") && reason.contains("11.0.0")
             ),
             "unexpected raw v9 classification: {error:?}"
         );
     }
 
     #[test]
-    fn v10_registry_wire_round_trips_without_synthesizing_rebind_state() {
+    fn v10_registry_with_v1_rebind_requires_restage_without_adoption() {
+        let transaction = registering_transaction();
+        let manifest = &transaction.candidate_manifest;
+        let fence = test_commit_fence(manifest);
+        let prior = fence
+            .phase_b_live_binding
+            .as_ref()
+            .unwrap_or_else(|| unreachable!());
+        let mut legacy_rebind = ActivePhaseBRebind {
+            intent: must(ActivePhaseBRebindIntent::new(
+                transaction.transaction_id.clone(),
+                transaction.installer_plan_digest.clone(),
+                test_handle("active-phase-b-rebind-wire"),
+                must(candidate_manifest_digest(manifest)),
+                test_handle("a".repeat(64)),
+                prior,
+                test_handle("host-owner:wire"),
+                test_handle("b".repeat(64)),
+                test_handle("c".repeat(64)),
+                prior.host_epoch_lineage.clone(),
+                prior.host_epoch_sequence + 1,
+                test_handle("activation-lineage:wire"),
+                2,
+                must(phase_b_static_template_for_candidate(manifest)),
+            )),
+            prepared: None,
+            receipt: None,
+            recovery_history: Vec::new(),
+        };
+        legacy_rebind.intent.wire = test_handle("eliot.host.phase-b-rebind.v1");
+        legacy_rebind.intent.request_digest =
+            must(active_phase_b_rebind_intent_digest(&legacy_rebind.intent));
+        let mut raw_v10 = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+        raw_v10["registry_wire_version"] = serde_json::json!({
+            "major": 10,
+            "minor": 0,
+            "patch": 0
+        });
+        raw_v10["active_phase_b_rebind"] = must(serde_json::to_value(legacy_rebind));
+        let bytes = must(serde_json::to_vec(&raw_v10));
+        let error = decode_registry_bytes(&bytes)
+            .expect_err("raw v10 nested v1 authority must require explicit re-stage");
+        assert!(matches!(
+            error,
+            InstallationError::MigrationRequired { reason }
+                if reason.contains("wire v10")
+                    && reason.contains("re-stage as v11")
+                    && reason.contains("never synthesized or adopted")
+        ));
+    }
+
+    #[test]
+    fn v11_registry_wire_round_trips_without_synthesizing_rebind_state() {
         let current = ApprovedGenerationRegistry::new();
         let bytes = must(serde_json::to_vec(&current));
         let decoded = must(decode_registry_bytes(&bytes));
         assert_eq!(decoded, current);
         assert_eq!(
             decoded.registry_wire_version(),
-            ContractVersion::new(10, 0, 0)
+            ContractVersion::new(11, 0, 0)
         );
         assert!(decoded.active_phase_b_rebind().is_none());
     }
 
     #[test]
-    fn v4_registry_wire_rejects_omitted_optional_members() {
+    fn v11_registry_wire_rejects_omitted_mandatory_rebind_member() {
         let mut current = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
         current
             .as_object_mut()
             .unwrap_or_else(|| unreachable!())
-            .remove("pending_activation");
+            .remove("active_phase_b_rebind");
         let bytes = must(serde_json::to_vec(&current));
         assert!(matches!(
             decode_registry_bytes(&bytes),
             Err(InstallationError::CorruptRegistry { reason })
                 if reason.contains("missing mandatory fields")
+        ));
+
+        let mut nested = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+        let transaction = registering_transaction();
+        let manifest = &transaction.candidate_manifest;
+        let fence = test_commit_fence(manifest);
+        let prior = fence
+            .phase_b_live_binding
+            .as_ref()
+            .unwrap_or_else(|| unreachable!());
+        let active_rebind = ActivePhaseBRebind {
+            intent: must(ActivePhaseBRebindIntent::new(
+                transaction.transaction_id.clone(),
+                transaction.installer_plan_digest.clone(),
+                test_handle("active-phase-b-rebind-nested"),
+                must(candidate_manifest_digest(manifest)),
+                test_handle("a".repeat(64)),
+                prior,
+                test_handle("host-owner:nested"),
+                test_handle("b".repeat(64)),
+                test_handle("c".repeat(64)),
+                prior.host_epoch_lineage.clone(),
+                prior.host_epoch_sequence + 1,
+                test_handle("activation-lineage:nested"),
+                2,
+                must(phase_b_static_template_for_candidate(manifest)),
+            )),
+            prepared: None,
+            receipt: None,
+            recovery_history: Vec::new(),
+        };
+        nested["active_phase_b_rebind"] = must(serde_json::to_value(active_rebind));
+        nested["active_phase_b_rebind"]
+            .as_object_mut()
+            .unwrap_or_else(|| unreachable!())
+            .remove("prepared");
+        let bytes = must(serde_json::to_vec(&nested));
+        assert!(matches!(
+            decode_registry_bytes(&bytes),
+            Err(InstallationError::CorruptRegistry { .. })
         ));
     }
 
@@ -24529,6 +24818,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the lifecycle regression builds two durable recovery generations before mutating raw v11 bytes"
+    )]
     fn active_phase_b_rebind_completed_receipt_requires_fresh_owner_recovery_cas() {
         let transaction = fully_applied_system_registration_transaction();
         let approval = test_transaction_activation_approval(
@@ -24748,9 +25041,19 @@ mod tests {
                 if field == "active_phase_b_rebind.recovery.recovery_host_epoch_sequence"
         ));
 
+        let mut recovered_intent = fresh_intent;
+        recovered_intent.host_epoch_sequence = 3;
+        recovered_intent.activation_generation_sequence = 3;
+        recovered_intent.request_digest =
+            must(active_phase_b_rebind_intent_digest(&recovered_intent));
         let stale_revision = must(registry.load()).revision().saturating_sub(1);
         assert!(matches!(
-            registry.record_active_phase_b_rebind_recovery(&host, stale_revision, &recovery),
+            registry.record_active_phase_b_rebind_recovery_and_intent(
+                &host,
+                stale_revision,
+                &recovery,
+                &recovered_intent,
+            ),
             Err(InstallationError::CompareAndSaveConflict { .. })
         ));
         assert!(
@@ -24758,18 +25061,10 @@ mod tests {
                 .active_phase_b_rebind()
                 .is_some_and(|current| current.recovery_history.is_empty())
         );
-        must(registry.record_active_phase_b_rebind_recovery(
+        must(registry.record_active_phase_b_rebind_recovery_and_intent(
             &host,
             must(registry.load()).revision(),
             &recovery,
-        ));
-        let mut recovered_intent = fresh_intent;
-        recovered_intent.host_epoch_sequence = 3;
-        recovered_intent.request_digest =
-            must(active_phase_b_rebind_intent_digest(&recovered_intent));
-        must(registry.record_active_phase_b_rebind_intent(
-            &host,
-            must(registry.load()).revision(),
             &recovered_intent,
         ));
         let rebound = must(registry.load())
@@ -24781,6 +25076,132 @@ mod tests {
         assert!(rebound.receipt.is_none());
         assert_eq!(rebound.recovery_history.len(), 1);
         assert_eq!(rebound.recovery_history[0].prior_receipt, receipt);
+
+        let mut second_prepared = prepared.clone();
+        second_prepared.request_digest = recovered_intent.request_digest.clone();
+        second_prepared.host_owner_epoch = recovered_intent.host_owner_epoch.clone();
+        second_prepared.host_process_identity = recovered_intent.host_process_identity.clone();
+        second_prepared.host_process_nonce_digest =
+            recovered_intent.host_process_nonce_digest.clone();
+        second_prepared.host_epoch_lineage = recovered_intent.host_epoch_lineage.clone();
+        second_prepared.host_epoch_sequence = recovered_intent.host_epoch_sequence;
+        second_prepared.prepared_digest = must(second_prepared.computed_digest());
+        must(registry.record_active_phase_b_rebind_prepared(
+            &host,
+            must(registry.load()).revision(),
+            &second_prepared,
+        ));
+        let second_receipt = must(ActivePhaseBRebindReceipt::from_prepared(
+            &recovered_intent,
+            &second_prepared,
+        ));
+        must(registry.record_active_phase_b_rebind_receipt(
+            &host,
+            must(registry.load()).revision(),
+            &second_receipt,
+        ));
+        let second_completed = must(registry.load())
+            .active_phase_b_rebind()
+            .cloned()
+            .unwrap_or_else(|| unreachable!());
+        let second_recovery = must(ActivePhaseBRebindRecovery::new(
+            &second_completed,
+            test_handle("host-owner:reset-3"),
+            test_handle("d".repeat(64)),
+            test_handle("e".repeat(64)),
+            recovered_intent.host_epoch_lineage.clone(),
+            4,
+        ));
+        let mut final_intent = recovered_intent.clone();
+        final_intent.host_owner_epoch = second_recovery.recovery_host_owner_epoch.clone();
+        final_intent.host_process_identity = second_recovery.recovery_host_process_identity.clone();
+        final_intent.host_process_nonce_digest =
+            second_recovery.recovery_host_process_nonce_digest.clone();
+        final_intent.host_epoch_sequence = second_recovery.recovery_host_epoch_sequence;
+        final_intent.activation_generation_sequence = 4;
+        final_intent.request_digest = must(active_phase_b_rebind_intent_digest(&final_intent));
+        must(registry.record_active_phase_b_rebind_recovery_and_intent(
+            &host,
+            must(registry.load()).revision(),
+            &second_recovery,
+            &final_intent,
+        ));
+        let chained = must(registry.load());
+        let chained_rebind = chained
+            .active_phase_b_rebind()
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(chained_rebind.intent, final_intent);
+        assert_eq!(chained_rebind.recovery_history.len(), 2);
+        must(chained_rebind.validate());
+
+        let mut impossible_order = must(serde_json::to_value(&chained));
+        impossible_order["active_phase_b_rebind"]["recovery_history"]
+            .as_array_mut()
+            .unwrap_or_else(|| unreachable!())
+            .swap(0, 1);
+        assert!(matches!(
+            decode_registry_bytes(&must(serde_json::to_vec(&impossible_order))),
+            Err(InstallationError::CorruptRegistry { .. })
+        ));
+
+        let mut duplicate_transition = must(serde_json::to_value(&chained));
+        let history = duplicate_transition["active_phase_b_rebind"]["recovery_history"]
+            .as_array_mut()
+            .unwrap_or_else(|| unreachable!());
+        history.push(history[1].clone());
+        assert!(matches!(
+            decode_registry_bytes(&must(serde_json::to_vec(&duplicate_transition))),
+            Err(InstallationError::CorruptRegistry { .. })
+        ));
+
+        let mut forged_history = chained.clone();
+        {
+            let historical = &mut forged_history
+                .active_phase_b_rebind
+                .as_mut()
+                .unwrap_or_else(|| unreachable!())
+                .recovery_history[1];
+            historical.prior_intent.plan_digest = test_handle("2".repeat(64));
+            historical.prior_intent.activation_generation_lineage =
+                test_handle("activation-lineage:forged-history");
+            historical.prior_intent.request_digest = must(active_phase_b_rebind_intent_digest(
+                &historical.prior_intent,
+            ));
+            historical.prior_request_digest = historical.prior_intent.request_digest.clone();
+            historical.prior_prepared.request_digest =
+                historical.prior_intent.request_digest.clone();
+            historical.prior_prepared.prepared_digest =
+                must(historical.prior_prepared.computed_digest());
+            historical.prior_receipt.request_digest =
+                historical.prior_intent.request_digest.clone();
+            historical.prior_receipt.receipt_digest = must(active_phase_b_rebind_receipt_digest(
+                &historical.prior_receipt,
+            ));
+            historical.prior_receipt_digest = historical.prior_receipt.receipt_digest.clone();
+            historical.recovery_digest = must(historical.computed_digest());
+            must(historical.validate());
+        }
+        assert!(matches!(
+            decode_registry_bytes(&must(serde_json::to_vec(&forged_history))),
+            Err(InstallationError::CorruptRegistry { .. })
+        ));
+
+        let mut unauthorized_current = final_intent;
+        unauthorized_current.host_owner_epoch = test_handle("host-owner:reset-4");
+        unauthorized_current.host_process_identity = test_handle("f".repeat(64));
+        unauthorized_current.host_process_nonce_digest = test_handle("1".repeat(64));
+        unauthorized_current.host_epoch_sequence = 5;
+        unauthorized_current.activation_generation_sequence = 5;
+        unauthorized_current.request_digest =
+            must(active_phase_b_rebind_intent_digest(&unauthorized_current));
+        must(unauthorized_current.validate());
+        let mut mismatched_current = must(serde_json::to_value(&chained));
+        mismatched_current["active_phase_b_rebind"]["intent"] =
+            must(serde_json::to_value(unauthorized_current));
+        assert!(matches!(
+            decode_registry_bytes(&must(serde_json::to_vec(&mismatched_current))),
+            Err(InstallationError::CorruptRegistry { .. })
+        ));
         let _ = std::fs::remove_file(path);
     }
 
