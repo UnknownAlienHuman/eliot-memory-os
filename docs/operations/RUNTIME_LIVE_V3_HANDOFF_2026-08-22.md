@@ -30,11 +30,13 @@
 - `334bf60` — bounded SCM Host stop/start Pulse 5 candidate.
 - `7dcdf43` — first-install profiled root hierarchy, exact staging root and protected `canary-evidence` root.
 - `facc3c0` — Pulse 5 fresh Store proof and stop-owned single-start reconciliation correction.
+- `7faacee` — Pulse 5 installer-approved Store executable/materialized-config attestation with production-reachable static authority generation.
+- `7cc1730` — read-only runtime leases for Store attestation; canary never repairs or rewrites ACLs.
 
 ## Verified in focused source gates
 
 - Pulse 5 foundation: all-target check; canary 14/14; Host-state 104/104; focused Windows enabled-Administrators read-only test; formatting/diff; touched-crate no-deps Clippy.
-- Pulse 5 correction: canary all-target check; 17/17 tests; strict no-deps Clippy; formatting and diff checks.
+- Final Pulse 5 correction: canary all-target check; 21/21 tests; strict no-deps Clippy; formatting and diff checks. Independent source audits accepted static-generation reachability, same-path binary/config substitution rejection, read-only ACL behavior and single-start cleanup.
 - First-install roots: focused all-target checks; 12 Windows installer-root primitive tests; SystemService planner test; v18-to-v19 migration test; formatting/diff.
 - Earlier integrated milestones carry their own focused test and strict lint evidence in Git history.
 
@@ -65,9 +67,9 @@ Pulses 6–8 remain post-canary recovery/removal work. They may report exact blo
 
 ## Repository cleanup state
 
-Cleanup was deliberately not executed while active worktrees still contained unique changes. The last read-only inventory was approximately 267 worktrees, 269 local branches and 223 tips not ancestors of staging. Several historical tips are known patch-equivalent or superseded, but the complete safe-delete classification is not yet trusted.
+The 2026-08-22 exact inventory found 269 registered worktrees and 253 local `codex/*` refs before cleanup: 44 local tips were ancestors of staging, two were tree-equivalent, 209 were unique non-ancestors and the remainder were dirty, live-process-bound or otherwise unknown. Eight clean, non-live, staging-contained superseded worktrees and their local branches were removed without force; 183,023,726 bytes (174.55 MiB) were reclaimed. Current readback is 262 worktrees and 246 local `codex/*` refs because one new active Pulse 5 correction worktree appeared during cleanup.
 
-Before deletion, recompute reachability against this branch, exclude every live agent worktree, archive unique commits, then delete only confirmed patch-equivalent/superseded worktrees and their dedicated build caches. Preserve all `.eliot/inbox` evidence until its owning ingestion/disposition is explicit.
+The remaining unique non-ancestor tips are not classified as garbage. Recompute reachability and liveness before every later deletion; archive or integrate unique commits first. Cargo target directories account for about 17.11 GiB but were not removed while agents were compiling. Preserve all `.eliot/inbox` evidence until its owning ingestion/disposition is explicit.
 
 ## Exact restart point
 
