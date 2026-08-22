@@ -31,7 +31,7 @@ use crate::{
 /// are live Host-owned handoff material and cannot be represented by an
 /// installer candidate. Destination file identities are observed after
 /// Phase B materialization and are not part of this immutable inventory.
-const REQUIRED_PACKAGE_ROLES: [(&str, bool); 9] = [
+pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 9] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),

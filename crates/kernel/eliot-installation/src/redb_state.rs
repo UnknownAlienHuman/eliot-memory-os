@@ -11,6 +11,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use super::package_planner::REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROLES;
 use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
     InstallationError, InstallationStage, InstallationStepOutcome, InstallationTransaction,
@@ -21,8 +22,9 @@ use super::{
 use eliot_contracts::ContractVersion;
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
-    AuthenticodeEvidence, DirectoryPublicationReceipt, FileIdentity, OwnedDirectoryPublication,
-    PackageFileSpec, PackageManifest, PeCoffEvidence, TrustedSourceBundle, canonical_windows_path,
+    AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier, DirectoryPublicationReceipt,
+    FileIdentity, OwnedDirectoryPublication, PackageFileSpec, PackageManifest, PeCoffEvidence,
+    TrustedSourceBundle, WindowsAuthenticodeVerifier, canonical_windows_path,
     delete_owned_file_handle, file_identity_for_open_handle, open_no_follow_directory,
     open_no_follow_file, validate_package_relative_path, windows_paths_equal,
 };
@@ -33,18 +35,6 @@ const PUBLICATION_JOURNAL_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("source_bundle_publication_journal_v1");
 const TRANSACTION_TEMP_CREATE_ATTEMPTS: usize = 16;
 static NEXT_TRANSACTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-const SOURCE_BUNDLE_REQUIRED_ROLES: [(&str, bool); 9] = [
-    ("eliot-host.exe", true),
-    ("eliot-watchdog.exe", true),
-    ("eliot-kernel.exe", true),
-    ("eliot-store-surreal.exe", true),
-    ("surreal.exe", true),
-    ("eliotd.exe", true),
-    ("generation.json", false),
-    ("eliotd-governor.json", false),
-    ("eliotd.json", false),
-];
 
 /// Typed durable state of one source-bundle directory publication.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -187,12 +177,44 @@ pub struct RedbInstallationTransactionStore {
     allow_unpublished_stage_fixture: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationJournalStoreFault {
+    None,
+    #[cfg(test)]
+    AfterTemporaryCreateBeforeInsert,
+    #[cfg(test)]
+    AfterJournalCommitBeforePublish,
+    #[cfg(test)]
+    AfterFinalPublishBeforeResponse,
+}
+
 impl RedbInstallationTransactionStore {
     /// Persist and read back a source-bundle publication intent in the exact
     /// caller-selected store before any native directory move occurs.
     pub fn begin_source_bundle_publication_at_exact_path(
         path: impl AsRef<Path>,
         journal: &SourceBundlePublicationJournal,
+    ) -> Result<SourceBundlePublicationJournal, InstallationError> {
+        Self::begin_source_bundle_publication_with_fault(
+            path.as_ref(),
+            journal,
+            PublicationJournalStoreFault::None,
+        )
+    }
+
+    #[cfg(test)]
+    fn begin_source_bundle_publication_at_exact_path_with_fault(
+        path: impl AsRef<Path>,
+        journal: &SourceBundlePublicationJournal,
+        fault: PublicationJournalStoreFault,
+    ) -> Result<SourceBundlePublicationJournal, InstallationError> {
+        Self::begin_source_bundle_publication_with_fault(path.as_ref(), journal, fault)
+    }
+
+    fn begin_source_bundle_publication_with_fault(
+        path: &Path,
+        journal: &SourceBundlePublicationJournal,
+        fault: PublicationJournalStoreFault,
     ) -> Result<SourceBundlePublicationJournal, InstallationError> {
         validate_publication_journal(journal)?;
         if journal.state != SourceBundlePublicationJournalState::Intent {
@@ -201,7 +223,6 @@ impl RedbInstallationTransactionStore {
                 reason: "begin accepts only an Intent journal".to_owned(),
             });
         }
-        let path = path.as_ref();
         require_existing_parent(path)?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {
@@ -230,28 +251,7 @@ impl RedbInstallationTransactionStore {
             Ok(_) => Err(existing_path_error()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 verify_publication_intent(journal)?;
-                let database = Database::create(path)
-                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
-                insert_publication_journal(&database, journal)?;
-                drop(database);
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(path)
-                    .and_then(|file| file.sync_all())
-                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
-                sync_parent_directory(path.parent().ok_or_else(|| {
-                    InstallationError::InvalidField {
-                        field: "transaction_store.path".to_owned(),
-                        reason: "path must have a parent".to_owned(),
-                    }
-                })?)?;
-                let store = Self::open_existing_exact_path(path)?;
-                store
-                    .load_source_bundle_publication(&journal.operation_id)?
-                    .ok_or(InstallationError::UnknownOutcome {
-                        stage: InstallationStage::Planned,
-                    })
+                begin_new_source_bundle_publication_store(path, journal, fault)
             }
             Err(error) => Err(InstallationError::Platform(error.to_string())),
         }
@@ -728,6 +728,236 @@ impl PendingTransactionStorePublication {
             stage: InstallationStage::Planned,
         })
     }
+
+    fn publish_publication_journal(
+        mut self,
+        destination: &Path,
+        journal: &SourceBundlePublicationJournal,
+        fault: PublicationJournalStoreFault,
+    ) -> Result<(), InstallationError> {
+        #[cfg(not(test))]
+        let _ = fault;
+        #[cfg(windows)]
+        {
+            verify_transaction_parent(&self.parent)?;
+            let retained =
+                self.temporary_file
+                    .as_ref()
+                    .ok_or(InstallationError::UnknownOutcome {
+                        stage: InstallationStage::Planned,
+                    })?;
+            verify_retained_transaction_file(retained)?;
+        }
+        match fs::hard_link(&self.temporary, destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(existing_path_error());
+            }
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        }
+        let directory = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "transaction_store.path".to_owned(),
+                reason: "exact path must name a file".to_owned(),
+            })?;
+        sync_parent_directory(directory).map_err(|_| InstallationError::UnknownOutcome {
+            stage: InstallationStage::Planned,
+        })?;
+        #[cfg(windows)]
+        let expected_identity = self
+            .temporary_file
+            .as_ref()
+            .ok_or(InstallationError::UnknownOutcome {
+                stage: InstallationStage::Planned,
+            })?
+            .identity;
+        #[cfg(windows)]
+        {
+            let retained = self
+                .temporary_file
+                .take()
+                .ok_or(InstallationError::UnknownOutcome {
+                    stage: InstallationStage::Planned,
+                })?;
+            if delete_owned_file_handle(retained.file, retained.identity).is_err() {
+                return Err(InstallationError::UnknownOutcome {
+                    stage: InstallationStage::Planned,
+                });
+            }
+        }
+        sync_parent_directory(directory).map_err(|_| InstallationError::UnknownOutcome {
+            stage: InstallationStage::Planned,
+        })?;
+        verify_published_publication_journal(
+            destination,
+            journal,
+            #[cfg(windows)]
+            Some(expected_identity),
+            #[cfg(not(windows))]
+            None,
+        )?;
+        #[cfg(test)]
+        if fault == PublicationJournalStoreFault::AfterFinalPublishBeforeResponse {
+            return Err(injected_publication_store_fault(
+                "after final publication before response",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn begin_new_source_bundle_publication_store(
+    destination: &Path,
+    journal: &SourceBundlePublicationJournal,
+    fault: PublicationJournalStoreFault,
+) -> Result<SourceBundlePublicationJournal, InstallationError> {
+    let mut publication = PendingTransactionStorePublication::reserve(destination)?;
+    #[cfg(test)]
+    if fault == PublicationJournalStoreFault::AfterTemporaryCreateBeforeInsert {
+        return Err(injected_publication_store_fault(
+            "after temporary create before journal insert",
+        ));
+    }
+    #[cfg(windows)]
+    let database = Database::builder()
+        .create_file(
+            publication
+                .temporary_file
+                .as_ref()
+                .ok_or(InstallationError::UnknownOutcome {
+                    stage: InstallationStage::Planned,
+                })?
+                .file
+                .try_clone()
+                .map_err(|error| {
+                    InstallationError::Platform(format!("temporary handle clone: {error}"))
+                })?,
+        )
+        .map_err(|error| InstallationError::Platform(format!("temporary create: {error}")))?;
+    #[cfg(not(windows))]
+    let database = Database::create(publication.temporary())
+        .map_err(|error| InstallationError::Platform(format!("temporary create: {error}")))?;
+    insert_publication_journal(&database, journal).map_err(|error| match error {
+        InstallationError::Platform(reason) => {
+            InstallationError::Platform(format!("temporary journal populate: {reason}"))
+        }
+        other => other,
+    })?;
+    #[cfg(windows)]
+    publication
+        .temporary_file
+        .as_ref()
+        .ok_or(InstallationError::UnknownOutcome {
+            stage: InstallationStage::Planned,
+        })?
+        .file
+        .sync_all()
+        .map_err(|error| InstallationError::Platform(format!("temporary sync: {error}")))?;
+    #[cfg(not(windows))]
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(publication.temporary())
+        .and_then(|file| file.sync_all())
+        .map_err(|error| InstallationError::Platform(format!("temporary sync: {error}")))?;
+    verify_publication_journal_database(&database, journal)?;
+    drop(database);
+    publication.retain_written_temporary()?;
+    #[cfg(not(windows))]
+    verify_published_publication_journal(publication.temporary(), journal, None)?;
+    #[cfg(test)]
+    if fault == PublicationJournalStoreFault::AfterJournalCommitBeforePublish {
+        return Err(injected_publication_store_fault(
+            "after journal commit before final publication",
+        ));
+    }
+    publication.publish_publication_journal(destination, journal, fault)?;
+    let store = RedbInstallationTransactionStore::open_existing_exact_path(destination)?;
+    let recorded = store
+        .load_source_bundle_publication(&journal.operation_id)?
+        .ok_or(InstallationError::UnknownOutcome {
+            stage: InstallationStage::Planned,
+        })?;
+    if recorded != *journal {
+        return Err(InstallationError::IdentityConflict);
+    }
+    verify_publication_intent(&recorded)?;
+    Ok(recorded)
+}
+
+fn verify_publication_journal_database(
+    database: &impl ReadableDatabase,
+    expected: &SourceBundlePublicationJournal,
+) -> Result<(), InstallationError> {
+    let actual = read_publication_journal(database, &expected.operation_id)?.ok_or(
+        InstallationError::UnknownOutcome {
+            stage: InstallationStage::Planned,
+        },
+    )?;
+    if actual != *expected {
+        return Err(InstallationError::IdentityConflict);
+    }
+    verify_publication_intent(&actual)
+}
+
+fn verify_published_publication_journal(
+    path: &Path,
+    expected: &SourceBundlePublicationJournal,
+    expected_identity: Option<FileIdentity>,
+) -> Result<(), InstallationError> {
+    #[cfg(windows)]
+    let (published_identity, published_file) =
+        open_no_follow_file(path).map_err(|_| InstallationError::UnknownOutcome {
+            stage: InstallationStage::Planned,
+        })?;
+    #[cfg(windows)]
+    if expected_identity != Some(published_identity) {
+        return Err(InstallationError::UnknownOutcome {
+            stage: InstallationStage::Planned,
+        });
+    }
+    let store = RedbInstallationTransactionStore::open_existing_exact_path(path).map_err(|_| {
+        InstallationError::UnknownOutcome {
+            stage: InstallationStage::Planned,
+        }
+    })?;
+    let actual = store
+        .load_source_bundle_publication(&expected.operation_id)?
+        .ok_or(InstallationError::UnknownOutcome {
+            stage: InstallationStage::Planned,
+        })?;
+    if actual != *expected {
+        return Err(InstallationError::IdentityConflict);
+    }
+    verify_publication_intent(&actual)?;
+    #[cfg(windows)]
+    {
+        let identity = file_identity_for_open_handle(&published_file).map_err(|_| {
+            InstallationError::UnknownOutcome {
+                stage: InstallationStage::Planned,
+            }
+        })?;
+        if identity != published_identity
+            || published_identity.volume_serial_number == 0
+            || published_identity.file_index == 0
+        {
+            return Err(InstallationError::UnknownOutcome {
+                stage: InstallationStage::Planned,
+            });
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = expected_identity;
+    Ok(())
+}
+
+#[cfg(test)]
+fn injected_publication_store_fault(boundary: &str) -> InstallationError {
+    InstallationError::Platform(format!(
+        "injected source publication journal store fault {boundary}"
+    ))
 }
 
 impl Drop for PendingTransactionStorePublication {
@@ -1444,8 +1674,53 @@ fn verify_publication_bundle(
         {
             return Err(InstallationError::IdentityConflict);
         }
+        if role.executable {
+            let expected_authenticode = role
+                .authenticode
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?;
+            let verified_authenticode = verify_publication_authenticode(
+                &bundle.path().join(&role.relative_path),
+                actual.identity,
+                &actual.sha256,
+                expected_authenticode,
+            )?;
+            if verified_authenticode.verdict != AuthenticodeVerdict::Valid
+                || verified_authenticode != *expected_authenticode
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
     }
     Ok(())
+}
+
+fn verify_publication_authenticode(
+    path: &Path,
+    identity: FileIdentity,
+    sha256: &str,
+    expected: &AuthenticodeEvidence,
+) -> Result<AuthenticodeEvidence, InstallationError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if is_explicit_test_support_authenticode(expected) {
+        return Ok(expected.clone());
+    }
+    WindowsAuthenticodeVerifier
+        .verify(path, identity, sha256)
+        .map_err(|error| InstallationError::Platform(format!("Authenticode readback: {error}")))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn is_explicit_test_support_authenticode(evidence: &AuthenticodeEvidence) -> bool {
+    evidence.verdict == AuthenticodeVerdict::Valid
+        && evidence.signer_certificate_sha256.as_deref()
+            == Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        && evidence.signer_subject.as_deref() == Some("ELIOT test-support unsigned fixture")
+        && evidence.signer_not_before_unix_seconds == Some(1)
+        && evidence.signer_not_after_unix_seconds == Some(2)
+        && evidence.verification_time_unix_seconds == Some(1)
+        && evidence.countersigner_certificate_sha256.is_none()
+        && evidence.trust_status == 0
 }
 
 fn verify_publication_intent(
@@ -1917,7 +2192,7 @@ mod tests {
                 authenticode: executable.then_some(AuthenticodeEvidence {
                     verdict: eliot_platform_windows::AuthenticodeVerdict::Valid,
                     signer_certificate_sha256: Some("a".repeat(64)),
-                    signer_subject: Some("fixture".to_owned()),
+                    signer_subject: Some("ELIOT test-support unsigned fixture".to_owned()),
                     signer_not_before_unix_seconds: Some(1),
                     signer_not_after_unix_seconds: Some(2),
                     verification_time_unix_seconds: Some(1),
@@ -2053,7 +2328,7 @@ mod tests {
                     authenticode: (*executable).then_some(AuthenticodeEvidence {
                         verdict: eliot_platform_windows::AuthenticodeVerdict::Valid,
                         signer_certificate_sha256: Some("a".repeat(64)),
-                        signer_subject: Some("fixture".to_owned()),
+                        signer_subject: Some("ELIOT test-support unsigned fixture".to_owned()),
                         signer_not_before_unix_seconds: Some(1),
                         signer_not_after_unix_seconds: Some(2),
                         verification_time_unix_seconds: Some(1),
@@ -2227,6 +2502,163 @@ mod tests {
         ));
         drop(store);
         let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_publication_journal_store_is_atomic_at_every_publication_boundary() {
+        let directory = std::env::temp_dir().join(format!(
+            "eliot-installation-source-publication-atomic-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create atomic journal directory");
+        let output_bundle = directory.join("bundle");
+        let (publication, intent) = live_publication_journal_fixture(&output_bundle);
+        drop(publication);
+
+        let unauthorized_final = directory.join("unauthorized-existing.redb");
+        drop(Database::create(&unauthorized_final).expect("create caller-owned final store"));
+        let unauthorized_before = fs::read(&unauthorized_final).expect("read caller-owned store");
+        assert!(matches!(
+            RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
+                &unauthorized_final,
+                &intent,
+            ),
+            Err(InstallationError::MigrationRequired { .. })
+        ));
+        assert_eq!(
+            fs::read(&unauthorized_final).expect("read untouched caller-owned store"),
+            unauthorized_before,
+            "an existing final without the exact journal must never be adopted or mutated"
+        );
+
+        for (name, fault) in [
+            (
+                "before-publish.redb",
+                PublicationJournalStoreFault::AfterJournalCommitBeforePublish,
+            ),
+            (
+                "before-insert.redb",
+                PublicationJournalStoreFault::AfterTemporaryCreateBeforeInsert,
+            ),
+        ] {
+            let path = directory.join(name);
+            let fault_result =
+                RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path_with_fault(
+                    &path,
+                    &intent,
+                    fault,
+                );
+            assert!(
+                matches!(
+                    &fault_result,
+                    Err(InstallationError::Platform(reason)) if reason.contains("injected source publication journal store fault")
+                ),
+                "unexpected fault result: {fault_result:?}"
+            );
+            assert!(
+                !path.exists(),
+                "a crash before no-replace publication must leave the final store absent"
+            );
+            assert_eq!(
+                RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
+                    &path, &intent,
+                )
+                .expect("retry atomic journal publication"),
+                intent
+            );
+        }
+
+        let response_loss_path = directory.join("after-publish.redb");
+        assert!(matches!(
+            RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path_with_fault(
+                &response_loss_path,
+                &intent,
+                PublicationJournalStoreFault::AfterFinalPublishBeforeResponse,
+            ),
+            Err(InstallationError::Platform(reason)) if reason.contains("injected source publication journal store fault")
+        ));
+        assert!(
+            response_loss_path.exists(),
+            "the deterministic response-loss seam must expose the committed final store"
+        );
+        assert_eq!(
+            RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
+                &response_loss_path,
+                &intent,
+            )
+            .expect("reconcile response-loss journal publication"),
+            intent
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsigned_or_caller_forged_valid_authenticode_never_creates_journal_authority() {
+        let directory = std::env::temp_dir().join(format!(
+            "eliot-installation-source-publication-authenticode-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create Authenticode journal directory");
+        let output_bundle = directory.join("bundle");
+        let (publication, intent) = live_publication_journal_fixture(&output_bundle);
+        drop(publication);
+
+        let mut unsigned = intent.clone();
+        unsigned.precommit_files[0]
+            .authenticode
+            .as_mut()
+            .expect("executable evidence")
+            .verdict = AuthenticodeVerdict::Unsigned;
+        unsigned.precommit_digest = PlatformHandle::new(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&unsigned.precommit_files).expect("unsigned inventory")
+            )
+        ))
+        .expect("unsigned digest");
+        let unsigned_store = directory.join("unsigned.redb");
+        assert!(
+            RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
+                &unsigned_store,
+                &unsigned,
+            )
+            .is_err()
+        );
+        assert!(!unsigned_store.exists());
+
+        let mut forged_valid = intent;
+        for role in forged_valid
+            .precommit_files
+            .iter_mut()
+            .filter(|role| role.executable)
+        {
+            role.authenticode
+                .as_mut()
+                .expect("executable evidence")
+                .signer_subject = Some("caller-forged Valid evidence".to_owned());
+        }
+        forged_valid.precommit_digest = PlatformHandle::new(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&forged_valid.precommit_files).expect("forged inventory")
+            )
+        ))
+        .expect("forged digest");
+        let forged_store = directory.join("forged-valid.redb");
+        assert!(
+            RedbInstallationTransactionStore::begin_source_bundle_publication_at_exact_path(
+                &forged_store,
+                &forged_valid,
+            )
+            .is_err(),
+            "caller-authored Valid evidence must be rechecked by official WinTrust"
+        );
+        assert!(!forged_store.exists());
         let _ = fs::remove_dir_all(directory);
     }
 

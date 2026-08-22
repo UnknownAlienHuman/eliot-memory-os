@@ -1428,6 +1428,14 @@ fn reconcile_existing_publication(
             precommit_files,
             "durable publication journal exists but its destination is absent".to_owned(),
         ))),
+        Err(error) if journal.state == SourceBundlePublicationJournalState::Intent => {
+            Ok(Some(persist_unknown_publication(
+                &store,
+                &journal,
+                precommit_files,
+                format!("durable publication reconciliation rejected: {error}"),
+            )?))
+        }
         Err(error) => Ok(Some(journal_unknown_outcome(
             &journal,
             precommit_files,
@@ -1740,11 +1748,11 @@ mod tests {
                 pe,
                 authenticode: AuthenticodeEvidence {
                     verdict: eliot_platform_windows::AuthenticodeVerdict::Valid,
-                    signer_certificate_sha256: None,
-                    signer_subject: None,
-                    signer_not_before_unix_seconds: None,
-                    signer_not_after_unix_seconds: None,
-                    verification_time_unix_seconds: None,
+                    signer_certificate_sha256: Some("a".repeat(64)),
+                    signer_subject: Some("ELIOT test-support unsigned fixture".to_owned()),
+                    signer_not_before_unix_seconds: Some(1),
+                    signer_not_after_unix_seconds: Some(2),
+                    verification_time_unix_seconds: Some(1),
                     countersigner_certificate_sha256: None,
                     trust_status: 0,
                 },
@@ -2055,6 +2063,41 @@ mod tests {
                 .count();
             assert_eq!(temporary_count, usize::from(substituted));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejected_destination_reconciliation_is_durably_unknown() {
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let input = test_input(&source_parent, &anchor, &staging);
+        let journal = crash_after_publication_intent(&input);
+        fs::create_dir(&journal.output_bundle).unwrap();
+        fs::write(journal.output_bundle.join("foreign.txt"), b"foreign").unwrap();
+
+        let outcome = materialize_canary_source_bundle(&input).unwrap();
+        assert!(matches!(
+            outcome,
+            CanarySourceBundleMaterializeOutcome::CommittedUnknown(_)
+        ));
+        let store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&input.store_path).unwrap();
+        let recorded = store
+            .load_source_bundle_publication(&journal.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorded.state,
+            SourceBundlePublicationJournalState::CommittedUnknown
+        );
+        assert!(
+            recorded
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("reconciliation rejected"))
+        );
+        assert!(journal.temporary_path.exists());
     }
 
     #[cfg(windows)]
