@@ -10915,6 +10915,29 @@ fn process_token_identity(
     result
 }
 
+/// Returns whether the current process token has enabled membership in the
+/// built-in Administrators group.
+///
+/// This is an observation only. It does not grant authority and callers that
+/// cross an administrative mutation boundary must independently require an
+/// elevated token and the operation-specific typed request.
+///
+/// # Errors
+///
+/// Returns a typed adapter error when the current process token or its group
+/// membership cannot be observed, or when called off Windows.
+pub fn is_process_builtin_administrator() -> Result<bool, WindowsAdapterError> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        process_token_is_builtin_administrator(unsafe { GetCurrentProcess() })
+    }
+    #[cfg(not(windows))]
+    {
+        Err(WindowsAdapterError::Unavailable)
+    }
+}
+
 #[cfg(windows)]
 fn process_token_is_builtin_administrator(
     process: windows_sys::Win32::Foundation::HANDLE,
@@ -14250,6 +14273,12 @@ mod tests {
             admin.auth_discriminator(),
             NamedPipeAuthDiscriminator::BuiltinAdministrators
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_process_builtin_administrator_membership_is_read_only_observable() {
+        assert!(is_process_builtin_administrator().is_ok());
     }
 
     #[test]

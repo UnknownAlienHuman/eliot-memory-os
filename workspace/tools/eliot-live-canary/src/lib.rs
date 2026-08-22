@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CANARY_SCHEMA: &str = "eliot.runtime.live-canary.v2";
+pub const CANARY_SCHEMA: &str = "eliot.runtime.live-canary.v3";
 pub const DEFAULT_DEADLINE_MS: u64 = 30_000;
 pub const MAX_DEADLINE_MS: u64 = 120_000;
 const MAX_EVIDENCE_BYTES: usize = 128 * 1024;
@@ -38,6 +38,7 @@ pub enum Pulse {
     Two = 2,
     Three = 3,
     Four = 4,
+    Five = 5,
 }
 
 impl TryFrom<u8> for Pulse {
@@ -49,8 +50,9 @@ impl TryFrom<u8> for Pulse {
             2 => Ok(Self::Two),
             3 => Ok(Self::Three),
             4 => Ok(Self::Four),
+            5 => Ok(Self::Five),
             _ => Err(CanaryError::Invalid(format!(
-                "pulse must be one of 1, 2, 3, 4 (got {value})"
+                "pulse must be one of 1, 2, 3, 4, 5 (got {value})"
             ))),
         }
     }
@@ -84,18 +86,60 @@ pub struct ProcessSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContourSnapshot {
+    pub host_epoch_lineage: String,
+    pub host_epoch_sequence: u64,
+    pub host_epoch_parent_lineage: Option<String>,
+    pub host_epoch_parent_sequence: Option<u64>,
+    pub host_process_nonce_digest: String,
+    pub activation_id: Option<String>,
+    pub activation_generation: Option<String>,
+    pub activation_state: Option<String>,
     pub sequence: u64,
     pub last_checksum: Option<String>,
     pub kernel: Option<ProcessSnapshot>,
     pub kernel_generation: Option<String>,
     pub kernel_generation_digest: Option<String>,
+    pub kernel_activation_nonce_digest: Option<String>,
+    pub kernel_state: Option<String>,
     pub store: Option<ProcessSnapshot>,
     pub store_generation: Option<String>,
     pub store_fence: Option<String>,
     pub store_request_digest: Option<String>,
     pub ready_receipt_digest: Option<String>,
     pub readiness_observation_digest: Option<String>,
+    pub clean_marker_last_sequence: Option<u64>,
+    pub clean_marker_last_checksum: Option<String>,
     pub integrity_gaps: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScmProcessSnapshot {
+    pub process_id: u32,
+    pub start_time_100ns: u64,
+    pub image_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScmRuntimeSnapshot {
+    pub service_name: String,
+    pub configuration_digest: String,
+    pub state: String,
+    pub runtime_identity_digest: Option<String>,
+    pub process: Option<ScmProcessSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PulseFiveScmEvidence {
+    pub approved_generation: String,
+    pub host_before: ScmRuntimeSnapshot,
+    pub host_stopped: ScmRuntimeSnapshot,
+    pub host_after: ScmRuntimeSnapshot,
+    pub watchdog_before: ScmRuntimeSnapshot,
+    pub watchdog_while_host_stopped: ScmRuntimeSnapshot,
+    pub watchdog_after: ScmRuntimeSnapshot,
+    pub stopped_runtime_status: String,
+    pub stopped_runtime_status_digest: String,
+    pub owner_release_digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -145,6 +189,8 @@ pub struct PulseEvidence {
     pub status: String,
     pub before: Option<ContourSnapshot>,
     pub after: Option<ContourSnapshot>,
+    pub stop_boundary: Option<ContourSnapshot>,
+    pub pulse_five_scm: Option<PulseFiveScmEvidence>,
     pub request_digest: Option<String>,
     pub receipt_digest: Option<String>,
     pub dynamic_supervision: Option<DynamicSupervisionEvidence>,
@@ -234,6 +280,8 @@ struct PassEvidenceInput {
     pulse: Pulse,
     before: Option<ContourSnapshot>,
     after: Option<ContourSnapshot>,
+    stop_boundary: Option<ContourSnapshot>,
+    pulse_five_scm: Option<PulseFiveScmEvidence>,
     request_digest: Option<String>,
     receipt_digest: Option<String>,
     dynamic_supervision: Option<DynamicSupervisionEvidence>,
@@ -259,6 +307,8 @@ impl RuntimeObservation {
             status: self.report.status.clone(),
             before: input.before,
             after: input.after,
+            stop_boundary: input.stop_boundary,
+            pulse_five_scm: input.pulse_five_scm,
             request_digest: input.request_digest,
             receipt_digest: input.receipt_digest,
             dynamic_supervision: input.dynamic_supervision,
@@ -348,6 +398,7 @@ impl ProductionCanary {
             Pulse::Two => self.run_pulse_two(&observation),
             Pulse::Three => self.run_pulse_three(observation, deadline).await,
             Pulse::Four => self.run_pulse_four(observation, deadline).await,
+            Pulse::Five => self.run_pulse_five(observation, deadline).await,
         }
     }
 
@@ -381,6 +432,8 @@ impl ProductionCanary {
             pulse: Pulse::One,
             before: None,
             after: Some(observation.contour.clone()),
+            stop_boundary: None,
+            pulse_five_scm: None,
             request_digest: None,
             receipt_digest: None,
             dynamic_supervision: observation.dynamic_supervision.clone(),
@@ -405,6 +458,8 @@ impl ProductionCanary {
             pulse: Pulse::Two,
             before: Some(observation.contour.clone()),
             after: Some(observation.contour.clone()),
+            stop_boundary: None,
+            pulse_five_scm: None,
             request_digest: None,
             receipt_digest: Some(dynamic.receipt_digest.clone()),
             dynamic_supervision: Some(dynamic),
@@ -483,6 +538,8 @@ impl ProductionCanary {
             pulse: Pulse::Three,
             before: Some(before.contour),
             after: Some(after.contour.clone()),
+            stop_boundary: None,
+            pulse_five_scm: None,
             request_digest: Some(control.request_digest),
             receipt_digest: Some(control.receipt_digest),
             dynamic_supervision: after.dynamic_supervision.clone(),
@@ -564,10 +621,59 @@ impl ProductionCanary {
             pulse: Pulse::Four,
             before: Some(before.contour),
             after: Some(after.contour.clone()),
+            stop_boundary: None,
+            pulse_five_scm: None,
             request_digest: Some(control.request_digest),
             receipt_digest: Some(control.receipt_digest),
             dynamic_supervision: after.dynamic_supervision.clone(),
         }))
+    }
+
+    async fn run_pulse_five(
+        &self,
+        before: RuntimeObservation,
+        deadline: Instant,
+    ) -> PulseDisposition {
+        if let Some(blocked) = self.fault_gate(Pulse::Five, &before) {
+            return blocked;
+        }
+        if let Some(blocked) =
+            require_pulse_five_baseline(Pulse::Five, &before, &self.config.host_state_root)
+        {
+            return blocked;
+        }
+        #[cfg(windows)]
+        {
+            match run_windows_pulse_five(&self.config.host_state_root, &before, deadline).await {
+                Ok(result) => {
+                    PulseDisposition::Pass(result.after.pass_evidence(PassEvidenceInput {
+                        pulse: Pulse::Five,
+                        before: Some(before.contour),
+                        after: Some(result.after.contour.clone()),
+                        stop_boundary: Some(result.stop_boundary),
+                        pulse_five_scm: Some(result.scm_evidence.clone()),
+                        request_digest: Some(result.request_digest),
+                        receipt_digest: Some(result.receipt_digest),
+                        dynamic_supervision: result.after.dynamic_supervision.clone(),
+                    }))
+                }
+                Err(error) => before.fail(
+                    Pulse::Five,
+                    &self.config.host_state_root,
+                    format!("Pulse 5 Host stop/start failed closed: {error}"),
+                ),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = deadline;
+            before.blocked(
+                Pulse::Five,
+                &self.config.host_state_root,
+                "Pulse 5 requires the Windows exact-registration SCM adapter",
+                "eliot-platform-windows::WindowsPlatform",
+            )
+        }
     }
 
     fn fault_gate(
@@ -601,6 +707,25 @@ impl ProductionCanary {
                         &self.config.host_state_root,
                         format!("elevation state is unknown: {error}"),
                         "eliot-platform-windows::is_process_elevated",
+                    ));
+                }
+            }
+            match eliot_platform_windows::is_process_builtin_administrator() {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Some(observation.blocked(
+                        pulse,
+                        &self.config.host_state_root,
+                        "the current elevated token does not have enabled BUILTIN\\Administrators membership",
+                        "eliot-platform-windows::is_process_builtin_administrator",
+                    ));
+                }
+                Err(error) => {
+                    return Some(observation.blocked(
+                        pulse,
+                        &self.config.host_state_root,
+                        format!("BUILTIN\\Administrators membership is unknown: {error}"),
+                        "eliot-platform-windows::is_process_builtin_administrator",
                     ));
                 }
             }
@@ -761,6 +886,40 @@ fn require_store_baseline(
     None
 }
 
+fn require_pulse_five_baseline(
+    pulse: Pulse,
+    observation: &RuntimeObservation,
+    root: &Path,
+) -> Option<PulseDisposition> {
+    if let Err(error) = validate_runtime_live_contour(&observation.report) {
+        return Some(observation.blocked(
+            pulse,
+            root,
+            format!("Host restart requires an exact RUNTIME_LIVE baseline: {error}"),
+            "eliot-runtime-status full runtime contour",
+        ));
+    }
+    let contour = &observation.contour;
+    if contour.activation_state.as_deref() != Some("Active")
+        || contour.kernel_state.as_deref() != Some("Active")
+        || contour.kernel.is_none()
+        || contour.store.is_none()
+        || contour.kernel_activation_nonce_digest.is_none()
+        || contour.ready_receipt_digest.is_none()
+        || contour.readiness_observation_digest.is_none()
+        || !contour.integrity_gaps.is_empty()
+        || observation.dynamic_supervision.is_none()
+    {
+        return Some(observation.blocked(
+            pulse,
+            root,
+            "Host restart requires exact Active Host/Kernel/Store, consumed activation nonce, fresh readiness and dynamic supervision evidence",
+            "eliot-host-state retained active contour",
+        ));
+    }
+    None
+}
+
 fn validate_post_runtime(
     before: &RuntimeObservation,
     after: &RuntimeObservation,
@@ -815,6 +974,737 @@ fn validate_runtime_live_contour(report: &RuntimeStatusReport) -> Result<(), Str
         );
     }
     Ok(())
+}
+
+#[cfg(windows)]
+struct PulseFiveAuthority {
+    platform: eliot_platform_windows::WindowsPlatform,
+    host_request: eliot_platform_windows::ServiceRegistrationRequest,
+    watchdog_request: eliot_platform_windows::ServiceRegistrationRequest,
+    installation_id: PlatformHandle,
+    approved_generation: String,
+    _host_root_lease: eliot_platform_windows::ProtectedRootLease,
+}
+
+#[cfg(windows)]
+struct PulseFiveResult {
+    after: RuntimeObservation,
+    stop_boundary: ContourSnapshot,
+    scm_evidence: PulseFiveScmEvidence,
+    request_digest: String,
+    receipt_digest: String,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct PulseFiveMutationLedger {
+    stop_calls: u8,
+    start_calls: u8,
+    stopped_clean_proven: bool,
+    owner_released_proven: bool,
+}
+
+#[cfg(windows)]
+impl PulseFiveMutationLedger {
+    fn stop_once<T>(&mut self, effect: impl FnOnce() -> T) -> Result<T, String> {
+        if self.stop_calls != 0 || self.start_calls != 0 {
+            return Err("Pulse 5 permits exactly one ordered Host stop call".to_owned());
+        }
+        self.stop_calls = 1;
+        Ok(effect())
+    }
+
+    fn record_stopped_clean(&mut self) -> Result<(), String> {
+        if self.stop_calls != 1 || self.start_calls != 0 || self.stopped_clean_proven {
+            return Err("StoppedClean proof is out of order or duplicated".to_owned());
+        }
+        self.stopped_clean_proven = true;
+        Ok(())
+    }
+
+    fn record_owner_released(&mut self) -> Result<(), String> {
+        if !self.stopped_clean_proven || self.start_calls != 0 || self.owner_released_proven {
+            return Err("owner release must follow the sole StoppedClean proof".to_owned());
+        }
+        self.owner_released_proven = true;
+        Ok(())
+    }
+
+    fn start_once<T>(&mut self, effect: impl FnOnce() -> T) -> Result<T, String> {
+        if self.stop_calls != 1
+            || self.start_calls != 0
+            || !self.stopped_clean_proven
+            || !self.owner_released_proven
+        {
+            return Err(
+                "Pulse 5 permits one Host start only after StoppedClean and owner release"
+                    .to_owned(),
+            );
+        }
+        self.start_calls = 1;
+        Ok(effect())
+    }
+
+    fn validate_complete(&self) -> Result<(), String> {
+        if self.stop_calls == 1 && self.start_calls == 1 {
+            Ok(())
+        } else {
+            Err("Pulse 5 did not execute exactly one Host stop and one Host start".to_owned())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn load_pulse_five_authority(
+    root: &Path,
+    before: &RuntimeObservation,
+) -> Result<PulseFiveAuthority, String> {
+    use eliot_installation::{InstallerServiceRole, RedbInstallationRegistry};
+    use eliot_platform_windows::ProtectedRootLease;
+
+    let registry_root = ProtectedRootLease::open_existing(root)
+        .map_err(|error| format!("retain Host root for installer registry: {error}"))?;
+    let canonical = registry_root
+        .canonical_path()
+        .map_err(|error| format!("resolve retained Host root: {error}"))?;
+    registry_root
+        .verify_stable_identity()
+        .map_err(|error| format!("verify retained Host root: {error}"))?;
+    if !eliot_platform_windows::windows_paths_equal(root, &canonical) {
+        return Err("caller Host root differs from the retained OS identity".to_owned());
+    }
+    let registry = RedbInstallationRegistry::inspect_existing_at(registry_root)
+        .map_err(|error| format!("inspect retained installation registry: {error}"))?
+        .ok_or_else(|| "retained installation registry is absent".to_owned())?;
+    let active = registry
+        .active()
+        .ok_or_else(|| "installation registry has no exact active generation".to_owned())?;
+    let generation = active.manifest.generation.clone();
+    let committed = registry
+        .last_committed_activation_fence()
+        .ok_or_else(|| "active generation has no committed activation fence".to_owned())?;
+    if committed.generation != generation
+        || committed.config_digest != active.manifest.config_digest
+        || active.manifest.runtime_launch.generation != generation
+    {
+        return Err(
+            "active manifest, committed activation fence and runtime launch generation disagree"
+                .to_owned(),
+        );
+    }
+    let manifest_root = Path::new(
+        active
+            .manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    if !eliot_platform_windows::windows_paths_equal(&canonical, manifest_root) {
+        return Err(
+            "caller Host root is not the active manifest-derived host_state_root".to_owned(),
+        );
+    }
+    let (journal_state, journal_contour, journal_digest) =
+        inspect_journal_contour(&canonical).map_err(|error| error.to_string())?;
+    if journal_digest != before.journal_digest
+        || journal_contour != before.contour
+        || journal_state.host.installation
+            != active
+                .manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+    {
+        return Err(
+            "Host journal changed or names a different installation while SCM authority was loaded"
+                .to_owned(),
+        );
+    }
+    let host_request = registry
+        .service_registration_approval(&generation, InstallerServiceRole::Host)
+        .ok_or_else(|| "active generation has no installer-owned EliotHost approval".to_owned())?
+        .service_registration_request()
+        .map_err(|error| format!("reconstruct approved EliotHost request: {error}"))?;
+    let watchdog_request = registry
+        .service_registration_approval(&generation, InstallerServiceRole::Watchdog)
+        .ok_or_else(|| {
+            "active generation has no installer-owned EliotWatchdog approval".to_owned()
+        })?
+        .service_registration_request()
+        .map_err(|error| format!("reconstruct approved EliotWatchdog request: {error}"))?;
+    let retained = ProtectedRootLease::open_existing(&canonical)
+        .map_err(|error| format!("retain Host root for Pulse 5 lifetime: {error}"))?;
+    retained
+        .verify_stable_identity()
+        .map_err(|error| format!("verify Pulse 5 Host root lifetime lease: {error}"))?;
+    let platform = eliot_platform_windows::WindowsPlatform::new(canonical)
+        .map_err(|error| format!("bind Windows adapter to retained Host root: {error}"))?;
+    Ok(PulseFiveAuthority {
+        platform,
+        host_request,
+        watchdog_request,
+        installation_id: journal_state.host.installation,
+        approved_generation: generation.as_str().to_owned(),
+        _host_root_lease: retained,
+    })
+}
+
+#[cfg(windows)]
+fn scm_state_name(observation: &eliot_platform_windows::ServiceRuntimeObservation) -> String {
+    if observation.is_running() {
+        "Running"
+    } else if observation.is_starting() {
+        "Starting"
+    } else if observation.is_stopping() {
+        "Stopping"
+    } else if observation.is_stopped() {
+        "Stopped"
+    } else {
+        "Unknown"
+    }
+    .to_owned()
+}
+
+#[cfg(windows)]
+fn scm_snapshot(
+    observation: &eliot_platform_windows::ServiceRuntimeObservation,
+) -> ScmRuntimeSnapshot {
+    ScmRuntimeSnapshot {
+        service_name: observation.service_name().to_owned(),
+        configuration_digest: observation.configuration_digest().to_owned(),
+        state: scm_state_name(observation),
+        runtime_identity_digest: observation.runtime_identity_digest(),
+        process: observation.process().map(|process| ScmProcessSnapshot {
+            process_id: process.process_id,
+            start_time_100ns: process.start_time_100ns,
+            image_path: process.image_path.clone(),
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn inspect_exact_scm(
+    authority: &PulseFiveAuthority,
+    request: &eliot_platform_windows::ServiceRegistrationRequest,
+    role: &str,
+) -> Result<eliot_platform_windows::ServiceRuntimeObservation, String> {
+    match authority
+        .platform
+        .inspect_service_registration_runtime(request)
+    {
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Matching { observation }
+            if observation.configuration_digest() == request.expected_configuration_digest() =>
+        {
+            Ok(observation)
+        }
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Matching { .. } => Err(
+            format!("{role} SCM configuration digest differs from installer approval"),
+        ),
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Absent => {
+            Err(format!("{role} SCM registration is absent"))
+        }
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Mismatched => {
+            Err(format!("{role} SCM registration is substituted"))
+        }
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Unknown => Err(format!(
+            "{role} SCM registration/runtime readback is Unknown"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn require_running_scm(
+    authority: &PulseFiveAuthority,
+    request: &eliot_platform_windows::ServiceRegistrationRequest,
+    role: &str,
+) -> Result<eliot_platform_windows::ServiceRuntimeObservation, String> {
+    let observation = inspect_exact_scm(authority, request, role)?;
+    if !observation.is_running()
+        || observation.process().is_none()
+        || observation.runtime_identity_digest().is_none()
+    {
+        return Err(format!(
+            "{role} is not exact Running PID/start/image/config evidence"
+        ));
+    }
+    Ok(observation)
+}
+
+#[cfg(windows)]
+fn require_same_watchdog(
+    before: &eliot_platform_windows::ServiceRuntimeObservation,
+    observed: &eliot_platform_windows::ServiceRuntimeObservation,
+) -> Result<(), String> {
+    if !observed.is_running()
+        || before.configuration_digest() != observed.configuration_digest()
+        || before.runtime_identity_digest() != observed.runtime_identity_digest()
+        || before.process() != observed.process()
+    {
+        return Err(
+            "EliotWatchdog sibling did not retain the exact Running PID/start/image/config identity"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_status_registration_against_scm(
+    registration: &ServiceRegistrationState,
+    observation: &eliot_platform_windows::ServiceRuntimeObservation,
+    role: &str,
+) -> Result<(), String> {
+    let expected = observation
+        .process()
+        .ok_or_else(|| format!("{role} SCM process identity is absent"))?;
+    let projected = registration
+        .observed_runtime
+        .as_ref()
+        .ok_or_else(|| format!("{role} runtime-status process identity is absent"))?;
+    if registration.registration != "Matching"
+        || registration.state != "Running"
+        || projected.process_id != expected.process_id
+        || projected.start_time_100ns != expected.start_time_100ns
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(&projected.image_path),
+            Path::new(&expected.image_path),
+        )
+        || observation.runtime_identity_digest().as_deref()
+            != Some(projected.runtime_identity_digest.as_str())
+    {
+        return Err(format!(
+            "{role} runtime-status projection differs from exact SCM readback"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn wait_for_host_state(
+    authority: &PulseFiveAuthority,
+    want_running: bool,
+    watchdog_before: &eliot_platform_windows::ServiceRuntimeObservation,
+    deadline: Instant,
+) -> Result<eliot_platform_windows::ServiceRuntimeObservation, String> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "deadline exceeded while waiting for EliotHost {}",
+                if want_running { "Running" } else { "Stopped" }
+            ));
+        }
+        let watchdog =
+            require_running_scm(authority, &authority.watchdog_request, "EliotWatchdog")?;
+        require_same_watchdog(watchdog_before, &watchdog)?;
+        let host = inspect_exact_scm(authority, &authority.host_request, "EliotHost")?;
+        if (want_running && host.is_running()) || (!want_running && host.is_stopped()) {
+            if want_running
+                && (host.process().is_none() || host.runtime_identity_digest().is_none())
+            {
+                return Err("Running EliotHost lacks exact runtime identity".to_owned());
+            }
+            if !want_running && host.process().is_some() {
+                return Err("Stopped EliotHost still exposes a live process identity".to_owned());
+            }
+            return Ok(host);
+        }
+        let expected_transition = if want_running {
+            host.is_starting()
+        } else {
+            host.is_stopping()
+        };
+        if !expected_transition {
+            return Err(format!(
+                "EliotHost entered unexpected SCM state {} during {}",
+                scm_state_name(&host),
+                if want_running { "start" } else { "stop" }
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait =
+            Duration::from_millis(u64::from(host.wait_hint_ms()).clamp(50, 500)).min(remaining);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+#[cfg(windows)]
+fn validate_stopped_boundary(
+    before: &ContourSnapshot,
+    state: &HostState,
+    stopped: &ContourSnapshot,
+) -> Result<(), String> {
+    validate_stopped_contour(before, stopped)?;
+    let activation = state
+        .activation
+        .as_ref()
+        .ok_or_else(|| "stopped Host journal has no activation record".to_owned())?;
+    let marker = state
+        .clean_marker
+        .as_ref()
+        .ok_or_else(|| "stopped Host journal has no CleanMarker".to_owned())?;
+    if activation.state != eliot_host_state::ActivationState::StoppedClean {
+        return Err("Host did not durably reach StoppedClean before SCM start".to_owned());
+    }
+    if marker.manifest.last_sequence <= before.sequence
+        || marker.manifest.last_sequence.checked_add(1) != Some(state.sequence)
+        || stopped.clean_marker_last_sequence != Some(marker.manifest.last_sequence)
+        || stopped.clean_marker_last_checksum.as_deref()
+            != Some(marker.manifest.last_checksum.as_str())
+    {
+        return Err(
+            "CleanMarker is not the final verified journal record covering the pre-stop sequence"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_stopped_contour(
+    before: &ContourSnapshot,
+    stopped: &ContourSnapshot,
+) -> Result<(), String> {
+    if stopped.activation_state.as_deref() != Some("StoppedClean")
+        || stopped.clean_marker_last_sequence.is_none()
+        || stopped.clean_marker_last_checksum.is_none()
+        || stopped
+            .clean_marker_last_sequence
+            .is_some_and(|sequence| sequence <= before.sequence)
+        || stopped
+            .clean_marker_last_sequence
+            .and_then(|sequence| sequence.checked_add(1))
+            != Some(stopped.sequence)
+    {
+        return Err(
+            "stopped contour lacks a final CleanMarker covering the pre-stop journal".to_owned(),
+        );
+    }
+    if stopped.host_epoch_lineage != before.host_epoch_lineage
+        || stopped.host_epoch_sequence != before.host_epoch_sequence
+        || stopped.host_process_nonce_digest != before.host_process_nonce_digest
+        || stopped.activation_id != before.activation_id
+        || stopped.activation_generation != before.activation_generation
+    {
+        return Err("Host stop changed the active epoch/activation identity in place".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prove_owner_released(installation: &PlatformHandle) -> Result<String, String> {
+    let mut lease = eliot_platform_windows::HostOwnerLease::acquire(installation)
+        .map_err(|error| format!("HostOwnerLease was not cleanly released: {error}"))?;
+    if !lease.is_for_installation(installation) {
+        return Err("owner-lease probe selected a foreign installation".to_owned());
+    }
+    let name = lease.name().to_owned();
+    lease
+        .release()
+        .map_err(|error| format!("owner-lease probe release became Unknown: {error}"))?;
+    Ok(digest_bytes(
+        format!("eliot.pulse5.owner-released.v1:{name}").as_bytes(),
+    ))
+}
+
+#[cfg(windows)]
+fn validate_fresh_pulse_five_contour(
+    before: &RuntimeObservation,
+    stopped: &ContourSnapshot,
+    after: &RuntimeObservation,
+    scm: &PulseFiveScmEvidence,
+) -> Result<(), String> {
+    validate_runtime_live_contour(&after.report)?;
+    let old = &before.contour;
+    let new = &after.contour;
+    if new.host_epoch_lineage != old.host_epoch_lineage
+        || old.host_epoch_sequence.checked_add(1) != Some(new.host_epoch_sequence)
+        || new.host_epoch_parent_lineage.as_deref() != Some(old.host_epoch_lineage.as_str())
+        || new.host_epoch_parent_sequence != Some(old.host_epoch_sequence)
+    {
+        return Err("restarted Host epoch is not the exact direct child".to_owned());
+    }
+    if new.host_process_nonce_digest == old.host_process_nonce_digest
+        || new.activation_id == old.activation_id
+        || new.activation_generation == old.activation_generation
+        || new.kernel_generation_digest == old.kernel_generation_digest
+        || new.kernel_activation_nonce_digest == old.kernel_activation_nonce_digest
+        || new.ready_receipt_digest == old.ready_receipt_digest
+        || new.readiness_observation_digest == old.readiness_observation_digest
+    {
+        return Err(
+            "Host restart reused a predecessor Host/activation/Kernel/readiness identity"
+                .to_owned(),
+        );
+    }
+    if new.activation_state.as_deref() != Some("Active")
+        || new.kernel_state.as_deref() != Some("Active")
+        || !new.integrity_gaps.is_empty()
+        || stopped.activation_state.as_deref() != Some("StoppedClean")
+    {
+        return Err(
+            "post-start Host/Kernel contour is not exact Active after StoppedClean".to_owned(),
+        );
+    }
+    let old_supervision = before
+        .dynamic_supervision
+        .as_ref()
+        .ok_or_else(|| "baseline dynamic supervision is absent".to_owned())?;
+    let new_supervision = after
+        .dynamic_supervision
+        .as_ref()
+        .ok_or_else(|| "post-start dynamic supervision is absent".to_owned())?;
+    if old_supervision.lease_id == new_supervision.lease_id
+        || old_supervision.receipt_digest == new_supervision.receipt_digest
+        || old_supervision.publication_digest == new_supervision.publication_digest
+    {
+        return Err(
+            "post-start eliotd/ORS supervision reused predecessor lease/receipt/publication"
+                .to_owned(),
+        );
+    }
+    validate_pulse_five_scm_evidence(scm)
+}
+
+#[cfg(windows)]
+fn validate_pulse_five_scm_evidence(scm: &PulseFiveScmEvidence) -> Result<(), String> {
+    let before_host = scm
+        .host_before
+        .process
+        .as_ref()
+        .ok_or_else(|| "pre-stop Host process evidence is absent".to_owned())?;
+    let after_host = scm
+        .host_after
+        .process
+        .as_ref()
+        .ok_or_else(|| "post-start Host process evidence is absent".to_owned())?;
+    if scm.approved_generation.trim().is_empty()
+        || scm.host_before.service_name != eliot_platform_windows::ELIOT_HOST_SERVICE_NAME
+        || scm.host_stopped.service_name != eliot_platform_windows::ELIOT_HOST_SERVICE_NAME
+        || scm.host_after.service_name != eliot_platform_windows::ELIOT_HOST_SERVICE_NAME
+        || scm.host_before.configuration_digest != scm.host_stopped.configuration_digest
+        || scm.host_before.configuration_digest != scm.host_after.configuration_digest
+        || scm.host_before.runtime_identity_digest.is_none()
+        || scm.host_after.runtime_identity_digest.is_none()
+        || scm.host_before.runtime_identity_digest == scm.host_after.runtime_identity_digest
+        || scm.host_stopped.runtime_identity_digest.is_some()
+        || scm.host_before.state != "Running"
+        || scm.host_stopped.state != "Stopped"
+        || scm.host_stopped.process.is_some()
+        || scm.host_after.state != "Running"
+        || (before_host.process_id == after_host.process_id
+            && before_host.start_time_100ns == after_host.start_time_100ns)
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(&before_host.image_path),
+            Path::new(&after_host.image_path),
+        )
+    {
+        return Err(
+            "Host SCM stop/start did not produce a fresh exact process identity".to_owned(),
+        );
+    }
+    if scm.watchdog_before.service_name != eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_NAME
+        || scm.watchdog_before.state != "Running"
+        || scm.watchdog_before != scm.watchdog_while_host_stopped
+        || scm.watchdog_before != scm.watchdog_after
+    {
+        return Err("Watchdog sibling identity changed across Host stop/start".to_owned());
+    }
+    if scm.stopped_runtime_status == "RUNTIME_LIVE"
+        || !is_lower_hex(&scm.stopped_runtime_status_digest)
+        || !is_lower_hex(&scm.owner_release_digest)
+    {
+        return Err(
+            "stopped Host boundary retained stale Healthy or incomplete evidence".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn wait_for_runtime_live(
+    root: &Path,
+    deadline: Instant,
+) -> Result<RuntimeObservation, String> {
+    let mut last = "runtime has not yet been observed".to_owned();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "deadline exceeded before fresh full RUNTIME_LIVE: {last}"
+            ));
+        }
+        match observe_runtime(root, deadline) {
+            Ok(observation) => match validate_runtime_live_contour(&observation.report) {
+                Ok(()) if observation.dynamic_supervision.is_some() => return Ok(observation),
+                Ok(()) => {
+                    last.clear();
+                    last.push_str("dynamic supervision evidence is absent");
+                }
+                Err(error) => last = error,
+            },
+            Err(error) => last = error.to_string(),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
+    }
+}
+
+#[cfg(windows)]
+async fn run_windows_pulse_five(
+    root: &Path,
+    before: &RuntimeObservation,
+    deadline: Instant,
+) -> Result<PulseFiveResult, String> {
+    let authority = load_pulse_five_authority(root, before)?;
+    let fresh_before = observe_runtime(root, deadline).map_err(|error| error.to_string())?;
+    if fresh_before.status_digest != before.status_digest
+        || fresh_before.journal_digest != before.journal_digest
+        || fresh_before.dynamic_supervision != before.dynamic_supervision
+    {
+        return Err("runtime changed after baseline and before the Host stop boundary".to_owned());
+    }
+    let host_before = require_running_scm(&authority, &authority.host_request, "EliotHost")?;
+    let watchdog_before =
+        require_running_scm(&authority, &authority.watchdog_request, "EliotWatchdog")?;
+    validate_status_registration_against_scm(
+        &before.report.services.host_service_registration,
+        &host_before,
+        "EliotHost",
+    )?;
+    validate_status_registration_against_scm(
+        &before.report.services.watchdog_service_registration,
+        &watchdog_before,
+        "EliotWatchdog",
+    )?;
+    let host_runtime_digest = host_before
+        .runtime_identity_digest()
+        .ok_or_else(|| "pre-stop Host runtime identity digest is absent".to_owned())?;
+    let stop_request = authority
+        .host_request
+        .clone()
+        .with_expected_runtime_identity_digest(host_runtime_digest)
+        .map_err(|error| format!("bind exact pre-stop Host identity: {error}"))?;
+    let mut mutations = PulseFiveMutationLedger::default();
+    match mutations
+        .stop_once(|| authority.platform.stop_service_registration(&stop_request))?
+        .map_err(|error| format!("Host stop failed before classification: {error}"))?
+    {
+        eliot_platform_windows::ServiceStopOutcome::Stopped { .. } => {}
+        eliot_platform_windows::ServiceStopOutcome::AlreadyStopped { .. } => {
+            return Err("Host was already Stopped; Pulse 5 did not own a stop".to_owned());
+        }
+        eliot_platform_windows::ServiceStopOutcome::AlreadyStopping { .. } => {
+            return Err("Host was already Stopping; Pulse 5 did not own a stop".to_owned());
+        }
+        eliot_platform_windows::ServiceStopOutcome::EffectUnknown => {
+            return Err("Host stop outcome is Unknown; no stop or start is resent".to_owned());
+        }
+    }
+    let host_stopped = wait_for_host_state(&authority, false, &watchdog_before, deadline).await?;
+    let watchdog_stopped =
+        require_running_scm(&authority, &authority.watchdog_request, "EliotWatchdog")?;
+    require_same_watchdog(&watchdog_before, &watchdog_stopped)?;
+    let stopped_proof = (|| {
+        let (stopped_state, stop_boundary, _) =
+            inspect_journal_contour(root).map_err(|error| error.to_string())?;
+        validate_stopped_boundary(&before.contour, &stopped_state, &stop_boundary)?;
+        let stopped_status = collect_status(root, deadline)
+            .map_err(|error| format!("read stopped runtime status: {error}"))?;
+        if !root_matches_report(root, &stopped_status)
+            || stopped_status.status == "RUNTIME_LIVE"
+            || stopped_status.components.kernel.is_healthy()
+            || stopped_status.components.store.is_healthy()
+            || stopped_status.components.eliotd.is_healthy()
+            || stopped_status.services.kernel.is_healthy()
+            || stopped_status.services.store.is_healthy()
+            || stopped_status.services.eliotd.is_healthy()
+        {
+            return Err(
+                "stopped Host boundary was substituted or retained stale Kernel/Store/eliotd Healthy evidence"
+                    .to_owned(),
+            );
+        }
+        let stopped_status_digest =
+            digest_json(&stopped_status).map_err(|error| error.to_string())?;
+        Ok::<_, String>((stop_boundary, stopped_status.status, stopped_status_digest))
+    })();
+    let (stop_boundary, stopped_runtime_status, stopped_status_digest) = stopped_proof?;
+    mutations.record_stopped_clean()?;
+    let owner_release_digest = prove_owner_released(&authority.installation_id)?;
+    mutations.record_owner_released()?;
+    match mutations
+        .start_once(|| {
+            authority
+                .platform
+                .start_service_registration(&authority.host_request)
+        })?
+        .map_err(|error| format!("Host start failed before classification: {error}"))?
+    {
+        eliot_platform_windows::ServiceStartOutcome::Started { .. } => {}
+        eliot_platform_windows::ServiceStartOutcome::AlreadyRunning { .. } => {
+            return Err("Host was already Running; Pulse 5 did not own a start".to_owned());
+        }
+        eliot_platform_windows::ServiceStartOutcome::AlreadyStarting { .. } => {
+            return Err("Host was already Starting; Pulse 5 did not own a start".to_owned());
+        }
+        eliot_platform_windows::ServiceStartOutcome::EffectUnknown => {
+            return Err("Host start outcome is Unknown; start is not resent".to_owned());
+        }
+    }
+    let host_after = wait_for_host_state(&authority, true, &watchdog_before, deadline).await?;
+    let watchdog_after =
+        require_running_scm(&authority, &authority.watchdog_request, "EliotWatchdog")?;
+    require_same_watchdog(&watchdog_before, &watchdog_after)?;
+    let after = wait_for_runtime_live(root, deadline).await?;
+    validate_status_registration_against_scm(
+        &after.report.services.host_service_registration,
+        &host_after,
+        "EliotHost",
+    )?;
+    validate_status_registration_against_scm(
+        &after.report.services.watchdog_service_registration,
+        &watchdog_after,
+        "EliotWatchdog",
+    )?;
+    mutations.validate_complete()?;
+    let scm_evidence = PulseFiveScmEvidence {
+        approved_generation: authority.approved_generation,
+        host_before: scm_snapshot(&host_before),
+        host_stopped: scm_snapshot(&host_stopped),
+        host_after: scm_snapshot(&host_after),
+        watchdog_before: scm_snapshot(&watchdog_before),
+        watchdog_while_host_stopped: scm_snapshot(&watchdog_stopped),
+        watchdog_after: scm_snapshot(&watchdog_after),
+        stopped_runtime_status,
+        stopped_runtime_status_digest: stopped_status_digest,
+        owner_release_digest,
+    };
+    validate_fresh_pulse_five_contour(before, &stop_boundary, &after, &scm_evidence)?;
+    let request_digest = digest_json(&(
+        "eliot.live-canary.pulse5.request.v1",
+        &scm_evidence.approved_generation,
+        &scm_evidence.host_before,
+        &scm_evidence.watchdog_before,
+        &before.journal_digest,
+    ))
+    .map_err(|error| error.to_string())?;
+    let receipt_digest = digest_json(&(
+        "eliot.live-canary.pulse5.receipt.v1",
+        &request_digest,
+        &stop_boundary,
+        &scm_evidence,
+        &after.journal_digest,
+        &after.status_digest,
+        &after.dynamic_supervision,
+    ))
+    .map_err(|error| error.to_string())?;
+    Ok(PulseFiveResult {
+        after,
+        stop_boundary,
+        scm_evidence,
+        request_digest,
+        receipt_digest,
+    })
 }
 
 fn new_request(
@@ -1065,6 +1955,26 @@ fn observe_runtime(root: &Path, deadline: Instant) -> Result<RuntimeObservation,
             "status returned a Host state root different from the retained caller root".to_owned(),
         ));
     }
+    let (state, contour, journal_digest) = inspect_journal_contour(root)?;
+    if Instant::now() >= deadline {
+        return Err(CanaryError::Observation(
+            "deadline exceeded after journal replay".to_owned(),
+        ));
+    }
+    let dynamic_supervision = bind_dynamic_supervision(&report, &state)?;
+    let status_digest = digest_json(&report)?;
+    Ok(RuntimeObservation {
+        report,
+        status_digest,
+        journal_digest,
+        contour,
+        dynamic_supervision,
+    })
+}
+
+fn inspect_journal_contour(
+    root: &Path,
+) -> Result<(HostState, ContourSnapshot, String), CanaryError> {
     let journal_path = root.join(JOURNAL_FILE_NAME);
     let inspection = RedbJournalBackend::inspect_existing_at(&journal_path)
         .map_err(|error| CanaryError::Observation(format!("journal inspect: {error}")))?
@@ -1075,22 +1985,9 @@ fn observe_runtime(root: &Path, deadline: Instant) -> Result<RuntimeObservation,
         })?;
     let state = readonly_project_host_state(&inspection.image)
         .map_err(|error| CanaryError::Observation(format!("journal replay: {error}")))?;
-    if Instant::now() >= deadline {
-        return Err(CanaryError::Observation(
-            "deadline exceeded after journal replay".to_owned(),
-        ));
-    }
     let contour = contour_from_state(&state)?;
-    let dynamic_supervision = bind_dynamic_supervision(&report, &state)?;
-    let journal_digest = digest_json(&contour)?;
-    let status_digest = digest_json(&report)?;
-    Ok(RuntimeObservation {
-        report,
-        status_digest,
-        journal_digest,
-        contour,
-        dynamic_supervision,
-    })
+    let digest = digest_json(&contour)?;
+    Ok((state, contour, digest))
 }
 
 fn bind_dynamic_supervision(
@@ -1151,6 +2048,22 @@ fn root_matches_report(root: &Path, report: &RuntimeStatusReport) -> bool {
 
 fn contour_from_state(state: &HostState) -> Result<ContourSnapshot, CanaryError> {
     let mut integrity_gaps = Vec::new();
+    let host_process_nonce_digest = digest_bytes(state.host.nonce.as_str().as_bytes());
+    let activation_id = state
+        .activation
+        .as_ref()
+        .map(|record| record.activation_id.as_str().to_owned());
+    let activation_generation = state.activation.as_ref().map(|record| {
+        format!(
+            "{}:{}",
+            record.fence.activation_generation.current.lineage.as_str(),
+            record.fence.activation_generation.current.sequence
+        )
+    });
+    let activation_state = state
+        .activation
+        .as_ref()
+        .map(|record| format!("{:?}", record.state));
     let kernel = state.kernel.as_ref().and_then(|record| {
         let process = record.process.as_ref()?;
         let job = record.candidate_job_binding.as_ref()?;
@@ -1187,6 +2100,14 @@ fn contour_from_state(state: &HostState) -> Result<ContourSnapshot, CanaryError>
         })
         .transpose()?
         .unwrap_or((None, None));
+    let kernel_activation_nonce_digest = state
+        .kernel
+        .as_ref()
+        .and_then(|record| record.one_time_nonce.activation_nonce_digest());
+    let kernel_state = state
+        .kernel
+        .as_ref()
+        .map(|record| format!("{:?}", record.state));
     if state.kernel.is_some() && kernel.is_none() {
         integrity_gaps.push("Kernel exact process/Job contour is unavailable".to_owned());
     }
@@ -1220,17 +2141,45 @@ fn contour_from_state(state: &HostState) -> Result<ContourSnapshot, CanaryError>
         integrity_gaps.push("no retained Kernel ProbeReady observation".to_owned());
     }
     Ok(ContourSnapshot {
+        host_epoch_lineage: state.host.epoch.current.lineage.as_str().to_owned(),
+        host_epoch_sequence: state.host.epoch.current.sequence,
+        host_epoch_parent_lineage: state
+            .host
+            .epoch
+            .parent
+            .as_ref()
+            .map(|parent| parent.lineage.as_str().to_owned()),
+        host_epoch_parent_sequence: state
+            .host
+            .epoch
+            .parent
+            .as_ref()
+            .map(|parent| parent.sequence),
+        host_process_nonce_digest,
+        activation_id,
+        activation_generation,
+        activation_state,
         sequence: state.sequence,
         last_checksum: state.last_checksum.as_ref().map(ToString::to_string),
         kernel,
         kernel_generation,
         kernel_generation_digest,
+        kernel_activation_nonce_digest,
+        kernel_state,
         store,
         store_generation: current_store.map(|record| record.generation.to_string()),
         store_fence: current_store.map(|record| record.store_fence.as_str().to_owned()),
         store_request_digest: current_store.map(|record| record.request_digest.as_str().to_owned()),
         ready_receipt_digest,
         readiness_observation_digest,
+        clean_marker_last_sequence: state
+            .clean_marker
+            .as_ref()
+            .map(|marker| marker.manifest.last_sequence),
+        clean_marker_last_checksum: state
+            .clean_marker
+            .as_ref()
+            .map(|marker| marker.manifest.last_checksum.as_str().to_owned()),
         integrity_gaps,
     })
 }
@@ -1650,17 +2599,29 @@ mod tests {
 
     fn contour() -> ContourSnapshot {
         ContourSnapshot {
+            host_epoch_lineage: "host-lineage".to_owned(),
+            host_epoch_sequence: 3,
+            host_epoch_parent_lineage: Some("host-lineage".to_owned()),
+            host_epoch_parent_sequence: Some(2),
+            host_process_nonce_digest: digest_bytes(b"host-nonce-before"),
+            activation_id: Some("activation-before".to_owned()),
+            activation_generation: Some("activation-lineage:3".to_owned()),
+            activation_state: Some("Active".to_owned()),
             sequence: 3,
             last_checksum: Some("a".repeat(64)),
             kernel: Some(process(10, 100, "kernel.exe", "kernel-job")),
             kernel_generation: Some("lineage:3".to_owned()),
             kernel_generation_digest: Some(digest_bytes(b"kernel-before")),
+            kernel_activation_nonce_digest: Some(digest_bytes(b"kernel-nonce-before")),
+            kernel_state: Some("Active".to_owned()),
             store: Some(process(20, 200, "store.exe", "store-job")),
             store_generation: Some("3".to_owned()),
             store_fence: Some("b".repeat(64)),
             store_request_digest: Some("c".repeat(64)),
             ready_receipt_digest: Some("d".repeat(64)),
             readiness_observation_digest: Some("e".repeat(64)),
+            clean_marker_last_sequence: None,
+            clean_marker_last_checksum: None,
             integrity_gaps: Vec::new(),
         }
     }
@@ -1714,6 +2675,206 @@ mod tests {
             contour: contour(),
             dynamic_supervision: dynamic,
         }
+    }
+
+    #[cfg(windows)]
+    fn scm_runtime(
+        service_name: &str,
+        state: &str,
+        configuration_seed: char,
+        runtime_seed: Option<char>,
+        process: Option<(u32, u64, &str)>,
+    ) -> ScmRuntimeSnapshot {
+        ScmRuntimeSnapshot {
+            service_name: service_name.to_owned(),
+            configuration_digest: configuration_seed.to_string().repeat(64),
+            state: state.to_owned(),
+            runtime_identity_digest: runtime_seed.map(|seed| seed.to_string().repeat(64)),
+            process: process.map(
+                |(process_id, start_time_100ns, image_path)| ScmProcessSnapshot {
+                    process_id,
+                    start_time_100ns,
+                    image_path: image_path.to_owned(),
+                },
+            ),
+        }
+    }
+
+    #[cfg(windows)]
+    fn pulse_five_fixture() -> (
+        RuntimeObservation,
+        ContourSnapshot,
+        RuntimeObservation,
+        PulseFiveScmEvidence,
+    ) {
+        let before = runtime_observation("RUNTIME_LIVE", Some(dynamic('a')));
+        let mut stopped = before.contour.clone();
+        stopped.activation_state = Some("StoppedClean".to_owned());
+        stopped.clean_marker_last_sequence = Some(9);
+        stopped.clean_marker_last_checksum = Some("9".repeat(64));
+        stopped.sequence = 10;
+
+        let mut after = runtime_observation("RUNTIME_LIVE", Some(dynamic('b')));
+        after.status_digest = "c".repeat(64);
+        after.journal_digest = "d".repeat(64);
+        after.contour.host_epoch_sequence = before.contour.host_epoch_sequence + 1;
+        after.contour.host_epoch_parent_lineage = Some(before.contour.host_epoch_lineage.clone());
+        after.contour.host_epoch_parent_sequence = Some(before.contour.host_epoch_sequence);
+        after.contour.host_process_nonce_digest = digest_bytes(b"host-nonce-after");
+        after.contour.activation_id = Some("activation-after".to_owned());
+        after.contour.activation_generation = Some("activation-lineage:4".to_owned());
+        after.contour.kernel_generation = Some("kernel-lineage:4".to_owned());
+        after.contour.kernel_generation_digest = Some(digest_bytes(b"kernel-after"));
+        after.contour.kernel_activation_nonce_digest = Some(digest_bytes(b"kernel-nonce-after"));
+        after.contour.ready_receipt_digest = Some("1".repeat(64));
+        after.contour.readiness_observation_digest = Some("2".repeat(64));
+
+        let host_before = scm_runtime(
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+            "Running",
+            '3',
+            Some('4'),
+            Some((100, 1_000, r"C:\Program Files\Eliot\eliot-host.exe")),
+        );
+        let host_stopped = scm_runtime(
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+            "Stopped",
+            '3',
+            None,
+            None,
+        );
+        let host_after = scm_runtime(
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+            "Running",
+            '3',
+            Some('5'),
+            Some((101, 2_000, r"C:\Program Files\Eliot\eliot-host.exe")),
+        );
+        let watchdog = scm_runtime(
+            eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_NAME,
+            "Running",
+            '6',
+            Some('7'),
+            Some((200, 500, r"C:\Program Files\Eliot\eliot-watchdog.exe")),
+        );
+        let scm = PulseFiveScmEvidence {
+            approved_generation: "generation-pulse-five".to_owned(),
+            host_before,
+            host_stopped,
+            host_after,
+            watchdog_before: watchdog.clone(),
+            watchdog_while_host_stopped: watchdog.clone(),
+            watchdog_after: watchdog,
+            stopped_runtime_status: "READINESS_DEGRADED".to_owned(),
+            stopped_runtime_status_digest: "8".repeat(64),
+            owner_release_digest: "9".repeat(64),
+        };
+        (before, stopped, after, scm)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pulse_five_exact_one_stop_and_one_start_are_ordered_after_durable_fences() {
+        let mut ledger = PulseFiveMutationLedger::default();
+        let mut effects = Vec::new();
+        assert!(ledger.start_once(|| effects.push("start-early")).is_err());
+        assert!(effects.is_empty());
+        ledger
+            .stop_once(|| effects.push("stop"))
+            .unwrap_or_else(|_| unreachable!());
+        assert!(ledger.stop_once(|| effects.push("stop-again")).is_err());
+        assert_eq!(effects, vec!["stop"]);
+        assert!(ledger.start_once(|| effects.push("start-early")).is_err());
+        ledger
+            .record_stopped_clean()
+            .unwrap_or_else(|_| unreachable!());
+        assert!(ledger.start_once(|| effects.push("start-early")).is_err());
+        ledger
+            .record_owner_released()
+            .unwrap_or_else(|_| unreachable!());
+        ledger
+            .start_once(|| effects.push("start"))
+            .unwrap_or_else(|_| unreachable!());
+        assert!(ledger.start_once(|| effects.push("start-again")).is_err());
+        assert_eq!(effects, vec!["stop", "start"]);
+        assert!(ledger.validate_complete().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pulse_five_production_callsite_binds_typed_effects_to_the_ordering_guard() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("async fn run_windows_pulse_five")
+            .and_then(|(_, rest)| rest.split_once("fn new_request"))
+            .map_or("", |(body, _)| body);
+        assert_eq!(production.matches(".stop_once(||").count(), 1);
+        assert_eq!(production.matches(".start_once(||").count(), 1);
+        assert_eq!(
+            production
+                .matches(".stop_service_registration(&stop_request)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production
+                .matches(".start_service_registration(&authority.host_request)")
+                .count(),
+            1
+        );
+        assert!(production.contains("EffectUnknown =>"));
+        assert!(!production.contains("ServiceOperation::Stop"));
+        assert!(!production.contains("ServiceOperation::Start"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pulse_five_requires_stable_watchdog_and_stopped_clean_marker() {
+        let (before, stopped, _after, mut scm) = pulse_five_fixture();
+        assert!(validate_stopped_contour(&before.contour, &stopped).is_ok());
+        assert!(validate_pulse_five_scm_evidence(&scm).is_ok());
+
+        let mut missing_marker = stopped.clone();
+        missing_marker.clean_marker_last_sequence = None;
+        assert!(validate_stopped_contour(&before.contour, &missing_marker).is_err());
+
+        scm.watchdog_after
+            .runtime_identity_digest
+            .clone_from(&Some("a".repeat(64)));
+        assert!(validate_pulse_five_scm_evidence(&scm).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pulse_five_requires_direct_child_host_epoch_fresh_nonces_and_readiness() {
+        let (before, stopped, after, scm) = pulse_five_fixture();
+        assert!(validate_fresh_pulse_five_contour(&before, &stopped, &after, &scm).is_ok());
+
+        let mut foreign_parent = after.clone();
+        foreign_parent.contour.host_epoch_parent_lineage = Some("foreign-host".to_owned());
+        assert!(
+            validate_fresh_pulse_five_contour(&before, &stopped, &foreign_parent, &scm).is_err()
+        );
+
+        let mut reused_nonce = after.clone();
+        reused_nonce
+            .contour
+            .kernel_activation_nonce_digest
+            .clone_from(&before.contour.kernel_activation_nonce_digest);
+        assert!(validate_fresh_pulse_five_contour(&before, &stopped, &reused_nonce, &scm).is_err());
+
+        let mut stale_readiness = after.clone();
+        stale_readiness
+            .contour
+            .ready_receipt_digest
+            .clone_from(&before.contour.ready_receipt_digest);
+        assert!(
+            validate_fresh_pulse_five_contour(&before, &stopped, &stale_readiness, &scm).is_err()
+        );
+
+        let mut stale_eliotd = after;
+        stale_eliotd.dynamic_supervision = before.dynamic_supervision.clone();
+        assert!(validate_fresh_pulse_five_contour(&before, &stopped, &stale_eliotd, &scm).is_err());
     }
 
     fn kernel_receipt(

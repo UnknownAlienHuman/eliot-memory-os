@@ -13,18 +13,18 @@ use std::time::Duration;
 #[command(
     name = "eliot-live-canary",
     version,
-    about = "Bounded, fail-closed ELIOT runtime-live canary Pulses 1-4"
+    about = "Bounded, fail-closed ELIOT runtime-live canary Pulses 1-5"
 )]
 struct Args {
     #[arg(long)]
     host_state_root: PathBuf,
     #[arg(long)]
     evidence_dir: PathBuf,
-    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
     pulse: u8,
     #[arg(long, default_value_t = DEFAULT_DEADLINE_MS, value_parser = clap::value_parser!(u64).range(1..=MAX_DEADLINE_MS))]
     deadline_ms: u64,
-    /// Required before any Kernel/Store mutation can be attempted.
+    /// Required before any Kernel/Store mutation or Host SCM restart can be attempted.
     #[arg(long)]
     execute_faults: bool,
 }

@@ -659,6 +659,19 @@ impl OneTimeNonceState {
         self.state
     }
 
+    /// Returns a non-secret SHA-256 projection of the retained Kernel
+    /// activation nonce.
+    ///
+    /// The raw one-use nonce remains private to the Host journal contract;
+    /// read-only observers can use this digest to prove that a later Kernel
+    /// activation did not reuse the predecessor credential.
+    #[must_use]
+    pub fn activation_nonce_digest(&self) -> Option<String> {
+        self.nonce_ref
+            .as_ref()
+            .map(|nonce| format!("{:x}", Sha256::digest(nonce.as_str().as_bytes())))
+    }
+
     pub(crate) fn nonce_ref(&self) -> Option<&PlatformHandle> {
         self.nonce_ref.as_ref()
     }

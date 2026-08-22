@@ -221,6 +221,25 @@ fn typed_nonce_state(state: NonceState, digest_byte: char) -> OneTimeNonceState 
     }
 }
 
+#[test]
+fn activation_nonce_digest_is_non_secret_stable_and_identity_sensitive() {
+    let first = typed_nonce_state(NonceState::Consumed, 'a');
+    let same = typed_nonce_state(NonceState::Consumed, 'a');
+    let second = typed_nonce_state(NonceState::Consumed, 'b');
+    let first_digest = first
+        .activation_nonce_digest()
+        .unwrap_or_else(|| unreachable!());
+    assert_eq!(Some(first_digest.clone()), same.activation_nonce_digest());
+    assert_ne!(Some(first_digest.clone()), second.activation_nonce_digest());
+    assert_eq!(first_digest.len(), 64);
+    assert!(first_digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(
+        OneTimeNonceState::unissued().activation_nonce_digest(),
+        None
+    );
+    assert!(!first_digest.contains(&"a".repeat(64)));
+}
+
 fn terminated_prior(history_complete: bool, members: &[PlatformHandle]) -> PriorKernelDisposition {
     PriorKernelDisposition::Terminated(PriorKernelSource {
         host: host(1),
