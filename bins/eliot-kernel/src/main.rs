@@ -2,8 +2,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(windows)]
-use eliot_kernel::SupervisionLeaseReceiptVerifierConfig;
 use eliot_kernel::{
     AuthorityDescriptorContour, EliotdReceiptRootBinding, KernelBuildError, KernelComposition,
     KernelConfig,
@@ -33,29 +31,8 @@ use eliot_contracts::sha256_hex;
 #[cfg(windows)]
 use eliot_platform_windows::{
     NamedPipePeerProcessBinding, ProtectedRuntimePathLease, UserOwnedPathLease, UserOwnedRootLease,
-    current_process_named_pipe_expectation, observe_named_pipe_peer_process, windows_paths_equal,
+    current_process_named_pipe_expectation, observe_named_pipe_peer_process,
 };
-#[cfg(windows)]
-use eliot_runtime_contracts::{SupervisionLeaseVerificationContext, SupervisionTrustAnchor};
-
-#[cfg(windows)]
-const WATCHDOG_ADMISSION_FILE_NAME: &str = "watchdog-admission.json";
-#[cfg(windows)]
-const WATCHDOG_ADMISSION_SCHEMA: &str = "eliot.watchdog-admission.v1";
-#[cfg(windows)]
-const WATCHDOG_ADMISSION_LIMIT: u64 = 1024 * 1024;
-
-#[cfg(windows)]
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KernelReceiptAdmissionConfig {
-    schema: String,
-    installation_id: String,
-    approved_generation: String,
-    trust_anchor: SupervisionTrustAnchor,
-    context: SupervisionLeaseVerificationContext,
-}
-
 #[cfg(windows)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct KernelStartupBinding {
@@ -202,68 +179,6 @@ impl KernelStartupBinding {
         self.host_process_id == process_id
             && self.host_process_start == start_time_100ns
             && self.host_process_image == image_path
-    }
-
-    fn load_supervision_receipt_verifier(
-        &self,
-    ) -> Result<(SupervisionLeaseReceiptVerifierConfig, String), String> {
-        let admission_path = self.receipt_root.join(WATCHDOG_ADMISSION_FILE_NAME);
-        let admission = ProtectedRuntimePathLease::open_existing_absolute(&admission_path)
-            .map_err(|error| {
-                format!("installer-owned watchdog admission is unavailable: {error}")
-            })?;
-        if !windows_paths_equal(admission.path(), &admission_path)
-            || admission.verify_stable_identity().is_err()
-            || admission.verify_path_identity().is_err()
-        {
-            return Err(
-                "installer-owned watchdog admission identity does not match its fixed Host path"
-                    .to_owned(),
-            );
-        }
-        let bytes = admission
-            .read_bounded(WATCHDOG_ADMISSION_LIMIT)
-            .map_err(|error| format!("watchdog admission read failed: {error}"))?;
-        if sha256_hex(&bytes) != self.generation_config_digest {
-            return Err(
-                "watchdog admission bytes do not match the Host-approved manifest digest"
-                    .to_owned(),
-            );
-        }
-        let config: KernelReceiptAdmissionConfig = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("watchdog admission decode failed: {error}"))?;
-        if config.schema != WATCHDOG_ADMISSION_SCHEMA
-            || config.installation_id != self.installation_id
-            || config.approved_generation != self.approved_generation
-            || config.trust_anchor.installation_id != self.installation_id
-            || config.context.public_key_fingerprint != config.trust_anchor.public_key_fingerprint()
-        {
-            return Err(
-                "watchdog admission is not bound to the active installation/generation authority"
-                    .to_owned(),
-            );
-        }
-        config
-            .trust_anchor
-            .validate()
-            .map_err(|error| format!("watchdog admission trust anchor is invalid: {error}"))?;
-        let mut context = config.context;
-        context.now_ms = 1;
-        context
-            .validate()
-            .map_err(|error| format!("watchdog admission lease context is invalid: {error}"))?;
-        if admission.verify_stable_identity().is_err() || admission.verify_path_identity().is_err()
-        {
-            return Err("watchdog admission identity changed during validation".to_owned());
-        }
-        let lease_id = context.lease_id.clone();
-        Ok((
-            SupervisionLeaseReceiptVerifierConfig {
-                trust_anchor: config.trust_anchor,
-                verification_context: context,
-            },
-            lease_id,
-        ))
     }
 }
 
@@ -1080,107 +995,5 @@ mod tests {
         assert!(!binding.matches_observed(42, 73, r"C:\eliot\eliot-host.exe"));
         assert!(!binding.matches_observed(41, 74, r"C:\eliot\eliot-host.exe"));
         assert!(!binding.matches_observed(41, 73, r"C:\eliot\replacement.exe"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn production_startup_loads_public_receipt_verifier_from_manifest_bound_admission() {
-        use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
-        use eliot_runtime_contracts::{
-            Ed25519SupervisionLeaseSigner, LeaseState, SupervisionLeaseActiveStateBinding,
-            SupervisionLeaseSigner, SupervisionObservationScope, SupervisionOrsMirrorBinding,
-        };
-
-        let root = std::env::temp_dir().join(format!(
-            "eliot-kernel-receipt-admission-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("test clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("test root");
-        let root_override = eliot_platform_windows::test_support::override_protected_root(&root);
-        let host = root.join("host");
-        eliot_platform_windows::prepare_protected_directory(&host).expect("protected host root");
-
-        let signer = Ed25519SupervisionLeaseSigner::from_secret_key(
-            "kernel-supervision",
-            "kernel-supervision-key",
-            [7; 32],
-        )
-        .expect("signer");
-        let anchor = SupervisionTrustAnchor::new(
-            "installation-a",
-            signer.signer_id(),
-            signer.key_id(),
-            signer.public_key().to_vec(),
-        )
-        .expect("trust anchor");
-        let generation = ResourceGeneration::new(1).expect("generation");
-        let epoch = AuthorityEpoch::new(1).expect("epoch");
-        let context = SupervisionLeaseVerificationContext {
-            now_ms: 1,
-            lease_id: "lease-a".to_owned(),
-            host_epoch: epoch,
-            activation_id: "activation-a".to_owned(),
-            activation_generation: generation,
-            kernel_epoch: epoch,
-            watchdog_epoch: epoch,
-            state_fence: StateFence::new(epoch, generation),
-            scope_ref: "scope-a".to_owned(),
-            observation_scope: SupervisionObservationScope {
-                targets: vec!["target-a".to_owned()],
-                sensor_profile: "kernel-heartbeat".to_owned(),
-                claimed_coverage: vec!["process".to_owned()],
-                governance_axis: "runtime-live".to_owned(),
-            },
-            target_id: "target-a".to_owned(),
-            module_id: "eliotd".to_owned(),
-            process_id: "process-a".to_owned(),
-            target_generation: generation,
-            module_generation: generation,
-            process_generation: generation,
-            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
-            ors_mirror: SupervisionOrsMirrorBinding {
-                record_id: "record-a".to_owned(),
-                subject_lease_id: "lease-a".to_owned(),
-                lease_revision: 1,
-                ticket_sha256: "c".repeat(64),
-                previous_receipt_sha256: None,
-            },
-            active_state: SupervisionLeaseActiveStateBinding {
-                state: LeaseState::Active,
-                revocation_id: None,
-                revocation_epoch: None,
-            },
-        };
-        let bytes = serde_json::to_vec(&serde_json::json!({
-            "schema": WATCHDOG_ADMISSION_SCHEMA,
-            "installation_id": "installation-a",
-            "approved_generation": "generation-a",
-            "trust_anchor": anchor.clone(),
-            "context": context.clone(),
-        }))
-        .expect("admission bytes");
-        std::fs::write(host.join(WATCHDOG_ADMISSION_FILE_NAME), &bytes).expect("admission file");
-
-        let mut binding = exact_startup_binding();
-        binding.receipt_root = host;
-        binding.generation_config_digest = sha256_hex(&bytes);
-        let (verifier, lease_id) = binding
-            .load_supervision_receipt_verifier()
-            .expect("manifest-bound receipt verifier");
-        assert_eq!(lease_id, "lease-a");
-        assert_eq!(
-            verifier.trust_anchor.public_key_fingerprint(),
-            context.public_key_fingerprint
-        );
-        assert_eq!(verifier.verification_context, context);
-
-        binding.generation_config_digest = "d".repeat(64);
-        assert!(binding.load_supervision_receipt_verifier().is_err());
-        drop(root_override);
-        let _ = std::fs::remove_dir_all(root);
     }
 }

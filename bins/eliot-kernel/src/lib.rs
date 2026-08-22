@@ -251,17 +251,6 @@ pub struct SupervisionLeaseAuthorityConfig {
     pub authority: ProvisionedSupervisionAuthority,
 }
 
-/// Installation-pinned public authority used only to authenticate the current
-/// ORS lease embedded in an eliotd live receipt. This deliberately carries no
-/// signing credential reference: receipt publication must not require or
-/// fabricate Kernel signing authority.
-#[cfg(windows)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SupervisionLeaseReceiptVerifierConfig {
-    pub trust_anchor: SupervisionTrustAnchor,
-    pub verification_context: SupervisionLeaseVerificationContext,
-}
-
 /// Host-injected, manifest-bound roots and generation identity for the
 /// Kernel-owned eliotd live receipt.  The absolute paths are not authority on
 /// their own: the full `RuntimeStateRoots` digest and active manifest identities
@@ -357,26 +346,6 @@ impl SupervisionLeaseAuthorityConfig {
     /// Validates the installer receipt before any ciphertext file is opened.
     pub fn validate(&self) -> Result<(), String> {
         self.authority.validate().map_err(|error| error.to_string())
-    }
-}
-
-#[cfg(windows)]
-impl SupervisionLeaseReceiptVerifierConfig {
-    /// Validates the installer-pinned public trust contour before the ORS is
-    /// opened. No secret provider is consulted by this verifier.
-    pub fn validate(&self) -> Result<(), String> {
-        self.trust_anchor
-            .validate()
-            .map_err(|error| error.to_string())?;
-        let mut context = self.verification_context.clone();
-        context.now_ms = 1;
-        context.validate().map_err(|error| error.to_string())?;
-        if context.public_key_fingerprint != self.trust_anchor.public_key_fingerprint() {
-            return Err(
-                "receipt-verifier context fingerprint does not match its trust anchor".to_owned(),
-            );
-        }
-        Ok(())
     }
 }
 
