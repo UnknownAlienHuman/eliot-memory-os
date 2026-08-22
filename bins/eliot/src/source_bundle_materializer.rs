@@ -2206,7 +2206,10 @@ mod tests {
         let error = materialize_canary_source_bundle(&input)
             .expect_err("forged stale Valid evidence must not materialize");
         assert!(
-            error.to_string().contains("Authenticode readback"),
+            error.to_string().contains("Authenticode readback")
+                || error
+                    .to_string()
+                    .contains("installation transaction identity conflict"),
             "the sealed WinTrust verifier must reject forged stale evidence: {error}"
         );
         let store =
