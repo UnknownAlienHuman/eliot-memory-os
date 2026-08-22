@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::{
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     time::Duration,
 };
@@ -207,8 +207,12 @@ enum InstallationCommand {
         eliotd: PathBuf,
         #[arg(long, value_parser = absolute_path)]
         output_bundle: PathBuf,
+        /// Absolute create-new diagnostic JSON path. This file is never an
+        /// apply/recovery authority and cannot be imported through `create`.
         #[arg(long, value_parser = absolute_path)]
         output: PathBuf,
+        /// Absolute create-new durable transaction store. Apply and recovery
+        /// require this exact path together with `--transaction-id`.
         #[arg(long, value_parser = absolute_path)]
         store: PathBuf,
         #[arg(long)]
@@ -1009,7 +1013,8 @@ fn write_generation_output_reconciliation(reconciliation: &GenerationOutputRecon
             "output": reconciliation.output_path.display().to_string(),
             "detail": reconciliation.diagnostic,
             "authority": "DURABLE_TRANSACTION_STORE",
-            "action": "reconcile the exact durable store before treating the JSON output as authoritative",
+            "output_role": "DIAGNOSTIC_NON_IMPORTABLE",
+            "action": "reconcile and continue only with installation apply/recover using the exact --store and --transaction-id; never import or adopt the JSON output",
             "scope": INSTALLATION_SCOPE,
         })
     );
@@ -1097,7 +1102,7 @@ where
             store_path,
             output_path: output,
             diagnostic: format!(
-                "durable transaction store committed before JSON output write failed: {error}; the store is authoritative and the output must be reconciled without deleting, retrying, or adopting the store"
+                "durable transaction store committed before diagnostic JSON publication/readback completed: {error}; the store is authoritative and the output must be reconciled without deleting, retrying, or adopting the store"
             ),
         };
         write_generation_output_reconciliation(&reconciliation);
@@ -1129,6 +1134,9 @@ where
             "store": store_path.display().to_string(),
             "scope": "source_publication_bound_generation_planner",
             "source_publication_bound": true,
+            "durable_authority": "DURABLE_TRANSACTION_STORE_PLUS_TRANSACTION_ID",
+            "output_role": "DIAGNOSTIC_NON_IMPORTABLE",
+            "continuation": "installation apply/recover --store <exact> --transaction-id <exact>",
         }))?
     );
     Ok(InstallationGenerationOutcome::Generated {
@@ -1251,6 +1259,9 @@ fn run_installation_materialize_source_bundle(
                     "transaction_id": transaction_id.as_str(),
                     "output": output_path.display().to_string(),
                     "store": store_path.display().to_string(),
+                    "durable_authority": "DURABLE_TRANSACTION_STORE_PLUS_TRANSACTION_ID",
+                    "output_role": "DIAGNOSTIC_NON_IMPORTABLE",
+                    "continuation": "installation apply/recover --store <exact> --transaction-id <exact>",
                     "bundle_path": receipt.bundle_path,
                     "generation": receipt.generation,
                     "evidence_digest": receipt.evidence_digest,
@@ -1273,7 +1284,7 @@ fn run_installation_materialize_source_bundle(
 fn run_installation_create(_input: &Path, _store_path: &Path) -> i32 {
     write_installation_error(
         "INSTALLATION_CREATE_PRODUCTION_DISABLED",
-        "raw transaction import is not a production constructor; use installation materialize-source-bundle --store",
+        "raw and diagnostic transaction JSON is non-importable and is not a production constructor; use installation materialize-source-bundle --store, then apply/recover with the exact --store and --transaction-id",
     );
     INVALID_REQUEST_EXIT
 }
@@ -2233,6 +2244,12 @@ fn cli_path_handle(path: &Path, field: &str) -> Result<PlatformHandle> {
     cli_handle(path.to_string_lossy().into_owned(), field)
 }
 
+/// Writes a create-new diagnostic projection of the already committed plan.
+///
+/// The file is deliberately non-importable: apply and recovery open only the
+/// exact durable transaction store and transaction id. A partial diagnostic
+/// left by a process crash is retained for reconciliation and cannot become
+/// installation authority through the retired `create` command.
 fn write_transaction_artifact(
     path: &Path,
     transaction: &InstallationTransaction,
@@ -2245,12 +2262,34 @@ fn write_transaction_artifact(
     }
     let bytes = serde_json::to_vec_pretty(transaction)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut expected = bytes.clone();
+    expected.push(b'\n');
     let mut file = fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(path)?;
     file.write_all(&bytes)?;
-    file.write_all(b"\n")
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut readback = Vec::with_capacity(expected.len());
+    file.read_to_end(&mut readback)?;
+    if readback != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "diagnostic transaction output readback differs from the exact written bytes",
+        ));
+    }
+    let decoded = decode_installation_transaction_json(&readback)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if decoded != *transaction {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "diagnostic transaction output does not deserialize to the committed transaction",
+        ));
+    }
+    Ok(())
 }
 
 /// Non-Windows builds have no authenticated Windows Kernel front door.

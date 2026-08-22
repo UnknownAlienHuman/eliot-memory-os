@@ -8,11 +8,12 @@ use std::{
 };
 
 use eliot_installation::{
-    AuthorityEpoch, CandidateManifest, InstallationEpoch, InstallationProfile,
-    InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, ManagedEnvironmentAction,
-    ManagedEnvironmentChangeRequest, PlannedChange, RedbInstallationTransactionStore,
-    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
-    SupervisionAuthorityBinding, UserOwnedRootLease, parse_installation_transaction_id,
+    AuthorityEpoch, CandidateManifest, INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationEpoch,
+    InstallationProfile, InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan,
+    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER,
+    PlannedChange, RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
+    RuntimeStateRoots, StateFence, SupervisionAuthorityBinding, UserOwnedRootLease,
+    parse_installation_transaction_id,
 };
 #[cfg(windows)]
 use eliot_platform_windows::protected_program_data_root;
@@ -561,7 +562,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
             )),
         },
         authority_descriptor_path: fixture_path(root, "authority.json"),
-        authority_descriptor_digest: fixture_handle("7".repeat(64)),
+        authority_descriptor_digest: fixture_handle(PHASE_B_PENDING_MARKER),
         runtime_state_roots: runtime_state_roots.clone(),
         kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
         kernel_artifact_digest: fixture_handle("a".repeat(64)),
@@ -577,7 +578,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         store_bridge_executable_path: fixture_path(root, "eliot-store-surreal.exe"),
         store_bridge_artifact_digest: fixture_handle("1".repeat(64)),
         store_bootstrap_descriptor_path: fixture_path(root, "store-bootstrap.json"),
-        store_bootstrap_descriptor_digest: fixture_handle("6".repeat(64)),
+        store_bootstrap_descriptor_digest: fixture_handle(PHASE_B_PENDING_MARKER),
         canonical_store_executable_path: fixture_path(root, "surreal.exe"),
         canonical_store_artifact_digest: fixture_handle("5".repeat(64)),
         kernel_arguments: vec![
@@ -586,11 +587,11 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
             fixture_handle("--store-bootstrap"),
             fixture_path(root, "store-bootstrap.json"),
             fixture_handle("--store-bootstrap-sha256"),
-            fixture_handle("6".repeat(64)),
+            fixture_handle(PHASE_B_PENDING_MARKER),
             fixture_handle("--authority-descriptor"),
             fixture_path(root, "authority.json"),
             fixture_handle("--authority-descriptor-sha256"),
-            fixture_handle("7".repeat(64)),
+            fixture_handle(PHASE_B_PENDING_MARKER),
             fixture_handle("--kernel-artifact-sha256"),
             fixture_handle("a".repeat(64)),
             fixture_handle("--eliotd-descriptor"),
@@ -740,7 +741,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
     clippy::too_many_lines,
     reason = "the raw-import rejection assertion keeps the production CLI boundary evidence together"
 )]
-fn installation_cli_rejects_valid_raw_transaction_import() {
+fn installation_cli_rejects_exact_diagnostic_transaction_import() {
     let temp_root = std::env::temp_dir().join(format!(
         "eliot-installation-cli-round-trip-{}",
         std::process::id()
@@ -771,11 +772,10 @@ fn installation_cli_rejects_valid_raw_transaction_import() {
     }
     let input = temp_root.join("transaction.json");
     let store = temp_root.join("transaction.redb");
-    fs::write(
-        &input,
-        serde_json::to_vec_pretty(&transaction).expect("serialize constructor transaction"),
-    )
-    .expect("write constructor transaction");
+    let mut diagnostic =
+        serde_json::to_vec_pretty(&transaction).expect("serialize constructor transaction");
+    diagnostic.push(b'\n');
+    fs::write(&input, diagnostic).expect("write exact diagnostic transaction projection");
 
     let plan = Command::new(env!("CARGO_BIN_EXE_eliot"))
         .current_dir(&temp_root)
@@ -795,7 +795,8 @@ fn installation_cli_rejects_valid_raw_transaction_import() {
     let planned: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
     assert_eq!(
         planned["transaction_wire_version"],
-        serde_json::json!({"major": 15, "minor": 0, "patch": 0})
+        serde_json::to_value(INSTALLATION_TRANSACTION_WIRE_VERSION)
+            .expect("serialize current transaction wire version")
     );
 
     let create = Command::new(env!("CARGO_BIN_EXE_eliot"))
@@ -813,6 +814,11 @@ fn installation_cli_rejects_valid_raw_transaction_import() {
     assert!(!create.status.success());
     let created: Value = serde_json::from_slice(&create.stdout).expect("create JSON");
     assert_installation_error(&created, "INSTALLATION_CREATE_PRODUCTION_DISABLED");
+    assert!(
+        created["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("materialize-source-bundle --store"))
+    );
     assert!(
         !store.exists(),
         "valid raw transaction created a durable store"

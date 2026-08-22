@@ -744,7 +744,8 @@ impl GenerationPackagePlanner {
     /// Computes the canonical full nine-role artifact evidence reference.
     ///
     /// This associated wrapper is the single public entry point for producers
-    /// that materialize the retained source bundle before invoking [`Self::plan`].
+    /// that materialize the retained source bundle before invoking
+    /// [`Self::plan_with_source_publication_binding`].
     pub fn artifact_set_evidence_digest(
         manifest: &PackageManifest,
         expected: &[PackageArtifactDigest],
@@ -763,13 +764,15 @@ impl GenerationPackagePlanner {
         phase_a_template_content_digest(expected)
     }
 
-    /// Plan directly from a caller-selected source directory without a
-    /// materializer publication proof.  This remains an explicitly separate
-    /// unbound path; it does not claim release-publication authority.
-    pub fn plan(
+    /// Build a fresh self-observed binding solely for same-crate planner
+    /// fixtures. Production callers must present the materializer publication
+    /// proof through [`Self::plan_with_source_publication_binding`].
+    #[cfg(test)]
+    pub(crate) fn plan_unbound_for_test(
         input: GenerationPackagePlanInput,
     ) -> Result<InstallationTransaction, InstallationError> {
-        Self::plan_with_binding(input, None)
+        let publication_binding = test_source_publication_binding(&input)?;
+        Self::plan_with_binding(input, &publication_binding)
     }
 
     /// Plan from a source directory whose exact materializer publication facts
@@ -786,7 +789,7 @@ impl GenerationPackagePlanner {
             files,
             evidence_digest,
         };
-        Self::plan_with_binding(input, Some(&publication_binding))
+        Self::plan_with_binding(input, &publication_binding)
     }
 
     /// Derive the complete candidate/package/effect graph and create one
@@ -802,7 +805,7 @@ impl GenerationPackagePlanner {
     )]
     fn plan_with_binding(
         input: GenerationPackagePlanInput,
-        publication_binding: Option<&SourceBundlePublicationBinding>,
+        publication_binding: &SourceBundlePublicationBinding,
     ) -> Result<InstallationTransaction, InstallationError> {
         handle(&input.transaction_id, "generation.transaction_id")?;
         input.installation_epoch.validate()?;
@@ -935,14 +938,12 @@ impl GenerationPackagePlanner {
                 "trusted source digest set is incomplete".to_owned(),
             ));
         }
-        if let Some(binding) = publication_binding.as_ref() {
-            validate_source_bundle_publication_binding(
-                binding,
-                source_identity,
-                &package_manifest,
-                &expected_file_digests,
-            )?;
-        }
+        validate_source_bundle_publication_binding(
+            publication_binding,
+            source_identity,
+            &package_manifest,
+            &expected_file_digests,
+        )?;
         let digest_for = |name: &str| {
             expected_file_digests
                 .iter()
@@ -1545,6 +1546,52 @@ fn validate_exact_source_inventory(
         return Err(InstallationError::IdentityConflict);
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn test_source_publication_binding(
+    input: &GenerationPackagePlanInput,
+) -> Result<SourceBundlePublicationBinding, InstallationError> {
+    let source =
+        TrustedSourceBundle::open(Path::new(input.source_root.as_str())).map_err(|error| {
+            InstallationError::Platform(format!("test source open failed: {error}"))
+        })?;
+    let source_identity = source.identity();
+    let observed = source.observe().map_err(|error| {
+        InstallationError::Platform(format!("test source observe failed: {error}"))
+    })?;
+    validate_exact_source_inventory(&observed)?;
+    let files = REQUIRED_PACKAGE_ROLES
+        .iter()
+        .map(|(name, executable)| {
+            let entry = observed
+                .files
+                .iter()
+                .find(|entry| entry.relative_path == *name)
+                .ok_or(InstallationError::IdentityConflict)?;
+            eliot_platform_windows::PackageFileSpec::new(name, *executable, entry.size)
+                .map_err(|error| package_plan_error(&error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifest = PackageManifest::new(input.generation.as_str(), files)
+        .map_err(|error| package_plan_error(&error))?;
+    let expected = derive_expected_digests(&observed, &manifest)?;
+    let evidence_digest = artifact_set_evidence_digest(&manifest, &expected)?;
+    let ordered_files = REQUIRED_PACKAGE_ROLES
+        .iter()
+        .map(|(role, _)| {
+            expected
+                .iter()
+                .find(|file| file.relative_path == *role)
+                .cloned()
+                .ok_or(InstallationError::IdentityConflict)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SourceBundlePublicationBinding {
+        source_identity,
+        files: ordered_files,
+        evidence_digest,
+    })
 }
 
 fn validate_source_bundle_publication_binding(
@@ -2655,9 +2702,11 @@ mod tests {
         let (_tmp, portable, _roots) = temp_portable_root();
         let source_dir = tempfile::TempDir::new().unwrap();
         populate_source_with_roles(source_dir.path());
-        let transaction =
-            GenerationPackagePlanner::plan(production_input(source_dir.path(), portable))
-                .expect("trusted generation planner should build one transaction");
+        let transaction = GenerationPackagePlanner::plan_unbound_for_test(production_input(
+            source_dir.path(),
+            portable,
+        ))
+        .expect("trusted generation planner should build one transaction");
         transaction
             .validate()
             .expect("generated transaction validates");
@@ -2782,9 +2831,11 @@ mod tests {
         let (_tmp, portable, _roots) = temp_portable_root();
         let source_dir = tempfile::TempDir::new().unwrap();
         populate_source_with_roles(source_dir.path());
-        let transaction =
-            GenerationPackagePlanner::plan(production_input(source_dir.path(), portable))
-                .expect("trusted generation planner should build");
+        let transaction = GenerationPackagePlanner::plan_unbound_for_test(production_input(
+            source_dir.path(),
+            portable,
+        ))
+        .expect("trusted generation planner should build");
         let mut candidate = transaction.candidate_manifest;
         let lease_scope_id = candidate
             .runtime_launch
@@ -2856,7 +2907,7 @@ mod tests {
             r"{}\Eliot\packages",
             input.profile_anchor_root.as_str()
         ));
-        let transaction = GenerationPackagePlanner::plan(input)
+        let transaction = GenerationPackagePlanner::plan_unbound_for_test(input)
             .expect("trusted SystemService generation planner should build");
         assert!(candidate_has_nonplaceholder_package_digests(
             &transaction.candidate_manifest
@@ -3109,11 +3160,16 @@ mod tests {
         populate_source_with_roles(source_a.path());
         populate_source_with_roles(source_b.path());
 
-        let first =
-            GenerationPackagePlanner::plan(production_input(source_a.path(), portable.clone()))
-                .expect("first trusted source should plan");
-        let second = GenerationPackagePlanner::plan(production_input(source_b.path(), portable))
-            .expect("second trusted source should plan");
+        let first = GenerationPackagePlanner::plan_unbound_for_test(production_input(
+            source_a.path(),
+            portable.clone(),
+        ))
+        .expect("first trusted source should plan");
+        let second = GenerationPackagePlanner::plan_unbound_for_test(production_input(
+            source_b.path(),
+            portable,
+        ))
+        .expect("second trusted source should plan");
         let first_identity = first
             .installer_effects
             .iter()
@@ -3166,9 +3222,9 @@ mod tests {
         // Keep destination paths fixed so this assertion isolates derivation
         // from the source-bundle location itself.
         second_input.staging_root = first_input.staging_root.clone();
-        let first =
-            GenerationPackagePlanner::plan(first_input).expect("first trusted source should plan");
-        let second = GenerationPackagePlanner::plan(second_input)
+        let first = GenerationPackagePlanner::plan_unbound_for_test(first_input)
+            .expect("first trusted source should plan");
+        let second = GenerationPackagePlanner::plan_unbound_for_test(second_input)
             .expect("second trusted source should plan");
 
         assert_eq!(
@@ -3202,9 +3258,11 @@ mod tests {
         let (_tmp, portable, _roots) = temp_portable_root();
         let source_dir = tempfile::TempDir::new().unwrap();
         populate_source_with_roles(source_dir.path());
-        let transaction =
-            GenerationPackagePlanner::plan(production_input(source_dir.path(), portable))
-                .expect("trusted generation planner should build one transaction");
+        let transaction = GenerationPackagePlanner::plan_unbound_for_test(production_input(
+            source_dir.path(),
+            portable,
+        ))
+        .expect("trusted generation planner should build one transaction");
         let package_index = transaction
             .installer_effects
             .iter()
@@ -3323,8 +3381,11 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                GenerationPackagePlanner::plan(production_input(source_dir.path(), portable))
-                    .is_err(),
+                GenerationPackagePlanner::plan_unbound_for_test(production_input(
+                    source_dir.path(),
+                    portable,
+                ))
+                .is_err(),
                 "source mutation {mutation} must be rejected"
             );
         }

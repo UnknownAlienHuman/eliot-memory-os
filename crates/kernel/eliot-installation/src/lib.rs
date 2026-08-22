@@ -20232,8 +20232,8 @@ mod tests {
             ] {
                 std::fs::write(source_dir.path().join(name), file_content(name, exe)).unwrap();
             }
-            let planned_via_planner =
-                must(GenerationPackagePlanner::plan(GenerationPackagePlanInput {
+            let planned_via_planner = must(GenerationPackagePlanner::plan_unbound_for_test(
+                GenerationPackagePlanInput {
                     transaction_id: test_handle(format!(
                         "transaction:planner-bootstrap-{}",
                         NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
@@ -20259,7 +20259,8 @@ mod tests {
                     )),
                     minimum_store_available_bytes: 1,
                     recovery_command: test_handle("recovery:command"),
-                }));
+                },
+            ));
             let tail = &planned_via_planner.installer_effects
                 [planned_via_planner.installer_effects.len() - 6..];
             assert!(matches!(

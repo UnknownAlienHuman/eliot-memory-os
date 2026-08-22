@@ -1250,7 +1250,10 @@ pub fn materialize_canary_source_bundle(
 )]
 mod tests {
     use super::*;
-    use eliot_installation::GenerationPackagePlanInput;
+    use eliot_installation::{
+        GenerationPackagePlanInput, InstallationTransactionStore, RedbInstallationTransactionStore,
+        decode_installation_transaction_json,
+    };
     use tempfile::TempDir;
 
     #[cfg(windows)]
@@ -1538,11 +1541,18 @@ mod tests {
             store.exists(),
             "bound generation omitted exact durable store"
         );
+        let output_bytes = fs::read(&output).unwrap();
+        assert_eq!(output_bytes.last(), Some(&b'\n'));
+        let diagnostic = decode_installation_transaction_json(&output_bytes).unwrap();
+        let durable_store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&store).unwrap();
+        let durable = durable_store.load(&transaction_id).unwrap().unwrap();
+        assert_eq!(diagnostic, durable);
     }
 
     #[cfg(windows)]
     #[test]
-    fn output_failure_after_store_publication_returns_unknown_and_retains_store() {
+    fn partial_output_failure_returns_unknown_and_store_remains_sole_authority() {
         let (source_parent, _anchor, _staging, input, receipt) = materialized_fixture();
         let output_bundle = PathBuf::from(&receipt.bundle_path);
         let output = source_parent.path().join("generated.json");
@@ -1555,7 +1565,10 @@ mod tests {
             output.clone(),
             store.clone(),
             binding,
-            |_path, _transaction| Err(std::io::Error::other("injected output failure")),
+            |path, _transaction| {
+                fs::write(path, b"{\"partial\":")?;
+                Err(std::io::Error::other("injected output failure"))
+            },
         )
         .unwrap();
 
@@ -1576,10 +1589,11 @@ mod tests {
             store.exists(),
             "durable store was removed after output failure"
         );
-        assert!(
-            !output.exists(),
-            "injected output writer unexpectedly created output"
-        );
+        assert_eq!(fs::read(&output).unwrap(), b"{\"partial\":");
+        assert!(decode_installation_transaction_json(&fs::read(&output).unwrap()).is_err());
+        let durable_store =
+            RedbInstallationTransactionStore::open_existing_exact_path(&store).unwrap();
+        assert!(durable_store.load(&transaction_id).unwrap().is_some());
     }
 
     #[cfg(windows)]
