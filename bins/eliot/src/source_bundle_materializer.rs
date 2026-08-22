@@ -870,13 +870,25 @@ fn build_typed_bundle(
 }
 
 fn write_create_new(path: &Path, bytes: &[u8]) -> Result<(), MaterializeError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| {
-            MaterializeError::Platform(format!("create {}: {error}", path.display()))
-        })?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        // The retained native publication root blocks rename/delete of the
+        // directory.  These child opens add the matching no-follow and
+        // no-delete-sharing fence for every role file.
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        MaterializeError::Platform(format!("create {}: {error}", path.display()))
+    })?;
     file.write_all(bytes).map_err(|error| {
         MaterializeError::Platform(format!("write {}: {error}", path.display()))
     })?;
@@ -889,12 +901,17 @@ fn sync_directory(path: &Path) -> Result<(), MaterializeError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let directory = OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        // The retained publication root itself denies delete sharing and
+        // carries DELETE access for the eventual native rename.  This
+        // readback handle must explicitly share DELETE to coexist with that
+        // exact root handle; it cannot authorize a rename while the root is
+        // retained.
+        .share_mode(FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|error| MaterializeError::Platform(format!("open temporary bundle: {error}")))?;
@@ -1058,7 +1075,7 @@ fn materialize_with_executables(
     }
     sync_directory(&temp)?;
 
-    let precommit_bundle = TrustedSourceBundle::open(&temp).map_err(|error| {
+    let precommit_bundle = publication.trusted_source_bundle().map_err(|error| {
         MaterializeError::Platform(format!("open precommit source bundle: {error}"))
     })?;
     let precommit_observed =
@@ -1705,5 +1722,26 @@ mod tests {
         );
         input.output_bundle = source_parent.path().join("different-bundle");
         assert!(!input.output_bundle.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_publication_root_blocks_rename_during_role_writes() {
+        let parent = TempDir::new().unwrap();
+        let destination = parent.path().join("bundle");
+        let publication = OwnedDirectoryPublication::create(&destination).unwrap();
+        let temporary = publication.temporary_path().to_path_buf();
+        let role = temporary.join("generation.json");
+        write_create_new(&role, b"{\"diagnostic\":true}\n").unwrap();
+
+        let substituted = parent.path().join("substituted");
+        assert!(
+            fs::rename(&temporary, &substituted).is_err(),
+            "retained native root handle must block root substitution during writes"
+        );
+        assert_eq!(fs::read(role).unwrap(), b"{\"diagnostic\":true}\n");
+
+        drop(publication);
+        fs::remove_dir_all(temporary).unwrap();
     }
 }

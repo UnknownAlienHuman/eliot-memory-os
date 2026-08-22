@@ -3178,11 +3178,10 @@ pub struct OwnedDirectoryPublication {
     initial_temporary_identity: FileIdentity,
     #[cfg(windows)]
     contour: DirectoryPublicationContour,
-    /// The source directory object is retained from construction through the
-    /// move.  It is opened no-follow with delete sharing so existing staging
-    /// readback can coexist with the retained authority, while all
-    /// identity/readback observations remain bound to this exact object rather
-    /// than a later pathname lookup.
+    /// The source directory object is retained from native create through the
+    /// handle-relative rename.  It is opened no-follow without delete
+    /// sharing, so same-token pathname rename/delete attempts cannot replace
+    /// the object while the materializer writes and observes it.
     #[cfg(windows)]
     temporary_handle: Option<std::fs::File>,
     committed: bool,
@@ -3236,11 +3235,36 @@ impl OwnedDirectoryPublication {
         self.initial_temporary_identity
     }
 
-    /// Atomically move the completely materialized temporary directory to the
-    /// absent destination with write-through and no replacement semantics.
+    /// Reuse the retained temporary-root handle for a trusted pre-commit
+    /// source observation without reopening the mutable pathname.  The
+    /// publication root carries DELETE access for the eventual native rename;
+    /// cloning this handle preserves its no-delete-sharing fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed staging error when the retained handle cannot be
+    /// cloned, revalidated, or bound to the exact source-root contour.
+    pub fn trusted_source_bundle(&self) -> Result<TrustedSourceBundle, PackageStagingError> {
+        #[cfg(windows)]
+        {
+            let root = self
+                .temporary_handle
+                .as_ref()
+                .ok_or(PackageStagingError::IdentityMismatch)?;
+            package_staging::retain_source_directory_with_retained_root(&self.temporary, root)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(PackageStagingError::UnsupportedPlatform)
+        }
+    }
+
+    /// Atomically rename the completely materialized temporary directory to
+    /// the absent destination through the retained handles, with no
+    /// replacement semantics.
     ///
     /// The supplied identity must be independently measured by the caller's
-    /// complete pre-commit readback. A successful Windows move is never
+    /// complete pre-commit readback. A successful Windows rename is never
     /// reported as `Err`; uncertain post-commit readback returns a typed
     /// reconcilable outcome.
     ///
@@ -10168,17 +10192,35 @@ fn open_publication_directory(
     path: &Path,
     share_delete: bool,
 ) -> Result<std::fs::File, DirectoryPublicationError> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+    open_publication_directory_with_access(path, share_delete, FILE_GENERIC_READ)
+}
+
+#[cfg(windows)]
+fn open_publication_directory_for_create(
+    path: &Path,
+) -> Result<std::fs::File, DirectoryPublicationError> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_SUBDIRECTORY, FILE_GENERIC_READ};
+    open_publication_directory_with_access(path, false, FILE_GENERIC_READ | FILE_ADD_SUBDIRECTORY)
+}
+
+#[cfg(windows)]
+fn open_publication_directory_with_access(
+    path: &Path,
+    share_delete: bool,
+    access: u32,
+) -> Result<std::fs::File, DirectoryPublicationError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     let share_mode =
         FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
     let mut options = std::fs::OpenOptions::new();
     options
         .read(true)
-        .access_mode(FILE_GENERIC_READ)
+        .access_mode(access)
         .share_mode(share_mode)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(|error| {
@@ -10199,35 +10241,284 @@ fn open_publication_directory(
 }
 
 #[cfg(windows)]
-fn open_movable_publication_directory(
-    path: &Path,
-) -> Result<std::fs::File, DirectoryPublicationError> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        // The retained directory is an identity/readback authority, not a
-        // deletion handle.  Sharing delete lets the materializer's existing
-        // no-follow directory sync handle open while this source remains
-        // retained; publication itself still uses the create-new move.
-        .access_mode(FILE_GENERIC_READ)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options
-        .open(path)
-        .map_err(|_| DirectoryPublicationError::Io)?;
-    let metadata = file.metadata().map_err(|_| DirectoryPublicationError::Io)?;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(DirectoryPublicationError::ReparsePoint);
-    }
-    if !metadata.is_dir() {
+#[repr(C)]
+struct NativeUnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct NativeObjectAttributes {
+    length: u32,
+    root_directory: windows_sys::Win32::Foundation::HANDLE,
+    object_name: *mut NativeUnicodeString,
+    attributes: u32,
+    security_descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    security_quality_of_service: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct NativeIoStatusBlock {
+    status: i32,
+    information: usize,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct NativeFileRenameInformation {
+    replace_if_exists: u8,
+    padding: [u8; 7],
+    root_directory: windows_sys::Win32::Foundation::HANDLE,
+    file_name_length: u32,
+    file_name: [u16; 1],
+}
+
+#[cfg(windows)]
+const NATIVE_STATUS_OBJECT_NAME_COLLISION: i32 = -0x3FFF_FFCB;
+
+#[cfg(windows)]
+const NATIVE_STATUS_OBJECT_NAME_EXISTS: i32 = 0x4000_0000;
+
+#[cfg(windows)]
+const NATIVE_FILE_CREATE: u32 = 2;
+
+#[cfg(windows)]
+const NATIVE_FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+
+#[cfg(windows)]
+const NATIVE_FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+
+#[cfg(windows)]
+const NATIVE_FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+#[cfg(windows)]
+const NATIVE_OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+
+#[cfg(windows)]
+const NATIVE_FILE_RENAME_INFORMATION: i32 = 10;
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtCreateFile(
+        file_handle: *mut windows_sys::Win32::Foundation::HANDLE,
+        desired_access: u32,
+        object_attributes: *mut NativeObjectAttributes,
+        io_status_block: *mut NativeIoStatusBlock,
+        allocation_size: *mut i64,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        ea_buffer: *mut std::ffi::c_void,
+        ea_length: u32,
+    ) -> i32;
+
+    fn NtSetInformationFile(
+        file_handle: windows_sys::Win32::Foundation::HANDLE,
+        io_status_block: *mut NativeIoStatusBlock,
+        file_information: *mut std::ffi::c_void,
+        length: u32,
+        file_information_class: i32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn native_status_is_success(status: i32) -> bool {
+    status >= 0
+}
+
+#[cfg(windows)]
+fn native_directory_name(name: &str) -> Result<Vec<u16>, DirectoryPublicationError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.encode_utf16().count() > usize::from(u16::MAX / 2)
+    {
         return Err(DirectoryPublicationError::InvalidPath);
     }
-    Ok(file)
+    if name
+        .chars()
+        .any(|character| character == '\0' || character == '/' || character == '\\')
+    {
+        return Err(DirectoryPublicationError::InvalidPath);
+    }
+    Ok(name.encode_utf16().collect())
+}
+
+#[cfg(windows)]
+fn create_owned_directory_relative(
+    parent: &std::fs::File,
+    name: &str,
+    security_descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+) -> Result<std::fs::File, DirectoryPublicationError> {
+    use std::os::windows::{fs::MetadataExt, io::FromRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let name = native_directory_name(name)?;
+    let length = u16::try_from(name.len().saturating_mul(2))
+        .map_err(|_| DirectoryPublicationError::InvalidPath)?;
+    let mut unicode = NativeUnicodeString {
+        length,
+        maximum_length: length,
+        buffer: name.as_ptr().cast_mut(),
+    };
+    let mut attributes = NativeObjectAttributes {
+        length: u32::try_from(std::mem::size_of::<NativeObjectAttributes>())
+            .map_err(|_| DirectoryPublicationError::Io)?,
+        root_directory: {
+            use std::os::windows::io::AsRawHandle;
+            parent.as_raw_handle().cast()
+        },
+        object_name: &raw mut unicode,
+        attributes: NATIVE_OBJ_CASE_INSENSITIVE,
+        // Native create does not accept every caller-owned absolute owner
+        // descriptor through OBJECT_ATTRIBUTES (STATUS_INVALID_OWNER on
+        // ordinary developer tokens).  Apply the exact descriptor to the
+        // returned handle immediately below, before exposing it to callers.
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut io_status = NativeIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = std::ptr::null_mut();
+    let mut desired_access = FILE_GENERIC_READ | FILE_ADD_SUBDIRECTORY | DELETE;
+    if !security_descriptor.is_null() {
+        desired_access |= windows_sys::Win32::Storage::FileSystem::WRITE_DAC
+            | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
+    }
+    let status = unsafe {
+        // SAFETY: all native structures and UTF-16 storage remain live for
+        // the synchronous call; RootDirectory is a retained no-follow
+        // parent handle and FILE_CREATE forbids adoption.
+        NtCreateFile(
+            &raw mut raw,
+            desired_access,
+            &raw mut attributes,
+            &raw mut io_status,
+            std::ptr::null_mut(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NATIVE_FILE_CREATE,
+            NATIVE_FILE_DIRECTORY_FILE
+                | NATIVE_FILE_OPEN_REPARSE_POINT
+                | NATIVE_FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if !native_status_is_success(status) {
+        if status == NATIVE_STATUS_OBJECT_NAME_COLLISION
+            || status == NATIVE_STATUS_OBJECT_NAME_EXISTS
+        {
+            return Err(DirectoryPublicationError::AlreadyExists);
+        }
+        return Err(DirectoryPublicationError::Io);
+    }
+    if raw.is_null() {
+        return Err(DirectoryPublicationError::Io);
+    }
+    let file = unsafe {
+        // SAFETY: NtCreateFile returned a unique owned handle.
+        std::fs::File::from_raw_handle(raw.cast())
+    };
+    let result = (|| {
+        apply_owned_directory_security(&file, security_descriptor)?;
+        let metadata = file.metadata().map_err(|_| DirectoryPublicationError::Io)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(DirectoryPublicationError::ReparsePoint);
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(file),
+        Err(error) => {
+            // The native create was create-only and returned the exact child
+            // handle.  If post-create ACL/identity validation fails, make a
+            // best-effort handle-bound disposition before dropping it; never
+            // resolve the pathname for cleanup or adopt the failed directory.
+            let _ = delete_created_directory_handle(&file);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn apply_owned_directory_security(
+    file: &std::fs::File,
+    descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+) -> Result<(), DirectoryPublicationError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    if descriptor.is_null() {
+        return Ok(());
+    }
+    let descriptor = std::mem::ManuallyDrop::new(OwnedSecurityDescriptor { raw: descriptor });
+    let owner = descriptor
+        .owner()
+        .map_err(|_| DirectoryPublicationError::Io)?;
+    let dacl = descriptor
+        .dacl()
+        .map_err(|_| DirectoryPublicationError::Io)?;
+    let status = unsafe {
+        // SAFETY: `file` is a live handle opened with WRITE_DAC/WRITE_OWNER;
+        // owner and DACL point into the caller-owned descriptor and remain
+        // live for this synchronous operation.
+        SetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(DirectoryPublicationError::Io)
+    }
+}
+
+#[cfg(windows)]
+fn delete_created_directory_handle(file: &std::fs::File) -> Result<(), DirectoryPublicationError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let ok = unsafe {
+        // SAFETY: `file` is the exact create-only directory handle and was
+        // opened with DELETE; the disposition buffer has the documented size.
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>())
+                .map_err(|_| DirectoryPublicationError::Io)?,
+        )
+    };
+    if ok == 0 {
+        Err(DirectoryPublicationError::Io)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -10256,6 +10547,14 @@ fn retain_directory_publication_contour(
             return Err(DirectoryPublicationError::IdentityMismatch);
         }
         entries.push((observed_path, identity, handle));
+    }
+    let parent_path = entries
+        .last()
+        .map(|(path, _, _)| path.clone())
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    let parent_handle = open_publication_directory_for_create(&parent_path)?;
+    if let Some((_, _, handle)) = entries.last_mut() {
+        *handle = parent_handle;
     }
     let (canonical_parent, parent_identity, _) = entries
         .last()
@@ -10297,36 +10596,59 @@ fn require_directory_publication_absent(
 }
 
 #[cfg(windows)]
-fn move_directory_create_new_durable(
-    temporary: &Path,
-    destination: &Path,
+fn rename_directory_from_handle(
+    source: &std::fs::File,
+    destination_parent: &std::fs::File,
+    destination_name: &str,
 ) -> Result<(), DirectoryPublicationError> {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
-    let temporary_wide = wide(temporary);
-    let destination_wide = wide(destination);
-    let moved = unsafe {
-        // SAFETY: both path buffers are NUL-terminated and live for the call.
-        // Omitting MOVEFILE_REPLACE_EXISTING is the atomic fail-if-exists
-        // contract; WRITE_THROUGH makes the metadata move durable before
-        // success is returned.
-        MoveFileExW(
-            temporary_wide.as_ptr(),
-            destination_wide.as_ptr(),
-            MOVEFILE_WRITE_THROUGH,
+    use std::os::windows::io::AsRawHandle;
+
+    let name = native_directory_name(destination_name)?;
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
+    let header_bytes = std::mem::size_of::<NativeFileRenameInformation>()
+        .checked_sub(std::mem::size_of::<u16>())
+        .ok_or(DirectoryPublicationError::Io)?;
+    let total_bytes = header_bytes
+        .checked_add(name_bytes)
+        .ok_or(DirectoryPublicationError::Io)?;
+    let word_count = total_bytes
+        .checked_add(std::mem::size_of::<usize>() - 1)
+        .ok_or(DirectoryPublicationError::Io)?
+        / std::mem::size_of::<usize>();
+    let mut storage = vec![0_usize; word_count];
+    let info = storage.as_mut_ptr().cast::<NativeFileRenameInformation>();
+    unsafe {
+        // SAFETY: `storage` is allocator-aligned for the repr(C) header and
+        // has enough initialized capacity for the header plus UTF-16 name.
+        (*info).replace_if_exists = 0;
+        (*info).padding = [0; 7];
+        (*info).root_directory = destination_parent.as_raw_handle().cast();
+        (*info).file_name_length =
+            u32::try_from(name_bytes).map_err(|_| DirectoryPublicationError::InvalidPath)?;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).file_name.as_mut_ptr(), name.len());
+    }
+    let mut io_status = NativeIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let status = unsafe {
+        // SAFETY: source and destination parent are retained live handles;
+        // the rename buffer is valid for the synchronous native call.
+        NtSetInformationFile(
+            source.as_raw_handle().cast(),
+            &raw mut io_status,
+            info.cast(),
+            u32::try_from(total_bytes).map_err(|_| DirectoryPublicationError::Io)?,
+            NATIVE_FILE_RENAME_INFORMATION,
         )
     };
-    if moved != 0 {
+    if native_status_is_success(status) {
         return Ok(());
     }
-    let error = std::io::Error::last_os_error();
-    if matches!(
-        error.raw_os_error(),
-        Some(code)
-            if code == ERROR_ALREADY_EXISTS.cast_signed()
-                || code == ERROR_FILE_EXISTS.cast_signed()
-    ) || std::fs::symlink_metadata(destination).is_ok()
-    {
+    if status == NATIVE_STATUS_OBJECT_NAME_COLLISION || status == NATIVE_STATUS_OBJECT_NAME_EXISTS {
         return Err(DirectoryPublicationError::AlreadyExists);
     }
     Err(DirectoryPublicationError::Io)
@@ -10351,43 +10673,44 @@ fn prepare_owned_directory_publication(
     let canonical_destination = contour.canonical_parent.join(destination_name);
     require_directory_publication_absent(&canonical_destination)?;
 
+    let parent = contour
+        .entries
+        .last()
+        .map(|(_, _, handle)| handle)
+        .ok_or(DirectoryPublicationError::InvalidPath)?;
     for index in 0_u32..64 {
-        let temporary = contour.canonical_parent.join(format!(
-            ".{destination_name}.tmp.{}.{}",
-            std::process::id(),
-            index
-        ));
-        match std::fs::create_dir(&temporary) {
-            Ok(()) => {
-                let prepared = (|| {
-                    validate_owned_temporary_name(&temporary, &canonical_destination)?;
-                    verify_directory_publication_contour(&contour)?;
-                    require_directory_publication_absent(&canonical_destination)?;
-                    let source = open_movable_publication_directory(&temporary)?;
-                    let source_path = final_windows_path_from_handle(&source)
-                        .map_err(|_| DirectoryPublicationError::Io)?;
-                    let source_identity = file_identity_from_handle(&source)
-                        .map_err(|_| DirectoryPublicationError::Io)?;
-                    if !windows_paths_equal(&source_path, &temporary)
-                        || source_identity.volume_serial_number == 0
-                        || source_identity.file_index == 0
-                    {
-                        return Err(DirectoryPublicationError::IdentityMismatch);
-                    }
-                    Ok(OwnedDirectoryPublication {
-                        temporary: source_path,
-                        destination: canonical_destination.clone(),
-                        initial_temporary_identity: source_identity,
-                        contour,
-                        temporary_handle: Some(source),
-                        committed: false,
-                    })
-                })();
-                return prepared;
+        let temporary_name = format!(".{destination_name}.tmp.{}.{}", std::process::id(), index);
+        let temporary = contour.canonical_parent.join(&temporary_name);
+        let source =
+            match create_owned_directory_relative(parent, &temporary_name, std::ptr::null_mut()) {
+                Ok(source) => source,
+                Err(DirectoryPublicationError::AlreadyExists) => continue,
+                Err(error) => return Err(error),
+            };
+        let prepared = (|| {
+            validate_owned_temporary_name(&temporary, &canonical_destination)?;
+            verify_directory_publication_contour(&contour)?;
+            require_directory_publication_absent(&canonical_destination)?;
+            let source_path = final_windows_path_from_handle(&source)
+                .map_err(|_| DirectoryPublicationError::Io)?;
+            let source_identity =
+                file_identity_from_handle(&source).map_err(|_| DirectoryPublicationError::Io)?;
+            if !windows_paths_equal(&source_path, &temporary)
+                || source_identity.volume_serial_number == 0
+                || source_identity.file_index == 0
+            {
+                return Err(DirectoryPublicationError::IdentityMismatch);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err(DirectoryPublicationError::Io),
-        }
+            Ok(OwnedDirectoryPublication {
+                temporary: source_path,
+                destination: canonical_destination.clone(),
+                initial_temporary_identity: source_identity,
+                contour,
+                temporary_handle: Some(source),
+                committed: false,
+            })
+        })();
+        return prepared;
     }
     Err(DirectoryPublicationError::Io)
 }
@@ -10417,6 +10740,17 @@ impl OwnedDirectoryPublication {
         verify_directory_publication_contour(&self.contour)?;
         let canonical_parent_path = publication_path_text(&self.contour.canonical_parent)?;
         let destination_path = publication_path_text(&self.destination)?;
+        let destination_name = self
+            .destination
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or(DirectoryPublicationError::InvalidPath)?;
+        let destination_parent = self
+            .contour
+            .entries
+            .last()
+            .map(|(_, _, handle)| handle)
+            .ok_or(DirectoryPublicationError::InvalidPath)?;
         let source = self
             .temporary_handle
             .as_ref()
@@ -10442,11 +10776,11 @@ impl OwnedDirectoryPublication {
             return Err(DirectoryPublicationError::IdentityMismatch);
         }
         before_move();
-        let source = self
-            .temporary_handle
-            .take()
-            .ok_or(DirectoryPublicationError::IdentityMismatch)?;
-        move_directory_create_new_durable(&self.temporary, &self.destination)?;
+        // The retained source handle is the object being renamed.  The
+        // retained destination-parent handle and relative leaf make this a
+        // no-follow, no-replace operation with no path-source lookup between
+        // the final identity check and the commit boundary.
+        rename_directory_from_handle(source, destination_parent, destination_name)?;
         self.committed = true;
 
         let unknown = |reason| {
@@ -10461,7 +10795,7 @@ impl OwnedDirectoryPublication {
         if let Some(reason) = injected_postcommit_unknown {
             return Ok(unknown(reason));
         }
-        let Ok(moved_path) = final_windows_path_from_handle(&source) else {
+        let Ok(moved_path) = final_windows_path_from_handle(source) else {
             return Ok(unknown(
                 DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
             ));
@@ -10469,7 +10803,7 @@ impl OwnedDirectoryPublication {
         if !windows_paths_equal(&moved_path, &self.destination) {
             return Ok(unknown(DirectoryPublicationUnknown::PostCommitPathChanged));
         }
-        let Ok(moved_identity) = file_identity_from_handle(&source) else {
+        let Ok(moved_identity) = file_identity_from_handle(source) else {
             return Ok(unknown(
                 DirectoryPublicationUnknown::PostCommitIdentityUnavailable,
             ));
@@ -10479,6 +10813,8 @@ impl OwnedDirectoryPublication {
                 DirectoryPublicationUnknown::PostCommitIdentityChanged,
             ));
         }
+        // The retained source handle intentionally denies FILE_SHARE_DELETE;
+        // readback handles must request only the shares that the owner grants.
         let Ok(observer) = open_publication_directory(&self.destination, true) else {
             return Ok(unknown(
                 DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
@@ -10502,7 +10838,7 @@ impl OwnedDirectoryPublication {
                 DirectoryPublicationUnknown::PostCommitIdentityChanged,
             ));
         }
-        let Ok(destination_pin) = open_publication_directory(&self.destination, false) else {
+        let Ok(destination_pin) = open_publication_directory(&self.destination, true) else {
             return Ok(unknown(
                 DirectoryPublicationUnknown::PostCommitReadbackUnavailable,
             ));
@@ -10531,9 +10867,9 @@ impl OwnedDirectoryPublication {
             ));
         }
         if let Some((_, _, parent)) = self.contour.entries.last() {
-            // MoveFileExW WRITE_THROUGH is the durable commit boundary. Some
-            // Windows filesystems reject directory FlushFileBuffers, so this
-            // is best-effort reinforcement, not a second fallible commit.
+            // NtSetInformationFile is the handle-relative commit boundary.
+            // Some Windows filesystems reject directory FlushFileBuffers, so
+            // this is best-effort reinforcement, not a second fallible commit.
             let _ = parent.sync_all();
         }
         Ok(DirectoryPublicationOutcome::Published(
@@ -16493,7 +16829,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn directory_publication_drop_never_deletes_a_substituted_tree() {
+    fn directory_publication_root_cannot_be_substituted_during_writes() {
         let root = std::env::temp_dir().join(format!(
             "eliot-directory-publication-drop-substitution-{}",
             unique_suffix()
@@ -16503,21 +16839,15 @@ mod tests {
         let publication = OwnedDirectoryPublication::create(&destination)
             .unwrap_or_else(|error| panic!("prepare publication: {error}"));
         let temporary = publication.temporary_path().to_path_buf();
-        let retired = root.join("retired");
-        std::fs::rename(&temporary, &retired)
-            .unwrap_or_else(|error| panic!("substitute source name: {error}"));
-        std::fs::create_dir(&temporary)
-            .unwrap_or_else(|error| panic!("create foreign substitute: {error}"));
-        std::fs::write(temporary.join("foreign.txt"), b"foreign-owner")
-            .unwrap_or_else(|error| panic!("write foreign substitute: {error}"));
+        std::fs::write(temporary.join("role.json"), b"owned")
+            .unwrap_or_else(|error| panic!("write owned role: {error}"));
+        let substituted = root.join("substituted");
+        assert!(
+            std::fs::rename(&temporary, &substituted).is_err(),
+            "retained source handle must block root rename/substitution"
+        );
 
         drop(publication);
-
-        assert_eq!(
-            std::fs::read(temporary.join("foreign.txt"))
-                .unwrap_or_else(|error| panic!("foreign tree was deleted: {error}")),
-            b"foreign-owner"
-        );
         let _ = std::fs::remove_dir_all(root);
     }
 

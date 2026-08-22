@@ -1231,29 +1231,34 @@ impl TrustedSourceBundle {
             let mut identities = HashSet::new();
             let mut total_bytes = 0_u64;
             let mut files = Vec::new();
-            let _tree = walk_trusted_source_tree(self.path(), |relative, path, file, identity| {
-                if !identities.insert(identity) {
-                    return Err(PackageStagingError::IdentityMismatch);
-                }
-                if files.len() >= MAX_PACKAGE_FILES {
-                    return Err(PackageStagingError::BoundExceeded);
-                }
-                let observed = observe_source_handle(file, path, MAX_PACKAGE_FILE_BYTES)?;
-                total_bytes = total_bytes
-                    .checked_add(observed.size)
-                    .ok_or(PackageStagingError::BoundExceeded)?;
-                if total_bytes > MAX_PACKAGE_TOTAL_BYTES {
-                    return Err(PackageStagingError::BoundExceeded);
-                }
-                files.push(PackageSourceFileObservation {
-                    relative_path: relative.canonical.clone(),
-                    sha256: observed.sha256,
-                    identity,
-                    size: observed.size,
-                    pe: observed.pe,
-                });
-                Ok(())
-            })?;
+            let root = self.contour.last().ok_or(PackageStagingError::Io)?;
+            let _tree = walk_trusted_source_tree_with_root(
+                self.path(),
+                Some(root),
+                |relative, path, file, identity| {
+                    if !identities.insert(identity) {
+                        return Err(PackageStagingError::IdentityMismatch);
+                    }
+                    if files.len() >= MAX_PACKAGE_FILES {
+                        return Err(PackageStagingError::BoundExceeded);
+                    }
+                    let observed = observe_source_handle(file, path, MAX_PACKAGE_FILE_BYTES)?;
+                    total_bytes = total_bytes
+                        .checked_add(observed.size)
+                        .ok_or(PackageStagingError::BoundExceeded)?;
+                    if total_bytes > MAX_PACKAGE_TOTAL_BYTES {
+                        return Err(PackageStagingError::BoundExceeded);
+                    }
+                    files.push(PackageSourceFileObservation {
+                        relative_path: relative.canonical.clone(),
+                        sha256: observed.sha256,
+                        identity,
+                        size: observed.size,
+                        pe: observed.pe,
+                    });
+                    Ok(())
+                },
+            )?;
             self.verify_stable()?;
             files.sort_by(|left, right| {
                 let left = validate_relative_text(&left.relative_path).ok();
@@ -1306,6 +1311,50 @@ fn retain_source_directory(path: &Path) -> Result<TrustedSourceBundle, PackageSt
     if !super::windows_paths_equal(&observed, &canonical) {
         return Err(PackageStagingError::IdentityMismatch);
     }
+    Ok(TrustedSourceBundle {
+        path: observed,
+        identity,
+        contour,
+    })
+}
+
+/// Reuse an already-retained source root handle without reopening its path.
+/// This is the publication bridge: the native-owned directory handle carries
+/// DELETE access so it can later be renamed, and a path reopen would therefore
+/// require `FILE_SHARE_DELETE` and weaken the substitution fence.  Ancestors
+/// are still retained no-follow; the root itself is cloned from the exact
+/// caller-owned handle.
+#[cfg(windows)]
+pub(crate) fn retain_source_directory_with_retained_root(
+    path: &Path,
+    root: &std::fs::File,
+) -> Result<TrustedSourceBundle, PackageStagingError> {
+    validate_source_root_input(path)?;
+    reject_reparse_ancestors(path)?;
+    let canonical = super::canonical_windows_path(path).map_err(map_protected_path_error)?;
+    let mut ancestors = canonical
+        .ancestors()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+    let expected_root = ancestors
+        .pop()
+        .ok_or(PackageStagingError::RootUnavailable)?;
+    if !super::windows_paths_equal(&expected_root, &canonical) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let mut contour = Vec::with_capacity(ancestors.len().saturating_add(1));
+    for ancestor in ancestors {
+        contour.push(open_existing_directory(&ancestor)?);
+    }
+    let root = root.try_clone().map_err(|_| PackageStagingError::Io)?;
+    let identity = super::file_identity_from_handle(&root).map_err(|_| PackageStagingError::Io)?;
+    let observed =
+        super::final_windows_path_from_handle(&root).map_err(map_protected_path_error)?;
+    if !super::windows_paths_equal(&observed, &canonical) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    contour.push(root);
     Ok(TrustedSourceBundle {
         path: observed,
         identity,
@@ -2495,6 +2544,23 @@ where
 #[cfg(windows)]
 fn walk_trusted_source_tree<F>(
     root: &Path,
+    on_file: F,
+) -> Result<Vec<TreeEntry>, PackageStagingError>
+where
+    F: FnMut(
+        &PackageRelativePath,
+        &Path,
+        &std::fs::File,
+        FileIdentity,
+    ) -> Result<(), PackageStagingError>,
+{
+    walk_trusted_source_tree_with_root(root, None, on_file)
+}
+
+#[cfg(windows)]
+fn walk_trusted_source_tree_with_root<F>(
+    root: &Path,
+    retained_root: Option<&std::fs::File>,
     mut on_file: F,
 ) -> Result<Vec<TreeEntry>, PackageStagingError>
 where
@@ -2505,7 +2571,10 @@ where
         FileIdentity,
     ) -> Result<(), PackageStagingError>,
 {
-    let root_handle = open_existing_directory(root)?;
+    let root_handle = match retained_root {
+        Some(root) => root.try_clone().map_err(|_| PackageStagingError::Io)?,
+        None => open_existing_directory(root)?,
+    };
     let root_final = final_path_from_handle(&root_handle)?;
     if !super::windows_paths_equal(&root_final, root) {
         return Err(PackageStagingError::IdentityMismatch);
@@ -2665,15 +2734,32 @@ fn retain_destination_parent(
 
 #[cfg(windows)]
 fn open_existing_directory(path: &Path) -> Result<std::fs::File, PackageStagingError> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+    open_existing_directory_with_access(path, FILE_GENERIC_READ)
+}
+
+#[cfg(windows)]
+fn open_existing_directory_for_create(path: &Path) -> Result<std::fs::File, PackageStagingError> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_SUBDIRECTORY, FILE_GENERIC_READ};
+    open_existing_directory_with_access(path, FILE_GENERIC_READ | FILE_ADD_SUBDIRECTORY)
+}
+
+#[cfg(windows)]
+fn open_existing_directory_with_access(
+    path: &Path,
+    access: u32,
+) -> Result<std::fs::File, PackageStagingError> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     let mut options = std::fs::OpenOptions::new();
     options
         .read(true)
-        .access_mode(FILE_GENERIC_READ)
+        // Delete sharing remains omitted so an ancestor cannot be renamed
+        // while its exact handle is being observed or used for creation.
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(|error| {
@@ -3002,39 +3088,30 @@ fn security_descriptor_digest(file: &std::fs::File) -> Result<String, PackageSta
 
 #[cfg(windows)]
 fn create_generation_root(path: &Path) -> Result<std::fs::File, PackageStagingError> {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-
     let parent = path.parent().ok_or(PackageStagingError::RootUnavailable)?;
-    let parent_file = open_existing_directory(parent)?;
+    let parent_file = open_existing_directory_for_create(parent)?;
     let descriptor = super::OwnedSecurityDescriptor::for_installer_system_object(true)
         .map_err(|_| PackageStagingError::SecurityMismatch)?;
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
-            .map_err(|_| PackageStagingError::Io)?,
-        lpSecurityDescriptor: descriptor.raw,
-        bInheritHandle: 0,
-    };
-    let wide = super::wide(path);
-    let created = unsafe {
-        // SAFETY: path and descriptor remain live for this synchronous call;
-        // CreateDirectoryW is atomic and does not adopt an existing object.
-        CreateDirectoryW(wide.as_ptr(), &raw const attributes)
-    };
-    if created == 0 {
-        let error = unsafe { GetLastError() };
-        drop(parent_file);
-        return if error == ERROR_ALREADY_EXISTS {
-            Err(PackageStagingError::GenerationExists)
-        } else {
-            Err(PackageStagingError::Io)
-        };
-    }
-    drop(parent_file);
-    let Ok(root) = open_existing_directory_for_delete(path) else {
-        return Err(PackageStagingError::RollbackRefused);
-    };
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(PackageStagingError::InvalidRelativePath)?;
+    let root = super::create_owned_directory_relative(&parent_file, name, descriptor.raw).map_err(
+        |error| match error {
+            super::DirectoryPublicationError::AlreadyExists => {
+                PackageStagingError::GenerationExists
+            }
+            super::DirectoryPublicationError::ReparsePoint => PackageStagingError::ReparsePoint,
+            super::DirectoryPublicationError::IdentityMismatch => {
+                PackageStagingError::IdentityMismatch
+            }
+            super::DirectoryPublicationError::InvalidPath => {
+                PackageStagingError::InvalidRelativePath
+            }
+            super::DirectoryPublicationError::Io
+            | super::DirectoryPublicationError::UnsupportedPlatform => PackageStagingError::Io,
+        },
+    )?;
     let Ok(identity) = file_identity_from_open_handle(&root) else {
         drop(root);
         return Err(PackageStagingError::RollbackRefused);
@@ -3139,37 +3216,29 @@ fn create_destination_file(
 fn create_destination_directory(
     path: &Path,
 ) -> Result<(std::fs::File, FileIdentity, String), PackageStagingError> {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-
     let parent = path.parent().ok_or(PackageStagingError::RootUnavailable)?;
-    let parent_file = open_existing_directory(parent)?;
+    let parent_file = open_existing_directory_for_create(parent)?;
     let descriptor = super::OwnedSecurityDescriptor::for_installer_system_object(true)
         .map_err(|_| PackageStagingError::SecurityMismatch)?;
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
-            .map_err(|_| PackageStagingError::Io)?,
-        lpSecurityDescriptor: descriptor.raw,
-        bInheritHandle: 0,
-    };
-    let wide = super::wide(path);
-    let created = unsafe {
-        // SAFETY: path and descriptor remain live for this synchronous call;
-        // CreateDirectoryW is create-only and never adopts an existing entry.
-        CreateDirectoryW(wide.as_ptr(), &raw const attributes)
-    };
-    drop(parent_file);
-    if created == 0 {
-        return if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            Err(PackageStagingError::GenerationExists)
-        } else {
-            Err(PackageStagingError::Io)
-        };
-    }
-    let Ok(directory) = open_existing_directory_for_delete(path) else {
-        return Err(PackageStagingError::RollbackRefused);
-    };
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(PackageStagingError::InvalidRelativePath)?;
+    let directory = super::create_owned_directory_relative(&parent_file, name, descriptor.raw)
+        .map_err(|error| match error {
+            super::DirectoryPublicationError::AlreadyExists => {
+                PackageStagingError::GenerationExists
+            }
+            super::DirectoryPublicationError::ReparsePoint => PackageStagingError::ReparsePoint,
+            super::DirectoryPublicationError::IdentityMismatch => {
+                PackageStagingError::IdentityMismatch
+            }
+            super::DirectoryPublicationError::InvalidPath => {
+                PackageStagingError::InvalidRelativePath
+            }
+            super::DirectoryPublicationError::Io
+            | super::DirectoryPublicationError::UnsupportedPlatform => PackageStagingError::Io,
+        })?;
     let Ok(identity) = file_identity_from_open_handle(&directory) else {
         drop(directory);
         return Err(PackageStagingError::RollbackRefused);
@@ -4552,6 +4621,11 @@ mod tests {
         let (second, second_identity, _) =
             create_destination_directory(&second_path).expect("second directory");
         assert!(second_path.is_dir());
+        let substituted = parent.join("bin-substituted");
+        assert!(
+            std::fs::rename(&first_path, &substituted).is_err(),
+            "retained native child handle must block StagePackage child substitution"
+        );
         delete_open_handle(second, second_identity).expect("second delete");
         delete_open_handle(first, first_identity).expect("first delete");
         assert!(!first_path.exists());
