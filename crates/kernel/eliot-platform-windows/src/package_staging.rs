@@ -30,8 +30,19 @@ pub const MAX_PACKAGE_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Maximum PE header prefix inspected by the pure parser.
 pub const MAX_PE_HEADER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_AUTHENTICODE_CERT_DER_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of files plus directories walked from one source root.
 pub const MAX_ENUMERATED_ENTRIES: usize = MAX_PACKAGE_FILES * 2 + MAX_PACKAGE_PATH_DEPTH;
+
+fn provider_chain_is_bounded<T>(count: u32, chain: *const T) -> bool {
+    count != 0 && !chain.is_null()
+}
+
+fn provider_der_length(pointer: *const u8, length: u32) -> Option<usize> {
+    let length = usize::try_from(length).ok()?;
+    (length != 0 && length <= MAX_AUTHENTICODE_CERT_DER_BYTES && !pointer.is_null())
+        .then_some(length)
+}
 
 /// A validated relative package path using `/` as its canonical separator.
 ///
@@ -604,6 +615,26 @@ impl AuthenticodeVerifier for WindowsAuthenticodeVerifier {
     }
 }
 
+enum StagingAuthenticodeVerifier<'a> {
+    Generic(&'a dyn AuthenticodeVerifier),
+    Official,
+}
+
+impl StagingAuthenticodeVerifier<'_> {
+    fn verify(
+        &self,
+        path: &Path,
+        file: &mut std::fs::File,
+        identity: FileIdentity,
+        sha256: &str,
+    ) -> Result<AuthenticodeEvidence, AuthenticodeError> {
+        match self {
+            Self::Generic(verifier) => verifier.verify(path, identity, sha256),
+            Self::Official => verify_authenticode_handle(path, file, identity, sha256),
+        }
+    }
+}
+
 #[cfg(not(windows))]
 fn verify_authenticode_platform(
     _path: &Path,
@@ -619,41 +650,107 @@ fn verify_authenticode_platform(
     expected_identity: FileIdentity,
     expected_sha256: &str,
 ) -> Result<AuthenticodeEvidence, AuthenticodeError> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
-    };
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
 
     if !path.is_absolute() || !super::valid_sha256_hex(expected_sha256) {
         return Err(AuthenticodeError::InvalidInput);
     }
     let mut file = std::fs::OpenOptions::new();
     file.read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        // WinTrust needs to read the object, but this handle deliberately does
+        // not share future writes or deletes during the provider call.
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let mut file = file.open(path).map_err(|_| AuthenticodeError::NotFound)?;
+    verify_authenticode_handle(path, &mut file, expected_identity, expected_sha256)
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthenticodeFileObservation {
+    path: PathBuf,
+    identity: FileIdentity,
+    size: u64,
+    sha256: String,
+}
+
+#[cfg(windows)]
+fn observe_authenticode_handle(
+    file: &mut std::fs::File,
+) -> Result<AuthenticodeFileObservation, AuthenticodeError> {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
     let metadata = file
         .metadata()
         .map_err(|_| AuthenticodeError::InvalidFile)?;
     if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(AuthenticodeError::InvalidFile);
     }
+    let path =
+        super::final_windows_path_from_handle(file).map_err(|_| AuthenticodeError::InvalidFile)?;
     let identity =
-        super::file_identity_from_handle(&file).map_err(|_| AuthenticodeError::InvalidFile)?;
-    if identity != expected_identity {
+        super::file_identity_from_handle(file).map_err(|_| AuthenticodeError::InvalidFile)?;
+    let size = metadata.len();
+    let sha256 = hash_file(file)?;
+    Ok(AuthenticodeFileObservation {
+        path,
+        identity,
+        size,
+        sha256,
+    })
+}
+
+#[cfg(windows)]
+fn compare_authenticode_observations(
+    expected_path: &Path,
+    before: &AuthenticodeFileObservation,
+    after: &AuthenticodeFileObservation,
+) -> Result<(), AuthenticodeError> {
+    if !super::windows_paths_equal(&before.path, expected_path)
+        || !super::windows_paths_equal(&after.path, expected_path)
+        || before.identity != after.identity
+    {
         return Err(AuthenticodeError::IdentityMismatch);
     }
-    let observed_sha256 = hash_file(&mut file)?;
-    if observed_sha256 != expected_sha256 {
+    if before.size != after.size || before.sha256 != after.sha256 {
         return Err(AuthenticodeError::DigestMismatch);
     }
-    let canonical_path =
-        super::final_windows_path_from_handle(&file).map_err(|_| AuthenticodeError::InvalidFile)?;
-    if !super::windows_paths_equal(&canonical_path, path) {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_authenticode_handle(
+    path: &Path,
+    file: &mut std::fs::File,
+    expected_identity: FileIdentity,
+    expected_sha256: &str,
+) -> Result<AuthenticodeEvidence, AuthenticodeError> {
+    if !path.is_absolute() || !super::valid_sha256_hex(expected_sha256) {
+        return Err(AuthenticodeError::InvalidInput);
+    }
+    let before = observe_authenticode_handle(file)?;
+    if before.identity != expected_identity {
         return Err(AuthenticodeError::IdentityMismatch);
     }
-    verify_signature(&canonical_path, &file)
+    if before.sha256 != expected_sha256 {
+        return Err(AuthenticodeError::DigestMismatch);
+    }
+    let evidence = verify_signature(&before.path, file)?;
+    let after = observe_authenticode_handle(file)?;
+    compare_authenticode_observations(path, &before, &after)?;
+    Ok(evidence)
+}
+
+#[cfg(not(windows))]
+fn verify_authenticode_handle(
+    _path: &Path,
+    _file: &mut std::fs::File,
+    _expected_identity: FileIdentity,
+    _expected_sha256: &str,
+) -> Result<AuthenticodeEvidence, AuthenticodeError> {
+    Err(AuthenticodeError::UnsupportedPlatform)
 }
 
 #[cfg(windows)]
@@ -796,6 +893,14 @@ fn provider_evidence(
     if signer.is_null() {
         return None;
     }
+    let (cert_count, cert_chain) = unsafe {
+        // SAFETY: signer is live until provider CLOSE; these are the provider's
+        // own chain count and first-element pointer.
+        ((*signer).csCertChain, (*signer).pasCertChain)
+    };
+    if !provider_chain_is_bounded(cert_count, cert_chain.cast_const()) {
+        return None;
+    }
     let cert = unsafe {
         // SAFETY: signer is live; WinTrust bounds certificate index zero.
         WTHelperGetProvCertFromChain(signer, 0)
@@ -811,42 +916,48 @@ fn provider_evidence(
         // SAFETY: context is provider-owned and live until CLOSE.
         &*context
     })?;
-    if context.pbCertEncoded.is_null() || context.cbCertEncoded == 0 {
-        return None;
-    }
+    let der_length = provider_der_length(context.pbCertEncoded, context.cbCertEncoded)?;
     let der = unsafe {
-        // SAFETY: provider supplied the exact bounded DER length.
-        std::slice::from_raw_parts(context.pbCertEncoded, context.cbCertEncoded as usize)
+        // SAFETY: the provider pointer is non-null and the byte length is
+        // explicitly bounded before constructing the DER slice.
+        std::slice::from_raw_parts(context.pbCertEncoded, der_length)
     };
     let (signer_subject, not_before, not_after) = certificate_evidence(context);
     let countersigner = unsafe {
         // SAFETY: provider is live; the optional countersigner is provider-owned.
         WTHelperGetProvSignerFromChain(provider, 0, 1, 0)
     };
-    let countersigner_certificate_sha256 = (!countersigner.is_null())
-        .then(|| {
-            let cert = unsafe {
-                // SAFETY: countersigner is provider-owned and live.
-                WTHelperGetProvCertFromChain(countersigner, 0)
-            };
-            if cert.is_null() {
-                return None;
-            }
-            let context = unsafe {
-                // SAFETY: cert remains live until provider CLOSE.
-                (*cert).pCert
-            };
-            let context = (!context.is_null()).then(|| unsafe { &*context })?;
-            if context.pbCertEncoded.is_null() || context.cbCertEncoded == 0 {
-                return None;
-            }
-            let der = unsafe {
-                // SAFETY: provider supplied the exact bounded DER length.
-                std::slice::from_raw_parts(context.pbCertEncoded, context.cbCertEncoded as usize)
-            };
-            Some(hex_digest(der))
-        })
-        .flatten();
+    let countersigner_certificate_sha256 = if countersigner.is_null() {
+        None
+    } else {
+        let (cert_count, cert_chain) = unsafe {
+            // SAFETY: countersigner is provider-owned and live until CLOSE;
+            // these are its chain count and first-element pointer.
+            ((*countersigner).csCertChain, (*countersigner).pasCertChain)
+        };
+        if !provider_chain_is_bounded(cert_count, cert_chain.cast_const()) {
+            return None;
+        }
+        let cert = unsafe {
+            // SAFETY: countersigner is provider-owned and live.
+            WTHelperGetProvCertFromChain(countersigner, 0)
+        };
+        if cert.is_null() {
+            return None;
+        }
+        let context = unsafe {
+            // SAFETY: cert remains live until provider CLOSE.
+            (*cert).pCert
+        };
+        let context = (!context.is_null()).then(|| unsafe { &*context })?;
+        let der_length = provider_der_length(context.pbCertEncoded, context.cbCertEncoded)?;
+        let der = unsafe {
+            // SAFETY: the provider pointer is non-null and the byte length is
+            // explicitly bounded before constructing the DER slice.
+            std::slice::from_raw_parts(context.pbCertEncoded, der_length)
+        };
+        Some(hex_digest(der))
+    };
 
     Some(AuthenticodeEvidence {
         verdict: AuthenticodeVerdict::Valid,
@@ -1612,7 +1723,7 @@ impl PackageStager {
     /// Returns a typed error for invalid manifests, tree mismatches, identity
     /// or security races, failed trust, or refused exact-owned rollback.
     pub fn stage(&self, manifest: &PackageManifest) -> Result<StagingReceipt, PackageStagingError> {
-        self.stage_with_verifier(manifest, &WindowsAuthenticodeVerifier)
+        self.stage_internal(manifest, &StagingAuthenticodeVerifier::Official)
     }
 
     /// Same operation with the sealed Authenticode injection seam.
@@ -1625,6 +1736,14 @@ impl PackageStager {
         &self,
         manifest: &PackageManifest,
         verifier: &V,
+    ) -> Result<StagingReceipt, PackageStagingError> {
+        self.stage_internal(manifest, &StagingAuthenticodeVerifier::Generic(verifier))
+    }
+
+    fn stage_internal(
+        &self,
+        manifest: &PackageManifest,
+        verifier: &StagingAuthenticodeVerifier<'_>,
     ) -> Result<StagingReceipt, PackageStagingError> {
         let manifest = manifest.validate()?;
         let generation = validate_relative_text(&manifest.generation)?;
@@ -1901,7 +2020,7 @@ impl PackageStager {
         manifest: &PackageManifest,
         expected_files: &[StagedFileReceipt],
     ) -> Result<Vec<StagedFileReceipt>, PackageStagingError> {
-        let verifier = WindowsAuthenticodeVerifier;
+        let verifier = StagingAuthenticodeVerifier::Official;
         let mut files = Vec::with_capacity(manifest.files.len());
         for spec in &manifest.files {
             let relative = validate_relative_text(&spec.relative_path)?;
@@ -1911,12 +2030,16 @@ impl PackageStager {
                 .find(|file| ordinal_eq_str(&file.relative_path, &spec.relative_path))
                 .ok_or(PackageStagingError::TreeMismatch)?
                 .source_identity;
-            let destination_file = open_existing_file(&destination)?;
+            let mut destination_file = open_existing_file(&destination)?;
             let destination_identity = file_identity_from_open_handle(&destination_file)?;
-            let destination_snapshot =
-                read_destination_snapshot(&destination, spec.expected_size, destination_identity)?;
+            let destination_snapshot = read_destination_snapshot_handle(
+                &destination_file,
+                &destination,
+                spec.expected_size,
+                destination_identity,
+            )?;
             let pe = if spec.executable {
-                let header = read_file_prefix(&destination, MAX_PE_HEADER_BYTES)?;
+                let header = read_file_prefix_handle(&destination_file, MAX_PE_HEADER_BYTES)?;
                 Some(parse_pe_coff(&header).map_err(PackageStagingError::PeParse)?)
             } else {
                 None
@@ -1925,6 +2048,7 @@ impl PackageStager {
                 let evidence = verifier
                     .verify(
                         &destination,
+                        &mut destination_file,
                         destination_identity,
                         &destination_snapshot.sha256,
                     )
@@ -1958,11 +2082,11 @@ impl PackageStager {
         Ok(files)
     }
 
-    fn copy_and_measure<V: AuthenticodeVerifier>(
+    fn copy_and_measure(
         &self,
         manifest: &PackageManifest,
         destination_root: &Path,
-        verifier: &V,
+        verifier: &StagingAuthenticodeVerifier<'_>,
         created: &mut CreatedTree,
     ) -> Result<Vec<StagedFileReceipt>, PackageStagingError> {
         for entry in expected_tree(manifest)? {
@@ -1993,11 +2117,11 @@ impl PackageStager {
         Ok(files)
     }
 
-    fn copy_one_file<V: AuthenticodeVerifier>(
+    fn copy_one_file(
         &self,
         spec: &PackageFileSpec,
         destination_root: &Path,
-        verifier: &V,
+        verifier: &StagingAuthenticodeVerifier<'_>,
         total: &mut u64,
         created: &mut CreatedTree,
     ) -> Result<StagedFileReceipt, PackageStagingError> {
@@ -2016,11 +2140,12 @@ impl PackageStager {
         } else {
             None
         };
-        let (destination_file, destination_identity, destination_readback) =
+        let (mut destination_file, destination_identity, destination_readback) =
             copy_destination_bytes(&source_snapshot, &destination, spec.expected_size)?;
         let authenticode = if spec.executable {
             let evidence = match verifier.verify(
                 &destination,
+                &mut destination_file,
                 destination_identity,
                 &destination_readback.sha256,
             ) {
@@ -2632,13 +2757,15 @@ fn open_existing_file(path: &Path) -> Result<std::fs::File, PackageStagingError>
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_READ,
     };
     let mut options = std::fs::OpenOptions::new();
     options
         .read(true)
         .access_mode(FILE_GENERIC_READ)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        // Retain a read-only observation fence: future writers and deletes
+        // cannot open this object while the handle is live.
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -2963,7 +3090,6 @@ fn create_destination_file(
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
     };
 
     let parent = path.parent().ok_or(PackageStagingError::RootUnavailable)?;
@@ -2979,11 +3105,11 @@ fn create_destination_file(
     let wide = super::wide(path);
     let handle = unsafe {
         // SAFETY: path/descriptor remain live; CREATE_NEW makes the file
-        // create-only and the share mode deliberately omits delete sharing.
+        // create-only and the retained handle omits write/delete sharing.
         CreateFileW(
             wide.as_ptr(),
             FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_SHARE_READ,
             &raw const attributes,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
@@ -3333,54 +3459,14 @@ fn flush_file_buffers(_file: &std::fs::File) -> Result<(), PackageStagingError> 
 }
 
 #[cfg(windows)]
+#[cfg(test)]
 fn read_destination_snapshot(
     path: &Path,
     expected_size: u64,
     expected_identity: FileIdentity,
 ) -> Result<DestinationSnapshot, PackageStagingError> {
     let file = open_existing_file(path)?;
-    let actual_identity = file_identity_from_open_handle(&file)?;
-    if actual_identity != expected_identity {
-        return Err(PackageStagingError::IdentityMismatch);
-    }
-    let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
-    if metadata.len() != expected_size {
-        return Err(PackageStagingError::SizeMismatch);
-    }
-    if metadata.len() > MAX_PACKAGE_FILE_BYTES {
-        return Err(PackageStagingError::BoundExceeded);
-    }
-    let mut reader = file.try_clone().map_err(|_| PackageStagingError::Io)?;
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|_| PackageStagingError::Io)?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
-    let mut size = 0_u64;
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|_| PackageStagingError::Io)?;
-        if read == 0 {
-            break;
-        }
-        size = size
-            .checked_add(read as u64)
-            .ok_or(PackageStagingError::BoundExceeded)?;
-        if size > expected_size {
-            return Err(PackageStagingError::SizeMismatch);
-        }
-        digest.update(&buffer[..read]);
-    }
-    if size != metadata.len() {
-        return Err(PackageStagingError::SizeMismatch);
-    }
-    let security_descriptor_sha256 = verify_system_security(&file, false)?;
-    Ok(DestinationSnapshot {
-        size,
-        sha256: hex_digest(&digest.finalize()),
-        security_descriptor_sha256,
-    })
+    read_destination_snapshot_handle(&file, path, expected_size, expected_identity)
 }
 
 #[cfg(windows)]
@@ -3448,18 +3534,12 @@ fn read_destination_snapshot_handle(
     Err(PackageStagingError::UnsupportedPlatform)
 }
 
-#[cfg(not(windows))]
-fn read_destination_snapshot(
-    _path: &Path,
-    _expected_size: u64,
-    _expected_identity: FileIdentity,
-) -> Result<DestinationSnapshot, PackageStagingError> {
-    Err(PackageStagingError::UnsupportedPlatform)
-}
-
 #[cfg(windows)]
-fn read_file_prefix(path: &Path, limit: usize) -> Result<Vec<u8>, PackageStagingError> {
-    let file = open_existing_file(path)?;
+fn read_file_prefix_handle(
+    file: &std::fs::File,
+    limit: usize,
+) -> Result<Vec<u8>, PackageStagingError> {
+    let file = file.try_clone().map_err(|_| PackageStagingError::Io)?;
     let mut bytes = Vec::new();
     file.take(u64::try_from(limit).map_err(|_| PackageStagingError::BoundExceeded)?)
         .read_to_end(&mut bytes)
@@ -3468,7 +3548,10 @@ fn read_file_prefix(path: &Path, limit: usize) -> Result<Vec<u8>, PackageStaging
 }
 
 #[cfg(not(windows))]
-fn read_file_prefix(_path: &Path, _limit: usize) -> Result<Vec<u8>, PackageStagingError> {
+fn read_file_prefix_handle(
+    _file: &std::fs::File,
+    _limit: usize,
+) -> Result<Vec<u8>, PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
 }
 
@@ -3705,6 +3788,81 @@ mod tests {
         for status in [0x800b_0100, 0x8009_2013, 0xdead_beef] {
             assert_ne!(classify_wintrust_status(status), AuthenticodeVerdict::Valid);
         }
+    }
+
+    #[test]
+    fn malformed_authenticode_provider_buffers_fail_closed_before_der_slice() {
+        let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        assert!(!provider_chain_is_bounded(0, dangling));
+        assert!(!provider_chain_is_bounded(1, std::ptr::null::<u8>()));
+        assert!(provider_chain_is_bounded(1, dangling));
+        assert_eq!(provider_der_length(std::ptr::null(), 1), None);
+        assert_eq!(provider_der_length(dangling, 0), None);
+        assert_eq!(
+            provider_der_length(
+                dangling,
+                u32::try_from(MAX_AUTHENTICODE_CERT_DER_BYTES + 1).expect("bound fits"),
+            ),
+            None
+        );
+        assert_eq!(provider_der_length(dangling, 1), Some(1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn authenticode_observation_rejects_mutation_and_substitution() {
+        let path = PathBuf::from(r"C:\Eliot\generation\app.exe");
+        let baseline = AuthenticodeFileObservation {
+            path: path.clone(),
+            identity: FileIdentity {
+                volume_serial_number: 1,
+                file_index: 2,
+            },
+            size: 6,
+            sha256: hex_digest(b"before"),
+        };
+        let mut mutation = baseline.clone();
+        mutation.sha256 = hex_digest(b"after!");
+        assert_eq!(
+            compare_authenticode_observations(&path, &baseline, &mutation),
+            Err(AuthenticodeError::DigestMismatch)
+        );
+        let mut substitution = baseline.clone();
+        substitution.identity.file_index = 3;
+        assert_eq!(
+            compare_authenticode_observations(&path, &baseline, &substitution),
+            Err(AuthenticodeError::IdentityMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn authenticode_retained_handle_blocks_write_and_substitution() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-authenticode-contour-{}-{}",
+            std::process::id(),
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("app.exe");
+        let replacement = root.join("replacement.exe");
+        std::fs::write(&path, b"before").expect("write");
+        let mut file = open_trusted_source_file(&path).expect("retained handle");
+        let before = observe_authenticode_handle(&mut file).expect("before observation");
+        assert!(
+            std::fs::write(&path, b"after!").is_err(),
+            "retained Authenticode handle must block future writes"
+        );
+        assert!(
+            std::fs::rename(&path, &replacement).is_err(),
+            "retained Authenticode handle must block path substitution"
+        );
+        let after = observe_authenticode_handle(&mut file).expect("after observation");
+        compare_authenticode_observations(&path, &before, &after)
+            .expect("same-handle observation remains stable");
+        drop(file);
+        std::fs::remove_file(&path).expect("file cleanup");
+        std::fs::remove_dir(&root).expect("root cleanup");
     }
 
     #[test]
