@@ -25,7 +25,7 @@ pub use runtime_control::{
 use std::ffi::OsString;
 use std::io;
 #[cfg(windows)]
-use std::io::Read;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -81,6 +81,13 @@ use eliot_ors::{
 #[cfg(windows)]
 use eliot_platform::WorkScopePath;
 use eliot_platform::{PlatformHandle, SecretReference, ServiceState};
+#[cfg(windows)]
+use eliot_platform_windows::{
+    DirectoryPublicationError, DirectoryPublicationOutcome, FileIdentity,
+    OwnedDirectoryPublication, OwnedDirectoryRetirementOutcome,
+    OwnedDirectoryRetirementPrecondition, ProtectedRuntimePathLease, PublicationOutcome,
+    retire_owned_directory_exact, windows_paths_equal,
+};
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME,
     HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError, ProtectedPathLease,
@@ -89,11 +96,16 @@ use eliot_platform_windows::{
     TerminatedJobChild, WindowsPlatform, fresh_kernel_activation_nonce,
 };
 #[cfg(windows)]
-use eliot_platform_windows::{FileIdentity, PublicationOutcome};
-#[cfg(windows)]
 use eliot_process::DispatchAuthorityId;
 use eliot_runtime_contracts::{
     HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
+};
+#[cfg(windows)]
+use eliot_runtime_contracts::{
+    SUPERVISION_LEASE_FILE_NAME, SignedSupervisionLease, SupervisionLeaseVerifier,
+    WATCHDOG_ADMISSION_FILE_NAME, WATCHDOG_PUBLICATION_DIRECTORY_PREFIX,
+    WATCHDOG_PUBLICATION_FILE_NAME, WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate,
+    WatchdogPublicationBundle, WatchdogPublicationRetentionPlan,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -639,9 +651,6 @@ use eliot_platform_windows::{
     SuspendedLaunchSpec, UserOwnedPathLease, UserOwnedRootLease, WindowsAdapterError,
     observe_named_pipe_peer_process,
 };
-
-#[cfg(windows)]
-use eliot_platform_windows::windows_paths_equal;
 
 #[cfg(windows)]
 const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 4] = [
@@ -2700,6 +2709,29 @@ fn validate_probe_response(
     let ready = response.receipt.clone().ok_or_else(|| {
         HostError::ProcessContour("Kernel did not return a ready receipt".to_owned())
     })?;
+    let supervision = response.supervision_lease.as_ref().ok_or_else(|| {
+        HostError::ProcessContour(
+            "Kernel did not return the exact current supervision ORS snapshot".to_owned(),
+        )
+    })?;
+    supervision
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let payload = &supervision.record.artifact.payload;
+    if payload.installation_id != request.candidate.installation_id.as_str()
+        || payload.host_epoch != request.candidate.host_epoch
+        || payload.activation_id != request.candidate.activation_id.as_str()
+        || payload.activation_generation != activation.generation
+        || payload.kernel_epoch != request.candidate.kernel_epoch
+        || payload.state_fence.authority_epoch != request.candidate.kernel_epoch
+        || payload.state_fence.resource_generation != activation.generation
+        || supervision.record.state != eliot_runtime_contracts::LeaseState::Active
+        || supervision.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel supervision snapshot is foreign to the exact readiness contour".to_owned(),
+        ));
+    }
     ready
         .validate_for_probe(request, activation)
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -2711,8 +2743,67 @@ struct AuthenticatedKernelReadiness {
     request: KernelControlRequest,
     response: KernelControlResponse,
     ready: KernelReadyReceipt,
+    supervision_lease: eliot_ors::SupervisionLeaseSnapshot,
     store_fence: PlatformHandle,
     peer_evidence: PlatformHandle,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublishedSupervisionIdentity {
+    lease_id: PlatformHandle,
+    ors_receipt_digest: PlatformHandle,
+    publication_digest: PlatformHandle,
+}
+
+#[cfg(windows)]
+impl PublishedSupervisionIdentity {
+    fn evidence_refs(&self) -> Result<[PlatformHandle; 3], HostError> {
+        Ok([
+            PlatformHandle::new(format!("supervision-lease:{}", self.lease_id.as_str()))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            PlatformHandle::new(format!(
+                "supervision-ors-receipt:{}",
+                self.ors_receipt_digest.as_str()
+            ))
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+            PlatformHandle::new(format!(
+                "watchdog-publication:{}",
+                self.publication_digest.as_str()
+            ))
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        ])
+    }
+
+    fn is_bound_by(&self, evidence_refs: &[PlatformHandle]) -> Result<bool, HostError> {
+        Ok(self
+            .evidence_refs()?
+            .iter()
+            .all(|expected| evidence_refs.contains(expected)))
+    }
+}
+
+#[cfg(windows)]
+fn readiness_supervision_fence_matches(
+    supervision: &PublishedSupervisionIdentity,
+    publication_is_exact: bool,
+    evidence_refs: &[PlatformHandle],
+) -> bool {
+    publication_is_exact && supervision.is_bound_by(evidence_refs).unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn require_exact_supervision_head(
+    expected: &eliot_ors::SupervisionLeaseSnapshot,
+    read_current: impl FnOnce() -> Result<eliot_ors::SupervisionLeaseSnapshot, HostError>,
+) -> Result<(), HostError> {
+    if read_current()? != *expected {
+        return Err(HostError::RecoveryRequired(
+            "Kernel ORS head changed after Watchdog publication and before readiness journal admission"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2818,6 +2909,9 @@ struct ReadinessContourIdentity {
     candidate_binding_digest: PlatformHandle,
     store_requirement_digest: PlatformHandle,
     store_proof_fence: Option<PlatformHandle>,
+    supervision_lease_id: Option<PlatformHandle>,
+    supervision_ors_receipt_digest: Option<PlatformHandle>,
+    watchdog_publication_digest: Option<PlatformHandle>,
 }
 
 #[cfg(windows)]
@@ -2830,6 +2924,9 @@ impl ReadinessContourIdentity {
             && self.active_kernel_record_checksum == other.active_kernel_record_checksum
             && self.candidate_binding_digest == other.candidate_binding_digest
             && self.store_requirement_digest == other.store_requirement_digest
+            && self.supervision_lease_id == other.supervision_lease_id
+            && self.supervision_ors_receipt_digest == other.supervision_ors_receipt_digest
+            && self.watchdog_publication_digest == other.watchdog_publication_digest
     }
 }
 
@@ -2913,6 +3010,9 @@ impl HostReadinessGate {
         if self.lease.as_ref().is_some_and(|lease| {
             contour == Some(&lease.contour)
                 && lease.contour.store_proof_fence.is_some()
+                && lease.contour.supervision_lease_id.is_some()
+                && lease.contour.supervision_ors_receipt_digest.is_some()
+                && lease.contour.watchdog_publication_digest.is_some()
                 && now < lease.valid_until
         }) {
             return ReadinessGateAction::PreserveAuthenticatedHealth;
@@ -2930,7 +3030,11 @@ impl HostReadinessGate {
     }
 
     fn grant(&mut self, contour: ReadinessContourIdentity, now: std::time::Instant) -> bool {
-        if contour.store_proof_fence.is_none() {
+        if contour.store_proof_fence.is_none()
+            || contour.supervision_lease_id.is_none()
+            || contour.supervision_ors_receipt_digest.is_none()
+            || contour.watchdog_publication_digest.is_none()
+        {
             self.lease = None;
             return false;
         }
@@ -4856,6 +4960,11 @@ impl HostJobBranches {
             let response = decode_control_response_frame(&frame)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let ready = validate_probe_response(&request, activation, &response)?;
+            let supervision_lease = response.supervision_lease.clone().ok_or_else(|| {
+                HostError::ProcessContour(
+                    "Kernel did not return the exact current supervision ORS snapshot".to_owned(),
+                )
+            })?;
             let store_fence = validated_store_proof_fence(
                 requirement,
                 &ready,
@@ -4867,6 +4976,7 @@ impl HostJobBranches {
                 request,
                 response,
                 ready,
+                supervision_lease,
                 store_fence,
                 peer_evidence,
             })
@@ -6458,6 +6568,470 @@ fn sha256_json(value: &impl serde::Serialize) -> Result<String, HostError> {
 }
 
 #[cfg(windows)]
+const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
+#[cfg(windows)]
+const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
+
+#[cfg(windows)]
+struct HostWatchdogPublicationObservation {
+    path: PathBuf,
+    marker: WatchdogPublicationBundle,
+    admission: WatchdogAdmissionTemplate,
+    lease: SignedSupervisionLease,
+    retirement: OwnedDirectoryRetirementPrecondition,
+}
+
+#[cfg(windows)]
+fn decode_watchdog_publication_observation(
+    path: &Path,
+    observation: &eliot_platform_windows::OwnedDirectoryObservation,
+    require_final_name: bool,
+) -> Result<HostWatchdogPublicationObservation, HostError> {
+    let admission_bytes = observation
+        .bytes(WATCHDOG_ADMISSION_FILE_NAME)
+        .ok_or_else(|| {
+            HostError::RecoveryRequired("Watchdog admission child is absent".to_owned())
+        })?;
+    let lease_bytes = observation
+        .bytes(SUPERVISION_LEASE_FILE_NAME)
+        .ok_or_else(|| HostError::RecoveryRequired("Watchdog lease child is absent".to_owned()))?;
+    let marker_bytes = observation
+        .bytes(WATCHDOG_PUBLICATION_FILE_NAME)
+        .ok_or_else(|| {
+            HostError::RecoveryRequired("Watchdog publication marker is absent".to_owned())
+        })?;
+    let admission: WatchdogAdmissionTemplate =
+        serde_json::from_slice(admission_bytes).map_err(|error| {
+            HostError::RecoveryRequired(format!("Watchdog admission decode failed: {error}"))
+        })?;
+    let marker: WatchdogPublicationBundle =
+        serde_json::from_slice(marker_bytes).map_err(|error| {
+            HostError::RecoveryRequired(format!("Watchdog marker decode failed: {error}"))
+        })?;
+    let lease: SignedSupervisionLease = serde_json::from_slice(lease_bytes).map_err(|error| {
+        HostError::RecoveryRequired(format!("Watchdog lease decode failed: {error}"))
+    })?;
+    admission
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    marker
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    lease
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if admission
+        .canonical_bytes()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+        != admission_bytes
+        || marker
+            .canonical_bytes()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+            != marker_bytes
+        || serde_json::to_vec(&lease)
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+            != lease_bytes
+    {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog publication children are not canonical".to_owned(),
+        ));
+    }
+    marker
+        .verify_bytes(admission_bytes, lease_bytes)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if marker.installation_id != admission.installation_id
+        || marker.approved_generation != admission.approved_generation
+        || marker.supervision_lease_id != admission.supervision_lease_id
+    {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog marker is not bound to its admission template".to_owned(),
+        ));
+    }
+    if require_final_name {
+        let expected_name = marker
+            .directory_name()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let actual_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                HostError::RecoveryRequired("Watchdog publication path is not canonical".to_owned())
+            })?;
+        if !actual_name.eq_ignore_ascii_case(&expected_name) {
+            return Err(HostError::RecoveryRequired(
+                "Watchdog publication directory is not content-addressed by its ORS receipt"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(HostWatchdogPublicationObservation {
+        path: path.to_path_buf(),
+        marker,
+        admission,
+        lease,
+        retirement: observation.retirement_precondition(),
+    })
+}
+
+#[cfg(windows)]
+fn observe_host_watchdog_publication(
+    path: &Path,
+) -> Result<HostWatchdogPublicationObservation, HostError> {
+    let observation = eliot_platform_windows::observe_owned_directory_exact(
+        path,
+        &[
+            WATCHDOG_ADMISSION_FILE_NAME,
+            SUPERVISION_LEASE_FILE_NAME,
+            WATCHDOG_PUBLICATION_FILE_NAME,
+        ],
+        WATCHDOG_PUBLICATION_CHILD_LIMIT,
+    )
+    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    decode_watchdog_publication_observation(path, &observation, true)
+}
+
+#[cfg(windows)]
+fn verify_exact_current_watchdog_publication(
+    observed: &HostWatchdogPublicationObservation,
+    template: &WatchdogAdmissionTemplate,
+    current: &eliot_ors::SupervisionLeaseSnapshot,
+) -> Result<(), HostError> {
+    if observed.admission != *template
+        || observed.lease != current.record.artifact
+        || observed.marker.lease_revision != current.record.revision
+        || observed.marker.ors_record_id != current.record.record_id.as_str()
+        || observed.marker.ors_receipt_sha256 != current.receipt.receipt_sha256
+    {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog publication is not the exact authoritative ORS head".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_watchdog_publication_child(path: &Path, bytes: &[u8]) -> Result<(), HostError> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
+        FILE_SHARE_READ,
+    };
+
+    if bytes.len() as u64 > WATCHDOG_PUBLICATION_CHILD_LIMIT {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog publication child exceeds the bounded size".to_owned(),
+        ));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+        .open(path)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if !metadata.is_file()
+        || metadata.len() != bytes.len() as u64
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog publication child identity is invalid".to_owned(),
+        ));
+    }
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let mut readback = Vec::with_capacity(bytes.len());
+    file.read_to_end(&mut readback)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if readback != bytes {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog publication child readback changed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn scan_host_watchdog_publications(
+    host_state_root: &Path,
+) -> Result<Vec<HostWatchdogPublicationObservation>, HostError> {
+    let mut observed = Vec::new();
+    for entry in std::fs::read_dir(host_state_root)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+    {
+        let entry = entry.map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                HostError::RecoveryRequired("Host state child name is not Unicode".to_owned())
+            })?;
+        if !name
+            .to_ascii_lowercase()
+            .starts_with(WATCHDOG_PUBLICATION_DIRECTORY_PREFIX)
+        {
+            continue;
+        }
+        observed.push(observe_host_watchdog_publication(&entry.path())?);
+    }
+    observed.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(observed)
+}
+
+#[cfg(windows)]
+fn read_manifest_current_supervision_lease(
+    manifest: &CandidateManifest,
+    lease_id: &str,
+) -> Result<eliot_ors::SupervisionLeaseSnapshot, HostError> {
+    let lease_id = OperationIdentity::new(lease_id.to_owned())
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let ors_path = PathBuf::from(
+        manifest
+            .runtime_launch
+            .runtime_state_roots
+            .kernel_ors_root
+            .as_str(),
+    )
+    .join(KERNEL_ORS_FILE_NAME);
+    let retained = ProtectedRuntimePathLease::open_existing_absolute(&ors_path)
+        .map_err(|error| HostError::RecoveryRequired(format!("Kernel ORS open failed: {error}")))?;
+    if !windows_paths_equal(retained.path(), &ors_path) {
+        return Err(HostError::RecoveryRequired(
+            "Kernel ORS path is not the manifest-selected child".to_owned(),
+        ));
+    }
+    retained
+        .verify_stable_identity()
+        .and_then(|()| retained.verify_path_identity())
+        .map_err(|error| HostError::RecoveryRequired(format!("Kernel ORS changed: {error}")))?;
+    let current = eliot_ors::read_current_supervision_lease_read_only(retained.path(), &lease_id)
+        .map_err(|error| HostError::RecoveryRequired(format!("Kernel ORS read failed: {error}")))?
+        .ok_or_else(|| {
+            HostError::RecoveryRequired("Kernel ORS has no current supervision lease".to_owned())
+        })?;
+    retained
+        .verify_stable_identity()
+        .and_then(|()| retained.verify_path_identity())
+        .map_err(|error| HostError::RecoveryRequired(format!("Kernel ORS changed: {error}")))?;
+    current
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    Ok(current)
+}
+
+#[cfg(windows)]
+fn supervision_publication_identity(
+    template: &WatchdogAdmissionTemplate,
+    current: &eliot_ors::SupervisionLeaseSnapshot,
+) -> Result<PublishedSupervisionIdentity, HostError> {
+    let lease_bytes = serde_json::to_vec(&current.record.artifact)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let marker = WatchdogPublicationBundle::new(
+        template,
+        current.record.revision,
+        current.record.record_id.as_str(),
+        current.receipt.receipt_sha256.clone(),
+        &lease_bytes,
+    )
+    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    Ok(PublishedSupervisionIdentity {
+        lease_id: PlatformHandle::new(template.supervision_lease_id.clone())
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        ors_receipt_digest: PlatformHandle::new(current.receipt.receipt_sha256.clone())
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        publication_digest: PlatformHandle::new(sha256_json(&marker)?)
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+    })
+}
+
+#[cfg(windows)]
+fn publish_current_watchdog_supervision_bundle(
+    host_state_root: &Path,
+    manifest: &CandidateManifest,
+    template: &WatchdogAdmissionTemplate,
+    expected_template_digest: &str,
+    kernel_snapshot: &eliot_ors::SupervisionLeaseSnapshot,
+) -> Result<PublishedSupervisionIdentity, HostError> {
+    template
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if template
+        .digest()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+        != expected_template_digest
+    {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog admission template does not match the provisioned Phase-B digest".to_owned(),
+        ));
+    }
+    let current =
+        read_manifest_current_supervision_lease(manifest, &template.supervision_lease_id)?;
+    if current != *kernel_snapshot {
+        return Err(HostError::RecoveryRequired(
+            "Kernel ProbeReady supervision snapshot is not the current ORS head".to_owned(),
+        ));
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| HostError::RecoveryRequired("system time exceeds u64".to_owned()))?;
+    let verification_context = current
+        .active_verification_context(template.trust_anchor.public_key_fingerprint(), now_ms)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    template
+        .trust_anchor
+        .verify(&current.record.artifact, &verification_context)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let admission_bytes = template
+        .canonical_bytes()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let lease_bytes = serde_json::to_vec(&current.record.artifact)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let marker = WatchdogPublicationBundle::new(
+        template,
+        current.record.revision,
+        current.record.record_id.as_str(),
+        current.receipt.receipt_sha256.clone(),
+        &lease_bytes,
+    )
+    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let marker_bytes = marker
+        .canonical_bytes()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let destination = host_state_root.join(
+        marker
+            .directory_name()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+    );
+
+    match OwnedDirectoryPublication::create(&destination) {
+        Ok(publication) => {
+            let temporary = publication.temporary_path().to_path_buf();
+            write_watchdog_publication_child(
+                &temporary.join(WATCHDOG_ADMISSION_FILE_NAME),
+                &admission_bytes,
+            )?;
+            write_watchdog_publication_child(
+                &temporary.join(SUPERVISION_LEASE_FILE_NAME),
+                &lease_bytes,
+            )?;
+            // Marker is created last inside the still-unpublished directory.
+            write_watchdog_publication_child(
+                &temporary.join(WATCHDOG_PUBLICATION_FILE_NAME),
+                &marker_bytes,
+            )?;
+            let precommit = eliot_platform_windows::observe_owned_directory_exact(
+                &temporary,
+                &[
+                    WATCHDOG_ADMISSION_FILE_NAME,
+                    SUPERVISION_LEASE_FILE_NAME,
+                    WATCHDOG_PUBLICATION_FILE_NAME,
+                ],
+                WATCHDOG_PUBLICATION_CHILD_LIMIT,
+            )
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            let decoded = decode_watchdog_publication_observation(&temporary, &precommit, false)?;
+            verify_exact_current_watchdog_publication(&decoded, template, &current)?;
+            if precommit.directory_identity != publication.temporary_identity() {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog publication temporary directory identity changed".to_owned(),
+                ));
+            }
+            match publication.publish(precommit.directory_identity) {
+                Ok(
+                    DirectoryPublicationOutcome::Published(_)
+                    | DirectoryPublicationOutcome::CommittedUnknown(_),
+                ) => {}
+                Err(DirectoryPublicationError::AlreadyExists) => {
+                    // A concurrent exact replay may win the create-new name.
+                    // Authority remains the retained post-commit readback
+                    // below; this losing temp can never replace the winner.
+                }
+                Err(error) => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "Watchdog directory publication failed before commit: {error}"
+                    )));
+                }
+            }
+        }
+        Err(DirectoryPublicationError::AlreadyExists) => {}
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "Watchdog directory preparation failed: {error}"
+            )));
+        }
+    }
+
+    let published = observe_host_watchdog_publication(&destination)?;
+    verify_exact_current_watchdog_publication(&published, template, &current)?;
+    if read_manifest_current_supervision_lease(manifest, &template.supervision_lease_id)? != current
+    {
+        return Err(HostError::RecoveryRequired(
+            "Kernel ORS head changed during Watchdog publication".to_owned(),
+        ));
+    }
+
+    // Retirement begins only after the new exact current bundle is durable.
+    let observed = scan_host_watchdog_publications(host_state_root)?;
+    let markers = observed
+        .iter()
+        .map(|bundle| bundle.marker.clone())
+        .collect::<Vec<_>>();
+    let plan = WatchdogPublicationRetentionPlan::for_current(&marker, &markers)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    for digest in plan.retired_receipt_digests() {
+        if digest == &current.receipt.receipt_sha256 {
+            return Err(HostError::RecoveryRequired(
+                "Watchdog retention attempted to retire the current ORS bundle".to_owned(),
+            ));
+        }
+        let candidate = observed
+            .iter()
+            .find(|bundle| bundle.marker.ors_receipt_sha256 == *digest)
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Watchdog retirement candidate disappeared before exact retirement".to_owned(),
+                )
+            })?;
+        match retire_owned_directory_exact(&candidate.path, &candidate.retirement)
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+        {
+            OwnedDirectoryRetirementOutcome::Retired => {}
+            OwnedDirectoryRetirementOutcome::CommittedUnknown(_) => {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog spool cleanup committed with unknown final absence".to_owned(),
+                ));
+            }
+        }
+    }
+    let after = scan_host_watchdog_publications(host_state_root)?;
+    if after.len() > WATCHDOG_PUBLICATION_RETAINED_LIMIT {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog protected spool remains above its fixed retention bound".to_owned(),
+        ));
+    }
+    let current_after = after
+        .iter()
+        .find(|bundle| bundle.marker.ors_receipt_sha256 == current.receipt.receipt_sha256)
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Watchdog current bundle disappeared during retention".to_owned(),
+            )
+        })?;
+    verify_exact_current_watchdog_publication(current_after, template, &current)?;
+    supervision_publication_identity(template, &current)
+}
+
+#[cfg(windows)]
 fn host_owned_store_recovery_request(
     host: &HostInstallationEpoch,
     activation_id: &PlatformHandle,
@@ -6911,6 +7485,7 @@ fn append_authenticated_kernel_readiness<B: JournalBackend>(
     proof: &AuthenticatedKernelReadiness,
     approved_kernel_artifact: &PlatformHandle,
     approved_config: &PlatformHandle,
+    supervision: &PublishedSupervisionIdentity,
 ) -> Result<AppendReceipt, HostError> {
     let snapshot = journal.snapshot()?;
     let active = snapshot.kernel.as_ref().ok_or_else(|| {
@@ -6955,6 +7530,7 @@ fn append_authenticated_kernel_readiness<B: JournalBackend>(
         PlatformHandle::new(format!("kernel-response:{}", response_digest.as_str()))
             .map_err(|error| HostError::Platform(error.to_string()))?,
     );
+    evidence_refs.extend(supervision.evidence_refs()?);
     let expected = ReadinessApprovedContour {
         config_digest: approved_config.clone(),
         store_fence: proof.store_fence.clone(),
@@ -14643,8 +15219,71 @@ impl HostComposition {
         .map_err(|error| HostError::Platform(error.to_string()))?;
         let store_requirement_digest = PlatformHandle::new(sha256_json(requirement)?)
             .map_err(|error| HostError::Platform(error.to_string()))?;
+        let registry_generation = self
+            .registry
+            .generations()
+            .iter()
+            .find(|item| item.manifest.generation == *generation)
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "readiness generation is absent from the durable registry".to_owned(),
+                )
+            })?;
+        let registry_authority = self
+            .registry
+            .provisioned_supervision_authority_for_generation(generation)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "readiness generation has no durable provisioned supervision authority"
+                        .to_owned(),
+                )
+            })?;
+        let launch_authority = self
+            .jobs
+            .launch
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "readiness contour has no retained Phase-B launch overlay".to_owned(),
+                )
+            })?
+            .provisioned_supervision_authority()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if launch_authority != registry_authority {
+            return Err(HostError::ProcessContour(
+                "retained Phase-B launch authority differs from durable registry authority"
+                    .to_owned(),
+            ));
+        }
+        let template = registry_authority
+            .watchdog_admission_template()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let current_supervision = read_manifest_current_supervision_lease(
+            &registry_generation.manifest,
+            &registry_authority.supervision_lease_id,
+        )?;
+        let supervision_identity =
+            supervision_publication_identity(&template, &current_supervision)?;
+        let expected_publication_path = self.launch_options.host_state_root().join(format!(
+            "{WATCHDOG_PUBLICATION_DIRECTORY_PREFIX}{}",
+            current_supervision.receipt.receipt_sha256
+        ));
+        let publication_is_exact = observe_host_watchdog_publication(&expected_publication_path)
+            .and_then(|observed| {
+                verify_exact_current_watchdog_publication(
+                    &observed,
+                    &template,
+                    &current_supervision,
+                )
+            })
+            .is_ok();
         let store_proof_fence = state.readiness_observations.last().and_then(|observation| {
-            (observation.active_kernel_record_checksum == active_kernel_record_checksum
+            (readiness_supervision_fence_matches(
+                &supervision_identity,
+                publication_is_exact,
+                &observation.evidence_refs,
+            ) && observation.active_kernel_record_checksum == active_kernel_record_checksum
                 && observation.fence == active.fence
                 && observation.kernel_process.process_id == active_process.process_id
                 && observation.kernel_job == *active_job
@@ -14661,6 +15300,9 @@ impl HostComposition {
             candidate_binding_digest,
             store_requirement_digest,
             store_proof_fence,
+            supervision_lease_id: Some(supervision_identity.lease_id),
+            supervision_ors_receipt_digest: Some(supervision_identity.ors_receipt_digest),
+            watchdog_publication_digest: Some(supervision_identity.publication_digest),
         })
     }
 
@@ -14705,11 +15347,56 @@ impl HostComposition {
             store_artifact,
             materialized_config_digest,
         )?;
+        let registry_authority = self
+            .registry
+            .provisioned_supervision_authority_for_generation(generation)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            .cloned()
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "readiness generation has no durable provisioned supervision authority"
+                        .to_owned(),
+                )
+            })?;
+        let launch_authority = self
+            .jobs
+            .launch
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "readiness contour has no retained Phase-B launch overlay".to_owned(),
+                )
+            })?
+            .provisioned_supervision_authority()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if launch_authority != &registry_authority {
+            return Err(HostError::ProcessContour(
+                "retained Phase-B launch authority differs from durable registry authority"
+                    .to_owned(),
+            ));
+        }
+        let watchdog_template = registry_authority
+            .watchdog_admission_template()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let published_supervision = publish_current_watchdog_supervision_bundle(
+            self.launch_options.host_state_root(),
+            &active.manifest,
+            &watchdog_template,
+            &registry_authority.watchdog_admission_template_digest,
+            &proof.supervision_lease,
+        )?;
+        require_exact_supervision_head(&proof.supervision_lease, || {
+            read_manifest_current_supervision_lease(
+                &active.manifest,
+                &registry_authority.supervision_lease_id,
+            )
+        })?;
         append_authenticated_kernel_readiness(
             &self.journal,
             &proof,
             kernel_artifact,
             materialized_config_digest,
+            &published_supervision,
         )?;
         let confirmed = self.current_readiness_contour(
             generation,
@@ -15708,6 +16395,11 @@ mod watchdog_service_tests {
         pending_scm_launch.store_bootstrap_descriptor_digest = pending_marker.clone();
         pending_scm_launch.kernel_arguments[5] = pending_marker.clone();
         pending_scm_launch.kernel_arguments[9] = pending_marker;
+        pending_scm_launch.supervision_authority =
+            eliot_installation::SupervisionAuthorityBinding::Pending {
+                supervision_lease_id: PlatformHandle::new("test-supervision-lease")
+                    .unwrap_or_else(|_| unreachable!()),
+            };
         pending_scm_launch = pending_scm_launch
             .with_computed_digest()
             .unwrap_or_else(|_| unreachable!());
@@ -16400,6 +17092,143 @@ mod journal_tests {
     }
 
     #[cfg(windows)]
+    fn readiness_supervision_snapshot(
+        fixture: &ReadinessFixture,
+    ) -> eliot_ors::SupervisionLeaseSnapshot {
+        use eliot_runtime_contracts::{SupervisionLeaseSigner as _, SupervisionLeaseVerifier as _};
+
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("test clock after Unix epoch")
+                .as_millis(),
+        )
+        .expect("test time fits u64");
+        let issued_at_ms = now_ms.saturating_sub(1_000);
+        let binding = eliot_ors::SupervisionLeaseBinding {
+            scope_ref: eliot_ors::OperationIdentity::new("scope-readiness").unwrap(),
+            observation_scope: eliot_runtime_contracts::SupervisionObservationScope {
+                targets: vec!["kernel-readiness".to_owned()],
+                sensor_profile: "kernel-heartbeat".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live".to_owned(),
+            },
+            installation_id: eliot_ors::OperationIdentity::new(
+                fixture.candidate.installation_id.as_str(),
+            )
+            .unwrap(),
+            host_epoch: fixture.candidate.host_epoch,
+            activation_id: eliot_ors::OperationIdentity::new(
+                fixture.candidate.activation_id.as_str(),
+            )
+            .unwrap(),
+            activation_generation: fixture.activation.generation,
+            kernel_epoch: fixture.candidate.kernel_epoch,
+            watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
+            generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
+                target_id: "kernel-readiness".to_owned(),
+                target_generation: fixture.activation.generation,
+                module_id: "eliot-kernel".to_owned(),
+                module_generation: fixture.activation.generation,
+                process_id: "pid:42:start:10".to_owned(),
+                process_generation: fixture.activation.generation,
+            },
+            state_fence: StateFence::new(
+                fixture.candidate.kernel_epoch,
+                fixture.activation.generation,
+            ),
+            issued_at_ms,
+            expires_at_ms: now_ms.saturating_add(60_000),
+            renew_before_ms: now_ms.saturating_add(30_000),
+            wake_policy: eliot_runtime_contracts::RegisteredActivityWakePolicy::Disabled,
+            state: eliot_runtime_contracts::LeaseState::Active,
+            terminal_disposition: None,
+            revocation_reason: None,
+            revocation_id: None,
+            revocation_epoch: None,
+        };
+        let request = eliot_ors::SupervisionLeasePrepareRequest {
+            ticket_id: eliot_ors::OperationIdentity::new(format!(
+                "readiness-ticket-{}",
+                Uuid::new_v4().simple()
+            ))
+            .unwrap(),
+            operation_id: eliot_ors::OperationIdentity::new(format!(
+                "readiness-operation-{}",
+                Uuid::new_v4().simple()
+            ))
+            .unwrap(),
+            lease_id: eliot_ors::OperationIdentity::new("readiness-supervision-lease").unwrap(),
+            expected_revision: None,
+            operation: eliot_ors::SupervisionLeaseOperation::Commit,
+            binding,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "eliot-host-readiness-supervision-{}-{}.redb",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        let store = eliot_ors::RedbRecoveryStore::open(&path).expect("test ORS");
+        let stage = store
+            .prepare_supervision_lease(request)
+            .expect("test supervision stage");
+        let signer = eliot_runtime_contracts::Ed25519SupervisionLeaseSigner::from_secret_key(
+            "readiness-kernel",
+            "readiness-key",
+            [7; 32],
+        )
+        .expect("test signer");
+        let envelope = stage
+            .ticket
+            .expected_payload()
+            .expect("test supervision payload")
+            .sign(&signer)
+            .expect("test supervision signature");
+        let anchor = eliot_runtime_contracts::SupervisionTrustAnchor::new(
+            envelope.payload.installation_id.clone(),
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .expect("test trust anchor");
+        let generation = &envelope.payload.generation_binding;
+        let context = eliot_runtime_contracts::SupervisionLeaseVerificationContext {
+            now_ms,
+            lease_id: envelope.payload.lease_id.clone(),
+            host_epoch: envelope.payload.host_epoch,
+            activation_id: envelope.payload.activation_id.clone(),
+            activation_generation: envelope.payload.activation_generation,
+            kernel_epoch: envelope.payload.kernel_epoch,
+            watchdog_epoch: envelope.payload.watchdog_epoch,
+            state_fence: envelope.payload.state_fence.clone(),
+            scope_ref: envelope.payload.scope_ref.clone(),
+            observation_scope: envelope.payload.observation_scope.clone(),
+            target_id: generation.target_id.clone(),
+            module_id: generation.module_id.clone(),
+            process_id: generation.process_id.clone(),
+            target_generation: generation.target_generation,
+            module_generation: generation.module_generation,
+            process_generation: generation.process_generation,
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: envelope.payload.ors_mirror.clone(),
+            active_state: eliot_runtime_contracts::SupervisionLeaseActiveStateBinding {
+                state: envelope.payload.state,
+                revocation_id: envelope.payload.revocation_id.clone(),
+                revocation_epoch: envelope.payload.revocation_epoch,
+            },
+        };
+        let verified = anchor
+            .verify(&envelope, &context)
+            .expect("test supervision verification");
+        let snapshot = store
+            .commit_supervision_lease(&stage.ticket, &verified)
+            .expect("test supervision commit");
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        snapshot
+    }
+
+    #[cfg(windows)]
     fn probe_exchange(
         fixture: &ReadinessFixture,
         validation_revision: u64,
@@ -16440,6 +17269,7 @@ mod journal_tests {
             health: HealthVector::healthy(),
             evidence_refs,
         };
+        let supervision_lease = readiness_supervision_snapshot(fixture);
         let response = KernelControlResponse {
             wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
             wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
@@ -16449,6 +17279,7 @@ mod journal_tests {
             receipt: Some(ready.clone()),
             activation_receipt: None,
             store_rebind_receipt: None,
+            supervision_lease: Some(supervision_lease),
             error: None,
             payload_digest: String::new(),
         }
@@ -16464,6 +17295,7 @@ mod journal_tests {
     ) -> AuthenticatedKernelReadiness {
         let (request, response, _ready) = probe_exchange(fixture, validation_revision);
         let ready = validate_probe_response(&request, &fixture.activation, &response).unwrap();
+        let supervision_lease = response.supervision_lease.clone().unwrap();
         let store_fence = validated_store_proof_fence(
             &fixture.requirement,
             &ready,
@@ -16476,8 +17308,18 @@ mod journal_tests {
             request,
             response,
             ready,
+            supervision_lease,
             store_fence,
             peer_evidence: PlatformHandle::new("kernel-peer:test-authenticated").unwrap(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn test_published_supervision_identity() -> PublishedSupervisionIdentity {
+        PublishedSupervisionIdentity {
+            lease_id: PlatformHandle::new("supervision-lease:test-readiness").unwrap(),
+            ors_receipt_digest: PlatformHandle::new("a".repeat(64)).unwrap(),
+            publication_digest: PlatformHandle::new("b".repeat(64)).unwrap(),
         }
     }
 
@@ -16488,11 +17330,13 @@ mod journal_tests {
         let active_kernel_record_checksum =
             PlatformHandle::new(record_checksum(&HostStateRecord::Kernel(active)).unwrap())
                 .unwrap();
+        let supervision = test_published_supervision_identity();
         let store_proof_fence = state
             .readiness_observations
             .last()
             .filter(|observation| {
                 observation.active_kernel_record_checksum == active_kernel_record_checksum
+                    && supervision.is_bound_by(&observation.evidence_refs).unwrap()
             })
             .map(|observation| observation.store_fence.clone());
         ReadinessContourIdentity {
@@ -16510,6 +17354,9 @@ mod journal_tests {
             )
             .unwrap(),
             store_proof_fence,
+            supervision_lease_id: Some(supervision.lease_id),
+            supervision_ors_receipt_digest: Some(supervision.ors_receipt_digest),
+            watchdog_publication_digest: Some(supervision.publication_digest),
         }
     }
 
@@ -16567,8 +17414,12 @@ mod journal_tests {
                 AuthorityEpoch::genesis(),
                 ResourceGeneration::genesis(),
             ),
-            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
-                supervision_lease_id: handle("test-supervision-lease"),
+            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Provisioned {
+                authority: test_provisioned_supervision_authority(
+                    "installation:liveness-store-split",
+                    generation.as_str(),
+                    ResourceGeneration::genesis(),
+                ),
             },
             authority_descriptor_path: authority_path.clone(),
             authority_descriptor_digest: handle("9".repeat(64)),
@@ -17299,6 +18150,16 @@ mod journal_tests {
             store_proof_fence: Some(
                 PlatformHandle::new("store-proof").unwrap_or_else(|_| unreachable!()),
             ),
+            supervision_lease_id: Some(
+                PlatformHandle::new("supervision-lease:test-liveness")
+                    .unwrap_or_else(|_| unreachable!()),
+            ),
+            supervision_ors_receipt_digest: Some(
+                PlatformHandle::new("a".repeat(64)).unwrap_or_else(|_| unreachable!()),
+            ),
+            watchdog_publication_digest: Some(
+                PlatformHandle::new("b".repeat(64)).unwrap_or_else(|_| unreachable!()),
+            ),
         };
         let mut gate = HostReadinessGate::default();
         assert!(gate.grant(exact.clone(), now));
@@ -17339,6 +18200,7 @@ mod journal_tests {
             &first,
             &fixture.kernel_artifact,
             &fixture.config,
+            &test_published_supervision_identity(),
         )
         .map(|_| HostBranchDisposition::Healthy)
         .unwrap();
@@ -17348,6 +18210,7 @@ mod journal_tests {
             &second,
             &fixture.kernel_artifact,
             &fixture.config,
+            &test_published_supervision_identity(),
         )
         .map(|_| HostBranchDisposition::Healthy)
         .unwrap();
@@ -17396,6 +18259,7 @@ mod journal_tests {
                 &proof,
                 &fixture.kernel_artifact,
                 &fixture.config,
+                &test_published_supervision_identity(),
             )?;
             Ok(readiness_contour(&fixture))
         };
@@ -17484,6 +18348,15 @@ mod journal_tests {
         let mut contour = exact.clone();
         contour.store_proof_fence = Some(changed("store-proof"));
         variants.push(("store_proof_fence", contour));
+        let mut contour = exact.clone();
+        contour.supervision_lease_id = Some(changed("supervision-lease"));
+        variants.push(("supervision_lease_id", contour));
+        let mut contour = exact.clone();
+        contour.supervision_ors_receipt_digest = Some(changed("supervision-ors-receipt"));
+        variants.push(("supervision_ors_receipt_digest", contour));
+        let mut contour = exact.clone();
+        contour.watchdog_publication_digest = Some(changed("watchdog-publication"));
+        variants.push(("watchdog_publication_digest", contour));
 
         let now = std::time::Instant::now();
         for (field, current) in variants {
@@ -17530,6 +18403,49 @@ mod journal_tests {
 
     #[cfg(windows)]
     #[test]
+    fn production_readiness_supervision_fence_rejects_substitution_and_post_publish_renewal() {
+        let fixture = active_readiness_fixture();
+        let proof = authenticated_proof(&fixture, 44);
+        let exact = test_published_supervision_identity();
+        append_authenticated_kernel_readiness(
+            &fixture.journal,
+            &proof,
+            &fixture.kernel_artifact,
+            &fixture.config,
+            &exact,
+        )
+        .unwrap();
+        let observation = fixture
+            .journal
+            .snapshot()
+            .unwrap()
+            .readiness_observations
+            .pop()
+            .unwrap();
+        assert!(readiness_supervision_fence_matches(
+            &exact,
+            true,
+            &observation.evidence_refs,
+        ));
+        assert!(!readiness_supervision_fence_matches(
+            &exact,
+            false,
+            &observation.evidence_refs,
+        ));
+        let mut substituted = exact.clone();
+        substituted.publication_digest = PlatformHandle::new("c".repeat(64)).unwrap();
+        assert!(!readiness_supervision_fence_matches(
+            &substituted,
+            true,
+            &observation.evidence_refs,
+        ));
+        let mut renewed = proof.supervision_lease.clone();
+        renewed.receipt.receipt_sha256 = "d".repeat(64);
+        assert!(require_exact_supervision_head(&proof.supervision_lease, || Ok(renewed)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn degraded_recovery_becomes_healthy_only_after_journaled_probe() {
         let fixture = active_readiness_fixture();
         let contour = readiness_contour(&fixture);
@@ -17550,6 +18466,7 @@ mod journal_tests {
                     &proof,
                     &fixture.kernel_artifact,
                     &fixture.config,
+                    &test_published_supervision_identity(),
                 )?;
                 Ok(readiness_contour(&fixture))
             },
@@ -17618,6 +18535,7 @@ mod journal_tests {
             &proof,
             &fixture.kernel_artifact,
             &fixture.config,
+            &test_published_supervision_identity(),
         );
         assert!(matches!(
             outcome,
@@ -17646,6 +18564,7 @@ mod journal_tests {
             &proof,
             &fixture.kernel_artifact,
             &fixture.config,
+            &test_published_supervision_identity(),
         )
         .unwrap();
         let snapshot = fixture.journal.snapshot().unwrap();
@@ -18376,6 +19295,7 @@ mod journal_tests {
                     &proof,
                     &fixture.kernel_artifact,
                     &fixture.config,
+                    &test_published_supervision_identity(),
                 )?;
                 Ok(readiness_contour(&fixture))
             },
@@ -19619,6 +20539,7 @@ mod tests {
             receipt: None,
             activation_receipt: None,
             store_rebind_receipt: None,
+            supervision_lease: None,
             error,
             payload_digest: String::new(),
         };

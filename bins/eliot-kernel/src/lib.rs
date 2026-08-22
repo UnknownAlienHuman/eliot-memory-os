@@ -682,25 +682,6 @@ fn supervision_authority_root_spec(
     // below it before opening the retained ciphertext file. Never substitute
     // `kernel_root` itself as the installation root.
     let installation_root = profile_anchor.join("Eliot");
-    let normalized_installation = installation_root
-        .as_os_str()
-        .to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase();
-    let normalized_kernel = kernel_root
-        .as_os_str()
-        .to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase();
-    let required_prefix = format!("{normalized_installation}\\");
-    if !normalized_kernel.starts_with(&required_prefix) {
-        return Err(SupervisionLeaseError::Signing(
-            "Kernel supervision root is outside the protected Eliot installation contour"
-                .to_owned(),
-        ));
-    }
     Ok(InstallerRootPrimitiveSpec {
         root: kernel_root.to_path_buf(),
         installation_root,
@@ -777,6 +758,18 @@ impl KernelSupervisionLeaseAuthority {
     /// Returns the exact lease identity selected by the installer plan.
     pub fn supervision_lease_id(&self) -> &str {
         &self.supervision_lease_id
+    }
+
+    /// Returns the exact authoritative ORS head selected by the provisioned
+    /// lease identity.  ProbeReady callers must fail closed when this is
+    /// absent or no longer Active; no receipt is synthesized in memory.
+    pub fn current_snapshot(
+        &self,
+    ) -> Result<Option<SupervisionLeaseSnapshot>, SupervisionLeaseAuthorityError> {
+        let lease_id = eliot_ors::OperationIdentity::new(self.supervision_lease_id.clone())?;
+        self.ors
+            .load_current_supervision_lease(&lease_id)
+            .map_err(Into::into)
     }
 
     fn validate_binding(
@@ -6767,6 +6760,26 @@ impl KernelComposition {
         } else {
             None
         };
+        #[cfg(windows)]
+        let supervision_lease = if is_probe {
+            let snapshot = self
+                .supervision_lease_authority
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?
+                .current_snapshot()
+                .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::SessionFenced)?;
+            if snapshot.record.state != LeaseState::Active
+                || snapshot.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            Some(snapshot)
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let supervision_lease = None;
         let activation_receipt: Option<KernelActivationReceipt> = match &request.command {
             KernelControlCommand::Activate(permit) => Some(
                 self.service
@@ -6835,6 +6848,7 @@ impl KernelComposition {
             receipt,
             activation_receipt,
             store_rebind_receipt,
+            supervision_lease,
             error: None,
             payload_digest: String::new(),
         }
@@ -10177,15 +10191,17 @@ mod tests {
         assert_eq!(spec.profile_anchor, profile_anchor);
         assert_eq!(spec.profile, InstallerRootProfile::SystemService);
 
-        assert!(
-            supervision_authority_root_spec(
-                &spec
-                    .profile_anchor
-                    .join("foreign-installation")
-                    .join("kernel")
-            )
-            .is_err(),
-            "a foreign ProgramData root must not be admitted"
+        let foreign = supervision_authority_root_spec(
+            &spec
+                .profile_anchor
+                .join("foreign-installation")
+                .join("kernel"),
+        )
+        .expect("foreign contour remains a data-only spec until the physical boundary");
+        assert_eq!(
+            eliot_platform_windows::WindowsInstallerRootPrimitive::new().inspect(&foreign),
+            Err(eliot_platform_windows::InstallerRootError::InvalidPath),
+            "the physical read boundary must reject a foreign ProgramData root"
         );
     }
 

@@ -3,6 +3,7 @@
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
 use eliot_ipc::TransportError;
 use eliot_kernel_core::AuthoritySnapshotBindingWire;
+use eliot_ors::{SupervisionLeaseProjection, SupervisionLeaseSnapshot};
 use eliot_platform::{KernelActivationNonce, PlatformHandle, PortError, SecretReference};
 use eliot_process::{
     CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
@@ -26,7 +27,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 2;
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 3;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
@@ -789,6 +790,11 @@ pub struct KernelControlResponse {
     /// Bound receipt returned after a successful Store rebind or its
     /// digest-only reconciliation.
     pub store_rebind_receipt: Option<StoreRebindReceipt>,
+    /// Exact validated current ORS supervision snapshot returned only with a
+    /// Kernel-authored ready receipt. It is public verification material, not
+    /// signing authority; Host must compare it with the manifest-selected ORS
+    /// head before publishing its signed artifact to Watchdog.
+    pub supervision_lease: Option<SupervisionLeaseSnapshot>,
     /// Stable rejection detail, when the command was not accepted.
     pub error: Option<String>,
     /// Digest over all fields except this digest.
@@ -808,6 +814,7 @@ impl KernelControlResponse {
             receipt: &'a Option<KernelReadyReceipt>,
             activation_receipt: &'a Option<KernelActivationReceipt>,
             store_rebind_receipt: &'a Option<StoreRebindReceipt>,
+            supervision_lease: &'a Option<SupervisionLeaseSnapshot>,
             error: &'a Option<String>,
         }
         serde_json::to_vec(&Unsigned {
@@ -819,6 +826,7 @@ impl KernelControlResponse {
             receipt: &self.receipt,
             activation_receipt: &self.activation_receipt,
             store_rebind_receipt: &self.store_rebind_receipt,
+            supervision_lease: &self.supervision_lease,
             error: &self.error,
         })
         .map_err(|_| KernelServiceError::InvalidField {
@@ -862,6 +870,28 @@ impl KernelControlResponse {
         }
         if let Some(error) = &self.error {
             validate_text(error, "control.error")?;
+        }
+        if self.receipt.is_some() != self.supervision_lease.is_some() {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.supervision_lease",
+                reason: "must accompany exactly one Kernel-authored ready receipt",
+            });
+        }
+        if let Some(snapshot) = &self.supervision_lease {
+            snapshot
+                .validate()
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "control.supervision_lease",
+                    reason: "must be an exact validated ORS snapshot",
+                })?;
+            if snapshot.record.state != eliot_runtime_contracts::LeaseState::Active
+                || snapshot.record.projection != SupervisionLeaseProjection::Active
+            {
+                return Err(KernelServiceError::InvalidField {
+                    field: "control.supervision_lease",
+                    reason: "must be the active ORS projection",
+                });
+            }
         }
         if self.payload_digest.len() != 64
             || !self
@@ -1486,6 +1516,7 @@ pub fn semantic_store_config_hash_from_json(
         authority_state_fence: OrderedStateFence,
         authority_descriptor_path: serde_json::Value,
         authority_descriptor_digest: serde_json::Value,
+        supervision_authority: serde_json::Value,
         runtime_state_roots: OrderedRuntimeStateRoots,
         kernel_work_root: serde_json::Value,
         kernel_artifact_digest: serde_json::Value,
@@ -1532,6 +1563,7 @@ pub fn semantic_store_config_hash_from_json(
                 "authority_state_fence",
                 "authority_descriptor_path",
                 "authority_descriptor_digest",
+                "supervision_authority",
                 "runtime_state_roots",
                 "kernel_work_root",
                 "kernel_artifact_digest",
@@ -1610,6 +1642,7 @@ pub fn semantic_store_config_hash_from_json(
             },
             authority_descriptor_path: field(value, "authority_descriptor_path")?,
             authority_descriptor_digest: field(value, "authority_descriptor_digest")?,
+            supervision_authority: field(value, "supervision_authority")?,
             runtime_state_roots: OrderedRuntimeStateRoots {
                 profile: field(&roots, "profile")?,
                 profile_anchor_root: field(&roots, "profile_anchor_root")?,
@@ -2572,6 +2605,10 @@ mod tests {
                 },
                 "authority_descriptor_path": "C:/eliot/authority.json",
                 "authority_descriptor_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "supervision_authority": {
+                    "state": "PENDING",
+                    "supervision_lease_id": "test-supervision-lease"
+                },
                 "runtime_state_roots": {
                     "profile": "portable_dev",
                     "profile_anchor_root": "C:/eliot",
@@ -2646,6 +2683,19 @@ mod tests {
             "127.0.0.1:8001",
         ))
         .expect("second bytes");
+        let first_semantic = semantic_store_config_hash_from_json(&first).expect("semantic hash");
+        let second_semantic = semantic_store_config_hash_from_json(&second).expect("semantic hash");
+        assert_ne!(first_semantic, second_semantic);
+    }
+
+    #[test]
+    fn semantic_store_config_hash_binds_supervision_authority() {
+        let first_value = semantic_store_config_value("ws://127.0.0.1:8000/rpc", "127.0.0.1:8000");
+        let mut second_value = first_value.clone();
+        second_value["runtime_launch"]["supervision_authority"]["supervision_lease_id"] =
+            serde_json::Value::String("substituted-supervision-lease".to_owned());
+        let first = serde_json::to_vec(&first_value).expect("first bytes");
+        let second = serde_json::to_vec(&second_value).expect("second bytes");
         let first_semantic = semantic_store_config_hash_from_json(&first).expect("semantic hash");
         let second_semantic = semantic_store_config_hash_from_json(&second).expect("semantic hash");
         assert_ne!(first_semantic, second_semantic);

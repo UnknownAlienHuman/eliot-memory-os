@@ -28,14 +28,20 @@ use eliot_platform_windows::{
     NamedPipePeerProcessBinding, ProcessIdentity, ProtectedPathLease, ProtectedRootLease,
     ProtectedRuntimePathLease, ServiceBootstrapArguments, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, WindowsAdapterError, WindowsPlatform,
-    windows_paths_equal,
+    observe_owned_directory_exact, windows_paths_equal,
 };
 use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
 };
 use eliot_runtime_contracts::{
-    SignedSupervisionLease, SupervisionLeaseError, SupervisionLeaseVerificationContext,
-    SupervisionLeaseVerifier, SupervisionTrustAnchor, VerifiedSupervisionLease,
+    ProvisionedSupervisionAuthority, SignedSupervisionLease, SupervisionLeaseError,
+    SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionTrustAnchor,
+    VerifiedSupervisionLease, WATCHDOG_PUBLICATION_DIRECTORY_PREFIX,
+    WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate, WatchdogPublicationBundle,
+    WatchdogPublicationRetentionPlan,
+};
+pub use eliot_runtime_contracts::{
+    SUPERVISION_LEASE_FILE_NAME, WATCHDOG_ADMISSION_FILE_NAME, WATCHDOG_PUBLICATION_FILE_NAME,
 };
 use eliot_watchdog_core::{Epoch, Watchdog};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -46,16 +52,8 @@ mod registry_fixture;
 
 pub const SERVICE_NAME: &str = "EliotWatchdog";
 pub const PROTOCOL_VERSION: &str = "eliot.watchdog.v1";
-/// Fixed files owned by the installer below the approved per-installation
-/// Host state root. These are never resolved from `ProgramData`, the current
-/// directory, or an environment variable.
-pub const SUPERVISION_LEASE_FILE_NAME: &str = "supervision-lease.json";
-/// Watchdog admission configuration below the approved Host state root.
-pub const WATCHDOG_ADMISSION_FILE_NAME: &str = "watchdog-admission.json";
 /// Approved-generation registry below the approved Host state root.
 pub const INSTALLATION_REGISTRY_FILE_NAME: &str = "installation-registry.redb";
-const ADMISSION_CONFIG_SCHEMA: &str = "eliot.watchdog-admission.v1";
-const ADMISSION_CONFIG_LIMIT: u64 = 1024 * 1024;
 const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
 const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 
@@ -349,44 +347,8 @@ pub fn validate_watchdog_scm_bootstrap(
     })
 }
 
-/// Installation-owned Watchdog admission configuration. It is loaded from
-/// fixed children of the installer-approved per-installation Host root and
-/// independently bound to the active registry manifest digest; no value is
-/// selected from the lease envelope.
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WatchdogAdmissionConfig {
-    /// Strict admission-config schema marker.
-    pub schema: String,
-    /// Installation identity expected by the service environment.
-    pub installation_id: String,
-    /// Active approved generation identity.
-    pub approved_generation: String,
-    /// External installation-pinned trust anchor.
-    pub trust_anchor: SupervisionTrustAnchor,
-    /// Independently configured current lease verification values.
-    pub context: SupervisionLeaseVerificationContext,
-}
-
-impl WatchdogAdmissionConfig {
-    fn validate_shape(&self) -> Result<(), SpoolError> {
-        if self.schema != ADMISSION_CONFIG_SCHEMA {
-            return Err(SpoolError::InvalidLease(
-                "watchdog admission config schema is unsupported".to_owned(),
-            ));
-        }
-        validate_text(&self.installation_id, "admission.installation_id")?;
-        validate_text(&self.approved_generation, "admission.approved_generation")?;
-        self.trust_anchor
-            .validate()
-            .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-        let mut context = self.context.clone();
-        context.now_ms = 1;
-        context
-            .validate()
-            .map_err(|error| SpoolError::InvalidLease(error.to_string()))
-    }
-}
+/// Canonical public admission template shared with Host/runtime-status.
+pub type WatchdogAdmissionConfig = WatchdogAdmissionTemplate;
 
 /// Verified admission result.  Only the authenticated lease crosses into the
 /// Watchdog composition; the independently configured epoch is retained only
@@ -438,15 +400,9 @@ pub trait WatchdogAdmissionSource: Send + Sync + 'static {
     }
 }
 
-/// File-backed admission source for the Host/Kernel lease and its independent
-/// trust/configuration/registry inputs.
-#[allow(
-    clippy::struct_field_names,
-    reason = "the explicit path suffix distinguishes three independently protected filesystem inputs"
-)]
+/// Registry- and ORS-backed admission source for the immutable Host
+/// publication selected by the current authoritative ORS receipt.
 pub struct FileWatchdogAdmission {
-    lease_path: PathBuf,
-    admission_config_path: PathBuf,
     registry_path: PathBuf,
     installation_id: String,
     roots_digest: String,
@@ -465,6 +421,7 @@ pub struct WatchdogRuntimeBinding {
     approved_host_image: PathBuf,
     approved_host_registration: ApprovedHostRegistration,
     approved_watchdog_registration: ServiceRegistrationRequest,
+    provisioned_supervision_authority: ProvisionedSupervisionAuthority,
     /// Retained for the complete lifetime of the admission and sensor. This
     /// is the no-follow proof that the Host-state contour cannot be replaced
     /// underneath path-based redb/file consumers.
@@ -500,24 +457,12 @@ impl FileWatchdogAdmission {
     /// bootstrap-selected active/pending contour, or its runtime roots cannot
     /// be retained and validated.
     pub fn from_registry(
-        lease_path: impl Into<PathBuf>,
-        admission_config_path: impl Into<PathBuf>,
         registry_path: impl Into<PathBuf>,
         bootstrap: ServiceBootstrapArguments,
     ) -> Result<Self, SpoolError> {
-        let lease_path = lease_path.into();
-        let admission_config_path = admission_config_path.into();
         let registry_path = registry_path.into();
         let (installation_id, binding) = load_runtime_binding(&registry_path, &bootstrap)?;
-        validate_host_admission_paths(
-            &binding,
-            &lease_path,
-            &admission_config_path,
-            &registry_path,
-        )?;
         Ok(Self {
-            lease_path,
-            admission_config_path,
             registry_path,
             installation_id,
             roots_digest: binding.roots.roots_digest.as_str().to_owned(),
@@ -532,12 +477,10 @@ impl FileWatchdogAdmission {
     /// bootstrap-selected active/pending contour, or its runtime roots cannot
     /// be retained and validated.
     pub fn new(
-        lease_path: impl Into<PathBuf>,
-        admission_config_path: impl Into<PathBuf>,
         registry_path: impl Into<PathBuf>,
         bootstrap: ServiceBootstrapArguments,
     ) -> Result<Self, SpoolError> {
-        Self::from_registry(lease_path, admission_config_path, registry_path, bootstrap)
+        Self::from_registry(registry_path, bootstrap)
     }
 
     #[must_use]
@@ -548,7 +491,19 @@ impl FileWatchdogAdmission {
 
 impl WatchdogAdmissionSource for FileWatchdogAdmission {
     fn reload(&self) -> Result<VerifiedWatchdogAdmission, SpoolError> {
-        load_supervision_lease_bound(self)
+        let template = self
+            .binding
+            .provisioned_supervision_authority
+            .watchdog_admission_template()
+            .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+        load_content_addressed_supervision_lease_bound(
+            self,
+            &template,
+            &self
+                .binding
+                .provisioned_supervision_authority
+                .watchdog_admission_template_digest,
+        )
     }
 
     fn approved_host_image(&self) -> Option<PathBuf> {
@@ -2375,6 +2330,25 @@ fn load_runtime_binding(
     .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
     .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
     let selected_manifest = select_runtime_manifest(&registry, bootstrap)?;
+    let provisioned_supervision_authority = registry
+        .provisioned_supervision_authority_for_generation(&selected_manifest.generation)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+        .cloned()
+        .ok_or_else(|| {
+            SpoolError::InvalidLease(
+                "selected generation has no durable provisioned supervision authority".to_owned(),
+            )
+        })?;
+    provisioned_supervision_authority
+        .validate()
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    if provisioned_supervision_authority.candidate_generation
+        != selected_manifest.generation.as_str()
+    {
+        return Err(SpoolError::InvalidLease(
+            "provisioned supervision authority is foreign to the selected generation".to_owned(),
+        ));
+    }
     let (approved_host_registration, watchdog_request) =
         load_approved_service_registrations(&registry, &selected_manifest, bootstrap)?;
     let roots = selected_manifest.runtime_launch.runtime_state_roots.clone();
@@ -2432,43 +2406,12 @@ fn load_runtime_binding(
             approved_host_image,
             approved_host_registration,
             approved_watchdog_registration: watchdog_request,
+            provisioned_supervision_authority,
             host_state_root_lease: Arc::new(host_state_root_lease),
             _approved_host_image_lease: Arc::new(approved_host_image_lease),
             _root_leases: Arc::new(leases),
         },
     ))
-}
-
-fn validate_host_admission_paths(
-    binding: &WatchdogRuntimeBinding,
-    lease_path: &Path,
-    admission_config_path: &Path,
-    registry_path: &Path,
-) -> Result<(), SpoolError> {
-    let expected = [
-        (lease_path, SUPERVISION_LEASE_FILE_NAME),
-        (admission_config_path, WATCHDOG_ADMISSION_FILE_NAME),
-        (registry_path, INSTALLATION_REGISTRY_FILE_NAME),
-    ];
-    for (actual, leaf) in expected {
-        validate_host_admission_child(&binding.host_state_root, actual, leaf)?;
-    }
-    Ok(())
-}
-
-fn validate_host_admission_child(
-    host_state_root: &Path,
-    actual: &Path,
-    leaf: &str,
-) -> Result<(), SpoolError> {
-    let expected_path = host_state_root.join(leaf);
-    if windows_paths_equal(actual, &expected_path) {
-        Ok(())
-    } else {
-        Err(SpoolError::InvalidLease(format!(
-            "Watchdog admission path is not the approved Host child: {leaf}"
-        )))
-    }
 }
 
 fn select_runtime_manifest(
@@ -2785,27 +2728,147 @@ fn validate_runtime_binding(
     Ok(())
 }
 
-fn load_supervision_lease_bound(
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedWatchdogPublication {
+    marker: WatchdogPublicationBundle,
+    admission: WatchdogAdmissionConfig,
+    lease: SignedSupervisionLease,
+    raw: eliot_platform_windows::OwnedDirectoryObservation,
+}
+
+fn observe_watchdog_publication(path: &Path) -> Result<ObservedWatchdogPublication, SpoolError> {
+    let raw = observe_owned_directory_exact(
+        path,
+        &[
+            WATCHDOG_ADMISSION_FILE_NAME,
+            SUPERVISION_LEASE_FILE_NAME,
+            WATCHDOG_PUBLICATION_FILE_NAME,
+        ],
+        LEASE_FILE_LIMIT,
+    )
+    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    let admission_bytes = raw
+        .bytes(WATCHDOG_ADMISSION_FILE_NAME)
+        .ok_or_else(|| SpoolError::InvalidLease("admission child is absent".to_owned()))?;
+    let lease_bytes = raw
+        .bytes(SUPERVISION_LEASE_FILE_NAME)
+        .ok_or_else(|| SpoolError::InvalidLease("lease child is absent".to_owned()))?;
+    let marker_bytes = raw
+        .bytes(WATCHDOG_PUBLICATION_FILE_NAME)
+        .ok_or_else(|| SpoolError::InvalidLease("publication marker is absent".to_owned()))?;
+    let admission: WatchdogAdmissionConfig = serde_json::from_slice(admission_bytes)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    let lease: SignedSupervisionLease = serde_json::from_slice(lease_bytes)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    let marker: WatchdogPublicationBundle = serde_json::from_slice(marker_bytes)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    admission
+        .validate()
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    lease
+        .validate()
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    marker
+        .validate()
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    if admission
+        .canonical_bytes()
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+        != admission_bytes
+        || serde_json::to_vec(&lease)
+            .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+            != lease_bytes
+        || marker
+            .canonical_bytes()
+            .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+            != marker_bytes
+    {
+        return Err(SpoolError::InvalidLease(
+            "Watchdog publication children are not canonical".to_owned(),
+        ));
+    }
+    marker
+        .verify_bytes(admission_bytes, lease_bytes)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    if marker.installation_id != admission.installation_id
+        || marker.approved_generation != admission.approved_generation
+        || marker.supervision_lease_id != admission.supervision_lease_id
+    {
+        return Err(SpoolError::InvalidLease(
+            "Watchdog marker is not bound to its admission template".to_owned(),
+        ));
+    }
+    let expected_name = marker
+        .directory_name()
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_none_or(|name| !name.eq_ignore_ascii_case(&expected_name))
+    {
+        return Err(SpoolError::InvalidLease(
+            "Watchdog directory is not keyed by its ORS receipt".to_owned(),
+        ));
+    }
+    Ok(ObservedWatchdogPublication {
+        marker,
+        admission,
+        lease,
+        raw,
+    })
+}
+
+fn scan_watchdog_publications(
+    host_state_root: &Path,
+) -> Result<Vec<ObservedWatchdogPublication>, SpoolError> {
+    let mut observed = Vec::new();
+    for entry in std::fs::read_dir(host_state_root)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(ToOwned::to_owned)
+            .ok_or(SpoolError::InvalidProtectedRoot)?;
+        if name
+            .to_ascii_lowercase()
+            .starts_with(WATCHDOG_PUBLICATION_DIRECTORY_PREFIX)
+        {
+            observed.push(observe_watchdog_publication(&entry.path())?);
+        }
+    }
+    Ok(observed)
+}
+
+fn load_content_addressed_supervision_lease_bound(
     source: &FileWatchdogAdmission,
+    config: &WatchdogAdmissionConfig,
+    expected_template_digest: &str,
 ) -> Result<VerifiedWatchdogAdmission, SpoolError> {
-    let lease_path = source.lease_path.as_path();
-    let admission_config_path = source.admission_config_path.as_path();
-    let registry_path = source.registry_path.as_path();
-    let expected_installation_id = source.installation_id.as_str();
-    let expected_roots_digest = source.roots_digest.as_str();
-    let bootstrap = &source.bootstrap;
-    let expected_manifest = &source.binding.selected_manifest;
     let binding = &source.binding;
     binding
         .host_state_root_lease
         .verify_stable_identity()
         .map_err(|error| SpoolError::InvalidLease(format!("Host state root changed: {error}")))?;
-    validate_host_admission_paths(binding, lease_path, admission_config_path, registry_path)?;
-    validate_text(expected_installation_id, "installation_id")?;
-    let config_bytes = read_bounded(admission_config_path, ADMISSION_CONFIG_LIMIT)?;
-    let config: WatchdogAdmissionConfig = serde_json::from_slice(&config_bytes)
+    let expected_registry_path = binding
+        .host_state_root()
+        .join(INSTALLATION_REGISTRY_FILE_NAME);
+    if !windows_paths_equal(&source.registry_path, &expected_registry_path) {
+        return Err(SpoolError::InvalidLease(
+            "Watchdog registry path is not the exact approved Host child".to_owned(),
+        ));
+    }
+    config
+        .validate()
         .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    config.validate_shape()?;
+    if config
+        .digest()
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+        != expected_template_digest
+    {
+        return Err(SpoolError::InvalidLease(
+            "Watchdog admission does not match provisioned Phase-B digest".to_owned(),
+        ));
+    }
     let registry = RedbInstallationRegistry::inspect_existing_at(
         ProtectedRootLease::open_existing(binding.host_state_root()).map_err(|error| {
             SpoolError::InvalidLease(format!("Host state root reopen failed: {error}"))
@@ -2813,10 +2876,33 @@ fn load_supervision_lease_bound(
     )
     .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
     .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
-    let selected_manifest = select_runtime_manifest(&registry, bootstrap)?;
-    if selected_manifest != **expected_manifest {
+    let selected_manifest = select_runtime_manifest(&registry, &source.bootstrap)?;
+    if selected_manifest != *binding.selected_manifest {
         return Err(SpoolError::InvalidLease(
-            "selected runtime contour changed after watchdog binding".to_owned(),
+            "selected runtime contour changed after Watchdog binding".to_owned(),
+        ));
+    }
+    let current_authority = registry
+        .provisioned_supervision_authority_for_generation(&selected_manifest.generation)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+        .ok_or_else(|| {
+            SpoolError::InvalidLease(
+                "selected generation lost its durable supervision authority".to_owned(),
+            )
+        })?;
+    if current_authority != &binding.provisioned_supervision_authority {
+        return Err(SpoolError::InvalidLease(
+            "selected generation supervision authority changed after binding".to_owned(),
+        ));
+    }
+    let current_template = current_authority
+        .watchdog_admission_template()
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    if &current_template != config
+        || current_authority.watchdog_admission_template_digest != expected_template_digest
+    {
+        return Err(SpoolError::InvalidLease(
+            "Watchdog admission is not the durable Phase-B authority projection".to_owned(),
         ));
     }
     validate_bound_service_registrations(
@@ -2824,15 +2910,8 @@ fn load_supervision_lease_bound(
         &selected_manifest,
         &binding.approved_host_registration.request,
         &binding.approved_watchdog_registration,
-        bootstrap,
+        &source.bootstrap,
     )?;
-    if config.installation_id != expected_installation_id
-        || config.trust_anchor.installation_id != expected_installation_id
-    {
-        return Err(SpoolError::InvalidLease(
-            "admission installation identity does not match the service installation".to_owned(),
-        ));
-    }
     validate_runtime_binding(
         selected_manifest
             .runtime_launch
@@ -2844,41 +2923,71 @@ fn load_supervision_lease_bound(
             .runtime_state_roots
             .roots_digest
             .as_str(),
-        expected_installation_id,
-        expected_roots_digest,
+        source.installation_id.as_str(),
+        source.roots_digest.as_str(),
     )?;
-    if config.approved_generation != selected_manifest.generation.as_str() {
-        return Err(SpoolError::InvalidLease(
-            "admission generation is not the selected approved generation".to_owned(),
-        ));
-    }
-    let expected_config_digest = selected_manifest.config_digest.as_str();
-    if !is_sha256_hex(expected_config_digest) || sha256_hex(&config_bytes) != expected_config_digest
+    if config.installation_id != source.installation_id
+        || config.approved_generation != selected_manifest.generation.as_str()
     {
         return Err(SpoolError::InvalidLease(
-            "admission config digest is not the selected manifest config digest".to_owned(),
+            "Watchdog admission is foreign to the selected generation".to_owned(),
         ));
     }
-    let expected_fingerprint = selected_manifest.supervision_key_fingerprint.as_str();
-    if config.trust_anchor.public_key_fingerprint() != expected_fingerprint
-        || config.context.public_key_fingerprint != expected_fingerprint
+    let lease_id = eliot_ors::OperationIdentity::new(config.supervision_lease_id.clone())
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    let durable_current = read_manifest_selected_ors_current(&selected_manifest, &lease_id)?
+        .ok_or_else(|| {
+            SpoolError::LeaseFenced("Kernel ORS has no current supervision lease".to_owned())
+        })?;
+    let bundle_path = binding.host_state_root().join(format!(
+        "{WATCHDOG_PUBLICATION_DIRECTORY_PREFIX}{}",
+        durable_current.receipt.receipt_sha256
+    ));
+    let publication = observe_watchdog_publication(&bundle_path)?;
+    if publication.admission != *config
+        || publication.lease != durable_current.record.artifact
+        || publication.marker.lease_revision != durable_current.record.revision
+        || publication.marker.ors_record_id != durable_current.record.record_id.as_str()
+        || publication.marker.ors_receipt_sha256 != durable_current.receipt.receipt_sha256
     {
-        return Err(SpoolError::InvalidLease(
-            "admission trust fingerprint is not the selected manifest fingerprint".to_owned(),
+        return Err(SpoolError::LeaseFenced(
+            "Watchdog bundle is not the exact current ORS head".to_owned(),
         ));
     }
     let now_ms = current_unix_ms()?;
-    let mut context = config.context;
-    context.now_ms = now_ms;
-    context
-        .validate()
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    let lease_bytes = read_bounded(lease_path, LEASE_FILE_LIMIT)?;
-    let envelope: SignedSupervisionLease = serde_json::from_slice(&lease_bytes)
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    let durable_current = read_manifest_selected_ors_current(&selected_manifest, &context)?;
-    let lease =
-        verify_against_durable_current(&config.trust_anchor, &context, &envelope, durable_current)?;
+    let context = durable_current
+        .active_verification_context(config.trust_anchor.public_key_fingerprint(), now_ms)
+        .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    let lease = verify_against_durable_current(
+        &config.trust_anchor,
+        &context,
+        &publication.lease,
+        Some(durable_current.clone()),
+    )?;
+    let spool = scan_watchdog_publications(binding.host_state_root())?;
+    if spool.len() > WATCHDOG_PUBLICATION_RETAINED_LIMIT {
+        return Err(SpoolError::LeaseFenced(
+            "Watchdog protected spool exceeds its fixed retention bound".to_owned(),
+        ));
+    }
+    let markers = spool
+        .iter()
+        .map(|entry| entry.marker.clone())
+        .collect::<Vec<_>>();
+    let plan = WatchdogPublicationRetentionPlan::for_current(&publication.marker, &markers)
+        .map_err(|error| SpoolError::LeaseFenced(error.to_string()))?;
+    if !plan.retired_receipt_digests().is_empty() {
+        return Err(SpoolError::LeaseFenced(
+            "Watchdog protected spool has unretired non-current bundles".to_owned(),
+        ));
+    }
+    let durable_after = read_manifest_selected_ors_current(&selected_manifest, &lease_id)?;
+    let publication_after = observe_watchdog_publication(&bundle_path)?;
+    if durable_after.as_ref() != Some(&durable_current) || publication_after != publication {
+        return Err(SpoolError::LeaseFenced(
+            "Watchdog publication or ORS head changed during verification".to_owned(),
+        ));
+    }
     Ok(VerifiedWatchdogAdmission {
         watchdog_epoch: context.watchdog_epoch,
         lease,
@@ -2887,7 +2996,7 @@ fn load_supervision_lease_bound(
 
 fn read_manifest_selected_ors_current(
     selected_manifest: &CandidateManifest,
-    context: &SupervisionLeaseVerificationContext,
+    lease_id: &eliot_ors::OperationIdentity,
 ) -> Result<Option<SupervisionLeaseSnapshot>, SpoolError> {
     let kernel_ors_path = PathBuf::from(
         selected_manifest
@@ -2910,9 +3019,7 @@ fn read_manifest_selected_ors_current(
     kernel_ors_lease
         .verify_path_identity()
         .map_err(|error| SpoolError::InvalidLease(format!("Kernel ORS path changed: {error}")))?;
-    let lease_id = eliot_ors::OperationIdentity::new(context.lease_id.clone())
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    read_current_supervision_lease_read_only(kernel_ors_lease.path(), &lease_id)
+    read_current_supervision_lease_read_only(kernel_ors_lease.path(), lease_id)
         .map_err(|error| SpoolError::InvalidLease(format!("Kernel ORS read failed: {error}")))
 }
 
@@ -3015,31 +3122,6 @@ fn current_unix_ms() -> Result<u64, SpoolError> {
         .as_millis()
         .try_into()
         .map_err(|_| SpoolError::InvalidLease("current time overflows u64".to_owned()))
-}
-
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, SpoolError> {
-    ProtectedRuntimePathLease::open_existing_absolute(path)
-        .and_then(|lease| lease.read_bounded(limit))
-        .map_err(|error| match error {
-            eliot_platform_windows::ProtectedPathError::SizeExceeded => SpoolError::InvalidLease(
-                "protected admission file exceeds the bounded size".to_owned(),
-            ),
-            _ => SpoolError::InvalidProtectedRoot,
-        })
-}
-
-fn validate_text(value: &str, field: &str) -> Result<(), SpoolError> {
-    if value.trim().is_empty() || value.chars().any(char::is_control) {
-        return Err(SpoolError::InvalidLease(format!("{field} is invalid")));
-    }
-    Ok(())
-}
-
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -3366,6 +3448,8 @@ mod tests {
         bootstrap: &ServiceBootstrapArguments,
         generation: &str,
     ) -> CandidateManifest {
+        use eliot_runtime_contracts::SupervisionLeaseSigner as _;
+
         let descriptor_path = bootstrap
             .config_descriptor_path()
             .to_string_lossy()
@@ -3379,6 +3463,40 @@ mod tests {
         let authority_generation = bootstrap.transaction_plan_generation();
         let roots_digest = "f".repeat(64);
         let config_digest = "d".repeat(64);
+        let signer = eliot_runtime_contracts::Ed25519SupervisionLeaseSigner::from_secret_key(
+            "eliot-kernel",
+            "test-supervision-key",
+            [0x39; 32],
+        )
+        .unwrap_or_else(|error| panic!("test supervision signer: {error}"));
+        let trust_anchor = eliot_runtime_contracts::SupervisionTrustAnchor::new(
+            &installation,
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .unwrap_or_else(|error| panic!("test supervision anchor: {error}"));
+        let key_reference = eliot_runtime_contracts::SupervisionSealedKeyReference::new(
+            "test-supervision-authority.sealed",
+            "S-1-5-80-1-2-3-4-5",
+            eliot_runtime_contracts::SupervisionSealedKeyFileIdentity {
+                canonical_path_digest: "1".repeat(64),
+                volume_serial_number: 7,
+                file_index: 11,
+                security_descriptor_digest: "2".repeat(64),
+            },
+            "3".repeat(64),
+        )
+        .unwrap_or_else(|error| panic!("test sealed key reference: {error}"));
+        let provisioned_authority = ProvisionedSupervisionAuthority::new(
+            "test-supervision-lease",
+            generation,
+            eliot_contracts::ResourceGeneration::new(authority_generation)
+                .unwrap_or_else(|error| panic!("test authority generation: {error}")),
+            key_reference,
+            trust_anchor,
+        )
+        .unwrap_or_else(|error| panic!("test provisioned supervision authority: {error}"));
         let descriptor = serde_json::json!({
             "profile": "system_service",
             "portable_root": null,
@@ -3398,6 +3516,10 @@ mod tests {
             },
             "authority_descriptor_path": descriptor_path,
             "authority_descriptor_digest": bootstrap.config_descriptor_digest(),
+            "supervision_authority": {
+                "state": "PROVISIONED",
+                "authority": provisioned_authority
+            },
             "runtime_state_roots": {
                 "profile": "system_service",
                 "profile_anchor_root": r"C:\ProgramData",
@@ -4487,42 +4609,18 @@ mod tests {
     }
 
     #[test]
-    fn host_admission_children_are_exact_and_never_legacy_or_created() {
-        let host_root = Path::new(
-            r"C:\ProgramData\Eliot\installations\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\host",
-        );
-        assert!(
-            validate_host_admission_child(
-                host_root,
-                &host_root.join(SUPERVISION_LEASE_FILE_NAME),
-                SUPERVISION_LEASE_FILE_NAME,
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_host_admission_child(
-                host_root,
-                Path::new(r"C:\ProgramData\Eliot\host\supervision-lease.json"),
-                SUPERVISION_LEASE_FILE_NAME,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_host_admission_child(
-                host_root,
-                &host_root.join(r"..\other\supervision-lease.json"),
-                SUPERVISION_LEASE_FILE_NAME,
-            )
-            .is_err()
-        );
-        assert!(validate_host_admission_child(
-            host_root,
-            Path::new(
-                r"C:\ProgramData\Eliot\installations\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\host\installation-registry.redb",
-            ),
-            INSTALLATION_REGISTRY_FILE_NAME,
-        )
-        .is_err());
+    fn production_admission_uses_only_ors_addressed_publications() {
+        let library = include_str!("lib.rs");
+        assert!(library.contains("load_content_addressed_supervision_lease_bound"));
+        assert!(library.contains("provisioned_supervision_authority_for_generation"));
+        assert!(library.contains("WATCHDOG_PUBLICATION_DIRECTORY_PREFIX"));
+        let legacy_fixed_loader = ["fn load_supervision_lease_", "bound("].concat();
+        assert!(!library.contains(&legacy_fixed_loader));
+        let fixed_lease_child = ["host_state_root.join(SUPERVISION_", "LEASE_FILE_NAME)"].concat();
+        let fixed_admission_child =
+            ["host_state_root.join(WATCHDOG_", "ADMISSION_FILE_NAME)"].concat();
+        assert!(!library.contains(&fixed_lease_child));
+        assert!(!library.contains(&fixed_admission_child));
     }
 
     #[test]
@@ -4704,13 +4802,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = supervision_fixture_path();
         let store = eliot_ors::RedbRecoveryStore::open(&path)?;
+        let now_ms = current_unix_ms()?;
         let first_stage = store.prepare_supervision_lease(supervision_fixture_request(
             "ticket-r1",
             "operation-r1",
             "lease-renewal",
             None,
             eliot_ors::SupervisionLeaseOperation::Commit,
-            supervision_fixture_binding(100)?,
+            supervision_fixture_binding(now_ms.saturating_sub(200))?,
         )?)?;
         let first_envelope = supervision_fixture_envelope(&first_stage)?;
         let (first_anchor, first_context) = supervision_fixture_verifier(&first_envelope)?;
@@ -4723,7 +4822,7 @@ mod tests {
             "lease-renewal",
             Some(1),
             eliot_ors::SupervisionLeaseOperation::Renew,
-            supervision_fixture_binding(200)?,
+            supervision_fixture_binding(now_ms.saturating_sub(100))?,
         )?)?;
         let second_envelope = supervision_fixture_envelope(&second_stage)?;
         let (second_anchor, second_context) = supervision_fixture_verifier(&second_envelope)?;

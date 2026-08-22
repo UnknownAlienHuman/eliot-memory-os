@@ -11,10 +11,10 @@ use eliot_platform_windows::ServiceBootstrapArguments;
 use eliot_platform_windows::{ServiceRegistrationRequest, WindowsPlatform};
 use eliot_watchdog::{
     FileWatchdogAdmission, INSTALLATION_REGISTRY_FILE_NAME, IndependentKernelSensor,
-    LiveHostObservationSource, SERVICE_NAME, SUPERVISION_LEASE_FILE_NAME,
-    WATCHDOG_ADMISSION_FILE_NAME, WatchdogAdmissionSource, WatchdogComposition, WatchdogConfig,
-    WatchdogRuntimeReadback, WatchdogSelfAdmissionProbe, WatchdogSelfAdmissionStatus,
-    inspect_approved_host_registration, project_service_runtime_inspection,
+    LiveHostObservationSource, SERVICE_NAME, WatchdogAdmissionSource, WatchdogComposition,
+    WatchdogConfig, WatchdogRuntimeReadback, WatchdogSelfAdmissionProbe,
+    WatchdogSelfAdmissionStatus, inspect_approved_host_registration,
+    project_service_runtime_inspection,
 };
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<Option<ServiceBootstrapArguments>, String>> =
@@ -50,8 +50,6 @@ fn run_watchdog(
     let host_state_root = bootstrap
         .host_state_root()
         .ok_or_else(|| "SCM bootstrap omitted the installer-approved Host state root".to_owned())?;
-    let lease_path = host_state_root.join(SUPERVISION_LEASE_FILE_NAME);
-    let admission_config_path = host_state_root.join(WATCHDOG_ADMISSION_FILE_NAME);
     let registry_path = host_state_root.join(INSTALLATION_REGISTRY_FILE_NAME);
     // The lease is issued by the Host/Kernel contour.  There is deliberately
     // no genesis/default lease in this process.  A stale or missing lease
@@ -60,13 +58,8 @@ fn run_watchdog(
     // later, freshly verified lease.  The source is retained by the
     // composition and reloaded before every observation.
     let admission_source = Arc::new(
-        FileWatchdogAdmission::from_registry(
-            lease_path,
-            admission_config_path,
-            registry_path,
-            bootstrap,
-        )
-        .map_err(|error| error.to_string())?,
+        FileWatchdogAdmission::from_registry(registry_path, bootstrap)
+            .map_err(|error| error.to_string())?,
     );
     let binding = admission_source.runtime_binding();
     inspect_approved_host_registration(&binding).map_err(|error| error.to_string())?;

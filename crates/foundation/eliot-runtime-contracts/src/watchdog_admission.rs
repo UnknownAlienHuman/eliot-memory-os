@@ -7,8 +7,18 @@ use crate::{SupervisionLeaseError, SupervisionTrustAnchor};
 
 /// Canonical schema for the immutable, public Watchdog admission template.
 pub const WATCHDOG_ADMISSION_SCHEMA: &str = "eliot.watchdog-admission.v2";
-/// Canonical schema for the marker-last Host publication bundle.
-pub const WATCHDOG_PUBLICATION_SCHEMA: &str = "eliot.watchdog-publication.v1";
+/// Canonical schema for one immutable Host publication bundle.
+pub const WATCHDOG_PUBLICATION_SCHEMA: &str = "eliot.watchdog-publication.v2";
+/// Content-addressed directory prefix below the approved Host state root.
+pub const WATCHDOG_PUBLICATION_DIRECTORY_PREFIX: &str = "watchdog-supervision-";
+/// Canonical admission child inside one immutable publication directory.
+pub const WATCHDOG_ADMISSION_FILE_NAME: &str = "watchdog-admission.json";
+/// Canonical signed-lease child inside one immutable publication directory.
+pub const SUPERVISION_LEASE_FILE_NAME: &str = "supervision-lease.json";
+/// Canonical bundle marker child inside one immutable publication directory.
+pub const WATCHDOG_PUBLICATION_FILE_NAME: &str = "watchdog-publication.json";
+/// Current bundle plus one predecessor retained for bounded audit/recovery.
+pub const WATCHDOG_PUBLICATION_RETAINED_LIMIT: usize = 2;
 
 /// Validation failure for public Watchdog admission/publication contracts.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -31,6 +41,10 @@ pub enum WatchdogPublicationError {
     /// The marker does not bind the exact admission/lease bytes.
     #[error("watchdog publication marker does not bind the exact file bytes")]
     ContentMismatch,
+    /// The observed immutable spool cannot be reduced without risking the
+    /// exact current ORS-bound publication.
+    #[error("watchdog publication retention set is invalid")]
+    InvalidRetentionSet,
 }
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), WatchdogPublicationError> {
@@ -56,9 +70,10 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), WatchdogPubli
 
 /// Immutable public admission selected by an approved installation manifest.
 ///
-/// Dynamic lease state is deliberately absent. The manifest binds the digest
-/// of these canonical bytes; Host publishes the current signed ORS artifact in
-/// a separate marker-last bundle. No private key locator crosses this type.
+/// Dynamic lease state is deliberately absent. The provisioned Phase-B
+/// authority binds the digest of these canonical bytes; Host publishes the
+/// current signed ORS artifact in a separate immutable bundle. No private key
+/// locator crosses this type.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatchdogAdmissionTemplate {
@@ -118,21 +133,21 @@ impl WatchdogAdmissionTemplate {
         Ok(())
     }
 
-    /// Returns the exact canonical JSON bytes covered by the manifest digest.
+    /// Returns the exact canonical JSON bytes covered by the Phase-B binding.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, WatchdogPublicationError> {
         self.validate()?;
         serde_json::to_vec(self).map_err(|_| WatchdogPublicationError::Encoding)
     }
 
-    /// Computes the manifest-facing lowercase SHA-256 template digest.
+    /// Computes the Phase-B-facing lowercase SHA-256 template digest.
     pub fn digest(&self) -> Result<String, WatchdogPublicationError> {
         Ok(sha256_hex(&self.canonical_bytes()?))
     }
 }
 
-/// Marker published last after Host writes the immutable admission and exact
-/// current signed lease. Readers must retain/read this marker before and after
-/// both children and reject any byte, identity, or ORS-head mismatch.
+/// Marker inside one atomically published, content-addressed directory.
+/// Readers derive the directory solely from the current ORS receipt digest,
+/// retain all three children, and reject any byte, identity, or ORS mismatch.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatchdogPublicationBundle {
@@ -157,6 +172,30 @@ pub struct WatchdogPublicationBundle {
 }
 
 impl WatchdogPublicationBundle {
+    /// Constructs the canonical marker for exact admission and lease bytes.
+    pub fn new(
+        admission: &WatchdogAdmissionTemplate,
+        lease_revision: u64,
+        ors_record_id: impl Into<String>,
+        ors_receipt_sha256: impl Into<String>,
+        lease_bytes: &[u8],
+    ) -> Result<Self, WatchdogPublicationError> {
+        let admission_bytes = admission.canonical_bytes()?;
+        let marker = Self {
+            schema: WATCHDOG_PUBLICATION_SCHEMA.to_owned(),
+            installation_id: admission.installation_id.clone(),
+            approved_generation: admission.approved_generation.clone(),
+            supervision_lease_id: admission.supervision_lease_id.clone(),
+            lease_revision,
+            ors_record_id: ors_record_id.into(),
+            ors_receipt_sha256: ors_receipt_sha256.into(),
+            admission_sha256: sha256_hex(&admission_bytes),
+            lease_sha256: sha256_hex(lease_bytes),
+        };
+        marker.validate()?;
+        Ok(marker)
+    }
+
     /// Validates marker shape without trusting the referenced files.
     pub fn validate(&self) -> Result<(), WatchdogPublicationError> {
         if self.schema != WATCHDOG_PUBLICATION_SCHEMA {
@@ -207,6 +246,125 @@ impl WatchdogPublicationBundle {
         }
         Ok(())
     }
+
+    /// Returns the sole allowed directory name for this ORS head.
+    pub fn directory_name(&self) -> Result<String, WatchdogPublicationError> {
+        self.validate()?;
+        Ok(format!(
+            "{WATCHDOG_PUBLICATION_DIRECTORY_PREFIX}{}",
+            self.ors_receipt_sha256
+        ))
+    }
+
+    /// Returns the canonical marker bytes stored inside the bundle directory.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, WatchdogPublicationError> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|_| WatchdogPublicationError::Encoding)
+    }
+}
+
+/// Deterministic bounded-retention decision for an already durable current
+/// publication. Only the exact ORS receipt digests are returned; filesystem
+/// retirement still requires an independently retained directory/file
+/// identity fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchdogPublicationRetentionPlan {
+    retained_receipt_digests: Vec<String>,
+    retired_receipt_digests: Vec<String>,
+}
+
+impl WatchdogPublicationRetentionPlan {
+    /// Selects current plus at most one immediately preceding revision. The
+    /// current receipt must occur exactly once and can never be selected for
+    /// retirement. Duplicate receipt digests fail closed.
+    pub fn for_current(
+        current: &WatchdogPublicationBundle,
+        observed: &[WatchdogPublicationBundle],
+    ) -> Result<Self, WatchdogPublicationError> {
+        current.validate()?;
+        if observed.is_empty() {
+            return Err(WatchdogPublicationError::InvalidRetentionSet);
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        let mut unique_revisions = std::collections::BTreeSet::new();
+        let mut current_count = 0_usize;
+        for marker in observed {
+            marker.validate()?;
+            if marker.installation_id != current.installation_id
+                || marker.approved_generation != current.approved_generation
+                || marker.supervision_lease_id != current.supervision_lease_id
+                || marker.admission_sha256 != current.admission_sha256
+                || (marker.ors_receipt_sha256 != current.ors_receipt_sha256
+                    && marker.lease_revision >= current.lease_revision)
+            {
+                return Err(WatchdogPublicationError::InvalidRetentionSet);
+            }
+            if !unique.insert(marker.ors_receipt_sha256.as_str())
+                || !unique_revisions.insert(marker.lease_revision)
+            {
+                return Err(WatchdogPublicationError::InvalidRetentionSet);
+            }
+            if marker.ors_receipt_sha256 == current.ors_receipt_sha256 {
+                current_count += 1;
+                if marker != current {
+                    return Err(WatchdogPublicationError::InvalidRetentionSet);
+                }
+            }
+        }
+        if current_count != 1 {
+            return Err(WatchdogPublicationError::InvalidRetentionSet);
+        }
+
+        let mut prior = observed
+            .iter()
+            .filter(|marker| marker.ors_receipt_sha256 != current.ors_receipt_sha256)
+            .collect::<Vec<_>>();
+        prior.sort_by(|left, right| {
+            right
+                .lease_revision
+                .cmp(&left.lease_revision)
+                .then_with(|| right.ors_receipt_sha256.cmp(&left.ors_receipt_sha256))
+        });
+        let mut retained_receipt_digests = vec![current.ors_receipt_sha256.clone()];
+        if WATCHDOG_PUBLICATION_RETAINED_LIMIT > 1 {
+            retained_receipt_digests.extend(
+                prior
+                    .iter()
+                    .take(WATCHDOG_PUBLICATION_RETAINED_LIMIT - 1)
+                    .map(|marker| marker.ors_receipt_sha256.clone()),
+            );
+        }
+        let retained = retained_receipt_digests
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let retired_receipt_digests: Vec<String> = observed
+            .iter()
+            .filter(|marker| !retained.contains(marker.ors_receipt_sha256.as_str()))
+            .map(|marker| marker.ors_receipt_sha256.clone())
+            .collect();
+        debug_assert!(
+            !retired_receipt_digests
+                .iter()
+                .any(|digest| digest == &current.ors_receipt_sha256)
+        );
+        Ok(Self {
+            retained_receipt_digests,
+            retired_receipt_digests,
+        })
+    }
+
+    /// Exact current/prior digest set retained after successful cleanup.
+    #[must_use]
+    pub fn retained_receipt_digests(&self) -> &[String] {
+        &self.retained_receipt_digests
+    }
+
+    /// Exact non-current digest set eligible for identity-bound retirement.
+    #[must_use]
+    pub fn retired_receipt_digests(&self) -> &[String] {
+        &self.retired_receipt_digests
+    }
 }
 
 #[cfg(test)]
@@ -241,23 +399,136 @@ mod tests {
 
     #[test]
     fn marker_rejects_mixed_admission_and_lease_bytes() {
-        let admission = b"admission";
         let lease = b"lease-v1";
-        let marker = WatchdogPublicationBundle {
-            schema: WATCHDOG_PUBLICATION_SCHEMA.to_owned(),
-            installation_id: "installation-1".to_owned(),
-            approved_generation: "generation-7".to_owned(),
-            supervision_lease_id: "lease-7".to_owned(),
-            lease_revision: 3,
-            ors_record_id: "record-3".to_owned(),
-            ors_receipt_sha256: "a".repeat(64),
-            admission_sha256: sha256_hex(admission),
-            lease_sha256: sha256_hex(lease),
-        };
-        marker.verify_bytes(admission, lease).expect("exact bundle");
+        let template =
+            WatchdogAdmissionTemplate::new("installation-1", "generation-7", "lease-7", anchor())
+                .expect("template");
+        let marker =
+            WatchdogPublicationBundle::new(&template, 3, "record-3", "a".repeat(64), lease)
+                .expect("marker");
+        let admission = template.canonical_bytes().expect("admission bytes");
+        marker
+            .verify_bytes(&admission, lease)
+            .expect("exact bundle");
         assert_eq!(
-            marker.verify_bytes(admission, b"lease-v2"),
+            marker.verify_bytes(&admission, b"lease-v2"),
             Err(WatchdogPublicationError::ContentMismatch)
+        );
+        assert_eq!(
+            marker.directory_name().expect("directory name"),
+            format!("{WATCHDOG_PUBLICATION_DIRECTORY_PREFIX}{}", "a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn renewal_flood_stays_bounded_and_never_retires_current() {
+        let template =
+            WatchdogAdmissionTemplate::new("installation-1", "generation-7", "lease-7", anchor())
+                .expect("template");
+        let mut durable = Vec::new();
+        for revision in 1_u64..=64 {
+            let current = WatchdogPublicationBundle::new(
+                &template,
+                revision,
+                format!("record-{revision}"),
+                format!("{revision:064x}"),
+                format!("lease-{revision}").as_bytes(),
+            )
+            .expect("marker");
+            durable.push(current.clone());
+            let plan = WatchdogPublicationRetentionPlan::for_current(&current, &durable)
+                .expect("retention plan");
+            assert!(
+                !plan
+                    .retired_receipt_digests()
+                    .contains(&current.ors_receipt_sha256),
+                "current publication must never be selected for retirement"
+            );
+            durable.retain(|marker| {
+                !plan
+                    .retired_receipt_digests()
+                    .contains(&marker.ors_receipt_sha256)
+            });
+            assert!(durable.len() <= WATCHDOG_PUBLICATION_RETAINED_LIMIT);
+            assert!(
+                durable
+                    .iter()
+                    .any(|marker| marker.ors_receipt_sha256 == current.ors_receipt_sha256)
+            );
+        }
+    }
+
+    #[test]
+    fn retention_rejects_foreign_template_even_at_higher_revision() {
+        let template =
+            WatchdogAdmissionTemplate::new("installation-1", "generation-7", "lease-7", anchor())
+                .expect("template");
+        let current =
+            WatchdogPublicationBundle::new(&template, 7, "record-7", "7".repeat(64), b"lease-7")
+                .expect("current");
+        let foreign_template =
+            WatchdogAdmissionTemplate::new("installation-1", "generation-8", "lease-8", anchor())
+                .expect("foreign template");
+        let foreign = WatchdogPublicationBundle::new(
+            &foreign_template,
+            999,
+            "foreign-record",
+            "f".repeat(64),
+            b"foreign-lease",
+        )
+        .expect("foreign marker");
+        assert_eq!(
+            WatchdogPublicationRetentionPlan::for_current(&current, &[current.clone(), foreign]),
+            Err(WatchdogPublicationError::InvalidRetentionSet)
+        );
+    }
+
+    #[test]
+    fn retention_rejects_noncurrent_same_or_future_revision() {
+        let template =
+            WatchdogAdmissionTemplate::new("installation-1", "generation-7", "lease-7", anchor())
+                .expect("template");
+        let current =
+            WatchdogPublicationBundle::new(&template, 7, "record-7", "7".repeat(64), b"lease-7")
+                .expect("current");
+        for revision in [7, 8] {
+            let forged = WatchdogPublicationBundle::new(
+                &template,
+                revision,
+                format!("record-{revision}-forged"),
+                format!("{revision:064x}"),
+                b"forged",
+            )
+            .expect("forged marker");
+            assert_eq!(
+                WatchdogPublicationRetentionPlan::for_current(&current, &[current.clone(), forged]),
+                Err(WatchdogPublicationError::InvalidRetentionSet)
+            );
+        }
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_prior_revision() {
+        let template =
+            WatchdogAdmissionTemplate::new("installation-1", "generation-7", "lease-7", anchor())
+                .expect("template");
+        let marker = |revision: u64, digest_byte: char| {
+            WatchdogPublicationBundle::new(
+                &template,
+                revision,
+                format!("record-{revision}-{digest_byte}"),
+                digest_byte.to_string().repeat(64),
+                format!("lease-{revision}-{digest_byte}").as_bytes(),
+            )
+            .expect("marker")
+        };
+        let current = marker(7, '7');
+        assert_eq!(
+            WatchdogPublicationRetentionPlan::for_current(
+                &current,
+                &[current.clone(), marker(6, 'a'), marker(6, 'b')]
+            ),
+            Err(WatchdogPublicationError::InvalidRetentionSet)
         );
     }
 }

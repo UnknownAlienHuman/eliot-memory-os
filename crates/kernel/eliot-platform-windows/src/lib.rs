@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 mod installer_authority_key;
 mod installer_root;
+mod owned_directory_retirement;
 mod package_staging;
 mod supervision_authority_key;
 mod tcp_listener_owner;
@@ -46,6 +47,12 @@ pub use installer_root::{
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
     WindowsInstallerRootPrimitive, is_process_elevated, windows_path_identity_digest,
     windows_paths_equal,
+};
+pub use owned_directory_retirement::{
+    OwnedDirectoryObservation, OwnedDirectoryObservedEntry, OwnedDirectoryRetirementEntry,
+    OwnedDirectoryRetirementError, OwnedDirectoryRetirementOutcome,
+    OwnedDirectoryRetirementPrecondition, OwnedDirectoryRetirementUnknown,
+    observe_owned_directory_exact, retire_owned_directory_exact,
 };
 pub use package_staging::{
     AuthenticodeError, AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier,
@@ -9760,7 +9767,6 @@ impl OwnedDirectoryPublication {
         if let Some(reason) = injected_postcommit_unknown {
             return Ok(unknown(reason));
         }
-
         let Ok(moved_path) = final_windows_path_from_handle(&source) else {
             return Ok(unknown(
                 DirectoryPublicationUnknown::PostCommitReadbackUnavailable,

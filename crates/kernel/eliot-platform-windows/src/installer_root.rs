@@ -155,6 +155,23 @@ impl WindowsInstallerRootExecutor {
         self.validate_profile_path(request)
     }
 
+    fn validate_read_request(
+        &self,
+        request: &InstallerRootRequest,
+    ) -> Result<(), InstallerRootError> {
+        if !request.root.is_absolute()
+            || !request.installation_root.is_absolute()
+            || !request.profile_anchor.is_absolute()
+        {
+            return Err(InstallerRootError::InvalidPath);
+        }
+        // Reading an already protected object is intentionally available to
+        // the EliotHost service SID. Elevation is required only for mutating
+        // installer effects; the same exact profile/root/reparse contour is
+        // still enforced here with Windows ordinal path comparison.
+        self.validate_profile_path(request)
+    }
+
     fn validate_profile_path(
         &self,
         request: &InstallerRootRequest,
@@ -287,7 +304,7 @@ impl WindowsInstallerRootPrimitive {
         spec: &InstallerRootPrimitiveSpec,
     ) -> Result<InstallerRootPrimitiveObservation, InstallerRootError> {
         let request = primitive_request(spec);
-        self.executor.validate_request(&request)?;
+        self.executor.validate_read_request(&request)?;
         match WindowsInstallerRootExecutor::readback(&request)? {
             Readback::Absent => Ok(InstallerRootPrimitiveObservation::Absent(
                 observe_absence(&request)?.snapshot,
@@ -378,6 +395,7 @@ impl WindowsInstallerRootPrimitive {
         path: &Path,
         limit: u64,
     ) -> Result<InstallerProtectedFileReadback, InstallerRootError> {
+        self.validate_protected_file_request(spec, path)?;
         read_protected_file(
             ProtectedFileSecurity::Installation(spec.profile),
             path,
@@ -398,7 +416,30 @@ impl WindowsInstallerRootPrimitive {
         limit: u64,
     ) -> Result<InstallerProtectedFileReadback, InstallerRootError> {
         ensure_system_service_spec(spec)?;
+        self.validate_protected_file_request(spec, path)?;
         read_protected_file(ProtectedFileSecurity::LocalServiceHostMarker, path, limit)
+    }
+
+    fn validate_protected_file_request(
+        &self,
+        spec: &InstallerRootPrimitiveSpec,
+        path: &Path,
+    ) -> Result<(), InstallerRootError> {
+        let request = primitive_request(spec);
+        self.executor.validate_read_request(&request)?;
+        if !path.is_absolute()
+            || windows_paths_equal(path, &spec.root)
+            || !windows_path_is_within(path, &spec.root)
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(InstallerRootError::InvalidPath);
+        }
+        validate_existing_ancestors(path)
     }
 
     /// Replaces a protected marker's bytes while retaining and re-verifying
@@ -1647,14 +1688,129 @@ mod primitive_tests {
     }
 
     #[test]
-    fn non_elevated_system_profile_is_rejected_before_os_observation() {
+    fn protected_file_read_rejects_every_path_outside_the_validated_root_contour() {
+        let fixture = Fixture::new();
+        fixture.ensure_user_parent();
+        let primitive = fixture.primitive(true);
+        let spec = fixture.user_spec("read-contour");
+        let snapshot = absent(&primitive, &spec);
+        primitive
+            .create(&spec, &snapshot)
+            .unwrap_or_else(|error| panic!("root create: {error}"));
+        let inside = spec.root.join("authority.json");
+        primitive
+            .create_protected_file(&spec, &inside, |_| Ok(b"inside".to_vec()))
+            .unwrap_or_else(|error| panic!("inside create: {error}"));
+        assert!(primitive.read_protected_file(&spec, &inside, 64).is_ok());
+
+        let foreign_spec = fixture.user_spec("foreign-read-contour");
+        let foreign_snapshot = absent(&primitive, &foreign_spec);
+        primitive
+            .create(&foreign_spec, &foreign_snapshot)
+            .unwrap_or_else(|error| panic!("foreign root create: {error}"));
+        let foreign = foreign_spec.root.join("authority.json");
+        primitive
+            .create_protected_file(&foreign_spec, &foreign, |_| Ok(b"foreign".to_vec()))
+            .unwrap_or_else(|error| panic!("foreign create: {error}"));
+
+        assert_eq!(
+            primitive.read_protected_file(&spec, &foreign, 64),
+            Err(InstallerRootError::InvalidPath)
+        );
+        let unicode_confusable = fixture
+            .user
+            .join("Eli\u{43e}t")
+            .join("read-contour")
+            .join("authority.json");
+        assert_eq!(
+            primitive.read_protected_file(&spec, &unicode_confusable, 64),
+            Err(InstallerRootError::InvalidPath)
+        );
+        assert_eq!(
+            primitive.read_protected_file(&spec, &spec.root, 64),
+            Err(InstallerRootError::InvalidPath)
+        );
+        assert_eq!(
+            primitive.read_protected_file(
+                &spec,
+                &spec
+                    .root
+                    .join("..")
+                    .join("foreign-read-contour")
+                    .join("authority.json"),
+                64
+            ),
+            Err(InstallerRootError::InvalidPath)
+        );
+
+        let junction_root = fixture.user.join("Eliot").join("read-junction");
+        let junction_target = fixture.root.join("read-junction-target");
+        std::fs::create_dir(&junction_target)
+            .unwrap_or_else(|error| panic!("junction target create: {error}"));
+        let output = Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction_root)
+            .arg(&junction_target)
+            .output()
+            .unwrap_or_else(|error| panic!("junction command: {error}"));
+        assert!(output.status.success(), "mklink /J failed: {output:?}");
+        let junction_spec = fixture.user_spec("read-junction");
+        assert_eq!(
+            primitive.read_protected_file(
+                &junction_spec,
+                &junction_root.join("authority.json"),
+                64,
+            ),
+            Err(InstallerRootError::ReparsePoint)
+        );
+        std::fs::remove_dir(&junction_root)
+            .unwrap_or_else(|error| panic!("junction cleanup: {error}"));
+    }
+
+    #[test]
+    fn non_elevated_system_read_contour_accepts_exact_path_before_acl_readback() {
+        let fixture = Fixture::new();
+        let spec = fixture.system_spec("kernel-work");
+        std::fs::create_dir_all(&spec.root)
+            .unwrap_or_else(|error| panic!("system contour fixture: {error}"));
+        let path = spec.root.join("supervision-authority.json");
+        std::fs::write(&path, b"sealed")
+            .unwrap_or_else(|error| panic!("system file fixture: {error}"));
+
+        let non_elevated_reader = fixture.primitive(false);
+        assert_eq!(
+            non_elevated_reader.validate_protected_file_request(&spec, &path),
+            Ok(())
+        );
+        assert_ne!(
+            non_elevated_reader.read_protected_file(&spec, &path, 64),
+            Err(InstallerRootError::NotElevated),
+            "read-only contour validation must reach exact ACL/identity readback without elevation"
+        );
+        assert_eq!(
+            non_elevated_reader.validate_protected_file_request(
+                &spec,
+                &fixture.system.join("Eliot-other").join("sealed.json"),
+            ),
+            Err(InstallerRootError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn non_elevated_system_mutation_is_rejected_before_os_observation() {
         let fixture = Fixture::new();
         let primitive = fixture.primitive(false);
         let spec = fixture.system_spec("state");
+        let request = primitive_request(&spec);
 
         assert_eq!(
-            primitive.inspect(&spec),
+            primitive.executor.validate_request(&request),
             Err(InstallerRootError::NotElevated)
+        );
+        assert_ne!(
+            primitive.inspect(&spec),
+            Err(InstallerRootError::NotElevated),
+            "read-only inspection must not inherit the installer mutation elevation gate"
         );
     }
 

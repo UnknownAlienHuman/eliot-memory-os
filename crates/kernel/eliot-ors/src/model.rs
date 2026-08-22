@@ -5,7 +5,8 @@ use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_receipts::ReceiptEnvelope;
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, LeaseState, SignedSupervisionLease,
-    SupervisionGenerationBinding, SupervisionLease, SupervisionLeaseTerminalDisposition,
+    SupervisionGenerationBinding, SupervisionLease, SupervisionLeaseActiveStateBinding,
+    SupervisionLeaseTerminalDisposition, SupervisionLeaseVerificationContext,
     SupervisionObservationScope, SupervisionOrsMirrorBinding, VerifiedSupervisionLease,
     VerifiedSupervisionLeaseTerminalTransition,
 };
@@ -815,8 +816,66 @@ pub struct SupervisionLeaseSnapshot {
 }
 
 impl SupervisionLeaseSnapshot {
-    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+    /// Validates the complete current/history record and canonical receipt.
+    ///
+    /// This is public so an authenticated IPC consumer can validate a snapshot
+    /// before comparing it with the exact durable ORS head. Validation grants
+    /// no lease authority and performs no signature verification.
+    pub fn validate(&self) -> Result<(), OrsError> {
         self.record.validate(&self.receipt)
+    }
+
+    /// Constructs the verifier context from the validated pre-sign ORS
+    /// binding, never from caller-authored admission values or by copying the
+    /// signed payload. Only an active current snapshot can produce a context.
+    pub fn active_verification_context(
+        &self,
+        public_key_fingerprint: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<SupervisionLeaseVerificationContext, OrsError> {
+        self.validate()?;
+        if self.record.state != LeaseState::Active
+            || self.record.projection != SupervisionLeaseProjection::Active
+        {
+            return Err(OrsError::SupervisionLeaseBindingMismatch);
+        }
+        let binding = &self.record.binding;
+        let generation = &binding.generation_binding;
+        let context = SupervisionLeaseVerificationContext {
+            now_ms,
+            lease_id: self.record.lease_id.as_str().to_owned(),
+            host_epoch: binding.host_epoch,
+            activation_id: binding.activation_id.as_str().to_owned(),
+            activation_generation: binding.activation_generation,
+            kernel_epoch: binding.kernel_epoch,
+            watchdog_epoch: binding.watchdog_epoch,
+            state_fence: binding.state_fence.clone(),
+            scope_ref: binding.scope_ref.as_str().to_owned(),
+            observation_scope: binding.observation_scope.clone(),
+            target_id: generation.target_id.clone(),
+            module_id: generation.module_id.clone(),
+            process_id: generation.process_id.clone(),
+            target_generation: generation.target_generation,
+            module_generation: generation.module_generation,
+            process_generation: generation.process_generation,
+            public_key_fingerprint: public_key_fingerprint.into(),
+            ors_mirror: SupervisionOrsMirrorBinding {
+                record_id: self.record.record_id.as_str().to_owned(),
+                subject_lease_id: self.record.lease_id.as_str().to_owned(),
+                lease_revision: self.record.revision,
+                ticket_sha256: self.record.ticket_sha256.clone(),
+                previous_receipt_sha256: self.record.previous_receipt_sha256.clone(),
+            },
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: binding.state,
+                revocation_id: binding.revocation_id.clone(),
+                revocation_epoch: binding.revocation_epoch,
+            },
+        };
+        context
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        Ok(context)
     }
 
     pub fn record(&self) -> &SupervisionLeaseRecord {

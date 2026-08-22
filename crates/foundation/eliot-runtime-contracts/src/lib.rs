@@ -53,8 +53,10 @@ pub use supervision_lease::{
     VerifiedSupervisionLeaseTerminalTransition,
 };
 pub use watchdog_admission::{
-    WATCHDOG_ADMISSION_SCHEMA, WATCHDOG_PUBLICATION_SCHEMA, WatchdogAdmissionTemplate,
-    WatchdogPublicationBundle, WatchdogPublicationError,
+    SUPERVISION_LEASE_FILE_NAME, WATCHDOG_ADMISSION_FILE_NAME, WATCHDOG_ADMISSION_SCHEMA,
+    WATCHDOG_PUBLICATION_DIRECTORY_PREFIX, WATCHDOG_PUBLICATION_FILE_NAME,
+    WATCHDOG_PUBLICATION_RETAINED_LIMIT, WATCHDOG_PUBLICATION_SCHEMA, WatchdogAdmissionTemplate,
+    WatchdogPublicationBundle, WatchdogPublicationError, WatchdogPublicationRetentionPlan,
 };
 
 /// Stable wire name for this contract family.

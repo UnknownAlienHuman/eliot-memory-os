@@ -9,28 +9,15 @@ use eliot_installation::InstallationError;
 use eliot_installation::InstallationTransactionStore;
 use eliot_installation::{ApprovedGenerationRegistry, CandidateManifest, InstallerServiceRole};
 use eliot_runtime_contracts::{
-    HealthDimension, SignedSupervisionLease, SupervisionLeaseVerificationContext,
-    SupervisionLeaseVerifier, SupervisionTrustAnchor,
+    HealthDimension, SUPERVISION_LEASE_FILE_NAME, SignedSupervisionLease,
+    SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionTrustAnchor,
+    WATCHDOG_ADMISSION_FILE_NAME, WATCHDOG_PUBLICATION_DIRECTORY_PREFIX,
+    WATCHDOG_PUBLICATION_FILE_NAME, WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate,
+    WatchdogPublicationBundle, WatchdogPublicationRetentionPlan,
 };
-use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 
-const WATCHDOG_ADMISSION_SCHEMA: &str = "eliot.watchdog-admission.v1";
-const WATCHDOG_ADMISSION_LIMIT: u64 = 1024 * 1024;
-const SUPERVISION_LEASE_LIMIT: u64 = 1024 * 1024;
-
-/// The installer-owned Watchdog admission projection.  This deliberately
-/// mirrors the existing durable schema instead of introducing a status writer
-/// or accepting caller-authored trust material.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RuntimeAdmissionConfig {
-    schema: String,
-    installation_id: String,
-    approved_generation: String,
-    trust_anchor: SupervisionTrustAnchor,
-    context: SupervisionLeaseVerificationContext,
-}
+const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ComponentState {
@@ -1013,6 +1000,7 @@ fn is_fresh_typed(observed_ms: u64, now_ms: u64, max_age_ms: u64) -> Result<(), 
 
 fn require_host_monotonic_lease(
     host_state_root: Option<&Path>,
+    manifest: Option<&CandidateManifest>,
     now_ms: u64,
     deadline: Instant,
 ) -> Result<(), String> {
@@ -1022,9 +1010,12 @@ fn require_host_monotonic_lease(
     let Some(root) = host_state_root else {
         return Ok(());
     };
+    let manifest = manifest.ok_or_else(|| {
+        "monotonic lease requires the exact active manifest/Phase-B binding".to_owned()
+    })?;
     #[cfg(not(windows))]
     {
-        let _ = (root, now_ms);
+        let _ = (root, manifest, now_ms);
         return Err(
             "monotonic lease requires Windows ProtectedRuntimePathLease; wall-clock-only rejected"
                 .to_owned(),
@@ -1032,81 +1023,302 @@ fn require_host_monotonic_lease(
     }
     #[cfg(windows)]
     {
-        let lease_path = root.join("supervision-lease.json");
-        let admission_path = root.join("watchdog-admission.json");
-        let lease =
-            eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(&lease_path)
-                .map_err(|e| format!("monotonic supervision lease unavailable: {e}"))?;
-        let admission = eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
-            &admission_path,
-        )
-        .map_err(|e| format!("monotonic supervision admission unavailable: {e}"))?;
-        lease
-            .verify_stable_identity()
-            .map_err(|e| format!("monotonic lease stable identity failed: {e}"))?;
-        lease
-            .verify_path_identity()
-            .map_err(|e| format!("monotonic lease path identity failed: {e}"))?;
-        admission
-            .verify_stable_identity()
-            .map_err(|e| format!("monotonic admission stable identity failed: {e}"))?;
-        admission
-            .verify_path_identity()
-            .map_err(|e| format!("monotonic admission path identity failed: {e}"))?;
-        let lease_bytes = lease
-            .read_bounded(SUPERVISION_LEASE_LIMIT)
-            .map_err(|e| format!("monotonic lease read failed: {e}"))?;
-        let admission_bytes = admission
-            .read_bounded(WATCHDOG_ADMISSION_LIMIT)
-            .map_err(|e| format!("monotonic admission read failed: {e}"))?;
-        let envelope: SignedSupervisionLease = serde_json::from_slice(&lease_bytes)
-            .map_err(|e| format!("monotonic lease parse failed: {e}"))?;
-        let config: RuntimeAdmissionConfig = serde_json::from_slice(&admission_bytes)
-            .map_err(|e| format!("monotonic admission parse failed: {e}"))?;
-        if config.schema != WATCHDOG_ADMISSION_SCHEMA {
-            return Err("monotonic admission schema mismatch".to_owned());
-        }
-        config
-            .trust_anchor
-            .validate()
-            .map_err(|e| format!("monotonic admission trust anchor invalid: {e}"))?;
-        let mut shape = config.context.clone();
-        shape.now_ms = 1;
-        shape
-            .validate()
-            .map_err(|e| format!("monotonic admission context shape invalid: {e}"))?;
-        let mut context = config.context.clone();
-        context.now_ms = now_ms;
-        context
-            .validate()
-            .map_err(|e| format!("monotonic admission context invalid: {e}"))?;
-        config
-            .trust_anchor
-            .verify(&envelope, &context)
-            .map_err(|e| format!("monotonic lease signature verification failed: {e}"))?;
-        if envelope.payload.issued_at_ms == 0
-            || envelope.payload.expires_at_ms == 0
-            || envelope.payload.issued_at_ms >= envelope.payload.expires_at_ms
-        {
-            return Err("monotonic lease window invalid".to_owned());
-        }
-        if now_ms < envelope.payload.issued_at_ms || now_ms >= envelope.payload.expires_at_ms {
-            return Err(format!(
-                "monotonic lease not fresh: now {now_ms} outside {}..{}",
-                envelope.payload.issued_at_ms, envelope.payload.expires_at_ms
-            ));
-        }
-        if envelope.payload.state != eliot_runtime_contracts::LeaseState::Active {
-            return Err("monotonic lease is not Active".to_owned());
-        }
-        lease
-            .verify_stable_identity()
-            .map_err(|e| format!("monotonic lease changed after read: {e}"))?;
-        admission
-            .verify_stable_identity()
-            .map_err(|e| format!("monotonic admission changed after read: {e}"))?;
-        Ok(())
+        verify_host_supervision_bundle(root, manifest, now_ms, deadline).map(|_| ())
     }
+}
+
+#[cfg(windows)]
+struct VerifiedHostSupervisionBundle {
+    envelope: SignedSupervisionLease,
+    trust_anchor: SupervisionTrustAnchor,
+    context: SupervisionLeaseVerificationContext,
+    current: eliot_ors::SupervisionLeaseSnapshot,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedStatusWatchdogPublication {
+    path: PathBuf,
+    marker: WatchdogPublicationBundle,
+    admission: WatchdogAdmissionTemplate,
+    lease: SignedSupervisionLease,
+    raw: eliot_platform_windows::OwnedDirectoryObservation,
+}
+
+#[cfg(windows)]
+fn observe_status_watchdog_publication(
+    path: &Path,
+) -> Result<ObservedStatusWatchdogPublication, String> {
+    let raw = eliot_platform_windows::observe_owned_directory_exact(
+        path,
+        &[
+            WATCHDOG_ADMISSION_FILE_NAME,
+            SUPERVISION_LEASE_FILE_NAME,
+            WATCHDOG_PUBLICATION_FILE_NAME,
+        ],
+        WATCHDOG_PUBLICATION_CHILD_LIMIT,
+    )
+    .map_err(|error| format!("immutable Watchdog publication read failed: {error}"))?;
+    let admission_bytes = raw
+        .bytes(WATCHDOG_ADMISSION_FILE_NAME)
+        .ok_or_else(|| "Watchdog publication has no admission child".to_owned())?;
+    let lease_bytes = raw
+        .bytes(SUPERVISION_LEASE_FILE_NAME)
+        .ok_or_else(|| "Watchdog publication has no lease child".to_owned())?;
+    let marker_bytes = raw
+        .bytes(WATCHDOG_PUBLICATION_FILE_NAME)
+        .ok_or_else(|| "Watchdog publication has no marker child".to_owned())?;
+    let admission: WatchdogAdmissionTemplate = serde_json::from_slice(admission_bytes)
+        .map_err(|error| format!("Watchdog admission parse failed: {error}"))?;
+    let lease: SignedSupervisionLease = serde_json::from_slice(lease_bytes)
+        .map_err(|error| format!("Watchdog lease parse failed: {error}"))?;
+    let marker: WatchdogPublicationBundle = serde_json::from_slice(marker_bytes)
+        .map_err(|error| format!("Watchdog marker parse failed: {error}"))?;
+    admission
+        .validate()
+        .map_err(|error| format!("Watchdog admission invalid: {error}"))?;
+    lease
+        .validate()
+        .map_err(|error| format!("Watchdog lease invalid: {error}"))?;
+    marker
+        .validate()
+        .map_err(|error| format!("Watchdog marker invalid: {error}"))?;
+    if admission
+        .canonical_bytes()
+        .map_err(|error| format!("Watchdog admission encoding failed: {error}"))?
+        != admission_bytes
+        || serde_json::to_vec(&lease)
+            .map_err(|error| format!("Watchdog lease encoding failed: {error}"))?
+            != lease_bytes
+        || marker
+            .canonical_bytes()
+            .map_err(|error| format!("Watchdog marker encoding failed: {error}"))?
+            != marker_bytes
+    {
+        return Err("Watchdog publication children are not canonical".to_owned());
+    }
+    marker
+        .verify_bytes(admission_bytes, lease_bytes)
+        .map_err(|error| format!("Watchdog marker content binding failed: {error}"))?;
+    let expected_name = marker
+        .directory_name()
+        .map_err(|error| format!("Watchdog directory identity invalid: {error}"))?;
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_none_or(|name| !name.eq_ignore_ascii_case(&expected_name))
+    {
+        return Err("Watchdog publication directory is not keyed by its ORS receipt".to_owned());
+    }
+    Ok(ObservedStatusWatchdogPublication {
+        path: path.to_path_buf(),
+        marker,
+        admission,
+        lease,
+        raw,
+    })
+}
+
+#[cfg(windows)]
+fn scan_status_watchdog_publications(
+    root: &Path,
+) -> Result<Vec<ObservedStatusWatchdogPublication>, String> {
+    let mut observed = Vec::new();
+    for entry in std::fs::read_dir(root)
+        .map_err(|error| format!("Watchdog publication scan failed: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Watchdog publication entry failed: {error}"))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "Watchdog publication child name is not Unicode".to_owned())?;
+        if name
+            .to_ascii_lowercase()
+            .starts_with(WATCHDOG_PUBLICATION_DIRECTORY_PREFIX)
+        {
+            observed.push(observe_status_watchdog_publication(&entry.path())?);
+        }
+    }
+    observed.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(observed)
+}
+
+#[cfg(windows)]
+fn verify_host_supervision_bundle(
+    root: &Path,
+    manifest: &CandidateManifest,
+    now_ms: u64,
+    deadline: Instant,
+) -> Result<VerifiedHostSupervisionBundle, String> {
+    if Instant::now() >= deadline {
+        return Err("deadline exceeded before supervision bundle verification".to_owned());
+    }
+    let expected_host_root = Path::new(
+        manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    if !eliot_platform_windows::windows_paths_equal(root, expected_host_root) {
+        return Err("Host supervision root is not the active manifest root".to_owned());
+    }
+    let retained_root = eliot_platform_windows::ProtectedRootLease::open_existing(root)
+        .map_err(|error| format!("Host supervision root open failed: {error}"))?;
+    let canonical_root = retained_root
+        .canonical_path()
+        .map_err(|error| format!("Host supervision root resolve failed: {error}"))?;
+    if !eliot_platform_windows::windows_paths_equal(&canonical_root, root) {
+        return Err("Host supervision root is not the exact retained root".to_owned());
+    }
+    retained_root
+        .verify_stable_identity()
+        .map_err(|error| format!("Host supervision root changed: {error}"))?;
+
+    let registry = eliot_installation::RedbInstallationRegistry::inspect_existing_at(
+        eliot_platform_windows::ProtectedRootLease::open_existing(&canonical_root)
+            .map_err(|error| format!("Host registry root reopen failed: {error}"))?,
+    )
+    .map_err(|error| format!("Host registry read failed: {error}"))?
+    .ok_or_else(|| "Host registry is missing".to_owned())?;
+    registry
+        .validate()
+        .map_err(|error| format!("Host registry invalid: {error}"))?;
+    if !registry
+        .generations()
+        .iter()
+        .any(|generation| generation.manifest == *manifest)
+    {
+        return Err("requested manifest is not the exact durable registry generation".to_owned());
+    }
+    let authority = registry
+        .provisioned_supervision_authority_for_generation(&manifest.generation)
+        .map_err(|error| format!("Phase-B supervision authority invalid: {error}"))?
+        .cloned()
+        .ok_or_else(|| "generation has no durable provisioned supervision authority".to_owned())?;
+    authority
+        .validate()
+        .map_err(|error| format!("Phase-B supervision authority invalid: {error}"))?;
+    let admission = authority
+        .watchdog_admission_template()
+        .map_err(|error| format!("Phase-B Watchdog admission invalid: {error}"))?;
+    if admission
+        .digest()
+        .map_err(|error| format!("Phase-B Watchdog admission digest failed: {error}"))?
+        != authority.watchdog_admission_template_digest
+    {
+        return Err("Phase-B Watchdog admission digest mismatch".to_owned());
+    }
+
+    // ORS is read before any publication path is derived. Its exact current
+    // receipt is the sole content-addressing input.
+    let ors_path = PathBuf::from(
+        manifest
+            .runtime_launch
+            .runtime_state_roots
+            .kernel_ors_root
+            .as_str(),
+    )
+    .join("kernel-ors.redb");
+    let ors = eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(&ors_path)
+        .map_err(|error| format!("manifest-selected ORS unavailable: {error}"))?;
+    if !eliot_platform_windows::windows_paths_equal(ors.path(), &ors_path) {
+        return Err("retained Kernel ORS path is not exact".to_owned());
+    }
+    ors.verify_stable_identity()
+        .and_then(|()| ors.verify_path_identity())
+        .map_err(|error| format!("retained Kernel ORS identity failed: {error}"))?;
+    let lease_id = eliot_ors::OperationIdentity::new(authority.supervision_lease_id.clone())
+        .map_err(|error| format!("supervision lease identity invalid: {error}"))?;
+    let current = eliot_ors::read_current_supervision_lease_read_only(ors.path(), &lease_id)
+        .map_err(|error| format!("current supervision ORS read failed: {error}"))?
+        .ok_or_else(|| "current supervision ORS record is missing".to_owned())?;
+    current
+        .validate()
+        .map_err(|error| format!("current supervision ORS snapshot invalid: {error}"))?;
+
+    let publication_path = canonical_root.join(format!(
+        "{WATCHDOG_PUBLICATION_DIRECTORY_PREFIX}{}",
+        current.receipt.receipt_sha256
+    ));
+    let publication = observe_status_watchdog_publication(&publication_path)?;
+    let lease_bytes = publication
+        .raw
+        .bytes(SUPERVISION_LEASE_FILE_NAME)
+        .ok_or_else(|| "Watchdog publication lost its lease child".to_owned())?;
+    let expected_marker = WatchdogPublicationBundle::new(
+        &admission,
+        current.record.revision,
+        current.record.record_id.as_str(),
+        current.receipt.receipt_sha256.clone(),
+        lease_bytes,
+    )
+    .map_err(|error| format!("expected Watchdog marker invalid: {error}"))?;
+    if publication.admission != admission
+        || publication.lease != current.record.artifact
+        || publication.marker != expected_marker
+    {
+        return Err("published Watchdog bundle is not the exact current ORS head".to_owned());
+    }
+
+    let context = current
+        .active_verification_context(authority.trust_anchor.public_key_fingerprint(), now_ms)
+        .map_err(|error| format!("current supervision ORS binding invalid: {error}"))?;
+    authority
+        .trust_anchor
+        .verify(&publication.lease, &context)
+        .map_err(|error| format!("current supervision signature/freshness failed: {error}"))?;
+
+    let spool = scan_status_watchdog_publications(&canonical_root)?;
+    if spool.len() > WATCHDOG_PUBLICATION_RETAINED_LIMIT {
+        return Err("Watchdog protected spool exceeds its fixed retention bound".to_owned());
+    }
+    let markers = spool
+        .iter()
+        .map(|entry| entry.marker.clone())
+        .collect::<Vec<_>>();
+    let plan = WatchdogPublicationRetentionPlan::for_current(&publication.marker, &markers)
+        .map_err(|error| format!("Watchdog protected spool is invalid: {error}"))?;
+    if !plan.retired_receipt_digests().is_empty() {
+        return Err("Watchdog protected spool has unretired non-current bundles".to_owned());
+    }
+
+    if Instant::now() >= deadline {
+        return Err("deadline exceeded during supervision bundle verification".to_owned());
+    }
+    let registry_after = eliot_installation::RedbInstallationRegistry::inspect_existing_at(
+        eliot_platform_windows::ProtectedRootLease::open_existing(&canonical_root)
+            .map_err(|error| format!("Host registry final reopen failed: {error}"))?,
+    )
+    .map_err(|error| format!("Host registry final read failed: {error}"))?
+    .ok_or_else(|| "Host registry disappeared during verification".to_owned())?;
+    registry_after
+        .validate()
+        .map_err(|error| format!("Host registry final state invalid: {error}"))?;
+    let authority_after = registry_after
+        .provisioned_supervision_authority_for_generation(&manifest.generation)
+        .map_err(|error| format!("Phase-B authority final read invalid: {error}"))?
+        .ok_or_else(|| "Phase-B authority disappeared during verification".to_owned())?;
+    let current_after = eliot_ors::read_current_supervision_lease_read_only(ors.path(), &lease_id)
+        .map_err(|error| format!("current supervision ORS re-read failed: {error}"))?;
+    let publication_after = observe_status_watchdog_publication(&publication_path)?;
+    if authority_after != &authority
+        || current_after.as_ref() != Some(&current)
+        || publication_after != publication
+        || retained_root.verify_stable_identity().is_err()
+        || ors.verify_stable_identity().is_err()
+        || ors.verify_path_identity().is_err()
+    {
+        return Err("registry, ORS, or immutable publication changed during read".to_owned());
+    }
+
+    Ok(VerifiedHostSupervisionBundle {
+        envelope: publication.lease,
+        trust_anchor: authority.trust_anchor,
+        context,
+        current,
+    })
 }
 
 fn select_current_store_rebind<'a>(
@@ -1405,7 +1617,8 @@ fn inspect_kernel_live(
     if let Err(e) = is_fresh_typed(snapshot.observed_at_unix_ms, now_ms, 90_000) {
         return unknown_component("Kernel", format!("Kernel live snapshot not fresh: {e}"));
     }
-    if let Err(e) = require_host_monotonic_lease(host_state_root, now_ms, deadline) {
+    if let Err(e) = require_host_monotonic_lease(host_state_root, Some(manifest), now_ms, deadline)
+    {
         return unknown_component("Kernel", format!("monotonic lease freshness required: {e}"));
     }
     return ComponentState::Healthy;
@@ -1707,7 +1920,8 @@ fn inspect_store_live(
     if let Err(e) = is_fresh_typed(snapshot.observed_at_unix_ms, now_ms, 90_000) {
         return unknown_component("Store", format!("Store live snapshot not fresh: {e}"));
     }
-    if let Err(e) = require_host_monotonic_lease(host_state_root, now_ms, deadline) {
+    if let Err(e) = require_host_monotonic_lease(host_state_root, Some(manifest), now_ms, deadline)
+    {
         return unknown_component("Store", format!("monotonic lease freshness required: {e}"));
     }
     if Instant::now() >= deadline {
@@ -2185,6 +2399,7 @@ pub struct ProductionStoreLiveObserver {
 }
 pub struct ProductionWatchdogLiveObserver {
     host_state_root: PathBuf,
+    manifest: Option<CandidateManifest>,
 }
 pub struct ProductionEliotdLiveObserver {
     host_state_root: PathBuf,
@@ -2244,9 +2459,18 @@ fn production_store_observer(
 }
 
 impl ProductionWatchdogLiveObserver {
+    #[cfg(test)]
     fn for_root(host_state_root: &Path) -> Self {
         Self {
             host_state_root: host_state_root.to_path_buf(),
+            manifest: None,
+        }
+    }
+
+    fn for_manifest(host_state_root: &Path, manifest: &CandidateManifest) -> Self {
+        Self {
+            host_state_root: host_state_root.to_path_buf(),
+            manifest: Some(manifest.clone()),
         }
     }
 }
@@ -2390,77 +2614,19 @@ impl WatchdogLiveObserver for ProductionWatchdogLiveObserver {
                 return Err("deadline exceeded before Watchdog SCM observation".to_owned());
             }
             let now_ms = current_unix_ms()?;
-            let admission_path = self.host_state_root.join("watchdog-admission.json");
-            let lease_path = self.host_state_root.join("supervision-lease.json");
-            let admission_lease =
-                match eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
-                    &admission_path,
-                ) {
-                    Ok(l) => l,
-                    Err(_) => return Ok(None),
-                };
-            let supervision_lease =
-                match eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
-                    &lease_path,
-                ) {
-                    Ok(l) => l,
-                    Err(_) => return Ok(None),
-                };
-            if admission_lease.verify_stable_identity().is_err()
-                || admission_lease.verify_path_identity().is_err()
-                || supervision_lease.verify_stable_identity().is_err()
-                || supervision_lease.verify_path_identity().is_err()
-            {
+            let Some(manifest) = self.manifest.as_ref() else {
                 return Ok(None);
-            }
-            let admission_bytes = match admission_lease.read_bounded(WATCHDOG_ADMISSION_LIMIT) {
-                Ok(b) => b,
+            };
+            let bundle = match verify_host_supervision_bundle(
+                &self.host_state_root,
+                manifest,
+                now_ms,
+                deadline,
+            ) {
+                Ok(envelope) => envelope,
                 Err(_) => return Ok(None),
             };
-            let config: RuntimeAdmissionConfig = match serde_json::from_slice(&admission_bytes) {
-                Ok(c) => c,
-                Err(_) => return Ok(None),
-            };
-            if config.schema != WATCHDOG_ADMISSION_SCHEMA {
-                return Ok(None);
-            }
-            if config.trust_anchor.validate().is_err() {
-                return Ok(None);
-            }
-            let mut shape = config.context.clone();
-            shape.now_ms = 1;
-            if shape.validate().is_err() {
-                return Ok(None);
-            }
-            let mut context = config.context.clone();
-            context.now_ms = now_ms;
-            if context.validate().is_err() {
-                return Ok(None);
-            }
-            let supervision_bytes = match supervision_lease.read_bounded(SUPERVISION_LEASE_LIMIT) {
-                Ok(b) => b,
-                Err(_) => return Ok(None),
-            };
-            let envelope: SignedSupervisionLease = match serde_json::from_slice(&supervision_bytes)
-            {
-                Ok(e) => e,
-                Err(_) => return Ok(None),
-            };
-            if config.trust_anchor.verify(&envelope, &context).is_err() {
-                return Ok(None);
-            }
-            if envelope.payload.issued_at_ms == 0
-                || now_ms < envelope.payload.issued_at_ms
-                || now_ms >= envelope.payload.expires_at_ms
-            {
-                return Ok(None);
-            }
-            let heartbeat_ms = envelope.payload.issued_at_ms;
-            if admission_lease.verify_stable_identity().is_err()
-                || supervision_lease.verify_stable_identity().is_err()
-            {
-                return Ok(None);
-            }
+            let heartbeat_ms = bundle.envelope.payload.issued_at_ms;
             Ok(Some(WatchdogLiveSnapshot {
                 observed_at_unix_ms: now_ms,
                 heartbeat_unix_ms: heartbeat_ms,
@@ -2972,8 +3138,12 @@ pub fn collect_status_with_observers(
         }
     };
     check_deadline(deadline)?;
-    let (journal_contour, host_state_for_readiness) =
-        inspect_host_journal_retained(&retained_root, &canonical_path, deadline);
+    let (journal_contour, host_state_for_readiness) = inspect_host_journal_retained(
+        &retained_root,
+        &canonical_path,
+        active_manifest.as_ref(),
+        deadline,
+    );
     check_deadline(deadline)?;
     let readiness = inspect_readiness_from_host_state(host_state_for_readiness.as_ref(), deadline);
     check_deadline(deadline)?;
@@ -3038,13 +3208,22 @@ pub fn collect_status_with_observers(
         eliotd_observer,
         deadline,
     );
+    let derived_watchdog_observer = active_manifest
+        .as_ref()
+        .map(|manifest| ProductionWatchdogLiveObserver::for_manifest(&canonical_path, manifest));
+    let effective_watchdog_observer: Option<&dyn WatchdogLiveObserver> =
+        watchdog_observer.or_else(|| {
+            derived_watchdog_observer
+                .as_ref()
+                .map(|observer| observer as &dyn WatchdogLiveObserver)
+        });
     let watchdog_state = inspect_watchdog_live(
         host_state_for_readiness.as_ref(),
         active_manifest.as_ref(),
         &ors_contour,
         &host_service,
         &watchdog_service,
-        watchdog_observer,
+        effective_watchdog_observer,
         deadline,
     );
     let gaps = {
@@ -3199,14 +3378,13 @@ pub fn collect_status(
     deadline: Instant,
 ) -> Result<RuntimeStatusReport, StatusError> {
     let kernel_observer = ProductionKernelLiveObserver;
-    let watchdog_observer = ProductionWatchdogLiveObserver::for_root(host_state_root);
     let eliotd_observer = ProductionEliotdLiveObserver::for_root(host_state_root);
     collect_status_with_observers(
         host_state_root,
         deadline,
         Some(&kernel_observer),
         None,
-        Some(&watchdog_observer),
+        None,
         Some(&eliotd_observer),
     )
 }
@@ -3221,6 +3399,7 @@ fn readiness_gap() -> String {
 fn inspect_host_journal_retained(
     retained_root: &eliot_platform_windows::ProtectedRootLease,
     canonical_path: &Path,
+    active_manifest: Option<&CandidateManifest>,
     deadline: Instant,
 ) -> (HostJournalContour, Option<eliot_host_state::HostState>) {
     if Instant::now() >= deadline {
@@ -3763,7 +3942,9 @@ fn inspect_host_journal_retained(
         );
     }
     #[cfg(windows)]
-    if let Err(e) = require_host_monotonic_lease(Some(canonical_path), now_ms, deadline) {
+    if let Err(e) =
+        require_host_monotonic_lease(Some(canonical_path), active_manifest, now_ms, deadline)
+    {
         let gap = format!("monotonic lease not fresh: {e}; {}", host_journal_gap());
         return (
             HostJournalContour {
@@ -4028,90 +4209,6 @@ fn inspect_ors_retained(
             );
         }
 
-        let admission_path = canonical_path.join("watchdog-admission.json");
-        let lease_path = canonical_path.join("supervision-lease.json");
-        let admission_file_lease =
-            match eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
-                &admission_path,
-            ) {
-                Ok(lease) => lease,
-                Err(error) => {
-                    return unknown_ors(format!("Watchdog admission file unavailable: {error}"));
-                }
-            };
-        let supervision_file_lease =
-            match eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
-                &lease_path,
-            ) {
-                Ok(lease) => lease,
-                Err(error) => {
-                    return unknown_ors(format!("supervision lease file unavailable: {error}"));
-                }
-            };
-        if !eliot_platform_windows::windows_paths_equal(
-            admission_file_lease.path(),
-            &admission_path,
-        ) || !eliot_platform_windows::windows_paths_equal(
-            supervision_file_lease.path(),
-            &lease_path,
-        ) || admission_file_lease.verify_stable_identity().is_err()
-            || admission_file_lease.verify_path_identity().is_err()
-            || supervision_file_lease.verify_stable_identity().is_err()
-            || supervision_file_lease.verify_path_identity().is_err()
-        {
-            return unknown_ors(
-                "Watchdog admission file identity does not match the retained Host paths",
-            );
-        }
-        let admission_bytes = match admission_file_lease.read_bounded(WATCHDOG_ADMISSION_LIMIT) {
-            Ok(bytes) => bytes,
-            Err(error) => return unknown_ors(format!("Watchdog admission read failed: {error}")),
-        };
-        let mut config: RuntimeAdmissionConfig = match serde_json::from_slice(&admission_bytes) {
-            Ok(config) => config,
-            Err(error) => return unknown_ors(format!("Watchdog admission is corrupt: {error}")),
-        };
-        if config.schema != WATCHDOG_ADMISSION_SCHEMA {
-            return unknown_ors("Watchdog admission schema is unsupported");
-        }
-        if config.trust_anchor.validate().is_err() {
-            return unknown_ors("Watchdog admission trust anchor is invalid");
-        }
-        let mut shape_context = config.context.clone();
-        shape_context.now_ms = 1;
-        if shape_context.validate().is_err() {
-            return unknown_ors("Watchdog admission verification context is invalid");
-        }
-        let expected_installation = manifest
-            .runtime_launch
-            .installation_epoch
-            .installation
-            .as_str();
-        if config.installation_id != expected_installation
-            || config.trust_anchor.installation_id != expected_installation
-        {
-            return unknown_ors("Watchdog admission installation identity is not manifest-bound");
-        }
-        if config.approved_generation != manifest.generation.as_str() {
-            return unknown_ors(
-                "Watchdog admission generation is not the active manifest generation",
-            );
-        }
-        if !is_sha256_hex(manifest.config_digest.as_str())
-            || sha256_hex(&admission_bytes) != manifest.config_digest.as_str()
-        {
-            return unknown_ors(
-                "Watchdog admission bytes do not match the active manifest config digest",
-            );
-        }
-        let expected_fingerprint = manifest.supervision_key_fingerprint.as_str();
-        if config.trust_anchor.public_key_fingerprint() != expected_fingerprint
-            || config.context.public_key_fingerprint != expected_fingerprint
-        {
-            return unknown_ors(
-                "Watchdog admission trust fingerprint is not the active manifest fingerprint",
-            );
-        }
         let now_ms = match current_unix_ms() {
             Ok(value) => value,
             Err(error) => {
@@ -4120,65 +4217,33 @@ fn inspect_ors_retained(
                 ));
             }
         };
-        config.context.now_ms = now_ms;
-        if let Err(error) = config.context.validate() {
-            return unknown_ors(format!(
-                "current ORS verification context is invalid: {error}"
-            ));
-        }
-        let supervision_bytes = match supervision_file_lease.read_bounded(SUPERVISION_LEASE_LIMIT) {
-            Ok(bytes) => bytes,
-            Err(error) => return unknown_ors(format!("supervision lease read failed: {error}")),
-        };
-        let envelope: SignedSupervisionLease = match serde_json::from_slice(&supervision_bytes) {
-            Ok(envelope) => envelope,
-            Err(error) => return unknown_ors(format!("supervision lease is corrupt: {error}")),
-        };
-        if let Err(error) = config.trust_anchor.verify(&envelope, &config.context) {
-            return unknown_ors(format!("supervision lease verification failed: {error}"));
-        }
+        let bundle =
+            match verify_host_supervision_bundle(canonical_path, manifest, now_ms, deadline) {
+                Ok(bundle) => bundle,
+                Err(error) => return unknown_ors(error),
+            };
         if Instant::now() >= deadline {
             return unknown_ors("deadline exceeded before authoritative ORS status observation");
         }
-        let database = match eliot_ors::open_existing_read_only(ors_file_lease.path()) {
-            Ok(database) => database,
-            Err(error) => {
-                return unknown_ors(format!("manifest-bound ORS database open failed: {error}"));
-            }
-        };
-        let read = match database.begin_read() {
-            Ok(read) => read,
-            Err(error) => return unknown_ors(format!("manifest-bound ORS read failed: {error}")),
-        };
-        drop(read);
         let projection = match eliot_ors::observe_supervision_status(
             ors_file_lease.path(),
-            &config.trust_anchor,
-            &config.context,
+            &bundle.trust_anchor,
+            &bundle.context,
         ) {
             Ok(projection) => projection,
             Err(error) => {
                 return unknown_ors(format!("authoritative ORS status unavailable: {error}"));
             }
         };
-        if retained_root.verify_stable_identity().is_err()
+        if projection.current.as_ref() != Some(&bundle.current)
+            || retained_root.verify_stable_identity().is_err()
             || ors_root_lease.verify_stable_identity().is_err()
             || ors_file_lease.verify_stable_identity().is_err()
             || ors_file_lease.verify_path_identity().is_err()
-            || admission_file_lease.verify_stable_identity().is_err()
-            || admission_file_lease.verify_path_identity().is_err()
-            || supervision_file_lease.verify_stable_identity().is_err()
-            || supervision_file_lease.verify_path_identity().is_err()
         {
             return unknown_ors("a retained ORS/admission identity changed during observation");
         }
-        let _keep_leases = (
-            ors_root_lease,
-            ors_file_lease,
-            admission_file_lease,
-            supervision_file_lease,
-            database,
-        );
+        let _keep_leases = (ors_root_lease, ors_file_lease);
         let state = if projection.health == HealthDimension::Healthy {
             ComponentState::Healthy
         } else {
@@ -4768,6 +4833,47 @@ mod honest_tests {
         fixture_handle(root.join(name).to_string_lossy().into_owned())
     }
 
+    fn fixture_provisioned_supervision_authority(
+        installation_id: &str,
+        candidate_generation: &str,
+    ) -> eliot_runtime_contracts::ProvisionedSupervisionAuthority {
+        use eliot_runtime_contracts::SupervisionLeaseSigner as _;
+
+        let signer = eliot_runtime_contracts::Ed25519SupervisionLeaseSigner::from_secret_key(
+            "eliot-kernel",
+            "test-supervision-key",
+            [0x39; 32],
+        )
+        .expect("test supervision signer");
+        let trust_anchor = eliot_runtime_contracts::SupervisionTrustAnchor::new(
+            installation_id,
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .expect("test supervision anchor");
+        let key_reference = eliot_runtime_contracts::SupervisionSealedKeyReference::new(
+            "test-supervision-authority.sealed",
+            "S-1-5-80-1-2-3-4-5",
+            eliot_runtime_contracts::SupervisionSealedKeyFileIdentity {
+                canonical_path_digest: "1".repeat(64),
+                volume_serial_number: 7,
+                file_index: 11,
+                security_descriptor_digest: "2".repeat(64),
+            },
+            "3".repeat(64),
+        )
+        .expect("test sealed key reference");
+        eliot_runtime_contracts::ProvisionedSupervisionAuthority::new(
+            "test-supervision-lease",
+            candidate_generation,
+            eliot_installation::ResourceGeneration::genesis(),
+            key_reference,
+            trust_anchor,
+        )
+        .expect("test provisioned supervision authority")
+    }
+
     // This fixture deliberately materializes the complete immutable installer
     // contour so projection tests exercise the production wire shape.
     #[allow(clippy::too_many_lines)]
@@ -4798,8 +4904,11 @@ mod honest_tests {
                 eliot_installation::AuthorityEpoch::genesis(),
                 eliot_installation::ResourceGeneration::genesis(),
             ),
-            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
-                supervision_lease_id: fixture_handle("test-supervision-lease"),
+            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Provisioned {
+                authority: fixture_provisioned_supervision_authority(
+                    installation_epoch.installation.as_str(),
+                    generation.as_str(),
+                ),
             },
             authority_descriptor_path: fixture_path(&portable_root, "authority.json"),
             authority_descriptor_digest: fixture_handle("7".repeat(64)),
