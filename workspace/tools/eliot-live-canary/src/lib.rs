@@ -29,6 +29,7 @@ pub const DEFAULT_DEADLINE_MS: u64 = 30_000;
 pub const MAX_DEADLINE_MS: u64 = 120_000;
 const MAX_EVIDENCE_BYTES: usize = 128 * 1024;
 const JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
+const PULSE_FIVE_CLEANUP_GRACE_MS: u64 = 30_000;
 pub const HOST_RUNTIME_CONTROL_PIPE: &str = r"\\.\pipe\eliot\host\runtime-control-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -360,7 +361,11 @@ impl ProductionCanary {
         let pulse = self.config.pulse;
         let root = self.config.host_state_root.clone();
         let deadline = Instant::now() + self.config.deadline;
-        let result = tokio::time::timeout(self.config.deadline, self.run_bounded(deadline)).await;
+        let result = tokio::time::timeout(
+            canary_outer_timeout(pulse, self.config.deadline),
+            self.run_bounded(deadline),
+        )
+        .await;
         match result {
             Ok(disposition) => disposition,
             Err(_) => PulseDisposition::FailClosed(FailedPulse {
@@ -743,6 +748,16 @@ impl ProductionCanary {
     }
 }
 
+fn canary_outer_timeout(pulse: Pulse, operational_deadline: Duration) -> Duration {
+    if pulse == Pulse::Five {
+        operational_deadline
+            .checked_add(Duration::from_millis(PULSE_FIVE_CLEANUP_GRACE_MS))
+            .unwrap_or(Duration::MAX)
+    } else {
+        operational_deadline
+    }
+}
+
 fn service_registration_is_exact(
     registration: &eliot_runtime_status::ServiceRegistrationState,
 ) -> bool {
@@ -904,6 +919,9 @@ fn require_pulse_five_baseline(
         || contour.kernel_state.as_deref() != Some("Active")
         || contour.kernel.is_none()
         || contour.store.is_none()
+        || contour.store_generation.is_none()
+        || contour.store_fence.is_none()
+        || contour.store_request_digest.is_none()
         || contour.kernel_activation_nonce_digest.is_none()
         || contour.ready_receipt_digest.is_none()
         || contour.readiness_observation_digest.is_none()
@@ -1000,6 +1018,7 @@ struct PulseFiveResult {
 struct PulseFiveMutationLedger {
     stop_calls: u8,
     start_calls: u8,
+    stopped_readback_proven: bool,
     stopped_clean_proven: bool,
     owner_released_proven: bool,
 }
@@ -1015,10 +1034,22 @@ impl PulseFiveMutationLedger {
     }
 
     fn record_stopped_clean(&mut self) -> Result<(), String> {
-        if self.stop_calls != 1 || self.start_calls != 0 || self.stopped_clean_proven {
+        if self.stop_calls != 1
+            || self.start_calls != 0
+            || !self.stopped_readback_proven
+            || self.stopped_clean_proven
+        {
             return Err("StoppedClean proof is out of order or duplicated".to_owned());
         }
         self.stopped_clean_proven = true;
+        Ok(())
+    }
+
+    fn record_stopped_readback(&mut self) -> Result<(), String> {
+        if self.stop_calls != 1 || self.start_calls != 0 || self.stopped_readback_proven {
+            return Err("definitive Stopped readback is out of order or duplicated".to_owned());
+        }
+        self.stopped_readback_proven = true;
         Ok(())
     }
 
@@ -1030,15 +1061,20 @@ impl PulseFiveMutationLedger {
         Ok(())
     }
 
-    fn start_once<T>(&mut self, effect: impl FnOnce() -> T) -> Result<T, String> {
+    fn start_once<T>(
+        &mut self,
+        cleanup_after_proof_error: bool,
+        effect: impl FnOnce() -> T,
+    ) -> Result<T, String> {
         if self.stop_calls != 1
             || self.start_calls != 0
-            || !self.stopped_clean_proven
-            || !self.owner_released_proven
+            || !self.stopped_readback_proven
+            || (!cleanup_after_proof_error
+                && (!self.stopped_clean_proven || !self.owner_released_proven))
         {
             return Err(
-                "Pulse 5 permits one Host start only after StoppedClean and owner release"
-                    .to_owned(),
+                "Pulse 5 permits one Host start only after definitive Stopped readback; PASS also requires StoppedClean and owner release"
+                    .to_owned()
             );
         }
         self.start_calls = 1;
@@ -1046,12 +1082,76 @@ impl PulseFiveMutationLedger {
     }
 
     fn validate_complete(&self) -> Result<(), String> {
-        if self.stop_calls == 1 && self.start_calls == 1 {
+        if self.stop_calls == 1
+            && self.start_calls == 1
+            && self.stopped_readback_proven
+            && self.stopped_clean_proven
+            && self.owner_released_proven
+        {
             Ok(())
         } else {
             Err("Pulse 5 did not execute exactly one Host stop and one Host start".to_owned())
         }
     }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PulseFiveStartAttempt {
+    Started,
+    AlreadyRunning,
+    AlreadyStarting,
+    EffectUnknown,
+    Failed(String),
+}
+
+#[cfg(windows)]
+impl PulseFiveStartAttempt {
+    const fn is_owned_start(&self) -> bool {
+        matches!(self, Self::Started)
+    }
+
+    fn description(&self) -> &str {
+        match self {
+            Self::Started => "Started",
+            Self::AlreadyRunning => "AlreadyRunning",
+            Self::AlreadyStarting => "AlreadyStarting",
+            Self::EffectUnknown => "EffectUnknown",
+            Self::Failed(error) => error,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn resolve_post_stop_reconcile<T, O>(
+    stopped_proof: Result<T, String>,
+    start_attempt: &PulseFiveStartAttempt,
+    host_after: Result<O, String>,
+) -> Result<(T, O), String> {
+    let proof = match stopped_proof {
+        Ok(proof) => proof,
+        Err(proof_error) => {
+            let cleanup = match host_after {
+                Ok(_) => "exact EliotHost registration reconciled to Running".to_owned(),
+                Err(error) => format!("EliotHost Running cleanup failed: {error}"),
+            };
+            return Err(format!(
+                "{proof_error}; post-Stop cleanup outcome {}: {cleanup}; start was not resent",
+                start_attempt.description()
+            ));
+        }
+    };
+    if !start_attempt.is_owned_start() {
+        let reconciliation = match host_after {
+            Ok(_) => "exact EliotHost registration reconciled to Running".to_owned(),
+            Err(error) => format!("EliotHost Running reconciliation failed: {error}"),
+        };
+        return Err(format!(
+            "Pulse 5 did not own the exact Host start ({}); {reconciliation}; start was not resent",
+            start_attempt.description()
+        ));
+    }
+    host_after.map(|host| (proof, host))
 }
 
 #[cfg(windows)]
@@ -1329,6 +1429,35 @@ async fn wait_for_host_state(
 }
 
 #[cfg(windows)]
+async fn reconcile_host_running_after_start(
+    authority: &PulseFiveAuthority,
+    deadline: Instant,
+) -> Result<eliot_platform_windows::ServiceRuntimeObservation, String> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err("deadline exceeded while reconciling EliotHost Running cleanup".to_owned());
+        }
+        let host = inspect_exact_scm(authority, &authority.host_request, "EliotHost")?;
+        if host.is_running() {
+            if host.process().is_none() || host.runtime_identity_digest().is_none() {
+                return Err("Running EliotHost lacks exact runtime identity".to_owned());
+            }
+            return Ok(host);
+        }
+        if !host.is_starting() {
+            return Err(format!(
+                "EliotHost entered unexpected SCM state {} during Running cleanup",
+                scm_state_name(&host)
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait =
+            Duration::from_millis(u64::from(host.wait_hint_ms()).clamp(50, 500)).min(remaining);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+#[cfg(windows)]
 fn validate_stopped_boundary(
     before: &ContourSnapshot,
     state: &HostState,
@@ -1414,9 +1543,22 @@ fn validate_fresh_pulse_five_contour(
     after: &RuntimeObservation,
     scm: &PulseFiveScmEvidence,
 ) -> Result<(), String> {
+    validate_runtime_live_contour(&before.report)?;
     validate_runtime_live_contour(&after.report)?;
     let old = &before.contour;
     let new = &after.contour;
+    if before.report.active_generation.as_deref() != Some(scm.approved_generation.as_str())
+        || after.report.active_generation != before.report.active_generation
+        || !eliot_platform_windows::windows_paths_equal(
+            Path::new(&before.report.host_state_root),
+            Path::new(&after.report.host_state_root),
+        )
+    {
+        return Err(
+            "post-start Store status is not bound to the same approved generation/config/root"
+                .to_owned(),
+        );
+    }
     if new.host_epoch_lineage != old.host_epoch_lineage
         || old.host_epoch_sequence.checked_add(1) != Some(new.host_epoch_sequence)
         || new.host_epoch_parent_lineage.as_deref() != Some(old.host_epoch_lineage.as_str())
@@ -1444,6 +1586,54 @@ fn validate_fresh_pulse_five_contour(
     {
         return Err(
             "post-start Host/Kernel contour is not exact Active after StoppedClean".to_owned(),
+        );
+    }
+    let old_store = old
+        .store
+        .as_ref()
+        .ok_or_else(|| "baseline Store process/Job evidence is absent".to_owned())?;
+    let new_store = new
+        .store
+        .as_ref()
+        .ok_or_else(|| "post-start Store process/Job evidence is absent".to_owned())?;
+    if (new_store.process_id, new_store.start_time_100ns)
+        == (old_store.process_id, old_store.start_time_100ns)
+        || new_store.job_name == old_store.job_name
+    {
+        return Err("post-start Store reused the predecessor process or Job authority".to_owned());
+    }
+    if !eliot_platform_windows::windows_paths_equal(
+        Path::new(&old_store.image_path),
+        Path::new(&new_store.image_path),
+    ) {
+        return Err("post-start Store changed the approved executable path".to_owned());
+    }
+    let old_store_generation = old
+        .store_generation
+        .as_deref()
+        .ok_or_else(|| "baseline StoreRebind generation is absent".to_owned())?
+        .parse::<u64>()
+        .map_err(|_| "baseline StoreRebind generation is not an integer".to_owned())?;
+    let new_store_generation = new
+        .store_generation
+        .as_deref()
+        .ok_or_else(|| "post-start StoreRebind generation is absent".to_owned())?
+        .parse::<u64>()
+        .map_err(|_| "post-start StoreRebind generation is not an integer".to_owned())?;
+    if new_store_generation <= old_store_generation
+        || new.store_fence.as_ref().is_none_or(|fence| {
+            old.store_fence
+                .as_ref()
+                .is_some_and(|old_fence| old_fence == fence)
+        })
+        || new.store_request_digest.as_ref().is_none_or(|request| {
+            old.store_request_digest
+                .as_ref()
+                .is_some_and(|old_request| old_request == request)
+        })
+    {
+        return Err(
+            "post-start Store did not produce a causally fresh generation/fence/request".to_owned(),
         );
     }
     let old_supervision = before
@@ -1601,13 +1791,15 @@ async fn run_windows_pulse_five(
         }
     }
     let host_stopped = wait_for_host_state(&authority, false, &watchdog_before, deadline).await?;
-    let watchdog_stopped =
-        require_running_scm(&authority, &authority.watchdog_request, "EliotWatchdog")?;
-    require_same_watchdog(&watchdog_before, &watchdog_stopped)?;
+    mutations.record_stopped_readback()?;
     let stopped_proof = (|| {
+        let watchdog_stopped =
+            require_running_scm(&authority, &authority.watchdog_request, "EliotWatchdog")?;
+        require_same_watchdog(&watchdog_before, &watchdog_stopped)?;
         let (stopped_state, stop_boundary, _) =
             inspect_journal_contour(root).map_err(|error| error.to_string())?;
         validate_stopped_boundary(&before.contour, &stopped_state, &stop_boundary)?;
+        mutations.record_stopped_clean()?;
         let stopped_status = collect_status(root, deadline)
             .map_err(|error| format!("read stopped runtime status: {error}"))?;
         if !root_matches_report(root, &stopped_status)
@@ -1626,32 +1818,58 @@ async fn run_windows_pulse_five(
         }
         let stopped_status_digest =
             digest_json(&stopped_status).map_err(|error| error.to_string())?;
-        Ok::<_, String>((stop_boundary, stopped_status.status, stopped_status_digest))
+        let owner_release_digest = prove_owner_released(&authority.installation_id)?;
+        mutations.record_owner_released()?;
+        Ok::<_, String>((
+            stop_boundary,
+            stopped_status.status,
+            stopped_status_digest,
+            owner_release_digest,
+            watchdog_stopped,
+        ))
     })();
-    let (stop_boundary, stopped_runtime_status, stopped_status_digest) = stopped_proof?;
-    mutations.record_stopped_clean()?;
-    let owner_release_digest = prove_owner_released(&authority.installation_id)?;
-    mutations.record_owner_released()?;
-    match mutations
-        .start_once(|| {
-            authority
-                .platform
-                .start_service_registration(&authority.host_request)
-        })?
-        .map_err(|error| format!("Host start failed before classification: {error}"))?
-    {
-        eliot_platform_windows::ServiceStartOutcome::Started { .. } => {}
-        eliot_platform_windows::ServiceStartOutcome::AlreadyRunning { .. } => {
-            return Err("Host was already Running; Pulse 5 did not own a start".to_owned());
+    let cleanup_after_proof_error = stopped_proof.is_err();
+    let start_attempt = mutations.start_once(cleanup_after_proof_error, || {
+        match authority
+            .platform
+            .start_service_registration(&authority.host_request)
+        {
+            Ok(eliot_platform_windows::ServiceStartOutcome::Started { .. }) => {
+                PulseFiveStartAttempt::Started
+            }
+            Ok(eliot_platform_windows::ServiceStartOutcome::AlreadyRunning { .. }) => {
+                PulseFiveStartAttempt::AlreadyRunning
+            }
+            Ok(eliot_platform_windows::ServiceStartOutcome::AlreadyStarting { .. }) => {
+                PulseFiveStartAttempt::AlreadyStarting
+            }
+            Ok(eliot_platform_windows::ServiceStartOutcome::EffectUnknown) => {
+                PulseFiveStartAttempt::EffectUnknown
+            }
+            Err(error) => PulseFiveStartAttempt::Failed(format!(
+                "Host start failed before authoritative classification: {error}"
+            )),
         }
-        eliot_platform_windows::ServiceStartOutcome::AlreadyStarting { .. } => {
-            return Err("Host was already Starting; Pulse 5 did not own a start".to_owned());
-        }
-        eliot_platform_windows::ServiceStartOutcome::EffectUnknown => {
-            return Err("Host start outcome is Unknown; start is not resent".to_owned());
-        }
-    }
-    let host_after = wait_for_host_state(&authority, true, &watchdog_before, deadline).await?;
+    })?;
+    let reconcile_deadline = deadline.max(
+        Instant::now()
+            .checked_add(Duration::from_millis(PULSE_FIVE_CLEANUP_GRACE_MS))
+            .unwrap_or(deadline),
+    );
+    // This read-only reconciliation runs for every classified/unknown start
+    // outcome. The approved start effect above is never resent.
+    let host_after_result =
+        reconcile_host_running_after_start(&authority, reconcile_deadline).await;
+    let (
+        (
+            stop_boundary,
+            stopped_runtime_status,
+            stopped_status_digest,
+            owner_release_digest,
+            watchdog_stopped,
+        ),
+        host_after,
+    ) = resolve_post_stop_reconcile(stopped_proof, &start_attempt, host_after_result)?;
     let watchdog_after =
         require_running_scm(&authority, &authority.watchdog_request, "EliotWatchdog")?;
     require_same_watchdog(&watchdog_before, &watchdog_after)?;
@@ -2726,6 +2944,10 @@ mod tests {
         after.contour.kernel_generation = Some("kernel-lineage:4".to_owned());
         after.contour.kernel_generation_digest = Some(digest_bytes(b"kernel-after"));
         after.contour.kernel_activation_nonce_digest = Some(digest_bytes(b"kernel-nonce-after"));
+        after.contour.store = Some(process(21, 300, "store.exe", "store-job-after"));
+        after.contour.store_generation = Some("4".to_owned());
+        after.contour.store_fence = Some("3".repeat(64));
+        after.contour.store_request_digest = Some("4".repeat(64));
         after.contour.ready_receipt_digest = Some("1".repeat(64));
         after.contour.readiness_observation_digest = Some("2".repeat(64));
 
@@ -2758,7 +2980,7 @@ mod tests {
             Some((200, 500, r"C:\Program Files\Eliot\eliot-watchdog.exe")),
         );
         let scm = PulseFiveScmEvidence {
-            approved_generation: "generation-pulse-five".to_owned(),
+            approved_generation: "g".to_owned(),
             host_before,
             host_stopped,
             host_after,
@@ -2777,27 +2999,112 @@ mod tests {
     fn pulse_five_exact_one_stop_and_one_start_are_ordered_after_durable_fences() {
         let mut ledger = PulseFiveMutationLedger::default();
         let mut effects = Vec::new();
-        assert!(ledger.start_once(|| effects.push("start-early")).is_err());
+        assert!(
+            ledger
+                .start_once(false, || effects.push("start-early"))
+                .is_err()
+        );
         assert!(effects.is_empty());
         ledger
             .stop_once(|| effects.push("stop"))
             .unwrap_or_else(|_| unreachable!());
         assert!(ledger.stop_once(|| effects.push("stop-again")).is_err());
         assert_eq!(effects, vec!["stop"]);
-        assert!(ledger.start_once(|| effects.push("start-early")).is_err());
+        assert!(
+            ledger
+                .start_once(false, || effects.push("start-early"))
+                .is_err()
+        );
+        ledger
+            .record_stopped_readback()
+            .unwrap_or_else(|_| unreachable!());
+        assert!(
+            ledger
+                .start_once(false, || effects.push("start-early"))
+                .is_err()
+        );
         ledger
             .record_stopped_clean()
             .unwrap_or_else(|_| unreachable!());
-        assert!(ledger.start_once(|| effects.push("start-early")).is_err());
+        assert!(
+            ledger
+                .start_once(false, || effects.push("start-early"))
+                .is_err()
+        );
         ledger
             .record_owner_released()
             .unwrap_or_else(|_| unreachable!());
         ledger
-            .start_once(|| effects.push("start"))
+            .start_once(false, || effects.push("start"))
             .unwrap_or_else(|_| unreachable!());
-        assert!(ledger.start_once(|| effects.push("start-again")).is_err());
+        assert!(
+            ledger
+                .start_once(false, || effects.push("start-again"))
+                .is_err()
+        );
         assert_eq!(effects, vec!["stop", "start"]);
         assert!(ledger.validate_complete().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pulse_five_post_stop_proof_error_still_attempts_exactly_one_start_cleanup() {
+        let mut ledger = PulseFiveMutationLedger::default();
+        let mut starts = 0_u8;
+        ledger.stop_once(|| ()).unwrap_or_else(|_| unreachable!());
+        ledger
+            .record_stopped_readback()
+            .unwrap_or_else(|_| unreachable!());
+        let attempt = ledger
+            .start_once(true, || {
+                starts += 1;
+                PulseFiveStartAttempt::EffectUnknown
+            })
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(attempt, PulseFiveStartAttempt::EffectUnknown);
+        assert_eq!(starts, 1);
+        assert!(ledger.start_once(true, || starts += 1).is_err());
+        assert_eq!(starts, 1);
+        assert!(ledger.validate_complete().is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pulse_five_outer_timeout_preserves_fail_closed_cleanup_after_stopped() {
+        let operational_deadline = Duration::from_millis(5);
+        assert_eq!(
+            canary_outer_timeout(Pulse::Four, operational_deadline),
+            operational_deadline
+        );
+        let result = tokio::time::timeout(
+            canary_outer_timeout(Pulse::Five, operational_deadline),
+            async {
+                let mut ledger = PulseFiveMutationLedger::default();
+                let mut starts = 0_u8;
+                ledger.stop_once(|| ()).unwrap_or_else(|_| unreachable!());
+                ledger
+                    .record_stopped_readback()
+                    .unwrap_or_else(|_| unreachable!());
+                tokio::time::sleep(operational_deadline + Duration::from_millis(5)).await;
+                let attempt = ledger
+                    .start_once(true, || {
+                        starts += 1;
+                        PulseFiveStartAttempt::Started
+                    })
+                    .unwrap_or_else(|_| unreachable!());
+                let disposition = resolve_post_stop_reconcile::<(), ()>(
+                    Err("post-Stop proof deadline exceeded".to_owned()),
+                    &attempt,
+                    Ok(()),
+                );
+                (starts, ledger.start_calls, disposition)
+            },
+        )
+        .await
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(result.0, 1);
+        assert_eq!(result.1, 1);
+        assert!(result.2.is_err());
     }
 
     #[cfg(windows)]
@@ -2809,7 +3116,12 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once("fn new_request"))
             .map_or("", |(body, _)| body);
         assert_eq!(production.matches(".stop_once(||").count(), 1);
-        assert_eq!(production.matches(".start_once(||").count(), 1);
+        assert_eq!(
+            production
+                .matches(".start_once(cleanup_after_proof_error, ||")
+                .count(),
+            1
+        );
         assert_eq!(
             production
                 .matches(".stop_service_registration(&stop_request)")
@@ -2823,6 +3135,8 @@ mod tests {
             1
         );
         assert!(production.contains("EffectUnknown =>"));
+        assert!(production.contains("reconcile_host_running_after_start"));
+        assert!(production.contains("resolve_post_stop_reconcile("));
         assert!(!production.contains("ServiceOperation::Stop"));
         assert!(!production.contains("ServiceOperation::Start"));
     }
@@ -2875,6 +3189,92 @@ mod tests {
         let mut stale_eliotd = after;
         stale_eliotd.dynamic_supervision = before.dynamic_supervision.clone();
         assert!(validate_fresh_pulse_five_contour(&before, &stopped, &stale_eliotd, &scm).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pulse_five_rejects_stale_store_process_job_rebind_and_status_substitution() {
+        let (before, stopped, after, scm) = pulse_five_fixture();
+
+        let old_store = before
+            .contour
+            .store
+            .as_ref()
+            .unwrap_or_else(|| unreachable!());
+        let mut stale_process = after.clone();
+        let stale_process_snapshot = stale_process
+            .contour
+            .store
+            .as_mut()
+            .unwrap_or_else(|| unreachable!());
+        stale_process_snapshot.process_id = old_store.process_id;
+        stale_process_snapshot.start_time_100ns = old_store.start_time_100ns;
+        assert!(
+            validate_fresh_pulse_five_contour(&before, &stopped, &stale_process, &scm).is_err()
+        );
+
+        let mut stale_generation = after.clone();
+        stale_generation
+            .contour
+            .store_generation
+            .clone_from(&before.contour.store_generation);
+        assert!(
+            validate_fresh_pulse_five_contour(&before, &stopped, &stale_generation, &scm).is_err()
+        );
+
+        let mut stale_fence = after.clone();
+        stale_fence
+            .contour
+            .store_fence
+            .clone_from(&before.contour.store_fence);
+        assert!(validate_fresh_pulse_five_contour(&before, &stopped, &stale_fence, &scm).is_err());
+
+        let mut stale_request = after.clone();
+        stale_request
+            .contour
+            .store_request_digest
+            .clone_from(&before.contour.store_request_digest);
+        assert!(
+            validate_fresh_pulse_five_contour(&before, &stopped, &stale_request, &scm).is_err()
+        );
+
+        let mut stale_job = after.clone();
+        stale_job
+            .contour
+            .store
+            .as_mut()
+            .unwrap_or_else(|| unreachable!())
+            .job_name
+            .clone_from(
+                &before
+                    .contour
+                    .store
+                    .as_ref()
+                    .unwrap_or_else(|| unreachable!())
+                    .job_name,
+            );
+        assert!(validate_fresh_pulse_five_contour(&before, &stopped, &stale_job, &scm).is_err());
+
+        let mut foreign_image = after.clone();
+        foreign_image
+            .contour
+            .store
+            .as_mut()
+            .unwrap_or_else(|| unreachable!())
+            .image_path = r"C:\foreign\store.exe".to_owned();
+        assert!(
+            validate_fresh_pulse_five_contour(&before, &stopped, &foreign_image, &scm).is_err()
+        );
+
+        let mut foreign_root = after.clone();
+        foreign_root.report.host_state_root = r"C:\foreign\runtime".to_owned();
+        assert!(validate_fresh_pulse_five_contour(&before, &stopped, &foreign_root, &scm).is_err());
+
+        let mut foreign_approval = after;
+        foreign_approval.report.active_generation = Some("foreign-generation".to_owned());
+        assert!(
+            validate_fresh_pulse_five_contour(&before, &stopped, &foreign_approval, &scm).is_err()
+        );
     }
 
     fn kernel_receipt(
