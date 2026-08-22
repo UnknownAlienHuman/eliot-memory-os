@@ -18,7 +18,7 @@
 | Kernel and eliotd | `bins/eliot-kernel`, `bins/eliotd`, `crates/kernel/eliot-kernel-service` | Durable activation, physical process authority, supervision signing/reconciliation and authenticated ProbeReady are integrated. |
 | Store | `bins/eliot-store-surreal`, `crates/storage/eliot-store-surreal-adapter` | Canonical runtime roots, provider process/socket identity and recovery contour are integrated. |
 | Watchdog and runtime status | `bins/eliot-watchdog`, `workspace/tools/eliot-runtime-status` | Installer-owned registration, verified ORS/publication consumption and fail-closed status projection are integrated. |
-| Live canary | `workspace/tools/eliot-live-canary` | Source paths for Pulses 1–5 are integrated. Pulse 5 requires a fresh Store/Host/Kernel/readiness/supervision contour and owns bounded post-Stop cleanup. No live machine evidence exists yet. |
+| Live canary | `bins/eliot`, `workspace/tools/eliot-live-canary` | Source paths for Pulses 1–5 and the canonical manifest-bound `eliot runtime canary` entrypoint are integrated. Production evidence is marker-last and bound to the retained active registry, manifest, fence, Phase-B receipt and protected evidence-root identity. No live machine evidence exists yet. |
 
 ## Integrated milestone lineage
 
@@ -32,11 +32,13 @@
 - `facc3c0` — Pulse 5 fresh Store proof and stop-owned single-start reconciliation correction.
 - `7faacee` — Pulse 5 installer-approved Store executable/materialized-config attestation with production-reachable static authority generation.
 - `7cc1730` — read-only runtime leases for Store attestation; canary never repairs or rewrites ACLs.
+- `4c2b7c7` — production `eliot runtime canary`, exact active-manifest evidence root, retained Host/evidence object identity and marker-last authoritative completion.
 
 ## Verified in focused source gates
 
 - Pulse 5 foundation: all-target check; canary 14/14; Host-state 104/104; focused Windows enabled-Administrators read-only test; formatting/diff; touched-crate no-deps Clippy.
 - Final Pulse 5 correction: canary all-target check; 21/21 tests; strict no-deps Clippy; formatting and diff checks. Independent source audits accepted static-generation reachability, same-path binary/config substitution rejection, read-only ACL behavior and single-start cleanup.
+- Production canary invocation: `eliot` bin 23/23; `eliot-live-canary` 23/23; all-target `eliot` check; strict no-deps Clippy; formatting/diff. Independent audit rejected the first publication ordering, then accepted the corrected marker-last and exact snapshot-to-retained-handle identity chain.
 - First-install roots: focused all-target checks; 12 Windows installer-root primitive tests; SystemService planner test; v18-to-v19 migration test; formatting/diff.
 - Earlier integrated milestones carry their own focused test and strict lint evidence in Git history.
 
@@ -44,15 +46,11 @@ These checks prove source behavior only. They do not prove live service installa
 
 ## Mandatory remaining work
 
-### Production canary invocation and evidence
-
-`eliot-live-canary` is currently a workspace binary. Publish one canonical operator invocation, preferably through the already shipped `eliot.exe` CLI, without adding a tenth runtime role to the exact nine-role generation bundle.
-
-Bind evidence output to `RuntimeStateRoots::canary_evidence_root()` from the active manifest and retain/verify the protected root. Do not accept an arbitrary caller-provided directory as production authority.
-
 ### Signed runtime bundle
 
-The release pipeline intentionally emits unsigned binaries, while the source-bundle materializer correctly requires `AuthenticodeVerdict::Valid` for runtime executables. No usable code-signing certificate with private key was observed in the machine certificate stores during this run. Do not weaken Authenticode. A signed and timestamped exact bundle, or an explicitly approved development-signing trust setup, is required before Pulse 1.
+The release pipeline intentionally emits unsigned binaries, while the source-bundle materializer correctly requires `AuthenticodeVerdict::Valid` for all six runtime executables. No certificate combining a Code Signing EKU with `HasPrivateKey=true` was found in `Cert:\CurrentUser\My` or `Cert:\LocalMachine\My`. `signtool.exe` is installed at `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe`, but the repository has no approved signer selection, RFC3161 timestamp endpoint or signed-manifest finalization/readback command. The current release script explicitly emits `signed=false` and `signature_evidence=not-issued`.
+
+Do not weaken Authenticode or invent a self-signed production trust root. The next source slice is an exact fail-closed signing/finalization procedure; the next external prerequisite is a trusted OV/EV code-signing identity with an available private key and approved RFC3161 service. A signed and independently verified exact bundle is required before Pulse 1.
 
 ### Live Windows evidence
 
@@ -73,4 +71,4 @@ The remaining unique non-ancestor tips are not classified as garbage. Recompute 
 
 ## Exact restart point
 
-Resume from `origin/codex/runtime-live-v3-integration-staging`. Wire the canonical manifest-bound canary invocation/evidence root through `eliot.exe`, then complete the signed-bundle decision. Only after those source gates pass should live Pulses 1–5 begin.
+Resume from `origin/codex/runtime-live-v3-integration-staging`. The canonical manifest-bound `eliot runtime canary` source seam is complete. Implement and verify the fail-closed signed-bundle finalization procedure, obtain the approved external signing/timestamp authority, and only then begin the elevated disposable installation and live Pulses 1–5.
