@@ -190,6 +190,20 @@ impl SurrealServerSupervisor {
         Self { config }
     }
 
+    /// Rejects the reserved runtime-live store identity before any operation
+    /// can read credentials, touch runtime files, connect, or manage a
+    /// process. All effectful supervisor entrypoints share this admission
+    /// check so policy cannot be bypassed by a lifecycle helper.
+    pub fn validate_admission(&self) -> Result<(), StoreError> {
+        self.config
+            .reject_store_collision(
+                RUNTIME_LIVE_STORE_BIND,
+                RUNTIME_LIVE_STORE_ENDPOINT,
+                RUNTIME_LIVE_STORE_NAMESPACE,
+            )
+            .map_err(|error| StoreError::PolicyViolation(error.to_string()))
+    }
+
     /// Resolves an explicit path or a bare executable name through the current
     /// process `PATH`. The resolved absolute executable is passed to the child
     /// after its environment is cleared, so runtime lookup never depends on the
@@ -200,13 +214,7 @@ impl SurrealServerSupervisor {
     }
 
     pub async fn start_or_connect(&self) -> Result<ReadySurrealServer, StoreError> {
-        self.config
-            .reject_store_collision(
-                RUNTIME_LIVE_STORE_BIND,
-                RUNTIME_LIVE_STORE_ENDPOINT,
-                RUNTIME_LIVE_STORE_NAMESPACE,
-            )
-            .map_err(|error| StoreError::PolicyViolation(error.to_string()))?;
+        self.validate_admission()?;
         self.executable_path()?;
 
         let existing_password = self.read_existing_password()?;
@@ -261,6 +269,7 @@ impl SurrealServerSupervisor {
         &self,
         bytes: &[u8],
     ) -> Result<Option<String>, StoreError> {
+        self.validate_admission()?;
         let Some(credential) = self.read_existing_password()? else {
             return Ok(None);
         };
@@ -288,6 +297,7 @@ impl SurrealServerSupervisor {
     pub async fn rotate_legacy_credential_to_windows(
         &self,
     ) -> Result<CredentialRotationReport, StoreError> {
+        self.validate_admission()?;
         if self.config.credential_provider != CredentialProviderKind::WindowsCredentialManager {
             return Err(StoreError::PolicyViolation(
                 "credential rotation requires the Windows Credential Manager provider".to_owned(),
@@ -345,6 +355,7 @@ impl SurrealServerSupervisor {
     }
 
     pub async fn status(&self) -> Result<bool, StoreError> {
+        self.validate_admission()?;
         let Some(password) = self.read_existing_password()? else {
             return Ok(false);
         };
@@ -352,6 +363,7 @@ impl SurrealServerSupervisor {
     }
 
     pub async fn stop(&self) -> Result<bool, StoreError> {
+        self.validate_admission()?;
         let pid_path = self.pid_path();
         if !pid_path.is_file() {
             return Ok(false);
@@ -633,6 +645,7 @@ impl SurrealServerSupervisor {
         &self,
         connect_timeout_ms: u64,
     ) -> Result<SurrealRpcTransport, StoreError> {
+        self.validate_admission()?;
         let password = self.read_existing_password()?.ok_or_else(|| {
             StoreError::ServerStartFailed(
                 "cannot connect a sibling transport before credentials are initialized".to_owned(),
@@ -1092,6 +1105,7 @@ impl ReadySurrealServer {
     /// Returns an error when the owned process cannot be identified, refuses to
     /// stop, or when pid/lease bookkeeping cannot be updated.
     pub async fn shutdown_if_spawned(mut self) -> Result<SurrealShutdown, StoreError> {
+        self.supervisor.validate_admission()?;
         let mut cleanup_failures = Vec::new();
         if let Err(error) = self.release_client_lease() {
             cleanup_failures.push(format!("client lease release: {error}"));
@@ -1503,6 +1517,48 @@ mod lifecycle_tests {
             );
         };
         assert!(error.to_string().contains("runtime-live"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_runtime_live_config_is_rejected_before_lifecycle_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("lifecycle-collision")?;
+        let mut config = supervisor_for("definitely-not-a-provider", &root).config;
+        config.bind = "127.0.0.1:8000".to_owned();
+        config.endpoint = "ws://127.0.0.1:8000/rpc".to_owned();
+        config.ns = "eliot".to_owned();
+        let pid_path = root.join("tmp").join("surreal.pid");
+        fs::write(&pid_path, "not-a-pid")?;
+        let supervisor = SurrealServerSupervisor::new(config);
+
+        let failures = [
+            ("status", supervisor.status().await.map(|_| ())),
+            ("stop", supervisor.stop().await.map(|_| ())),
+            (
+                "rotation",
+                supervisor
+                    .rotate_legacy_credential_to_windows()
+                    .await
+                    .map(|_| ()),
+            ),
+        ];
+        for (operation, result) in failures {
+            let Err(error) = result else {
+                return Err(
+                    format!("canonical runtime-live {operation} operation was accepted").into(),
+                );
+            };
+            assert!(
+                error.to_string().contains("runtime-live"),
+                "{operation} bypassed the canonical collision guard: {error}"
+            );
+        }
+        assert!(
+            pid_path.is_file(),
+            "collision guard must preserve pid receipt"
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }

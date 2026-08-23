@@ -1656,6 +1656,9 @@ impl WriterWorker {
                 response_tx,
             } => {
                 let write_id = envelope.write_id;
+                if let Err(error) = self.store.validate_admission() {
+                    return finish_memory_response(write_id, response_tx, Err(error.into()));
+                }
                 if let Err(error) = self.validate_cognitive_begin(&precondition).await {
                     return finish_memory_response(write_id, response_tx, Err(error));
                 }
@@ -1682,6 +1685,9 @@ impl WriterWorker {
                 response_tx,
             } => {
                 let write_id = envelope.write_id;
+                if let Err(error) = self.store.validate_admission() {
+                    return finish_memory_response(write_id, response_tx, Err(error.into()));
+                }
                 if let Err(error) = self.validate_cognitive_terminal(&precondition).await {
                     return finish_memory_response(write_id, response_tx, Err(error));
                 }
@@ -2047,6 +2053,7 @@ impl WriterWorker {
                     if pending.envelope.input_hash == envelope.input_hash
                         && pending.envelope.project_id == envelope.project_id =>
                 {
+                    self.store.validate_admission()?;
                     let was_unknown = pending.status == WriteStatus::UnknownCommit;
                     envelope = pending.envelope;
                     already_staged = true;
@@ -2109,6 +2116,8 @@ impl WriterWorker {
                 }
             }
         }
+
+        self.store.validate_admission()?;
 
         if envelope.project_sequence_hint.is_none() {
             envelope.project_sequence_hint =
@@ -2196,6 +2205,7 @@ impl WriterWorker {
         &self,
         envelope: ObservabilityWriteEnvelope,
     ) -> Result<ObservabilityWriteReceipt, EngineError> {
+        self.store.validate_admission()?;
         let boundary_bytes = serde_json::to_vec(&envelope)?;
         if let Err(violation) = eliot_types::inspect_secret_bytes(&boundary_bytes) {
             return Err(EngineError::WriteRejected(format!(
@@ -2448,8 +2458,8 @@ mod tests {
     use eliot_store::{CanonicalStore, ControlWal};
     use eliot_types::{
         AgentId, ControlWalConfig, GovernorConfig, IdempotencyOptions, LifecycleStatus,
-        LifecycleWriteOptions, MemoryWriteEnvelope, OperationId, ProjectId, SemanticCommandKind,
-        TaintClass, Visibility, WriteId,
+        LifecycleWriteOptions, MemoryWriteEnvelope, OperationId, ProjectId, ReceiptId,
+        SemanticCommandKind, TaintClass, Visibility, WriteId, WriteReceipt, WriteStatus,
     };
     use time::OffsetDateTime;
     use tokio::sync::oneshot;
@@ -2551,6 +2561,126 @@ mod tests {
             path: path.display().to_string(),
         })?;
         assert_eq!(wal.pending_count()?, 0);
+        drop(wal);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_collision_is_rejected_before_fresh_wal_staging()
+    -> Result<(), crate::EngineError> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-c5-canonical-collision-{}",
+            WriteId::new_v7()
+        ));
+        let path = root.join("control.redb");
+        let wal = ControlWal::open(&ControlWalConfig {
+            path: path.display().to_string(),
+        })?;
+        let mut surreal = GovernorConfig::default().db.surreal;
+        surreal.exe = root.join("missing-surreal.exe").display().to_string();
+        surreal.bind = "127.0.0.1:8000".to_owned();
+        surreal.endpoint = "ws://127.0.0.1:8000/rpc".to_owned();
+        surreal.ns = "eliot".to_owned();
+        let store = CanonicalStore::new(surreal);
+        let (handle, actor) = super::WriterActor::channel(wal, store, &WriterConfig::default());
+        let actor_task = tokio::spawn(actor.run());
+
+        let Err(error) = handle
+            .submit(envelope(
+                WriteId::new_v7(),
+                ProjectId::new_v7(),
+                "collision",
+            ))
+            .await
+        else {
+            return Err(crate::EngineError::WriteRejected(
+                "canonical runtime-live collision was unexpectedly accepted".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("runtime-live"));
+
+        drop(handle);
+        actor_task.await.map_err(|error| {
+            crate::EngineError::WriteRejected(format!("writer actor join failed: {error}"))
+        })?;
+        let wal = ControlWal::open(&ControlWalConfig {
+            path: path.display().to_string(),
+        })?;
+        assert_eq!(wal.pending_count()?, 0);
+        assert_eq!(wal.committed_count()?, 0);
+        drop(wal);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_collision_preserves_committed_idempotent_replay_and_conflict()
+    -> Result<(), crate::EngineError> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-c5-canonical-replay-collision-{}",
+            WriteId::new_v7()
+        ));
+        let path = root.join("control.redb");
+        let wal = ControlWal::open(&ControlWalConfig {
+            path: path.display().to_string(),
+        })?;
+        let write_id = WriteId::new_v7();
+        let project_id = ProjectId::new_v7();
+        let committed_envelope = envelope(write_id, project_id, "committed-input");
+        let committed_receipt = WriteReceipt {
+            receipt_id: ReceiptId::from_uuid(write_id.as_uuid()),
+            write_id,
+            input_hash: committed_envelope.input_hash.clone(),
+            project_id,
+            task_id: None,
+            command_kind: committed_envelope.command_kind,
+            status: WriteStatus::Committed,
+            memory_revision: None,
+            project_sequence: None,
+            created_records: Vec::new(),
+            created_relations: Vec::new(),
+            weak_records: Vec::new(),
+            rejected_reason: None,
+            db_operation_id: None,
+            created_at: committed_envelope.created_at,
+        };
+        wal.append_pending(&committed_envelope)?;
+        wal.mark_committed(&committed_receipt)?;
+
+        let mut surreal = GovernorConfig::default().db.surreal;
+        surreal.exe = root.join("missing-surreal.exe").display().to_string();
+        surreal.bind = "127.0.0.1:8000".to_owned();
+        surreal.endpoint = "ws://127.0.0.1:8000/rpc".to_owned();
+        surreal.ns = "eliot".to_owned();
+        let store = CanonicalStore::new(surreal);
+        let (handle, actor) = super::WriterActor::channel(wal, store, &WriterConfig::default());
+        let actor_task = tokio::spawn(actor.run());
+
+        let replay = handle.submit(committed_envelope.clone()).await?;
+        assert_eq!(replay.status, WriteStatus::IdempotentReplay);
+
+        let Err(error) = handle
+            .submit(envelope(write_id, project_id, "different-input"))
+            .await
+        else {
+            return Err(crate::EngineError::WriteRejected(
+                "committed write_id conflict was unexpectedly accepted".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("idempotency conflict"));
+
+        drop(handle);
+        actor_task.await.map_err(|error| {
+            crate::EngineError::WriteRejected(format!("writer actor join failed: {error}"))
+        })?;
+        let wal = ControlWal::open(&ControlWalConfig {
+            path: path.display().to_string(),
+        })?;
+        assert_eq!(wal.pending_count()?, 0);
+        assert_eq!(wal.committed_count()?, 1);
+        assert_eq!(wal.failed_count()?, 0);
+        assert_eq!(wal.dead_letter_count()?, 0);
         drop(wal);
         let _ = std::fs::remove_dir_all(root);
         Ok(())

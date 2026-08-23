@@ -2158,6 +2158,13 @@ impl CanonicalStore {
         }
     }
 
+    /// Checks the configured canonical target before a caller enters a
+    /// persistent write path. The supervisor owns the reserved-store policy,
+    /// so this boundary cannot drift from lifecycle admission.
+    pub fn validate_admission(&self) -> Result<(), StoreError> {
+        SurrealServerSupervisor::new(self.config.clone()).validate_admission()
+    }
+
     #[must_use]
     pub fn from_client_set(client_set: Arc<DbClientSet>) -> Self {
         Self {
