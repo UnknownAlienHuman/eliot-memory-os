@@ -73,6 +73,22 @@ pub enum InstallerRootCreateDisposition {
     AlreadyExists,
 }
 
+/// Bounded stage at which a raw Win32 result was observed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallerRootStage {
+    OpenThreadToken,
+    OpenProcessToken,
+    DuplicateToken,
+    QueryPrivilege,
+    EnablePrivilege,
+    BindThreadToken,
+    RestorePrivilege,
+    RestoreThreadToken,
+    CreateDirectory,
+    OpenReadback,
+    Readback,
+}
+
 /// Fail-closed error from the Windows root executor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallerRootError {
@@ -94,6 +110,11 @@ pub enum InstallerRootError {
     Indeterminate,
     /// This executor is intentionally unavailable off Windows.
     UnsupportedPlatform,
+    /// A raw Win32 failure observed at a bounded operation stage.
+    Win32 {
+        stage: InstallerRootStage,
+        code: u32,
+    },
 }
 
 impl std::fmt::Display for InstallerRootError {
@@ -357,16 +378,18 @@ impl WindowsInstallerRootPrimitive {
         if &pinned.snapshot != expected {
             return Err(InstallerRootError::IdentityMismatch);
         }
-        if !create_directory_atomic(spec.profile, &spec.root)? {
-            return Ok(InstallerRootPrimitiveCreate {
-                disposition: InstallerRootCreateDisposition::AlreadyExists,
-                root: None,
-            });
-        }
-        let root = open_and_readback(&spec.root, spec.profile, true, false)?;
-        Ok(InstallerRootPrimitiveCreate {
-            disposition: InstallerRootCreateDisposition::Created,
-            root: Some(root.object_snapshot()),
+        with_system_restore_privilege(spec.profile, || {
+            if !create_directory_atomic(spec.profile, &spec.root)? {
+                return Ok(InstallerRootPrimitiveCreate {
+                    disposition: InstallerRootCreateDisposition::AlreadyExists,
+                    root: None,
+                });
+            }
+            let root = open_and_readback(&spec.root, spec.profile, true, false)?;
+            Ok(InstallerRootPrimitiveCreate {
+                disposition: InstallerRootCreateDisposition::Created,
+                root: Some(root.object_snapshot()),
+            })
         })
     }
 
@@ -871,6 +894,482 @@ fn rewrite_protected_file(
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrivilegeState {
+    luid: u64,
+    attributes: u32,
+}
+
+#[cfg(windows)]
+trait PrivilegeApi {
+    fn open_thread_token(&mut self) -> Result<usize, u32>;
+    fn open_process_token(&mut self) -> Result<usize, u32>;
+    fn duplicate_token(&mut self, source: usize) -> Result<usize, u32>;
+    fn query_restore_privilege(&mut self, token: usize) -> Result<PrivilegeState, u32>;
+    fn enable_restore_privilege(&mut self, token: usize, luid: u64) -> Result<(), u32>;
+    fn restore_restore_privilege(&mut self, token: usize, state: PrivilegeState)
+    -> Result<(), u32>;
+    fn bind_thread_token(&mut self, token: Option<usize>) -> Result<(), u32>;
+    fn close_token(&mut self, token: usize);
+}
+
+#[cfg(windows)]
+struct NativePrivilegeApi;
+
+#[cfg(windows)]
+impl PrivilegeApi for NativePrivilegeApi {
+    fn open_thread_token(&mut self) -> Result<usize, u32> {
+        use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        let mut token = std::ptr::null_mut();
+        if unsafe {
+            // SAFETY: the current thread pseudo-handle and output pointer are valid.
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                1,
+                &raw mut token,
+            )
+        } == 0
+        {
+            Err(unsafe {
+                // SAFETY: called immediately after the failed Win32 call.
+                windows_sys::Win32::Foundation::GetLastError()
+            })
+        } else {
+            Ok(token as usize)
+        }
+    }
+
+    fn open_process_token(&mut self) -> Result<usize, u32> {
+        use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token = std::ptr::null_mut();
+        if unsafe {
+            // SAFETY: the current process pseudo-handle and output pointer are valid.
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &raw mut token,
+            )
+        } == 0
+        {
+            Err(unsafe {
+                // SAFETY: called immediately after the failed Win32 call.
+                windows_sys::Win32::Foundation::GetLastError()
+            })
+        } else {
+            Ok(token as usize)
+        }
+    }
+
+    fn duplicate_token(&mut self, source: usize) -> Result<usize, u32> {
+        use windows_sys::Win32::Security::{
+            DuplicateTokenEx, SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES, TOKEN_IMPERSONATE,
+            TOKEN_QUERY, TokenImpersonation,
+        };
+        let mut duplicate = std::ptr::null_mut();
+        if unsafe {
+            // SAFETY: source is a live token handle and duplicate is a valid output pointer.
+            DuplicateTokenEx(
+                source as windows_sys::Win32::Foundation::HANDLE,
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE | TOKEN_QUERY,
+                std::ptr::null(),
+                SecurityImpersonation,
+                TokenImpersonation,
+                &raw mut duplicate,
+            )
+        } == 0
+        {
+            Err(unsafe {
+                // SAFETY: called immediately after the failed Win32 call.
+                windows_sys::Win32::Foundation::GetLastError()
+            })
+        } else {
+            Ok(duplicate as usize)
+        }
+    }
+
+    fn query_restore_privilege(&mut self, token: usize) -> Result<PrivilegeState, u32> {
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TOKEN_PRIVILEGES, TokenPrivileges,
+        };
+        let mut required = 0_u32;
+        let _ = unsafe {
+            // SAFETY: the zero-length probe has no output buffer.
+            GetTokenInformation(
+                token as windows_sys::Win32::Foundation::HANDLE,
+                TokenPrivileges,
+                std::ptr::null_mut(),
+                0,
+                &raw mut required,
+            )
+        };
+        if required == 0 {
+            return Err(unsafe {
+                // SAFETY: called immediately after the failed size probe.
+                windows_sys::Win32::Foundation::GetLastError()
+            });
+        }
+        let words = usize::try_from(required)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<usize>() - 1))
+            .map(|bytes| bytes / std::mem::size_of::<usize>())
+            .ok_or(windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        let mut buffer = vec![0_usize; words];
+        if unsafe {
+            // SAFETY: buffer is aligned and at least `required` bytes long.
+            GetTokenInformation(
+                token as windows_sys::Win32::Foundation::HANDLE,
+                TokenPrivileges,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &raw mut required,
+            )
+        } == 0
+        {
+            return Err(unsafe {
+                // SAFETY: called immediately after the failed Win32 call.
+                windows_sys::Win32::Foundation::GetLastError()
+            });
+        }
+        let privileges = buffer.as_ptr().cast::<TOKEN_PRIVILEGES>();
+        let count = unsafe {
+            // SAFETY: GetTokenInformation filled the TOKEN_PRIVILEGES header.
+            (*privileges).PrivilegeCount
+        };
+        let mut luid = windows_sys::Win32::Foundation::LUID::default();
+        let lookup_ok = unsafe {
+            // SAFETY: the output LUID is valid and the constant name is NUL-terminated.
+            windows_sys::Win32::Security::LookupPrivilegeValueW(
+                std::ptr::null(),
+                windows_sys::Win32::Security::SE_RESTORE_NAME,
+                &raw mut luid,
+            )
+        };
+        if lookup_ok == 0 {
+            return Err(unsafe {
+                // SAFETY: called immediately after the failed Win32 call.
+                windows_sys::Win32::Foundation::GetLastError()
+            });
+        }
+        let entries = unsafe {
+            // SAFETY: the returned variable-sized buffer contains `count` entries.
+            std::slice::from_raw_parts((*privileges).Privileges.as_ptr(), count as usize)
+        };
+        entries
+            .iter()
+            .find(|entry| {
+                entry.Luid.LowPart == luid.LowPart && entry.Luid.HighPart == luid.HighPart
+            })
+            .map(|entry| PrivilegeState {
+                luid: u64::from(entry.Luid.LowPart)
+                    | (u64::from(u32::from_ne_bytes(entry.Luid.HighPart.to_ne_bytes())) << 32),
+                attributes: entry.Attributes,
+            })
+            .ok_or(windows_sys::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED)
+    }
+
+    fn enable_restore_privilege(&mut self, token: usize, luid: u64) -> Result<(), u32> {
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_PRIVILEGES,
+        };
+        let low = u32::try_from(luid & u64::from(u32::MAX))
+            .map_err(|_| windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        let high = u32::try_from(luid >> 32)
+            .map_err(|_| windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        let state = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: windows_sys::Win32::Foundation::LUID {
+                    LowPart: low,
+                    HighPart: i32::from_ne_bytes(high.to_ne_bytes()),
+                },
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let ok = unsafe {
+            // SAFETY: token is a live duplicate with TOKEN_ADJUST_PRIVILEGES and state is valid.
+            AdjustTokenPrivileges(
+                token as windows_sys::Win32::Foundation::HANDLE,
+                0,
+                &raw const state,
+                u32::try_from(std::mem::size_of::<TOKEN_PRIVILEGES>())
+                    .map_err(|_| windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let code = unsafe {
+            // SAFETY: captured immediately after AdjustTokenPrivileges.
+            windows_sys::Win32::Foundation::GetLastError()
+        };
+        if ok == 0 || code == windows_sys::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED {
+            Err(if code == 0 {
+                windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED
+            } else {
+                code
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn restore_restore_privilege(
+        &mut self,
+        token: usize,
+        state: PrivilegeState,
+    ) -> Result<(), u32> {
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, TOKEN_PRIVILEGES,
+        };
+        let low = u32::try_from(state.luid & u64::from(u32::MAX))
+            .map_err(|_| windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        let high = u32::try_from(state.luid >> 32)
+            .map_err(|_| windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        let previous = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: windows_sys::Win32::Foundation::LUID {
+                    LowPart: low,
+                    HighPart: i32::from_ne_bytes(high.to_ne_bytes()),
+                },
+                Attributes: state.attributes,
+            }],
+        };
+        let ok = unsafe {
+            // SAFETY: token is a live duplicate and the restore state is valid.
+            AdjustTokenPrivileges(
+                token as windows_sys::Win32::Foundation::HANDLE,
+                0,
+                &raw const previous,
+                u32::try_from(std::mem::size_of::<TOKEN_PRIVILEGES>())
+                    .map_err(|_| windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let code = unsafe {
+            // SAFETY: captured immediately after AdjustTokenPrivileges.
+            windows_sys::Win32::Foundation::GetLastError()
+        };
+        if ok == 0 || code != 0 {
+            Err(if code == 0 {
+                windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED
+            } else {
+                code
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn bind_thread_token(&mut self, token: Option<usize>) -> Result<(), u32> {
+        use windows_sys::Win32::System::Threading::SetThreadToken;
+        if unsafe {
+            // SAFETY: null thread selects the current thread; token is either a live handle or null.
+            SetThreadToken(
+                std::ptr::null(),
+                token.unwrap_or_default() as windows_sys::Win32::Foundation::HANDLE,
+            )
+        } == 0
+        {
+            Err(unsafe {
+                // SAFETY: called immediately after the failed Win32 call.
+                windows_sys::Win32::Foundation::GetLastError()
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn close_token(&mut self, token: usize) {
+        unsafe {
+            // SAFETY: each token is closed exactly once by its owner.
+            windows_sys::Win32::Foundation::CloseHandle(
+                token as windows_sys::Win32::Foundation::HANDLE,
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ScopedRestorePrivilege<'a, A: PrivilegeApi + ?Sized> {
+    api: &'a mut A,
+    duplicate: usize,
+    prior_thread: Option<usize>,
+    prior_privilege: PrivilegeState,
+    adjusted: bool,
+    armed: bool,
+    _not_send_sync: std::marker::PhantomData<*mut ()>,
+}
+
+#[cfg(windows)]
+impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
+    fn enter(api: &'a mut A) -> Result<Self, InstallerRootError> {
+        use windows_sys::Win32::Foundation::{ERROR_NO_TOKEN, ERROR_NOT_ALL_ASSIGNED};
+        let (source, prior_thread) = match api.open_thread_token() {
+            Ok(token) => (token, Some(token)),
+            Err(code) if code == ERROR_NO_TOKEN => (
+                api.open_process_token()
+                    .map_err(|code| InstallerRootError::Win32 {
+                        stage: InstallerRootStage::OpenProcessToken,
+                        code,
+                    })?,
+                None,
+            ),
+            Err(code) => {
+                return Err(InstallerRootError::Win32 {
+                    stage: InstallerRootStage::OpenThreadToken,
+                    code,
+                });
+            }
+        };
+        let duplicate = match api.duplicate_token(source) {
+            Ok(token) => token,
+            Err(code) => {
+                if prior_thread.is_none() {
+                    api.close_token(source);
+                }
+                return Err(InstallerRootError::Win32 {
+                    stage: InstallerRootStage::DuplicateToken,
+                    code,
+                });
+            }
+        };
+        if prior_thread.is_none() {
+            api.close_token(source);
+        }
+        let prior_privilege = match api.query_restore_privilege(duplicate) {
+            Ok(state) => state,
+            Err(code) => {
+                api.close_token(duplicate);
+                if let Some(token) = prior_thread {
+                    api.close_token(token);
+                }
+                return Err(InstallerRootError::Win32 {
+                    stage: InstallerRootStage::QueryPrivilege,
+                    code: if code == 0 {
+                        ERROR_NOT_ALL_ASSIGNED
+                    } else {
+                        code
+                    },
+                });
+            }
+        };
+        let adjusted =
+            if prior_privilege.attributes & windows_sys::Win32::Security::SE_PRIVILEGE_ENABLED == 0
+            {
+                if let Err(code) = api.enable_restore_privilege(duplicate, prior_privilege.luid) {
+                    api.close_token(duplicate);
+                    if let Some(token) = prior_thread {
+                        api.close_token(token);
+                    }
+                    return Err(InstallerRootError::Win32 {
+                        stage: InstallerRootStage::EnablePrivilege,
+                        code,
+                    });
+                }
+                true
+            } else {
+                false
+            };
+        if let Err(code) = api.bind_thread_token(Some(duplicate)) {
+            let restore = if adjusted {
+                api.restore_restore_privilege(duplicate, prior_privilege)
+            } else {
+                Ok(())
+            };
+            api.close_token(duplicate);
+            if let Some(token) = prior_thread {
+                api.close_token(token);
+            }
+            if let Err(_restore_code) = restore {
+                std::process::abort();
+            }
+            return Err(InstallerRootError::Win32 {
+                stage: InstallerRootStage::BindThreadToken,
+                code,
+            });
+        }
+        Ok(Self {
+            api,
+            duplicate,
+            prior_thread,
+            prior_privilege,
+            adjusted,
+            armed: true,
+            _not_send_sync: std::marker::PhantomData,
+        })
+    }
+
+    fn restore(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.adjusted
+            && self
+                .api
+                .restore_restore_privilege(self.duplicate, self.prior_privilege)
+                .is_err()
+        {
+            std::process::abort();
+        }
+        if let Err(_code) = self.api.bind_thread_token(self.prior_thread) {
+            std::process::abort();
+        }
+        self.api.close_token(self.duplicate);
+        if let Some(token) = self.prior_thread {
+            self.api.close_token(token);
+        }
+        self.armed = false;
+    }
+}
+
+#[cfg(windows)]
+impl<A: PrivilegeApi + ?Sized> Drop for ScopedRestorePrivilege<'_, A> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.restore();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn with_native_restore_privilege<F, T>(f: F) -> Result<T, InstallerRootError>
+where
+    F: FnOnce() -> Result<T, InstallerRootError>,
+{
+    let mut api = NativePrivilegeApi;
+    let mut guard = ScopedRestorePrivilege::enter(&mut api)?;
+    let result = f();
+    guard.restore();
+    result
+}
+
+#[allow(clippy::needless_return)]
+fn with_system_restore_privilege<F, T>(
+    profile: InstallerRootProfile,
+    f: F,
+) -> Result<T, InstallerRootError>
+where
+    F: FnOnce() -> Result<T, InstallerRootError>,
+{
+    if profile != InstallerRootProfile::SystemService {
+        return f();
+    }
+    #[cfg(windows)]
+    {
+        return with_native_restore_privilege(f);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = f;
+        Err(InstallerRootError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(windows)]
 fn create_directory_atomic(
     profile: InstallerRootProfile,
     path: &Path,
@@ -881,7 +1380,11 @@ fn create_directory_atomic(
 
     let parent = path.parent().ok_or(InstallerRootError::MissingParent)?;
     let _parent = open_no_follow(parent, true, false).map_err(|error| match error {
-        InstallerRootError::Indeterminate => InstallerRootError::MissingParent,
+        InstallerRootError::Indeterminate
+        | InstallerRootError::Win32 {
+            stage: InstallerRootStage::OpenReadback,
+            ..
+        } => InstallerRootError::MissingParent,
         other => other,
     })?;
     let descriptor = expected_descriptor(profile, true)?;
@@ -899,10 +1402,17 @@ fn create_directory_atomic(
     {
         return Ok(true);
     }
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+    let code = unsafe {
+        // SAFETY: captured immediately after the failed CreateDirectoryW call.
+        GetLastError()
+    };
+    if code == ERROR_ALREADY_EXISTS {
         Ok(false)
     } else {
-        Err(InstallerRootError::Indeterminate)
+        Err(InstallerRootError::Win32 {
+            stage: InstallerRootStage::CreateDirectory,
+            code,
+        })
     }
 }
 
@@ -919,6 +1429,16 @@ fn open_no_follow(
     path: &Path,
     directory: bool,
     delete: bool,
+) -> Result<std::fs::File, InstallerRootError> {
+    open_no_follow_staged(path, directory, delete, false)
+}
+
+#[cfg(windows)]
+fn open_no_follow_staged(
+    path: &Path,
+    directory: bool,
+    delete: bool,
+    report_win32: bool,
 ) -> Result<std::fs::File, InstallerRootError> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -938,9 +1458,22 @@ fn open_no_follow(
                 0
             },
     );
-    let file = options
-        .open(path)
-        .map_err(|_| InstallerRootError::Indeterminate)?;
+    let file = options.open(path).map_err(|error| {
+        if report_win32 {
+            error
+                .raw_os_error()
+                .map_or(InstallerRootError::Indeterminate, |code| {
+                    u32::try_from(code).map_or(InstallerRootError::Indeterminate, |code| {
+                        InstallerRootError::Win32 {
+                            stage: InstallerRootStage::OpenReadback,
+                            code,
+                        }
+                    })
+                })
+        } else {
+            InstallerRootError::Indeterminate
+        }
+    })?;
     let metadata = file
         .metadata()
         .map_err(|_| InstallerRootError::Indeterminate)?;
@@ -968,6 +1501,9 @@ fn open_and_readback(
     directory: bool,
     delete: bool,
 ) -> Result<RootReadback, InstallerRootError> {
+    #[cfg(windows)]
+    let file = open_no_follow_staged(path, directory, delete, true)?;
+    #[cfg(not(windows))]
     let file = open_no_follow(path, directory, delete)?;
     let canonical_path = final_windows_path_from_handle(&file).map_err(map_protected_error)?;
     if !windows_paths_equal(&canonical_path, path) {
@@ -1490,6 +2026,186 @@ mod primitive_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[cfg(windows)]
+    struct FakePrivilegeApi {
+        thread: Result<usize, u32>,
+        process: Result<usize, u32>,
+        duplicate: Result<usize, u32>,
+        query: Result<PrivilegeState, u32>,
+        enable: Result<(), u32>,
+        restore: Result<(), u32>,
+        bind: Result<(), u32>,
+        bound: Vec<Option<usize>>,
+        adjusted: usize,
+        closed: Vec<usize>,
+    }
+
+    #[cfg(windows)]
+    impl PrivilegeApi for FakePrivilegeApi {
+        fn open_thread_token(&mut self) -> Result<usize, u32> {
+            self.thread
+        }
+
+        fn open_process_token(&mut self) -> Result<usize, u32> {
+            self.process
+        }
+
+        fn duplicate_token(&mut self, _source: usize) -> Result<usize, u32> {
+            self.duplicate
+        }
+
+        fn query_restore_privilege(&mut self, _token: usize) -> Result<PrivilegeState, u32> {
+            self.query
+        }
+
+        fn enable_restore_privilege(&mut self, _token: usize, _luid: u64) -> Result<(), u32> {
+            self.adjusted += 1;
+            self.enable
+        }
+
+        fn restore_restore_privilege(
+            &mut self,
+            _token: usize,
+            _state: PrivilegeState,
+        ) -> Result<(), u32> {
+            self.restore
+        }
+
+        fn bind_thread_token(&mut self, token: Option<usize>) -> Result<(), u32> {
+            self.bound.push(token);
+            self.bind
+        }
+
+        fn close_token(&mut self, token: usize) {
+            self.closed.push(token);
+        }
+    }
+
+    #[cfg(windows)]
+    fn fake_api() -> FakePrivilegeApi {
+        FakePrivilegeApi {
+            thread: Err(windows_sys::Win32::Foundation::ERROR_NO_TOKEN),
+            process: Ok(11),
+            duplicate: Ok(22),
+            query: Ok(PrivilegeState {
+                luid: 7,
+                attributes: 0,
+            }),
+            enable: Ok(()),
+            restore: Ok(()),
+            bind: Ok(()),
+            bound: Vec::new(),
+            adjusted: 0,
+            closed: Vec::new(),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoped_restore_privilege_falls_back_only_for_no_token_and_restores_binding() {
+        let mut api = fake_api();
+        {
+            let mut guard = ScopedRestorePrivilege::enter(&mut api).unwrap();
+            guard.restore();
+        }
+        assert_eq!(api.adjusted, 1);
+        assert_eq!(api.bound, vec![Some(22), None]);
+        assert_eq!(api.closed, vec![11, 22]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoped_restore_privilege_restores_an_existing_thread_token_without_process_fallback() {
+        let mut api = fake_api();
+        api.thread = Ok(33);
+        api.process = Err(99);
+        {
+            let mut guard = ScopedRestorePrivilege::enter(&mut api).unwrap();
+            guard.restore();
+        }
+        assert_eq!(api.bound, vec![Some(22), Some(33)]);
+        assert_eq!(api.closed, vec![22, 33]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoped_restore_privilege_does_not_fallback_for_other_thread_token_errors() {
+        let mut api = fake_api();
+        api.thread = Err(5);
+        assert!(matches!(
+            ScopedRestorePrivilege::enter(&mut api),
+            Err(InstallerRootError::Win32 {
+                stage: InstallerRootStage::OpenThreadToken,
+                code: 5,
+            })
+        ));
+        assert!(api.bound.is_empty());
+        assert!(api.closed.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoped_restore_privilege_rejects_missing_privilege_and_never_adjusts_process_token() {
+        let mut api = fake_api();
+        api.query = Err(windows_sys::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED);
+        assert!(matches!(
+            ScopedRestorePrivilege::enter(&mut api),
+            Err(InstallerRootError::Win32 {
+                stage: InstallerRootStage::QueryPrivilege,
+                code: windows_sys::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED,
+            })
+        ));
+        assert_eq!(api.adjusted, 0);
+        assert!(api.bound.is_empty());
+        assert_eq!(api.closed, vec![11, 22]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoped_restore_privilege_rolls_back_when_thread_binding_fails() {
+        let mut api = fake_api();
+        api.bind = Err(5);
+        assert!(matches!(
+            ScopedRestorePrivilege::enter(&mut api),
+            Err(InstallerRootError::Win32 {
+                stage: InstallerRootStage::BindThreadToken,
+                code: 5,
+            })
+        ));
+        assert_eq!(api.bound, vec![Some(22)]);
+        assert_eq!(api.closed, vec![11, 22]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoped_restore_privilege_reports_not_all_assigned_when_enable_fails() {
+        let mut api = fake_api();
+        api.enable = Err(windows_sys::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED);
+        assert!(matches!(
+            ScopedRestorePrivilege::enter(&mut api),
+            Err(InstallerRootError::Win32 {
+                stage: InstallerRootStage::EnablePrivilege,
+                code: windows_sys::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED,
+            })
+        ));
+        assert_eq!(api.adjusted, 1);
+        assert!(api.bound.is_empty());
+        assert_eq!(api.closed, vec![11, 22]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoped_restore_privilege_drop_restores_after_operation_panic() {
+        let mut api = fake_api();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ScopedRestorePrivilege::enter(&mut api).unwrap();
+            panic!("operation failure");
+        }));
+        assert!(panic.is_err());
+        assert_eq!(api.bound, vec![Some(22), None]);
+        assert_eq!(api.closed, vec![11, 22]);
+    }
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
