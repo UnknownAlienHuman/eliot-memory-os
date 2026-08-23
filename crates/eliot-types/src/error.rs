@@ -28,4 +28,13 @@ pub enum ConfigError {
 
     #[error("unsupported SurrealDB credential provider: {provider}")]
     UnsupportedCredentialProvider { provider: String },
+
+    #[error(
+        "configuration collides with the reserved runtime-live store: bind={bind}, endpoint={endpoint}, namespace={namespace}"
+    )]
+    RuntimeLiveStoreCollision {
+        bind: String,
+        endpoint: String,
+        namespace: String,
+    },
 }

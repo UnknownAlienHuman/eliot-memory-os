@@ -46,6 +46,11 @@ pub(crate) async fn ensure_daemon_ready(
     requester: &str,
     instance_name: &str,
 ) -> Result<Value> {
+    // Re-read and reject the legacy config before even reading runtime
+    // publication state or spawning a Governor child.  This is deliberately
+    // the first effectful-path guard for the reserved runtime-live endpoint.
+    crate::config::load_config(config_path)
+        .context("reject legacy configuration colliding with runtime-live store")?;
     let instance = RuntimeInstance::select(config_path, Some(instance_name))?;
     if let Ok(publication) = live_publication(&instance, protocol_version).await {
         validate_runtime_request_binding(&publication, governor, config_path)

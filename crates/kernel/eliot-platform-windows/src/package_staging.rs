@@ -1334,6 +1334,102 @@ pub struct TrustedSourceBundle {
     contour: Vec<std::fs::File>,
 }
 
+/// One retained regular file below a [`TrustedSourceBundle`]. The file handle
+/// is opened no-follow with read-only, no-share-write/no-share-delete
+/// semantics so an installer can carry `generation.json` through later
+/// effects without reopening a mutable pathname.
+pub struct TrustedSourceFileLease {
+    path: PathBuf,
+    relative_path: String,
+    identity: FileIdentity,
+    size: u64,
+    sha256: String,
+    #[cfg(windows)]
+    file: std::fs::File,
+}
+
+impl fmt::Debug for TrustedSourceFileLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrustedSourceFileLease")
+            .field("path", &self.path)
+            .field("relative_path", &self.relative_path)
+            .field("identity", &self.identity)
+            .field("size", &self.size)
+            .field("sha256", &self.sha256)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TrustedSourceFileLease {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Reads through the retained handle and verifies the original identity,
+    /// path, size and SHA-256 before returning bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a staging error when the retained handle, identity, path, size,
+    /// or hash cannot be verified.
+    pub fn read_bounded(&self, limit: u64) -> Result<Vec<u8>, PackageStagingError> {
+        #[cfg(windows)]
+        {
+            let observed = observe_source_handle(&self.file, &self.path, limit)?;
+            if observed.size != self.size || observed.sha256 != self.sha256 {
+                return Err(PackageStagingError::HashMismatch);
+            }
+            let identity = file_identity_from_open_handle(&self.file)?;
+            if identity != self.identity {
+                return Err(PackageStagingError::IdentityMismatch);
+            }
+            let mut file = self.file.try_clone().map_err(|_| PackageStagingError::Io)?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|_| PackageStagingError::Io)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|_| PackageStagingError::Io)?;
+            Ok(bytes)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = limit;
+            Err(PackageStagingError::UnsupportedPlatform)
+        }
+    }
+
+    /// Alias for callers that already supplied a bounded source-file policy.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`Self::read_bounded`].
+    pub fn read(&self, limit: u64) -> Result<Vec<u8>, PackageStagingError> {
+        self.read_bounded(limit)
+    }
+}
+
 impl fmt::Debug for TrustedSourceBundle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1366,6 +1462,58 @@ impl TrustedSourceBundle {
     #[must_use]
     pub const fn identity(&self) -> FileIdentity {
         self.identity
+    }
+
+    /// Retains one validated relative regular file below this source bundle.
+    /// The complete file fact is measured before the handle is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a staging error when the relative path, source contour, file
+    /// identity, or bounded hash observation is not proven.
+    pub fn retain_file(
+        &self,
+        relative_path: &str,
+    ) -> Result<TrustedSourceFileLease, PackageStagingError> {
+        #[cfg(windows)]
+        {
+            self.verify_stable()?;
+            let relative = validate_relative_text(relative_path)?;
+            let path = self.path.join(relative.as_str().replace('/', "\\"));
+            let file = open_trusted_source_file(&path)?;
+            let observed = observe_source_handle(&file, &path, MAX_PACKAGE_FILE_BYTES)?;
+            let identity = file_identity_from_open_handle(&file)?;
+            let observed_path = final_path_from_handle(&file)?;
+            if !super::windows_paths_equal(&observed_path, &path) {
+                return Err(PackageStagingError::IdentityMismatch);
+            }
+            self.verify_stable()?;
+            Ok(TrustedSourceFileLease {
+                path: observed_path,
+                relative_path: relative.canonical,
+                identity,
+                size: observed.size,
+                sha256: observed.sha256,
+                file,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = relative_path;
+            Err(PackageStagingError::UnsupportedPlatform)
+        }
+    }
+
+    /// Alias for [`Self::retain_file`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`Self::retain_file`].
+    pub fn open_relative_file(
+        &self,
+        relative_path: &str,
+    ) -> Result<TrustedSourceFileLease, PackageStagingError> {
+        self.retain_file(relative_path)
     }
 
     fn verify_stable(&self) -> Result<(), PackageStagingError> {
@@ -4690,6 +4838,46 @@ mod tests {
         std::fs::remove_dir(root.join("bin")).expect("bin cleanup");
         std::fs::remove_file(root.join("a.txt")).expect("a cleanup");
         std::fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_source_file_lease_retains_hash_and_blocks_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-package-source-file-lease-{}-{}",
+            std::process::id(),
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("generation.json");
+        let bytes = br#"{"generation":1}"#;
+        std::fs::write(&path, bytes).expect("generation fixture");
+
+        let source = TrustedSourceBundle::open(&root).expect("retained source");
+        let lease = source
+            .retain_file("generation.json")
+            .expect("retained generation file");
+        assert_eq!(lease.relative_path(), "generation.json");
+        assert_eq!(lease.size(), bytes.len() as u64);
+        assert_eq!(lease.sha256(), hex_digest(bytes));
+        assert_eq!(lease.read_bounded(4096).expect("retained bytes"), bytes);
+        assert!(
+            std::fs::write(&path, b"tampered").is_err(),
+            "retained source file must deny a competing writer"
+        );
+        let moved = root.with_file_name(format!(
+            "eliot-package-source-file-lease-moved-{}",
+            super::super::unique_suffix()
+        ));
+        assert!(
+            std::fs::rename(&root, &moved).is_err(),
+            "retained source contour must deny rename"
+        );
+        assert_eq!(lease.read(4096).expect("second retained read"), bytes);
+        drop(lease);
+        drop(source);
+        std::fs::remove_file(path).expect("file cleanup");
+        std::fs::remove_dir(root).expect("root cleanup");
     }
 
     #[cfg(windows)]

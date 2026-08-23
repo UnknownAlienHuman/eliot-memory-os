@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod installation_activation;
+mod runtime_live;
 mod supervision_authority;
 mod supervision_incarnation;
 mod supervision_lease;
@@ -34,6 +35,10 @@ pub use installation_activation::{
     InstallationDigestBinding, InstallationScmReadback, InstallationScmRole,
     SignedInstallationActivation, SignedInstallationActivationApproval,
     VerifiedInstallationActivationApproval,
+};
+pub use runtime_live::{
+    RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
+    RuntimeLiveStoreIdentity, RuntimeLiveStoreIdentityError,
 };
 
 pub use supervision_authority::{

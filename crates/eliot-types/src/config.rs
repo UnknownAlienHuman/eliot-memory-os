@@ -150,6 +150,28 @@ pub struct StoreConfig {
 }
 
 impl GovernorConfig {
+    /// Returns true when this configuration can claim the reserved store by
+    /// endpoint/namespace or by bind/namespace.
+    #[must_use]
+    pub fn collides_with_store(&self, bind: &str, endpoint: &str, namespace: &str) -> bool {
+        self.db
+            .surreal
+            .collides_with_store(bind, endpoint, namespace)
+    }
+
+    /// Rejects a reserved store identity before any writer, database, or child
+    /// process can be started.
+    pub fn reject_store_collision(
+        &self,
+        bind: &str,
+        endpoint: &str,
+        namespace: &str,
+    ) -> Result<(), ConfigError> {
+        self.db
+            .surreal
+            .reject_store_collision(bind, endpoint, namespace)
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(ConfigError::UnsupportedSchemaVersion {
@@ -241,6 +263,35 @@ impl GovernorConfig {
     }
 }
 
+impl SurrealServerConfig {
+    /// Returns true when this server configuration can claim the reserved
+    /// store by endpoint/namespace or by bind/namespace.
+    #[must_use]
+    pub fn collides_with_store(&self, bind: &str, endpoint: &str, namespace: &str) -> bool {
+        (self.endpoint == endpoint && self.ns == namespace)
+            || (same_loopback_port(&self.endpoint, endpoint) && self.ns == namespace)
+            || (self.bind == bind && self.ns == namespace)
+            || (same_loopback_port(&self.bind, bind) && self.ns == namespace)
+    }
+
+    /// Rejects a reserved store identity before a server or writer starts.
+    pub fn reject_store_collision(
+        &self,
+        bind: &str,
+        endpoint: &str,
+        namespace: &str,
+    ) -> Result<(), ConfigError> {
+        if self.collides_with_store(bind, endpoint, namespace) {
+            return Err(ConfigError::RuntimeLiveStoreCollision {
+                bind: self.bind.clone(),
+                endpoint: self.endpoint.clone(),
+                namespace: self.ns.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
@@ -325,6 +376,22 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), ConfigError
     }
 }
 
+fn same_loopback_port(left: &str, right: &str) -> bool {
+    match (loopback_port(left), loopback_port(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn loopback_port(value: &str) -> Option<u16> {
+    let value = value.to_ascii_lowercase();
+    let port = value
+        .strip_prefix("127.0.0.1:")
+        .or_else(|| value.strip_prefix("ws://127.0.0.1:"))
+        .and_then(|value| value.strip_suffix("/rpc").or(Some(value)))?;
+    port.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ConfigError, CredentialProviderKind, GovernorConfig, SurrealServerConfig};
@@ -332,6 +399,58 @@ mod tests {
     #[test]
     fn default_config_is_valid() -> Result<(), ConfigError> {
         GovernorConfig::default().validate()
+    }
+
+    #[test]
+    fn exact_runtime_live_identity_is_a_collision_but_other_config_is_parseable() {
+        let mut colliding = GovernorConfig::default();
+        colliding.db.surreal.bind = "127.0.0.1:8000".to_owned();
+        colliding.db.surreal.endpoint = "ws://127.0.0.1:8000/rpc".to_owned();
+        colliding.db.surreal.ns = "eliot".to_owned();
+        assert!(colliding.collides_with_store(
+            "127.0.0.1:8000",
+            "ws://127.0.0.1:8000/rpc",
+            "eliot"
+        ));
+        assert!(matches!(
+            colliding.reject_store_collision("127.0.0.1:8000", "ws://127.0.0.1:8000/rpc", "eliot"),
+            Err(ConfigError::RuntimeLiveStoreCollision { .. })
+        ));
+
+        let mut different = colliding.clone();
+        different.db.surreal.endpoint = "ws://127.0.0.1:8001/rpc".to_owned();
+        different.db.surreal.bind = "127.0.0.1:18001".to_owned();
+        assert!(!different.collides_with_store(
+            "127.0.0.1:8000",
+            "ws://127.0.0.1:8000/rpc",
+            "eliot"
+        ));
+        assert!(different.validate().is_ok());
+
+        let mut alternate_bind = colliding.clone();
+        alternate_bind.db.surreal.bind = "127.0.0.1:18001".to_owned();
+        assert!(alternate_bind.collides_with_store(
+            "127.0.0.1:8000",
+            "ws://127.0.0.1:8000/rpc",
+            "eliot"
+        ));
+
+        let mut alternate_endpoint = colliding.clone();
+        alternate_endpoint.db.surreal.endpoint = "WS://127.0.0.1:08000/rpc".to_owned();
+        alternate_endpoint.db.surreal.bind = "127.0.0.1:18001".to_owned();
+        assert!(alternate_endpoint.collides_with_store(
+            "127.0.0.1:8000",
+            "ws://127.0.0.1:8000/rpc",
+            "eliot"
+        ));
+
+        let mut alternate_namespace = colliding;
+        alternate_namespace.db.surreal.ns = "other".to_owned();
+        assert!(!alternate_namespace.collides_with_store(
+            "127.0.0.1:8000",
+            "ws://127.0.0.1:8000/rpc",
+            "eliot"
+        ));
     }
 
     /// Omitting `credential_provider` must not silently select the plaintext

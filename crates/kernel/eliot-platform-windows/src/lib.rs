@@ -104,8 +104,9 @@ pub use package_staging::{
     PackageSourceFileObservation, PackageSourceObservation, PackageStager, PackageStagingError,
     PackageStagingObservation, PeCoffError, PeCoffEvidence, StagePackageAuthorization,
     StagePackageExpectedFile, StagedDirectoryReceipt, StagedFileReceipt, StagingReceipt,
-    TrustedSourceBundle, WindowsAuthenticodeVerifier, ordinal_cmp_str, ordinal_component_cmp,
-    ordinal_eq_str, ordinal_path_cmp, parse_pe_coff, validate_package_relative_path,
+    TrustedSourceBundle, TrustedSourceFileLease, WindowsAuthenticodeVerifier, ordinal_cmp_str,
+    ordinal_component_cmp, ordinal_eq_str, ordinal_path_cmp, parse_pe_coff,
+    validate_package_relative_path,
 };
 pub use supervision_authority_key::{
     SealedSupervisionAuthorityKey, SupervisionAuthorityKeyError,
@@ -307,6 +308,258 @@ pub fn current_user_local_app_data_root() -> Result<PathBuf, ProtectedPathError>
     let canonical = canonical_windows_path(&raw)?;
     validate_directory_no_reparse(&canonical)?;
     Ok(canonical)
+}
+
+/// Fixed current-user configuration observation below the OS-known
+/// `LocalAppData\Eliot` root. A missing file is deliberately provisional and
+/// must not be treated as durable authority.
+#[derive(Debug)]
+pub enum LocalAppDataConfigObservation {
+    Absent { path: PathBuf },
+    Present(LocalAppDataConfigRead),
+}
+
+/// Read-only, identity-bound observation of the fixed Governor config file.
+pub struct LocalAppDataConfigRead {
+    path: PathBuf,
+    root_identity: FileIdentity,
+    parent_identity: FileIdentity,
+    file_identity: FileIdentity,
+    size: u64,
+    sha256: String,
+    bytes: Vec<u8>,
+    #[cfg(windows)]
+    root: std::fs::File,
+    #[cfg(windows)]
+    parents: Vec<std::fs::File>,
+    #[cfg(windows)]
+    file: std::fs::File,
+}
+
+impl std::fmt::Debug for LocalAppDataConfigRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalAppDataConfigRead")
+            .field("path", &self.path)
+            .field("root_identity", &self.root_identity)
+            .field("parent_identity", &self.parent_identity)
+            .field("file_identity", &self.file_identity)
+            .field("size", &self.size)
+            .field("sha256", &self.sha256)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocalAppDataConfigObservation {
+    /// Returns true only for a present, retained observation.
+    #[must_use]
+    pub const fn is_present(&self) -> bool {
+        matches!(self, Self::Present(_))
+    }
+
+    /// Missing config is always provisional rather than durable authority.
+    #[must_use]
+    pub const fn is_provisional_absent(&self) -> bool {
+        matches!(self, Self::Absent { .. })
+    }
+}
+
+impl LocalAppDataConfigRead {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn root_identity(&self) -> FileIdentity {
+        self.root_identity
+    }
+
+    #[must_use]
+    pub const fn parent_identity(&self) -> FileIdentity {
+        self.parent_identity
+    }
+
+    #[must_use]
+    pub const fn file_identity(&self) -> FileIdentity {
+        self.file_identity
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Returns the bounded bytes read twice through the same retained handle.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Re-reads the same retained file handle and verifies every retained
+    /// root/parent/file identity, final path, size and hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an identity, path, or bounded content read is
+    /// not stable.
+    pub fn verify_stable(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let root = file_identity_from_handle(&self.root).map_err(|_| ProtectedPathError::Io)?;
+            let parent_handle = self.parents.last().ok_or(ProtectedPathError::Io)?;
+            let parent =
+                file_identity_from_handle(parent_handle).map_err(|_| ProtectedPathError::Io)?;
+            let file = file_identity_from_handle(&self.file).map_err(|_| ProtectedPathError::Io)?;
+            if root != self.root_identity
+                || parent != self.parent_identity
+                || file != self.file_identity
+            {
+                return Err(ProtectedPathError::Io);
+            }
+            let path = final_windows_path_from_handle(&self.file)?;
+            if !windows_paths_equal(&path, &self.path) {
+                return Err(ProtectedPathError::Io);
+            }
+            let bytes = read_same_handle_twice(&self.file, self.size)?;
+            if bytes != self.bytes || format!("{:x}", Sha256::digest(&bytes)) != self.sha256 {
+                return Err(ProtectedPathError::Io);
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+}
+
+/// Observes the fixed `LocalAppData\Eliot\config\governor.toml` file using
+/// the OS known folder, never `LOCALAPPDATA` environment substitution.
+///
+/// # Errors
+///
+/// Returns an error when the known folder, retained contour, ACL, or bounded
+/// same-handle read cannot be proven safe.
+pub fn observe_current_user_config(
+    max_bytes: u64,
+) -> Result<LocalAppDataConfigObservation, ProtectedPathError> {
+    let local_app_data = current_user_local_app_data_root()?;
+    let eliot_root = local_app_data.join("Eliot");
+    let config_path = eliot_root.join("config").join("governor.toml");
+    observe_fixed_local_app_data_config(&eliot_root, &config_path, max_bytes)
+}
+
+/// Alias naming the fixed OS-known-folder observation explicitly.
+///
+/// # Errors
+///
+/// Propagates errors from [`observe_current_user_config`].
+pub fn observe_local_app_data_config(
+    max_bytes: u64,
+) -> Result<LocalAppDataConfigObservation, ProtectedPathError> {
+    observe_current_user_config(max_bytes)
+}
+
+fn observe_fixed_local_app_data_config(
+    root: &Path,
+    config_path: &Path,
+    max_bytes: u64,
+) -> Result<LocalAppDataConfigObservation, ProtectedPathError> {
+    #[cfg(windows)]
+    {
+        if max_bytes == 0 || !config_path.starts_with(root) {
+            return Err(ProtectedPathError::InvalidPath);
+        }
+        match std::fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ProtectedPathError::ReparsePoint);
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(ProtectedPathError::InvalidRoot);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LocalAppDataConfigObservation::Absent {
+                    path: config_path.to_path_buf(),
+                });
+            }
+            Err(_) => return Err(ProtectedPathError::Io),
+        }
+        let parent = config_path
+            .parent()
+            .ok_or(ProtectedPathError::InvalidPath)?;
+        match std::fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ProtectedPathError::ReparsePoint);
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(ProtectedPathError::InvalidPath);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LocalAppDataConfigObservation::Absent {
+                    path: config_path.to_path_buf(),
+                });
+            }
+            Err(_) => return Err(ProtectedPathError::Io),
+        }
+        let root_lease = match UserOwnedRootReadLease::open_existing(root) {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        };
+        let relative_parent = parent
+            .strip_prefix(root)
+            .map_err(|_| ProtectedPathError::InvalidPath)?;
+        let parent_handles =
+            open_user_owned_directory_read_only_contour(root, relative_parent, &root_lease.sid)?;
+        let parent_handle = parent_handles
+            .last()
+            .ok_or(ProtectedPathError::InvalidPath)?;
+        let parent_identity =
+            file_identity_from_handle(parent_handle).map_err(|_| ProtectedPathError::Io)?;
+        let file = match open_user_owned_file_read_only(config_path, &root_lease.sid) {
+            Ok(value) => value,
+            Err(ProtectedPathError::Io) if !config_path.exists() => {
+                return Ok(LocalAppDataConfigObservation::Absent {
+                    path: config_path.to_path_buf(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let file_identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
+        let bytes = read_same_handle_twice(&file, max_bytes)?;
+        let size = bytes.len() as u64;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let observed_path = final_windows_path_from_handle(&file)?;
+        if !windows_paths_equal(&observed_path, config_path) {
+            return Err(ProtectedPathError::Io);
+        }
+        Ok(LocalAppDataConfigObservation::Present(
+            LocalAppDataConfigRead {
+                path: observed_path,
+                root_identity: root_lease.identity,
+                parent_identity,
+                file_identity,
+                size,
+                sha256,
+                bytes,
+                root: root_lease.handle,
+                parents: parent_handles,
+                file,
+            },
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (root, config_path, max_bytes);
+        Err(ProtectedPathError::UnsupportedPlatform)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -824,6 +1077,17 @@ impl ProtectedRuntimePathLease {
         Self::open_absolute(path, false)
     }
 
+    /// Opens one existing runtime file read-only with exclusive sharing. This
+    /// is an opt-in canary fence; ordinary runtime lease sharing is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the protected path, ACL, or retained identity
+    /// cannot be proven.
+    pub fn open_existing_absolute_exclusive(path: &Path) -> Result<Self, ProtectedPathError> {
+        Self::open_absolute_exclusive(path)
+    }
+
     /// Creates or opens one runtime state file without changing its
     /// installer-provisioned ACL. Creation requires the already-provisioned
     /// `LocalService` write permission on the parent runtime root.
@@ -838,6 +1102,18 @@ impl ProtectedRuntimePathLease {
     }
 
     fn open_absolute(path: &Path, create: bool) -> Result<Self, ProtectedPathError> {
+        Self::open_absolute_mode(path, create, false)
+    }
+
+    fn open_absolute_exclusive(path: &Path) -> Result<Self, ProtectedPathError> {
+        Self::open_absolute_mode(path, false, true)
+    }
+
+    fn open_absolute_mode(
+        path: &Path,
+        create: bool,
+        exclusive: bool,
+    ) -> Result<Self, ProtectedPathError> {
         let root = expected_root()?;
         ensure_protected_containment(&root, path)?;
         let canonical = if create {
@@ -873,7 +1149,11 @@ impl ProtectedRuntimePathLease {
             } else {
                 pin_protected_directory_contour(&root, &parent)?
             };
-            let file = open_runtime_file(&canonical, create)?;
+            let file = if exclusive {
+                open_runtime_read_file_exclusive(&canonical)?
+            } else {
+                open_runtime_file(&canonical, create)?
+            };
             let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
             Ok(Self {
                 path: canonical,
@@ -983,19 +1263,33 @@ fn open_runtime_read_file(path: &Path) -> Result<std::fs::File, ProtectedPathErr
 }
 
 #[cfg(windows)]
+fn open_runtime_read_file_exclusive(path: &Path) -> Result<std::fs::File, ProtectedPathError> {
+    open_runtime_file_with_share(path, false, 0)
+}
+
+#[cfg(windows)]
 fn open_runtime_file(path: &Path, create: bool) -> Result<std::fs::File, ProtectedPathError> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    open_runtime_file_with_share(path, create, FILE_SHARE_READ | FILE_SHARE_WRITE)
+}
+
+#[cfg(windows)]
+fn open_runtime_file_with_share(
+    path: &Path,
+    create: bool,
+    share_mode: u32,
+) -> Result<std::fs::File, ProtectedPathError> {
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
     };
     let mut options = std::fs::OpenOptions::new();
     options
         .read(true)
         .write(create)
         .access_mode(runtime_file_access_mode(create))
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(share_mode)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = if create {
         options.create_new(true).open(path).or_else(|error| {
@@ -1005,7 +1299,7 @@ fn open_runtime_file(path: &Path, create: bool) -> Result<std::fs::File, Protect
                     .read(true)
                     .write(true)
                     .access_mode(runtime_file_access_mode(true))
-                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .share_mode(share_mode)
                     .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                     .open(path)
             } else {
@@ -1665,6 +1959,24 @@ fn open_user_owned_directory_contour(
 }
 
 #[cfg(windows)]
+fn open_user_owned_directory_read_only_contour(
+    root: &Path,
+    relative: &Path,
+    sid: &str,
+) -> Result<Vec<std::fs::File>, ProtectedPathError> {
+    let mut directories = vec![open_user_owned_directory_read_only(root, sid)?];
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(ProtectedPathError::InvalidPath);
+        };
+        current.push(component);
+        directories.push(open_user_owned_directory_read_only(&current, sid)?);
+    }
+    Ok(directories)
+}
+
+#[cfg(windows)]
 fn open_user_owned_file(path: &Path, sid: &str) -> Result<std::fs::File, ProtectedPathError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1686,6 +1998,84 @@ fn open_user_owned_file(path: &Path, sid: &str) -> Result<std::fs::File, Protect
     }
     protect_user_owned_opened_handle(&file, false, sid)?;
     Ok(file)
+}
+
+#[cfg(windows)]
+fn open_user_owned_file_read_only(
+    path: &Path,
+    sid: &str,
+) -> Result<std::fs::File, ProtectedPathError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_GENERIC_READ)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+    if !metadata.is_file() {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProtectedPathError::ReparsePoint);
+    }
+    ensure_single_user_file_link(&file)?;
+    verify_user_owned_opened_handle_read_only(&file, sid)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn ensure_single_user_file_link(file: &std::fs::File) -> Result<(), ProtectedPathError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let observed = unsafe {
+        // SAFETY: the retained file handle is live and the output points to
+        // initialized storage for the documented structure.
+        GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut information)
+    };
+    if observed == 0 || information.nNumberOfLinks != 1 {
+        return Err(ProtectedPathError::Io);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_same_handle_twice(
+    file: &std::fs::File,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ProtectedPathError> {
+    fn read_once(file: &std::fs::File, max_bytes: u64) -> Result<Vec<u8>, ProtectedPathError> {
+        let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+        if metadata.len() > max_bytes {
+            return Err(ProtectedPathError::SizeExceeded);
+        }
+        let mut clone = file.try_clone().map_err(|_| ProtectedPathError::Io)?;
+        clone
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| ProtectedPathError::Io)?;
+        let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+        clone
+            .read_to_end(&mut bytes)
+            .map_err(|_| ProtectedPathError::Io)?;
+        if bytes.len() as u64 != metadata.len() {
+            return Err(ProtectedPathError::Io);
+        }
+        Ok(bytes)
+    }
+    let first = read_once(file, max_bytes)?;
+    let second = read_once(file, max_bytes)?;
+    if first != second {
+        return Err(ProtectedPathError::Io);
+    }
+    Ok(first)
 }
 
 /// Creates and protects one `ProgramData` descendant directory.  Components
@@ -9456,6 +9846,98 @@ pub fn current_process_named_pipe_expectation()
     NamedPipePeerExpectation::new(sid, session_id)
 }
 
+/// Exact case-insensitive Windows basename matcher used by conservative
+/// process enumeration. Directory components and prefixes never match.
+#[must_use]
+pub fn process_basename_matches(observed: &str, expected: &str) -> bool {
+    std::path::Path::new(observed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+}
+
+/// Reports whether any process currently has the exact requested basename.
+/// This helper deliberately does not infer ownership, path, or identity.
+///
+/// # Errors
+///
+/// Returns an adapter error for an invalid basename, an unavailable process
+/// snapshot, or an unsupported platform.
+pub fn any_running_process_named(basename: &str) -> Result<bool, WindowsAdapterError> {
+    if basename.is_empty()
+        || std::path::Path::new(basename)
+            .file_name()
+            .and_then(|v| v.to_str())
+            != Some(basename)
+    {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(last_windows_adapter_error());
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
+                .map_err(|_| WindowsAdapterError::Failed)?,
+            ..Default::default()
+        };
+        let mut matched = false;
+        let first = unsafe { Process32FirstW(snapshot, &raw mut entry) } != 0;
+        let mut terminal_error = 0_u32;
+        if first {
+            loop {
+                let length = entry
+                    .szExeFile
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+                if process_basename_matches(&name, basename) {
+                    matched = true;
+                    break;
+                }
+                if unsafe { Process32NextW(snapshot, &raw mut entry) } == 0 {
+                    terminal_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                    break;
+                }
+            }
+        } else {
+            terminal_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        }
+        unsafe { CloseHandle(snapshot) };
+        if matched || terminal_error == ERROR_NO_MORE_FILES {
+            Ok(matched)
+        } else {
+            let error_code = i32::try_from(terminal_error).unwrap_or(i32::MAX);
+            let error = std::io::Error::from_raw_os_error(error_code);
+            Err(windows_adapter_from_io(&error))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = basename;
+        Err(WindowsAdapterError::Unavailable)
+    }
+}
+
+/// Conservative fixed-name observation for the legacy Governor executable.
+///
+/// # Errors
+///
+/// Propagates process snapshot errors from [`any_running_process_named`].
+pub fn is_eliot_governor_running() -> Result<bool, WindowsAdapterError> {
+    any_running_process_named("eliot-governor.exe")
+}
+
 #[cfg(not(windows))]
 pub fn current_process_named_pipe_expectation()
 -> Result<NamedPipePeerExpectation, WindowsAdapterError> {
@@ -14382,6 +14864,68 @@ fn inspect_session(_request: &SessionRequest) -> PortOutcome<SessionObservation>
 mod tests {
     use super::*;
 
+    #[test]
+    fn governor_process_basename_matching_is_exact_and_case_insensitive() {
+        assert!(process_basename_matches(
+            "eliot-governor.exe",
+            "eliot-governor.exe"
+        ));
+        assert!(process_basename_matches(
+            "ELIOT-GOVERNOR.EXE",
+            "eliot-governor.exe"
+        ));
+        assert!(!process_basename_matches(
+            "other-eliot-governor.exe",
+            "eliot-governor.exe"
+        ));
+        assert!(!process_basename_matches(
+            r"C:\evil\eliot-governor.exe.bak",
+            "eliot-governor.exe"
+        ));
+        assert!(!process_basename_matches(
+            "eliot-governor.exe.tmp",
+            "eliot-governor.exe"
+        ));
+    }
+
+    #[test]
+    fn process_scan_rejects_path_prefixes() {
+        assert_eq!(
+            any_running_process_named("nested/eliot-governor.exe"),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_known_folder_root_is_provisional_absence() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-local-config-absent-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let config = root.join("config").join("governor.toml");
+        let observed = observe_fixed_local_app_data_config(&root, &config, 4096)
+            .expect("missing root observation");
+        assert!(observed.is_provisional_absent());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_known_folder_config_directory_is_provisional_absence() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-local-config-parent-absent-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir(&root).expect("known-folder root fixture");
+        let config = root.join("config").join("governor.toml");
+        let observed = observe_fixed_local_app_data_config(&root, &config, 4096)
+            .expect("missing config directory observation");
+        assert!(observed.is_provisional_absent());
+        std::fs::remove_dir(&root).expect("root cleanup");
+    }
+
     #[cfg(windows)]
     static PROCESS_JOB_SPAWN_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
@@ -14962,6 +15506,36 @@ mod tests {
             b"receipt-v2"
         );
         drop(final_lease);
+        drop(root_override);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exclusive_runtime_read_lease_blocks_writers() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-platform-exclusive-lease-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).expect("test root");
+        let root_override = test_support::override_protected_root(&root);
+        let host = root.join("host");
+        prepare_protected_directory(&host).expect("protected host root");
+        let path = host.join("generation.json");
+        std::fs::write(&path, b"generation").expect("generation fixture");
+
+        let lease = ProtectedRuntimePathLease::open_existing_absolute_exclusive(&path)
+            .expect("exclusive runtime lease");
+        assert_eq!(
+            lease.read_bounded(64).expect("retained read"),
+            b"generation"
+        );
+        assert!(
+            std::fs::write(&path, b"tampered").is_err(),
+            "exclusive lease must deny a competing writer"
+        );
+        drop(lease);
         drop(root_override);
         let _ = std::fs::remove_dir_all(root);
     }
