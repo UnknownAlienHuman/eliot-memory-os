@@ -15247,8 +15247,44 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                     Ok(secret) => secret,
                     Err(error) => return secret_outcome(error),
                 };
-                let created = match self.primitive.create(&spec, &expected) {
-                    Ok(created) => created,
+                let created = match self.primitive.create_attempt(&spec, &expected) {
+                    Ok(eliot_platform_windows::InstallerRootCreateAttempt::Complete(created)) => {
+                        created
+                    }
+                    Ok(eliot_platform_windows::InstallerRootCreateAttempt::Failed {
+                        disposition: InstallerRootCreateDisposition::Created,
+                        error,
+                    }) => {
+                        let pending = port_pending(root_execution_error::<()>(error));
+                        return PortOutcome::Partial {
+                            value: InstallationEffectExecution {
+                                evidence: Vec::new(),
+                                create_disposition: Some(InstallationCreateDisposition::Created),
+                                credential_receipt: None,
+                                staging_receipt: None,
+                                phase_b_receipt: None,
+                                service_start_disposition: None,
+                                service_runtime_lineage: None,
+                            },
+                            missing: vec![pending],
+                        };
+                    }
+                    Ok(eliot_platform_windows::InstallerRootCreateAttempt::Failed {
+                        disposition: _disposition,
+                        error,
+                    }) => return root_execution_error(error),
+                    Ok(eliot_platform_windows::InstallerRootCreateAttempt::PreconditionRace {
+                        pending_ref,
+                    }) => {
+                        return PortOutcome::Error(PortError::ProviderReference {
+                            error: ProviderError {
+                                code: ProviderErrorCode::Failed,
+                                retryable: false,
+                            },
+                            reference: PlatformHandle::new(pending_ref)
+                                .unwrap_or_else(|_| unreachable!()),
+                        });
+                    }
                     Err(error) => return root_execution_error(error),
                 };
                 if created.disposition == InstallerRootCreateDisposition::AlreadyExists {
@@ -15283,7 +15319,21 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                         });
                 let marker = match receipt_result {
                     Ok(marker) => marker,
-                    Err(error) => return root_execution_error(error),
+                    Err(error) => {
+                        let pending = port_pending(root_execution_error::<()>(error));
+                        return PortOutcome::Partial {
+                            value: InstallationEffectExecution {
+                                evidence: Vec::new(),
+                                create_disposition: Some(InstallationCreateDisposition::Created),
+                                credential_receipt: None,
+                                staging_receipt: None,
+                                phase_b_receipt: None,
+                                service_start_disposition: None,
+                                service_runtime_lineage: None,
+                            },
+                            missing: vec![pending],
+                        };
+                    }
                 };
                 let evidence = PlatformHandle::new(root_marker_digest(&root, &marker))
                     .unwrap_or_else(|_| unreachable!());
@@ -16875,11 +16925,35 @@ fn root_port_error(error: InstallerRootError) -> PortError {
             code: ProviderErrorCode::PermissionDenied,
             retryable: false,
         }),
+        InstallerRootError::Win32 { stage, code } => PortError::ProviderReference {
+            error: ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            },
+            reference: installer_root_reference(stage, code),
+        },
         _ => PortError::Provider(ProviderError {
             code: ProviderErrorCode::Unavailable,
             retryable: false,
         }),
     }
+}
+
+fn installer_root_reference(stage: InstallerRootStage, code: u32) -> PlatformHandle {
+    let prefix = if matches!(
+        stage,
+        InstallerRootStage::OpenReadback | InstallerRootStage::Readback
+    ) && is_absence_status(code)
+    {
+        "installer-root-absence-race-v1"
+    } else {
+        "installer-root-win32-v2"
+    };
+    PlatformHandle::new(format!(
+        "{prefix}:{}:{code:08x}",
+        installer_root_stage_token(stage),
+    ))
+    .unwrap_or_else(|_| unreachable!())
 }
 
 fn secret_port_error(error: eliot_platform_windows::WindowsAdapterError) -> PortError {
@@ -16938,17 +17012,12 @@ fn root_execution_error<T>(error: InstallerRootError) -> PortOutcome<T> {
         | InstallerRootError::IdentityMismatch
         | InstallerRootError::Indeterminate => PortOutcome::Unknown(UnknownReason::Indeterminate),
         InstallerRootError::Win32 { stage, code } => {
-            let reference = PlatformHandle::new(format!(
-                "installer-root-win32-v2:{}:{code:08x}",
-                installer_root_stage_token(stage),
-            ))
-            .unwrap_or_else(|_| unreachable!());
             PortOutcome::Error(PortError::ProviderReference {
                 error: ProviderError {
                     code: ProviderErrorCode::Failed,
                     retryable: false,
                 },
-                reference,
+                reference: installer_root_reference(stage, code),
             })
         }
         InstallerRootError::InvalidPath | InstallerRootError::MissingParent => {
@@ -16981,6 +17050,10 @@ fn installer_root_stage_token(stage: InstallerRootStage) -> &'static str {
         InstallerRootStage::OpenReadback => "open-readback",
         InstallerRootStage::Readback => "readback",
     }
+}
+
+fn is_absence_status(code: u32) -> bool {
+    matches!(code, 2 | 3)
 }
 
 mod transaction_store_private {
@@ -17862,6 +17935,47 @@ where
                 }
                 let execution = match self.port.execute(&request) {
                     PortOutcome::Known(execution) => execution,
+                    PortOutcome::Partial { value, missing }
+                        if matches!(
+                            transaction.installer_effects[index],
+                            InstallerEffectPlan::CreateRoot { .. }
+                        ) && value.create_disposition
+                            == Some(InstallationCreateDisposition::Created) =>
+                    {
+                        let expected = TransactionVersion::of(&transaction)?;
+                        let Some(ownership) =
+                            transaction.effect_progress[index].ownership_secret.as_mut()
+                        else {
+                            return self.persist_unknown(
+                                transaction,
+                                index,
+                                PlatformHandle::new("mismatch:missing-ownership-secret")
+                                    .map_err(|error| platform_error(&error))?,
+                            );
+                        };
+                        ownership.create_disposition = InstallationCreateDisposition::Created;
+                        increment_revision(&mut transaction)?;
+                        transaction.validate()?;
+                        self.store.compare_and_save(expected, &transaction)?;
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            missing.into_iter().next().unwrap_or_else(|| {
+                                PlatformHandle::new("unknown:partial")
+                                    .unwrap_or_else(|_| unreachable!())
+                            }),
+                        );
+                    }
+                    PortOutcome::Partial { missing, .. } => {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            missing.into_iter().next().unwrap_or_else(|| {
+                                PlatformHandle::new("unknown:partial")
+                                    .unwrap_or_else(|_| unreachable!())
+                            }),
+                        );
+                    }
                     PortOutcome::Unknown(_reason)
                         if matches!(
                             transaction.installer_effects[index],
@@ -19364,10 +19478,16 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
 }
 
 fn is_typed_installer_root_reference(value: &str) -> bool {
-    let mut parts = value.split(':');
-    if parts.next() != Some("installer-root-win32-v2") {
-        return false;
+    if value == "installer-root-absence-race-v1:precondition" {
+        return true;
     }
+    let Some(rest) = value
+        .strip_prefix("installer-root-win32-v2:")
+        .or_else(|| value.strip_prefix("installer-root-absence-race-v1:"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split(':');
     let Some(stage) = parts.next() else {
         return false;
     };
@@ -20042,10 +20162,51 @@ mod tests {
     }
 
     #[test]
+    fn root_absence_race_uses_a_stable_semantic_pending_reference() {
+        let pending = port_pending(root_execution_error::<()>(InstallerRootError::Win32 {
+            stage: InstallerRootStage::OpenReadback,
+            code: 2,
+        }));
+        assert_eq!(
+            pending.as_str(),
+            "installer-root-absence-race-v1:open-readback:00000002"
+        );
+    }
+
+    #[test]
+    fn root_precondition_absence_race_reference_is_stable_and_persistable() {
+        let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {
+            error: ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            },
+            reference: test_handle("installer-root-absence-race-v1:precondition"),
+        }));
+        assert_eq!(
+            pending.as_str(),
+            "installer-root-absence-race-v1:precondition"
+        );
+    }
+
+    #[test]
+    fn root_readback_win32_error_remains_typed_for_inspection() {
+        let error = root_port_error(InstallerRootError::Win32 {
+            stage: InstallerRootStage::Readback,
+            code: 0xDEAD,
+        });
+        assert!(matches!(
+            error,
+            PortError::ProviderReference { reference, .. }
+                if reference.as_str() == "installer-root-win32-v2:readback:0000dead"
+        ));
+    }
+
+    #[test]
     fn provider_references_are_persisted_only_for_strict_win32_observability_codes() {
         let valid = [
             "installer-root-win32-v2:open-thread-token:00000000",
             "installer-root-win32-v2:readback:ffffffff",
+            "installer-root-absence-race-v1:open-readback:00000002",
         ];
         for reference in valid {
             let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {
@@ -23979,6 +24140,53 @@ mod tests {
             saved.effect_progress[0].state,
             InstallationEffectProgressState::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn partial_created_root_persists_disposition_and_never_resends_apply() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let mut port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            vec![PortOutcome::Unknown(UnknownReason::Indeterminate)],
+            execute_count.clone(),
+        );
+        port.execute_outcomes.push_back(PortOutcome::Partial {
+            value: InstallationEffectExecution {
+                evidence: Vec::new(),
+                create_disposition: Some(InstallationCreateDisposition::Created),
+                credential_receipt: None,
+                staging_receipt: None,
+                phase_b_receipt: None,
+                service_start_disposition: None,
+                service_runtime_lineage: None,
+            },
+            missing: vec![test_handle("installer-root-win32-v2:readback:00000005")],
+        });
+        let mut coordinator = InstallationCoordinator::new(port, store.clone());
+        assert!(matches!(
+            must(coordinator.drive_effect(&transaction_id)),
+            InstallationStepOutcome::RollbackRequired { .. }
+        ));
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            saved.effect_progress[0]
+                .ownership_secret
+                .as_ref()
+                .unwrap_or_else(|| unreachable!())
+                .create_disposition,
+            InstallationCreateDisposition::Created
+        );
+        assert!(matches!(
+            saved.effect_progress[0].state,
+            InstallationEffectProgressState::Unknown { .. }
+        ));
+        let _ = coordinator.drive_effect(&transaction_id);
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
     }
 
     #[test]

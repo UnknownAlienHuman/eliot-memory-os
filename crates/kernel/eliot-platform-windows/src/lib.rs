@@ -86,10 +86,10 @@ pub use installer_authority_key::{
     WindowsInstallationAuthorityKeyProvider, WindowsInstallationAuthorityKeyStore,
 };
 pub use installer_root::{
-    InstallerProtectedFileReadback, InstallerRootAbsentSnapshot, InstallerRootCreateDisposition,
-    InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveCreate,
-    InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
-    InstallerRootStage, WindowsInstallerRootPrimitive, is_process_elevated,
+    InstallerProtectedFileReadback, InstallerRootAbsentSnapshot, InstallerRootCreateAttempt,
+    InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
+    InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
+    InstallerRootProfile, InstallerRootStage, WindowsInstallerRootPrimitive, is_process_elevated,
     windows_path_identity_digest, windows_paths_equal,
 };
 pub use owned_directory_retirement::{

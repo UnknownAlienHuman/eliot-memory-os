@@ -7,9 +7,12 @@ use sha2::{Digest, Sha256};
 
 use super::{
     FileIdentity, OwnedSecurityDescriptor, ProtectedPathError, current_process_sid,
-    current_user_local_app_data_root, file_identity_from_handle, final_windows_path_from_handle,
-    protected_program_data_root, sid_to_string,
+    current_user_local_app_data_root, file_identity_from_handle, protected_program_data_root,
+    sid_to_string,
 };
+
+#[cfg(not(windows))]
+use super::final_windows_path_from_handle;
 
 const RECEIPT_LIMIT: u64 = 16 * 1024;
 
@@ -148,7 +151,7 @@ impl WindowsInstallerRootExecutor {
     fn readback(request: &InstallerRootRequest) -> Result<Readback, InstallerRootError> {
         match std::fs::symlink_metadata(&request.root) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Readback::Absent),
-            Err(_) => Err(InstallerRootError::Indeterminate),
+            Err(error) => Err(map_io_error(InstallerRootStage::Readback, &error)),
             Ok(metadata) if metadata.file_type().is_symlink() => Ok(Readback::Mismatch),
             Ok(metadata) if !metadata.is_dir() => Ok(Readback::Mismatch),
             Ok(_) => match open_and_readback(&request.root, request.profile, true, false) {
@@ -315,6 +318,25 @@ pub struct InstallerRootPrimitiveCreate {
     pub root: Option<InstallerRootObjectSnapshot>,
 }
 
+/// Outcome of a root create attempt, retaining the OS create disposition when
+/// post-create readback fails.
+#[derive(Debug)]
+pub enum InstallerRootCreateAttempt {
+    /// The create call and complete identity/security readback succeeded.
+    Complete(InstallerRootPrimitiveCreate),
+    /// The directory was created, but bounded post-create readback failed.
+    Failed {
+        disposition: InstallerRootCreateDisposition,
+        error: InstallerRootError,
+    },
+    /// The target appeared while the pinned absence precondition was being
+    /// established; no create call was issued.
+    PreconditionRace {
+        /// Stable semantic reference for the known target-appearance race.
+        pending_ref: &'static str,
+    },
+}
+
 /// Bounded protected-file readback used by the sealed installation adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallerProtectedFileReadback {
@@ -372,24 +394,67 @@ impl WindowsInstallerRootPrimitive {
         spec: &InstallerRootPrimitiveSpec,
         expected: &InstallerRootAbsentSnapshot,
     ) -> Result<InstallerRootPrimitiveCreate, InstallerRootError> {
+        match self.create_attempt(spec, expected)? {
+            InstallerRootCreateAttempt::Complete(value) => Ok(value),
+            InstallerRootCreateAttempt::Failed { error, .. } => Err(error),
+            InstallerRootCreateAttempt::PreconditionRace { .. } => {
+                Err(InstallerRootError::IdentityMismatch)
+            }
+        }
+    }
+
+    /// Performs a create while retaining the raw create disposition if
+    /// post-create identity/security readback fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, precondition, privilege or create-call error
+    /// before a disposition can be retained.
+    pub fn create_attempt(
+        &self,
+        spec: &InstallerRootPrimitiveSpec,
+        expected: &InstallerRootAbsentSnapshot,
+    ) -> Result<InstallerRootCreateAttempt, InstallerRootError> {
         let request = primitive_request(spec);
         self.executor.validate_request(&request)?;
-        let pinned = observe_absence(&request)?;
+        let pinned = match observe_absence(&request) {
+            Ok(pinned) => pinned,
+            Err(InstallerRootError::IdentityMismatch)
+                if std::fs::symlink_metadata(&request.root).is_ok() =>
+            {
+                return Ok(InstallerRootCreateAttempt::PreconditionRace {
+                    pending_ref: "installer-root-absence-race-v1:precondition",
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if &pinned.snapshot != expected {
             return Err(InstallerRootError::IdentityMismatch);
         }
         with_system_restore_privilege(spec.profile, || {
             if !create_directory_atomic(spec.profile, &spec.root)? {
-                return Ok(InstallerRootPrimitiveCreate {
-                    disposition: InstallerRootCreateDisposition::AlreadyExists,
-                    root: None,
-                });
+                return Ok(InstallerRootCreateAttempt::Complete(
+                    InstallerRootPrimitiveCreate {
+                        disposition: InstallerRootCreateDisposition::AlreadyExists,
+                        root: None,
+                    },
+                ));
             }
-            let root = open_and_readback(&spec.root, spec.profile, true, false)?;
-            Ok(InstallerRootPrimitiveCreate {
-                disposition: InstallerRootCreateDisposition::Created,
-                root: Some(root.object_snapshot()),
-            })
+            let root = match open_and_readback(&spec.root, spec.profile, true, false) {
+                Ok(root) => root,
+                Err(error) => {
+                    return Ok(InstallerRootCreateAttempt::Failed {
+                        disposition: InstallerRootCreateDisposition::Created,
+                        error,
+                    });
+                }
+            };
+            Ok(InstallerRootCreateAttempt::Complete(
+                InstallerRootPrimitiveCreate {
+                    disposition: InstallerRootCreateDisposition::Created,
+                    root: Some(root.object_snapshot()),
+                },
+            ))
         })
     }
 
@@ -631,7 +696,7 @@ fn observe_absence(
     match std::fs::symlink_metadata(&request.root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(_) => return Err(InstallerRootError::IdentityMismatch),
-        Err(_) => return Err(InstallerRootError::Indeterminate),
+        Err(error) => return Err(map_io_error(InstallerRootStage::Readback, &error)),
     }
     let parent = request
         .root
@@ -647,12 +712,11 @@ fn observe_absence(
             InstallerRootError::Indeterminate => InstallerRootError::MissingParent,
             other => other,
         })?;
-        let canonical = final_windows_path_from_handle(&pin).map_err(map_protected_error)?;
+        let canonical = canonical_path_from_handle(&pin, InstallerRootStage::Readback)?;
         if !windows_paths_equal(&canonical, &path) {
             return Err(InstallerRootError::IdentityMismatch);
         }
-        let identity =
-            file_identity_from_handle(&pin).map_err(|_| InstallerRootError::Indeterminate)?;
+        let identity = file_identity_from_handle_staged(&pin, InstallerRootStage::Readback)?;
         let snapshot = InstallerRootObjectSnapshot {
             canonical_path_digest: windows_path_digest(&canonical),
             volume_serial_number: identity.volume_serial_number,
@@ -673,7 +737,7 @@ fn observe_absence(
     match std::fs::symlink_metadata(&request.root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(_) => return Err(InstallerRootError::IdentityMismatch),
-        Err(_) => return Err(InstallerRootError::Indeterminate),
+        Err(error) => return Err(map_io_error(InstallerRootStage::Readback, &error)),
     }
     Ok(PinnedAbsentSnapshot {
         snapshot: InstallerRootAbsentSnapshot {
@@ -748,12 +812,11 @@ where
         // SAFETY: handle is newly created and uniquely owned.
         std::fs::File::from_raw_handle(handle.cast())
     };
-    let canonical = final_windows_path_from_handle(&file).map_err(map_protected_error)?;
+    let canonical = canonical_path_from_handle(&file, InstallerRootStage::Readback)?;
     if !windows_paths_equal(&canonical, path) {
         return Err(InstallerRootError::IdentityMismatch);
     }
-    let identity =
-        file_identity_from_handle(&file).map_err(|_| InstallerRootError::Indeterminate)?;
+    let identity = file_identity_from_handle_staged(&file, InstallerRootStage::Readback)?;
     let object = InstallerRootObjectSnapshot {
         canonical_path_digest: windows_path_digest(&canonical),
         volume_serial_number: identity.volume_serial_number,
@@ -766,7 +829,7 @@ where
     }
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|_| InstallerRootError::Indeterminate)?;
+        .map_err(|error| map_io_error(InstallerRootStage::Readback, &error))?;
     let final_digest = verify_protected_file_security(&file, security)?;
     if final_digest != object.security_descriptor_digest {
         return Err(InstallerRootError::SecurityMismatch);
@@ -793,16 +856,18 @@ fn read_protected_file(
 ) -> Result<InstallerProtectedFileReadback, InstallerRootError> {
     use std::io::Read as _;
 
+    #[cfg(windows)]
+    let file = open_no_follow_staged(path, false, false, true)?;
+    #[cfg(not(windows))]
     let file = open_no_follow(path, false, false)?;
-    let canonical = final_windows_path_from_handle(&file).map_err(map_protected_error)?;
+    let canonical = canonical_path_from_handle(&file, InstallerRootStage::Readback)?;
     if !windows_paths_equal(&canonical, path) {
         return Err(InstallerRootError::IdentityMismatch);
     }
-    let identity =
-        file_identity_from_handle(&file).map_err(|_| InstallerRootError::Indeterminate)?;
+    let identity = file_identity_from_handle_staged(&file, InstallerRootStage::Readback)?;
     let metadata = file
         .metadata()
-        .map_err(|_| InstallerRootError::Indeterminate)?;
+        .map_err(|error| map_io_error(InstallerRootStage::Readback, &error))?;
     if metadata.len() > limit {
         return Err(InstallerRootError::ReceiptMismatch);
     }
@@ -815,7 +880,7 @@ fn read_protected_file(
     let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|_| InstallerRootError::Indeterminate)?;
+        .map_err(|error| map_io_error(InstallerRootStage::Readback, &error))?;
     if bytes.len() as u64 > limit {
         return Err(InstallerRootError::ReceiptMismatch);
     }
@@ -848,19 +913,18 @@ fn rewrite_protected_file(
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let mut file = options
         .open(path)
-        .map_err(|_| InstallerRootError::Indeterminate)?;
+        .map_err(|error| map_io_error(InstallerRootStage::OpenReadback, &error))?;
     let metadata = file
         .metadata()
-        .map_err(|_| InstallerRootError::Indeterminate)?;
+        .map_err(|error| map_io_error(InstallerRootStage::Readback, &error))?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || metadata.is_dir() {
         return Err(InstallerRootError::ReparsePoint);
     }
-    let canonical = final_windows_path_from_handle(&file).map_err(map_protected_error)?;
+    let canonical = canonical_path_from_handle(&file, InstallerRootStage::Readback)?;
     if !windows_paths_equal(&canonical, path) {
         return Err(InstallerRootError::IdentityMismatch);
     }
-    let identity =
-        file_identity_from_handle(&file).map_err(|_| InstallerRootError::Indeterminate)?;
+    let identity = file_identity_from_handle_staged(&file, InstallerRootStage::Readback)?;
     let actual = InstallerRootObjectSnapshot {
         canonical_path_digest: windows_path_digest(&canonical),
         volume_serial_number: identity.volume_serial_number,
@@ -874,7 +938,7 @@ fn rewrite_protected_file(
         .and_then(|()| file.rewind())
         .and_then(|()| file.write_all(bytes))
         .and_then(|()| file.sync_all())
-        .map_err(|_| InstallerRootError::Indeterminate)?;
+        .map_err(|error| map_io_error(InstallerRootStage::Readback, &error))?;
     drop(file);
     let readback = read_protected_file(security, path, RECEIPT_LIMIT)?;
     if readback.object != *expected || readback.bytes != bytes {
@@ -1501,9 +1565,13 @@ fn open_no_follow_staged(
             InstallerRootError::Indeterminate
         }
     })?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| InstallerRootError::Indeterminate)?;
+    let metadata = file.metadata().map_err(|error| {
+        if report_win32 {
+            map_io_error(InstallerRootStage::OpenReadback, &error)
+        } else {
+            InstallerRootError::Indeterminate
+        }
+    })?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(InstallerRootError::ReparsePoint);
     }
@@ -1532,12 +1600,11 @@ fn open_and_readback(
     let file = open_no_follow_staged(path, directory, delete, true)?;
     #[cfg(not(windows))]
     let file = open_no_follow(path, directory, delete)?;
-    let canonical_path = final_windows_path_from_handle(&file).map_err(map_protected_error)?;
+    let canonical_path = canonical_path_from_handle(&file, InstallerRootStage::Readback)?;
     if !windows_paths_equal(&canonical_path, path) {
         return Err(InstallerRootError::IdentityMismatch);
     }
-    let identity =
-        file_identity_from_handle(&file).map_err(|_| InstallerRootError::Indeterminate)?;
+    let identity = file_identity_from_handle_staged(&file, InstallerRootStage::Readback)?;
     let security_descriptor_digest = verify_security(&file, profile, directory)?;
     Ok(RootReadback {
         file,
@@ -1627,13 +1694,14 @@ fn verify_protected_file_security(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_lines)]
 fn verify_security_exact(
     file: &std::fs::File,
     expected: &OwnedSecurityDescriptor,
     expected_owner: &str,
 ) -> Result<String, InstallerRootError> {
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorLength,
@@ -1663,37 +1731,60 @@ fn verify_security_exact(
         if !descriptor.is_null() {
             unsafe { LocalFree(descriptor.cast()) };
         }
-        return Err(InstallerRootError::Indeterminate);
+        return Err(InstallerRootError::Win32 {
+            stage: InstallerRootStage::Readback,
+            code: if status == ERROR_SUCCESS {
+                unsafe { GetLastError() }
+            } else {
+                status
+            },
+        });
     }
     let mut present = 0;
     let mut actual_dacl = std::ptr::null_mut();
     let mut defaulted = 0;
-    let dacl_matches = unsafe {
+    let dacl_ok = unsafe {
         // SAFETY: both descriptors remain live for these bounded ACL reads.
         GetSecurityDescriptorDacl(
             descriptor,
             &raw mut present,
             &raw mut actual_dacl,
             &raw mut defaulted,
-        ) != 0
-            && present != 0
-            && !actual_dacl.is_null()
-            && (*actual_dacl).AclSize == (*expected_dacl).AclSize
-            && std::slice::from_raw_parts(
-                actual_dacl.cast::<u8>(),
-                usize::from((*actual_dacl).AclSize),
-            ) == std::slice::from_raw_parts(
-                expected_dacl.cast::<u8>(),
-                usize::from((*expected_dacl).AclSize),
-            )
+        )
     };
+    if dacl_ok == 0 {
+        unsafe { LocalFree(descriptor.cast()) };
+        return Err(InstallerRootError::Win32 {
+            stage: InstallerRootStage::Readback,
+            code: unsafe { GetLastError() },
+        });
+    }
+    let dacl_matches = present != 0
+        && !actual_dacl.is_null()
+        && unsafe {
+            (*actual_dacl).AclSize == (*expected_dacl).AclSize
+                && std::slice::from_raw_parts(
+                    actual_dacl.cast::<u8>(),
+                    usize::from((*actual_dacl).AclSize),
+                ) == std::slice::from_raw_parts(
+                    expected_dacl.cast::<u8>(),
+                    usize::from((*expected_dacl).AclSize),
+                )
+        };
     let mut control = 0_u16;
     let mut revision = 0_u32;
-    let protected = unsafe {
+    let control_ok = unsafe {
         // SAFETY: descriptor remains live and output locals are valid.
-        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
-            && control & SE_DACL_PROTECTED != 0
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision)
     };
+    if control_ok == 0 {
+        unsafe { LocalFree(descriptor.cast()) };
+        return Err(InstallerRootError::Win32 {
+            stage: InstallerRootStage::Readback,
+            code: unsafe { GetLastError() },
+        });
+    }
+    let protected = control & SE_DACL_PROTECTED != 0;
     let observed_owner = (!owner.is_null())
         .then(|| sid_to_string(owner).ok())
         .flatten();
@@ -1714,13 +1805,16 @@ fn verify_security_exact(
     if !dacl_matches || !protected || !owner_matches {
         return Err(InstallerRootError::SecurityMismatch);
     }
-    descriptor_digest.ok_or(InstallerRootError::Indeterminate)
+    descriptor_digest.ok_or_else(|| InstallerRootError::Win32 {
+        stage: InstallerRootStage::Readback,
+        code: unsafe { GetLastError() },
+    })
 }
 
 #[cfg(windows)]
 fn observe_security_descriptor_digest(file: &std::fs::File) -> Result<String, InstallerRootError> {
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         GetSecurityDescriptorControl, GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
@@ -1744,19 +1838,33 @@ fn observe_security_descriptor_digest(file: &std::fs::File) -> Result<String, In
         if !descriptor.is_null() {
             unsafe { LocalFree(descriptor.cast()) };
         }
-        return Err(InstallerRootError::Indeterminate);
+        return Err(InstallerRootError::Win32 {
+            stage: InstallerRootStage::Readback,
+            code: if status == ERROR_SUCCESS {
+                unsafe { GetLastError() }
+            } else {
+                status
+            },
+        });
     }
     let mut control = 0_u16;
     let mut revision = 0_u32;
     let control_ok = unsafe {
         // SAFETY: descriptor is live and output locals are valid.
-        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision)
     };
+    if control_ok == 0 {
+        unsafe { LocalFree(descriptor.cast()) };
+        return Err(InstallerRootError::Win32 {
+            stage: InstallerRootStage::Readback,
+            code: unsafe { GetLastError() },
+        });
+    }
     let length = unsafe {
         // SAFETY: descriptor is live and Windows returns its bounded byte length.
         GetSecurityDescriptorLength(descriptor)
     } as usize;
-    let digest_value = if control_ok && length != 0 {
+    let digest_value = if length != 0 {
         Some(unsafe {
             // SAFETY: Windows reported `length` for this live descriptor.
             digest(std::slice::from_raw_parts(descriptor.cast::<u8>(), length))
@@ -1765,7 +1873,10 @@ fn observe_security_descriptor_digest(file: &std::fs::File) -> Result<String, In
         None
     };
     unsafe { LocalFree(descriptor.cast()) };
-    digest_value.ok_or(InstallerRootError::Indeterminate)
+    digest_value.ok_or_else(|| InstallerRootError::Win32 {
+        stage: InstallerRootStage::Readback,
+        code: unsafe { GetLastError() },
+    })
 }
 
 #[cfg(not(windows))]
@@ -2038,6 +2149,118 @@ fn map_protected_error(error: ProtectedPathError) -> InstallerRootError {
     }
 }
 
+fn map_io_error(stage: InstallerRootStage, error: &std::io::Error) -> InstallerRootError {
+    error
+        .raw_os_error()
+        .map_or(InstallerRootError::Indeterminate, |code| {
+            u32::try_from(code).map_or(InstallerRootError::Indeterminate, |code| {
+                InstallerRootError::Win32 { stage, code }
+            })
+        })
+}
+
+#[cfg(windows)]
+fn canonical_path_from_handle(
+    file: &std::fs::File,
+    stage: InstallerRootStage,
+) -> Result<PathBuf, InstallerRootError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    let handle = file.as_raw_handle().cast();
+    let required = unsafe {
+        // SAFETY: query call uses a live retained handle and no output buffer.
+        GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0)
+    };
+    if required == 0 {
+        return Err(InstallerRootError::Win32 {
+            stage,
+            code: unsafe { GetLastError() },
+        });
+    }
+    let capacity = usize::try_from(required)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or(InstallerRootError::Indeterminate)?;
+    let mut buffer = vec![0_u16; capacity];
+    let written = unsafe {
+        // SAFETY: buffer is writable for the declared length and handle remains live.
+        GetFinalPathNameByHandleW(
+            handle,
+            buffer.as_mut_ptr(),
+            u32::try_from(buffer.len()).map_err(|_| InstallerRootError::Indeterminate)?,
+            0,
+        )
+    };
+    let written = usize::try_from(written).map_err(|_| InstallerRootError::Indeterminate)?;
+    if written == 0 || written >= buffer.len() {
+        return Err(InstallerRootError::Win32 {
+            stage,
+            code: unsafe { GetLastError() },
+        });
+    }
+    let path =
+        String::from_utf16(&buffer[..written]).map_err(|_| InstallerRootError::InvalidPath)?;
+    let normalized = if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(dos) = path.strip_prefix(r"\\?\") {
+        dos.to_owned()
+    } else {
+        path
+    };
+    let normalized = PathBuf::from(normalized);
+    if !normalized.is_absolute() {
+        return Err(InstallerRootError::InvalidPath);
+    }
+    Ok(normalized)
+}
+
+#[cfg(not(windows))]
+fn canonical_path_from_handle(
+    file: &std::fs::File,
+    _stage: InstallerRootStage,
+) -> Result<PathBuf, InstallerRootError> {
+    final_windows_path_from_handle(file).map_err(map_protected_error)
+}
+
+#[cfg(windows)]
+fn file_identity_from_handle_staged(
+    file: &std::fs::File,
+    stage: InstallerRootStage,
+) -> Result<FileIdentity, InstallerRootError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let ok = unsafe {
+        // SAFETY: the handle is live and the output points to initialized storage.
+        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &raw mut information)
+    };
+    if ok == 0 {
+        return Err(InstallerRootError::Win32 {
+            stage,
+            code: unsafe { GetLastError() },
+        });
+    }
+    Ok(FileIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(not(windows))]
+fn file_identity_from_handle_staged(
+    file: &std::fs::File,
+    _stage: InstallerRootStage,
+) -> Result<FileIdentity, InstallerRootError> {
+    file_identity_from_handle(file).map_err(|_| InstallerRootError::Indeterminate)
+}
+
 fn digest_text(value: &str) -> String {
     digest(value.as_bytes())
 }
@@ -2126,6 +2349,19 @@ mod primitive_tests {
             adjusted: 0,
             closed: Vec::new(),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_readback_io_errors_keep_stage_and_win32_status() {
+        let error = std::io::Error::from_raw_os_error(5);
+        assert_eq!(
+            map_io_error(InstallerRootStage::Readback, &error),
+            InstallerRootError::Win32 {
+                stage: InstallerRootStage::Readback,
+                code: 5,
+            }
+        );
     }
 
     #[cfg(windows)]
