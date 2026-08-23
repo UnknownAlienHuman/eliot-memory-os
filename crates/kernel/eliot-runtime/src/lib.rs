@@ -8,7 +8,7 @@
 #![warn(missing_docs)]
 
 use eliot_observation_contracts::ObservationKind;
-use eliot_platform::{PortError, PortOutcome, ProviderErrorCode};
+use eliot_platform::{PortError, PortOutcome, ProviderError, ProviderErrorCode};
 use eliot_runtime_contracts::ServiceProcessState;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1225,14 +1225,21 @@ pub fn platform_result<T>(result: PortOutcome<T>) -> RuntimeResult {
             | PortError::InvalidServiceProcessRecord
             | PortError::InvalidPath => RuntimeFailure::InvalidInput,
             PortError::IdentityConflict => RuntimeFailure::Conflict,
-            PortError::Provider(provider) => match provider.code {
-                ProviderErrorCode::Unavailable => RuntimeFailure::Unavailable,
-                ProviderErrorCode::PermissionDenied => RuntimeFailure::PermissionDenied,
-                ProviderErrorCode::InvalidRequest => RuntimeFailure::InvalidInput,
-                ProviderErrorCode::Timeout => RuntimeFailure::Timeout,
-                ProviderErrorCode::Failed => RuntimeFailure::ProviderFailed,
-            },
+            PortError::Provider(provider)
+            | PortError::ProviderReference {
+                error: provider, ..
+            } => provider_runtime_failure(provider),
         }),
+    }
+}
+
+fn provider_runtime_failure(provider: ProviderError) -> RuntimeFailure {
+    match provider.code {
+        ProviderErrorCode::Unavailable => RuntimeFailure::Unavailable,
+        ProviderErrorCode::PermissionDenied => RuntimeFailure::PermissionDenied,
+        ProviderErrorCode::InvalidRequest => RuntimeFailure::InvalidInput,
+        ProviderErrorCode::Timeout => RuntimeFailure::Timeout,
+        ProviderErrorCode::Failed => RuntimeFailure::ProviderFailed,
     }
 }
 
@@ -1597,6 +1604,24 @@ mod tests {
             assert_eq!(actual, RuntimeResult::Failed(expected));
             assert_ne!(actual, RuntimeResult::Saturated);
         }
+    }
+
+    #[test]
+    fn provider_reference_maps_without_changing_runtime_classification() {
+        let outcome = PortOutcome::<()>::Error(PortError::ProviderReference {
+            error: ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            },
+            reference: eliot_platform::PlatformHandle::new(
+                "installer-root-win32-v2:create-directory:0000abcd",
+            )
+            .unwrap_or_else(|_| unreachable!()),
+        });
+        assert_eq!(
+            platform_result(outcome),
+            RuntimeResult::Failed(RuntimeFailure::ProviderFailed)
+        );
     }
 
     #[test]

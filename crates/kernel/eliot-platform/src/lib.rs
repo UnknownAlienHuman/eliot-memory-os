@@ -24,7 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 pub const CONTRACT_NAME: &str = "eliot.kernel.platform";
-pub const CONTRACT_VERSION: &str = "p-01-v1";
+pub const CONTRACT_VERSION: &str = "p-01-v2";
 
 /// A validated opaque provider/resource handle.
 #[derive(
@@ -236,6 +236,11 @@ pub enum PortError {
     InvalidPath,
     #[error("provider error: {0:?}")]
     Provider(ProviderError),
+    #[error("provider error at {reference}: {error:?}")]
+    ProviderReference {
+        error: ProviderError,
+        reference: PlatformHandle,
+    },
 }
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), PortError> {
@@ -1608,6 +1613,26 @@ mod tests {
         assert!(!format!("{:?}", schemars::schema_for!(PortOutcome<PlatformHandle>)).is_empty());
         assert!(!format!("{:?}", schemars::schema_for!(SourceEffectCeiling)).is_empty());
         assert!(context("canonical-context").validate().is_ok());
+    }
+
+    #[test]
+    fn provider_reference_serde_roundtrip_contains_only_nonsecret_metadata() {
+        let outcome = PortOutcome::<()>::Error(PortError::ProviderReference {
+            error: ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            },
+            reference: handle("installer-root-win32-v2:create-directory:0000abcd"),
+        });
+        let encoded = serde_json::to_value(&outcome).unwrap_or_else(|_| unreachable!());
+        let decoded: PortOutcome<()> =
+            serde_json::from_value(encoded.clone()).unwrap_or_else(|_| unreachable!());
+        assert_eq!(decoded, outcome);
+        assert_eq!(
+            encoded["Error"]["ProviderReference"]["reference"],
+            serde_json::json!("installer-root-win32-v2:create-directory:0000abcd")
+        );
+        assert!(!encoded.to_string().contains("provider error:"));
     }
 
     #[test]

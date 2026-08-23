@@ -25,24 +25,25 @@ use eliot_platform::{
 };
 pub use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{
-    AuthenticodeVerdict, ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
-    ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
-    ELIOT_WATCHDOG_SERVICE_NAME, FileIdentity, HostOwnerEpochCapability,
-    InstallerRootAbsentSnapshot, InstallerRootCreateDisposition, InstallerRootError,
-    InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
-    InstallerRootProfile, InstallerSecretCreateDisposition, InstallerSecretObservation,
-    PackageManifest, PackageStager, PackageStagingError, PackageStagingObservation,
-    ProtectedPathError, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    ServiceAccount, ServiceBootstrapArguments, ServiceControlGrantReadback,
-    ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
-    ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection, ServiceStartMode,
-    ServiceStartOutcome, ServiceStopOutcome, StagePackageAuthorization, StagePackageExpectedFile,
-    StagingReceipt, SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
-    TrustedSourceBundle, UserOwnedPathLease, UserOwnedRootReadLease, WindowsInstallerRootPrimitive,
-    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
-    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
-    fresh_service_registration_nonce, observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
+    AuthenticodeVerdict, CredentialSecret, ELIOT_HOST_SERVICE_DISPLAY_NAME,
+    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, FileIdentity,
+    HostOwnerEpochCapability, InstallerRootAbsentSnapshot, InstallerRootCreateDisposition,
+    InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation,
+    InstallerRootPrimitiveSpec, InstallerRootProfile, InstallerRootStage,
+    InstallerSecretCreateDisposition, InstallerSecretObservation, PackageManifest, PackageStager,
+    PackageStagingError, PackageStagingObservation, ProtectedPathError, ProtectedPathLease,
+    ProtectedRootLease, ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
+    ServiceControlGrantReadback, ServiceRegistrationCurrent, ServiceRegistrationInspection,
+    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
+    ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome, StagePackageAuthorization,
+    StagePackageExpectedFile, StagingReceipt, SupervisionAuthorityKeyError,
+    SupervisionAuthorityKeyStoreRequest, TrustedSourceBundle, UserOwnedPathLease,
+    UserOwnedRootReadLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
+    WindowsPlatform, WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
+    current_user_local_app_data_root, fresh_service_registration_nonce,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path, resolve_service_sid,
     watchdog_service_security_descriptor_digest,
 };
 pub use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
@@ -56,6 +57,7 @@ use redb::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+
 use thiserror::Error;
 
 #[cfg(test)]
@@ -192,9 +194,11 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 /// package contour, and per-installation canary-evidence root. Version 21
 /// makes the durable registration nonce and service-start deadline members
 /// mandatory on the current wire; v20 records require explicit migration.
+/// Version 22 separates filesystem and Credential Manager create dispositions
+/// and requires the keyed non-secret credential creation proof.
 /// Older wires cannot be interpreted as this effect set.
 /// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(21, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(22, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -209,6 +213,9 @@ pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion:
 /// injected timestamp in tests and persists the computed deadline before the
 /// external start call, so restart cannot silently create a second attempt.
 pub const SERVICE_START_CONVERGENCE_TIMEOUT_MS: u64 = 30_000;
+
+/// Version of the durable non-secret Credential Manager creation proof.
+pub const INSTALLATION_SECRET_CREATION_PROOF_VERSION: u32 = 1;
 
 /// Returns the stable contract identity for handshakes and provenance.
 pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
@@ -10350,7 +10357,8 @@ pub enum InstallationSecretLifecycle {
     Deleted,
 }
 
-/// Durable OS create classification. Only `Created` can authorize ownership.
+/// Durable filesystem create classification. Only `Created` can authorize a
+/// transaction-created root.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum InstallationCreateDisposition {
@@ -10360,6 +10368,48 @@ pub enum InstallationCreateDisposition {
     Created,
     /// The exact OS create call reported an existing path.
     AlreadyExists,
+}
+
+/// Durable Credential Manager provisioning classification. This is deliberately
+/// separate from the filesystem create result: the credential must be durably
+/// proven before any filesystem mutation is admitted.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InstallationSecretProvisionDisposition {
+    /// No provider mutation has been durably classified.
+    NotAttempted,
+    /// The exact credential was read back and matched its durable proof.
+    Created,
+}
+
+/// Non-secret proof that one provider-created ownership credential belongs to
+/// the exact transaction/effect attempt. The authenticator is keyed by the
+/// credential bytes and therefore cannot be forged or substituted by durable
+/// JSON alone.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationSecretCreationProof {
+    /// Version of the canonical proof payload.
+    pub version: u32,
+    /// Lowercase hexadecimal HMAC-SHA256 authenticator.
+    pub authenticator: PlatformHandle,
+}
+
+impl InstallationSecretCreationProof {
+    fn validate(&self) -> Result<(), InstallationError> {
+        if self.version != INSTALLATION_SECRET_CREATION_PROOF_VERSION {
+            return Err(InstallationError::InvalidField {
+                field: "effect_progress.ownership_secret.creation_proof.version".to_owned(),
+                reason: format!(
+                    "must equal current proof version {INSTALLATION_SECRET_CREATION_PROOF_VERSION}"
+                ),
+            });
+        }
+        sha256_handle(
+            &self.authenticator,
+            "effect_progress.ownership_secret.creation_proof.authenticator",
+        )
+    }
 }
 
 /// Provider scope for one durable installer ownership-key reference.
@@ -10420,13 +10470,18 @@ pub struct InstallationOwnershipSecret {
     pub reference: InstallationSecretReference,
     /// Root create disposition durably captured after the OS call.
     pub create_disposition: InstallationCreateDisposition,
+    /// Credential Manager create result, independent from filesystem state.
+    pub secret_provision_disposition: InstallationSecretProvisionDisposition,
+    /// Non-secret proof bound to the exact provider mutation.
+    pub creation_proof: InstallationSecretCreationProof,
     /// Intent-before-delete lifecycle.
     pub lifecycle: InstallationSecretLifecycle,
 }
 
 impl InstallationOwnershipSecret {
     fn validate(&self) -> Result<(), InstallationError> {
-        self.reference.validate()
+        self.reference.validate()?;
+        self.creation_proof.validate()
     }
 }
 
@@ -11717,9 +11772,9 @@ impl InstallationTransaction {
                     && ownership.as_ref().is_none_or(|ownership| {
                         ownership.lifecycle != InstallationSecretLifecycle::Deleted
                             && matches!(
-                                ownership.create_disposition,
-                                InstallationCreateDisposition::NotAttempted
-                                    | InstallationCreateDisposition::Created
+                                ownership.secret_provision_disposition,
+                                InstallationSecretProvisionDisposition::NotAttempted
+                                    | InstallationSecretProvisionDisposition::Created
                             )
                     }) => {}
                 (
@@ -11795,6 +11850,22 @@ impl InstallationTransaction {
                             field: "effect_progress.disposition".to_owned(),
                             reason: "transaction ownership requires a durable Created result"
                                 .to_owned(),
+                        });
+                    }
+                    if *disposition == InstallationEffectDisposition::CreatedByTransaction
+                        && matches!(effect, InstallerEffectPlan::CreateRoot { .. })
+                        && progress.ownership_secret.as_ref().is_none_or(|ownership| {
+                            ownership.secret_provision_disposition
+                                != InstallationSecretProvisionDisposition::Created
+                        })
+                    {
+                        return Err(InstallationError::InvalidField {
+                            field: "effect_progress.ownership_secret.secret_provision_disposition"
+                                .to_owned(),
+                            reason: format!(
+                                "root ownership requires a durable credential proof for {}",
+                                effect.effect_id().as_str()
+                            ),
                         });
                     }
                     if progress.ownership_secret.as_ref().is_some_and(|ownership| {
@@ -12231,7 +12302,7 @@ impl InstallationTransactionWire {
 }
 
 /// Validates the canonical transaction JSON without exposing a deserialized
-/// transaction authority object to another crate. Pre-v21 records are
+/// transaction authority object to another crate. Pre-v22 records are
 /// classified as an explicit migration requirement rather than synthesizing
 /// missing progress.
 pub fn validate_installation_transaction_json(bytes: &[u8]) -> Result<(), InstallationError> {
@@ -12293,6 +12364,33 @@ fn validate_current_transaction_progress(
                 });
             }
         }
+        if let Some(ownership) = progress
+            .get("ownership_secret")
+            .filter(|ownership| !ownership.is_null())
+        {
+            let object = ownership
+                .as_object()
+                .ok_or_else(|| InstallationError::CorruptRegistry {
+                    reason: format!(
+                        "installation transaction effect progress entry {index} ownership secret is not an object"
+                    ),
+                })?;
+            for (field, label) in [
+                (
+                    "secret_provision_disposition",
+                    "secret provision disposition",
+                ),
+                ("creation_proof", "credential creation proof"),
+            ] {
+                if !object.contains_key(field) {
+                    return Err(InstallationError::MigrationRequired {
+                        reason: format!(
+                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v22 is required"
+                        ),
+                    });
+                }
+            }
+        }
         if let Some(proof) = progress
             .get("service_start_proof")
             .filter(|proof| !proof.is_null())
@@ -12326,7 +12424,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v21 discriminator".to_owned(),
+            reason: "installation transaction predates the required v22 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
@@ -12888,9 +12986,9 @@ impl InstallationEffectRequest {
                 && self.precondition.credential_snapshot.is_none()
                 && ownership.lifecycle != InstallationSecretLifecycle::Deleted
                 && matches!(
-                    ownership.create_disposition,
-                    InstallationCreateDisposition::NotAttempted
-                        | InstallationCreateDisposition::Created
+                    ownership.secret_provision_disposition,
+                    InstallationSecretProvisionDisposition::NotAttempted
+                        | InstallationSecretProvisionDisposition::Created
                 ) => {}
             (
                 InstallerEffectPlan::RegisterService { .. }
@@ -12930,7 +13028,8 @@ impl InstallationEffectRequest {
             ) if self.precondition.credential_snapshot.is_none()
                 && self.store_credential.is_some()
                 && ownership.lifecycle == InstallationSecretLifecycle::Active
-                && ownership.create_disposition == InstallationCreateDisposition::Created => {}
+                && ownership.secret_provision_disposition
+                    == InstallationSecretProvisionDisposition::Created => {}
             _ => {
                 return Err(InstallationError::InvalidField {
                     field: "effect.ownership_secret".to_owned(),
@@ -12976,7 +13075,8 @@ impl InstallationEffectRequest {
             ) if progress.lifecycle == StoreCredentialLifecycle::Active
                 && self.ownership_secret.as_ref().is_some_and(|ownership| {
                     ownership.lifecycle == InstallationSecretLifecycle::Active
-                        && ownership.create_disposition == InstallationCreateDisposition::Created
+                        && ownership.secret_provision_disposition
+                            == InstallationSecretProvisionDisposition::Created
                 })
                 && self.precondition.credential_snapshot.is_none() => {}
             (InstallerEffectPlan::ProvisionStoreCredential { .. }, _, _) => {
@@ -13006,6 +13106,8 @@ impl InstallationEffectRequest {
             // Create disposition is an observed result persisted after the OS
             // call; it cannot retroactively change the committed authorization.
             ownership.create_disposition = InstallationCreateDisposition::NotAttempted;
+            ownership.secret_provision_disposition =
+                InstallationSecretProvisionDisposition::NotAttempted;
         }
         if let Some(credential) = &mut intent.store_credential {
             credential.receipt = None;
@@ -13381,12 +13483,22 @@ pub(crate) trait InstallationEffectPort: Send {
         PortOutcome::Unknown(UnknownReason::Unsupported)
     }
 
+    /// Generates and retains one opaque secret while returning only its
+    /// non-secret creation proof for durable intent persistence.
+    fn prepare_ownership_secret(
+        &mut self,
+        _request: &InstallationEffectRequest,
+        _reference: &InstallationSecretReference,
+    ) -> PortOutcome<InstallationSecretCreationProof> {
+        PortOutcome::Unknown(UnknownReason::Unsupported)
+    }
+
     /// Creates or reopens the installer-held ownership key only after its
     /// exact reference and effect intent were durably committed.
     fn provision_ownership_secret(
         &mut self,
         _request: &InstallationEffectRequest,
-    ) -> PortOutcome<InstallationCreateDisposition> {
+    ) -> PortOutcome<InstallationSecretProvisionDisposition> {
         PortOutcome::Unknown(UnknownReason::Unsupported)
     }
 
@@ -13432,12 +13544,18 @@ pub(crate) trait InstallationEffectPort: Send {
 
 /// Sealed production Windows adapter. Only [`WindowsInstallationCoordinator`]
 /// can construct or mutably use this capability.
-#[derive(Debug)]
 struct WindowsInstallationEffectPort {
     primitive: WindowsInstallerRootPrimitive,
     secrets: WindowsInstallerSecretProvider,
+    prepared_ownership_secret: Option<PreparedOwnershipSecret>,
     store_target_generator: WindowsStoreCredentialTargetGenerator,
     supervision_keys: WindowsSupervisionAuthorityKeyStore,
+}
+
+struct PreparedOwnershipSecret {
+    reference: InstallationSecretReference,
+    proof: InstallationSecretCreationProof,
+    secret: CredentialSecret,
 }
 
 impl WindowsInstallationEffectPort {
@@ -13445,6 +13563,7 @@ impl WindowsInstallationEffectPort {
         Self {
             primitive: WindowsInstallerRootPrimitive::new(),
             secrets: WindowsInstallerSecretProvider::new(),
+            prepared_ownership_secret: None,
             store_target_generator: WindowsStoreCredentialTargetGenerator::new(),
             supervision_keys: WindowsSupervisionAuthorityKeyStore::new(),
         }
@@ -13710,27 +13829,19 @@ impl WindowsInstallationEffectPort {
             .ownership_secret
             .as_ref()
             .ok_or(eliot_platform_windows::WindowsAdapterError::InvalidInput)?
-            .create_disposition;
-        if disposition == InstallationCreateDisposition::Created {
-            return self.secrets.read(reference);
+            .secret_provision_disposition;
+        if disposition != InstallationSecretProvisionDisposition::Created {
+            return Err(eliot_platform_windows::WindowsAdapterError::InvalidInput);
         }
-        if disposition != InstallationCreateDisposition::NotAttempted {
-            return Err(eliot_platform_windows::WindowsAdapterError::AlreadyExists);
+        let ownership = request
+            .ownership_secret
+            .as_ref()
+            .ok_or(eliot_platform_windows::WindowsAdapterError::InvalidInput)?;
+        let secret = self.secrets.read(reference)?;
+        if !ownership_secret_creation_proof_matches(request, ownership, secret.expose()) {
+            return Err(eliot_platform_windows::WindowsAdapterError::IdentityMismatch);
         }
-        match self.secrets.inspect(reference)? {
-            InstallerSecretObservation::Absent => {}
-            // A credential present before this call is indistinguishable from
-            // a forged/colliding entry or a crash after CredWrite. It must
-            // never be adopted as transaction ownership.
-            InstallerSecretObservation::Present => {
-                return Err(eliot_platform_windows::WindowsAdapterError::AlreadyExists);
-            }
-        }
-        let disposition = self.secrets.create_at(reference)?;
-        if disposition != InstallerSecretCreateDisposition::Created {
-            return Err(eliot_platform_windows::WindowsAdapterError::AlreadyExists);
-        }
-        self.secrets.read(reference)
+        Ok(secret)
     }
 
     fn host_credential_request(
@@ -14096,13 +14207,12 @@ impl WindowsInstallationEffectPort {
             .ownership_secret
             .as_ref()
             .ok_or(PortError::InvalidRequestMetadata)?;
-        if ownership.create_disposition != InstallationCreateDisposition::Created
+        if ownership.secret_provision_disposition != InstallationSecretProvisionDisposition::Created
             || ownership.lifecycle == InstallationSecretLifecycle::Deleted
         {
             return Err(PortError::InvalidRequestMetadata);
         }
-        self.secrets
-            .read(self.secret_target(request)?)
+        self.ensure_secret(request)
             .map(|secret| secret.expose().to_vec())
             .map_err(secret_port_error)
     }
@@ -14152,10 +14262,12 @@ impl WindowsInstallationEffectPort {
                 if ownership.create_disposition != InstallationCreateDisposition::Created {
                     return Ok(root_mismatch("created-without-durable-disposition"));
                 }
-                let secret = self
-                    .secrets
-                    .read(self.secret_target(request)?)
-                    .map_err(secret_port_error)?;
+                if ownership.secret_provision_disposition
+                    != InstallationSecretProvisionDisposition::Created
+                {
+                    return Ok(root_mismatch("created-without-durable-secret-proof"));
+                }
+                let secret = self.ensure_secret(request).map_err(secret_port_error)?;
                 let marker = self
                     .primitive
                     .read_protected_file(&spec, &ownership_receipt_path(request), RECEIPT_LIMIT)
@@ -14951,22 +15063,130 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         })
     }
 
+    fn prepare_ownership_secret(
+        &mut self,
+        request: &InstallationEffectRequest,
+        reference: &InstallationSecretReference,
+    ) -> PortOutcome<InstallationSecretCreationProof> {
+        if !matches!(
+            request.plan,
+            InstallerEffectPlan::CreateRoot { .. }
+                | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                | InstallerEffectPlan::StagePackage { .. }
+        ) {
+            return PortOutcome::Error(PortError::InvalidRequestMetadata);
+        }
+        let secret = match self.secrets.generate_secret() {
+            Ok(secret) => secret,
+            Err(error) => return secret_outcome(error),
+        };
+        let proof = match ownership_secret_creation_proof(request, reference, secret.expose()) {
+            Ok(proof) => proof,
+            Err(_error) => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+        };
+        self.prepared_ownership_secret = Some(PreparedOwnershipSecret {
+            reference: reference.clone(),
+            proof: proof.clone(),
+            secret,
+        });
+        PortOutcome::Known(proof)
+    }
+
     fn provision_ownership_secret(
         &mut self,
         request: &InstallationEffectRequest,
-    ) -> PortOutcome<InstallationCreateDisposition> {
-        let valid_stage = matches!(request.plan, InstallerEffectPlan::StagePackage { .. })
-            && request.precondition.package_snapshot.is_some();
-        let valid_credential = matches!(
+    ) -> PortOutcome<InstallationSecretProvisionDisposition> {
+        if !matches!(
             request.plan,
-            InstallerEffectPlan::ProvisionStoreCredential { .. }
-        ) && request.precondition.credential_snapshot.is_some();
-        if !valid_stage && !valid_credential {
+            InstallerEffectPlan::CreateRoot { .. }
+                | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                | InstallerEffectPlan::StagePackage { .. }
+        ) {
             return PortOutcome::Error(PortError::InvalidRequestMetadata);
         }
-        match self.ensure_secret(request) {
-            Ok(_) => PortOutcome::Known(InstallationCreateDisposition::Created),
-            Err(error) => secret_outcome(error),
+        let Some(ownership) = request.ownership_secret.as_ref() else {
+            return PortOutcome::Error(PortError::InvalidRequestMetadata);
+        };
+        let target = match self.secret_target(request) {
+            Ok(target) => target,
+            Err(error) => return PortOutcome::Error(error),
+        };
+        if ownership.secret_provision_disposition
+            != InstallationSecretProvisionDisposition::NotAttempted
+        {
+            return PortOutcome::Error(PortError::InvalidRequestMetadata);
+        }
+        let result = if let Some(prepared) = self.prepared_ownership_secret.take() {
+            if prepared.reference != ownership.reference
+                || prepared.proof != ownership.creation_proof
+            {
+                return PortOutcome::Error(PortError::Provider(ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                }));
+            }
+            match self.secrets.read_optional(target) {
+                Ok(Some(existing)) => {
+                    if !ownership_secret_creation_proof_matches(
+                        request,
+                        ownership,
+                        existing.expose(),
+                    ) {
+                        return PortOutcome::Error(PortError::Provider(ProviderError {
+                            code: ProviderErrorCode::Failed,
+                            retryable: false,
+                        }));
+                    }
+                    Ok(())
+                }
+                Ok(None) => {
+                    match self.secrets.write_exact_if_absent(target, prepared.secret) {
+                        Ok(
+                            InstallerSecretCreateDisposition::Created
+                            | InstallerSecretCreateDisposition::AlreadyExists,
+                        ) => {}
+                        Err(error) => return secret_outcome(error),
+                    }
+                    let readback = match self.secrets.read(target) {
+                        Ok(readback) => readback,
+                        Err(error) => return secret_outcome(error),
+                    };
+                    if !ownership_secret_creation_proof_matches(
+                        request,
+                        ownership,
+                        readback.expose(),
+                    ) {
+                        return PortOutcome::Error(PortError::Provider(ProviderError {
+                            code: ProviderErrorCode::Failed,
+                            retryable: false,
+                        }));
+                    }
+                    Ok(())
+                }
+                Err(error) => return secret_outcome(error),
+            }
+        } else {
+            match self.secrets.read_optional(target) {
+                Ok(Some(readback))
+                    if ownership_secret_creation_proof_matches(
+                        request,
+                        ownership,
+                        readback.expose(),
+                    ) =>
+                {
+                    Ok(())
+                }
+                Ok(Some(_)) => Err(PortError::Provider(ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                })),
+                Ok(None) => return PortOutcome::Unknown(UnknownReason::NotObserved),
+                Err(error) => return secret_outcome(error),
+            }
+        };
+        match result {
+            Ok(()) => PortOutcome::Known(InstallationSecretProvisionDisposition::Created),
+            Err(error) => PortOutcome::Error(error),
         }
     }
 
@@ -15359,6 +15579,16 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             Ok(target) => target,
             Err(error) => return PortOutcome::Error(error),
         };
+        let secret = match self.secrets.read(target) {
+            Ok(secret) => secret,
+            Err(error) => return secret_outcome(error),
+        };
+        if !ownership_secret_creation_proof_matches(request, ownership, secret.expose()) {
+            return PortOutcome::Error(PortError::Provider(ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            }));
+        }
         match self.secrets.delete(target) {
             Ok(()) => PortOutcome::Known(()),
             Err(error) => secret_outcome(error),
@@ -15627,6 +15857,61 @@ fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     outer.update(inner_digest);
     outer_pad.fill(0);
     format!("{:x}", outer.finalize())
+}
+
+fn ownership_secret_creation_payload(
+    request: &InstallationEffectRequest,
+    reference: &InstallationSecretReference,
+) -> Result<Vec<u8>, InstallationError> {
+    serde_json::to_vec(&(
+        "eliot.installation.ownership-secret-creation",
+        INSTALLATION_SECRET_CREATION_PROOF_VERSION,
+        request.transaction_id.as_str(),
+        request.effect_id.as_str(),
+        request.attempt,
+        request.plan_digest.as_str(),
+        reference.target.as_str(),
+        reference.expected_principal_sid.as_str(),
+        reference.scope,
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "effect_progress.ownership_secret.creation_proof".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+fn ownership_secret_creation_proof(
+    request: &InstallationEffectRequest,
+    reference: &InstallationSecretReference,
+    secret: &[u8],
+) -> Result<InstallationSecretCreationProof, InstallationError> {
+    let payload = ownership_secret_creation_payload(request, reference)?;
+    let authenticator =
+        PlatformHandle::new(hmac_sha256_hex(secret, &payload)).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "effect_progress.ownership_secret.creation_proof.authenticator".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+    Ok(InstallationSecretCreationProof {
+        version: INSTALLATION_SECRET_CREATION_PROOF_VERSION,
+        authenticator,
+    })
+}
+
+fn ownership_secret_creation_proof_matches(
+    request: &InstallationEffectRequest,
+    ownership: &InstallationOwnershipSecret,
+    secret: &[u8],
+) -> bool {
+    let Ok(payload) = ownership_secret_creation_payload(request, &ownership.reference) else {
+        return false;
+    };
+    ownership.creation_proof.version == INSTALLATION_SECRET_CREATION_PROOF_VERSION
+        && constant_time_equal(
+            ownership.creation_proof.authenticator.as_str().as_bytes(),
+            hmac_sha256_hex(secret, &payload).as_bytes(),
+        )
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
@@ -16597,9 +16882,25 @@ fn root_port_error(error: InstallerRootError) -> PortError {
     }
 }
 
-fn secret_port_error(_error: eliot_platform_windows::WindowsAdapterError) -> PortError {
+fn secret_port_error(error: eliot_platform_windows::WindowsAdapterError) -> PortError {
     PortError::Provider(ProviderError {
-        code: ProviderErrorCode::Unavailable,
+        code: match error {
+            eliot_platform_windows::WindowsAdapterError::InvalidInput => {
+                ProviderErrorCode::InvalidRequest
+            }
+            eliot_platform_windows::WindowsAdapterError::PermissionDenied => {
+                ProviderErrorCode::PermissionDenied
+            }
+            eliot_platform_windows::WindowsAdapterError::Timeout => ProviderErrorCode::Timeout,
+            eliot_platform_windows::WindowsAdapterError::IdentityMismatch
+            | eliot_platform_windows::WindowsAdapterError::AclMismatch
+            | eliot_platform_windows::WindowsAdapterError::AlreadyExists
+            | eliot_platform_windows::WindowsAdapterError::Failed => ProviderErrorCode::Failed,
+            eliot_platform_windows::WindowsAdapterError::NotFound
+            | eliot_platform_windows::WindowsAdapterError::Unavailable => {
+                ProviderErrorCode::Unavailable
+            }
+        },
         retryable: false,
     })
 }
@@ -16636,6 +16937,20 @@ fn root_execution_error<T>(error: InstallerRootError) -> PortOutcome<T> {
         InstallerRootError::ReceiptMismatch
         | InstallerRootError::IdentityMismatch
         | InstallerRootError::Indeterminate => PortOutcome::Unknown(UnknownReason::Indeterminate),
+        InstallerRootError::Win32 { stage, code } => {
+            let reference = PlatformHandle::new(format!(
+                "installer-root-win32-v2:{}:{code:08x}",
+                installer_root_stage_token(stage),
+            ))
+            .unwrap_or_else(|_| unreachable!());
+            PortOutcome::Error(PortError::ProviderReference {
+                error: ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                },
+                reference,
+            })
+        }
         InstallerRootError::InvalidPath | InstallerRootError::MissingParent => {
             PortOutcome::Error(PortError::InvalidPath)
         }
@@ -16649,6 +16964,22 @@ fn root_execution_error<T>(error: InstallerRootError) -> PortOutcome<T> {
                 retryable: false,
             }))
         }
+    }
+}
+
+fn installer_root_stage_token(stage: InstallerRootStage) -> &'static str {
+    match stage {
+        InstallerRootStage::OpenThreadToken => "open-thread-token",
+        InstallerRootStage::OpenProcessToken => "open-process-token",
+        InstallerRootStage::DuplicateToken => "duplicate-token",
+        InstallerRootStage::QueryPrivilege => "query-privilege",
+        InstallerRootStage::EnablePrivilege => "enable-privilege",
+        InstallerRootStage::BindThreadToken => "bind-thread-token",
+        InstallerRootStage::RestorePrivilege => "restore-privilege",
+        InstallerRootStage::RestoreThreadToken => "restore-thread-token",
+        InstallerRootStage::CreateDirectory => "create-directory",
+        InstallerRootStage::OpenReadback => "open-readback",
+        InstallerRootStage::Readback => "readback",
     }
 }
 
@@ -17084,21 +17415,23 @@ where
         if was_intent
             && matches!(
                 transaction.installer_effects[index],
-                InstallerEffectPlan::ProvisionStoreCredential { .. }
+                InstallerEffectPlan::CreateRoot { .. }
+                    | InstallerEffectPlan::ProvisionStoreCredential { .. }
                     | InstallerEffectPlan::StagePackage { .. }
             )
             && transaction.effect_progress[index]
                 .ownership_secret
                 .as_ref()
                 .is_some_and(|ownership| {
-                    ownership.create_disposition == InstallationCreateDisposition::NotAttempted
+                    ownership.secret_provision_disposition
+                        == InstallationSecretProvisionDisposition::NotAttempted
                 })
         {
             let disposition = match self.port.provision_ownership_secret(&request) {
                 PortOutcome::Known(disposition) => disposition,
                 other => return self.persist_unknown(transaction, index, port_pending(other)),
             };
-            if disposition != InstallationCreateDisposition::Created {
+            if disposition != InstallationSecretProvisionDisposition::Created {
                 return self.persist_unknown(
                     transaction,
                     index,
@@ -17111,7 +17444,7 @@ where
                 .ownership_secret
                 .as_mut()
                 .ok_or(InstallationError::IdentityConflict)?
-                .create_disposition = disposition;
+                .secret_provision_disposition = disposition;
             increment_revision(&mut transaction)?;
             transaction.validate()?;
             self.store.compare_and_save(expected, &transaction)?;
@@ -17343,7 +17676,13 @@ where
                             .map_err(|error| platform_error(&error))?,
                     );
                 }
-                let next_attempt = if was_intent {
+                let preserves_secret_attempt = matches!(
+                    transaction.installer_effects[index],
+                    InstallerEffectPlan::CreateRoot { .. }
+                        | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                        | InstallerEffectPlan::StagePackage { .. }
+                );
+                let next_attempt = if was_intent && !preserves_secret_attempt {
                     attempt
                         .checked_add(1)
                         .ok_or_else(|| InstallationError::InvalidField {
@@ -17380,10 +17719,23 @@ where
                                 );
                             }
                         };
+                        let proof = match self.port.prepare_ownership_secret(&request, &reference) {
+                            PortOutcome::Known(proof) => proof,
+                            other => {
+                                return self.persist_unknown(
+                                    transaction,
+                                    index,
+                                    port_pending(other),
+                                );
+                            }
+                        };
                         transaction.effect_progress[index].ownership_secret =
                             Some(InstallationOwnershipSecret {
                                 reference,
                                 create_disposition: InstallationCreateDisposition::NotAttempted,
+                                secret_provision_disposition:
+                                    InstallationSecretProvisionDisposition::NotAttempted,
+                                creation_proof: proof,
                                 lifecycle: InstallationSecretLifecycle::Active,
                             });
                         if matches!(
@@ -17415,13 +17767,15 @@ where
                 self.store.compare_and_save(expected, &transaction)?;
                 if matches!(
                     transaction.installer_effects[index],
-                    InstallerEffectPlan::ProvisionStoreCredential { .. }
+                    InstallerEffectPlan::CreateRoot { .. }
+                        | InstallerEffectPlan::ProvisionStoreCredential { .. }
                         | InstallerEffectPlan::StagePackage { .. }
                 ) && transaction.effect_progress[index]
                     .ownership_secret
                     .as_ref()
                     .is_some_and(|ownership| {
-                        ownership.create_disposition == InstallationCreateDisposition::NotAttempted
+                        ownership.secret_provision_disposition
+                            == InstallationSecretProvisionDisposition::NotAttempted
                     })
                 {
                     let disposition = match self.port.provision_ownership_secret(&request) {
@@ -17430,7 +17784,7 @@ where
                             return self.persist_unknown(transaction, index, port_pending(other));
                         }
                     };
-                    if disposition != InstallationCreateDisposition::Created {
+                    if disposition != InstallationSecretProvisionDisposition::Created {
                         return self.persist_unknown(
                             transaction,
                             index,
@@ -17443,7 +17797,7 @@ where
                         .ownership_secret
                         .as_mut()
                         .ok_or(InstallationError::IdentityConflict)?
-                        .create_disposition = disposition;
+                        .secret_provision_disposition = disposition;
                     increment_revision(&mut transaction)?;
                     transaction.validate()?;
                     self.store.compare_and_save(expected, &transaction)?;
@@ -17454,6 +17808,57 @@ where
                         InstallationEffectAction::Apply,
                         None,
                     )?;
+                }
+                if matches!(
+                    transaction.installer_effects[index],
+                    InstallerEffectPlan::CreateRoot { .. }
+                        | InstallerEffectPlan::StagePackage { .. }
+                        | InstallerEffectPlan::ProvisionStoreCredential { .. }
+                ) && request.action == InstallationEffectAction::Apply
+                {
+                    // The provider mutation and Created CAS are not enough
+                    // to authorize filesystem execution. Reload the exact
+                    // store record and bind revision/checksum, intent,
+                    // target, and proof before crossing the protected
+                    // external-effect boundary.
+                    let persisted = self
+                        .store
+                        .load(transaction_id)?
+                        .ok_or(InstallationError::IdentityConflict)?;
+                    persisted.validate()?;
+                    if TransactionVersion::of(&persisted)? != TransactionVersion::of(&transaction)?
+                    {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    let (persisted_attempt, persisted_intent_digest) =
+                        match &persisted.effect_progress[index].state {
+                            InstallationEffectProgressState::IntentCommitted {
+                                attempt,
+                                intent_digest,
+                            } => (*attempt, intent_digest.clone()),
+                            _ => return Err(InstallationError::IdentityConflict),
+                        };
+                    let persisted_request = effect_request(
+                        &persisted,
+                        index,
+                        persisted_attempt,
+                        InstallationEffectAction::Apply,
+                        None,
+                    )?;
+                    if persisted_request.intent_digest()? != persisted_intent_digest
+                        || persisted_request
+                            .ownership_secret
+                            .as_ref()
+                            .zip(request.ownership_secret.as_ref())
+                            .is_none_or(|(persisted, current)| {
+                                persisted.reference != current.reference
+                                    || persisted.creation_proof != current.creation_proof
+                            })
+                    {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    transaction = persisted;
+                    request = persisted_request;
                 }
                 let execution = match self.port.execute(&request) {
                     PortOutcome::Known(execution) => execution,
@@ -18937,6 +19342,8 @@ fn effect_request(
     Ok(request)
 }
 
+const REDACTED_PROVIDER_REFERENCE_PENDING: &str = "pending:provider-reference-redacted";
+
 fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
     let value = match outcome {
         PortOutcome::Known(_) => "unknown:unexpected-known".to_owned(),
@@ -18945,9 +19352,49 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
             || "unknown:partial".to_owned(),
             |value| value.as_str().to_owned(),
         ),
+        PortOutcome::Error(PortError::ProviderReference { reference, .. }) => {
+            if is_typed_installer_root_reference(reference.as_str()) {
+                return reference;
+            }
+            REDACTED_PROVIDER_REFERENCE_PENDING.to_owned()
+        }
         PortOutcome::Error(error) => format!("error:{error}"),
     };
     PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+}
+
+fn is_typed_installer_root_reference(value: &str) -> bool {
+    let mut parts = value.split(':');
+    if parts.next() != Some("installer-root-win32-v2") {
+        return false;
+    }
+    let Some(stage) = parts.next() else {
+        return false;
+    };
+    if !matches!(
+        stage,
+        "open-thread-token"
+            | "open-process-token"
+            | "duplicate-token"
+            | "query-privilege"
+            | "enable-privilege"
+            | "bind-thread-token"
+            | "restore-privilege"
+            | "restore-thread-token"
+            | "create-directory"
+            | "open-readback"
+            | "readback"
+    ) {
+        return false;
+    }
+    let Some(code) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && code.len() == 8
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn ownership_secret_absence_evidence(reference: &InstallationSecretReference) -> PlatformHandle {
@@ -19151,6 +19598,10 @@ mod tests {
     struct SharedStore {
         state: Arc<Mutex<Option<InstallationTransaction>>>,
         conflict_next: Arc<Mutex<bool>>,
+        created_load_target_effect_id: Arc<Mutex<Option<PlatformHandle>>>,
+        substitute_after_created_load: Arc<Mutex<bool>>,
+        stale_after_created_load: Arc<Mutex<bool>>,
+        missing_after_created_load: Arc<Mutex<bool>>,
     }
 
     impl InstallationTransactionStore for SharedStore {
@@ -19180,10 +19631,78 @@ mod tests {
             &self,
             transaction_id: &PlatformHandle,
         ) -> Result<Option<InstallationTransaction>, InstallationError> {
-            Ok(self
-                .state
+            let created_load_target_effect_id = self
+                .created_load_target_effect_id
                 .lock()
                 .unwrap_or_else(|_| unreachable!())
+                .clone();
+            let is_created_load_match = |progress: &InstallationEffectProgress| {
+                progress.ownership_secret.as_ref().is_some_and(|ownership| {
+                    ownership.secret_provision_disposition
+                        == InstallationSecretProvisionDisposition::Created
+                }) && created_load_target_effect_id
+                    .as_ref()
+                    .is_none_or(|effect_id| progress.effect_id == *effect_id)
+            };
+            let mut state = self.state.lock().unwrap_or_else(|_| unreachable!());
+            let exact_created_transaction = state.as_ref().is_some_and(|transaction| {
+                transaction.transaction_id == *transaction_id
+                    && transaction
+                        .effect_progress
+                        .iter()
+                        .any(is_created_load_match)
+            });
+            if exact_created_transaction
+                && *self
+                    .stale_after_created_load
+                    .lock()
+                    .unwrap_or_else(|_| unreachable!())
+            {
+                *self
+                    .stale_after_created_load
+                    .lock()
+                    .unwrap_or_else(|_| unreachable!()) = false;
+                let mut stale = state.as_ref().cloned().unwrap_or_else(|| unreachable!());
+                stale.revision = stale.revision.saturating_sub(1);
+                return Ok(Some(stale));
+            }
+            if exact_created_transaction
+                && *self
+                    .missing_after_created_load
+                    .lock()
+                    .unwrap_or_else(|_| unreachable!())
+            {
+                *self
+                    .missing_after_created_load
+                    .lock()
+                    .unwrap_or_else(|_| unreachable!()) = false;
+                return Ok(None);
+            }
+            if exact_created_transaction
+                && *self
+                    .substitute_after_created_load
+                    .lock()
+                    .unwrap_or_else(|_| unreachable!())
+            {
+                *self
+                    .substitute_after_created_load
+                    .lock()
+                    .unwrap_or_else(|_| unreachable!()) = false;
+                let transaction = state.as_mut().unwrap_or_else(|| unreachable!());
+                let progress = transaction
+                    .effect_progress
+                    .iter_mut()
+                    .find(|progress| is_created_load_match(progress))
+                    .unwrap_or_else(|| unreachable!());
+                progress
+                    .ownership_secret
+                    .as_mut()
+                    .unwrap_or_else(|| unreachable!())
+                    .creation_proof
+                    .authenticator = test_handle("b".repeat(64));
+                transaction.revision += 1;
+            }
+            Ok(state
                 .as_ref()
                 .filter(|transaction| transaction.transaction_id == *transaction_id)
                 .cloned())
@@ -19293,12 +19812,18 @@ mod tests {
         inspections: VecDeque<PortOutcome<InstallationEffectObservation>>,
         reconciliations: VecDeque<PortOutcome<InstallationEffectObservation>>,
         execute_outcomes: VecDeque<PortOutcome<InstallationEffectExecution>>,
+        provision_outcomes: VecDeque<PortOutcome<InstallationSecretProvisionDisposition>>,
         execute_count: Arc<Mutex<usize>>,
         executed_effect_ids: Arc<Mutex<Vec<PlatformHandle>>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        provision_write_count: Arc<Mutex<usize>>,
+        provision_reuses_existing: bool,
+        delete_count: Arc<Mutex<usize>>,
         create_disposition: InstallationCreateDisposition,
         secret_absence: VecDeque<PortOutcome<bool>>,
         secret_deletes: VecDeque<PortOutcome<()>>,
         panic_reconcile_once: bool,
+        panic_provision_once: bool,
     }
 
     impl InstallationEffectPort for FakeEffectPort {
@@ -19316,10 +19841,65 @@ mod tests {
             })
         }
 
+        fn prepare_ownership_secret(
+            &mut self,
+            _request: &InstallationEffectRequest,
+            _reference: &InstallationSecretReference,
+        ) -> PortOutcome<InstallationSecretCreationProof> {
+            self.events
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .push("prepare");
+            PortOutcome::Known(test_secret_creation_proof())
+        }
+
+        fn provision_ownership_secret(
+            &mut self,
+            request: &InstallationEffectRequest,
+        ) -> PortOutcome<InstallationSecretProvisionDisposition> {
+            self.events
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .push("provision");
+            let state = self
+                .shared
+                .load(&request.transaction_id)
+                .unwrap_or_else(|_| unreachable!())
+                .unwrap_or_else(|| unreachable!());
+            assert!(matches!(
+                state
+                    .effect_progress
+                    .iter()
+                    .find(|progress| progress.effect_id == request.effect_id)
+                    .unwrap_or_else(|| unreachable!())
+                    .state,
+                InstallationEffectProgressState::IntentCommitted { .. }
+            ));
+            if !self.provision_reuses_existing {
+                *self
+                    .provision_write_count
+                    .lock()
+                    .unwrap_or_else(|_| unreachable!()) += 1;
+            }
+            if self.panic_provision_once {
+                self.panic_provision_once = false;
+                panic!("simulated crash before credential provider response");
+            }
+            self.provision_outcomes
+                .pop_front()
+                .unwrap_or(PortOutcome::Known(
+                    InstallationSecretProvisionDisposition::Created,
+                ))
+        }
+
         fn execute(
             &mut self,
             request: &InstallationEffectRequest,
         ) -> PortOutcome<InstallationEffectExecution> {
+            self.events
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .push("execute");
             let state = self
                 .shared
                 .load(&request.transaction_id)
@@ -19345,6 +19925,20 @@ mod tests {
                     ),
                 }
             }));
+            if matches!(&request.plan, InstallerEffectPlan::CreateRoot { .. }) {
+                assert_eq!(
+                    state
+                        .effect_progress
+                        .iter()
+                        .find(|progress| progress.effect_id == request.effect_id)
+                        .unwrap_or_else(|| unreachable!())
+                        .ownership_secret
+                        .as_ref()
+                        .unwrap_or_else(|| unreachable!())
+                        .secret_provision_disposition,
+                    InstallationSecretProvisionDisposition::Created
+                );
+            }
             *self.execute_count.lock().unwrap_or_else(|_| unreachable!()) += 1;
             self.executed_effect_ids
                 .lock()
@@ -19394,6 +19988,7 @@ mod tests {
             &mut self,
             _request: &InstallationEffectRequest,
         ) -> PortOutcome<()> {
+            *self.delete_count.lock().unwrap_or_else(|_| unreachable!()) += 1;
             self.secret_deletes
                 .pop_front()
                 .unwrap_or(PortOutcome::Unknown(
@@ -19425,6 +20020,215 @@ mod tests {
 
     fn test_handle(value: impl Into<String>) -> PlatformHandle {
         must(PlatformHandle::new(value.into()))
+    }
+
+    fn test_secret_creation_proof() -> InstallationSecretCreationProof {
+        InstallationSecretCreationProof {
+            version: INSTALLATION_SECRET_CREATION_PROOF_VERSION,
+            authenticator: test_handle("a".repeat(64)),
+        }
+    }
+
+    #[test]
+    fn root_win32_error_uses_a_stable_typed_pending_reference() {
+        let pending = port_pending(root_execution_error::<()>(InstallerRootError::Win32 {
+            stage: InstallerRootStage::CreateDirectory,
+            code: 0xABCD,
+        }));
+        assert_eq!(
+            pending.as_str(),
+            "installer-root-win32-v2:create-directory:0000abcd"
+        );
+    }
+
+    #[test]
+    fn provider_references_are_persisted_only_for_strict_win32_observability_codes() {
+        let valid = [
+            "installer-root-win32-v2:open-thread-token:00000000",
+            "installer-root-win32-v2:readback:ffffffff",
+        ];
+        for reference in valid {
+            let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {
+                error: ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                },
+                reference: test_handle(reference),
+            }));
+            assert_eq!(pending.as_str(), reference);
+        }
+
+        for reference in [
+            r"C:\secret\credential",
+            "secret-token",
+            "installer-root-win32-v2:not-a-stage:0000abcd",
+            "installer-root-win32-v2:create-directory:0000ABCD",
+            "installer-root-win32-v2:create-directory:abcd",
+            "installer-root-win32-v2:create-directory:0000abcd:extra",
+        ] {
+            let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {
+                error: ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                },
+                reference: test_handle(reference),
+            }));
+            assert_eq!(pending.as_str(), REDACTED_PROVIDER_REFERENCE_PENDING);
+        }
+    }
+
+    #[test]
+    fn creation_proof_rejects_a_future_version() {
+        let mut proof = test_secret_creation_proof();
+        proof.version = INSTALLATION_SECRET_CREATION_PROOF_VERSION + 1;
+        assert!(proof.validate().is_err());
+    }
+
+    #[test]
+    fn creation_proof_binds_every_mutable_identity_field() {
+        let transaction = planned_transaction();
+        let request = must(effect_request(
+            &transaction,
+            0,
+            1,
+            InstallationEffectAction::Apply,
+            None,
+        ));
+        let reference = test_secret_reference("0123456789abcdef0123456789abcdef");
+        let secret = vec![0x5a; 32];
+        let proof = must(ownership_secret_creation_proof(
+            &request, &reference, &secret,
+        ));
+        let ownership = InstallationOwnershipSecret {
+            reference: reference.clone(),
+            create_disposition: InstallationCreateDisposition::NotAttempted,
+            secret_provision_disposition: InstallationSecretProvisionDisposition::NotAttempted,
+            creation_proof: proof,
+            lifecycle: InstallationSecretLifecycle::Active,
+        };
+        assert!(ownership_secret_creation_proof_matches(
+            &request, &ownership, &secret
+        ));
+
+        let mut transaction_id = request.clone();
+        transaction_id.transaction_id = test_handle("transaction-substituted");
+        assert!(!ownership_secret_creation_proof_matches(
+            &transaction_id,
+            &ownership,
+            &secret
+        ));
+        let mut effect_id = request.clone();
+        effect_id.effect_id = test_handle("effect-substituted");
+        assert!(!ownership_secret_creation_proof_matches(
+            &effect_id, &ownership, &secret
+        ));
+        let mut attempt = request.clone();
+        attempt.attempt = 2;
+        assert!(!ownership_secret_creation_proof_matches(
+            &attempt, &ownership, &secret
+        ));
+        let mut plan_digest = request.clone();
+        plan_digest.plan_digest = test_handle("b".repeat(64));
+        assert!(!ownership_secret_creation_proof_matches(
+            &plan_digest,
+            &ownership,
+            &secret
+        ));
+        let mut target = ownership.clone();
+        target.reference.target =
+            test_handle("eliot/installer-root/v1/abcdefabcdefabcdefabcdefabcdefab");
+        assert!(!ownership_secret_creation_proof_matches(
+            &request, &target, &secret
+        ));
+        let mut sid = ownership.clone();
+        sid.reference.expected_principal_sid = test_handle("S-1-5-21-2000");
+        assert!(!ownership_secret_creation_proof_matches(
+            &request, &sid, &secret
+        ));
+        let mut version = ownership;
+        version.creation_proof.version += 1;
+        assert!(!ownership_secret_creation_proof_matches(
+            &request, &version, &secret
+        ));
+        let payload = must(ownership_secret_creation_payload(&request, &reference));
+        assert!(
+            String::from_utf8_lossy(&payload)
+                .contains("eliot.installation.ownership-secret-creation")
+        );
+        assert!(
+            String::from_utf8_lossy(&payload).contains("WINDOWS_CREDENTIAL_MANAGER_CURRENT_USER")
+        );
+    }
+
+    #[test]
+    fn secret_bytes_are_absent_from_json_debug_and_evidence() {
+        let transaction = planned_transaction();
+        let request = must(effect_request(
+            &transaction,
+            0,
+            1,
+            InstallationEffectAction::Apply,
+            None,
+        ));
+        let reference = test_secret_reference("0123456789abcdef0123456789abcdef");
+        let secret = vec![0xa5; 32];
+        let proof = must(ownership_secret_creation_proof(
+            &request, &reference, &secret,
+        ));
+        let ownership = InstallationOwnershipSecret {
+            reference,
+            create_disposition: InstallationCreateDisposition::NotAttempted,
+            secret_provision_disposition: InstallationSecretProvisionDisposition::Created,
+            creation_proof: proof,
+            lifecycle: InstallationSecretLifecycle::Active,
+        };
+        let secret_hex = "a5".repeat(32);
+        let json = serde_json::to_string(&ownership).unwrap_or_else(|_| unreachable!());
+        let debug = format!("{ownership:?}");
+        let evidence = serde_json::to_string(&InstallationEffectExecution {
+            evidence: vec![test_handle("evidence:nonsecret")],
+            create_disposition: Some(InstallationCreateDisposition::Created),
+            credential_receipt: None,
+            staging_receipt: None,
+            phase_b_receipt: None,
+            service_start_disposition: None,
+            service_runtime_lineage: None,
+        })
+        .unwrap_or_else(|_| unreachable!());
+        assert!(!json.contains(&secret_hex));
+        assert!(!debug.contains(&secret_hex));
+        assert!(!evidence.contains(&secret_hex));
+    }
+
+    #[test]
+    fn v21_and_missing_secret_proof_require_explicit_migration() {
+        let transaction = planned_transaction();
+        let mut legacy = serde_json::to_value(&transaction).unwrap_or_else(|_| unreachable!());
+        legacy["transaction_wire_version"]["major"] = serde_json::json!(21);
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap_or_else(|_| unreachable!());
+        assert!(matches!(
+            validate_installation_transaction_json(&legacy_bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("21.0.0") && reason.contains("22.0.0")
+        ));
+
+        let mut missing = serde_json::to_value(&transaction).unwrap_or_else(|_| unreachable!());
+        let ownership = serde_json::to_value(test_ownership_secret(
+            InstallationCreateDisposition::NotAttempted,
+            InstallationSecretLifecycle::Active,
+        ))
+        .unwrap_or_else(|_| unreachable!());
+        missing["effect_progress"][0]["ownership_secret"] = ownership;
+        missing["effect_progress"][0]["ownership_secret"]
+            .as_object_mut()
+            .unwrap_or_else(|| unreachable!())
+            .remove("creation_proof");
+        let missing_bytes = serde_json::to_vec(&missing).unwrap_or_else(|_| unreachable!());
+        assert!(matches!(
+            validate_installation_transaction_json(&missing_bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("creation proof") && reason.contains("v22")
+        ));
     }
 
     fn test_watchdog_control_grant() -> InstallerServiceControlGrantReceipt {
@@ -20378,6 +21182,9 @@ mod tests {
                         Some(InstallationOwnershipSecret {
                             reference,
                             create_disposition: InstallationCreateDisposition::Created,
+                            secret_provision_disposition:
+                                InstallationSecretProvisionDisposition::Created,
+                            creation_proof: test_secret_creation_proof(),
                             lifecycle: InstallationSecretLifecycle::Active,
                         });
                     transaction.effect_progress[index].store_credential =
@@ -20806,6 +21613,16 @@ mod tests {
         InstallationOwnershipSecret {
             reference: test_secret_reference("0123456789abcdef0123456789abcdef"),
             create_disposition: disposition,
+            secret_provision_disposition: match disposition {
+                InstallationCreateDisposition::Created => {
+                    InstallationSecretProvisionDisposition::Created
+                }
+                InstallationCreateDisposition::NotAttempted
+                | InstallationCreateDisposition::AlreadyExists => {
+                    InstallationSecretProvisionDisposition::NotAttempted
+                }
+            },
+            creation_proof: test_secret_creation_proof(),
             lifecycle,
         }
     }
@@ -20904,12 +21721,18 @@ mod tests {
             inspections: inspections.into(),
             reconciliations: reconciliations.into(),
             execute_outcomes: VecDeque::new(),
+            provision_outcomes: VecDeque::new(),
             execute_count,
             executed_effect_ids: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(Mutex::new(Vec::new())),
+            provision_write_count: Arc::new(Mutex::new(0)),
+            provision_reuses_existing: false,
+            delete_count: Arc::new(Mutex::new(0)),
             create_disposition: InstallationCreateDisposition::Created,
             secret_absence: VecDeque::new(),
             secret_deletes: VecDeque::new(),
             panic_reconcile_once: false,
+            panic_provision_once: false,
         }
     }
 
@@ -22908,6 +23731,16 @@ mod tests {
         request.ownership_secret = Some(InstallationOwnershipSecret {
             reference,
             create_disposition: disposition,
+            secret_provision_disposition: match disposition {
+                InstallationCreateDisposition::Created => {
+                    InstallationSecretProvisionDisposition::Created
+                }
+                InstallationCreateDisposition::NotAttempted
+                | InstallationCreateDisposition::AlreadyExists => {
+                    InstallationSecretProvisionDisposition::NotAttempted
+                }
+            },
+            creation_proof: test_secret_creation_proof(),
             lifecycle: InstallationSecretLifecycle::Active,
         });
         must(request.validate());
@@ -23314,7 +24147,12 @@ mod tests {
         };
         assert_eq!(
             port.secrets
-                .create_at(&target)
+                .write_exact_if_absent(
+                    &target,
+                    port.secrets
+                        .generate_secret()
+                        .unwrap_or_else(|error| panic!("credential generation failed: {error}")),
+                )
                 .unwrap_or_else(|error| panic!("credential create failed: {error}")),
             InstallerSecretCreateDisposition::Created
         );
@@ -23322,7 +24160,7 @@ mod tests {
             windows_secret_request(reference, InstallationCreateDisposition::NotAttempted);
         assert_eq!(
             port.ensure_secret(&request).err(),
-            Some(eliot_platform_windows::WindowsAdapterError::AlreadyExists)
+            Some(eliot_platform_windows::WindowsAdapterError::InvalidInput)
         );
         assert_eq!(
             port.secrets
@@ -23675,6 +24513,351 @@ mod tests {
         let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
         cleanup_production_transaction(&saved);
         let _ = std::fs::remove_dir_all(moved);
+    }
+
+    #[test]
+    fn credential_proof_intent_cas_precedes_provider_and_root_execute() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            vec![PortOutcome::Known(matching(
+                InstallationEffectDisposition::CreatedByTransaction,
+            ))],
+            execute_count.clone(),
+        );
+        let events = port.events.clone();
+        let writes = port.provision_write_count.clone();
+        let mut coordinator = InstallationCoordinator::new(port, store);
+        let outcome = must(coordinator.drive_effect(&transaction_id));
+        assert!(
+            matches!(outcome, InstallationStepOutcome::Applied { .. }),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert_eq!(
+            *events.lock().unwrap_or_else(|_| unreachable!()),
+            vec!["prepare", "provision", "execute"]
+        );
+        assert_eq!(*writes.lock().unwrap_or_else(|_| unreachable!()), 1);
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
+    }
+
+    #[test]
+    fn created_cas_reload_precedes_create_root_execute() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            vec![PortOutcome::Known(matching(
+                InstallationEffectDisposition::CreatedByTransaction,
+            ))],
+            execute_count.clone(),
+        );
+        let events = port.events.clone();
+        let mut coordinator = InstallationCoordinator::new(port, store.clone());
+        must(coordinator.drive_effect(&transaction_id));
+        assert_eq!(
+            *events
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .last()
+                .unwrap(),
+            "execute"
+        );
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            saved.effect_progress[0]
+                .ownership_secret
+                .as_ref()
+                .unwrap_or_else(|| unreachable!())
+                .secret_provision_disposition,
+            InstallationSecretProvisionDisposition::Created
+        );
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn created_cas_reload_barrier_covers_stage_and_store_credential_effects() {
+        for (effect_kind, reload_mode) in [
+            ("stage-package", "substituted"),
+            ("stage-package", "stale"),
+            ("stage-package", "missing"),
+            ("stage-package", "exact"),
+            ("store-credential", "substituted"),
+            ("store-credential", "stale"),
+            ("store-credential", "missing"),
+            ("store-credential", "exact"),
+        ] {
+            let mut transaction = fully_applied_system_registration_transaction();
+            let index = transaction
+                .installer_effects
+                .iter()
+                .position(|effect| match effect_kind {
+                    "stage-package" => matches!(effect, InstallerEffectPlan::StagePackage { .. }),
+                    "store-credential" => {
+                        matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
+                    }
+                    _ => unreachable!(),
+                })
+                .unwrap_or_else(|| unreachable!());
+            for progress in &mut transaction.effect_progress[index..] {
+                progress.admitted_precondition = None;
+                progress.ownership_secret = None;
+                progress.registration_nonce = None;
+                progress.service_control_grant = None;
+                progress.service_start_deadline_ms = None;
+                progress.service_start_proof = None;
+                progress.store_credential = None;
+                progress.staging_receipt = None;
+                progress.phase_b_receipt = None;
+                progress.state = InstallationEffectProgressState::Pending;
+            }
+            transaction.stage = if effect_kind == "stage-package" {
+                InstallationStage::Staging
+            } else {
+                InstallationStage::Registering
+            };
+            transaction.observed_postconditions.clear();
+            transaction.pending_external_changes.clear();
+            transaction.revision += 1;
+            must(transaction.validate());
+
+            let transaction_id = transaction.transaction_id.clone();
+            let mut request = must(effect_request(
+                &transaction,
+                index,
+                1,
+                InstallationEffectAction::Apply,
+                None,
+            ));
+            let inspection = if effect_kind == "stage-package" {
+                let (source_bundle_identity, generation, manifest_digest) = match &request.plan {
+                    InstallerEffectPlan::StagePackage {
+                        source_bundle_identity,
+                        generation,
+                        manifest,
+                        ..
+                    } => (
+                        *source_bundle_identity,
+                        generation.clone(),
+                        must(PlatformHandle::new(manifest.canonical_digest())),
+                    ),
+                    _ => unreachable!(),
+                };
+                let files = Vec::new();
+                let total_bytes = 0;
+                let digest = must(PackageObservationSnapshot::compute_digest(
+                    &source_bundle_identity,
+                    &generation,
+                    &manifest_digest,
+                    &files,
+                    total_bytes,
+                ));
+                let snapshot = PackageObservationSnapshot {
+                    source_bundle_identity,
+                    generation,
+                    manifest_digest,
+                    files,
+                    total_bytes,
+                    digest,
+                };
+                must(package_absent_with_snapshot(&request, snapshot))
+            } else {
+                let snapshot = StoreCredentialAbsentSnapshot {
+                    host_owner_epoch: test_handle("host-owner:created-cas-reload"),
+                    host_process_identity: test_handle("a".repeat(64)),
+                    host_state_root: CredentialOwnershipMarkerIdentity {
+                        canonical_path_digest: test_handle("b".repeat(64)),
+                        volume_serial_number: 1,
+                        file_index: 1,
+                        security_descriptor_digest: test_handle("c".repeat(64)),
+                    },
+                    marker_path_digest: test_handle("d".repeat(64)),
+                    marker_absent: true,
+                    target_absent: true,
+                };
+                request.precondition =
+                    must(request.precondition.with_credential_snapshot(snapshot));
+                InstallationEffectObservation::Absent {
+                    observed_precondition: request.precondition.clone(),
+                    evidence: vec![test_handle("evidence:credential-absent")],
+                    service_runtime_lineage: None,
+                }
+            };
+            let store = SharedStore {
+                state: Arc::new(Mutex::new(Some(transaction))),
+                created_load_target_effect_id: Arc::new(Mutex::new(Some(
+                    request.effect_id.clone(),
+                ))),
+                ..SharedStore::default()
+            };
+            match reload_mode {
+                "substituted" => {
+                    *store
+                        .substitute_after_created_load
+                        .lock()
+                        .unwrap_or_else(|_| unreachable!()) = true;
+                }
+                "stale" => {
+                    *store
+                        .stale_after_created_load
+                        .lock()
+                        .unwrap_or_else(|_| unreachable!()) = true;
+                }
+                "missing" => {
+                    *store
+                        .missing_after_created_load
+                        .lock()
+                        .unwrap_or_else(|_| unreachable!()) = true;
+                }
+                "exact" => {}
+                _ => unreachable!(),
+            }
+            let execute_count = Arc::new(Mutex::new(0));
+            let port = fake_port(
+                store.clone(),
+                vec![PortOutcome::Known(inspection)],
+                Vec::new(),
+                execute_count.clone(),
+            );
+            let mut coordinator = InstallationCoordinator::new(port, store);
+            let outcome = coordinator.drive_effect(&transaction_id);
+            if reload_mode == "exact" {
+                assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
+            } else {
+                assert!(
+                    matches!(&outcome, Err(InstallationError::IdentityConflict)),
+                    "outcome={outcome:?}, effect_kind={effect_kind}, reload_mode={reload_mode}"
+                );
+                assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn restart_absent_without_prepared_secret_does_not_regenerate_or_execute() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let mut first = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            Vec::new(),
+            execute_count.clone(),
+        );
+        first.panic_provision_once = true;
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut coordinator = InstallationCoordinator::new(first, store.clone());
+            let _ = coordinator.drive_effect(&transaction_id);
+        }));
+        assert!(crashed.is_err());
+        let mut restarted = fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone());
+        restarted.provision_outcomes =
+            vec![PortOutcome::Unknown(UnknownReason::NotObserved)].into();
+        let events = restarted.events.clone();
+        let mut coordinator = InstallationCoordinator::new(restarted, store);
+        assert!(matches!(
+            must(coordinator.drive_effect(&transaction_id)),
+            InstallationStepOutcome::RollbackRequired { .. }
+        ));
+        assert_eq!(
+            *events.lock().unwrap_or_else(|_| unreachable!()),
+            vec!["provision"]
+        );
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+    }
+
+    #[test]
+    fn response_loss_present_matching_proof_does_not_write_twice() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let writes = Arc::new(Mutex::new(0));
+        let mut first = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            Vec::new(),
+            execute_count.clone(),
+        );
+        first.panic_provision_once = true;
+        first.provision_write_count = writes.clone();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut coordinator = InstallationCoordinator::new(first, store.clone());
+            let _ = coordinator.drive_effect(&transaction_id);
+        }));
+        assert!(crashed.is_err());
+        let mut restarted = fake_port(store.clone(), Vec::new(), Vec::new(), execute_count);
+        restarted.provision_write_count = writes.clone();
+        restarted.provision_reuses_existing = true;
+        let mut coordinator = InstallationCoordinator::new(restarted, store);
+        let _ = coordinator.drive_effect(&transaction_id);
+        assert_eq!(*writes.lock().unwrap_or_else(|_| unreachable!()), 1);
+    }
+
+    #[test]
+    fn foreign_present_proof_is_rejected_without_execute_or_delete() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let mut port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            Vec::new(),
+            execute_count.clone(),
+        );
+        let delete_count = port.delete_count.clone();
+        port.provision_outcomes = vec![PortOutcome::Error(PortError::Provider(ProviderError {
+            code: ProviderErrorCode::Failed,
+            retryable: false,
+        }))]
+        .into();
+        let mut coordinator = InstallationCoordinator::new(port, store);
+        assert!(matches!(
+            must(coordinator.drive_effect(&transaction_id)),
+            InstallationStepOutcome::RollbackRequired { .. }
+        ));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        assert_eq!(*delete_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+    }
+
+    #[test]
+    fn created_credential_substitution_blocks_root_execute() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        *store
+            .substitute_after_created_load
+            .lock()
+            .unwrap_or_else(|_| unreachable!()) = true;
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            Vec::new(),
+            execute_count.clone(),
+        );
+        let mut coordinator = InstallationCoordinator::new(port, store);
+        assert!(matches!(
+            coordinator.drive_effect(&transaction_id),
+            Err(InstallationError::IdentityConflict)
+        ));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
     }
 
     #[test]
@@ -24332,7 +25515,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("requires explicit migration to 21.0.0")
+                if reason.contains("requires explicit migration to 22.0.0")
         ));
     }
 
@@ -24381,7 +25564,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("wire 9.0.0 requires explicit migration to 21.0.0")
+                if reason.contains("wire 9.0.0 requires explicit migration to 22.0.0")
         ));
     }
 
@@ -24427,7 +25610,7 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 10.0.0 requires explicit migration to 21.0.0")
+                if reason.contains("wire 10.0.0 requires explicit migration to 22.0.0")
         ));
     }
 
@@ -24443,7 +25626,7 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 13.0.0 requires explicit migration to 21.0.0")
+                if reason.contains("wire 13.0.0 requires explicit migration to 22.0.0")
         ));
     }
 
@@ -24459,7 +25642,7 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 14.0.0 requires explicit migration to 21.0.0")
+                if reason.contains("wire 14.0.0 requires explicit migration to 22.0.0")
         ));
     }
 
@@ -24472,7 +25655,7 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 15.0.0 requires explicit migration to 21.0.0")
+                if reason.contains("wire 15.0.0 requires explicit migration to 22.0.0")
         ));
     }
 
@@ -24485,7 +25668,7 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 16.0.0") && reason.contains("21.0.0")
+                if reason.contains("wire 16.0.0") && reason.contains("22.0.0")
         ));
     }
 
@@ -24507,7 +25690,7 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 17.0.0") && reason.contains("21.0.0")
+                if reason.contains("wire 17.0.0") && reason.contains("22.0.0")
         ));
     }
 
@@ -24523,7 +25706,7 @@ mod tests {
         assert!(matches!(
             error,
             InstallationError::MigrationRequired { reason }
-                if reason.contains("wire 18.0.0") && reason.contains("21.0.0")
+                if reason.contains("wire 18.0.0") && reason.contains("22.0.0")
         ));
     }
 
@@ -24536,7 +25719,7 @@ mod tests {
         assert!(matches!(
             decode_installation_transaction_json(&bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 20.0.0") && reason.contains("21.0.0")
+                if reason.contains("wire 20.0.0") && reason.contains("22.0.0")
         ));
     }
 
@@ -24558,6 +25741,45 @@ mod tests {
                 panic!("missing {field} must be rejected without synthesis");
             };
             assert!(reason.contains("missing mandatory"), "{field}: {reason}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_v22_ownership_members_are_mandatory_and_never_synthesized() {
+        for field in [
+            "reference",
+            "create_disposition",
+            "secret_provision_disposition",
+            "creation_proof",
+            "lifecycle",
+        ] {
+            let mut value = must(serde_json::to_value(
+                fully_applied_system_registration_transaction(),
+            ));
+            let ownership = value["effect_progress"]
+                .as_array_mut()
+                .unwrap_or_else(|| unreachable!())
+                .iter_mut()
+                .find_map(|progress| {
+                    progress
+                        .get_mut("ownership_secret")
+                        .filter(|value| !value.is_null())
+                        .and_then(serde_json::Value::as_object_mut)
+                })
+                .unwrap_or_else(|| unreachable!());
+            ownership.remove(field);
+            let bytes = must(serde_json::to_vec(&value));
+            let error = decode_installation_transaction_json(&bytes)
+                .expect_err("missing current-v22 ownership member must reject the record");
+            assert!(
+                matches!(
+                    error,
+                    InstallationError::MigrationRequired { .. }
+                        | InstallationError::CorruptRegistry { .. }
+                ),
+                "missing {field} must classify as migration/corruption, got {error:?}"
+            );
         }
     }
 

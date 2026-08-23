@@ -3138,8 +3138,15 @@ mod tests {
     }
 
     #[test]
-    fn current_transaction_envelope_rejects_unknown_outer_members() {
-        let bytes = br#"{"wire_version":{"major":21,"minor":0,"patch":0},"transaction":{},"unexpected":true}"#;
+    fn transaction_envelope_requires_v21_migration_and_rejects_unknown_current_outer_members() {
+        let legacy_bytes = br#"{"wire_version":{"major":21,"minor":0,"patch":0},"transaction":{},"unexpected":true}"#;
+        assert!(matches!(
+            decode(legacy_bytes),
+            Err(InstallationError::MigrationRequired { reason })
+                if reason.contains("wire 21.0.0")
+        ));
+
+        let bytes = br#"{"wire_version":{"major":22,"minor":0,"patch":0},"transaction":{},"unexpected":true}"#;
         assert!(matches!(
             decode(bytes),
             Err(InstallationError::CorruptRegistry { reason })

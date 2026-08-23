@@ -5177,14 +5177,21 @@ pub enum InstallerSecretCreateDisposition {
 
 /// Narrow current-user Credential Manager provider for installer ownership keys.
 ///
-/// The provider never returns generated key bytes from creation. Callers durably
-/// persist only the unpredictable target returned by [`Self::fresh_reference`]
-/// and must commit that reference before calling [`Self::create_at`].
+/// The provider never returns generated key bytes from a persistence operation.
+/// Callers durably persist only the unpredictable target returned by
+/// [`Self::fresh_reference`] and must commit that reference and its proof before
+/// calling [`Self::write_exact_if_absent`].
 ///
 /// This is an OS/Credential Manager primitive, not transaction authority. The
 /// current-user SID and `CredMan` vault are the trust boundary; the installation
 /// adapter alone combines this primitive with durable intent and an HMAC-bound
-/// receipt. User/portable profiles therefore have the explicitly weaker
+/// receipt. `WinCred` has no atomic create-only operation: this target interlock
+/// serializes cooperating callers, while a non-cooperating same-user writer can
+/// still race and replace the value, including before the write reaches the
+/// provider. Exact readback verifies the bytes present immediately after the
+/// write, so it detects post-write drift but is not atomic authority. Root
+/// execution still requires the durable HMAC proof, Created CAS, and mandatory
+/// reload. User/portable profiles therefore have the explicitly weaker
 /// same-user boundary provided by Windows Credential Manager.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowsInstallerSecretProvider;
@@ -5244,36 +5251,85 @@ impl WindowsInstallerSecretProvider {
         }
     }
 
-    /// Creates a 256-bit key at an exact target whose intent is already durable.
+    /// Generates one 256-bit key without persisting it.
     ///
-    /// Key bytes are generated inside this call, written to Credential Manager,
-    /// and cleared before return. Existing valid entries are never overwritten.
+    /// The caller must retain the returned opaque value until the matching
+    /// durable intent has been committed. The value intentionally has no
+    /// `Debug`, `Clone`, or serialization implementation.
     ///
     /// # Errors
     ///
-    /// Returns a typed provider error for invalid targets, RNG failure, or
-    /// Credential Manager failure.
-    pub fn create_at(
+    /// Returns a typed provider error when the Windows CSPRNG is unavailable.
+    pub fn generate_secret(&self) -> Result<CredentialSecret, WindowsAdapterError> {
+        let mut secret = vec![0_u8; Self::KEY_BYTES];
+        fill_system_random(&mut secret)?;
+        Ok(CredentialSecret(secret))
+    }
+
+    /// Reads an exact installer target without mutating Credential Manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider error for invalid targets, provider failure, or
+    /// malformed credential data.
+    pub fn read_optional(
         &self,
         reference: &PlatformHandle,
+    ) -> Result<Option<CredentialSecret>, WindowsAdapterError> {
+        if !valid_installer_credential_target(reference.as_str()) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        match credential_read_optional(reference.as_str())? {
+            Some(secret) if secret.expose().len() == Self::KEY_BYTES => Ok(Some(secret)),
+            Some(_) => Err(WindowsAdapterError::InvalidInput),
+            None => Ok(None),
+        }
+    }
+
+    /// Writes exact bytes after an absence observation, under the bounded
+    /// same-user target interlock, and verifies the authoritative readback.
+    /// `WinCred` has no atomic create-only write; a non-cooperating same-user
+    /// writer can race this operation, including before the write reaches the
+    /// provider. The immediate constant-time readback verifies the bytes
+    /// present after the write and detects post-write drift; it is not an
+    /// authority decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider error for invalid targets, provider failure,
+    /// interlock failure, or failed authoritative readback.
+    pub fn write_exact_if_absent(
+        &self,
+        reference: &PlatformHandle,
+        secret: CredentialSecret,
     ) -> Result<InstallerSecretCreateDisposition, WindowsAdapterError> {
         if !valid_installer_credential_target(reference.as_str()) {
             return Err(WindowsAdapterError::InvalidInput);
         }
-        match self.inspect(reference)? {
-            InstallerSecretObservation::Present => {
-                return Ok(InstallerSecretCreateDisposition::AlreadyExists);
-            }
-            InstallerSecretObservation::Absent => {}
+        if secret.expose().len() != Self::KEY_BYTES {
+            return Err(WindowsAdapterError::InvalidInput);
         }
-        let mut secret = [0_u8; Self::KEY_BYTES];
-        fill_system_random(&mut secret)?;
-        let result = credential_write(reference.as_str(), &secret);
-        secret.fill(0);
-        result?;
-        match self.inspect(reference)? {
-            InstallerSecretObservation::Present => Ok(InstallerSecretCreateDisposition::Created),
-            InstallerSecretObservation::Absent => Err(WindowsAdapterError::Unavailable),
+        let _interlock =
+            HostCredentialInterlock::acquire("eliot-installer-ownership-secret-v1", reference)?;
+        if self.read_optional(reference)?.is_some() {
+            return Ok(InstallerSecretCreateDisposition::AlreadyExists);
+        }
+        credential_write(reference.as_str(), secret.expose())?;
+        let readback = self.read_optional(reference)?;
+        let result = require_exact_credential_readback(
+            secret.expose(),
+            readback.as_ref().map(CredentialSecret::expose),
+        );
+        drop(readback);
+        match result {
+            Ok(()) => {
+                drop(secret);
+                Ok(InstallerSecretCreateDisposition::Created)
+            }
+            Err(error) => {
+                drop(secret);
+                Err(error)
+            }
         }
     }
 
@@ -5425,11 +5481,14 @@ impl WindowsLocalServiceCredentialProvider {
 /// Opaque capability for the authenticated Host credential boundary.
 ///
 /// The capability owns no secret and exposes only operations needed by the
-/// Host composition.  The write-if-absent operation holds a protected,
+/// Host composition. The write-if-absent operation holds a protected,
 /// per-installation/per-target mutex across the final read, `CredWriteW`, and
-/// authoritative readback.  This closes the real `WinCred` read/write race;
-/// a second observation immediately before `CredWriteW` is not an atomic
-/// ownership check.
+/// authoritative readback. `WinCred` has no atomic create-only write: the
+/// mutex serializes cooperating callers, but a non-cooperating same-user
+/// writer can still race and replace the value, including before the write
+/// reaches the provider. Exact readback verifies the bytes present immediately
+/// after the write and detects post-write drift; it is collision/recovery
+/// evidence, not an atomic ownership proof.
 #[derive(Debug)]
 pub struct HostCredentialMutationCapability {
     installation_digest: String,
@@ -5471,9 +5530,13 @@ impl HostCredentialMutationCapability {
                     return Err(WindowsAdapterError::AlreadyExists);
                 }
                 primitive.write(target, &secret)?;
-                primitive
-                    .read_optional(target)?
-                    .ok_or(WindowsAdapterError::Unavailable)
+                let readback = primitive.read_optional(target)?;
+                require_exact_credential_readback(
+                    secret.expose(),
+                    readback.as_ref().map(CredentialSecret::expose),
+                )?;
+                let readback = readback.ok_or(WindowsAdapterError::Unavailable)?;
+                Ok(readback)
             })
         })
     }
@@ -5554,6 +5617,26 @@ struct HostCredentialInterlock {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
+#[cfg(windows)]
+const HOST_CREDENTIAL_INTERLOCK_TIMEOUT_MS: u32 = 30_000;
+
+#[cfg(windows)]
+fn classify_host_credential_interlock_wait(wait: u32) -> Result<(), WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{
+        WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+
+    if wait == WAIT_ABANDONED {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    match wait {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => Err(WindowsAdapterError::Timeout),
+        WAIT_FAILED => Err(last_windows_adapter_error()),
+        _ => Err(WindowsAdapterError::IdentityMismatch),
+    }
+}
+
 impl HostCredentialInterlock {
     fn acquire(
         installation_digest: &str,
@@ -5561,7 +5644,6 @@ impl HostCredentialInterlock {
     ) -> Result<Self, WindowsAdapterError> {
         #[cfg(windows)]
         {
-            use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
             use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
             use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
             let digest =
@@ -5585,16 +5667,13 @@ impl HostCredentialInterlock {
             if handle.is_null() {
                 return Err(last_windows_adapter_error());
             }
-            let wait = unsafe { WaitForSingleObject(handle, u32::MAX) };
-            if wait == WAIT_OBJECT_0 {
-                Ok(Self { handle })
-            } else {
-                let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-                Err(if wait == WAIT_ABANDONED {
-                    WindowsAdapterError::IdentityMismatch
-                } else {
-                    last_windows_adapter_error()
-                })
+            let wait = unsafe { WaitForSingleObject(handle, HOST_CREDENTIAL_INTERLOCK_TIMEOUT_MS) };
+            match classify_host_credential_interlock_wait(wait) {
+                Ok(()) => Ok(Self { handle }),
+                Err(error) => {
+                    let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+                    Err(error)
+                }
             }
         }
         #[cfg(not(windows))]
@@ -10387,6 +10466,29 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn constant_time_equal_bytes(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn require_exact_credential_readback(
+    expected: &[u8],
+    actual: Option<&[u8]>,
+) -> Result<(), WindowsAdapterError> {
+    match actual {
+        Some(actual) if constant_time_equal_bytes(expected, actual) => Ok(()),
+        Some(_) => Err(WindowsAdapterError::IdentityMismatch),
+        None => Err(WindowsAdapterError::Unavailable),
+    }
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -14890,6 +14992,49 @@ mod tests {
         assert_eq!(
             any_running_process_named("nested/eliot-governor.exe"),
             Err(WindowsAdapterError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn credential_write_readback_comparison_requires_exact_bytes() {
+        let expected = [0x5a; 32];
+        assert_eq!(
+            require_exact_credential_readback(&expected, Some(&expected)),
+            Ok(())
+        );
+        assert_eq!(
+            require_exact_credential_readback(&expected, None),
+            Err(WindowsAdapterError::Unavailable)
+        );
+        assert_eq!(
+            require_exact_credential_readback(&expected, Some(&[0x5a; 31])),
+            Err(WindowsAdapterError::IdentityMismatch)
+        );
+        let mut substituted = [0x5a; 32];
+        substituted[31] = 0xa5;
+        assert_eq!(
+            require_exact_credential_readback(&expected, Some(&substituted)),
+            Err(WindowsAdapterError::IdentityMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_interlock_wait_is_bounded_and_timeout_is_typed() {
+        use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+        assert!(std::hint::black_box(HOST_CREDENTIAL_INTERLOCK_TIMEOUT_MS) < u32::MAX);
+        assert_eq!(
+            classify_host_credential_interlock_wait(WAIT_OBJECT_0),
+            Ok(())
+        );
+        assert_eq!(
+            classify_host_credential_interlock_wait(WAIT_TIMEOUT),
+            Err(WindowsAdapterError::Timeout)
+        );
+        assert_eq!(
+            classify_host_credential_interlock_wait(WAIT_ABANDONED),
+            Err(WindowsAdapterError::IdentityMismatch)
         );
     }
 
