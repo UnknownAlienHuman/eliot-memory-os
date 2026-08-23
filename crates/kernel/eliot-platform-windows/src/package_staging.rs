@@ -1722,6 +1722,24 @@ fn map_protected_path_error(error: ProtectedPathError) -> PackageStagingError {
     }
 }
 
+fn map_restore_privilege_error(error: super::InstallerRootError) -> PackageStagingError {
+    match error {
+        super::InstallerRootError::UnsupportedPlatform => PackageStagingError::UnsupportedPlatform,
+        super::InstallerRootError::NotElevated
+        | super::InstallerRootError::Win32 {
+            stage:
+                super::InstallerRootStage::OpenThreadToken
+                | super::InstallerRootStage::OpenProcessToken
+                | super::InstallerRootStage::DuplicateToken
+                | super::InstallerRootStage::QueryPrivilege
+                | super::InstallerRootStage::EnablePrivilege
+                | super::InstallerRootStage::BindThreadToken,
+            ..
+        } => PackageStagingError::SecurityMismatch,
+        _ => PackageStagingError::Io,
+    }
+}
+
 /// One independently measured regular source file.
 ///
 /// This is intentionally narrower than [`StagedFileReceipt`]: it contains no
@@ -2258,8 +2276,14 @@ impl PackageStager {
         {
             return Err(PackageStagingError::HashMismatch);
         }
-        write_or_validate_prepared_marker(authorization, ownership_key)?;
-        self.stage_with_expected_inventory(manifest, &authorization.expected_files)
+        super::installer_root::with_system_restore_privilege_mapped(
+            super::InstallerRootProfile::SystemService,
+            || {
+                write_or_validate_prepared_marker(authorization, ownership_key)?;
+                self.stage_with_expected_inventory(manifest, &authorization.expected_files)
+            },
+            map_restore_privilege_error,
+        )
     }
 
     /// Create one immutable generation with the official `WinTrust` verifier.
@@ -2273,7 +2297,11 @@ impl PackageStager {
     /// Returns a typed error for invalid manifests, tree mismatches, identity
     /// or security races, failed trust, or refused exact-owned rollback.
     pub fn stage(&self, manifest: &PackageManifest) -> Result<StagingReceipt, PackageStagingError> {
-        self.stage_with_expected_inventory(manifest, &[])
+        super::installer_root::with_system_restore_privilege_mapped(
+            super::InstallerRootProfile::SystemService,
+            || self.stage_with_expected_inventory(manifest, &[]),
+            map_restore_privilege_error,
+        )
     }
 
     fn stage_with_expected_inventory(
@@ -4483,6 +4511,15 @@ mod tests {
         assert!(!source.contains(&generic_stage_method));
         assert!(!source.contains(&generic_dispatch_type));
         assert!(!source.contains(&generic_variant));
+    }
+
+    #[test]
+    fn system_owned_package_mutations_are_restore_scoped() {
+        let source = include_str!("package_staging.rs");
+        assert!(source.contains("with_system_restore_privilege_mapped"));
+        assert!(source.contains("InstallerRootProfile::SystemService"));
+        assert!(source.contains("write_or_validate_prepared_marker(authorization, ownership_key)"));
+        assert!(source.contains("self.stage_with_expected_inventory(manifest, &[]),"));
     }
 
     #[test]

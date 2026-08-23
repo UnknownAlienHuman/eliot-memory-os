@@ -1575,22 +1575,23 @@ impl<A: PrivilegeApi + ?Sized> Drop for ScopedRestorePrivilege<'_, A> {
     }
 }
 
-#[cfg(windows)]
-fn with_native_restore_privilege<F, T>(f: F) -> Result<T, InstallerRootError>
-where
-    F: FnOnce() -> Result<T, InstallerRootError>,
-{
-    let mut api = NativePrivilegeApi;
-    with_restore_privilege_api(&mut api, f)
-}
-
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn with_restore_privilege_api<A, F, T>(api: &mut A, f: F) -> Result<T, InstallerRootError>
 where
     A: PrivilegeApi + ?Sized,
     F: FnOnce() -> Result<T, InstallerRootError>,
 {
-    let mut guard = ScopedRestorePrivilege::enter(api)?;
+    with_restore_privilege_api_mapped(api, f, |error| error)
+}
+
+#[cfg(windows)]
+fn with_restore_privilege_api_mapped<A, F, T, E, M>(api: &mut A, f: F, map: M) -> Result<T, E>
+where
+    A: PrivilegeApi + ?Sized,
+    F: FnOnce() -> Result<T, E>,
+    M: FnOnce(InstallerRootError) -> E,
+{
+    let mut guard = ScopedRestorePrivilege::enter(api).map_err(map)?;
     let result = f();
     guard.restore();
     result
@@ -1604,17 +1605,34 @@ fn with_system_restore_privilege<F, T>(
 where
     F: FnOnce() -> Result<T, InstallerRootError>,
 {
+    with_system_restore_privilege_mapped(profile, f, |error| error)
+}
+
+/// Runs one system-owned mutation while the exact `SeRestorePrivilege` token
+/// scope is bound to the current thread.  Sibling Windows primitives use this
+/// mapped form when their public error type is not `InstallerRootError`.
+#[allow(clippy::needless_return)]
+pub(crate) fn with_system_restore_privilege_mapped<F, T, E, M>(
+    profile: InstallerRootProfile,
+    f: F,
+    map: M,
+) -> Result<T, E>
+where
+    F: FnOnce() -> Result<T, E>,
+    M: FnOnce(InstallerRootError) -> E,
+{
     if profile != InstallerRootProfile::SystemService {
         return f();
     }
     #[cfg(windows)]
     {
-        return with_native_restore_privilege(f);
+        let mut api = NativePrivilegeApi;
+        return with_restore_privilege_api_mapped(&mut api, f, map);
     }
     #[cfg(not(windows))]
     {
         let _ = f;
-        Err(InstallerRootError::UnsupportedPlatform)
+        Err(map(InstallerRootError::UnsupportedPlatform))
     }
 }
 
