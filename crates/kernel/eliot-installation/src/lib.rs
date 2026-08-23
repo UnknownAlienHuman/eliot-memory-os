@@ -17042,6 +17042,7 @@ fn installer_root_stage_token(stage: InstallerRootStage) -> &'static str {
         InstallerRootStage::RestorePrivilege => "restore-privilege",
         InstallerRootStage::RestoreThreadToken => "restore-thread-token",
         InstallerRootStage::CreateDirectory => "create-directory",
+        InstallerRootStage::CreateProtectedFile => "create-protected-file",
         InstallerRootStage::OpenReadback => "open-readback",
         InstallerRootStage::Readback => "readback",
     }
@@ -19493,6 +19494,7 @@ fn is_typed_installer_root_reference(value: &str) -> bool {
             | "restore-privilege"
             | "restore-thread-token"
             | "create-directory"
+            | "create-protected-file"
             | "open-readback"
             | "readback"
     ) {
@@ -20149,6 +20151,18 @@ mod tests {
         assert_eq!(
             pending.as_str(),
             "installer-root-win32-v2:create-directory:0000abcd"
+        );
+    }
+
+    #[test]
+    fn protected_file_create_win32_error_uses_a_stable_typed_pending_reference() {
+        let pending = port_pending(root_execution_error::<()>(InstallerRootError::Win32 {
+            stage: InstallerRootStage::CreateProtectedFile,
+            code: 5,
+        }));
+        assert_eq!(
+            pending.as_str(),
+            "installer-root-win32-v2:create-protected-file:00000005"
         );
     }
 

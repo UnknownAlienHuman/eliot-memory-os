@@ -88,6 +88,7 @@ pub enum InstallerRootStage {
     RestorePrivilege,
     RestoreThreadToken,
     CreateDirectory,
+    CreateProtectedFile,
     OpenReadback,
     Readback,
 }
@@ -142,6 +143,8 @@ struct WindowsInstallerRootExecutor {
     #[cfg(test)]
     post_create_readback_error: Option<InstallerRootError>,
     #[cfg(test)]
+    protected_file_create_error: Option<u32>,
+    #[cfg(test)]
     root_appearance_after_pinning: Option<PathBuf>,
 }
 
@@ -151,6 +154,8 @@ impl WindowsInstallerRootExecutor {
             policy_override: None,
             #[cfg(test)]
             post_create_readback_error: None,
+            #[cfg(test)]
+            protected_file_create_error: None,
             #[cfg(test)]
             root_appearance_after_pinning: None,
         }
@@ -493,9 +498,14 @@ impl WindowsInstallerRootPrimitive {
     where
         F: FnOnce(&InstallerRootObjectSnapshot) -> Result<Vec<u8>, InstallerRootError>,
     {
+        #[cfg(test)]
+        let injected_create_error = self.executor.protected_file_create_error;
+        #[cfg(not(test))]
+        let injected_create_error = None;
         create_protected_file(
             ProtectedFileSecurity::Installation(spec.profile),
             path,
+            injected_create_error,
             build,
         )
     }
@@ -518,7 +528,12 @@ impl WindowsInstallerRootPrimitive {
         F: FnOnce(&InstallerRootObjectSnapshot) -> Result<Vec<u8>, InstallerRootError>,
     {
         ensure_system_service_spec(spec)?;
-        create_protected_file(ProtectedFileSecurity::LocalServiceHostMarker, path, build)
+        create_protected_file(
+            ProtectedFileSecurity::LocalServiceHostMarker,
+            path,
+            None,
+            build,
+        )
     }
 
     /// # Errors
@@ -886,6 +901,7 @@ impl RootReadback {
 fn create_protected_file<F>(
     security: ProtectedFileSecurity,
     path: &Path,
+    injected_create_error: Option<u32>,
     build: F,
 ) -> Result<InstallerRootObjectSnapshot, InstallerRootError>
 where
@@ -909,23 +925,31 @@ where
         bInheritHandle: 0,
     };
     let wide = super::wide(path);
-    let handle = unsafe {
-        // SAFETY: path and descriptor are live; valid returned handle is adopted once.
-        CreateFileW(
-            wide.as_ptr(),
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-            0,
-            &raw const attributes,
-            CREATE_NEW,
-            FILE_ATTRIBUTE_HIDDEN,
-            std::ptr::null_mut(),
-        )
+    let handle = if injected_create_error.is_some() {
+        INVALID_HANDLE_VALUE
+    } else {
+        unsafe {
+            // SAFETY: path and descriptor are live; valid returned handle is adopted once.
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                0,
+                &raw const attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_HIDDEN,
+                std::ptr::null_mut(),
+            )
+        }
     };
     if handle == INVALID_HANDLE_VALUE {
-        return if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let create_error = injected_create_error.unwrap_or_else(|| unsafe { GetLastError() });
+        return if create_error == ERROR_ALREADY_EXISTS {
             Err(InstallerRootError::ReceiptMismatch)
         } else {
-            Err(InstallerRootError::Indeterminate)
+            Err(InstallerRootError::Win32 {
+                stage: InstallerRootStage::CreateProtectedFile,
+                code: create_error,
+            })
         };
     }
     let mut file = unsafe {
@@ -961,6 +985,7 @@ where
 fn create_protected_file<F>(
     _security: ProtectedFileSecurity,
     _path: &Path,
+    _injected_create_error: Option<u32>,
     _build: F,
 ) -> Result<InstallerRootObjectSnapshot, InstallerRootError>
 where
@@ -2486,6 +2511,47 @@ mod primitive_tests {
 
     #[cfg(windows)]
     #[test]
+    fn protected_file_create_raw_win32_error_keeps_stage_and_code_without_mutation() {
+        let fixture = Fixture::new();
+        fixture.ensure_user_parent();
+        let mut primitive = fixture.primitive(true);
+        let spec = fixture.user_spec("protected-file-create-error");
+        let expected = absent(&primitive, &spec);
+        primitive
+            .create(&spec, &expected)
+            .unwrap_or_else(|error| panic!("root create: {error}"));
+        let marker_path = spec.root.join("authority.json");
+        primitive.executor.protected_file_create_error = Some(5);
+
+        let error = primitive
+            .create_protected_file(&spec, &marker_path, |_| {
+                panic!("injected CreateFileW error must happen before the builder")
+            })
+            .expect_err("injected CreateFileW error must be returned");
+
+        assert_eq!(
+            error,
+            InstallerRootError::Win32 {
+                stage: InstallerRootStage::CreateProtectedFile,
+                code: 5,
+            }
+        );
+        assert!(
+            !marker_path.exists(),
+            "raw CreateFileW failure must not leave a protected file behind"
+        );
+
+        primitive.executor.protected_file_create_error =
+            Some(windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS);
+        assert_eq!(
+            primitive.create_protected_file(&spec, &marker_path, |_| Ok(Vec::new())),
+            Err(InstallerRootError::ReceiptMismatch),
+            "ERROR_ALREADY_EXISTS must retain the collision classification"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn post_create_readback_failure_retains_created_disposition() {
         let fixture = Fixture::new();
         fixture.ensure_user_parent();
@@ -2695,6 +2761,7 @@ mod primitive_tests {
                         elevated,
                     }),
                     post_create_readback_error: None,
+                    protected_file_create_error: None,
                     root_appearance_after_pinning: None,
                 },
             }
