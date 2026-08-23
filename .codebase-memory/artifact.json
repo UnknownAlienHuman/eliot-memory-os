@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "9588c44fe3b986f9779a65500ddb6f64627dd07e",
+    "indexed_at": "2026-08-23T16:30:12Z",
+    "project": "eliot-memory-os-9588-runtime-live-v3",
+    "nodes": 54063,
+    "edges": 267644,
+    "original_size": 111542272,
+    "compressed_size": 17507181,
+    "compression_level": 9
+}
