@@ -376,7 +376,9 @@ impl WindowsInstallerRootPrimitive {
         self.executor.validate_read_request(&request)?;
         match WindowsInstallerRootExecutor::readback(&request)? {
             Readback::Absent => Ok(InstallerRootPrimitiveObservation::Absent(
-                observe_absence(&request)?.snapshot,
+                observe_absence(&request)
+                    .map_err(|error| map_absence_observation_error(&error))?
+                    .snapshot,
             )),
             Readback::Matching(root) => Ok(InstallerRootPrimitiveObservation::Matching(
                 root.object_snapshot(),
@@ -419,14 +421,12 @@ impl WindowsInstallerRootPrimitive {
         self.executor.validate_request(&request)?;
         let pinned = match observe_absence(&request) {
             Ok(pinned) => pinned,
-            Err(InstallerRootError::IdentityMismatch)
-                if std::fs::symlink_metadata(&request.root).is_ok() =>
-            {
+            Err(AbsenceObservationError::RootAppeared) => {
                 return Ok(InstallerRootCreateAttempt::PreconditionRace {
                     pending_ref: "installer-root-absence-race-v1:precondition",
                 });
             }
-            Err(error) => return Err(error),
+            Err(AbsenceObservationError::Installer(error)) => return Err(error),
         };
         if &pinned.snapshot != expected {
             return Err(InstallerRootError::IdentityMismatch);
@@ -690,38 +690,72 @@ struct PinnedAbsentSnapshot {
     _pins: Vec<std::fs::File>,
 }
 
+/// Distinguishes a target that appeared during a stable absence observation
+/// from a semantic contour/identity failure.  The distinction is important:
+/// only the former is safe to expose as the typed absence-race reference.
+#[derive(Debug)]
+enum AbsenceObservationError {
+    RootAppeared,
+    Installer(InstallerRootError),
+}
+
+fn map_absence_observation_error(error: &AbsenceObservationError) -> InstallerRootError {
+    match error {
+        AbsenceObservationError::RootAppeared => InstallerRootError::IdentityMismatch,
+        AbsenceObservationError::Installer(error) => *error,
+    }
+}
+
 fn observe_absence(
     request: &InstallerRootRequest,
-) -> Result<PinnedAbsentSnapshot, InstallerRootError> {
+) -> Result<PinnedAbsentSnapshot, AbsenceObservationError> {
     match std::fs::symlink_metadata(&request.root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Ok(_) => return Err(InstallerRootError::IdentityMismatch),
-        Err(error) => return Err(map_io_error(InstallerRootStage::Readback, &error)),
+        Ok(_) => {
+            return Err(AbsenceObservationError::Installer(
+                InstallerRootError::IdentityMismatch,
+            ));
+        }
+        Err(error) => {
+            return Err(AbsenceObservationError::Installer(map_io_error(
+                InstallerRootStage::Readback,
+                &error,
+            )));
+        }
     }
     let parent = request
         .root
         .parent()
-        .ok_or(InstallerRootError::MissingParent)?;
+        .ok_or(AbsenceObservationError::Installer(
+            InstallerRootError::MissingParent,
+        ))?;
     let mut paths: Vec<PathBuf> = parent.ancestors().map(Path::to_path_buf).collect();
     paths.reverse();
     let mut pins = Vec::with_capacity(paths.len());
     let mut snapshots = Vec::with_capacity(paths.len());
     let mut profile_anchor = None;
     for path in paths {
-        let pin = open_no_follow(&path, true, false).map_err(|error| match error {
-            InstallerRootError::Indeterminate => InstallerRootError::MissingParent,
-            other => other,
-        })?;
-        let canonical = canonical_path_from_handle(&pin, InstallerRootStage::Readback)?;
+        let pin = open_no_follow(&path, true, false)
+            .map_err(|error| match error {
+                InstallerRootError::Indeterminate => InstallerRootError::MissingParent,
+                other => other,
+            })
+            .map_err(AbsenceObservationError::Installer)?;
+        let canonical = canonical_path_from_handle(&pin, InstallerRootStage::Readback)
+            .map_err(AbsenceObservationError::Installer)?;
         if !windows_paths_equal(&canonical, &path) {
-            return Err(InstallerRootError::IdentityMismatch);
+            return Err(AbsenceObservationError::Installer(
+                InstallerRootError::IdentityMismatch,
+            ));
         }
-        let identity = file_identity_from_handle_staged(&pin, InstallerRootStage::Readback)?;
+        let identity = file_identity_from_handle_staged(&pin, InstallerRootStage::Readback)
+            .map_err(AbsenceObservationError::Installer)?;
         let snapshot = InstallerRootObjectSnapshot {
             canonical_path_digest: windows_path_digest(&canonical),
             volume_serial_number: identity.volume_serial_number,
             file_index: identity.file_index,
-            security_descriptor_digest: observe_security_descriptor_digest(&pin)?,
+            security_descriptor_digest: observe_security_descriptor_digest(&pin)
+                .map_err(AbsenceObservationError::Installer)?,
         };
         if windows_paths_equal(&canonical, &request.profile_anchor) {
             profile_anchor = Some(snapshot.clone());
@@ -732,12 +766,30 @@ fn observe_absence(
     let parent_snapshot = snapshots
         .last()
         .cloned()
-        .ok_or(InstallerRootError::MissingParent)?;
-    let profile_anchor = profile_anchor.ok_or(InstallerRootError::InvalidPath)?;
+        .ok_or(AbsenceObservationError::Installer(
+            InstallerRootError::MissingParent,
+        ))?;
+    let profile_anchor = profile_anchor.ok_or(AbsenceObservationError::Installer(
+        InstallerRootError::InvalidPath,
+    ))?;
     match std::fs::symlink_metadata(&request.root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Ok(_) => return Err(InstallerRootError::IdentityMismatch),
-        Err(error) => return Err(map_io_error(InstallerRootStage::Readback, &error)),
+        Ok(_) => {
+            if !absence_contour_matches(request, &snapshots)
+                .map_err(AbsenceObservationError::Installer)?
+            {
+                return Err(AbsenceObservationError::Installer(
+                    InstallerRootError::IdentityMismatch,
+                ));
+            }
+            return Err(AbsenceObservationError::RootAppeared);
+        }
+        Err(error) => {
+            return Err(AbsenceObservationError::Installer(map_io_error(
+                InstallerRootStage::Readback,
+                &error,
+            )));
+        }
     }
     Ok(PinnedAbsentSnapshot {
         snapshot: InstallerRootAbsentSnapshot {
@@ -749,6 +801,39 @@ fn observe_absence(
         },
         _pins: pins,
     })
+}
+
+/// Re-checks the retained parent contour before classifying a target
+/// appearance as the semantic absence race.  A replacement parent (or any
+/// replaced ancestor) is an identity mismatch, never an absence race.
+fn absence_contour_matches(
+    request: &InstallerRootRequest,
+    snapshots: &[InstallerRootObjectSnapshot],
+) -> Result<bool, InstallerRootError> {
+    let parent = request
+        .root
+        .parent()
+        .ok_or(InstallerRootError::MissingParent)?;
+    let mut paths: Vec<PathBuf> = parent.ancestors().map(Path::to_path_buf).collect();
+    paths.reverse();
+    if paths.len() != snapshots.len() {
+        return Err(InstallerRootError::Indeterminate);
+    }
+    for (path, expected) in paths.iter().zip(snapshots) {
+        let pin = open_no_follow(path, true, false).map_err(|error| match error {
+            InstallerRootError::Indeterminate => InstallerRootError::MissingParent,
+            other => other,
+        })?;
+        let canonical = canonical_path_from_handle(&pin, InstallerRootStage::Readback)?;
+        if !windows_paths_equal(&canonical, path) {
+            return Ok(false);
+        }
+        let identity = file_identity_from_handle_staged(&pin, InstallerRootStage::Readback)?;
+        if identity != snapshot_identity(expected) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl RootReadback {
@@ -1727,18 +1812,17 @@ fn verify_security_exact(
             &raw mut descriptor,
         )
     };
-    if status != ERROR_SUCCESS || descriptor.is_null() {
+    if status != ERROR_SUCCESS {
         if !descriptor.is_null() {
             unsafe { LocalFree(descriptor.cast()) };
         }
         return Err(InstallerRootError::Win32 {
             stage: InstallerRootStage::Readback,
-            code: if status == ERROR_SUCCESS {
-                unsafe { GetLastError() }
-            } else {
-                status
-            },
+            code: status,
         });
+    }
+    if descriptor.is_null() {
+        return Err(InstallerRootError::Indeterminate);
     }
     let mut present = 0;
     let mut actual_dacl = std::ptr::null_mut();
@@ -1805,10 +1889,7 @@ fn verify_security_exact(
     if !dacl_matches || !protected || !owner_matches {
         return Err(InstallerRootError::SecurityMismatch);
     }
-    descriptor_digest.ok_or_else(|| InstallerRootError::Win32 {
-        stage: InstallerRootStage::Readback,
-        code: unsafe { GetLastError() },
-    })
+    descriptor_digest.ok_or(InstallerRootError::Indeterminate)
 }
 
 #[cfg(windows)]
@@ -1834,18 +1915,17 @@ fn observe_security_descriptor_digest(file: &std::fs::File) -> Result<String, In
             &raw mut descriptor,
         )
     };
-    if status != ERROR_SUCCESS || descriptor.is_null() {
+    if status != ERROR_SUCCESS {
         if !descriptor.is_null() {
             unsafe { LocalFree(descriptor.cast()) };
         }
         return Err(InstallerRootError::Win32 {
             stage: InstallerRootStage::Readback,
-            code: if status == ERROR_SUCCESS {
-                unsafe { GetLastError() }
-            } else {
-                status
-            },
+            code: status,
         });
+    }
+    if descriptor.is_null() {
+        return Err(InstallerRootError::Indeterminate);
     }
     let mut control = 0_u16;
     let mut revision = 0_u32;
@@ -1873,10 +1953,7 @@ fn observe_security_descriptor_digest(file: &std::fs::File) -> Result<String, In
         None
     };
     unsafe { LocalFree(descriptor.cast()) };
-    digest_value.ok_or_else(|| InstallerRootError::Win32 {
-        stage: InstallerRootStage::Readback,
-        code: unsafe { GetLastError() },
-    })
+    digest_value.ok_or(InstallerRootError::Indeterminate)
 }
 
 #[cfg(not(windows))]
@@ -2149,6 +2226,7 @@ fn map_protected_error(error: ProtectedPathError) -> InstallerRootError {
     }
 }
 
+#[cfg(windows)]
 fn map_io_error(stage: InstallerRootStage, error: &std::io::Error) -> InstallerRootError {
     error
         .raw_os_error()
@@ -2157,6 +2235,13 @@ fn map_io_error(stage: InstallerRootStage, error: &std::io::Error) -> InstallerR
                 InstallerRootError::Win32 { stage, code }
             })
         })
+}
+
+#[cfg(not(windows))]
+fn map_io_error(_stage: InstallerRootStage, _error: &std::io::Error) -> InstallerRootError {
+    // POSIX errno values are not Win32 status values.  Keep them out of the
+    // typed Win32 reference wire when this Windows primitive is unavailable.
+    InstallerRootError::Indeterminate
 }
 
 #[cfg(windows)]
@@ -2361,6 +2446,20 @@ mod primitive_tests {
                 stage: InstallerRootStage::Readback,
                 code: 5,
             }
+        );
+    }
+
+    #[test]
+    fn absence_race_mapping_does_not_relabel_identity_substitution() {
+        assert_eq!(
+            map_absence_observation_error(&AbsenceObservationError::RootAppeared),
+            InstallerRootError::IdentityMismatch
+        );
+        assert_eq!(
+            map_absence_observation_error(&AbsenceObservationError::Installer(
+                InstallerRootError::IdentityMismatch,
+            )),
+            InstallerRootError::IdentityMismatch
         );
     }
 
