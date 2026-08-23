@@ -18,6 +18,7 @@ use eliot_contracts::{
 use eliot_evidence::EvidenceEnvelope;
 use eliot_instrument_api::{InstrumentInvocation, VerificationRun};
 use eliot_receipts::{ReceiptEnvelope, ReceiptKind, RequestBinding};
+pub use eliot_runtime_contracts::ModuleGeneration as ProtocolModuleGeneration;
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -539,8 +540,8 @@ impl EventEnvelope {
         Ok(())
     }
 
-    fn replay_key(&self) -> String {
-        format!("{}:{}", self.stream_id, self.event_id)
+    fn replay_key(&self) -> EventIdentityKey {
+        EventIdentityKey::new(&self.stream_id, &self.event_id)
     }
 }
 
@@ -680,10 +681,61 @@ impl EventAckReceipt {
     }
 }
 
+const EVENT_IDENTITY_DOMAIN_TAG: &[u8] = b"eliot:event:v1";
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct EventIdentityKey {
+    stream_id: String,
+    event_id: String,
+}
+
+impl EventIdentityKey {
+    pub fn new(stream_id: impl Into<String>, event_id: impl Into<String>) -> Self {
+        Self {
+            stream_id: stream_id.into(),
+            event_id: event_id.into(),
+        }
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            EVENT_IDENTITY_DOMAIN_TAG.len() + 16 + self.stream_id.len() + self.event_id.len(),
+        );
+        out.extend_from_slice(EVENT_IDENTITY_DOMAIN_TAG);
+        out.extend_from_slice(&(self.stream_id.len() as u64).to_be_bytes());
+        out.extend_from_slice(self.stream_id.as_bytes());
+        out.extend_from_slice(&(self.event_id.len() as u64).to_be_bytes());
+        out.extend_from_slice(self.event_id.as_bytes());
+        out
+    }
+
+    pub fn canonical_hex(&self) -> String {
+        eliot_contracts::sha256_hex(&self.canonical_bytes())
+    }
+
+    pub fn canonical_key(&self) -> String {
+        self.canonical_hex()
+    }
+}
+
+pub type EventReplayKey = EventIdentityKey;
+
+pub fn event_replay_key(stream_id: &str, event_id: &str) -> String {
+    EventIdentityKey::new(stream_id, event_id).canonical_hex()
+}
+
 /// A pure replay identity ledger for compatibility and fixture checking.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReplayLedger {
-    entries: BTreeMap<String, (u64, String)>,
+    entries: BTreeMap<EventIdentityKey, (u64, String)>,
 }
 
 impl ReplayLedger {
@@ -1246,5 +1298,46 @@ mod tests {
         assert_eq!(identity.name.as_str(), CONTRACT_NAME);
         assert_eq!(identity.version, CONTRACT_VERSION);
         Ok(())
+    }
+
+    #[test]
+    fn colon_pair_stream_event_remains_distinct_via_length_prefixed_key()
+    -> Result<(), ProtocolError> {
+        let mut ledger = ReplayLedger::new();
+        let mut first = event();
+        first.stream_id = "s:e".to_owned();
+        first.event_id = "x".to_owned();
+        first.sequence = 1;
+        let mut second = event();
+        second.stream_id = "s".to_owned();
+        second.event_id = "e:x".to_owned();
+        second.sequence = 1;
+        assert_ne!(
+            event_replay_key(&first.stream_id, &first.event_id),
+            event_replay_key(&second.stream_id, &second.event_id)
+        );
+        assert_ne!(first.replay_key(), second.replay_key());
+        assert_eq!(ledger.observe(&first)?, EventDisposition::Accepted);
+        assert_eq!(ledger.observe(&second)?, EventDisposition::Accepted);
+        assert_eq!(ledger.len(), 2);
+        let duplicate = first.clone();
+        assert_eq!(ledger.observe(&duplicate)?, EventDisposition::Duplicate);
+        let mut conflict = first.clone();
+        conflict.sequence = 2;
+        assert_eq!(
+            ledger.observe(&conflict),
+            Err(ProtocolError::ReplayConflict)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn event_replay_key_is_injective_for_empty_vs_colon() {
+        assert_ne!(event_replay_key("a:b", "c"), event_replay_key("a", "b:c"));
+        assert_ne!(event_replay_key("s:e", "x"), event_replay_key("s", "e:x"));
+        assert_eq!(
+            event_replay_key("s", "e"),
+            EventReplayKey::new("s", "e").canonical_key()
+        );
     }
 }

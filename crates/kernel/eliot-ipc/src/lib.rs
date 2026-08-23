@@ -1016,18 +1016,19 @@ impl Default for ReplayLedger {
 }
 
 impl ReplayLedger {
-    pub fn observe(&mut self, id: impl Into<String>, frame: &Frame) -> ReplayDisposition {
+    pub fn observe(
+        &mut self,
+        id: impl Into<String>,
+        frame: &Frame,
+    ) -> Result<ReplayDisposition, TransportError> {
         let id = id.into();
         match self.entries.get(&id) {
-            Some(previous) if previous == frame => ReplayDisposition::Duplicate,
-            Some(_) => ReplayDisposition::Conflict,
+            Some(previous) if previous == frame => Ok(ReplayDisposition::Duplicate),
+            Some(_) => Ok(ReplayDisposition::Conflict),
+            None if self.entries.len() >= self.capacity => Err(TransportError::RegistryFull),
             None => {
-                if self.entries.len() >= self.capacity {
-                    ReplayDisposition::Conflict
-                } else {
-                    self.entries.insert(id, frame.clone());
-                    ReplayDisposition::New
-                }
+                self.entries.insert(id, frame.clone());
+                Ok(ReplayDisposition::New)
             }
         }
     }
@@ -1817,15 +1818,18 @@ mod tests {
         assert!(!session.accepts(3, 2));
         let frame = heartbeat();
         let mut ledger = ReplayLedger::default();
-        assert_eq!(ledger.observe("event", &frame), ReplayDisposition::New);
         assert_eq!(
-            ledger.observe("event", &frame),
+            ledger.observe("event", &frame).expect("new"),
+            ReplayDisposition::New
+        );
+        assert_eq!(
+            ledger.observe("event", &frame).expect("duplicate"),
             ReplayDisposition::Duplicate
         );
         let mut changed = frame.clone();
         changed.connection_id = "other".into();
         assert_eq!(
-            ledger.observe("event", &changed),
+            ledger.observe("event", &changed).expect("conflict"),
             ReplayDisposition::Conflict
         );
         let mut cancellation = CancellationRegistry::default();
@@ -1959,6 +1963,34 @@ mod tests {
         assert_eq!(
             cancellation.cancel_bound(&key),
             CancellationDisposition::Duplicate
+        );
+    }
+
+    #[test]
+    fn registry_full_is_distinct_from_conflict_and_preserves_duplicate() {
+        let mut ledger = ReplayLedger::with_capacity(1).expect("capacity");
+        let frame = heartbeat();
+        let mut conflict = frame.clone();
+        conflict.connection_id = "other".into();
+        assert_eq!(
+            ledger.observe("first", &frame).expect("new"),
+            ReplayDisposition::New
+        );
+        assert_eq!(
+            ledger.observe("first", &frame).expect("duplicate"),
+            ReplayDisposition::Duplicate
+        );
+        assert_eq!(
+            ledger.observe("first", &conflict).expect("conflict"),
+            ReplayDisposition::Conflict
+        );
+        assert_eq!(
+            ledger.observe("second", &conflict),
+            Err(TransportError::RegistryFull)
+        );
+        assert_eq!(
+            ledger.observe("first", &frame).expect("still duplicate"),
+            ReplayDisposition::Duplicate
         );
     }
 

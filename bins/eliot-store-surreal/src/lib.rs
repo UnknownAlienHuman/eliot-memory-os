@@ -18,7 +18,7 @@ use eliot_installation::{
     ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
     validate_store_credential_target,
 };
-use eliot_ipc::{ReplayDisposition, ReplayLedger, TransportLimits};
+use eliot_ipc::{BoundIdentity, ReplayDisposition, ReplayLedger, TransportError, TransportLimits};
 use eliot_kernel_service::{
     HostStoreBootstrapRequirement, STORE_MODULE_IDENTITY, STORE_ROUTE_IDENTITY,
 };
@@ -951,6 +951,7 @@ pub struct StoreEbpSession {
     connection_id: String,
     protocol_version: ProtocolVersion,
     state_fence: StateFence,
+    module_generation: eliot_protocol::ProtocolModuleGeneration,
     max_frame_bytes: usize,
     capabilities: BTreeSet<String>,
     replay: ReplayLedger,
@@ -1066,6 +1067,7 @@ pub fn admit_handshake(
             connection_id: frame.connection_id,
             protocol_version,
             state_fence: state_fence.clone(),
+            module_generation: hello.module_generation.clone(),
             max_frame_bytes: usize::try_from(hello.max_frame)
                 .map_err(|_| "ClientHello max_frame does not fit usize".to_owned())?,
             capabilities: capabilities.into_iter().collect(),
@@ -1090,11 +1092,21 @@ pub fn validate_request_frame(
     if identity.request.state_fence != session.state_fence {
         return Err("request identity state fence does not match the handshake fence".to_owned());
     }
-    match session.replay.observe(request_id.to_string(), frame) {
-        ReplayDisposition::Conflict => {
+    let bound = BoundIdentity::new(
+        session.connection_id.clone(),
+        session.module_generation.clone(),
+        request_id.to_string(),
+    )
+    .map_err(|error| format!("invalid request identity binding: {error}"))?;
+    match session.replay.observe_bound(bound, frame) {
+        Ok(ReplayDisposition::New | ReplayDisposition::Duplicate) => {}
+        Ok(ReplayDisposition::Conflict) => {
             return Err("request identity conflicts with a prior frame".to_owned());
         }
-        ReplayDisposition::New | ReplayDisposition::Duplicate => {}
+        Err(TransportError::RegistryFull) => {
+            return Err("bounded transport registry is full".to_owned());
+        }
+        Err(error) => return Err(error.to_string()),
     }
     let capability = request.capability();
     if !session.capabilities.contains(capability) {
@@ -1926,6 +1938,117 @@ mod tests {
                 &identity,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn store_replay_bound_capacity_is_registry_full_distinct_from_conflict() {
+        use eliot_ipc::{BoundIdentity, ReplayDisposition, TransportError};
+        let generation: eliot_protocol::ProtocolModuleGeneration =
+            serde_json::from_value(serde_json::json!({
+                "module_id": "module.test",
+                "generation": 1,
+                "artifact_id": "artifact",
+                "state": "ACTIVE",
+                "health": {
+                    "liveness": "HEALTHY",
+                    "readiness": "HEALTHY",
+                    "freshness": "HEALTHY",
+                    "compatibility": "HEALTHY",
+                    "integrity": "HEALTHY",
+                    "capacity": "HEALTHY"
+                },
+                "state_fence": {
+                    "authority_epoch": 1,
+                    "resource_generation": 1
+                }
+            }))
+            .expect("generation");
+        let frame = eliot_protocol::Frame {
+            protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+            encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+            connection_id: "c".to_owned(),
+            request_id: None,
+            kind: eliot_protocol::FrameKind::Heartbeat,
+            message_type: eliot_protocol::MessageType::Health,
+            request_identity: None,
+            payload: eliot_protocol::ProtocolPayload::Json(serde_json::Value::Null),
+            trace_context: std::collections::BTreeMap::new(),
+        };
+        let mut ledger = eliot_ipc::ReplayLedger::with_capacity(1).expect("capacity");
+        let bound = BoundIdentity::new("stream", generation.clone(), "request-1").expect("bound");
+        assert_eq!(
+            ledger.observe_bound(bound.clone(), &frame).expect("new"),
+            ReplayDisposition::New
+        );
+        assert_eq!(
+            ledger
+                .observe_bound(bound.clone(), &frame)
+                .expect("duplicate"),
+            ReplayDisposition::Duplicate
+        );
+        let mut conflict = frame.clone();
+        conflict.connection_id = "other".to_owned();
+        assert_eq!(
+            ledger
+                .observe_bound(bound.clone(), &conflict)
+                .expect("conflict"),
+            ReplayDisposition::Conflict
+        );
+        let second = BoundIdentity::new("stream", generation, "request-2").expect("bound2");
+        assert_eq!(
+            ledger.observe_bound(second, &frame),
+            Err(TransportError::RegistryFull)
+        );
+    }
+
+    #[test]
+    fn store_replay_1025th_new_identity_is_registry_full() {
+        use eliot_ipc::{BoundIdentity, ReplayDisposition, TransportError};
+        let generation: eliot_protocol::ProtocolModuleGeneration =
+            serde_json::from_value(serde_json::json!({
+                "module_id": "module.test",
+                "generation": 1,
+                "artifact_id": "artifact",
+                "state": "ACTIVE",
+                "health": {
+                    "liveness": "HEALTHY",
+                    "readiness": "HEALTHY",
+                    "freshness": "HEALTHY",
+                    "compatibility": "HEALTHY",
+                    "integrity": "HEALTHY",
+                    "capacity": "HEALTHY"
+                },
+                "state_fence": {
+                    "authority_epoch": 1,
+                    "resource_generation": 1
+                }
+            }))
+            .expect("generation");
+        let frame = eliot_protocol::Frame {
+            protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+            encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+            connection_id: "c".to_owned(),
+            request_id: None,
+            kind: eliot_protocol::FrameKind::Heartbeat,
+            message_type: eliot_protocol::MessageType::Health,
+            request_identity: None,
+            payload: eliot_protocol::ProtocolPayload::Json(serde_json::Value::Null),
+            trace_context: std::collections::BTreeMap::new(),
+        };
+        let mut ledger = eliot_ipc::ReplayLedger::default();
+        for n in 1..=1024 {
+            let id = format!("request-{n}");
+            let bound = BoundIdentity::new("stream", generation.clone(), id).expect("bound");
+            assert_eq!(
+                ledger.observe_bound(bound, &frame).expect("new"),
+                ReplayDisposition::New
+            );
+        }
+        let overflow = BoundIdentity::new("stream", generation, "request-1025").expect("overflow");
+        assert_eq!(
+            ledger.observe_bound(overflow, &frame),
+            Err(TransportError::RegistryFull)
         );
     }
 }

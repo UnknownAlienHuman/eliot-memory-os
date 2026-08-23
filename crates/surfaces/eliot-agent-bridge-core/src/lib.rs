@@ -19,7 +19,7 @@ pub use eliot_observation_contracts::{
 };
 pub use eliot_process::{FencingToken, Generation};
 pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope, Frame};
-use eliot_protocol::{EventAckReceipt, ReplayLedger};
+use eliot_protocol::{EventAckReceipt, EventIdentityKey, ReplayLedger};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 
@@ -845,8 +845,8 @@ pub struct AgentBridgeCore {
     cursor_policy: CursorPolicy,
     active: Option<ActiveAttach>,
     replay: ReplayLedger,
-    acknowledged_phases: BTreeMap<String, AckPhase>,
-    pending_deliveries: BTreeMap<String, PendingDelivery>,
+    acknowledged_phases: BTreeMap<EventIdentityKey, AckPhase>,
+    pending_deliveries: BTreeMap<EventIdentityKey, PendingDelivery>,
     cursors: BTreeMap<String, u64>,
 }
 
@@ -1066,7 +1066,7 @@ impl AgentBridgeCore {
                 reason: "durable events require an explicit acknowledgement",
             });
         }
-        let replay_key = format!("{}:{}", event.stream_id, event.event_id);
+        let replay_key = EventIdentityKey::new(&event.stream_id, &event.event_id);
         let mut completed_probe = self.replay.clone();
         match completed_probe
             .observe(event)
@@ -1331,5 +1331,39 @@ impl fmt::Debug for AgentBridgeCore {
             .field("replay_entries", &self.replay.len())
             .field("outstanding_deliveries", &self.pending_deliveries.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colon_pair_event_identity_keys_do_not_collide() {
+        let left = EventIdentityKey::new("a:b", "c");
+        let right = EventIdentityKey::new("a", "b:c");
+        assert_ne!(left, right);
+        assert_ne!(left.canonical_hex(), right.canonical_hex());
+        assert_ne!(left.canonical_bytes(), right.canonical_bytes());
+        let another_left = EventIdentityKey::new("s:e", "x");
+        let another_right = EventIdentityKey::new("s", "e:x");
+        assert_ne!(another_left.canonical_hex(), another_right.canonical_hex());
+    }
+
+    #[test]
+    fn bridge_pending_maps_use_typed_key_without_colon_collision() {
+        let mut pending: BTreeMap<EventIdentityKey, u8> = BTreeMap::new();
+        let mut acked: BTreeMap<EventIdentityKey, AckPhase> = BTreeMap::new();
+        let left = EventIdentityKey::new("a:b", "c");
+        let right = EventIdentityKey::new("a", "b:c");
+        pending.insert(left.clone(), 1);
+        acked.insert(left.clone(), AckPhase::Durable);
+        assert!(!pending.contains_key(&right));
+        assert!(!acked.contains_key(&right));
+        assert!(pending.contains_key(&left));
+        assert!(acked.contains_key(&left));
+        let left2 = EventIdentityKey::new("s:e", "x");
+        let right2 = EventIdentityKey::new("s", "e:x");
+        assert_ne!(left2.canonical_hex(), right2.canonical_hex());
     }
 }
