@@ -1033,11 +1033,37 @@ impl PrivilegeApi for NativePrivilegeApi {
                 windows_sys::Win32::Foundation::GetLastError()
             });
         }
+        let returned_bytes = usize::try_from(required)
+            .map_err(|_| windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        let allocated_bytes = buffer
+            .len()
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or(windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        let privilege_count_end = std::mem::offset_of!(TOKEN_PRIVILEGES, PrivilegeCount)
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or(windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        let privileges_offset = std::mem::offset_of!(TOKEN_PRIVILEGES, Privileges);
+        if returned_bytes > allocated_bytes || returned_bytes < privilege_count_end {
+            return Err(windows_sys::Win32::Foundation::ERROR_BAD_LENGTH);
+        }
         let privileges = buffer.as_ptr().cast::<TOKEN_PRIVILEGES>();
         let count = unsafe {
             // SAFETY: GetTokenInformation filled the TOKEN_PRIVILEGES header.
             (*privileges).PrivilegeCount
         };
+        let count = usize::try_from(count)
+            .map_err(|_| windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        let entries_bytes = count
+            .checked_mul(std::mem::size_of::<
+                windows_sys::Win32::Security::LUID_AND_ATTRIBUTES,
+            >())
+            .ok_or(windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        let entries_end = privileges_offset
+            .checked_add(entries_bytes)
+            .ok_or(windows_sys::Win32::Foundation::ERROR_ARITHMETIC_OVERFLOW)?;
+        if entries_end > returned_bytes {
+            return Err(windows_sys::Win32::Foundation::ERROR_BAD_LENGTH);
+        }
         let mut luid = windows_sys::Win32::Foundation::LUID::default();
         let lookup_ok = unsafe {
             // SAFETY: the output LUID is valid and the constant name is NUL-terminated.
@@ -1054,8 +1080,11 @@ impl PrivilegeApi for NativePrivilegeApi {
             });
         }
         let entries = unsafe {
-            // SAFETY: the returned variable-sized buffer contains `count` entries.
-            std::slice::from_raw_parts((*privileges).Privileges.as_ptr(), count as usize)
+            // SAFETY: the validated returned buffer contains `count` entries.
+            std::slice::from_raw_parts::<windows_sys::Win32::Security::LUID_AND_ATTRIBUTES>(
+                buffer.as_ptr().cast::<u8>().add(privileges_offset).cast(),
+                count,
+            )
         };
         entries
             .iter()
@@ -1228,9 +1257,7 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
         let duplicate = match api.duplicate_token(source) {
             Ok(token) => token,
             Err(code) => {
-                if prior_thread.is_none() {
-                    api.close_token(source);
-                }
+                api.close_token(source);
                 return Err(InstallerRootError::Win32 {
                     stage: InstallerRootStage::DuplicateToken,
                     code,
@@ -2126,6 +2153,23 @@ mod primitive_tests {
         }
         assert_eq!(api.bound, vec![Some(22), Some(33)]);
         assert_eq!(api.closed, vec![22, 33]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scoped_restore_privilege_closes_existing_thread_token_when_duplicate_fails() {
+        let mut api = fake_api();
+        api.thread = Ok(33);
+        api.duplicate = Err(5);
+        assert!(matches!(
+            ScopedRestorePrivilege::enter(&mut api),
+            Err(InstallerRootError::Win32 {
+                stage: InstallerRootStage::DuplicateToken,
+                code: 5,
+            })
+        ));
+        assert!(api.bound.is_empty());
+        assert_eq!(api.closed, vec![33]);
     }
 
     #[cfg(windows)]
