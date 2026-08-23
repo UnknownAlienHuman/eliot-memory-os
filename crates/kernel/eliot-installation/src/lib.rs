@@ -16940,17 +16940,8 @@ fn root_port_error(error: InstallerRootError) -> PortError {
 }
 
 fn installer_root_reference(stage: InstallerRootStage, code: u32) -> PlatformHandle {
-    let prefix = if matches!(
-        stage,
-        InstallerRootStage::OpenReadback | InstallerRootStage::Readback
-    ) && is_absence_status(code)
-    {
-        "installer-root-absence-race-v1"
-    } else {
-        "installer-root-win32-v2"
-    };
     PlatformHandle::new(format!(
-        "{prefix}:{}:{code:08x}",
+        "installer-root-win32-v2:{}:{code:08x}",
         installer_root_stage_token(stage),
     ))
     .unwrap_or_else(|_| unreachable!())
@@ -17050,10 +17041,6 @@ fn installer_root_stage_token(stage: InstallerRootStage) -> &'static str {
         InstallerRootStage::OpenReadback => "open-readback",
         InstallerRootStage::Readback => "readback",
     }
-}
-
-fn is_absence_status(code: u32) -> bool {
-    matches!(code, 2 | 3)
 }
 
 mod transaction_store_private {
@@ -20162,14 +20149,14 @@ mod tests {
     }
 
     #[test]
-    fn root_absence_race_uses_a_stable_semantic_pending_reference() {
+    fn raw_absence_status_remains_a_typed_win32_pending_reference() {
         let pending = port_pending(root_execution_error::<()>(InstallerRootError::Win32 {
             stage: InstallerRootStage::OpenReadback,
             code: 2,
         }));
         assert_eq!(
             pending.as_str(),
-            "installer-root-absence-race-v1:open-readback:00000002"
+            "installer-root-win32-v2:open-readback:00000002"
         );
     }
 
@@ -20206,7 +20193,7 @@ mod tests {
         let valid = [
             "installer-root-win32-v2:open-thread-token:00000000",
             "installer-root-win32-v2:readback:ffffffff",
-            "installer-root-absence-race-v1:open-readback:00000002",
+            "installer-root-win32-v2:open-readback:00000002",
         ];
         for reference in valid {
             let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {
