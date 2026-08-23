@@ -502,12 +502,14 @@ impl WindowsInstallerRootPrimitive {
         let injected_create_error = self.executor.protected_file_create_error;
         #[cfg(not(test))]
         let injected_create_error = None;
-        create_protected_file(
-            ProtectedFileSecurity::Installation(spec.profile),
-            path,
-            injected_create_error,
-            build,
-        )
+        with_system_restore_privilege(spec.profile, || {
+            create_protected_file(
+                ProtectedFileSecurity::Installation(spec.profile),
+                path,
+                injected_create_error,
+                build,
+            )
+        })
     }
 
     /// Creates a raw protected marker owned by the calling `LocalService` host.
@@ -528,12 +530,14 @@ impl WindowsInstallerRootPrimitive {
         F: FnOnce(&InstallerRootObjectSnapshot) -> Result<Vec<u8>, InstallerRootError>,
     {
         ensure_system_service_spec(spec)?;
-        create_protected_file(
-            ProtectedFileSecurity::LocalServiceHostMarker,
-            path,
-            None,
-            build,
-        )
+        with_system_restore_privilege(spec.profile, || {
+            create_protected_file(
+                ProtectedFileSecurity::LocalServiceHostMarker,
+                path,
+                None,
+                build,
+            )
+        })
     }
 
     /// # Errors
@@ -1577,7 +1581,16 @@ where
     F: FnOnce() -> Result<T, InstallerRootError>,
 {
     let mut api = NativePrivilegeApi;
-    let mut guard = ScopedRestorePrivilege::enter(&mut api)?;
+    with_restore_privilege_api(&mut api, f)
+}
+
+#[cfg(windows)]
+fn with_restore_privilege_api<A, F, T>(api: &mut A, f: F) -> Result<T, InstallerRootError>
+where
+    A: PrivilegeApi + ?Sized,
+    F: FnOnce() -> Result<T, InstallerRootError>,
+{
+    let mut guard = ScopedRestorePrivilege::enter(api)?;
     let result = f();
     guard.restore();
     result
@@ -2417,7 +2430,8 @@ fn digest(bytes: &[u8]) -> String {
 #[cfg(all(test, windows))]
 mod primitive_tests {
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -2434,6 +2448,7 @@ mod primitive_tests {
         bound: Vec<Option<usize>>,
         adjusted: usize,
         closed: Vec<usize>,
+        active: Arc<AtomicBool>,
     }
 
     #[cfg(windows)]
@@ -2469,6 +2484,7 @@ mod primitive_tests {
 
         fn bind_thread_token(&mut self, token: Option<usize>) -> Result<(), u32> {
             self.bound.push(token);
+            self.active.store(token.is_some(), Ordering::SeqCst);
             self.bind
         }
 
@@ -2493,6 +2509,7 @@ mod primitive_tests {
             bound: Vec::new(),
             adjusted: 0,
             closed: Vec::new(),
+            active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2548,6 +2565,72 @@ mod primitive_tests {
             Err(InstallerRootError::ReceiptMismatch),
             "ERROR_ALREADY_EXISTS must retain the collision classification"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_marker_create_maps_raw_error_while_restore_privilege_is_active() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("system-authority.json");
+        let mut api = fake_api();
+        let active = Arc::clone(&api.active);
+
+        let error = with_restore_privilege_api(&mut api, || {
+            assert!(
+                active.load(Ordering::SeqCst),
+                "protected marker creation must run with restore privilege bound"
+            );
+            create_protected_file(
+                ProtectedFileSecurity::Installation(InstallerRootProfile::SystemService),
+                &path,
+                Some(windows_sys::Win32::Foundation::ERROR_INVALID_OWNER),
+                |_| panic!("injected CreateFileW error must happen before the builder"),
+            )
+        })
+        .expect_err("injected CreateFileW error must be returned");
+
+        assert_eq!(
+            error,
+            InstallerRootError::Win32 {
+                stage: InstallerRootStage::CreateProtectedFile,
+                code: windows_sys::Win32::Foundation::ERROR_INVALID_OWNER,
+            }
+        );
+        assert!(
+            !active.load(Ordering::SeqCst),
+            "restore privilege must be unbound after protected marker creation"
+        );
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_service_marker_create_maps_raw_error_while_restore_privilege_is_active() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("local-service-authority.json");
+        let mut api = fake_api();
+        let active = Arc::clone(&api.active);
+
+        let error = with_restore_privilege_api(&mut api, || {
+            assert!(active.load(Ordering::SeqCst));
+            create_protected_file(
+                ProtectedFileSecurity::LocalServiceHostMarker,
+                &path,
+                Some(windows_sys::Win32::Foundation::ERROR_INVALID_OWNER),
+                |_| panic!("injected CreateFileW error must happen before the builder"),
+            )
+        })
+        .expect_err("injected CreateFileW error must be returned");
+
+        assert_eq!(
+            error,
+            InstallerRootError::Win32 {
+                stage: InstallerRootStage::CreateProtectedFile,
+                code: windows_sys::Win32::Foundation::ERROR_INVALID_OWNER,
+            }
+        );
+        assert!(!active.load(Ordering::SeqCst));
+        assert!(!path.exists());
     }
 
     #[cfg(windows)]
