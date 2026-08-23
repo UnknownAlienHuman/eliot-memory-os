@@ -31,6 +31,7 @@ use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
     ProtocolVersion, ServerHello,
 };
+use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
 use eliot_store_api::{
     CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, NamedReadRequest,
     NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
@@ -417,6 +418,16 @@ impl StoreLaunchConfig {
         if self.endpoint != format!("ws://{}/rpc", self.provider_bind_address) {
             return Err(
                 "endpoint must exactly match the explicit loopback provider bind address"
+                    .to_owned(),
+            );
+        }
+        if !RuntimeLiveStoreIdentity::canonical().is_exact_match(
+            &self.provider_bind_address,
+            &self.endpoint,
+            &self.namespace,
+        ) {
+            return Err(
+                "Store launch target must exactly match the canonical runtime-live bind, endpoint, and namespace"
                     .to_owned(),
             );
         }
@@ -1413,7 +1424,7 @@ mod tests {
                 supervision_lease_scope_id: handle("test-supervision-scope"),
             },
             authority_descriptor_path: handle(r"C:\ProgramData\Eliot\authority.json"),
-            authority_descriptor_digest: handle("7".repeat(64)),
+            authority_descriptor_digest: handle(eliot_installation::PHASE_B_PENDING_MARKER),
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
             kernel_artifact_digest: handle("1".repeat(64)),
@@ -1431,7 +1442,7 @@ mod tests {
             ),
             store_bridge_artifact_digest: handle("a".repeat(64)),
             store_bootstrap_descriptor_path: handle(r"C:\ProgramData\Eliot\store-bootstrap.json"),
-            store_bootstrap_descriptor_digest: handle("6".repeat(64)),
+            store_bootstrap_descriptor_digest: handle(eliot_installation::PHASE_B_PENDING_MARKER),
             canonical_store_executable_path: handle(r"C:\ProgramData\Eliot\bin\surreal.exe"),
             canonical_store_artifact_digest: handle("b".repeat(64)),
             kernel_arguments: vec![
@@ -1440,11 +1451,11 @@ mod tests {
                 handle("--store-bootstrap"),
                 handle(r"C:\ProgramData\Eliot\store-bootstrap.json"),
                 handle("--store-bootstrap-sha256"),
-                handle("6".repeat(64)),
+                handle(eliot_installation::PHASE_B_PENDING_MARKER),
                 handle("--authority-descriptor"),
                 handle(r"C:\ProgramData\Eliot\authority.json"),
                 handle("--authority-descriptor-sha256"),
-                handle("7".repeat(64)),
+                handle(eliot_installation::PHASE_B_PENDING_MARKER),
                 handle("--kernel-artifact-sha256"),
                 handle("1".repeat(64)),
                 handle("--eliotd-descriptor"),
@@ -1685,6 +1696,23 @@ mod tests {
         invalid_installation.approved_config_hash =
             launch_config_digest(&invalid_installation).expect("mismatched config digest");
         assert!(invalid_installation.validate().is_err());
+    }
+
+    #[test]
+    fn recomputed_digest_cannot_authorize_an_altered_runtime_live_target() {
+        let config = config();
+        for (bind, endpoint, namespace) in [
+            ("127.0.0.1:8001", "ws://127.0.0.1:8001/rpc", "eliot"),
+            ("127.0.0.1:8000", "ws://127.0.0.1:8000/rpc", "other"),
+        ] {
+            let mut altered = config.clone();
+            altered.provider_bind_address = bind.to_owned();
+            altered.endpoint = endpoint.to_owned();
+            altered.namespace = namespace.to_owned();
+            altered.approved_config_hash =
+                launch_config_digest(&altered).expect("recomputed altered digest");
+            assert!(altered.validate().is_err());
+        }
     }
 
     #[test]

@@ -31,7 +31,8 @@ use uuid::Uuid;
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use eliot_platform_windows::{
-    ProcessIdentity, RetainedProcessPathLease, observe_loopback_tcp_listener_owner,
+    ProcessIdentity, RetainedProcessPathLease, is_eliot_governor_running,
+    observe_loopback_tcp_listener_owner,
 };
 
 /// Wire revision for all S-03 requests.  The operation name is included in
@@ -167,6 +168,20 @@ impl RpcTransport {
                     "canonical provider process lease failed identity validation".to_owned(),
                 )
             })?;
+        match is_eliot_governor_running() {
+            Ok(true) => {
+                return Err(AdapterError::Config(
+                    "legacy eliot-governor.exe is running; refusing canonical provider launch"
+                        .to_owned(),
+                ));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return Err(AdapterError::Config(format!(
+                    "legacy eliot-governor.exe process state is unknown: {error}"
+                )));
+            }
+        }
         reject_occupied_endpoint(config, connect_timeout).await?;
         let mut provider_child = spawn_provider(config)?;
         let provider_process_id = provider_child.id().ok_or_else(|| {

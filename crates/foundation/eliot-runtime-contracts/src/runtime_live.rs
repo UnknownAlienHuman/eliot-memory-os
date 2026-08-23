@@ -113,11 +113,12 @@ mod tests {
     }
 
     #[test]
-    fn store_config_projection_ignores_unrelated_fields() {
+    fn store_config_projection_ignores_unrelated_fields()
+    -> Result<(), RuntimeLiveStoreIdentityError> {
         let identity = RuntimeLiveStoreIdentity::from_store_config_json(
             br#"{"provider_bind_address":"127.0.0.1:8000","endpoint":"ws://127.0.0.1:8000/rpc","namespace":"eliot","provider_arguments":["--bind"]}"#,
-        )
-        .expect("projection");
+        )?;
         assert!(identity.is_canonical());
+        Ok(())
     }
 }

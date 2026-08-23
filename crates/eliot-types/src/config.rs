@@ -268,10 +268,11 @@ impl SurrealServerConfig {
     /// store by endpoint/namespace or by bind/namespace.
     #[must_use]
     pub fn collides_with_store(&self, bind: &str, endpoint: &str, namespace: &str) -> bool {
-        (self.endpoint == endpoint && self.ns == namespace)
-            || (same_loopback_port(&self.endpoint, endpoint) && self.ns == namespace)
-            || (self.bind == bind && self.ns == namespace)
-            || (same_loopback_port(&self.bind, bind) && self.ns == namespace)
+        self.ns == namespace
+            && (self.endpoint == endpoint
+                || same_loopback_port(&self.endpoint, endpoint)
+                || self.bind == bind
+                || same_loopback_port(&self.bind, bind))
     }
 
     /// Rejects a reserved store identity before a server or writer starts.

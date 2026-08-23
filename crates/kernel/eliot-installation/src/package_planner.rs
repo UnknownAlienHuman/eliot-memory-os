@@ -7,6 +7,8 @@ use eliot_platform_windows::{
     TrustedSourceBundle, validate_package_relative_path,
 };
 
+use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -99,6 +101,127 @@ const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 7] = [
     ("eliotd.exe", true),
     ("eliotd-governor.json", false),
 ];
+
+/// The planner-side, wire-complete projection of `generation.json`.
+///
+/// The concrete Store service owns `StoreLaunchConfig`; this projection keeps
+/// the installation crate acyclic while still requiring every serialized
+/// launch field to be present before a package can be planned.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannerStoreLaunchConfig {
+    store_pipe: String,
+    launch_nonce: String,
+    expected_client_sid: String,
+    expected_client_session_id: u32,
+    approved_artifact_hash: String,
+    approved_config_hash: String,
+    endpoint: String,
+    provider_bind_address: String,
+    namespace: String,
+    database: String,
+    username: String,
+    connect_timeout_ms: u64,
+    query_timeout_ms: u64,
+    schema_generation: String,
+    blob_root: String,
+    instance_id: String,
+    credential_ref: String,
+    runtime_launch: RuntimeLaunchDescriptor,
+}
+
+#[derive(serde::Serialize)]
+struct PlannerOperationalConfig<'a> {
+    store_pipe: &'a str,
+    launch_nonce: &'a str,
+    expected_client_sid: &'a str,
+    expected_client_session_id: u32,
+    approved_artifact_hash: &'a str,
+    endpoint: &'a str,
+    provider_bind_address: &'a str,
+    namespace: &'a str,
+    database: &'a str,
+    username: &'a str,
+    connect_timeout_ms: u64,
+    query_timeout_ms: u64,
+    schema_generation: &'a str,
+    blob_root: &'a str,
+    instance_id: &'a str,
+    credential_ref: &'a str,
+    runtime_launch: &'a RuntimeLaunchDescriptor,
+}
+
+fn validate_source_store_config(
+    bytes: &[u8],
+    expected_config_path: &Path,
+) -> Result<PlannerStoreLaunchConfig, InstallationError> {
+    let config: PlannerStoreLaunchConfig =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::InvalidField {
+            field: "generation.json".to_owned(),
+            reason: format!("StoreLaunchConfig parse failed: {error}"),
+        })?;
+    if !RuntimeLiveStoreIdentity::canonical().is_exact_match(
+        &config.provider_bind_address,
+        &config.endpoint,
+        &config.namespace,
+    ) {
+        return Err(InstallationError::IdentityConflict);
+    }
+    if config.endpoint != format!("ws://{}/rpc", config.provider_bind_address)
+        || config.database.trim().is_empty()
+        || config.username.trim().is_empty()
+        || config.store_pipe.trim().is_empty()
+        || config.launch_nonce.trim().is_empty()
+        || config.credential_ref.trim().is_empty()
+        || config.blob_root.trim().is_empty()
+        || config.instance_id.trim().is_empty()
+        || config.schema_generation.trim().is_empty()
+        || config.expected_client_sid.trim().is_empty()
+        || config.approved_artifact_hash.len() != 64
+        || config.approved_config_hash.len() != 64
+        || config.connect_timeout_ms == 0
+        || config.query_timeout_ms == 0
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    config.runtime_launch.validate_for_config(
+        &PlatformHandle::new(expected_config_path.to_string_lossy().into_owned()).map_err(
+            |error| InstallationError::InvalidField {
+                field: "generation.json.runtime_launch.store_config_path".to_owned(),
+                reason: error.to_string(),
+            },
+        )?,
+    )?;
+    let operational = PlannerOperationalConfig {
+        store_pipe: &config.store_pipe,
+        launch_nonce: &config.launch_nonce,
+        expected_client_sid: &config.expected_client_sid,
+        expected_client_session_id: config.expected_client_session_id,
+        approved_artifact_hash: &config.approved_artifact_hash,
+        endpoint: &config.endpoint,
+        provider_bind_address: &config.provider_bind_address,
+        namespace: &config.namespace,
+        database: &config.database,
+        username: &config.username,
+        connect_timeout_ms: config.connect_timeout_ms,
+        query_timeout_ms: config.query_timeout_ms,
+        schema_generation: &config.schema_generation,
+        blob_root: &config.blob_root,
+        instance_id: &config.instance_id,
+        credential_ref: &config.credential_ref,
+        runtime_launch: &config.runtime_launch,
+    };
+    let digest = hex_digest(&serde_json::to_vec(&operational).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "generation.json.approved_config_hash".to_owned(),
+            reason: error.to_string(),
+        }
+    })?);
+    if digest != config.approved_config_hash {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(config)
+}
 
 fn append_evidence_text(bytes: &mut Vec<u8>, value: &str) {
     bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -772,7 +895,7 @@ impl GenerationPackagePlanner {
         input: GenerationPackagePlanInput,
     ) -> Result<InstallationTransaction, InstallationError> {
         let publication_binding = test_source_publication_binding(&input)?;
-        Self::plan_with_binding(input, &publication_binding)
+        Self::plan_with_binding(input, &publication_binding, false)
     }
 
     /// Plan from a source directory whose exact materializer publication facts
@@ -789,7 +912,7 @@ impl GenerationPackagePlanner {
             files,
             evidence_digest,
         };
-        Self::plan_with_binding(input, &publication_binding)
+        Self::plan_with_binding(input, &publication_binding, true)
     }
 
     /// Derive the complete candidate/package/effect graph and create one
@@ -806,6 +929,7 @@ impl GenerationPackagePlanner {
     fn plan_with_binding(
         input: GenerationPackagePlanInput,
         publication_binding: &SourceBundlePublicationBinding,
+        enforce_store_config: bool,
     ) -> Result<InstallationTransaction, InstallationError> {
         handle(&input.transaction_id, "generation.transaction_id")?;
         input.installation_epoch.validate()?;
@@ -876,6 +1000,27 @@ impl GenerationPackagePlanner {
             InstallationError::Platform(format!("source observe failed: {error}"))
         })?;
         validate_exact_source_inventory(&observed)?;
+        let source_store_config = if enforce_store_config {
+            let lease = source.retain_file("generation.json").map_err(|error| {
+                InstallationError::Platform(format!(
+                    "retain generation.json through planning: {error}"
+                ))
+            })?;
+            let bytes = lease.read_bounded(16 * 1024 * 1024).map_err(|error| {
+                InstallationError::Platform(format!("read generation.json lease: {error}"))
+            })?;
+            Some((
+                lease,
+                validate_source_store_config(
+                    &bytes,
+                    &Path::new(input.staging_root.as_str())
+                        .join(input.generation.as_str())
+                        .join("generation.json"),
+                )?,
+            ))
+        } else {
+            None
+        };
 
         let files = REQUIRED_PACKAGE_ROLES
             .iter()
@@ -1193,6 +1338,11 @@ impl GenerationPackagePlanner {
             runtime_launch: launch,
         };
         candidate.validate()?;
+        if let Some((_, config)) = source_store_config.as_ref()
+            && config.runtime_launch != candidate.runtime_launch
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
         // Validate the deterministic Phase-B static constraint at the sole
         // candidate producer. Host recomputes the same value from its exact
         // pending manifest before accepting the live overlay.
@@ -1490,7 +1640,7 @@ impl GenerationPackagePlanner {
                 reason: error.to_string(),
             })?,
         ];
-        InstallationTransaction::new(
+        let transaction = InstallationTransaction::new(
             input.transaction_id,
             input.installation_epoch,
             input.profile,
@@ -1503,7 +1653,35 @@ impl GenerationPackagePlanner {
             input.minimum_store_available_bytes,
             precondition_evidence,
             input.recovery_command,
-        )
+        )?;
+        if let Some((lease, config)) = source_store_config.as_ref() {
+            if config.runtime_launch != transaction.candidate_manifest.runtime_launch {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let reread = lease.read_bounded(16 * 1024 * 1024).map_err(|error| {
+                InstallationError::Platform(format!("final re-read generation.json lease: {error}"))
+            })?;
+            let digest = hex_digest(&reread);
+            let expected = transaction
+                .installer_effects
+                .iter()
+                .find_map(|effect| match effect {
+                    InstallerEffectPlan::StagePackage {
+                        expected_file_digests,
+                        ..
+                    } => expected_file_digests
+                        .iter()
+                        .find(|item| item.relative_path == "generation.json"),
+                    _ => None,
+                })
+                .ok_or(InstallationError::IdentityConflict)?;
+            if digest != expected.sha256.as_str()
+                || digest != transaction.candidate_manifest.config_digest.as_str()
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        Ok(transaction)
     }
 }
 
@@ -2824,6 +3002,127 @@ mod tests {
         let wire = serde_json::to_string(&transaction).unwrap();
         assert!(!wire.contains("host_runtime_activation_nonce"));
         assert!(!wire.contains("host_activation_nonce"));
+    }
+
+    fn planner_store_config_digest(config: &PlannerStoreLaunchConfig) -> String {
+        let operational = PlannerOperationalConfig {
+            store_pipe: &config.store_pipe,
+            launch_nonce: &config.launch_nonce,
+            expected_client_sid: &config.expected_client_sid,
+            expected_client_session_id: config.expected_client_session_id,
+            approved_artifact_hash: &config.approved_artifact_hash,
+            endpoint: &config.endpoint,
+            provider_bind_address: &config.provider_bind_address,
+            namespace: &config.namespace,
+            database: &config.database,
+            username: &config.username,
+            connect_timeout_ms: config.connect_timeout_ms,
+            query_timeout_ms: config.query_timeout_ms,
+            schema_generation: &config.schema_generation,
+            blob_root: &config.blob_root,
+            instance_id: &config.instance_id,
+            credential_ref: &config.credential_ref,
+            runtime_launch: &config.runtime_launch,
+        };
+        hex_digest(&serde_json::to_vec(&operational).unwrap())
+    }
+
+    fn planner_store_config_json(config: &PlannerStoreLaunchConfig) -> serde_json::Value {
+        serde_json::json!({
+            "store_pipe": &config.store_pipe,
+            "launch_nonce": &config.launch_nonce,
+            "expected_client_sid": &config.expected_client_sid,
+            "expected_client_session_id": config.expected_client_session_id,
+            "approved_artifact_hash": &config.approved_artifact_hash,
+            "approved_config_hash": &config.approved_config_hash,
+            "endpoint": &config.endpoint,
+            "provider_bind_address": &config.provider_bind_address,
+            "namespace": &config.namespace,
+            "database": &config.database,
+            "username": &config.username,
+            "connect_timeout_ms": config.connect_timeout_ms,
+            "query_timeout_ms": config.query_timeout_ms,
+            "schema_generation": &config.schema_generation,
+            "blob_root": &config.blob_root,
+            "instance_id": &config.instance_id,
+            "credential_ref": &config.credential_ref,
+            "runtime_launch": &config.runtime_launch,
+        })
+    }
+
+    #[test]
+    fn bound_generation_planner_rejects_rehashed_noncanonical_store_target() {
+        let (_tmp, portable, _roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        populate_source_with_roles(source_dir.path());
+        let input = production_input(source_dir.path(), portable);
+
+        // Derive the exact launch descriptor first; generation.json is excluded
+        // from the non-recursive Phase-A template facts, so replacing its
+        // placeholder bytes does not alter the descriptor we bind below.
+        let baseline = GenerationPackagePlanner::plan_unbound_for_test(input.clone())
+            .expect("baseline planner fixture should produce a launch descriptor");
+        let launch = baseline.candidate_manifest.runtime_launch.clone();
+        let mut config = PlannerStoreLaunchConfig {
+            store_pipe: r"\\.\pipe\eliot\store-test".to_owned(),
+            launch_nonce: "store:test".to_owned(),
+            expected_client_sid: "S-1-5-19".to_owned(),
+            expected_client_session_id: 0,
+            approved_artifact_hash: launch.store_bridge_artifact_digest.as_str().to_owned(),
+            approved_config_hash: String::new(),
+            endpoint: eliot_runtime_contracts::RUNTIME_LIVE_STORE_ENDPOINT.to_owned(),
+            provider_bind_address: eliot_runtime_contracts::RUNTIME_LIVE_STORE_BIND.to_owned(),
+            namespace: eliot_runtime_contracts::RUNTIME_LIVE_STORE_NAMESPACE.to_owned(),
+            database: "eliot".to_owned(),
+            username: "store".to_owned(),
+            connect_timeout_ms: 10_000,
+            query_timeout_ms: 10_000,
+            schema_generation: "1.0.0".to_owned(),
+            blob_root: Path::new(launch.runtime_state_roots.store_data_root.as_str())
+                .join("blob")
+                .to_string_lossy()
+                .into_owned(),
+            instance_id: "store-candidate".to_owned(),
+            credential_ref: launch.store_credential_target.as_str().to_owned(),
+            runtime_launch: launch,
+        };
+        config.approved_config_hash = planner_store_config_digest(&config);
+        let valid_json = planner_store_config_json(&config);
+        std::fs::write(
+            source_dir.path().join("generation.json"),
+            serde_json::to_vec(&valid_json).unwrap(),
+        )
+        .unwrap();
+
+        // Recompute the exact nine-role SHA/size vector and publication
+        // evidence after writing the valid generation document.
+        let binding = test_source_publication_binding(&input).unwrap();
+        GenerationPackagePlanner::plan_with_source_publication_binding(
+            input.clone(),
+            binding.source_identity,
+            binding.files.clone(),
+            binding.evidence_digest.clone(),
+        )
+        .expect("canonical bound fixture should plan");
+
+        let mut altered: PlannerStoreLaunchConfig = serde_json::from_value(valid_json).unwrap();
+        altered.namespace = "other".to_owned();
+        altered.approved_config_hash = planner_store_config_digest(&altered);
+        std::fs::write(
+            source_dir.path().join("generation.json"),
+            serde_json::to_vec(&planner_store_config_json(&altered)).unwrap(),
+        )
+        .unwrap();
+        let altered_binding = test_source_publication_binding(&input).unwrap();
+        assert!(matches!(
+            GenerationPackagePlanner::plan_with_source_publication_binding(
+                input,
+                altered_binding.source_identity,
+                altered_binding.files,
+                altered_binding.evidence_digest,
+            ),
+            Err(InstallationError::IdentityConflict)
+        ));
     }
 
     #[test]

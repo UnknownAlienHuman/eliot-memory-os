@@ -22,6 +22,7 @@ eliot-installation.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
+eliot-runtime-contracts.workspace = true
 eliot-store-api.workspace = true
 eliot-store-surreal-adapter.workspace = true
 secrecy.workspace = true

@@ -24,9 +24,12 @@ eliot-ors.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
 eliot-runtime-status.workspace = true
+eliot-runtime-contracts.workspace = true
 eliot-store-surreal = { path = "../eliot-store-surreal", version = "0.1.0" }
+eliot-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

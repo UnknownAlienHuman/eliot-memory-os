@@ -509,10 +509,7 @@ fn observe_fixed_local_app_data_config(
             }
             Err(_) => return Err(ProtectedPathError::Io),
         }
-        let root_lease = match UserOwnedRootReadLease::open_existing(root) {
-            Ok(value) => value,
-            Err(error) => return Err(error),
-        };
+        let root_lease = UserOwnedRootReadLease::open_existing(root)?;
         let relative_parent = parent
             .strip_prefix(root)
             .map_err(|_| ProtectedPathError::InvalidPath)?;

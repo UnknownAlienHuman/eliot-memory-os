@@ -22,9 +22,16 @@ use eliot_live_canary::{
 use eliot_platform_windows::{
     FileIdentity, InstallerRootError, InstallerRootObjectSnapshot,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
-    ProtectedRootLease, WindowsInstallerRootPrimitive, is_process_elevated,
-    windows_path_identity_digest,
+    ProtectedRootLease, ProtectedRuntimePathLease, TrustedSourceBundle, TrustedSourceFileLease,
+    WindowsInstallerRootPrimitive, is_eliot_governor_running, is_process_elevated,
+    observe_current_user_config, windows_path_identity_digest,
 };
+use eliot_runtime_contracts::{
+    RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
+    RuntimeLiveStoreIdentity,
+};
+use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
+use eliot_types::GovernorConfig;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -421,6 +428,8 @@ struct ManifestBoundCanaryBinding {
     registry: ApprovedGenerationRegistry,
     manifest: CandidateManifest,
     fence: ActivationCommitFence,
+    store_config_lease: ProtectedRuntimePathLease,
+    legacy_config: Option<eliot_platform_windows::LocalAppDataConfigRead>,
 }
 
 #[cfg(windows)]
@@ -543,6 +552,135 @@ fn validate_active_phase_b_runtime_binding(
 }
 
 #[cfg(windows)]
+fn classify_legacy_governor_process_state(state: Result<bool, String>) -> Result<(), String> {
+    match state {
+        Ok(false) => Ok(()),
+        Ok(true) => Err("legacy eliot-governor.exe is running".to_owned()),
+        Err(error) => Err(format!("legacy Governor process state is unknown: {error}")),
+    }
+}
+
+#[cfg(windows)]
+fn observe_legacy_governor_config() -> Result<Option<eliot_platform_windows::LocalAppDataConfigRead>>
+{
+    let retained = match observe_current_user_config(INSTALLATION_INPUT_LIMIT) {
+        Ok(eliot_platform_windows::LocalAppDataConfigObservation::Absent { .. }) => None,
+        Ok(eliot_platform_windows::LocalAppDataConfigObservation::Present(read)) => {
+            let text = std::str::from_utf8(read.bytes())
+                .map_err(|error| anyhow::anyhow!("legacy Governor config is not UTF-8: {error}"))?;
+            let config: GovernorConfig = toml::from_str(text)
+                .map_err(|error| anyhow::anyhow!("legacy Governor config is malformed: {error}"))?;
+            config
+                .validate()
+                .map_err(|error| anyhow::anyhow!("legacy Governor config is invalid: {error}"))?;
+            config
+                .db
+                .surreal
+                .reject_store_collision(
+                    RUNTIME_LIVE_STORE_BIND,
+                    RUNTIME_LIVE_STORE_ENDPOINT,
+                    RUNTIME_LIVE_STORE_NAMESPACE,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "legacy Governor config collides with runtime-live Store: {error}"
+                    )
+                })?;
+            read.verify_stable().map_err(|error| {
+                anyhow::anyhow!("legacy Governor config changed during validation: {error}")
+            })?;
+            Some(read)
+        }
+        Err(error) => anyhow::bail!("legacy Governor config observation is unknown: {error}"),
+    };
+    classify_legacy_governor_process_state(
+        is_eliot_governor_running().map_err(|error| error.to_string()),
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(retained)
+}
+
+#[cfg(windows)]
+fn revalidate_legacy_governor_gate(
+    retained: Option<&eliot_platform_windows::LocalAppDataConfigRead>,
+) -> Result<()> {
+    if let Some(read) = retained {
+        let text = std::str::from_utf8(read.bytes()).map_err(|error| {
+            anyhow::anyhow!("retained legacy Governor config is not UTF-8: {error}")
+        })?;
+        let config: GovernorConfig = toml::from_str(text).map_err(|error| {
+            anyhow::anyhow!("retained legacy Governor config is malformed: {error}")
+        })?;
+        config.validate().map_err(|error| {
+            anyhow::anyhow!("retained legacy Governor config is invalid: {error}")
+        })?;
+        config
+            .db
+            .surreal
+            .reject_store_collision(
+                RUNTIME_LIVE_STORE_BIND,
+                RUNTIME_LIVE_STORE_ENDPOINT,
+                RUNTIME_LIVE_STORE_NAMESPACE,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "retained legacy Governor config collides with runtime-live Store: {error}"
+                )
+            })?;
+        read.verify_stable()
+            .map_err(|error| anyhow::anyhow!("retained legacy Governor config changed: {error}"))?;
+    } else {
+        // An absent legacy config is provisional; reobserve the OS-known path
+        // after the guarded operation so appearance is not silently adopted.
+        let _ = observe_legacy_governor_config()?;
+    }
+    classify_legacy_governor_process_state(
+        is_eliot_governor_running().map_err(|error| error.to_string()),
+    )
+    .map_err(|error| anyhow::anyhow!(error))
+}
+
+#[cfg(windows)]
+fn validate_manifest_store_config(
+    manifest: &CandidateManifest,
+    lease: &ProtectedRuntimePathLease,
+) -> Result<()> {
+    let bytes = lease
+        .read_bounded(INSTALLATION_INPUT_LIMIT)
+        .map_err(|error| anyhow::anyhow!("read retained generation.json: {error}"))?;
+    if format!("{:x}", Sha256::digest(&bytes)) != manifest.config_digest.as_str() {
+        anyhow::bail!("installed generation.json digest differs from active manifest");
+    }
+    let config: StoreLaunchConfig = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("installed generation.json is malformed: {error}"))?;
+    config
+        .validate_materialized_at(Path::new(
+            manifest.runtime_launch.store_config_path.as_str(),
+        ))
+        .map_err(|error| anyhow::anyhow!("installed StoreLaunchConfig is invalid: {error}"))?;
+    if config.runtime_launch != manifest.runtime_launch {
+        anyhow::bail!("installed generation.json runtime_launch differs from active manifest");
+    }
+    if !RuntimeLiveStoreIdentity::canonical().is_exact_match(
+        &config.provider_bind_address,
+        &config.endpoint,
+        &config.namespace,
+    ) {
+        anyhow::bail!("installed generation.json targets a non-canonical runtime-live Store");
+    }
+    if launch_config_digest(&config)
+        .map_err(|error| anyhow::anyhow!("compute StoreLaunchConfig digest: {error}"))?
+        != config.approved_config_hash
+    {
+        anyhow::bail!("installed generation.json approved_config_hash is not self-consistent");
+    }
+    lease.verify_stable_identity().map_err(|error| {
+        anyhow::anyhow!("installed generation.json changed during validation: {error}")
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
 #[allow(clippy::too_many_lines)]
 fn load_manifest_bound_canary_binding(
     host_state_root: &Path,
@@ -604,6 +742,12 @@ fn load_manifest_bound_canary_binding(
         anyhow::bail!("active manifest and committed activation fence disagree");
     }
     validate_active_phase_b_runtime_binding(&registry, &manifest, &fence)?;
+    let legacy_config = observe_legacy_governor_config()?;
+    let store_config_lease = ProtectedRuntimePathLease::open_existing_absolute_exclusive(
+        Path::new(manifest.runtime_launch.store_config_path.as_str()),
+    )
+    .map_err(|error| anyhow::anyhow!("retain installed generation.json exclusively: {error}"))?;
+    validate_manifest_store_config(&manifest, &store_config_lease)?;
     let roots = &manifest.runtime_launch.runtime_state_roots;
     roots
         .validate()
@@ -679,6 +823,8 @@ fn load_manifest_bound_canary_binding(
         registry: registry.clone(),
         manifest,
         fence,
+        store_config_lease,
+        legacy_config,
     })
 }
 
@@ -689,6 +835,8 @@ fn revalidate_manifest_bound_canary_binding(
     expected_registry: &ApprovedGenerationRegistry,
     expected_manifest: &CandidateManifest,
     expected_fence: &ActivationCommitFence,
+    expected_store_config_lease: &ProtectedRuntimePathLease,
+    expected_legacy_config: Option<&eliot_platform_windows::LocalAppDataConfigRead>,
 ) -> Result<()> {
     let canonical_host_root = validate_snapshot_matches_lease(
         &PathBuf::from(
@@ -735,6 +883,8 @@ fn revalidate_manifest_bound_canary_binding(
         anyhow::bail!("committed activation fence changed during canary");
     }
     validate_active_phase_b_runtime_binding(&registry, &active.manifest, fence)?;
+    revalidate_legacy_governor_gate(expected_legacy_config)?;
+    validate_manifest_store_config(expected_manifest, expected_store_config_lease)?;
     retained_host
         .verify_stable_identity()
         .map_err(|error| anyhow::anyhow!("retained Host root changed during readback: {error}"))?;
@@ -776,6 +926,8 @@ fn validate_manifest_bound_canary_state(binding: &ManifestBoundCanaryBinding) ->
         &binding.registry,
         &binding.manifest,
         &binding.fence,
+        &binding.store_config_lease,
+        binding.legacy_config.as_ref(),
     )
 }
 
@@ -1461,6 +1613,166 @@ fn installation_status_error_code(error: &InstallationError) -> &'static str {
     }
 }
 
+#[cfg(windows)]
+struct InstallationRuntimePreflightGuard {
+    _source: TrustedSourceBundle,
+    generation: TrustedSourceFileLease,
+    legacy_config: Option<eliot_platform_windows::LocalAppDataConfigRead>,
+}
+
+#[cfg(windows)]
+impl InstallationRuntimePreflightGuard {
+    fn revalidate(&self, transaction: &InstallationTransaction) -> Result<()> {
+        let bytes = self
+            .generation
+            .read_bounded(INSTALLATION_INPUT_LIMIT)
+            .map_err(|error| anyhow::anyhow!("re-read retained generation.json: {error}"))?;
+        let stage = transaction
+            .installer_effects
+            .iter()
+            .find_map(|effect| match effect {
+                eliot_installation::InstallerEffectPlan::StagePackage {
+                    expected_file_digests,
+                    ..
+                } => Some(expected_file_digests),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("transaction lost its StagePackage effect"))?;
+        let expected = stage
+            .iter()
+            .find(|item| item.relative_path == "generation.json")
+            .ok_or_else(|| anyhow::anyhow!("StagePackage omitted generation.json digest"))?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        if digest != expected.sha256.as_str()
+            || digest != transaction.candidate_manifest.config_digest.as_str()
+        {
+            anyhow::bail!("retained generation.json digest changed during installation effects");
+        }
+        let config: StoreLaunchConfig = serde_json::from_slice(&bytes).map_err(|error| {
+            anyhow::anyhow!("retained generation.json became malformed: {error}")
+        })?;
+        config
+            .validate_materialized_at(Path::new(
+                transaction
+                    .candidate_manifest
+                    .runtime_launch
+                    .store_config_path
+                    .as_str(),
+            ))
+            .map_err(|error| anyhow::anyhow!("retained StoreLaunchConfig changed: {error}"))?;
+        if config.runtime_launch != transaction.candidate_manifest.runtime_launch
+            || !RuntimeLiveStoreIdentity::canonical().is_exact_match(
+                &config.provider_bind_address,
+                &config.endpoint,
+                &config.namespace,
+            )
+        {
+            anyhow::bail!("retained generation.json runtime binding changed during effects");
+        }
+        revalidate_legacy_governor_gate(self.legacy_config.as_ref())
+    }
+}
+
+#[cfg(not(windows))]
+struct InstallationRuntimePreflightGuard;
+
+#[cfg(not(windows))]
+impl InstallationRuntimePreflightGuard {
+    fn revalidate(&self, _transaction: &InstallationTransaction) -> Result<()> {
+        anyhow::bail!(
+            "installation runtime preflight requires Windows retained-file and process probes"
+        )
+    }
+}
+
+#[cfg(windows)]
+fn validate_installation_runtime_preflight(
+    transaction: &InstallationTransaction,
+) -> Result<InstallationRuntimePreflightGuard> {
+    let stage = transaction
+        .installer_effects
+        .iter()
+        .find_map(|effect| match effect {
+            eliot_installation::InstallerEffectPlan::StagePackage {
+                source_bundle,
+                source_bundle_identity,
+                manifest,
+                expected_file_digests,
+                ..
+            } => Some((
+                source_bundle,
+                source_bundle_identity,
+                manifest,
+                expected_file_digests,
+            )),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("transaction has no exact StagePackage effect"))?;
+    let source = TrustedSourceBundle::open(Path::new(stage.0.as_str()))
+        .map_err(|error| anyhow::anyhow!("retain source bundle: {error}"))?;
+    if source.identity() != *stage.1 {
+        anyhow::bail!("source bundle identity differs from durable StagePackage binding");
+    }
+    let lease = source
+        .retain_file("generation.json")
+        .map_err(|error| anyhow::anyhow!("retain generation.json: {error}"))?;
+    let bytes = lease
+        .read_bounded(INSTALLATION_INPUT_LIMIT)
+        .map_err(|error| anyhow::anyhow!("read retained generation.json: {error}"))?;
+    let expected = stage
+        .3
+        .iter()
+        .find(|item| item.relative_path == "generation.json")
+        .ok_or_else(|| anyhow::anyhow!("StagePackage omitted generation.json digest"))?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if digest != expected.sha256.as_str()
+        || digest != transaction.candidate_manifest.config_digest.as_str()
+    {
+        anyhow::bail!(
+            "source generation.json digest differs from StagePackage or candidate manifest"
+        );
+    }
+    let config: StoreLaunchConfig = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("source generation.json is malformed: {error}"))?;
+    config
+        .validate_materialized_at(Path::new(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .store_config_path
+                .as_str(),
+        ))
+        .map_err(|error| anyhow::anyhow!("source StoreLaunchConfig is invalid: {error}"))?;
+    if config.runtime_launch != transaction.candidate_manifest.runtime_launch {
+        anyhow::bail!("source generation.json runtime_launch differs from candidate manifest");
+    }
+    if !RuntimeLiveStoreIdentity::canonical().is_exact_match(
+        &config.provider_bind_address,
+        &config.endpoint,
+        &config.namespace,
+    ) {
+        anyhow::bail!("source generation.json targets a non-canonical runtime-live Store");
+    }
+    lease
+        .read_bounded(INSTALLATION_INPUT_LIMIT)
+        .map_err(|error| anyhow::anyhow!("re-read generation.json lease: {error}"))?;
+    let legacy_config = observe_legacy_governor_config()?;
+    Ok(InstallationRuntimePreflightGuard {
+        _source: source,
+        generation: lease,
+        legacy_config,
+    })
+}
+
+#[cfg(not(windows))]
+fn validate_installation_runtime_preflight(
+    _transaction: &InstallationTransaction,
+) -> Result<InstallationRuntimePreflightGuard> {
+    anyhow::bail!(
+        "installation runtime preflight requires Windows retained-file and process probes"
+    )
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the CLI keeps coordinator reopen, sealed readback and bounded outcome output in one auditable boundary"
@@ -1701,6 +2013,20 @@ fn run_installation_effect(
         return Ok(installation_command_exit_code(status));
     }
 
+    let preflight_guard = match validate_installation_runtime_preflight(&preflight_transaction) {
+        Ok(guard) => guard,
+        Err(error) => {
+            write_installation_error(
+                if recover {
+                    "INSTALLATION_RECOVER_PREFLIGHT_REJECTED"
+                } else {
+                    "INSTALLATION_APPLY_PREFLIGHT_REJECTED"
+                },
+                &error.to_string(),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     let outcome = if recover {
         coordinator.rollback(&transaction_id)
@@ -1805,6 +2131,13 @@ fn run_installation_effect(
         }
     };
     drop(coordinator);
+    if let Err(error) = preflight_guard.revalidate(&preflight_transaction) {
+        write_installation_error(
+            "POST_EFFECT_RUNTIME_GUARD_UNKNOWN",
+            &format!("post-coordinator runtime lease revalidation failed: {error}"),
+        );
+        return Ok(UNKNOWN_OUTCOME_EXIT);
+    }
     let store = match RedbInstallationTransactionStore::open_existing_exact_path(store_path) {
         Ok(store) => store,
         Err(error) => {
@@ -2563,6 +2896,14 @@ fn init_tracing() {
 )]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_governor_pre_gate_rejects_present_and_unknown_process_state() {
+        assert!(classify_legacy_governor_process_state(Ok(false)).is_ok());
+        assert!(classify_legacy_governor_process_state(Ok(true)).is_err());
+        assert!(classify_legacy_governor_process_state(Err("probe failed".to_owned())).is_err());
+    }
 
     #[test]
     fn committed_unknown_materialization_uses_reconciliation_exit() {

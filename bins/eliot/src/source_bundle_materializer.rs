@@ -23,6 +23,10 @@ use eliot_platform_windows::{
     canonical_windows_path, open_no_follow_directory, parse_pe_coff,
     validate_package_relative_path,
 };
+use eliot_runtime_contracts::{
+    RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
+    RuntimeLiveStoreIdentity,
+};
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -517,6 +521,15 @@ fn validate_store_config_bytes(
             "generation.json runtime_launch is not the exact planner template".to_owned(),
         ));
     }
+    if !RuntimeLiveStoreIdentity::canonical().is_exact_match(
+        &config.provider_bind_address,
+        &config.endpoint,
+        &config.namespace,
+    ) {
+        return Err(MaterializeError::Contract(
+            "generation.json target is not the canonical runtime-live Store identity".to_owned(),
+        ));
+    }
     Ok(config)
 }
 
@@ -801,9 +814,9 @@ fn build_typed_bundle(
         expected_client_session_id: 0,
         approved_artifact_hash: store_bridge.sha256.clone(),
         approved_config_hash: String::new(),
-        endpoint: "ws://127.0.0.1:8000/rpc".to_owned(),
-        provider_bind_address: "127.0.0.1:8000".to_owned(),
-        namespace: "eliot".to_owned(),
+        endpoint: RUNTIME_LIVE_STORE_ENDPOINT.to_owned(),
+        provider_bind_address: RUNTIME_LIVE_STORE_BIND.to_owned(),
+        namespace: RUNTIME_LIVE_STORE_NAMESPACE.to_owned(),
         database: "eliot".to_owned(),
         username: "store".to_owned(),
         connect_timeout_ms: 10_000,
@@ -2432,6 +2445,60 @@ mod tests {
         assert_publication_binding_rejects(|binding, _| {
             binding.evidence_digest = handle("0".repeat(64));
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn planner_rejects_rehashed_noncanonical_generation_target() {
+        let (_source_parent, _anchor, _staging, input, receipt) = materialized_fixture();
+        let bundle = PathBuf::from(&receipt.bundle_path);
+        let generation_path = bundle.join("generation.json");
+        let mut config: StoreLaunchConfig =
+            serde_json::from_slice(&fs::read(&generation_path).unwrap()).unwrap();
+        config.namespace = "other".to_owned();
+        config.approved_config_hash = launch_config_digest(&config).unwrap();
+        fs::write(&generation_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let source = TrustedSourceBundle::open(&bundle).unwrap();
+        let observed = source.observe().unwrap();
+        let expected = REQUIRED_ROLES
+            .iter()
+            .map(|(role, _)| {
+                let file = observed
+                    .files
+                    .iter()
+                    .find(|file| file.relative_path == *role)
+                    .unwrap();
+                PackageArtifactDigest {
+                    relative_path: role.to_string(),
+                    expected_size: file.size,
+                    sha256: handle(file.sha256.clone()),
+                }
+            })
+            .collect::<Vec<_>>();
+        let specs = REQUIRED_ROLES
+            .iter()
+            .map(|(role, executable)| {
+                let file = expected
+                    .iter()
+                    .find(|file| file.relative_path == *role)
+                    .unwrap();
+                PackageFileSpec::new(role, *executable, file.expected_size).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let manifest = PackageManifest::new(input.generation.as_str(), specs).unwrap();
+        let evidence =
+            GenerationPackagePlanner::artifact_set_evidence_digest(&manifest, &expected).unwrap();
+        let result = GenerationPackagePlanner::plan_with_source_publication_binding(
+            bound_plan_input(&input, &bundle),
+            source.identity(),
+            expected,
+            evidence,
+        );
+        assert!(
+            result.is_err(),
+            "rehashed noncanonical Store target must fail closed"
+        );
     }
 
     #[cfg(windows)]

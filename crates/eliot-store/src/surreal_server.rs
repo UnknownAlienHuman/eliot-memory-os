@@ -2,6 +2,9 @@ use crate::StoreError;
 use crate::surreal_rpc::SurrealRpcTransport;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
+use eliot_runtime_contracts::{
+    RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
+};
 use eliot_types::{CredentialProviderKind, SurrealServerConfig};
 use eliot_windows_ipc::{credential_read_current_user, credential_write_current_user};
 use secrecy::{ExposeSecret, SecretString};
@@ -197,6 +200,13 @@ impl SurrealServerSupervisor {
     }
 
     pub async fn start_or_connect(&self) -> Result<ReadySurrealServer, StoreError> {
+        self.config
+            .reject_store_collision(
+                RUNTIME_LIVE_STORE_BIND,
+                RUNTIME_LIVE_STORE_ENDPOINT,
+                RUNTIME_LIVE_STORE_NAMESPACE,
+            )
+            .map_err(|error| StoreError::PolicyViolation(error.to_string()))?;
         self.executable_path()?;
 
         let existing_password = self.read_existing_password()?;
@@ -1474,6 +1484,27 @@ mod lifecycle_tests {
                 allow_guests: false,
             },
         })
+    }
+
+    #[tokio::test]
+    async fn canonical_runtime_live_config_is_rejected_before_executable_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("canonical-collision")?;
+        let mut config = supervisor_for("definitely-not-a-provider", &root).config;
+        config.bind = "127.0.0.1:8000".to_owned();
+        config.endpoint = "ws://127.0.0.1:8000/rpc".to_owned();
+        config.ns = "eliot".to_owned();
+        let Err(error) = SurrealServerSupervisor::new(config)
+            .start_or_connect()
+            .await
+        else {
+            return Err(
+                std::io::Error::other("canonical runtime-live target must be refused").into(),
+            );
+        };
+        assert!(error.to_string().contains("runtime-live"));
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     /// Returns a pid that is guaranteed to have exited.

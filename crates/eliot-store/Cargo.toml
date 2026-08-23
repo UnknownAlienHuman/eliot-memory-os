@@ -9,6 +9,7 @@ license.workspace = true
 base64.workspace = true
 blake3.workspace = true
 eliot-types.workspace = true
+eliot-runtime-contracts.workspace = true
 eliot-windows-ipc.workspace = true
 futures-util.workspace = true
 redb.workspace = true
