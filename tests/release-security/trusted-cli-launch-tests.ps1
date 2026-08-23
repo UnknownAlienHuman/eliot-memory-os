@@ -220,13 +220,18 @@ function New-TrustedCliFixture([string]$Name) {
     }
 }
 
-function New-TestContract([object]$Fixture) {
+function New-TestContract([object]$Fixture, [string]$StorePath) {
+    $resolvedStorePath = $Fixture.store
+    if ($PSBoundParameters.ContainsKey('StorePath') -and
+        -not [string]::IsNullOrWhiteSpace($StorePath)) {
+        $resolvedStorePath = $StorePath
+    }
     return New-ProductionMaterializeContract `
         -UnsignedBundlePath $Fixture.unsigned `
         -SignedBundlePath $Fixture.signed `
         -OutputBundlePath $Fixture.output_bundle `
         -OutputPath $Fixture.output `
-        -StorePath $Fixture.store `
+        -StorePath $resolvedStorePath `
         -GenerationValue 'generation-test' `
         -InstallationValue 'installation-test' `
         -LineageIdValue 'lineage-test' `
@@ -238,6 +243,42 @@ function New-TestContract([object]$Fixture) {
         -ProfileValue 'portable_dev' `
         -ProfileAnchorRootPath $Fixture.anchor `
         -InstallationKeyValue $null
+}
+
+function New-TestSystemServiceContract(
+    [object]$Fixture,
+    [string]$StagingRootPath,
+    [string]$ProfileValue = 'system_service'
+) {
+    return New-ProductionMaterializeContract `
+        -UnsignedBundlePath $Fixture.unsigned `
+        -SignedBundlePath $Fixture.signed `
+        -OutputBundlePath $Fixture.output_bundle `
+        -OutputPath $Fixture.output `
+        -StorePath $Fixture.store `
+        -GenerationValue 'generation-system-service-test' `
+        -InstallationValue 'installation-system-service-test' `
+        -LineageIdValue 'lineage-system-service-test' `
+        -SequenceValue 1 `
+        -TransactionIdValue 'transaction:system-service-test' `
+        -StagingRootPath $StagingRootPath `
+        -MinimumStoreAvailableBytesValue 1 `
+        -RecoveryCommandValue 'eliot installation recover --store exact --transaction-id transaction:system-service-test' `
+        -ProfileValue $ProfileValue `
+        -ProfileAnchorRootPath $Fixture.anchor `
+        -InstallationKeyValue ('ab' * 32)
+}
+
+function Test-ReplacedAuthorityRootRejected([object]$Contract, [string]$Path) {
+    Remove-Item -LiteralPath $Path -Recurse -Force
+    New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    try {
+        [void](New-ProductionMaterializePathPins $Contract)
+        return $false
+    }
+    catch {
+        return $true
+    }
 }
 
 function Get-TestBundleVerification([object]$Contract, [string]$Signed) {
@@ -441,6 +482,112 @@ foreach ($required in @{
     [System.IO.File]::WriteAllText(
         $instrumentedPath, $instrumented, [System.Text.UTF8Encoding]::new($false))
     . $instrumentedPath
+
+    # A clean SystemService handoff validates the future canonical staging
+    # path but does not create/adopt it; CreateRoot/ApplyAcl/StagePackage own
+    # that physical directory. Also cover canonical-path and reparse guards.
+    $cleanSystemService = New-TrustedCliFixture 'system-service-clean'
+    $cleanEliotRoot = Join-Path $cleanSystemService.anchor 'Eliot'
+    New-Item -ItemType Directory -Path $cleanEliotRoot -Force | Out-Null
+    $cleanStaging = Join-Path $cleanEliotRoot 'packages'
+    if (Test-Path -LiteralPath $cleanStaging) {
+        throw 'clean SystemService fixture unexpectedly contains staging root before preflight'
+    }
+    [void](New-TestSystemServiceContract $cleanSystemService $cleanStaging)
+    if (Test-Path -LiteralPath $cleanStaging) {
+        throw 'launcher contract preflight created the absent SystemService staging root'
+    }
+
+    $cleanUserMode = New-TrustedCliFixture 'user-mode-clean'
+    $userModeEliotRoot = Join-Path $cleanUserMode.anchor 'Eliot'
+    New-Item -ItemType Directory -Path $userModeEliotRoot -Force | Out-Null
+    $userModeStaging = Join-Path $userModeEliotRoot 'packages'
+    [void](New-TestSystemServiceContract $cleanUserMode $userModeStaging 'user_mode')
+    if (Test-Path -LiteralPath $userModeStaging) {
+        throw 'launcher contract preflight created the absent UserMode staging root'
+    }
+
+    $portableDeleted = New-TrustedCliFixture 'portable-staging-deleted-after-contract'
+    $portableDeletedContract = New-TestContract $portableDeleted
+    Remove-Item -LiteralPath $portableDeleted.staging -Recurse -Force
+    $portableDeletionRejected = $false
+    try { [void](New-ProductionMaterializePathPins $portableDeletedContract) }
+    catch { $portableDeletionRejected = $true }
+    if (-not $portableDeletionRejected) {
+        throw 'portable_dev staging deletion after contract was silently skipped'
+    }
+
+    $profiledAppeared = New-TrustedCliFixture 'profiled-staging-appeared-after-contract'
+    $profiledAppearedEliotRoot = Join-Path $profiledAppeared.anchor 'Eliot'
+    New-Item -ItemType Directory -Path $profiledAppearedEliotRoot -Force | Out-Null
+    $profiledAppearedStaging = Join-Path $profiledAppearedEliotRoot 'packages'
+    $profiledAppearedContract = New-TestSystemServiceContract $profiledAppeared $profiledAppearedStaging
+    New-Item -ItemType Directory -Path $profiledAppearedStaging -Force | Out-Null
+    $profiledAppearanceRejected = $false
+    try { [void](New-ProductionMaterializePathPins $profiledAppearedContract) }
+    catch { $profiledAppearanceRejected = $_.Exception.Message -match 'appeared after an absent preflight' }
+    if (-not $profiledAppearanceRejected) {
+        throw 'profiled staging appearance after absent contract was silently adopted'
+    }
+
+    $stagingReplacement = New-TrustedCliFixture 'authority-staging-replacement'
+    $stagingReplacementContract = New-TestContract $stagingReplacement
+    if (-not (Test-ReplacedAuthorityRootRejected $stagingReplacementContract $stagingReplacement.staging)) {
+        throw 'pre-existing staging replacement before first pin was accepted'
+    }
+
+    $anchorReplacement = New-TrustedCliFixture 'authority-anchor-replacement'
+    $anchorReplacementContract = New-TestContract $anchorReplacement
+    if (-not (Test-ReplacedAuthorityRootRejected $anchorReplacementContract $anchorReplacement.anchor)) {
+        throw 'profile anchor replacement before first pin was accepted'
+    }
+
+    $outputParentReplacement = New-TrustedCliFixture 'authority-output-parent-replacement'
+    $outputParentReplacementContract = New-TestContract $outputParentReplacement
+    $outputParent = Split-Path -Parent $outputParentReplacement.output_bundle
+    if (-not (Test-ReplacedAuthorityRootRejected $outputParentReplacementContract $outputParent)) {
+        throw 'output parent replacement before first pin was accepted'
+    }
+
+    $storeParentReplacement = New-TrustedCliFixture 'authority-store-parent-replacement'
+    $storeParent = Join-Path $storeParentReplacement.root 'store-parent'
+    New-Item -ItemType Directory -Path $storeParent -Force | Out-Null
+    $storePath = Join-Path $storeParent 'transaction.redb'
+    $storeParentReplacementContract = New-TestContract $storeParentReplacement $storePath
+    if (-not (Test-ReplacedAuthorityRootRejected $storeParentReplacementContract $storeParent)) {
+        throw 'store parent replacement before first pin was accepted'
+    }
+
+    $wrongStagingRejected = $false
+    try { [void](New-TestSystemServiceContract $cleanSystemService (Join-Path $cleanSystemService.anchor 'other')) }
+    catch { $wrongStagingRejected = $_.Exception.Message -match 'canonical profile staging path' }
+    if (-not $wrongStagingRejected) {
+        throw 'noncanonical SystemService staging path was accepted'
+    }
+
+    $existingMismatch = New-TrustedCliFixture 'system-service-existing-mismatch'
+    $mismatchEliotRoot = Join-Path $existingMismatch.anchor 'Eliot'
+    New-Item -ItemType Directory -Path $mismatchEliotRoot -Force | Out-Null
+    $mismatchCanonical = Join-Path $mismatchEliotRoot 'packages'
+    New-Item -ItemType Directory -Path $mismatchCanonical -Force | Out-Null
+    $mismatchRejected = $false
+    try { [void](New-TestSystemServiceContract $existingMismatch (Join-Path $existingMismatch.anchor 'staging')) }
+    catch { $mismatchRejected = $_.Exception.Message -match 'canonical profile staging path' }
+    if (-not $mismatchRejected) {
+        throw 'existing noncanonical staging directory was accepted'
+    }
+
+    $reparseFixture = New-TrustedCliFixture 'system-service-reparse'
+    $reparseEliotRoot = Join-Path $reparseFixture.anchor 'Eliot'
+    New-Item -ItemType Directory -Path $reparseEliotRoot -Force | Out-Null
+    $reparseCanonical = Join-Path $reparseEliotRoot 'packages'
+    New-Item -ItemType Junction -Path $reparseCanonical -Target $reparseFixture.root | Out-Null
+    $reparseRejected = $false
+    try { [void](New-TestSystemServiceContract $reparseFixture $reparseCanonical) }
+    catch { $reparseRejected = $_.Exception.Message -match 'reparse-point ancestor' }
+    if (-not $reparseRejected) {
+        throw 'existing reparse-point staging directory was accepted'
+    }
 
     $normal = New-TrustedCliFixture 'normal'
     $normalContract = New-TestContract $normal

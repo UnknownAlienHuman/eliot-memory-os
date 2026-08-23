@@ -497,6 +497,64 @@ function Assert-ProductionAbsentPath([string]$Path, [string]$Purpose) {
     return $resolved
 }
 
+function Assert-ExistingPathAncestorsNoReparse([string]$Path, [string]$Purpose) {
+    $resolved = Get-FullyQualifiedWindowsPath $Path $Purpose
+    $cursor = $resolved.TrimEnd('\')
+    while (-not [string]::IsNullOrWhiteSpace($cursor)) {
+        if (Test-Path -LiteralPath $cursor) {
+            $item = Get-Item -LiteralPath $cursor -ErrorAction Stop
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Purpose contains a reparse-point ancestor: $cursor"
+            }
+        }
+        if ($cursor -match '^[A-Za-z]:$') { break }
+        $parent = Split-Path -Parent $cursor
+        if ([string]::IsNullOrWhiteSpace($parent) -or
+            [string]::Equals($parent, $cursor, [System.StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $cursor = $parent.TrimEnd('\')
+    }
+    return $resolved
+}
+
+function Get-ProductionDirectoryIdentityFact([string]$Path, [string]$Purpose) {
+    $pin = $null
+    try {
+        $pin = New-NativeDirectoryPin $Path $false
+        return [pscustomobject]@{
+            path = [string]$pin.path
+            volume_serial_number = [uint32]$pin.identity.VolumeSerialNumber
+            file_index = [uint64]$pin.identity.FileIndex
+        }
+    }
+    catch {
+        throw "$Purpose authority directory identity could not be retained: $($_.Exception.Message)"
+    }
+    finally {
+        if ($pin) { Close-NativeDirectoryPin $pin }
+    }
+}
+
+function Assert-ProductionDirectoryPinMatchesContract(
+    [object]$Pin,
+    [object]$Contract,
+    [string]$Purpose
+) {
+    $facts = @($Contract.authority_directory_identities | Where-Object {
+            Test-ExactWindowsPath ([string]$_.path) ([string]$Pin.path)
+        })
+    if ($facts.Count -ne 1) {
+        throw "$Purpose has no unique preflight authority identity"
+    }
+    $fact = $facts[0]
+    if ([uint32]$fact.volume_serial_number -ne [uint32]$Pin.identity.VolumeSerialNumber -or
+        [uint64]$fact.file_index -ne [uint64]$Pin.identity.FileIndex -or
+        [uint64]$fact.file_index -eq 0) {
+        throw "$Purpose authority directory identity changed before first retained pin"
+    }
+}
+
 function Assert-PathOutsideBundle([string]$Path, [string]$Bundle, [string]$Purpose) {
     $candidate = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
     $root = [System.IO.Path]::GetFullPath($Bundle).TrimEnd('\')
@@ -530,8 +588,34 @@ function New-ProductionMaterializeContract {
     $outputBundlePath = Assert-ProductionAbsentPath $OutputBundlePath 'OutputBundle'
     $outputPath = Assert-ProductionAbsentPath $OutputPath 'Output'
     $storePath = Assert-ProductionAbsentPath $StorePath 'Store'
-    $staging = Assert-ExistingBundleDirectory $StagingRootPath 'StagingRoot'
     $anchor = Assert-ExistingBundleDirectory $ProfileAnchorRootPath 'ProfileAnchorRoot'
+    $profile = Assert-ProductionScalar $ProfileValue 'Profile'
+    if ($profile -notin @('system_service', 'user_mode', 'portable_dev')) {
+        throw 'Profile must be system_service, user_mode, or portable_dev'
+    }
+    $requestedStaging = Get-FullyQualifiedWindowsPath $StagingRootPath 'StagingRoot'
+    $stagingPreexisting = $false
+    if ($profile -in @('system_service', 'user_mode')) {
+        $canonicalStaging = [System.IO.Path]::GetFullPath((Join-Path $anchor 'Eliot\packages')).TrimEnd('\')
+        if (-not (Test-ExactWindowsPath $requestedStaging $canonicalStaging)) {
+            throw "StagingRoot must equal the canonical profile staging path: $canonicalStaging"
+        }
+        Assert-ExistingPathAncestorsNoReparse $canonicalStaging 'StagingRoot' | Out-Null
+        # The installer owns CreateRoot/ApplyAcl/StagePackage. Materialization
+        # may validate an already-provisioned root, but must not create or adopt
+        # the future packages directory during source-bundle publication.
+        if (Test-Path -LiteralPath $requestedStaging) {
+            $staging = Assert-ExistingBundleDirectory $requestedStaging 'StagingRoot'
+            $stagingPreexisting = $true
+        }
+        else {
+            $staging = $requestedStaging
+        }
+    }
+    else {
+        $staging = Assert-ExistingBundleDirectory $requestedStaging 'StagingRoot'
+        $stagingPreexisting = $true
+    }
     foreach ($candidate in @($outputBundlePath, $outputPath, $storePath)) {
         Assert-PathOutsideBundle $candidate $unsigned 'materialize output'
         Assert-PathOutsideBundle $candidate $signed 'materialize output'
@@ -543,6 +627,22 @@ function New-ProductionMaterializeContract {
             throw 'OutputBundle, Output, and Store must be three distinct create-new paths'
         }
     }
+    $authorityPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in @(
+            (Split-Path -Parent $outputBundlePath)
+            (Split-Path -Parent $outputPath)
+            (Split-Path -Parent $storePath)
+            $anchor
+        )) {
+        if (-not $authorityPaths.Contains($path)) { [void]$authorityPaths.Add($path) }
+    }
+    if ($stagingPreexisting -and -not $authorityPaths.Contains($staging)) {
+        [void]$authorityPaths.Add($staging)
+    }
+    $authorityIdentities = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $authorityPaths) {
+        [void]$authorityIdentities.Add((Get-ProductionDirectoryIdentityFact $path 'materialize'))
+    }
     if ($SequenceValue -eq 0) { throw 'Sequence must be non-zero' }
     if ($MinimumStoreAvailableBytesValue -eq 0) {
         throw 'MinimumStoreAvailableBytes must be non-zero'
@@ -551,10 +651,6 @@ function New-ProductionMaterializeContract {
     if ([System.IO.Path]::IsPathRooted($generation) -or
         @($generation -split '[\\/]').Where({ $_ -eq '.' -or $_ -eq '..' -or $_ -eq '' }).Count -ne 0) {
         throw 'Generation must be a canonical non-traversing relative identity'
-    }
-    $profile = Assert-ProductionScalar $ProfileValue 'Profile'
-    if ($profile -notin @('system_service', 'user_mode', 'portable_dev')) {
-        throw 'Profile must be system_service, user_mode, or portable_dev'
     }
     $installationKey = $null
     if (-not [string]::IsNullOrWhiteSpace($InstallationKeyValue)) {
@@ -578,6 +674,8 @@ function New-ProductionMaterializeContract {
         sequence = [UInt64]$SequenceValue
         transaction_id = Assert-ProductionScalar $TransactionIdValue 'TransactionId'
         staging_root = $staging
+        staging_root_preexisting = $stagingPreexisting
+        authority_directory_identities = @($authorityIdentities)
         minimum_store_available_bytes = [UInt64]$MinimumStoreAvailableBytesValue
         recovery_command = Assert-ProductionScalar $RecoveryCommandValue 'RecoveryCommand'
         profile = $profile
@@ -930,9 +1028,21 @@ function New-ProductionMaterializePathPins([object]$Contract) {
         (Split-Path -Parent ([string]$Contract.output_bundle)),
         (Split-Path -Parent ([string]$Contract.output)),
         (Split-Path -Parent ([string]$Contract.store)),
-        [string]$Contract.staging_root,
         [string]$Contract.profile_anchor_root
     )
+    # A clean SystemService install intentionally has no packages directory
+    # yet: the durable installer creates and ACLs it in CreateRoot/StagePackage.
+    # Retain the protected staging pin whenever that directory already exists.
+    if ($null -eq $Contract.staging_root_preexisting -or
+        $Contract.staging_root_preexisting -isnot [bool]) {
+        throw 'materialize contract staging_root_preexisting must be a strict Boolean'
+    }
+    if ($Contract.staging_root_preexisting) {
+        $paths += [string]$Contract.staging_root
+    }
+    elseif (Test-Path -LiteralPath ([string]$Contract.staging_root)) {
+        throw 'materialize staging root appeared after an absent preflight; adoption is forbidden'
+    }
     $seen = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase)
     $pins = [System.Collections.Generic.List[object]]::new()
@@ -940,7 +1050,15 @@ function New-ProductionMaterializePathPins([object]$Contract) {
         foreach ($path in $paths) {
             $resolved = [System.IO.Path]::GetFullPath($path).TrimEnd('\')
             if ($seen.Add($resolved)) {
-                [void]$pins.Add((New-NativeDirectoryPin $resolved $false))
+                $pin = New-NativeDirectoryPin $resolved $false
+                try {
+                    Assert-ProductionDirectoryPinMatchesContract $pin $Contract 'materialize authority'
+                    [void]$pins.Add($pin)
+                    $pin = $null
+                }
+                finally {
+                    if ($pin) { Close-NativeDirectoryPin $pin }
+                }
             }
         }
         return ,@($pins)

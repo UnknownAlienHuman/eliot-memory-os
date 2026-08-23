@@ -124,6 +124,16 @@ $productionLauncher = Join-Path $repo 'scripts\invoke-eliot-windows-x64-producti
 if ($LASTEXITCODE -ne 0) { throw 'authoritative source-bundle materialization failed or requires reconciliation' }
 ```
 
+For profiled installs (`-Profile system_service` or `-Profile user_mode`),
+`-StagingRoot` must be exactly
+`<ProfileAnchorRoot>\Eliot\packages`. The launcher retains and validates the
+existing profile anchor and rejects noncanonical or reparse-point paths, but it
+does not require, create, repair, or adopt the future `packages` directory when
+it is absent. Durable installer `CreateRoot`/`ApplyAcl`/`StagePackage` owns that
+creation and protected-root binding. An already-provisioned staging root is
+still pinned and read back; `portable_dev` retains its existing requirement for
+an already-existing staging directory.
+
 That Rust materializer independently rechecks the exact six PE Authenticode and
 hash contracts and atomically publishes the exact nine-role Phase-A bundle. Its
 `SOURCE_BUNDLE_MATERIALIZED` result is the first authoritative handoff; neither
