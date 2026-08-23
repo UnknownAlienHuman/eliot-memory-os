@@ -139,12 +139,20 @@ struct RootPolicyOverride {
 #[derive(Debug, Default)]
 struct WindowsInstallerRootExecutor {
     policy_override: Option<RootPolicyOverride>,
+    #[cfg(test)]
+    post_create_readback_error: Option<InstallerRootError>,
+    #[cfg(test)]
+    root_appearance_after_pinning: Option<PathBuf>,
 }
 
 impl WindowsInstallerRootExecutor {
     const fn new() -> Self {
         Self {
             policy_override: None,
+            #[cfg(test)]
+            post_create_readback_error: None,
+            #[cfg(test)]
+            root_appearance_after_pinning: None,
         }
     }
 
@@ -419,7 +427,14 @@ impl WindowsInstallerRootPrimitive {
     ) -> Result<InstallerRootCreateAttempt, InstallerRootError> {
         let request = primitive_request(spec);
         self.executor.validate_request(&request)?;
-        let pinned = match observe_absence(&request) {
+        #[cfg(test)]
+        let pinned_result = observe_absence_with_root_appearance(
+            &request,
+            self.executor.root_appearance_after_pinning.as_deref(),
+        );
+        #[cfg(not(test))]
+        let pinned_result = observe_absence(&request);
+        let pinned = match pinned_result {
             Ok(pinned) => pinned,
             Err(AbsenceObservationError::RootAppeared) => {
                 return Ok(InstallerRootCreateAttempt::PreconditionRace {
@@ -439,6 +454,13 @@ impl WindowsInstallerRootPrimitive {
                         root: None,
                     },
                 ));
+            }
+            #[cfg(test)]
+            if let Some(error) = self.executor.post_create_readback_error {
+                return Ok(InstallerRootCreateAttempt::Failed {
+                    disposition: InstallerRootCreateDisposition::Created,
+                    error,
+                });
             }
             let root = match open_and_readback(&spec.root, spec.profile, true, false) {
                 Ok(root) => root,
@@ -709,6 +731,13 @@ fn map_absence_observation_error(error: &AbsenceObservationError) -> InstallerRo
 fn observe_absence(
     request: &InstallerRootRequest,
 ) -> Result<PinnedAbsentSnapshot, AbsenceObservationError> {
+    observe_absence_with_root_appearance(request, None)
+}
+
+fn observe_absence_with_root_appearance(
+    request: &InstallerRootRequest,
+    #[allow(unused_variables)] root_appearance: Option<&Path>,
+) -> Result<PinnedAbsentSnapshot, AbsenceObservationError> {
     match std::fs::symlink_metadata(&request.root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(_) => {
@@ -772,6 +801,12 @@ fn observe_absence(
     let profile_anchor = profile_anchor.ok_or(AbsenceObservationError::Installer(
         InstallerRootError::InvalidPath,
     ))?;
+    #[cfg(test)]
+    if let Some(path) = root_appearance {
+        std::fs::create_dir(path).map_err(|error| {
+            AbsenceObservationError::Installer(map_io_error(InstallerRootStage::Readback, &error))
+        })?;
+    }
     match std::fs::symlink_metadata(&request.root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(_) => {
@@ -2449,6 +2484,38 @@ mod primitive_tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn post_create_readback_failure_retains_created_disposition() {
+        let fixture = Fixture::new();
+        fixture.ensure_user_parent();
+        let mut primitive = fixture.primitive(true);
+        primitive.executor.post_create_readback_error = Some(InstallerRootError::Win32 {
+            stage: InstallerRootStage::Readback,
+            code: 5,
+        });
+        let spec = fixture.user_spec("post-create-readback-failure");
+        let expected = absent(&primitive, &spec);
+
+        let attempt = primitive
+            .create_attempt(&spec, &expected)
+            .unwrap_or_else(|error| panic!("create attempt failed before readback: {error:?}"));
+        assert!(matches!(
+            attempt,
+            InstallerRootCreateAttempt::Failed {
+                disposition: InstallerRootCreateDisposition::Created,
+                error: InstallerRootError::Win32 {
+                    stage: InstallerRootStage::Readback,
+                    code: 5,
+                },
+            }
+        ));
+        assert!(
+            spec.root.is_dir(),
+            "the directory was created before readback failed"
+        );
+    }
+
     #[test]
     fn absence_race_mapping_does_not_relabel_identity_substitution() {
         assert_eq!(
@@ -2627,6 +2694,8 @@ mod primitive_tests {
                         portable_root: self.portable.clone(),
                         elevated,
                     }),
+                    post_create_readback_error: None,
+                    root_appearance_after_pinning: None,
                 },
             }
         }
@@ -2732,6 +2801,47 @@ mod primitive_tests {
             Err(InstallerRootError::IdentityMismatch)
         );
         assert!(!spec.root.exists());
+    }
+
+    #[test]
+    fn root_appearance_with_stable_contour_is_race_but_replacement_is_identity_mismatch() {
+        let fixture = Fixture::new();
+        fixture.ensure_user_parent();
+        let mut primitive = fixture.primitive(true);
+        let spec = fixture.user_spec("contour-race");
+        let request = primitive_request(&spec);
+        let expected = absent(&primitive, &spec);
+
+        primitive.executor.root_appearance_after_pinning = Some(spec.root.clone());
+        let attempt = primitive.create_attempt(&spec, &expected);
+        assert!(
+            matches!(
+                &attempt,
+                Ok(InstallerRootCreateAttempt::PreconditionRace {
+                    pending_ref: "installer-root-absence-race-v1:precondition",
+                })
+            ),
+            "unexpected root appearance outcome: {attempt:?}"
+        );
+        assert!(
+            absence_contour_matches(&request, &expected.ancestors)
+                .unwrap_or_else(|error| panic!("stable contour readback failed: {error:?}")),
+            "an appearing root with the retained parent contour is the absence race"
+        );
+        std::fs::remove_dir(&spec.root)
+            .unwrap_or_else(|error| panic!("failed to remove appearing root: {error}"));
+
+        let parent = spec.root.parent().unwrap_or_else(|| unreachable!());
+        let moved = fixture.user.join("Eliot-original");
+        std::fs::rename(parent, &moved)
+            .unwrap_or_else(|error| panic!("failed to substitute parent: {error}"));
+        create_directory_atomic(InstallerRootProfile::UserMode, parent)
+            .unwrap_or_else(|error| panic!("failed to create replacement parent: {error}"));
+        assert!(
+            !absence_contour_matches(&request, &expected.ancestors)
+                .unwrap_or_else(|error| panic!("replacement contour readback failed: {error:?}")),
+            "a replaced parent must never be classified as an absence race"
+        );
     }
 
     #[test]
@@ -3147,6 +3257,61 @@ mod primitive_tests {
         assert_eq!(
             ensure_system_service_spec(&fixture.user_spec("not-system")),
             Err(InstallerRootError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn security_readback_status_preserves_stage_and_win32_code() {
+        use std::mem::ManuallyDrop;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_HANDLE};
+
+        let fixture = Fixture::new();
+        let path = fixture.root.join("closed-security-handle");
+        std::fs::write(&path, b"fixture")
+            .unwrap_or_else(|error| panic!("security fixture write failed: {error}"));
+        let file = ManuallyDrop::new(
+            std::fs::File::open(&path)
+                .unwrap_or_else(|error| panic!("security fixture open failed: {error}")),
+        );
+        let handle = (*file).as_raw_handle();
+        assert_ne!(
+            unsafe {
+                // SAFETY: the handle is live and is intentionally closed to exercise
+                // the raw GetSecurityInfo failure branch.
+                CloseHandle(handle.cast())
+            },
+            0
+        );
+        let expected = expected_descriptor(InstallerRootProfile::UserMode, false)
+            .unwrap_or_else(|error| panic!("expected descriptor failed: {error:?}"));
+        assert_eq!(
+            verify_security_exact(&file, &expected, "S-1-5-21-invalid"),
+            Err(InstallerRootError::Win32 {
+                stage: InstallerRootStage::Readback,
+                code: ERROR_INVALID_HANDLE,
+            })
+        );
+
+        let file = ManuallyDrop::new(
+            std::fs::File::open(&path)
+                .unwrap_or_else(|error| panic!("second security fixture open failed: {error}")),
+        );
+        let handle = (*file).as_raw_handle();
+        assert_ne!(
+            unsafe {
+                // SAFETY: the handle is live and is intentionally closed to exercise
+                // the raw descriptor-observation failure branch.
+                CloseHandle(handle.cast())
+            },
+            0
+        );
+        assert_eq!(
+            observe_security_descriptor_digest(&file),
+            Err(InstallerRootError::Win32 {
+                stage: InstallerRootStage::Readback,
+                code: ERROR_INVALID_HANDLE,
+            })
         );
     }
 

@@ -28,12 +28,13 @@ use eliot_platform_windows::{
     AuthenticodeVerdict, CredentialSecret, ELIOT_HOST_SERVICE_DISPLAY_NAME,
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
     ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, FileIdentity,
-    HostOwnerEpochCapability, InstallerRootAbsentSnapshot, InstallerRootCreateDisposition,
-    InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation,
-    InstallerRootPrimitiveSpec, InstallerRootProfile, InstallerRootStage,
-    InstallerSecretCreateDisposition, InstallerSecretObservation, PackageManifest, PackageStager,
-    PackageStagingError, PackageStagingObservation, ProtectedPathError, ProtectedPathLease,
-    ProtectedRootLease, ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
+    HostOwnerEpochCapability, InstallerRootAbsentSnapshot, InstallerRootCreateAttempt,
+    InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
+    InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
+    InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
+    InstallerSecretObservation, PackageManifest, PackageStager, PackageStagingError,
+    PackageStagingObservation, ProtectedPathError, ProtectedPathLease, ProtectedRootLease,
+    ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
     ServiceControlGrantReadback, ServiceRegistrationCurrent, ServiceRegistrationInspection,
     ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
     ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome, StagePackageAuthorization,
@@ -15247,45 +15248,11 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                     Ok(secret) => secret,
                     Err(error) => return secret_outcome(error),
                 };
-                let created = match self.primitive.create_attempt(&spec, &expected) {
-                    Ok(eliot_platform_windows::InstallerRootCreateAttempt::Complete(created)) => {
-                        created
-                    }
-                    Ok(eliot_platform_windows::InstallerRootCreateAttempt::Failed {
-                        disposition: InstallerRootCreateDisposition::Created,
-                        error,
-                    }) => {
-                        let pending = port_pending(root_execution_error::<()>(error));
-                        return PortOutcome::Partial {
-                            value: InstallationEffectExecution {
-                                evidence: Vec::new(),
-                                create_disposition: Some(InstallationCreateDisposition::Created),
-                                credential_receipt: None,
-                                staging_receipt: None,
-                                phase_b_receipt: None,
-                                service_start_disposition: None,
-                                service_runtime_lineage: None,
-                            },
-                            missing: vec![pending],
-                        };
-                    }
-                    Ok(eliot_platform_windows::InstallerRootCreateAttempt::Failed {
-                        disposition: _disposition,
-                        error,
-                    }) => return root_execution_error(error),
-                    Ok(eliot_platform_windows::InstallerRootCreateAttempt::PreconditionRace {
-                        pending_ref,
-                    }) => {
-                        return PortOutcome::Error(PortError::ProviderReference {
-                            error: ProviderError {
-                                code: ProviderErrorCode::Failed,
-                                retryable: false,
-                            },
-                            reference: PlatformHandle::new(pending_ref)
-                                .unwrap_or_else(|_| unreachable!()),
-                        });
-                    }
-                    Err(error) => return root_execution_error(error),
+                let created = match map_root_create_attempt(
+                    self.primitive.create_attempt(&spec, &expected),
+                ) {
+                    Ok(created) => created,
+                    Err(outcome) => return outcome,
                 };
                 if created.disposition == InstallerRootCreateDisposition::AlreadyExists {
                     return PortOutcome::Known(InstallationEffectExecution {
@@ -16994,6 +16961,43 @@ fn host_port_error() -> PortError {
 
 fn secret_outcome<T>(error: eliot_platform_windows::WindowsAdapterError) -> PortOutcome<T> {
     PortOutcome::Error(secret_port_error(error))
+}
+
+fn map_root_create_attempt(
+    attempt: Result<InstallerRootCreateAttempt, InstallerRootError>,
+) -> Result<InstallerRootPrimitiveCreate, PortOutcome<InstallationEffectExecution>> {
+    match attempt {
+        Ok(InstallerRootCreateAttempt::Complete(created)) => Ok(created),
+        Ok(InstallerRootCreateAttempt::Failed {
+            disposition: InstallerRootCreateDisposition::Created,
+            error,
+        }) => {
+            let pending = port_pending(root_execution_error::<()>(error));
+            Err(PortOutcome::Partial {
+                value: InstallationEffectExecution {
+                    evidence: Vec::new(),
+                    create_disposition: Some(InstallationCreateDisposition::Created),
+                    credential_receipt: None,
+                    staging_receipt: None,
+                    phase_b_receipt: None,
+                    service_start_disposition: None,
+                    service_runtime_lineage: None,
+                },
+                missing: vec![pending],
+            })
+        }
+        Ok(InstallerRootCreateAttempt::Failed { error, .. }) => Err(root_execution_error(error)),
+        Ok(InstallerRootCreateAttempt::PreconditionRace { pending_ref }) => {
+            Err(PortOutcome::Error(PortError::ProviderReference {
+                error: ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                },
+                reference: PlatformHandle::new(pending_ref).unwrap_or_else(|_| unreachable!()),
+            }))
+        }
+        Err(error) => Err(root_execution_error(error)),
+    }
 }
 
 fn root_execution_error<T>(error: InstallerRootError) -> PortOutcome<T> {
@@ -24174,6 +24178,46 @@ mod tests {
         ));
         let _ = coordinator.drive_effect(&transaction_id);
         assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
+    }
+
+    #[test]
+    fn production_root_create_mapping_preserves_partial_created_and_typed_race_reference() {
+        let partial = map_root_create_attempt(Ok(InstallerRootCreateAttempt::Failed {
+            disposition: InstallerRootCreateDisposition::Created,
+            error: InstallerRootError::Win32 {
+                stage: InstallerRootStage::Readback,
+                code: 5,
+            },
+        }))
+        .err()
+        .unwrap_or_else(|| unreachable!());
+        let PortOutcome::Partial { value, missing } = partial else {
+            panic!("created post-readback failure must remain partial");
+        };
+        assert_eq!(
+            value.create_disposition,
+            Some(InstallationCreateDisposition::Created)
+        );
+        assert_eq!(
+            missing,
+            vec![test_handle("installer-root-win32-v2:readback:00000005")]
+        );
+
+        let race = map_root_create_attempt(Ok(InstallerRootCreateAttempt::PreconditionRace {
+            pending_ref: "installer-root-absence-race-v1:precondition",
+        }))
+        .err()
+        .unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            race,
+            PortOutcome::Error(PortError::ProviderReference {
+                error: ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                },
+                reference: test_handle("installer-root-absence-race-v1:precondition"),
+            })
+        );
     }
 
     #[test]
