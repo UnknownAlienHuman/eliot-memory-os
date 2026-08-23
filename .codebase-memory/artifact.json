@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "491082a4abea6debe97711d96f0a484b7d1520dc",
-    "indexed_at": "2026-08-23T18:40:59Z",
-    "project": "eliot-memory-os-exact-491082a4",
-    "nodes": 54092,
-    "edges": 267900,
-    "original_size": 108003328,
-    "compressed_size": 17453730,
-    "compression_level": 9
+    "commit": "a0bd178eebe1fbeeebfb9f6a0057894344681b12",
+    "indexed_at": "2026-08-23T21:45:15Z",
+    "project": "eliot-memory-os",
+    "nodes": 53989,
+    "edges": 265545,
+    "original_size": 150011904,
+    "compressed_size": 26845274,
+    "compression_level": 3
 }
