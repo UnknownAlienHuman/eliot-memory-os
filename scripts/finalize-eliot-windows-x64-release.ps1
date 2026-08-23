@@ -675,7 +675,10 @@ function Assert-ExistingBundleDirectory([string]$Path, [string]$Purpose) {
     if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
         throw "$Purpose does not exist as an absolute directory: $resolved"
     }
-    $item = Get-Item -LiteralPath $resolved -ErrorAction Stop
+    # Hidden/system profile roots (for example C:\ProgramData) are valid
+    # authority directories.  Get-Item without -Force hides them in both
+    # Windows PowerShell 5.1 and PowerShell 7, despite Test-Path succeeding.
+    $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
     if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "$Purpose must not be a reparse-point directory: $resolved"
     }
@@ -691,7 +694,7 @@ function Assert-AbsentOutputBundle([string]$Path, [string]$Purpose) {
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
         throw "$Purpose parent directory must already exist: $parent"
     }
-    $parentItem = Get-Item -LiteralPath $parent -ErrorAction Stop
+    $parentItem = Get-Item -LiteralPath $parent -Force -ErrorAction Stop
     if (($parentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "$Purpose parent directory must not be a reparse point: $parent"
     }

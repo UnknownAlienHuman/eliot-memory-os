@@ -502,7 +502,10 @@ function Assert-ExistingPathAncestorsNoReparse([string]$Path, [string]$Purpose) 
     $cursor = $resolved.TrimEnd('\')
     while (-not [string]::IsNullOrWhiteSpace($cursor)) {
         if (Test-Path -LiteralPath $cursor) {
-            $item = Get-Item -LiteralPath $cursor -ErrorAction Stop
+            # Existing hidden ancestors such as C:\ProgramData remain valid
+            # profile roots; inspect them explicitly in both PowerShell
+            # generations instead of treating provider filtering as absence.
+            $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
             if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw "$Purpose contains a reparse-point ancestor: $cursor"
             }

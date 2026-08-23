@@ -498,6 +498,31 @@ foreach ($required in @{
         throw 'launcher contract preflight created the absent SystemService staging root'
     }
 
+    # C:\ProgramData is commonly hidden/system on Windows. Exercise the real
+    # production SystemService contract with a hidden profile anchor so the
+    # finalizer and ancestor no-reparse checks cannot silently rely on the
+    # provider's default hidden-item filtering. This is provider-free and does
+    # not create/adopt the canonical packages directory.
+    $hiddenAnchorFixture = New-TrustedCliFixture 'system-service-hidden-anchor'
+    $hiddenAttributes = ([System.IO.File]::GetAttributes($hiddenAnchorFixture.anchor) -bor
+        [System.IO.FileAttributes]::Hidden)
+    [System.IO.File]::SetAttributes($hiddenAnchorFixture.anchor, $hiddenAttributes)
+    try {
+        $hiddenEliotRoot = Join-Path $hiddenAnchorFixture.anchor 'Eliot'
+        New-Item -ItemType Directory -Path $hiddenEliotRoot -Force | Out-Null
+        $hiddenStaging = Join-Path $hiddenEliotRoot 'packages'
+        [void](New-TestSystemServiceContract $hiddenAnchorFixture $hiddenStaging)
+        if (Test-Path -LiteralPath $hiddenStaging) {
+            throw 'hidden SystemService preflight created the absent staging root'
+        }
+    }
+    finally {
+        [System.IO.File]::SetAttributes(
+            $hiddenAnchorFixture.anchor,
+            ([System.IO.File]::GetAttributes($hiddenAnchorFixture.anchor) -band
+                (-bnot [System.IO.FileAttributes]::Hidden)))
+    }
+
     $cleanUserMode = New-TrustedCliFixture 'user-mode-clean'
     $userModeEliotRoot = Join-Path $cleanUserMode.anchor 'Eliot'
     New-Item -ItemType Directory -Path $userModeEliotRoot -Force | Out-Null
@@ -864,6 +889,7 @@ foreach ($required in @{
         verifier_launch_substitution_blocked = $true
         failed_suspended_child_reaped = $true
         no_live_signing_or_installation = $true
+        hidden_system_service_anchor_supported = $true
     } | ConvertTo-Json -Depth 4
 }
 finally {
