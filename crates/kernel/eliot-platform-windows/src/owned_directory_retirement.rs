@@ -639,7 +639,9 @@ fn map_directory_error(error: crate::DirectoryPublicationError) -> OwnedDirector
         crate::DirectoryPublicationError::IdentityMismatch => {
             OwnedDirectoryRetirementError::IdentityMismatch
         }
-        crate::DirectoryPublicationError::Io => OwnedDirectoryRetirementError::Io,
+        crate::DirectoryPublicationError::Io | crate::DirectoryPublicationError::Win32 { .. } => {
+            OwnedDirectoryRetirementError::Io
+        }
         crate::DirectoryPublicationError::UnsupportedPlatform => {
             OwnedDirectoryRetirementError::UnsupportedPlatform
         }

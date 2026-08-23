@@ -33,8 +33,8 @@ use eliot_platform_windows::{
     InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
     InstallerSecretObservation, PackageManifest, PackageStager, PackageStagingError,
-    PackageStagingObservation, ProtectedPathError, ProtectedPathLease, ProtectedRootLease,
-    ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
+    PackageStagingObservation, PackageStagingStage, ProtectedPathError, ProtectedPathLease,
+    ProtectedRootLease, ProtectedRuntimePathLease, ServiceAccount, ServiceBootstrapArguments,
     ServiceControlGrantReadback, ServiceRegistrationCurrent, ServiceRegistrationInspection,
     ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
     ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome, StagePackageAuthorization,
@@ -16380,6 +16380,13 @@ fn stage_package_authorization(
 
 fn package_port_error(error: &PackageStagingError) -> PortError {
     match error {
+        PackageStagingError::Win32 { stage, code } => PortError::ProviderReference {
+            error: ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            },
+            reference: package_staging_reference(*stage, *code),
+        },
         PackageStagingError::InvalidRelativePath
         | PackageStagingError::ManifestCollision
         | PackageStagingError::BoundExceeded
@@ -16399,8 +16406,25 @@ fn package_port_error(error: &PackageStagingError) -> PortError {
     }
 }
 
+fn package_staging_reference(stage: PackageStagingStage, code: u32) -> PlatformHandle {
+    let stage = match stage {
+        PackageStagingStage::SetSecurityInfo => "set-security-info",
+        PackageStagingStage::GetSecurityInfo => "get-security-info",
+        PackageStagingStage::CreateFileW => "create-file-w",
+        PackageStagingStage::FlushFileBuffers => "flush-file-buffers",
+    };
+    PlatformHandle::new(format!("stage-package-win32-v1:{stage}:{code:08x}"))
+        .unwrap_or_else(|_| unreachable!())
+}
+
 fn package_staging_outcome<T>(error: &PackageStagingError) -> PortOutcome<T> {
     match error {
+        PackageStagingError::Win32 { stage, code } => {
+            PortOutcome::Error(package_port_error(&PackageStagingError::Win32 {
+                stage: *stage,
+                code: *code,
+            }))
+        }
         PackageStagingError::UnsupportedPlatform => {
             PortOutcome::Unknown(UnknownReason::Unsupported)
         }
@@ -16415,10 +16439,12 @@ fn package_staging_outcome<T>(error: &PackageStagingError) -> PortOutcome<T> {
 }
 
 fn package_pending(error: &PackageStagingError) -> InstallationEffectObservation {
-    InstallationEffectObservation::Mismatch {
-        pending_ref: PlatformHandle::new(format!("mismatch:package:{error}"))
+    let pending_ref = match error {
+        PackageStagingError::Win32 { stage, code } => package_staging_reference(*stage, *code),
+        _ => PlatformHandle::new(format!("mismatch:package:{error}"))
             .unwrap_or_else(|_| unreachable!()),
-    }
+    };
+    InstallationEffectObservation::Mismatch { pending_ref }
 }
 
 fn package_receipt_binding(
@@ -20152,6 +20178,26 @@ mod tests {
             pending.as_str(),
             "installer-root-win32-v2:create-directory:0000abcd"
         );
+    }
+
+    #[test]
+    fn package_stage_win32_error_uses_a_stable_typed_provider_reference() {
+        let error = PackageStagingError::Win32 {
+            stage: PackageStagingStage::SetSecurityInfo,
+            code: 5,
+        };
+        assert_eq!(
+            package_staging_reference(PackageStagingStage::SetSecurityInfo, 5).as_str(),
+            "stage-package-win32-v1:set-security-info:00000005"
+        );
+        assert!(matches!(
+            package_port_error(&error),
+            PortError::ProviderReference { reference, .. }
+                if reference.as_str() == "stage-package-win32-v1:set-security-info:00000005"
+        ));
+        let json = serde_json::to_string(&error).unwrap_or_else(|_| unreachable!());
+        assert!(json.contains("SET_SECURITY_INFO"));
+        assert!(json.contains("\"code\":5"));
     }
 
     #[test]

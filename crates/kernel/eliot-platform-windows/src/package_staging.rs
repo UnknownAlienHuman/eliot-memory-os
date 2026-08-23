@@ -51,6 +51,17 @@ pub struct StagePackageExpectedFile {
     pub sha256: String,
 }
 
+/// Native operation that failed while the StagePackage provider was observing
+/// or mutating a protected object.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PackageStagingStage {
+    SetSecurityInfo,
+    GetSecurityInfo,
+    CreateFileW,
+    FlushFileBuffers,
+}
+
 /// Durable, HMAC-bound capability for one `StagePackage` mutation/recovery.
 ///
 /// The installation coordinator persists the source snapshot and ownership
@@ -1285,6 +1296,12 @@ pub enum PackageStagingError {
     UnsupportedPlatform,
     /// A bounded Windows operation failed before classification.
     Io,
+    /// A native StagePackage operation failed; the semantic operation and raw
+    /// Win32 status are retained for durable recovery observability.
+    Win32 {
+        stage: PackageStagingStage,
+        code: u32,
+    },
 }
 
 impl fmt::Display for PackageStagingError {
@@ -1294,6 +1311,9 @@ impl fmt::Display for PackageStagingError {
             Self::Authenticode(error) => write!(formatter, "Authenticode staging error: {error}"),
             Self::AuthenticodeRejected(verdict) => {
                 write!(formatter, "Authenticode verdict rejected: {verdict:?}")
+            }
+            Self::Win32 { stage, code } => {
+                write!(formatter, "{stage:?} failed with Win32 status {code:#010x}")
             }
             other => formatter.write_str(match other {
                 Self::InvalidRelativePath => "invalid package-relative path",
@@ -1312,7 +1332,10 @@ impl fmt::Display for PackageStagingError {
                 Self::RollbackRefused => "exact-owned package rollback was refused",
                 Self::UnsupportedPlatform => "package staging requires Windows",
                 Self::Io => "package staging I/O failed",
-                Self::PeParse(_) | Self::Authenticode(_) | Self::AuthenticodeRejected(_) => {
+                Self::PeParse(_)
+                | Self::Authenticode(_)
+                | Self::AuthenticodeRejected(_)
+                | Self::Win32 { .. } => {
                     unreachable!()
                 }
             }),
@@ -1737,6 +1760,23 @@ fn map_restore_privilege_error(error: super::InstallerRootError) -> PackageStagi
             ..
         } => PackageStagingError::SecurityMismatch,
         _ => PackageStagingError::Io,
+    }
+}
+
+fn map_directory_publication_error(error: super::DirectoryPublicationError) -> PackageStagingError {
+    match error {
+        super::DirectoryPublicationError::AlreadyExists => PackageStagingError::GenerationExists,
+        super::DirectoryPublicationError::ReparsePoint => PackageStagingError::ReparsePoint,
+        super::DirectoryPublicationError::IdentityMismatch => PackageStagingError::IdentityMismatch,
+        super::DirectoryPublicationError::InvalidPath => PackageStagingError::InvalidRelativePath,
+        super::DirectoryPublicationError::Win32 { code } => PackageStagingError::Win32 {
+            stage: PackageStagingStage::SetSecurityInfo,
+            code,
+        },
+        super::DirectoryPublicationError::Io => PackageStagingError::Io,
+        super::DirectoryPublicationError::UnsupportedPlatform => {
+            PackageStagingError::UnsupportedPlatform
+        }
     }
 }
 
@@ -3644,8 +3684,21 @@ fn verify_system_security(
 ) -> Result<String, PackageStagingError> {
     let expected = super::OwnedSecurityDescriptor::for_installer_system_object(directory)
         .map_err(|_| PackageStagingError::SecurityMismatch)?;
-    super::verify_exact_file_security(file, &expected, "S-1-5-18")
-        .map_err(|_| PackageStagingError::SecurityMismatch)?;
+    if super::verify_exact_file_security(file, &expected, "S-1-5-18").is_err() {
+        // The shared verifier intentionally exposes only its semantic adapter
+        // error. Probe the same handle once more to retain a raw GetSecurityInfo
+        // status when the OS could not even produce a descriptor; any other
+        // result remains a fail-closed ACL/security mismatch.
+        return match security_descriptor_digest(file) {
+            Err(
+                error @ PackageStagingError::Win32 {
+                    stage: PackageStagingStage::GetSecurityInfo,
+                    ..
+                },
+            ) => Err(error),
+            _ => Err(PackageStagingError::SecurityMismatch),
+        };
+    }
     security_descriptor_digest(file)
 }
 
@@ -3700,7 +3753,10 @@ fn security_descriptor_digest(file: &std::fs::File) -> Result<String, PackageSta
         if !descriptor.is_null() {
             unsafe { LocalFree(descriptor.cast()) };
         }
-        return Err(PackageStagingError::Io);
+        return Err(PackageStagingError::Win32 {
+            stage: PackageStagingStage::GetSecurityInfo,
+            code: status,
+        });
     }
     let length = unsafe {
         // SAFETY: descriptor is live and self-relative.
@@ -3729,22 +3785,8 @@ fn create_generation_root(path: &Path) -> Result<std::fs::File, PackageStagingEr
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or(PackageStagingError::InvalidRelativePath)?;
-    let root = super::create_owned_directory_relative(&parent_file, name, descriptor.raw).map_err(
-        |error| match error {
-            super::DirectoryPublicationError::AlreadyExists => {
-                PackageStagingError::GenerationExists
-            }
-            super::DirectoryPublicationError::ReparsePoint => PackageStagingError::ReparsePoint,
-            super::DirectoryPublicationError::IdentityMismatch => {
-                PackageStagingError::IdentityMismatch
-            }
-            super::DirectoryPublicationError::InvalidPath => {
-                PackageStagingError::InvalidRelativePath
-            }
-            super::DirectoryPublicationError::Io
-            | super::DirectoryPublicationError::UnsupportedPlatform => PackageStagingError::Io,
-        },
-    )?;
+    let root = super::create_owned_directory_relative(&parent_file, name, descriptor.raw)
+        .map_err(map_directory_publication_error)?;
     let Ok(identity) = file_identity_from_open_handle(&root) else {
         drop(root);
         return Err(PackageStagingError::RollbackRefused);
@@ -3809,10 +3851,14 @@ fn create_destination_file(
     };
     drop(parent_file);
     if handle == INVALID_HANDLE_VALUE {
-        return if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let code = unsafe { GetLastError() };
+        return if code == ERROR_ALREADY_EXISTS {
             Err(PackageStagingError::GenerationExists)
         } else {
-            Err(PackageStagingError::Io)
+            Err(PackageStagingError::Win32 {
+                stage: PackageStagingStage::CreateFileW,
+                code,
+            })
         };
     }
     let file = unsafe {
@@ -3858,20 +3904,7 @@ fn create_destination_directory(
         .and_then(|value| value.to_str())
         .ok_or(PackageStagingError::InvalidRelativePath)?;
     let directory = super::create_owned_directory_relative(&parent_file, name, descriptor.raw)
-        .map_err(|error| match error {
-            super::DirectoryPublicationError::AlreadyExists => {
-                PackageStagingError::GenerationExists
-            }
-            super::DirectoryPublicationError::ReparsePoint => PackageStagingError::ReparsePoint,
-            super::DirectoryPublicationError::IdentityMismatch => {
-                PackageStagingError::IdentityMismatch
-            }
-            super::DirectoryPublicationError::InvalidPath => {
-                PackageStagingError::InvalidRelativePath
-            }
-            super::DirectoryPublicationError::Io
-            | super::DirectoryPublicationError::UnsupportedPlatform => PackageStagingError::Io,
-        })?;
+        .map_err(map_directory_publication_error)?;
     let Ok(identity) = file_identity_from_open_handle(&directory) else {
         drop(directory);
         return Err(PackageStagingError::RollbackRefused);
@@ -4125,13 +4158,17 @@ fn copy_source_to_destination(
 #[cfg(windows)]
 fn flush_file_buffers(file: &std::fs::File) -> Result<(), PackageStagingError> {
     use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
     let ok = unsafe {
         // SAFETY: file owns a live writable handle.
         FlushFileBuffers(file.as_raw_handle().cast())
     };
     if ok == 0 {
-        return Err(PackageStagingError::Io);
+        return Err(PackageStagingError::Win32 {
+            stage: PackageStagingStage::FlushFileBuffers,
+            code: unsafe { GetLastError() },
+        });
     }
     Ok(())
 }
@@ -4520,6 +4557,21 @@ mod tests {
         assert!(source.contains("InstallerRootProfile::SystemService"));
         assert!(source.contains("write_or_validate_prepared_marker(authorization, ownership_key)"));
         assert!(source.contains("self.stage_with_expected_inventory(manifest, &[]),"));
+    }
+
+    #[test]
+    fn package_stage_win32_error_retains_operation_and_raw_status() {
+        let error = PackageStagingError::Win32 {
+            stage: PackageStagingStage::FlushFileBuffers,
+            code: 5,
+        };
+        assert_eq!(
+            error.to_string(),
+            "FlushFileBuffers failed with Win32 status 0x00000005"
+        );
+        let json = serde_json::to_string(&error).unwrap_or_else(|_| unreachable!());
+        assert!(json.contains("FLUSH_FILE_BUFFERS"));
+        assert!(json.contains("\"code\":5"));
     }
 
     #[test]

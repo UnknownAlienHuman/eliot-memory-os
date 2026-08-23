@@ -102,10 +102,10 @@ pub use package_staging::{
     AuthenticodeError, AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier,
     MAX_ENUMERATED_ENTRIES, PackageFileSpec, PackageManifest, PackageRelativePath,
     PackageSourceFileObservation, PackageSourceObservation, PackageStager, PackageStagingError,
-    PackageStagingObservation, PeCoffError, PeCoffEvidence, StagePackageAuthorization,
-    StagePackageExpectedFile, StagedDirectoryReceipt, StagedFileReceipt, StagingReceipt,
-    TrustedSourceBundle, TrustedSourceFileLease, WindowsAuthenticodeVerifier, ordinal_cmp_str,
-    ordinal_component_cmp, ordinal_eq_str, ordinal_path_cmp, parse_pe_coff,
+    PackageStagingObservation, PackageStagingStage, PeCoffError, PeCoffEvidence,
+    StagePackageAuthorization, StagePackageExpectedFile, StagedDirectoryReceipt, StagedFileReceipt,
+    StagingReceipt, TrustedSourceBundle, TrustedSourceFileLease, WindowsAuthenticodeVerifier,
+    ordinal_cmp_str, ordinal_component_cmp, ordinal_eq_str, ordinal_path_cmp, parse_pe_coff,
     validate_package_relative_path,
 };
 pub use supervision_authority_key::{
@@ -3478,6 +3478,8 @@ pub enum DirectoryPublicationError {
     IdentityMismatch,
     /// Windows failed before the move committed.
     Io,
+    /// A documented Win32 call failed before the move committed.
+    Win32 { code: u32 },
     /// The primitive is intentionally unavailable off Windows.
     UnsupportedPlatform,
 }
@@ -3490,6 +3492,7 @@ impl std::fmt::Display for DirectoryPublicationError {
             Self::AlreadyExists => "directory publication destination already exists",
             Self::IdentityMismatch => "directory publication identity changed",
             Self::Io => "directory publication I/O failed before commit",
+            Self::Win32 { .. } => "directory publication Win32 call failed before commit",
             Self::UnsupportedPlatform => "directory publication requires Windows",
         })
     }
@@ -11227,7 +11230,7 @@ fn apply_owned_directory_security(
     if status == 0 {
         Ok(())
     } else {
-        Err(DirectoryPublicationError::Io)
+        Err(DirectoryPublicationError::Win32 { code: status })
     }
 }
 
