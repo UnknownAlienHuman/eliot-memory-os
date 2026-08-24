@@ -82,6 +82,12 @@ pub struct WatchdogAction {
     pub reason: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReapTermination {
+    Graceful,
+    Forced,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReapReceipt {
     pub operation_id: String,
@@ -91,7 +97,7 @@ pub struct ReapReceipt {
     pub stdout_closed: bool,
     pub stderr_closed: bool,
     pub all_tasks_joined: bool,
-    pub forced_termination: bool,
+    pub termination: ReapTermination,
     pub terminal_error_codes: Vec<u32>,
 }
 
@@ -102,7 +108,8 @@ impl ReapReceipt {
             && self.stdout_closed
             && self.stderr_closed
             && self.all_tasks_joined
-            && (self.forced_termination || self.terminal_error_codes.is_empty())
+            && (matches!(self.termination, ReapTermination::Forced)
+                || self.terminal_error_codes.is_empty())
     }
 }
 

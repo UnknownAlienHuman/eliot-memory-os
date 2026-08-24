@@ -1,0 +1,46 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "opencode-go",
+  "model_id": "ox-alpha-free",
+  "agent_profile": "plan",
+  "session_id": "ses_fccf606fcffeCw3AOMDCG4YIiu",
+  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
+  "result": {
+    "work_item_id": "W0-05",
+    "disposition": "CHALLENGED_TRANSITIONAL_PROFILE",
+    "accepted_findings": [
+      "scripts/verify.sh delegates to the same versioned PowerShell profile used by scripts/verify.ps1, so their ordered step list is identical by construction.",
+      "The profile fails closed on missing scripts and non-zero native exit codes.",
+      "Before W0-03 integration the profile intentionally could not pass because its STU step was a ContractChallenge."
+    ],
+    "conflicts_at_audit_time": [
+      "Fast CI had an inline default-member command list and did not call the local versioned profile.",
+      "Local profile and CI differed on --locked and workspace scope.",
+      "Justfile retained a distinct quick inner loop; canonical I18.21 says scripts/Justfile are aliases around the versioned verifier/runner.",
+      "The separately authored PowerShell and Bash normative verifiers have edge-case parser differences even though both passed the current manifest."
+    ],
+    "post_audit_note": "W0-03 subsequently changed fast CI to invoke scripts/verify.ps1 and aligned --locked/workspace flags. Full runtime parity remains unverified.",
+    "evidence_lineage": [
+      "scripts/verify.ps1",
+      "scripts/verify.sh",
+      "scripts/verify-normative.ps1",
+      "scripts/verify-normative.sh",
+      "Justfile",
+      ".github/workflows/ci.yml",
+      "docs/normative/ELIOT_IMPLEMENTATION.md:17520-17533"
+    ]
+  },
+  "integration_disposition": {
+    "accepted_findings": [
+      "OS entrypoints share one profile implementation.",
+      "CI/local structural parity required repair and has not yet been runtime-proved."
+    ],
+    "deferred": [
+      "Do not claim full I18.21 conformance until the native verifier/runner bootstrap and tool identity/evidence model are reconciled.",
+      "Do not remove the repository's documented quick inner loop merely to satisfy a textual alias interpretation."
+    ],
+    "proof_ceiling": "static profile/workflow audit; no full verifier execution"
+  }
+}

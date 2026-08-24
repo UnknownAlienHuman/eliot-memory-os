@@ -1,0 +1,40 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "opencode-go",
+  "model_id": "ox-alpha-free",
+  "agent_profile": "plan",
+  "session_id": "ses_fccfbea25ffek0Bm9gAjJ2XwSR",
+  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
+  "result": {
+    "work_item_id": "W0-02b",
+    "disposition": "ACCEPTED_IN_PART_WITH_CORRECTION",
+    "findings": [
+      "Six safe packages can inherit the full workspace lint table.",
+      "Five intentional Windows FFI packages retained local Rust lint tables and therefore did not inherit any workspace Clippy policy after their old Clippy tables were removed.",
+      "The workspace sets unsafe_code=forbid, which a source-level allow cannot override.",
+      "The eliot-installation diagnostics are real source findings because that package already inherits workspace lints.",
+      "The reported too_many_lines findings belong to the later extraction wave, while enum size, result size, documentation, and local control-flow findings require source-level treatment."
+    ],
+    "auditor_proposal": "Use a per-group [lints.clippy] workspace=true table while retaining local [lints.rust] overrides.",
+    "evidence_lineage": [
+      "Cargo.toml:310-326",
+      "the eleven W0-02 package manifests",
+      "docs/tasks/RECOVERY_PROGRAM_v1.md:301",
+      "static unsafe-site inventories"
+    ]
+  },
+  "integration_disposition": {
+    "accepted_findings": [
+      "The five FFI packages must not remain without the effective workspace Clippy policy.",
+      "Lowering workspace unsafe_code=forbid is not justified by this migration.",
+      "eliot-installation source findings must not be disguised as inheritance problems."
+    ],
+    "rejected_or_corrected": [
+      "Cargo does not support the proposed per-tool-group inheritance switch. Official Cargo documentation and the current Cargo diagnostic permit only top-level [lints] workspace=true with no overrides.",
+      "The accepted temporary mechanism is an exact explicit copy of the workspace Clippy policy in the five FFI manifests, tracked by swarm/challenges/W0-02-FFI-LINT-INHERITANCE.md."
+    ],
+    "proof_ceiling": "static manifest/source audit; focused and workspace clippy remain required"
+  }
+}

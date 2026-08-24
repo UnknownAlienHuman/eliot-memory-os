@@ -8,5 +8,5 @@ license = "MIT"
 [lib]
 path = "src/lib.rs"
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

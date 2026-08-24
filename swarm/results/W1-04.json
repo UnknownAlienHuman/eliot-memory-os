@@ -1,0 +1,68 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "opencode-go",
+  "model_id": "ox-alpha-free",
+  "agent_profile": "plan",
+  "session_id": "ses_fccf606e6ffeZICkvz8uMb5vmM",
+  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
+  "independence_profile": "normal external audit; not an independent W1-06 lane",
+  "result": {
+    "work_item_id": "W1-04",
+    "disposition": "UNKNOWN",
+    "normative_refs": [
+      "C:/Development/Rust/docs/ELIOT Arhitecture/ELIOT_ARCHITECTURE.md#A16.1 (Decision anchors table, L2605-2668)",
+      "docs/normative/PROJECTION_NOTICE.md:1-10",
+      "docs/normative/projection-manifest.tsv:4",
+      "AGENTS.md#source-of-truth"
+    ],
+    "hypotheses": [
+      "H1: a conformance.toml or generated anchor-index artifact already exists somewhere in the repo",
+      "H2: no conformance artifact exists; A16.1's 58 decision anchors are unmapped to code owners",
+      "H3: partial mapping exists only as scattered single-anchor references (e.g. ARCH-SEC-01 in code)"
+    ],
+    "findings": [
+      "No docs/conformance.toml or equivalent generated artifact exists: glob **/conformance* returns zero files; 'conformance' appears only in prose/tests (eliot-wasm-runtime, mcp contract, audit docs)",
+      "A16.1 normative anchor set = 58 unique ARCH-*-NN IDs (Invariant vs Contract classes) at ELIOT_ARCHITECTURE.md L2611-2668; count verified by unique-match enumeration",
+      "Canonical and repo-projected doc are byte-identical: SHA-256 58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8 equals manifest row and is enforced by scripts/verify-normative.ps1:104-126",
+      "Code search for 'ARCH-[A-Z]+-[0-9]+' across *.rs/*.toml/*.json hits exactly one file: crates/governor/eliot-problem/src/lib.rs:1341 ('from_rule: ARCH-SEC-01') - so H2/H3 hold, H1 refuted",
+      "Projection sources for the four fields exist but are not anchor-linked: source_handles = ExperienceBrief.exact_source_handles Vec<String> (crates/eliot-types/src/semantic_memory.rs:332); support = ClaimEnvelope.supporting_evidence/counterevidence Vec<ArtifactId> (crates/foundation/eliot-evidence/src/lib.rs:459-460) and UnderstandingState.evidence_handles (lib.rs:548); invalidation = EpistemicStatus lifecycle incl. Supported/refuted variants (eliot-evidence/src/lib.rs:84-88,236) - no explicit invalidation field; owner = no per-anchor owner record anywhere (UNKNOWN)"
+    ],
+    "discriminator": "If any generated conformance artifact existed, glob '**/conformance*' plus rg 'ARCH-[A-Z]+-[0-9]+' over *.rs/*.toml/*.json/*.jsonc would return >1 code hit; observed exactly 1 (eliot-problem), therefore anchor-to-code conformance coverage is currently 1/58 (~1.7%) and ungenerated",
+    "uncertainty": "Owner semantics unresolved: whether 'owner' means crate path, module symbol, or governed actor; eliot-evidence ClaimEnvelope has no invalidation field, only status transitions - invalidation projection would be inferred, not read",
+    "unresolved_questions": [
+      "Should docs/conformance.toml live under docs/ (non-authority, like normative projection) or config/?",
+      "Is invalidation derived from EpistemicStatus transitions or from git history of owning files?",
+      "Should the generator hard-fail when an anchor has zero code references (coverage gate) or emit warnings?"
+    ],
+    "proposed_effects": [
+      "Add scripts/gen-conformance.ps1 (native PowerShell, no Python/Node): parse rows matching '^\\| `ARCH-[A-Z]+-[0-9]+` \\| (Invariant|Contract) \\|' between headings '## A16.1.' and '## A16.2.' in docs/normative/ELIOT_ARCHITECTURE.md; emit docs/conformance.toml with [anchor.<ID>] id/class/statement_hash plus projected owner/source_handles/support/invalidation sourced from rg scans of semantic_memory.rs:332 and eliot-evidence ClaimEnvelope",
+      "Proof command: pwsh -File scripts/verify-conformance.ps1 - re-parses doc, re-runs rg projections, byte-compares against committed conformance.toml, verifies input doc SHA-256 against projection-manifest.tsv row 4; exit 0 iff all 58 anchors present and projections reproducible; wire into Justfile quick target",
+      "Rust-native alternative: workspace/tools bin crate reusing the same TSV-table parser, satisfying AGENTS.md native-Rust preference"
+    ],
+    "evidence_lineage": [
+      "C:/Development/Rust/docs/ELIOT Arhitecture/ELIOT_ARCHITECTURE.md:2603-2724 (canonical, hash-matched)",
+      "docs/normative/ELIOT_ARCHITECTURE.md:2603-2668 (58 anchors enumerated)",
+      "docs/normative/projection-manifest.tsv:4",
+      "scripts/verify-normative.ps1:24-29,104-128",
+      "crates/eliot-types/src/semantic_memory.rs:320-334",
+      "crates/foundation/eliot-evidence/src/lib.rs:84-88,448-476,542-557",
+      "crates/governor/eliot-problem/src/lib.rs:1341",
+      "git log d40a0a1 (HEAD, clean-tracked state; 5 modified Cargo.toml manifests noted)"
+    ]
+  },
+  "integration_disposition": {
+    "accepted_findings": [
+      "58 unique A16.1 decision anchors",
+      "no generated conformance artifact",
+      "only one current Rust/TOML/JSON ARCH anchor reference found by the auditor"
+    ],
+    "rejected_or_deferred_proposals": [
+      "Do not infer per-anchor owners or support from generic semantic-memory/evidence types; UNKNOWN remains the default.",
+      "Do not add conformance generation to the quick gate before generator ownership and an independent oracle are defined."
+    ],
+    "proof_ceiling": "current source/document inventory only; no runtime or product proof"
+  }
+}
+

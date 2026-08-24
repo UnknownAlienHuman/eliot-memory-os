@@ -257,14 +257,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nonzero_completed_exit_is_failed() {
-        let exit = ExitStatus::new(ExitDisposition::Completed, Some(7), None, 1).unwrap();
+    fn nonzero_completed_exit_is_failed() -> Result<(), eliot_process::ContractError> {
+        let exit = ExitStatus::new(ExitDisposition::Completed, Some(7), None, 1)?;
         assert!(!successful_exit(&exit));
+        Ok(())
     }
 
     #[test]
-    fn zero_completed_exit_succeeds() {
-        let exit = ExitStatus::new(ExitDisposition::Completed, Some(0), None, 1).unwrap();
+    fn zero_completed_exit_succeeds() -> Result<(), eliot_process::ContractError> {
+        let exit = ExitStatus::new(ExitDisposition::Completed, Some(0), None, 1)?;
         assert!(successful_exit(&exit));
+        Ok(())
     }
 }

@@ -2560,11 +2560,11 @@ mod primitive_tests {
         let marker_path = spec.root.join("authority.json");
         primitive.executor.protected_file_create_error = Some(5);
 
-        let error = primitive
-            .create_protected_file(&spec, &marker_path, |_| {
-                panic!("injected CreateFileW error must happen before the builder")
-            })
-            .expect_err("injected CreateFileW error must be returned");
+        let Err(error) = primitive.create_protected_file(&spec, &marker_path, |_| {
+            panic!("injected CreateFileW error must happen before the builder")
+        }) else {
+            panic!("injected CreateFileW error must be returned");
+        };
 
         assert_eq!(
             error,
@@ -2595,7 +2595,7 @@ mod primitive_tests {
         let mut api = fake_api();
         let active = Arc::clone(&api.active);
 
-        let error = with_restore_privilege_api(&mut api, || {
+        let Err(error) = with_restore_privilege_api(&mut api, || {
             assert!(
                 active.load(Ordering::SeqCst),
                 "protected marker creation must run with restore privilege bound"
@@ -2606,8 +2606,9 @@ mod primitive_tests {
                 Some(windows_sys::Win32::Foundation::ERROR_INVALID_OWNER),
                 |_| panic!("injected CreateFileW error must happen before the builder"),
             )
-        })
-        .expect_err("injected CreateFileW error must be returned");
+        }) else {
+            panic!("injected CreateFileW error must be returned");
+        };
 
         assert_eq!(
             error,
@@ -2631,7 +2632,7 @@ mod primitive_tests {
         let mut api = fake_api();
         let active = Arc::clone(&api.active);
 
-        let error = with_restore_privilege_api(&mut api, || {
+        let Err(error) = with_restore_privilege_api(&mut api, || {
             assert!(active.load(Ordering::SeqCst));
             create_protected_file(
                 ProtectedFileSecurity::LocalServiceHostMarker,
@@ -2639,8 +2640,9 @@ mod primitive_tests {
                 Some(windows_sys::Win32::Foundation::ERROR_INVALID_OWNER),
                 |_| panic!("injected CreateFileW error must happen before the builder"),
             )
-        })
-        .expect_err("injected CreateFileW error must be returned");
+        }) else {
+            panic!("injected CreateFileW error must be returned");
+        };
 
         assert_eq!(
             error,
@@ -2701,29 +2703,33 @@ mod primitive_tests {
 
     #[cfg(windows)]
     #[test]
-    fn scoped_restore_privilege_falls_back_only_for_no_token_and_restores_binding() {
+    fn scoped_restore_privilege_falls_back_only_for_no_token_and_restores_binding()
+    -> Result<(), InstallerRootError> {
         let mut api = fake_api();
         {
-            let mut guard = ScopedRestorePrivilege::enter(&mut api).unwrap();
+            let mut guard = ScopedRestorePrivilege::enter(&mut api)?;
             guard.restore();
         }
         assert_eq!(api.adjusted, 1);
         assert_eq!(api.bound, vec![Some(22), None]);
         assert_eq!(api.closed, vec![11, 22]);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn scoped_restore_privilege_restores_an_existing_thread_token_without_process_fallback() {
+    fn scoped_restore_privilege_restores_an_existing_thread_token_without_process_fallback()
+    -> Result<(), InstallerRootError> {
         let mut api = fake_api();
         api.thread = Ok(33);
         api.process = Err(99);
         {
-            let mut guard = ScopedRestorePrivilege::enter(&mut api).unwrap();
+            let mut guard = ScopedRestorePrivilege::enter(&mut api)?;
             guard.restore();
         }
         assert_eq!(api.bound, vec![Some(22), Some(33)]);
         assert_eq!(api.closed, vec![22, 33]);
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -2814,7 +2820,9 @@ mod primitive_tests {
     fn scoped_restore_privilege_drop_restores_after_operation_panic() {
         let mut api = fake_api();
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ScopedRestorePrivilege::enter(&mut api).unwrap();
+            let Ok(_guard) = ScopedRestorePrivilege::enter(&mut api) else {
+                panic!("restore privilege setup must succeed");
+            };
             panic!("operation failure");
         }));
         assert!(panic.is_err());

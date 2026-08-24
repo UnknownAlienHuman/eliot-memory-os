@@ -1,0 +1,48 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "opencode-go",
+  "model_id": "ox-alpha-free",
+  "agent_profile": "plan",
+  "session_id": "ses_fccf606fcffeCw3AOMDCG4YIiu",
+  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
+  "result": {
+    "work_item_id": "W1-03",
+    "disposition": "ACCEPTED_WITH_LIMITATIONS",
+    "blocker_ledger": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md",
+    "ledger_cells": ["C0-12", "C0-13", "A-01", "A-03", "A-05", "G-03", "G-10"],
+    "cycles": [
+      "C0-12 <-> Q-01/consumers",
+      "A-01/A-03/A-05 <-> P-03",
+      "A-01 <-> C0-06"
+    ],
+    "minimum_vertex_cut_claim": {
+      "cells": ["C0-12", "A-01"],
+      "size": 2,
+      "status": "AUDITOR_HYPOTHESIS_NOT_EXECUTION_PROVEN"
+    },
+    "staleness_findings": [
+      "The tracked ledger predates the current source revision and contains more cells than the seven named by the recovery program.",
+      "A DispatchPermit issuer is now present at crates/kernel/eliot-kernel-core/src/authority_controller.rs:472-504.",
+      "commit_canonical was found as a definition with zero callers in the audited source inventory."
+    ],
+    "evidence_lineage": [
+      "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md",
+      "crates/kernel/eliot-kernel-core/src/authority_controller.rs:472-504",
+      "source-only search for commit_canonical callers"
+    ]
+  },
+  "integration_disposition": {
+    "accepted_findings": [
+      "The named blocker ledger exists and is tracked.",
+      "Its cycle analysis is stale against at least one current source anchor.",
+      "The proposed two-cell cut is useful only as a revalidation hypothesis."
+    ],
+    "rejected_or_deferred_proposals": [
+      "Do not use the historical ledger as current execution truth without rebuilding it from the current source graph.",
+      "Do not start W2 from the unverified minimum-cut claim."
+    ],
+    "proof_ceiling": "source and tracked-ledger inventory only; no Cargo or runtime execution"
+  }
+}

@@ -20,7 +20,7 @@ use thiserror::Error;
 pub const CONTRACT_ID: &str = "eliot.instrument.dotnet.msbuild";
 /// Default executable used for SDK-style projects.
 pub const DOTNET_EXECUTABLE: &str = "dotnet";
-/// Default MSBuild profile passed to `dotnet`.
+/// Default `MSBuild` profile passed to `dotnet`.
 pub const DEFAULT_PROFILE: &str = "msbuild";
 
 /// Configuration for bounded .NET/MSBuild command validation.
@@ -28,7 +28,7 @@ pub const DEFAULT_PROFILE: &str = "msbuild";
 pub struct DotnetMsbuildConfig {
     /// Executable name accepted for dotnet requests.
     pub dotnet_executable: String,
-    /// Executable name accepted for direct MSBuild requests.
+    /// Executable name accepted for direct `MSBuild` requests.
     pub msbuild_executable: String,
 }
 

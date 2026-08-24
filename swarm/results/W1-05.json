@@ -1,0 +1,39 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "opencode-go",
+  "model_id": "ox-alpha-free",
+  "agent_profile": "plan",
+  "session_id": "ses_fccfbea25ffek0Bm9gAjJ2XwSR",
+  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
+  "result": {
+    "work_item_id": "W1-05",
+    "disposition": "ACCEPTED_WITH_LIMITATIONS",
+    "contour_a": ["eliot-app", "eliot-engine", "eliot-store"],
+    "contour_b": ["eliot", "eliot-host", "eliot-kernel", "eliotd"],
+    "findings": [
+      "No direct or transitive Cargo dependency edge was found between the enumerated contour-A and contour-B packages.",
+      "The only production cross-contour behavior found was the contour-B eliot binary observing eliot-governor.exe as a negative coexistence or retirement gate.",
+      "Shared contract-type edges exist through eliot-runtime-contracts and GovernorConfig but do not constitute an executable contour join.",
+      "No cross-contour test invocation was found; eliot_host_governor_handshake has no contour-B peer in the audited inventory."
+    ],
+    "uncertainty": "The audit was source-only and package names are a recovery-program projection, not a proven complete runtime topology.",
+    "evidence_lineage": [
+      "Cargo.toml and package manifests at source revision d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+      "source searches for GovernorConfig, eliot-governor.exe, and eliot_host_governor_handshake"
+    ]
+  },
+  "integration_disposition": {
+    "accepted_findings": [
+      "No production A-to-B Cargo edge was demonstrated.",
+      "A negative coexistence check is not an execution join.",
+      "Current tests do not prove a joined two-contour product loop."
+    ],
+    "rejected_or_deferred_proposals": [
+      "Do not infer that either contour is dead solely from absent Cargo edges.",
+      "Runtime composition and signed-bundle evidence remain required."
+    ],
+    "proof_ceiling": "source dependency and call-site inventory only; no runtime proof"
+  }
+}

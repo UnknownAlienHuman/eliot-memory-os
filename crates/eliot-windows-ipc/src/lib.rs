@@ -2463,14 +2463,15 @@ mod tests {
     const SUPERVISED_FIXTURE_ENV: &str = "ELIOT_WINDOWS_IPC_SUPERVISED_FIXTURE";
 
     #[test]
-    fn supervised_process_native_fixture_process() {
+    fn supervised_process_native_fixture_process() -> Result<(), Box<dyn std::error::Error>> {
         if std::env::var_os(SUPERVISED_FIXTURE_ENV).is_none() {
-            return;
+            return Ok(());
         }
         let mut input = Vec::new();
-        std::io::stdin().read_to_end(&mut input).unwrap();
-        std::io::stdout().write_all(&input).unwrap();
-        std::io::stderr().write_all(b"fixture-stderr").unwrap();
+        std::io::stdin().read_to_end(&mut input)?;
+        std::io::stdout().write_all(&input)?;
+        std::io::stderr().write_all(b"fixture-stderr")?;
+        Ok(())
     }
 
     fn supervised_fixture_command() -> Result<std::process::Command, Box<dyn std::error::Error>> {
@@ -2597,8 +2598,12 @@ mod tests {
         Ok(())
     }
 
-    fn managed_powershell(script: &str, cwd: &std::path::Path) -> std::process::Command {
-        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
+    fn managed_powershell(
+        script: &str,
+        cwd: &std::path::Path,
+    ) -> std::io::Result<std::process::Command> {
+        let system_root = std::env::var_os("SystemRoot")
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "SystemRoot"))?;
         let mut command = std::process::Command::new(
             std::path::PathBuf::from(system_root)
                 .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
@@ -2618,11 +2623,15 @@ mod tests {
                 command.env(name, value);
             }
         }
-        command
+        Ok(command)
     }
 
-    fn managed_cmd(script_name: &str, cwd: &std::path::Path) -> std::process::Command {
-        let comspec = std::env::var_os("ComSpec").expect("ComSpec");
+    fn managed_cmd(
+        script_name: &str,
+        cwd: &std::path::Path,
+    ) -> std::io::Result<std::process::Command> {
+        let comspec = std::env::var_os("ComSpec")
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "ComSpec"))?;
         let mut command = std::process::Command::new(comspec);
         command
             .args(["/D", "/C", script_name])
@@ -2633,7 +2642,7 @@ mod tests {
                 command.env(name, value);
             }
         }
-        command
+        Ok(command)
     }
 
     fn is_post_terminate_pipe_closure(error: &std::io::Error) -> bool {
@@ -3002,7 +3011,7 @@ mod tests {
     #[test]
     fn suspended_job_reports_its_root_process_image() -> Result<(), Box<dyn std::error::Error>> {
         let root = OwnedTestRoot::new("eliot-job-process-attestation")?;
-        let command = managed_powershell("Start-Sleep -Seconds 10", &root);
+        let command = managed_powershell("Start-Sleep -Seconds 10", &root)?;
         let expected_image = std::path::PathBuf::from(command.get_program()).canonicalize()?;
         let mut child = SuspendedJobChild::spawn(&command)?;
         let processes = child.observed_processes();
@@ -3025,7 +3034,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let root = OwnedTestRoot::new("eliot-job-fast-descendant")?;
         let script = "$info = New-Object System.Diagnostics.ProcessStartInfo; $info.FileName = $env:ComSpec; $info.Arguments = '/D /C ping -n 2 127.0.0.1 >NUL'; $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $process = [System.Diagnostics.Process]::Start($info); $process.WaitForExit(); Start-Sleep -Milliseconds 1500";
-        let mut child = SuspendedJobChild::spawn(&managed_powershell(script, &root))?;
+        let command = managed_powershell(script, &root)?;
+        let mut child = SuspendedJobChild::spawn(&command)?;
         std::thread::sleep(Duration::from_millis(200));
         let live_processes = child.job_processes()?;
         let descendant = live_processes
@@ -3067,7 +3077,8 @@ mod tests {
             "@echo off\r\n\"%SystemRoot%\\System32\\ping.exe\" -n 3 127.0.0.1 >NUL\r\necho escaped>escaped.txt\r\n",
         )?;
         let script = "$info = New-Object System.Diagnostics.ProcessStartInfo; $info.FileName = $env:ComSpec; $info.Arguments = '/D /C child.cmd'; $info.UseShellExecute = $false; $info.CreateNoWindow = $true; [System.Diagnostics.Process]::Start($info) | Out-Null; Write-Output root";
-        let mut child = SuspendedJobChild::spawn(&managed_powershell(script, &root))?;
+        let command = managed_powershell(script, &root)?;
+        let mut child = SuspendedJobChild::spawn(&command)?;
         std::thread::sleep(Duration::from_millis(250));
         child.terminate(37)?;
         let _ = child.wait_timeout(Duration::from_secs(1))?;
@@ -3093,7 +3104,8 @@ mod tests {
             root.join("root.cmd"),
             "@echo off\r\nstart \"\" /B \"%ComSpec%\" /D /C child.cmd\r\necho root\r\n",
         )?;
-        let mut child = SuspendedJobChild::spawn(&managed_cmd("root.cmd", &root))?;
+        let command = managed_cmd("root.cmd", &root)?;
+        let mut child = SuspendedJobChild::spawn(&command)?;
         let mut stdout = child.take_stdout().ok_or("stdout")?;
         let mut stderr = child.take_stderr().ok_or("stderr")?;
         let root_started = Instant::now();

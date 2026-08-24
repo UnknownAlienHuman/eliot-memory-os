@@ -54,17 +54,39 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
-      - name: Metadata
-        run: cargo metadata --locked --format-version 1 --no-deps > $null
+      - name: Workspace topology baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = cargo metadata --locked --format-version 1 --no-deps | ConvertFrom-Json
+          if ($metadata.packages.Count -ne 125) {
+            throw "Expected 125 workspace packages, observed $($metadata.packages.Count)"
+          }
+          if ($metadata.workspace_default_members.Count -ne 6) {
+            throw "Expected 6 default members, observed $($metadata.workspace_default_members.Count)"
+          }
+          "workspace_packages=$($metadata.packages.Count) default_members=$($metadata.workspace_default_members.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Formatting
-        run: cargo fmt --all -- --check
+      # cargo-deny 0.20.2 is pinned to the official release dated 2026-07-09.
+      - name: Install pinned cargo-deny
+        shell: pwsh
+        run: |
+          cargo install --locked --version 0.20.2 cargo-deny
+          $cargoDeny = (Get-Command cargo-deny -ErrorAction Stop).Source
+          $version = (& cargo-deny --version).Trim()
+          if ($version -notmatch '^cargo-deny 0\.20\.2(?:\s|$)') {
+            throw "Unexpected cargo-deny identity: $version"
+          }
+          $sha256 = (Get-FileHash -LiteralPath $cargoDeny -Algorithm SHA256).Hash.ToLowerInvariant()
+          @(
+            "cargo-deny version: $version"
+            "cargo-deny path: $cargoDeny"
+            "cargo-deny sha256: $sha256"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Default members check
-        run: cargo check --locked --all-targets
-
-      - name: Default members clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Versioned local verification profile
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/verify.ps1
 
       - name: Eliot.Operator Release build
         run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release

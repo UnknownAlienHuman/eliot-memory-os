@@ -1,0 +1,52 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "opencode-go",
+  "model_id": "ox-alpha-free",
+  "agent_profile": "plan",
+  "session_id": "ses_fccfbec6bffeJF33pz7OdKurJx",
+  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "result": {
+    "work_item_id": "W1-07",
+    "disposition": "ACCEPTED_WITH_LIMITATIONS",
+    "bin_target_count": 22,
+    "classification": {
+      "structurally_reachable_success": 14,
+      "typed_refusal_or_no_core_success": 6,
+      "test_only": 2,
+      "unresolved": 0
+    },
+    "refusal_roots": [
+      "eliot-native-worker",
+      "eliot-doctor",
+      "eliot-dreamer",
+      "eliot-wasm-host",
+      "eliot-agent-bridge",
+      "eliot-testd core submit path"
+    ],
+    "test_only_roots": [
+      "eliot-credential-suite-guard",
+      "eliot-process-guardian"
+    ],
+    "uncertainty": "Static reachable success is not a live observed PASS. eliot-testd has a live transport/readiness loop but its core submit capability is a typed refusal, so its bucket is purpose-dependent.",
+    "evidence_lineage": [
+      "cargo metadata --no-deps --format-version 1",
+      "22 bin entrypoint source inventories",
+      "scripts/run-isolated-tests.ps1:330-331",
+      "docs/normative/ELIOT_ARCHITECTURE.md:2501-2523",
+      "docs/normative/ELIOT_IMPLEMENTATION.md:293"
+    ]
+  },
+  "integration_disposition": {
+    "accepted_findings": [
+      "The recovery program's count 21 is stale; current metadata has 22 bin targets.",
+      "Six roots lack a structurally reachable core success path under the stated discriminator.",
+      "Two guard binaries are test-harness roots."
+    ],
+    "deferred": [
+      "No reachable-success root is CURRENT_VERIFIED without runtime evidence.",
+      "No packaging or cutover decision follows from this inventory alone."
+    ],
+    "proof_ceiling": "static composition-root inventory only"
+  }
+}

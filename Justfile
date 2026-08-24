@@ -1,4 +1,4 @@
-set shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
+set shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
 
 default: quick
 
@@ -30,4 +30,8 @@ sync-skills:
 
 quick: metadata fmt-check check
 
-verify: metadata fmt-check check clippy test
+verify:
+    pwsh -NoProfile -File scripts/verify.ps1
+
+verify-list:
+    pwsh -NoProfile -File scripts/verify.ps1 -List

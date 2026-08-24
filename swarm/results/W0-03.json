@@ -1,0 +1,56 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "opencode-go",
+  "model_id": "ox-alpha-free",
+  "agent_profile": "plan",
+  "session_id": "ses_fccf606e6ffeZICkvz8uMb5vmM",
+  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
+  "result": {
+    "work_item_id": "W0-03",
+    "disposition": "ACCEPTED_CONTRACT_CHALLENGE",
+    "workspace_inventory": {
+      "packages": 125,
+      "default_members": 6,
+      "fast_ci_coverage_before": "default members only"
+    },
+    "findings": [
+      "Fast CI did not pass --workspace to check or clippy, while the candidate-release workflow already had full-workspace gates.",
+      "deny.toml existed but no workflow invoked cargo deny and no CI tool identity was pinned.",
+      "STU was absent from CI; the recovery program proposed warning at 45,000 and failure at 100,000.",
+      "Canonical I2.16 defines STU as a conservative planning fallback and says a numeric-band crossing alone records evidence; it does not fail or split a crate.",
+      "Canonical I17.15 says I2.16 planning bands alone never create a refusal, and I18.38 says the profiles are route/task-family hypotheses rather than universal module limits."
+    ],
+    "dispositions": {
+      "workspace_coverage": "CHANGE_WARRANTED",
+      "cargo_deny": "CHANGE_WARRANTED_WITH_PINNED_IDENTITY_AND_DIGEST_EVIDENCE",
+      "stu_warning": "ACCEPT_ONLY_AS_PROVISIONAL_NON_BLOCKING_OBSERVATION",
+      "stu_size_only_failure": "REJECT_CONFLICTS_WITH_CANONICAL_I2_16"
+    },
+    "safe_residual": "Emit deterministic per-file STU observations with explicit PROVISIONAL status and never return nonzero solely because a numeric band was crossed.",
+    "normative_anchors": [
+      "docs/normative/ELIOT_IMPLEMENTATION.md:2901-3017",
+      "docs/normative/ELIOT_IMPLEMENTATION.md:16637-16688",
+      "docs/normative/ELIOT_IMPLEMENTATION.md:17520-17533",
+      "docs/normative/ELIOT_IMPLEMENTATION.md:18070-18072"
+    ],
+    "evidence_lineage": [
+      ".github/workflows/ci.yml:57-70",
+      ".github/workflows/candidate-release.yml:64-110",
+      "Cargo.toml:2-136",
+      "Justfile:11-18",
+      "deny.toml:1-20",
+      "docs/tasks/RECOVERY_PROGRAM_v1.md:302"
+    ]
+  },
+  "integration_disposition": {
+    "accepted_findings": [
+      "Workspace CI and cargo-deny gaps are real.",
+      "The size-only hard STU gate conflicts with the canonical Implementation.",
+      "The non-blocking measurement residual is admissible."
+    ],
+    "binding_root_decision": "swarm/challenges/W0-03-STU-HARD-GATE.md",
+    "proof_ceiling": "source/workflow and normative audit only; implementation and runtime verification remain separate"
+  }
+}

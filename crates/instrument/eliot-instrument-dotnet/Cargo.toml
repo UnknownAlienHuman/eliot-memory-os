@@ -11,5 +11,5 @@ eliot-instrument-api = { path = "../eliot-instrument-api" }
 eliot-process = { path = "../../kernel/eliot-process" }
 thiserror = "2.0.18"
 
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true
