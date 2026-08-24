@@ -16414,6 +16414,7 @@ fn package_staging_reference(stage: PackageStagingStage, code: u32) -> PlatformH
         PackageStagingStage::DuplicateHandle => "duplicate-handle",
         PackageStagingStage::SetFilePointerEx => "set-file-pointer-ex",
         PackageStagingStage::ReadFile => "read-file",
+        PackageStagingStage::WriteFile => "write-file",
     };
     PlatformHandle::new(format!("stage-package-win32-v1:{stage}:{code:08x}"))
         .unwrap_or_else(|_| unreachable!())
@@ -19517,6 +19518,7 @@ fn is_typed_package_staging_reference(value: &str) -> bool {
             | "duplicate-handle"
             | "set-file-pointer-ex"
             | "read-file"
+            | "write-file"
     ) {
         return false;
     }
@@ -20325,6 +20327,7 @@ mod tests {
             "installer-root-win32-v2:open-readback:00000002",
             "stage-package-win32-v1:get-security-info:00000005",
             "stage-package-win32-v1:read-file:00000005",
+            "stage-package-win32-v1:write-file:00000005",
         ];
         for reference in valid {
             let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {
@@ -20349,6 +20352,8 @@ mod tests {
             "stage-package-win32-v1:get-security-info:0000005",
             "stage-package-win32-v1:get-security-info:00000005:extra",
             "stage-package-win32-v1:get-security-info:00000005 ",
+            "stage-package-win32-v1:write-file:0000000A",
+            "stage-package-win32-v1:write-file:00000005:extra",
             r"C:\package\secret",
         ] {
             let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {

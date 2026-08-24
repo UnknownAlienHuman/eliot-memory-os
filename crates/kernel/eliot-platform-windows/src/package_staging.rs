@@ -64,6 +64,7 @@ pub enum PackageStagingStage {
     DuplicateHandle,
     SetFilePointerEx,
     ReadFile,
+    WriteFile,
 }
 
 /// Durable, HMAC-bound capability for one `StagePackage` mutation/recovery.
@@ -2209,7 +2210,7 @@ fn write_or_validate_prepared_marker(
         Err(error) => return Err(error),
     };
     file.write_all(&bytes)
-        .map_err(|_| PackageStagingError::Io)?;
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::WriteFile))?;
     flush_file_buffers(&file)?;
     Ok(())
 }
@@ -2232,7 +2233,7 @@ fn read_prepared_marker(
     let mut bytes = Vec::new();
     file.take(1024 * 1024)
         .read_to_end(&mut bytes)
-        .map_err(|_| PackageStagingError::Io)?;
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::ReadFile))?;
     let marker: StagePackagePreparedMarker =
         serde_json::from_slice(&bytes).map_err(|_| PackageStagingError::IdentityMismatch)?;
     if marker.version != STAGE_PACKAGE_MARKER_VERSION {
@@ -4158,20 +4159,20 @@ fn copy_source_to_destination(
     let mut source = source_snapshot
         .file
         .try_clone()
-        .map_err(|_| PackageStagingError::Io)?;
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::DuplicateHandle))?;
     source
         .seek(SeekFrom::Start(0))
-        .map_err(|_| PackageStagingError::Io)?;
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::SetFilePointerEx))?;
     destination
         .seek(SeekFrom::Start(0))
-        .map_err(|_| PackageStagingError::Io)?;
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::SetFilePointerEx))?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     let mut total = 0_u64;
     loop {
         let read = source
             .read(&mut buffer)
-            .map_err(|_| PackageStagingError::Io)?;
+            .map_err(|error| map_package_io_error(error, PackageStagingStage::ReadFile))?;
         if read == 0 {
             break;
         }
@@ -4183,7 +4184,7 @@ fn copy_source_to_destination(
         }
         destination
             .write_all(&buffer[..read])
-            .map_err(|_| PackageStagingError::Io)?;
+            .map_err(|error| map_package_io_error(error, PackageStagingStage::WriteFile))?;
         digest.update(&buffer[..read]);
     }
     if total != source_snapshot.size {
@@ -5496,6 +5497,10 @@ mod tests {
                 PackageStagingStage::SetFilePointerEx,
             ),
             (PackageStagingStage::ReadFile, PackageStagingStage::ReadFile),
+            (
+                PackageStagingStage::WriteFile,
+                PackageStagingStage::WriteFile,
+            ),
         ] {
             assert_eq!(
                 map_package_io_error(std::io::Error::from_raw_os_error(5), stage),
