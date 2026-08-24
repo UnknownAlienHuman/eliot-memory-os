@@ -16298,7 +16298,7 @@ fn service_matching_observation(
 
 fn package_stager(
     request: &InstallationEffectRequest,
-) -> Result<(PackageStager, PackageManifest), PortError> {
+) -> Result<(PackageStager, PackageManifest), PackageStagingError> {
     let InstallerEffectPlan::StagePackage {
         source_bundle,
         source_bundle_identity,
@@ -16307,15 +16307,13 @@ fn package_stager(
         ..
     } = &request.plan
     else {
-        return Err(PortError::InvalidRequestMetadata);
+        return Err(PackageStagingError::Io);
     };
-    let source = TrustedSourceBundle::open(Path::new(source_bundle.as_str()))
-        .map_err(|error| package_port_error(&error))?;
+    let source = TrustedSourceBundle::open(Path::new(source_bundle.as_str()))?;
     if source.identity() != *source_bundle_identity {
-        return Err(PortError::IdentityConflict);
+        return Err(PackageStagingError::IdentityMismatch);
     }
-    let stager = PackageStager::open(source, Path::new(staging_root.as_str()))
-        .map_err(|error| package_port_error(&error))?;
+    let stager = PackageStager::open(source, Path::new(staging_root.as_str()))?;
     Ok((stager, manifest.clone()))
 }
 
@@ -16634,7 +16632,7 @@ fn package_absent_with_snapshot(
 fn inspect_package(
     request: &InstallationEffectRequest,
 ) -> Result<InstallationEffectObservation, PackageStagingError> {
-    let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
+    let (stager, manifest) = package_stager(request)?;
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
         generation,
@@ -16767,7 +16765,7 @@ fn reconcile_package(
         };
     }
 
-    let (stager, manifest) = package_stager(request).map_err(|_| PackageStagingError::Io)?;
+    let (stager, manifest) = package_stager(request)?;
     if persisted.source_bundle_identity != stager.source().identity() {
         return Err(PackageStagingError::IdentityMismatch);
     }
@@ -16865,7 +16863,7 @@ fn execute_package(
             }
             let (stager, _) = match package_stager(request) {
                 Ok(value) => value,
-                Err(error) => return PortOutcome::Error(error),
+                Err(error) => return PortOutcome::Error(package_port_error(&error)),
             };
             if snapshot.source_bundle_identity != stager.source().identity() {
                 return PortOutcome::Unknown(UnknownReason::Indeterminate);
@@ -20198,6 +20196,32 @@ mod tests {
         let json = serde_json::to_string(&error).unwrap_or_else(|_| unreachable!());
         assert!(json.contains("SET_SECURITY_INFO"));
         assert!(json.contains("\"code\":5"));
+    }
+
+    #[test]
+    fn package_inspection_errors_preserve_provider_diagnostics() {
+        let win32 = Err::<(), _>(PackageStagingError::Win32 {
+            stage: PackageStagingStage::GetSecurityInfo,
+            code: 5,
+        })
+        .map_err(|error| package_port_error(&error))
+        .unwrap_err();
+        assert!(matches!(
+            win32,
+            PortError::ProviderReference { reference, .. }
+                if reference.as_str() == "stage-package-win32-v1:get-security-info:00000005"
+        ));
+
+        let security = Err::<(), _>(PackageStagingError::SecurityMismatch)
+            .map_err(|error| package_port_error(&error))
+            .unwrap_err();
+        assert!(matches!(
+            security,
+            PortError::Provider(ProviderError {
+                code: ProviderErrorCode::PermissionDenied,
+                retryable: false,
+            })
+        ));
     }
 
     #[test]
