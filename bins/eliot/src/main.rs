@@ -22,9 +22,10 @@ use eliot_live_canary::{
 use eliot_platform_windows::{
     FileIdentity, InstallerRootError, InstallerRootObjectSnapshot,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
-    ProtectedRootLease, ProtectedRuntimePathLease, TrustedSourceBundle, TrustedSourceFileLease,
-    WindowsInstallerRootPrimitive, is_eliot_governor_running, is_process_elevated,
-    observe_current_user_config, windows_path_identity_digest,
+    PackageStagingError, PackageStagingStage, ProtectedRootLease, ProtectedRuntimePathLease,
+    TrustedSourceBundle, TrustedSourceFileLease, WindowsInstallerRootPrimitive,
+    is_eliot_governor_running, is_process_elevated, observe_current_user_config,
+    windows_path_identity_digest,
 };
 use eliot_runtime_contracts::{
     RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
@@ -1709,16 +1710,19 @@ fn validate_installation_runtime_preflight(
         })
         .ok_or_else(|| anyhow::anyhow!("transaction has no exact StagePackage effect"))?;
     let source = TrustedSourceBundle::open(Path::new(stage.0.as_str()))
-        .map_err(|error| anyhow::anyhow!("retain source bundle: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("retain source bundle")?;
     if source.identity() != *stage.1 {
         anyhow::bail!("source bundle identity differs from durable StagePackage binding");
     }
     let lease = source
         .retain_file("generation.json")
-        .map_err(|error| anyhow::anyhow!("retain generation.json: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("retain generation.json")?;
     let bytes = lease
         .read_bounded(INSTALLATION_INPUT_LIMIT)
-        .map_err(|error| anyhow::anyhow!("read retained generation.json: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("read retained generation.json")?;
     let expected = stage
         .3
         .iter()
@@ -1755,7 +1759,8 @@ fn validate_installation_runtime_preflight(
     }
     lease
         .read_bounded(INSTALLATION_INPUT_LIMIT)
-        .map_err(|error| anyhow::anyhow!("re-read generation.json lease: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("re-read generation.json lease")?;
     let legacy_config = observe_legacy_governor_config()?;
     Ok(InstallationRuntimePreflightGuard {
         _source: source,
@@ -2016,14 +2021,12 @@ fn run_installation_effect(
     let preflight_guard = match validate_installation_runtime_preflight(&preflight_transaction) {
         Ok(guard) => guard,
         Err(error) => {
-            write_installation_error(
-                if recover {
-                    "INSTALLATION_RECOVER_PREFLIGHT_REJECTED"
-                } else {
-                    "INSTALLATION_APPLY_PREFLIGHT_REJECTED"
-                },
-                &error.to_string(),
-            );
+            let (code, detail, reference) = installation_preflight_error(recover, &error);
+            if let Some(reference) = reference {
+                write_installation_error_with_reference(&code, &detail, &reference);
+            } else {
+                write_installation_error(&code, &detail);
+            }
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
@@ -2801,6 +2804,65 @@ fn write_installation_error(code: &str, detail: &str) {
     );
 }
 
+fn write_installation_error_with_reference(code: &str, detail: &str, reference: &str) {
+    println!(
+        "{}",
+        json!({
+            "status": "ERROR",
+            "code": code,
+            "detail": detail,
+            "reference": reference,
+            "completed": false,
+            "scope": INSTALLATION_SCOPE,
+        })
+    );
+}
+
+fn installation_preflight_error(
+    recover: bool,
+    error: &anyhow::Error,
+) -> (String, String, Option<String>) {
+    if let Some(PackageStagingError::Win32 { stage, code }) =
+        error.downcast_ref::<PackageStagingError>()
+    {
+        let reference = format!(
+            "stage-package-win32-v1:{}:{code:08x}",
+            package_staging_stage_name(*stage)
+        );
+        return (
+            if recover {
+                "INSTALLATION_RECOVER_PREFLIGHT_REJECTED".to_owned()
+            } else {
+                "INSTALLATION_APPLY_PREFLIGHT_REJECTED".to_owned()
+            },
+            reference.clone(),
+            Some(reference),
+        );
+    }
+    (
+        if recover {
+            "INSTALLATION_RECOVER_PREFLIGHT_REJECTED".to_owned()
+        } else {
+            "INSTALLATION_APPLY_PREFLIGHT_REJECTED".to_owned()
+        },
+        error.to_string(),
+        None,
+    )
+}
+
+fn package_staging_stage_name(stage: PackageStagingStage) -> &'static str {
+    match stage {
+        PackageStagingStage::SetSecurityInfo => "set-security-info",
+        PackageStagingStage::GetSecurityInfo => "get-security-info",
+        PackageStagingStage::CreateFileW => "create-file-w",
+        PackageStagingStage::FlushFileBuffers => "flush-file-buffers",
+        PackageStagingStage::GetFileInformationByHandle => "get-file-information-by-handle",
+        PackageStagingStage::DuplicateHandle => "duplicate-handle",
+        PackageStagingStage::SetFilePointerEx => "set-file-pointer-ex",
+        PackageStagingStage::ReadFile => "read-file",
+    }
+}
+
 fn write_runtime_status_error(code: &str, detail: &str, deadline_exceeded: bool) {
     println!(
         "{}",
@@ -3068,6 +3130,40 @@ mod tests {
             Some("ACTIVE_VERIFIED")
         );
         assert_eq!(installation_command_exit_code("ACTIVE_VERIFIED"), 0);
+    }
+
+    #[test]
+    fn package_win32_preflight_emits_typed_stage_and_code() {
+        let error = anyhow::Error::new(PackageStagingError::Win32 {
+            stage: PackageStagingStage::GetFileInformationByHandle,
+            code: 5,
+        })
+        .context("retain source bundle");
+        assert_eq!(
+            installation_preflight_error(false, &error),
+            (
+                "INSTALLATION_APPLY_PREFLIGHT_REJECTED".to_owned(),
+                "stage-package-win32-v1:get-file-information-by-handle:00000005".to_owned(),
+                Some("stage-package-win32-v1:get-file-information-by-handle:00000005".to_owned()),
+            )
+        );
+        assert_eq!(
+            installation_preflight_error(true, &error),
+            (
+                "INSTALLATION_RECOVER_PREFLIGHT_REJECTED".to_owned(),
+                "stage-package-win32-v1:get-file-information-by-handle:00000005".to_owned(),
+                Some("stage-package-win32-v1:get-file-information-by-handle:00000005".to_owned()),
+            )
+        );
+    }
+
+    #[test]
+    fn non_package_preflight_errors_remain_generic_rejections() {
+        let error = anyhow::anyhow!("secret path or credential reference");
+        let (code, detail, reference) = installation_preflight_error(false, &error);
+        assert_eq!(code, "INSTALLATION_APPLY_PREFLIGHT_REJECTED");
+        assert_eq!(detail, "secret path or credential reference");
+        assert_eq!(reference, None);
     }
 
     #[test]

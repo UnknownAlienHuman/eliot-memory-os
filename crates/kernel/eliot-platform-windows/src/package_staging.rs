@@ -60,6 +60,10 @@ pub enum PackageStagingStage {
     GetSecurityInfo,
     CreateFileW,
     FlushFileBuffers,
+    GetFileInformationByHandle,
+    DuplicateHandle,
+    SetFilePointerEx,
+    ReadFile,
 }
 
 /// Durable, HMAC-bound capability for one `StagePackage` mutation/recovery.
@@ -1428,12 +1432,15 @@ impl TrustedSourceFileLease {
             if identity != self.identity {
                 return Err(PackageStagingError::IdentityMismatch);
             }
-            let mut file = self.file.try_clone().map_err(|_| PackageStagingError::Io)?;
-            file.seek(SeekFrom::Start(0))
-                .map_err(|_| PackageStagingError::Io)?;
+            let mut file = self.file.try_clone().map_err(|error| {
+                map_package_io_error(error, PackageStagingStage::DuplicateHandle)
+            })?;
+            file.seek(SeekFrom::Start(0)).map_err(|error| {
+                map_package_io_error(error, PackageStagingStage::SetFilePointerEx)
+            })?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)
-                .map_err(|_| PackageStagingError::Io)?;
+                .map_err(|error| map_package_io_error(error, PackageStagingStage::ReadFile))?;
             Ok(bytes)
         }
         #[cfg(not(windows))]
@@ -1543,8 +1550,9 @@ impl TrustedSourceBundle {
         #[cfg(windows)]
         {
             let root = self.contour.last().ok_or(PackageStagingError::Io)?;
-            let identity =
-                super::file_identity_from_handle(root).map_err(|_| PackageStagingError::Io)?;
+            let identity = super::file_identity_from_handle(root).map_err(|error| {
+                map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+            })?;
             if identity != self.identity {
                 return Err(PackageStagingError::IdentityMismatch);
             }
@@ -1672,7 +1680,9 @@ fn retain_source_directory(path: &Path) -> Result<TrustedSourceBundle, PackageSt
     let canonical = super::canonical_windows_path(path).map_err(map_protected_path_error)?;
     let contour = retain_directory_contour(&canonical)?;
     let root = contour.last().ok_or(PackageStagingError::RootUnavailable)?;
-    let identity = super::file_identity_from_handle(root).map_err(|_| PackageStagingError::Io)?;
+    let identity = super::file_identity_from_handle(root).map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })?;
     let observed = super::final_windows_path_from_handle(root).map_err(map_protected_path_error)?;
     if !super::windows_paths_equal(&observed, &canonical) {
         return Err(PackageStagingError::IdentityMismatch);
@@ -1713,8 +1723,12 @@ pub(crate) fn retain_source_directory_with_retained_root(
     for ancestor in ancestors {
         contour.push(open_existing_directory(&ancestor)?);
     }
-    let root = root.try_clone().map_err(|_| PackageStagingError::Io)?;
-    let identity = super::file_identity_from_handle(&root).map_err(|_| PackageStagingError::Io)?;
+    let root = root
+        .try_clone()
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::DuplicateHandle))?;
+    let identity = super::file_identity_from_handle(&root).map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })?;
     let observed =
         super::final_windows_path_from_handle(&root).map_err(map_protected_path_error)?;
     if !super::windows_paths_equal(&observed, &canonical) {
@@ -1746,6 +1760,14 @@ fn map_protected_path_error(error: ProtectedPathError) -> PackageStagingError {
 }
 
 fn map_package_open_error(error: std::io::Error) -> PackageStagingError {
+    map_package_io_error(error, PackageStagingStage::CreateFileW)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "std::io::Error is consumed by each map_err boundary"
+)]
+fn map_package_io_error(error: std::io::Error, stage: PackageStagingStage) -> PackageStagingError {
     if error.kind() == std::io::ErrorKind::NotFound {
         return PackageStagingError::RootUnavailable;
     }
@@ -1753,7 +1775,7 @@ fn map_package_open_error(error: std::io::Error) -> PackageStagingError {
         .raw_os_error()
         .and_then(|code| u32::try_from(code).ok())
         .map_or(PackageStagingError::Io, |code| PackageStagingError::Win32 {
-            stage: PackageStagingStage::CreateFileW,
+            stage,
             code,
         })
 }
@@ -3258,7 +3280,9 @@ where
     ) -> Result<(), PackageStagingError>,
 {
     let root_handle = match retained_root {
-        Some(root) => root.try_clone().map_err(|_| PackageStagingError::Io)?,
+        Some(root) => root
+            .try_clone()
+            .map_err(|error| map_package_io_error(error, PackageStagingStage::DuplicateHandle))?,
         None => open_existing_directory(root)?,
     };
     let root_final = final_path_from_handle(&root_handle)?;
@@ -3449,7 +3473,9 @@ fn open_existing_directory_with_access(
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(map_package_open_error)?;
-    let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
+    let metadata = file.metadata().map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PackageStagingError::ReparsePoint);
     }
@@ -3473,7 +3499,9 @@ fn open_existing_directory_for_delete(path: &Path) -> Result<std::fs::File, Pack
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(map_package_open_error)?;
-    let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
+    let metadata = file.metadata().map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PackageStagingError::ReparsePoint);
     }
@@ -3509,7 +3537,9 @@ fn open_existing_file(path: &Path) -> Result<std::fs::File, PackageStagingError>
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(map_package_open_error)?;
-    let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
+    let metadata = file.metadata().map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PackageStagingError::ReparsePoint);
     }
@@ -3534,7 +3564,9 @@ fn open_trusted_source_file(path: &Path) -> Result<std::fs::File, PackageStaging
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(map_package_open_error)?;
-    let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
+    let metadata = file.metadata().map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PackageStagingError::ReparsePoint);
     }
@@ -3564,7 +3596,9 @@ fn open_existing_file_for_delete(path: &Path) -> Result<std::fs::File, PackageSt
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(map_package_open_error)?;
-    let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
+    let metadata = file.metadata().map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PackageStagingError::ReparsePoint);
     }
@@ -3584,7 +3618,9 @@ fn open_existing_file_for_delete(_path: &Path) -> Result<std::fs::File, PackageS
 fn file_identity_from_open_handle(
     file: &std::fs::File,
 ) -> Result<FileIdentity, PackageStagingError> {
-    super::file_identity_from_handle(file).map_err(|_| PackageStagingError::Io)
+    super::file_identity_from_handle(file).map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })
 }
 
 #[cfg(windows)]
@@ -3600,7 +3636,10 @@ fn ensure_single_link(file: &std::fs::File) -> Result<(), PackageStagingError> {
         GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut information)
     };
     if ok == 0 {
-        return Err(PackageStagingError::Io);
+        return Err(PackageStagingError::Win32 {
+            stage: PackageStagingStage::GetFileInformationByHandle,
+            code: unsafe { windows_sys::Win32::Foundation::GetLastError() },
+        });
     }
     if information.nNumberOfLinks != 1 {
         return Err(PackageStagingError::IdentityMismatch);
@@ -3944,7 +3983,9 @@ fn snapshot_source_file(
     }
     let identity = file_identity_from_open_handle(&file)?;
     ensure_single_link(&file)?;
-    let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
+    let metadata = file.metadata().map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })?;
     if metadata.len() != expected_size {
         return Err(PackageStagingError::SizeMismatch);
     }
@@ -3953,7 +3994,7 @@ fn snapshot_source_file(
     }
     let size = metadata.len();
     file.seek(SeekFrom::Start(0))
-        .map_err(|_| PackageStagingError::Io)?;
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::SetFilePointerEx))?;
     let mut digest = Sha256::new();
     let mut header = Vec::new();
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
@@ -3961,7 +4002,7 @@ fn snapshot_source_file(
     loop {
         let read = file
             .read(&mut buffer)
-            .map_err(|_| PackageStagingError::Io)?;
+            .map_err(|error| map_package_io_error(error, PackageStagingStage::ReadFile))?;
         if read == 0 {
             break;
         }
@@ -3983,7 +4024,12 @@ fn snapshot_source_file(
     ensure_single_link(&file)?;
     let after_identity = file_identity_from_open_handle(&file)?;
     let after_path = final_path_from_handle(&file)?;
-    let after_size = file.metadata().map_err(|_| PackageStagingError::Io)?.len();
+    let after_size = file
+        .metadata()
+        .map_err(|error| {
+            map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+        })?
+        .len();
     if after_identity != identity
         || !super::windows_paths_equal(&after_path, path)
         || after_size != size
@@ -4020,14 +4066,21 @@ fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
     if !super::windows_paths_equal(&before_path, expected_path) {
         return Err(PackageStagingError::IdentityMismatch);
     }
-    let before_size = file.metadata().map_err(|_| PackageStagingError::Io)?.len();
+    let before_size = file
+        .metadata()
+        .map_err(|error| {
+            map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+        })?
+        .len();
     if before_size > max_observation_size || before_size > MAX_PACKAGE_FILE_BYTES {
         return Err(PackageStagingError::BoundExceeded);
     }
-    let mut reader = file.try_clone().map_err(|_| PackageStagingError::Io)?;
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::DuplicateHandle))?;
     reader
         .seek(SeekFrom::Start(0))
-        .map_err(|_| PackageStagingError::Io)?;
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::SetFilePointerEx))?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     let mut header = Vec::new();
@@ -4035,7 +4088,7 @@ fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
     loop {
         let read = reader
             .read(&mut buffer)
-            .map_err(|_| PackageStagingError::Io)?;
+            .map_err(|error| map_package_io_error(error, PackageStagingStage::ReadFile))?;
         if read == 0 {
             break;
         }
@@ -4058,7 +4111,12 @@ fn observe_source_handle_with_post_read_hook<H: FnOnce()>(
     ensure_single_link(file)?;
     let after_identity = file_identity_from_open_handle(file)?;
     let after_path = final_path_from_handle(file)?;
-    let after_size = file.metadata().map_err(|_| PackageStagingError::Io)?.len();
+    let after_size = file
+        .metadata()
+        .map_err(|error| {
+            map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+        })?
+        .len();
     if after_identity != identity {
         return Err(PackageStagingError::IdentityMismatch);
     }
@@ -4193,24 +4251,28 @@ fn read_destination_snapshot_handle(
     if !super::windows_paths_equal(&canonical, expected_path) {
         return Err(PackageStagingError::IdentityMismatch);
     }
-    let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
+    let metadata = file.metadata().map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })?;
     if metadata.len() != expected_size {
         return Err(PackageStagingError::SizeMismatch);
     }
     if metadata.len() > MAX_PACKAGE_FILE_BYTES {
         return Err(PackageStagingError::BoundExceeded);
     }
-    let mut reader = file.try_clone().map_err(|_| PackageStagingError::Io)?;
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::DuplicateHandle))?;
     reader
         .seek(SeekFrom::Start(0))
-        .map_err(|_| PackageStagingError::Io)?;
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::SetFilePointerEx))?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     let mut size = 0_u64;
     loop {
         let read = reader
             .read(&mut buffer)
-            .map_err(|_| PackageStagingError::Io)?;
+            .map_err(|error| map_package_io_error(error, PackageStagingStage::ReadFile))?;
         if read == 0 {
             break;
         }
@@ -4248,11 +4310,13 @@ fn read_file_prefix_handle(
     file: &std::fs::File,
     limit: usize,
 ) -> Result<Vec<u8>, PackageStagingError> {
-    let file = file.try_clone().map_err(|_| PackageStagingError::Io)?;
+    let file = file
+        .try_clone()
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::DuplicateHandle))?;
     let mut bytes = Vec::new();
     file.take(u64::try_from(limit).map_err(|_| PackageStagingError::BoundExceeded)?)
         .read_to_end(&mut bytes)
-        .map_err(|_| PackageStagingError::Io)?;
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::ReadFile))?;
     Ok(bytes)
 }
 
@@ -5109,7 +5173,9 @@ mod tests {
         );
         assert!(matches!(
             trusted_open,
-            Err(PackageStagingError::Io | PackageStagingError::RootUnavailable)
+            Err(PackageStagingError::Io
+                | PackageStagingError::RootUnavailable
+                | PackageStagingError::Win32 { .. })
         ));
         let source = TrustedSourceBundle::open(&root).expect("source");
         let observed = source.observe();
@@ -5412,6 +5478,37 @@ mod tests {
             map_package_open_error(std::io::Error::from(std::io::ErrorKind::NotFound)),
             PackageStagingError::RootUnavailable
         );
+    }
+
+    #[test]
+    fn package_handle_io_errors_preserve_operation_and_not_found_classification() {
+        for (stage, expected) in [
+            (
+                PackageStagingStage::GetFileInformationByHandle,
+                PackageStagingStage::GetFileInformationByHandle,
+            ),
+            (
+                PackageStagingStage::DuplicateHandle,
+                PackageStagingStage::DuplicateHandle,
+            ),
+            (
+                PackageStagingStage::SetFilePointerEx,
+                PackageStagingStage::SetFilePointerEx,
+            ),
+            (PackageStagingStage::ReadFile, PackageStagingStage::ReadFile),
+        ] {
+            assert_eq!(
+                map_package_io_error(std::io::Error::from_raw_os_error(5), stage),
+                PackageStagingError::Win32 {
+                    stage: expected,
+                    code: 5
+                }
+            );
+            assert_eq!(
+                map_package_io_error(std::io::Error::from(std::io::ErrorKind::NotFound), stage),
+                PackageStagingError::RootUnavailable
+            );
+        }
     }
 
     #[cfg(windows)]

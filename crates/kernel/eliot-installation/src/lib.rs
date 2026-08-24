@@ -16410,6 +16410,10 @@ fn package_staging_reference(stage: PackageStagingStage, code: u32) -> PlatformH
         PackageStagingStage::GetSecurityInfo => "get-security-info",
         PackageStagingStage::CreateFileW => "create-file-w",
         PackageStagingStage::FlushFileBuffers => "flush-file-buffers",
+        PackageStagingStage::GetFileInformationByHandle => "get-file-information-by-handle",
+        PackageStagingStage::DuplicateHandle => "duplicate-handle",
+        PackageStagingStage::SetFilePointerEx => "set-file-pointer-ex",
+        PackageStagingStage::ReadFile => "read-file",
     };
     PlatformHandle::new(format!("stage-package-win32-v1:{stage}:{code:08x}"))
         .unwrap_or_else(|_| unreachable!())
@@ -19483,7 +19487,9 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
             |value| value.as_str().to_owned(),
         ),
         PortOutcome::Error(PortError::ProviderReference { reference, .. }) => {
-            if is_typed_installer_root_reference(reference.as_str()) {
+            if is_typed_installer_root_reference(reference.as_str())
+                || is_typed_package_staging_reference(reference.as_str())
+            {
                 return reference;
             }
             REDACTED_PROVIDER_REFERENCE_PENDING.to_owned()
@@ -19491,6 +19497,37 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
         PortOutcome::Error(error) => format!("error:{error}"),
     };
     PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+}
+
+fn is_typed_package_staging_reference(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("stage-package-win32-v1:") else {
+        return false;
+    };
+    let mut parts = rest.split(':');
+    let Some(stage) = parts.next() else {
+        return false;
+    };
+    if !matches!(
+        stage,
+        "set-security-info"
+            | "get-security-info"
+            | "create-file-w"
+            | "flush-file-buffers"
+            | "get-file-information-by-handle"
+            | "duplicate-handle"
+            | "set-file-pointer-ex"
+            | "read-file"
+    ) {
+        return false;
+    }
+    let Some(code) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && code.len() == 8
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn is_typed_installer_root_reference(value: &str) -> bool {
@@ -20193,6 +20230,10 @@ mod tests {
             PortError::ProviderReference { reference, .. }
                 if reference.as_str() == "stage-package-win32-v1:set-security-info:00000005"
         ));
+        assert_eq!(
+            port_pending(PortOutcome::<()>::Error(package_port_error(&error))).as_str(),
+            "stage-package-win32-v1:set-security-info:00000005"
+        );
         let json = serde_json::to_string(&error).unwrap_or_else(|_| unreachable!());
         assert!(json.contains("SET_SECURITY_INFO"));
         assert!(json.contains("\"code\":5"));
@@ -20282,6 +20323,8 @@ mod tests {
             "installer-root-win32-v2:open-thread-token:00000000",
             "installer-root-win32-v2:readback:ffffffff",
             "installer-root-win32-v2:open-readback:00000002",
+            "stage-package-win32-v1:get-security-info:00000005",
+            "stage-package-win32-v1:read-file:00000005",
         ];
         for reference in valid {
             let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {
@@ -20301,6 +20344,12 @@ mod tests {
             "installer-root-win32-v2:create-directory:0000ABCD",
             "installer-root-win32-v2:create-directory:abcd",
             "installer-root-win32-v2:create-directory:0000abcd:extra",
+            "stage-package-win32-v1:not-a-stage:0000abcd",
+            "stage-package-win32-v1:get-security-info:0000000A",
+            "stage-package-win32-v1:get-security-info:0000005",
+            "stage-package-win32-v1:get-security-info:00000005:extra",
+            "stage-package-win32-v1:get-security-info:00000005 ",
+            r"C:\package\secret",
         ] {
             let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {
                 error: ProviderError {
