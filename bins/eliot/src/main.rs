@@ -2860,7 +2860,7 @@ fn package_staging_stage_name(stage: PackageStagingStage) -> &'static str {
         PackageStagingStage::DuplicateHandle => "duplicate-handle",
         PackageStagingStage::SetFilePointerEx => "set-file-pointer-ex",
         PackageStagingStage::ReadFile => "read-file",
-        PackageStagingStage::WriteFile => "WRITE_FILE",
+        PackageStagingStage::WriteFile => "write-file",
     }
 }
 
@@ -3144,16 +3144,16 @@ mod tests {
             installation_preflight_error(false, &error),
             (
                 "INSTALLATION_APPLY_PREFLIGHT_REJECTED".to_owned(),
-                "stage-package-win32-v1:WRITE_FILE:00000005".to_owned(),
-                Some("stage-package-win32-v1:WRITE_FILE:00000005".to_owned()),
+                "stage-package-win32-v1:write-file:00000005".to_owned(),
+                Some("stage-package-win32-v1:write-file:00000005".to_owned()),
             )
         );
         assert_eq!(
             installation_preflight_error(true, &error),
             (
                 "INSTALLATION_RECOVER_PREFLIGHT_REJECTED".to_owned(),
-                "stage-package-win32-v1:WRITE_FILE:00000005".to_owned(),
-                Some("stage-package-win32-v1:WRITE_FILE:00000005".to_owned()),
+                "stage-package-win32-v1:write-file:00000005".to_owned(),
+                Some("stage-package-win32-v1:write-file:00000005".to_owned()),
             )
         );
     }
