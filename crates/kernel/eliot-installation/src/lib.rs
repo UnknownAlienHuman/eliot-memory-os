@@ -8666,6 +8666,7 @@ fn validate_package_binding(
             manifest,
             staging_root,
             candidate_manifest_digest: bound_manifest_digest,
+            package_manifest_digest: bound_package_manifest_digest,
             ..
         } = effect
         else {
@@ -8681,8 +8682,16 @@ fn validate_package_binding(
         if !same_windows_root(staging_root.as_str(), transaction_staging_root.as_str())? {
             return Err(InstallationError::IdentityConflict);
         }
-        PackageManifest::new(&manifest.generation, manifest.files.clone())
-            .map_err(|error| package_plan_error(&error))?;
+        let validated_package_manifest =
+            PackageManifest::new(&manifest.generation, manifest.files.clone())
+                .map_err(|error| package_plan_error(&error))?;
+        sha256_handle(
+            bound_package_manifest_digest,
+            "installer_effect.package_manifest_digest",
+        )?;
+        if bound_package_manifest_digest.as_str() != validated_package_manifest.canonical_digest() {
+            return Err(InstallationError::IdentityConflict);
+        }
     }
     if package_count > 1 {
         return Err(InstallationError::Duplicate {
@@ -9583,6 +9592,7 @@ impl InstallerEffectPlan {
                 staging_root,
                 expected_file_digests,
                 candidate_manifest_digest,
+                package_manifest_digest,
                 ..
             } => {
                 approved_path(source_bundle, "installer_effect.source_bundle")?;
@@ -9605,6 +9615,13 @@ impl InstallerEffectPlan {
                     candidate_manifest_digest,
                     "installer_effect.candidate_manifest_digest",
                 )?;
+                sha256_handle(
+                    package_manifest_digest,
+                    "installer_effect.package_manifest_digest",
+                )?;
+                if package_manifest_digest.as_str() != manifest.canonical_digest() {
+                    return Err(InstallationError::IdentityConflict);
+                }
                 let mut paths = BTreeSet::new();
                 for digest in expected_file_digests {
                     validate_package_relative_text(
@@ -16653,6 +16670,15 @@ fn package_absent_with_snapshot(
     })
 }
 
+fn package_manifest_matches(
+    manifest: &PackageManifest,
+    generation: &PlatformHandle,
+    package_manifest_digest: &PlatformHandle,
+) -> bool {
+    manifest.generation == generation.as_str()
+        && manifest.canonical_digest() == package_manifest_digest.as_str()
+}
+
 fn inspect_package(
     request: &InstallationEffectRequest,
 ) -> Result<InstallationEffectObservation, PackageStagingError> {
@@ -16660,15 +16686,13 @@ fn inspect_package(
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
         generation,
-        candidate_manifest_digest,
+        package_manifest_digest,
         ..
     } = &request.plan
     else {
         return Err(PackageStagingError::Io);
     };
-    if manifest.generation != generation.as_str()
-        || manifest.canonical_digest() != candidate_manifest_digest.as_str()
-    {
+    if !package_manifest_matches(&manifest, generation, package_manifest_digest) {
         return Err(PackageStagingError::IdentityMismatch);
     }
     let observed = stager.source().observe()?;
@@ -16720,7 +16744,7 @@ fn reconcile_package(
     let InstallerEffectPlan::StagePackage {
         expected_file_digests,
         generation,
-        candidate_manifest_digest,
+        package_manifest_digest,
         manifest,
         staging_root,
         ..
@@ -16733,10 +16757,9 @@ fn reconcile_package(
         .package_snapshot
         .as_ref()
         .ok_or(PackageStagingError::Io)?;
-    if manifest.generation != generation.as_str()
-        || manifest.canonical_digest() != candidate_manifest_digest.as_str()
+    if !package_manifest_matches(manifest, generation, package_manifest_digest)
         || persisted.generation != *generation
-        || persisted.manifest_digest.as_str() != manifest.canonical_digest()
+        || persisted.manifest_digest != *package_manifest_digest
     {
         return Err(PackageStagingError::IdentityMismatch);
     }
@@ -16830,7 +16853,7 @@ fn execute_package(
     let InstallerEffectPlan::StagePackage {
         expected_file_digests: _,
         generation,
-        candidate_manifest_digest,
+        package_manifest_digest,
         manifest,
         staging_root,
         ..
@@ -16878,10 +16901,9 @@ fn execute_package(
         }
         InstallationEffectAction::Apply => {
             if ownership_key.is_empty()
-                || manifest.generation != generation.as_str()
-                || manifest.canonical_digest() != candidate_manifest_digest.as_str()
+                || !package_manifest_matches(manifest, generation, package_manifest_digest)
                 || snapshot.generation != *generation
-                || snapshot.manifest_digest.as_str() != manifest.canonical_digest()
+                || snapshot.manifest_digest != *package_manifest_digest
             {
                 return PortOutcome::Unknown(UnknownReason::Indeterminate);
             }
@@ -31242,6 +31264,113 @@ mod tests {
             ..request
         };
         must(valid_request.validate());
+    }
+
+    #[test]
+    fn package_binding_validates_candidate_and_package_digests_independently() {
+        let transaction = registering_transaction();
+        let package_manifest = must(PackageManifest::new("candidate", Vec::new()));
+        let package_effect = InstallerEffectPlan::StagePackage {
+            effect_id: test_handle("effect:package-binding"),
+            source_bundle: transaction.staging_root.clone(),
+            source_bundle_identity: FileIdentity {
+                volume_serial_number: 1,
+                file_index: 1,
+            },
+            generation: transaction.candidate_manifest.generation.clone(),
+            manifest: package_manifest.clone(),
+            staging_root: transaction.staging_root.clone(),
+            expected_file_digests: Vec::new(),
+            candidate_manifest_digest: must(candidate_manifest_digest(
+                &transaction.candidate_manifest,
+            )),
+            package_manifest_digest: must(PlatformHandle::new(package_manifest.canonical_digest())),
+        };
+        let effects = vec![package_effect.clone()];
+        must(validate_package_binding(
+            &transaction.candidate_manifest,
+            &transaction.staging_root,
+            &effects,
+        ));
+
+        let mut candidate_mutation = effects.clone();
+        if let InstallerEffectPlan::StagePackage {
+            candidate_manifest_digest,
+            ..
+        } = &mut candidate_mutation[0]
+        {
+            *candidate_manifest_digest = test_handle("a".repeat(64));
+        }
+        assert!(
+            validate_package_binding(
+                &transaction.candidate_manifest,
+                &transaction.staging_root,
+                &candidate_mutation,
+            )
+            .is_err()
+        );
+
+        let mut package_mutation = effects;
+        if let InstallerEffectPlan::StagePackage {
+            package_manifest_digest,
+            ..
+        } = &mut package_mutation[0]
+        {
+            *package_manifest_digest = test_handle("b".repeat(64));
+        }
+        assert!(
+            validate_package_binding(
+                &transaction.candidate_manifest,
+                &transaction.staging_root,
+                &package_mutation,
+            )
+            .is_err()
+        );
+        must(package_effect.validate());
+        if let InstallerEffectPlan::StagePackage {
+            package_manifest_digest,
+            ..
+        } = &mut package_mutation[0]
+        {
+            *package_manifest_digest = test_handle("c".repeat(64));
+        }
+        assert!(package_mutation[0].validate().is_err());
+    }
+
+    #[test]
+    fn package_manifest_matches_rejects_candidate_and_mutated_bindings() {
+        let transaction = registering_transaction();
+        let manifest = must(PackageManifest::new("package-generation", Vec::new()));
+        let generation = test_handle("package-generation");
+        let package_manifest_digest = must(PlatformHandle::new(manifest.canonical_digest()));
+        let candidate_manifest_digest =
+            must(candidate_manifest_digest(&transaction.candidate_manifest));
+        assert_ne!(
+            candidate_manifest_digest, package_manifest_digest,
+            "the regression fixture must keep the two bindings unequal"
+        );
+        assert!(package_manifest_matches(
+            &manifest,
+            &generation,
+            &package_manifest_digest
+        ));
+        assert!(!package_manifest_matches(
+            &manifest,
+            &generation,
+            &candidate_manifest_digest
+        ));
+        let mutated_generation = test_handle("mutated-generation");
+        assert!(!package_manifest_matches(
+            &manifest,
+            &mutated_generation,
+            &package_manifest_digest
+        ));
+        let mutated_package_manifest_digest = test_handle("e".repeat(64));
+        assert!(!package_manifest_matches(
+            &manifest,
+            &generation,
+            &mutated_package_manifest_digest
+        ));
     }
 
     #[test]

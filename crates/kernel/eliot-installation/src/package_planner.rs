@@ -2506,6 +2506,52 @@ mod tests {
     }
 
     #[test]
+    fn wrong_package_digest_rejected() {
+        let (_tmp, portable, roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(source_dir.path().join("a.txt"), b"hello").unwrap();
+        let manifest = PackageManifest::new(
+            "candidate",
+            vec![eliot_platform_windows::PackageFileSpec::new("a.txt", false, 5).unwrap()],
+        )
+        .unwrap();
+        let candidate = make_candidate(portable.clone(), roots.clone());
+        let (changes, effects) = installer_parts(&roots);
+        let tx = SealedPackagePlanner::plan(
+            h("transaction:1"),
+            make_epoch(),
+            crate::InstallationProfile::PortableDev,
+            make_request(),
+            candidate,
+            test_handle(portable.as_str().to_owned()),
+            test_handle(source_dir.path().to_string_lossy().into_owned()),
+            manifest,
+            changes,
+            effects,
+            1,
+            vec![h("evidence:plan")],
+            h("recovery:cmd"),
+        )
+        .unwrap();
+        assert!(SealedPackagePlanner::reopen_and_validate(&tx).is_ok());
+
+        let mut forged = tx.clone();
+        let pkg_idx = forged
+            .installer_effects
+            .iter()
+            .position(|e| matches!(e, InstallerEffectPlan::StagePackage { .. }))
+            .unwrap();
+        if let InstallerEffectPlan::StagePackage {
+            package_manifest_digest,
+            ..
+        } = &mut forged.installer_effects[pkg_idx]
+        {
+            *package_manifest_digest = h("f".repeat(64));
+        }
+        assert!(SealedPackagePlanner::reopen_and_validate(&forged).is_err());
+    }
+
+    #[test]
     fn duplicate_reordered_files_rejected() {
         let (_tmp, portable, roots) = temp_portable_root();
         let source_dir = tempfile::TempDir::new().unwrap();
