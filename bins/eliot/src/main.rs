@@ -2860,6 +2860,7 @@ fn package_staging_stage_name(stage: PackageStagingStage) -> &'static str {
         PackageStagingStage::DuplicateHandle => "duplicate-handle",
         PackageStagingStage::SetFilePointerEx => "set-file-pointer-ex",
         PackageStagingStage::ReadFile => "read-file",
+        PackageStagingStage::WriteFile => "WRITE_FILE",
     }
 }
 
@@ -3135,24 +3136,24 @@ mod tests {
     #[test]
     fn package_win32_preflight_emits_typed_stage_and_code() {
         let error = anyhow::Error::new(PackageStagingError::Win32 {
-            stage: PackageStagingStage::GetFileInformationByHandle,
+            stage: PackageStagingStage::WriteFile,
             code: 5,
         })
-        .context("retain source bundle");
+        .context(r"retain source bundle C:\secret\package");
         assert_eq!(
             installation_preflight_error(false, &error),
             (
                 "INSTALLATION_APPLY_PREFLIGHT_REJECTED".to_owned(),
-                "stage-package-win32-v1:get-file-information-by-handle:00000005".to_owned(),
-                Some("stage-package-win32-v1:get-file-information-by-handle:00000005".to_owned()),
+                "stage-package-win32-v1:WRITE_FILE:00000005".to_owned(),
+                Some("stage-package-win32-v1:WRITE_FILE:00000005".to_owned()),
             )
         );
         assert_eq!(
             installation_preflight_error(true, &error),
             (
                 "INSTALLATION_RECOVER_PREFLIGHT_REJECTED".to_owned(),
-                "stage-package-win32-v1:get-file-information-by-handle:00000005".to_owned(),
-                Some("stage-package-win32-v1:get-file-information-by-handle:00000005".to_owned()),
+                "stage-package-win32-v1:WRITE_FILE:00000005".to_owned(),
+                Some("stage-package-win32-v1:WRITE_FILE:00000005".to_owned()),
             )
         );
     }
