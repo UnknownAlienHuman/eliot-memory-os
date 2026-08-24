@@ -1745,6 +1745,19 @@ fn map_protected_path_error(error: ProtectedPathError) -> PackageStagingError {
     }
 }
 
+fn map_package_open_error(error: std::io::Error) -> PackageStagingError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return PackageStagingError::RootUnavailable;
+    }
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .map_or(PackageStagingError::Io, |code| PackageStagingError::Win32 {
+            stage: PackageStagingStage::CreateFileW,
+            code,
+        })
+}
+
 fn map_restore_privilege_error(error: super::InstallerRootError) -> PackageStagingError {
     match error {
         super::InstallerRootError::UnsupportedPlatform => PackageStagingError::UnsupportedPlatform,
@@ -3142,9 +3155,9 @@ where
             return Err(PackageStagingError::BoundExceeded);
         }
         let mut pending = Vec::new();
-        let read_dir = std::fs::read_dir(&directory).map_err(|_| PackageStagingError::Io)?;
+        let read_dir = std::fs::read_dir(&directory).map_err(map_package_open_error)?;
         for entry in read_dir {
-            let entry = entry.map_err(|_| PackageStagingError::Io)?;
+            let entry = entry.map_err(map_package_open_error)?;
             let name = entry
                 .file_name()
                 .to_str()
@@ -3172,7 +3185,7 @@ where
             if entries.len() >= MAX_ENUMERATED_ENTRIES {
                 return Err(PackageStagingError::BoundExceeded);
             }
-            let metadata = std::fs::symlink_metadata(&path).map_err(|_| PackageStagingError::Io)?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(map_package_open_error)?;
             if is_reparse_metadata(&metadata) {
                 return Err(PackageStagingError::ReparsePoint);
             }
@@ -3264,9 +3277,9 @@ where
             return Err(PackageStagingError::BoundExceeded);
         }
         let mut pending = Vec::new();
-        let read_dir = std::fs::read_dir(&directory).map_err(|_| PackageStagingError::Io)?;
+        let read_dir = std::fs::read_dir(&directory).map_err(map_package_open_error)?;
         for entry in read_dir {
-            let entry = entry.map_err(|_| PackageStagingError::Io)?;
+            let entry = entry.map_err(map_package_open_error)?;
             let name = entry
                 .file_name()
                 .to_str()
@@ -3294,7 +3307,7 @@ where
             if entries.len() >= MAX_ENUMERATED_ENTRIES {
                 return Err(PackageStagingError::BoundExceeded);
             }
-            let metadata = std::fs::symlink_metadata(&path).map_err(|_| PackageStagingError::Io)?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(map_package_open_error)?;
             if is_reparse_metadata(&metadata) {
                 return Err(PackageStagingError::ReparsePoint);
             }
@@ -3367,7 +3380,7 @@ fn reject_reparse_ancestors(path: &Path) -> Result<(), PackageStagingError> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(PackageStagingError::RootUnavailable);
             }
-            Err(_) => return Err(PackageStagingError::Io),
+            Err(error) => return Err(map_package_open_error(error)),
         }
     }
     Ok(())
@@ -3435,13 +3448,7 @@ fn open_existing_directory_with_access(
         .access_mode(access)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            PackageStagingError::RootUnavailable
-        } else {
-            PackageStagingError::Io
-        }
-    })?;
+    let file = options.open(path).map_err(map_package_open_error)?;
     let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PackageStagingError::ReparsePoint);
@@ -3465,13 +3472,7 @@ fn open_existing_directory_for_delete(path: &Path) -> Result<std::fs::File, Pack
         .access_mode(FILE_GENERIC_READ | DELETE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            PackageStagingError::RootUnavailable
-        } else {
-            PackageStagingError::Io
-        }
-    })?;
+    let file = options.open(path).map_err(map_package_open_error)?;
     let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PackageStagingError::ReparsePoint);
@@ -3507,13 +3508,7 @@ fn open_existing_file(path: &Path) -> Result<std::fs::File, PackageStagingError>
         // cannot open this object while the handle is live.
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            PackageStagingError::RootUnavailable
-        } else {
-            PackageStagingError::Io
-        }
-    })?;
+    let file = options.open(path).map_err(map_package_open_error)?;
     let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PackageStagingError::ReparsePoint);
@@ -3538,13 +3533,7 @@ fn open_trusted_source_file(path: &Path) -> Result<std::fs::File, PackageStaging
         .access_mode(FILE_GENERIC_READ)
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            PackageStagingError::RootUnavailable
-        } else {
-            PackageStagingError::Io
-        }
-    })?;
+    let file = options.open(path).map_err(map_package_open_error)?;
     let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PackageStagingError::ReparsePoint);
@@ -3574,7 +3563,7 @@ fn open_existing_file_for_delete(path: &Path) -> Result<std::fs::File, PackageSt
         .access_mode(FILE_GENERIC_READ | DELETE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path).map_err(|_| PackageStagingError::Io)?;
+    let file = options.open(path).map_err(map_package_open_error)?;
     let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PackageStagingError::ReparsePoint);
@@ -3647,7 +3636,7 @@ fn path_exists(path: &Path) -> Result<bool, PackageStagingError> {
         Ok(metadata) if is_reparse_metadata(&metadata) => Err(PackageStagingError::ReparsePoint),
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(PackageStagingError::Io),
+        Err(error) => Err(map_package_open_error(error)),
     }
 }
 
@@ -3658,7 +3647,7 @@ fn path_exists(_path: &Path) -> Result<bool, PackageStagingError> {
 
 #[cfg(windows)]
 fn is_directory_path(path: &Path) -> Result<bool, PackageStagingError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| PackageStagingError::Io)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(map_package_open_error)?;
     if is_reparse_metadata(&metadata) {
         return Err(PackageStagingError::ReparsePoint);
     }
@@ -5408,6 +5397,21 @@ mod tests {
             PackageStagingObservation::Mismatch(PackageStagingError::PartialTree),
             PackageStagingObservation::Matching(_)
         ));
+    }
+
+    #[test]
+    fn package_open_errors_preserve_raw_win32_status_and_not_found_classification() {
+        assert_eq!(
+            map_package_open_error(std::io::Error::from_raw_os_error(5)),
+            PackageStagingError::Win32 {
+                stage: PackageStagingStage::CreateFileW,
+                code: 5,
+            }
+        );
+        assert_eq!(
+            map_package_open_error(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            PackageStagingError::RootUnavailable
+        );
     }
 
     #[cfg(windows)]
