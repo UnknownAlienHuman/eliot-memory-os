@@ -23,6 +23,8 @@ use eliot_platform::{
     InstallationObservation, InstallationPort, InstallationRequest, PortError, PortOutcome,
     ProviderError, ProviderErrorCode, UnknownReason,
 };
+#[cfg(test)]
+use eliot_platform_windows::PeCoffError;
 pub use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{
     AuthenticodeVerdict, CredentialSecret, ELIOT_HOST_SERVICE_DISPLAY_NAME,
@@ -16377,46 +16379,67 @@ fn stage_package_authorization(
 }
 
 fn package_port_error(error: &PackageStagingError) -> PortError {
-    match error {
-        PackageStagingError::Win32 { stage, code } => PortError::ProviderReference {
-            error: ProviderError {
-                code: ProviderErrorCode::Failed,
-                retryable: false,
-            },
-            reference: package_staging_reference(*stage, *code),
+    let provider = ProviderError {
+        code: match error {
+            PackageStagingError::UnsupportedPlatform => ProviderErrorCode::Unavailable,
+            PackageStagingError::SecurityMismatch => ProviderErrorCode::PermissionDenied,
+            _ => ProviderErrorCode::Failed,
         },
-        PackageStagingError::InvalidRelativePath
-        | PackageStagingError::ManifestCollision
-        | PackageStagingError::BoundExceeded
-        | PackageStagingError::RootUnavailable => PortError::InvalidRequestMetadata,
-        PackageStagingError::UnsupportedPlatform => PortError::Provider(ProviderError {
-            code: ProviderErrorCode::Unavailable,
-            retryable: false,
-        }),
-        PackageStagingError::SecurityMismatch => PortError::Provider(ProviderError {
-            code: ProviderErrorCode::PermissionDenied,
-            retryable: false,
-        }),
-        _ => PortError::Provider(ProviderError {
-            code: ProviderErrorCode::Failed,
-            retryable: false,
-        }),
+        retryable: false,
+    };
+    PortError::ProviderReference {
+        error: provider,
+        reference: package_staging_error_reference(error),
     }
 }
 
 fn package_staging_reference(stage: PackageStagingStage, code: u32) -> PlatformHandle {
     let stage = match stage {
+        PackageStagingStage::KnownFolderPath => "known-folder-path",
+        PackageStagingStage::CanonicalizePath => "canonicalize-path",
+        PackageStagingStage::SymlinkMetadata => "symlink-metadata",
         PackageStagingStage::SetSecurityInfo => "set-security-info",
         PackageStagingStage::GetSecurityInfo => "get-security-info",
         PackageStagingStage::CreateFileW => "create-file-w",
+        PackageStagingStage::FileMetadata => "file-metadata",
         PackageStagingStage::FlushFileBuffers => "flush-file-buffers",
         PackageStagingStage::GetFileInformationByHandle => "get-file-information-by-handle",
+        PackageStagingStage::GetFinalPathNameByHandleW => "get-final-path-name-by-handle-w",
         PackageStagingStage::DuplicateHandle => "duplicate-handle",
         PackageStagingStage::SetFilePointerEx => "set-file-pointer-ex",
         PackageStagingStage::ReadFile => "read-file",
         PackageStagingStage::WriteFile => "write-file",
     };
     PlatformHandle::new(format!("stage-package-win32-v1:{stage}:{code:08x}"))
+        .unwrap_or_else(|_| unreachable!())
+}
+
+fn package_staging_error_reference(error: &PackageStagingError) -> PlatformHandle {
+    let semantic = match error {
+        PackageStagingError::InvalidRelativePath => "invalid-relative-path",
+        PackageStagingError::ManifestCollision => "manifest-collision",
+        PackageStagingError::BoundExceeded => "bound-exceeded",
+        PackageStagingError::RootUnavailable => "root-unavailable",
+        PackageStagingError::ReparsePoint => "reparse-point",
+        PackageStagingError::WrongEntryKind => "wrong-entry-kind",
+        PackageStagingError::IdentityMismatch => "identity-mismatch",
+        PackageStagingError::HashMismatch => "hash-mismatch",
+        PackageStagingError::SizeMismatch => "size-mismatch",
+        PackageStagingError::SecurityMismatch => "security-mismatch",
+        PackageStagingError::GenerationExists => "generation-exists",
+        PackageStagingError::TreeMismatch => "tree-mismatch",
+        PackageStagingError::PartialTree => "partial-tree",
+        PackageStagingError::PeParse(_) => "pe-parse",
+        PackageStagingError::Authenticode(_) => "authenticode",
+        PackageStagingError::AuthenticodeRejected(_) => "authenticode-rejected",
+        PackageStagingError::RollbackRefused => "rollback-refused",
+        PackageStagingError::UnsupportedPlatform => "unsupported-platform",
+        PackageStagingError::Io => "io",
+        PackageStagingError::Win32 { stage, code } => {
+            return package_staging_reference(*stage, *code);
+        }
+    };
+    PlatformHandle::new(format!("stage-package-error-v1:{semantic}"))
         .unwrap_or_else(|_| unreachable!())
 }
 
@@ -16442,11 +16465,7 @@ fn package_staging_outcome<T>(error: &PackageStagingError) -> PortOutcome<T> {
 }
 
 fn package_pending(error: &PackageStagingError) -> InstallationEffectObservation {
-    let pending_ref = match error {
-        PackageStagingError::Win32 { stage, code } => package_staging_reference(*stage, *code),
-        _ => PlatformHandle::new(format!("mismatch:package:{error}"))
-            .unwrap_or_else(|_| unreachable!()),
-    };
+    let pending_ref = package_staging_error_reference(error);
     InstallationEffectObservation::Mismatch { pending_ref }
 }
 
@@ -19501,6 +19520,30 @@ fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
 }
 
 fn is_typed_package_staging_reference(value: &str) -> bool {
+    if let Some(semantic) = value.strip_prefix("stage-package-error-v1:") {
+        return matches!(
+            semantic,
+            "invalid-relative-path"
+                | "manifest-collision"
+                | "bound-exceeded"
+                | "root-unavailable"
+                | "reparse-point"
+                | "wrong-entry-kind"
+                | "identity-mismatch"
+                | "hash-mismatch"
+                | "size-mismatch"
+                | "security-mismatch"
+                | "generation-exists"
+                | "tree-mismatch"
+                | "partial-tree"
+                | "pe-parse"
+                | "authenticode"
+                | "authenticode-rejected"
+                | "rollback-refused"
+                | "unsupported-platform"
+                | "io"
+        );
+    }
     let Some(rest) = value.strip_prefix("stage-package-win32-v1:") else {
         return false;
     };
@@ -19510,11 +19553,16 @@ fn is_typed_package_staging_reference(value: &str) -> bool {
     };
     if !matches!(
         stage,
-        "set-security-info"
+        "known-folder-path"
+            | "canonicalize-path"
+            | "symlink-metadata"
+            | "set-security-info"
             | "get-security-info"
             | "create-file-w"
+            | "file-metadata"
             | "flush-file-buffers"
             | "get-file-information-by-handle"
+            | "get-final-path-name-by-handle-w"
             | "duplicate-handle"
             | "set-file-pointer-ex"
             | "read-file"
@@ -20260,11 +20308,229 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             security,
-            PortError::Provider(ProviderError {
-                code: ProviderErrorCode::PermissionDenied,
-                retryable: false,
-            })
+            PortError::ProviderReference {
+                error: ProviderError {
+                    code: ProviderErrorCode::PermissionDenied,
+                    retryable: false,
+                },
+                reference,
+                ..
+            } if reference.as_str() == "stage-package-error-v1:security-mismatch"
         ));
+    }
+
+    #[test]
+    fn every_package_staging_error_has_an_exact_bounded_provider_and_pending_reference() {
+        let cases = [
+            (
+                PackageStagingError::InvalidRelativePath,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:invalid-relative-path",
+            ),
+            (
+                PackageStagingError::ManifestCollision,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:manifest-collision",
+            ),
+            (
+                PackageStagingError::BoundExceeded,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:bound-exceeded",
+            ),
+            (
+                PackageStagingError::RootUnavailable,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:root-unavailable",
+            ),
+            (
+                PackageStagingError::ReparsePoint,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:reparse-point",
+            ),
+            (
+                PackageStagingError::WrongEntryKind,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:wrong-entry-kind",
+            ),
+            (
+                PackageStagingError::IdentityMismatch,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:identity-mismatch",
+            ),
+            (
+                PackageStagingError::HashMismatch,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:hash-mismatch",
+            ),
+            (
+                PackageStagingError::SizeMismatch,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:size-mismatch",
+            ),
+            (
+                PackageStagingError::SecurityMismatch,
+                ProviderErrorCode::PermissionDenied,
+                "stage-package-error-v1:security-mismatch",
+            ),
+            (
+                PackageStagingError::GenerationExists,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:generation-exists",
+            ),
+            (
+                PackageStagingError::TreeMismatch,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:tree-mismatch",
+            ),
+            (
+                PackageStagingError::PartialTree,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:partial-tree",
+            ),
+            (
+                PackageStagingError::PeParse(PeCoffError::Truncated),
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:pe-parse",
+            ),
+            (
+                PackageStagingError::Authenticode(
+                    eliot_platform_windows::AuthenticodeError::InvalidFile,
+                ),
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:authenticode",
+            ),
+            (
+                PackageStagingError::AuthenticodeRejected(AuthenticodeVerdict::Unsigned),
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:authenticode-rejected",
+            ),
+            (
+                PackageStagingError::RollbackRefused,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:rollback-refused",
+            ),
+            (
+                PackageStagingError::UnsupportedPlatform,
+                ProviderErrorCode::Unavailable,
+                "stage-package-error-v1:unsupported-platform",
+            ),
+            (
+                PackageStagingError::Io,
+                ProviderErrorCode::Failed,
+                "stage-package-error-v1:io",
+            ),
+            (
+                PackageStagingError::Win32 {
+                    stage: PackageStagingStage::GetFinalPathNameByHandleW,
+                    code: 8,
+                },
+                ProviderErrorCode::Failed,
+                "stage-package-win32-v1:get-final-path-name-by-handle-w:00000008",
+            ),
+        ];
+        assert_eq!(cases.len(), 20);
+        for (error, expected_code, expected) in cases {
+            let port = package_port_error(&error);
+            assert!(matches!(
+                &port,
+                PortError::ProviderReference {
+                    error: ProviderError { code, retryable: false },
+                    reference,
+                } if *code == expected_code && reference.as_str() == expected
+            ));
+            assert_eq!(
+                port_pending(PortOutcome::<()>::Error(port)).as_str(),
+                expected
+            );
+            assert!(is_typed_package_staging_reference(expected));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_root_native_failure_survives_production_inspect_and_store_reload() {
+        let source_dir = tempfile::TempDir::new().expect("create empty source bundle");
+        let source_path = source_dir.path();
+        let source = TrustedSourceBundle::open(source_path).expect("retain source bundle");
+        let source_identity = source.identity();
+        drop(source);
+
+        let registered = system_registration_transaction();
+        let package_index = registered
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::StagePackage { .. }))
+            .unwrap_or_else(|| unreachable!());
+        let mut effects = registered.installer_effects.clone();
+        let staging_root = match &mut effects[package_index] {
+            InstallerEffectPlan::StagePackage {
+                source_bundle,
+                source_bundle_identity: expected_identity,
+                staging_root,
+                ..
+            } => {
+                *source_bundle = test_handle(source_path.to_string_lossy().into_owned());
+                *expected_identity = source_identity;
+                staging_root.clone()
+            }
+            _ => unreachable!(),
+        };
+        let missing = Path::new(staging_root.as_str());
+        assert!(!missing.exists());
+        let (stage, code) = match PackageStagingError::from(
+            ProtectedRootLease::open_existing(missing).unwrap_err(),
+        ) {
+            PackageStagingError::Win32 { stage, code } => (stage, code),
+            other => panic!("unexpected protected-root failure: {other:?}"),
+        };
+        assert_ne!(code, 0);
+
+        let mut transaction = must(InstallationTransaction::new(
+            registered.transaction_id.clone(),
+            registered.installation_epoch.clone(),
+            registered.profile,
+            registered.request.clone(),
+            registered.current_active_manifest.clone(),
+            registered.candidate_manifest.clone(),
+            registered.staging_root.clone(),
+            registered.planned_changes.clone(),
+            effects,
+            registered.minimum_store_available_bytes,
+            registered.precondition_evidence.clone(),
+            registered.recovery_command.clone(),
+        ));
+        transaction.effect_progress[..package_index]
+            .clone_from_slice(&registered.effect_progress[..package_index]);
+        must(transaction.validate());
+        let transaction_id = transaction.transaction_id.clone();
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(transaction))),
+            ..SharedStore::default()
+        };
+        let expected = package_staging_reference(stage, code).as_str().to_owned();
+        assert!(expected.starts_with("stage-package-win32-v1:"));
+        let mut coordinator =
+            InstallationCoordinator::new(WindowsInstallationEffectPort::new(), store.clone());
+        let outcome = must(coordinator.drive_effect_at(&transaction_id, 1_000));
+        assert!(matches!(
+            outcome,
+            InstallationStepOutcome::RollbackRequired { ref pending_refs }
+                if pending_refs.len() == 1 && pending_refs[0].as_str() == expected
+        ));
+
+        let reloaded = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(reloaded.stage(), InstallationStage::RollbackRequired);
+        assert_eq!(
+            reloaded.pending_external_changes,
+            vec![test_handle(expected.clone())]
+        );
+        assert!(matches!(
+            &reloaded.effect_progress[package_index].state,
+            InstallationEffectProgressState::Unknown { pending_ref }
+                if pending_ref.as_str() == expected
+        ));
+        assert!(!expected.contains("ProgramData"));
+        assert!(!expected.contains('\\'));
     }
 
     #[test]
@@ -20326,8 +20592,13 @@ mod tests {
             "installer-root-win32-v2:readback:ffffffff",
             "installer-root-win32-v2:open-readback:00000002",
             "stage-package-win32-v1:get-security-info:00000005",
+            "stage-package-win32-v1:known-folder-path:80070005",
+            "stage-package-win32-v1:canonicalize-path:00000003",
+            "stage-package-win32-v1:get-final-path-name-by-handle-w:00000008",
             "stage-package-win32-v1:read-file:00000005",
             "stage-package-win32-v1:write-file:00000005",
+            "stage-package-error-v1:security-mismatch",
+            "stage-package-error-v1:pe-parse",
         ];
         for reference in valid {
             let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {
@@ -20349,11 +20620,16 @@ mod tests {
             "installer-root-win32-v2:create-directory:0000abcd:extra",
             "stage-package-win32-v1:not-a-stage:0000abcd",
             "stage-package-win32-v1:get-security-info:0000000A",
+            "stage-package-win32-v1:known-folder-path:8007000A",
             "stage-package-win32-v1:get-security-info:0000005",
             "stage-package-win32-v1:get-security-info:00000005:extra",
             "stage-package-win32-v1:get-security-info:00000005 ",
             "stage-package-win32-v1:write-file:0000000A",
             "stage-package-win32-v1:write-file:00000005:extra",
+            "stage-package-error-v1:identity-mismatch:extra",
+            "stage-package-error-v1:IDENTITY-MISMATCH",
+            "stage-package-error-v1:not-a-semantic",
+            "stage-package-error-v1:",
             r"C:\package\secret",
         ] {
             let pending = port_pending(PortOutcome::<()>::Error(PortError::ProviderReference {

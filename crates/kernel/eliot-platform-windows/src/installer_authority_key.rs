@@ -599,6 +599,8 @@ fn map_protected_path_error(error: ProtectedPathError) -> InstallationAuthorityK
         ProtectedPathError::InvalidPath => InstallationAuthorityKeyError::InvalidPath,
         ProtectedPathError::ReparsePoint => InstallationAuthorityKeyError::ReparsePoint,
         ProtectedPathError::AclMismatch => InstallationAuthorityKeyError::AclMismatch,
+        ProtectedPathError::IdentityMismatch => InstallationAuthorityKeyError::IdentityMismatch,
+        ProtectedPathError::Win32 { .. } => InstallationAuthorityKeyError::Io,
         ProtectedPathError::Io | ProtectedPathError::SizeExceeded => {
             InstallationAuthorityKeyError::Io
         }

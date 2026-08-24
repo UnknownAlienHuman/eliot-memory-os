@@ -2852,11 +2852,16 @@ fn installation_preflight_error(
 
 fn package_staging_stage_name(stage: PackageStagingStage) -> &'static str {
     match stage {
+        PackageStagingStage::KnownFolderPath => "known-folder-path",
+        PackageStagingStage::CanonicalizePath => "canonicalize-path",
+        PackageStagingStage::SymlinkMetadata => "symlink-metadata",
         PackageStagingStage::SetSecurityInfo => "set-security-info",
         PackageStagingStage::GetSecurityInfo => "get-security-info",
         PackageStagingStage::CreateFileW => "create-file-w",
+        PackageStagingStage::FileMetadata => "file-metadata",
         PackageStagingStage::FlushFileBuffers => "flush-file-buffers",
         PackageStagingStage::GetFileInformationByHandle => "get-file-information-by-handle",
+        PackageStagingStage::GetFinalPathNameByHandleW => "get-final-path-name-by-handle-w",
         PackageStagingStage::DuplicateHandle => "duplicate-handle",
         PackageStagingStage::SetFilePointerEx => "set-file-pointer-ex",
         PackageStagingStage::ReadFile => "read-file",
@@ -3156,6 +3161,34 @@ mod tests {
                 Some("stage-package-win32-v1:write-file:00000005".to_owned()),
             )
         );
+    }
+
+    #[test]
+    fn package_staging_stage_names_are_canonical_and_exhaustive() {
+        for (stage, expected) in [
+            (PackageStagingStage::KnownFolderPath, "known-folder-path"),
+            (PackageStagingStage::CanonicalizePath, "canonicalize-path"),
+            (PackageStagingStage::SymlinkMetadata, "symlink-metadata"),
+            (PackageStagingStage::SetSecurityInfo, "set-security-info"),
+            (PackageStagingStage::GetSecurityInfo, "get-security-info"),
+            (PackageStagingStage::CreateFileW, "create-file-w"),
+            (PackageStagingStage::FileMetadata, "file-metadata"),
+            (PackageStagingStage::FlushFileBuffers, "flush-file-buffers"),
+            (
+                PackageStagingStage::GetFileInformationByHandle,
+                "get-file-information-by-handle",
+            ),
+            (
+                PackageStagingStage::GetFinalPathNameByHandleW,
+                "get-final-path-name-by-handle-w",
+            ),
+            (PackageStagingStage::DuplicateHandle, "duplicate-handle"),
+            (PackageStagingStage::SetFilePointerEx, "set-file-pointer-ex"),
+            (PackageStagingStage::ReadFile, "read-file"),
+            (PackageStagingStage::WriteFile, "write-file"),
+        ] {
+            assert_eq!(package_staging_stage_name(stage), expected);
+        }
     }
 
     #[test]

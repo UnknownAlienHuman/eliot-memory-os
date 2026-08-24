@@ -242,8 +242,27 @@ impl std::fmt::Display for HostOwnerLeaseReleaseError {
 
 impl std::error::Error for HostOwnerLeaseReleaseError {}
 
-/// Protected `ProgramData` path policy used by Host, installation and
-/// Watchdog durable state.  The policy is intentionally shared so a caller
+/// Bounded native operation used while retaining a protected path contour.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtectedPathStage {
+    /// `SHGetKnownFolderPath` failed while resolving an OS-owned root.
+    KnownFolderPath,
+    /// `std::fs::canonicalize` failed while resolving an existing contour.
+    CanonicalizePath,
+    /// `std::fs::symlink_metadata` failed while rejecting reparse substitution.
+    SymlinkMetadata,
+    /// A directory or file handle could not be opened with create-file semantics.
+    CreateFileW,
+    /// Metadata could not be read from a retained file handle.
+    FileMetadata,
+    /// `GetFileInformationByHandle` failed for a retained handle.
+    GetFileInformationByHandle,
+    /// `GetFinalPathNameByHandleW` failed for a retained handle.
+    GetFinalPathNameByHandleW,
+}
+
+/// Protected `ProgramData` path policy error used by Host, installation and
+/// Watchdog durable state. The policy is intentionally shared so a caller
 /// cannot substitute a per-user or arbitrary working-directory root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtectedPathError {
@@ -258,6 +277,15 @@ pub enum ProtectedPathError {
     AclMismatch,
     /// The filesystem operation failed before a safe classification existed.
     Io,
+    /// A retained object no longer has its originally observed identity.
+    IdentityMismatch,
+    /// A bounded Windows operation failed with a safe raw status.
+    Win32 {
+        /// Exact semantic operation that failed.
+        stage: ProtectedPathStage,
+        /// Raw Windows status bit pattern from the provider boundary.
+        code: u32,
+    },
     /// The protected file exceeded the caller's explicit bounded read limit.
     SizeExceeded,
     /// Durable protected storage is intentionally unavailable off Windows.
@@ -266,12 +294,20 @@ pub enum ProtectedPathError {
 
 impl std::fmt::Display for ProtectedPathError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::Win32 { stage, code } = self {
+            return write!(
+                formatter,
+                "protected path {stage:?} failed with status {code:#010x}"
+            );
+        }
         formatter.write_str(match self {
             Self::InvalidRoot => "ProgramData protected root is invalid",
             Self::InvalidPath => "path is outside the protected ProgramData contour",
             Self::ReparsePoint => "protected path contains a reparse point",
             Self::AclMismatch => "protected path ACL does not match service/admin policy",
             Self::Io => "protected path I/O failed",
+            Self::IdentityMismatch => "protected path identity changed",
+            Self::Win32 { .. } => unreachable!(),
             Self::SizeExceeded => "protected file exceeds its bounded read limit",
             Self::UnsupportedPlatform => "protected ProgramData storage requires Windows",
         })
@@ -279,6 +315,28 @@ impl std::fmt::Display for ProtectedPathError {
 }
 
 impl std::error::Error for ProtectedPathError {}
+
+#[cfg(windows)]
+fn protected_path_io_error(
+    stage: ProtectedPathStage,
+    error: &std::io::Error,
+) -> ProtectedPathError {
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .map_or(ProtectedPathError::Io, |code| ProtectedPathError::Win32 {
+            stage,
+            code,
+        })
+}
+
+#[cfg(not(windows))]
+fn protected_path_io_error(
+    _stage: ProtectedPathStage,
+    _error: &std::io::Error,
+) -> ProtectedPathError {
+    ProtectedPathError::Io
+}
 
 /// Returns the canonical `ProgramData` directory after rejecting reparse
 /// substitution in the root and its existing ancestors.
@@ -566,6 +624,14 @@ enum KnownFolder {
 }
 
 #[cfg(windows)]
+fn known_folder_hresult_error(status: i32) -> ProtectedPathError {
+    ProtectedPathError::Win32 {
+        stage: ProtectedPathStage::KnownFolderPath,
+        code: u32::from_ne_bytes(status.to_ne_bytes()),
+    }
+}
+
+#[cfg(windows)]
 fn known_folder_path(folder: KnownFolder) -> Result<PathBuf, ProtectedPathError> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -585,9 +651,16 @@ fn known_folder_path(folder: KnownFolder) -> Result<PathBuf, ProtectedPathError>
         // and `path` receives task-allocator memory released below.
         SHGetKnownFolderPath(folder_id, 0, std::ptr::null_mut(), &raw mut path)
     };
-    if status != S_OK || path.is_null() {
+    if status != S_OK {
         unsafe {
             // SAFETY: CoTaskMemFree accepts null and any pointer returned by the API.
+            CoTaskMemFree(path.cast());
+        }
+        return Err(known_folder_hresult_error(status));
+    }
+    if path.is_null() {
+        unsafe {
+            // SAFETY: CoTaskMemFree accepts null.
             CoTaskMemFree(path.cast());
         }
         return Err(ProtectedPathError::InvalidRoot);
@@ -641,7 +714,8 @@ fn known_folder_path(_folder: KnownFolder) -> Result<PathBuf, ProtectedPathError
 /// Returns an error when canonicalization fails or the OS result is not an
 /// absolute DOS/UNC path.
 pub fn canonical_windows_path(path: &Path) -> Result<PathBuf, ProtectedPathError> {
-    let canonical = std::fs::canonicalize(path).map_err(|_| ProtectedPathError::Io)?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| protected_path_io_error(ProtectedPathStage::CanonicalizePath, &error))?;
     #[cfg(windows)]
     {
         normalize_final_windows_path_text(&canonical.to_string_lossy())
@@ -763,10 +837,15 @@ impl ProtectedRootLease {
         {
             let directories = pin_protected_directory_contour(&root, relative)?;
             let retained = directories.last().ok_or(ProtectedPathError::InvalidPath)?;
-            let identity =
-                file_identity_from_handle(retained).map_err(|_| ProtectedPathError::Io)?;
+            let identity = file_identity_from_handle(retained).map_err(|error| {
+                protected_path_io_error(ProtectedPathStage::GetFileInformationByHandle, &error)
+            })?;
+            let observed = final_windows_path_from_handle(retained)?;
+            if !windows_paths_equal(&observed, &canonical) {
+                return Err(ProtectedPathError::IdentityMismatch);
+            }
             Ok(Self {
-                path: canonical,
+                path: observed,
                 identity,
                 directories,
             })
@@ -787,11 +866,15 @@ impl ProtectedRootLease {
     pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
         #[cfg(windows)]
         {
-            final_windows_path_from_handle(
+            let observed = final_windows_path_from_handle(
                 self.directories
                     .last()
                     .ok_or(ProtectedPathError::InvalidPath)?,
-            )
+            )?;
+            if !windows_paths_equal(&observed, &self.path) {
+                return Err(ProtectedPathError::IdentityMismatch);
+            }
+            Ok(observed)
         }
         #[cfg(not(windows))]
         {
@@ -818,10 +901,11 @@ impl ProtectedRootLease {
                 .directories
                 .last()
                 .ok_or(ProtectedPathError::InvalidPath)?;
-            let identity =
-                file_identity_from_handle(retained).map_err(|_| ProtectedPathError::Io)?;
+            let identity = file_identity_from_handle(retained).map_err(|error| {
+                protected_path_io_error(ProtectedPathStage::GetFileInformationByHandle, &error)
+            })?;
             if identity != self.identity {
-                return Err(ProtectedPathError::Io);
+                return Err(ProtectedPathError::IdentityMismatch);
             }
             Ok(())
         }
@@ -2171,7 +2255,12 @@ fn ensure_protected_containment(root: &Path, path: &Path) -> Result<(), Protecte
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(ProtectedPathError::Io),
+            Err(error) => {
+                return Err(protected_path_io_error(
+                    ProtectedPathStage::SymlinkMetadata,
+                    &error,
+                ));
+            }
         }
     }
     Ok(())
@@ -2188,14 +2277,20 @@ fn reject_reparse_chain(path: &Path, require_existing: bool) -> Result<(), Prote
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ProtectedPathError::InvalidRoot);
             }
-            Err(_) => return Err(ProtectedPathError::Io),
+            Err(error) => {
+                return Err(protected_path_io_error(
+                    ProtectedPathStage::SymlinkMetadata,
+                    &error,
+                ));
+            }
         }
     }
     Ok(())
 }
 
 fn validate_directory_no_reparse(path: &Path) -> Result<(), ProtectedPathError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| ProtectedPathError::Io)?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| protected_path_io_error(ProtectedPathStage::SymlinkMetadata, &error))?;
     if !metadata.is_dir() {
         return Err(ProtectedPathError::InvalidRoot);
     }
@@ -2243,12 +2338,34 @@ fn pin_protected_directory_contour(
 ) -> Result<Vec<std::fs::File>, ProtectedPathError> {
     let components = protected_components(relative)?;
     let mut current = root.to_path_buf();
-    let mut directories = vec![pin_directory(root).map_err(|_| ProtectedPathError::Io)?];
+    let mut directories = vec![pin_protected_directory(root)?];
     for component in components {
         current.push(component);
-        directories.push(pin_directory(&current).map_err(|_| ProtectedPathError::Io)?);
+        directories.push(pin_protected_directory(&current)?);
     }
     Ok(directories)
+}
+
+#[cfg(windows)]
+fn pin_protected_directory(path: &Path) -> Result<std::fs::File, ProtectedPathError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| protected_path_io_error(ProtectedPathStage::CreateFileW, &error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| protected_path_io_error(ProtectedPathStage::FileMetadata, &error))?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProtectedPathError::ReparsePoint);
+    }
+    Ok(file)
 }
 
 #[cfg(windows)]
@@ -11819,7 +11936,10 @@ fn final_windows_path_from_handle(file: &std::fs::File) -> Result<PathBuf, Prote
         GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0)
     };
     if required == 0 {
-        return Err(ProtectedPathError::Io);
+        return Err(protected_path_io_error(
+            ProtectedPathStage::GetFinalPathNameByHandleW,
+            &std::io::Error::last_os_error(),
+        ));
     }
     let mut buffer =
         vec![0_u16; usize::try_from(required).map_err(|_| ProtectedPathError::Io)? + 1];
@@ -11832,8 +11952,13 @@ fn final_windows_path_from_handle(file: &std::fs::File) -> Result<PathBuf, Prote
             0,
         )
     };
-    if written == 0 || usize::try_from(written).map_err(|_| ProtectedPathError::Io)? >= buffer.len()
-    {
+    if written == 0 {
+        return Err(protected_path_io_error(
+            ProtectedPathStage::GetFinalPathNameByHandleW,
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    if usize::try_from(written).map_err(|_| ProtectedPathError::Io)? >= buffer.len() {
         return Err(ProtectedPathError::Io);
     }
     let path = String::from_utf16(
@@ -14965,6 +15090,18 @@ fn inspect_session(_request: &SessionRequest) -> PortOutcome<SessionObservation>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn known_folder_hresult_preserves_the_unsigned_bit_pattern() {
+        assert_eq!(
+            known_folder_hresult_error(i32::from_ne_bytes(0x8007_0005_u32.to_ne_bytes())),
+            ProtectedPathError::Win32 {
+                stage: ProtectedPathStage::KnownFolderPath,
+                code: 0x8007_0005,
+            }
+        );
+    }
 
     #[test]
     fn governor_process_basename_matching_is_exact_and_case_insensitive() {

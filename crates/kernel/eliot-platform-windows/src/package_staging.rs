@@ -17,7 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{FileIdentity, ProtectedPathError};
+use super::{FileIdentity, ProtectedPathError, ProtectedPathStage};
 
 /// Maximum number of manifest files accepted by one bounded staging call.
 pub const MAX_PACKAGE_FILES: usize = 4096;
@@ -51,16 +51,21 @@ pub struct StagePackageExpectedFile {
     pub sha256: String,
 }
 
-/// Native operation that failed while the StagePackage provider was observing
+/// Native operation that failed while the `StagePackage` provider was observing
 /// or mutating a protected object.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PackageStagingStage {
+    KnownFolderPath,
+    CanonicalizePath,
+    SymlinkMetadata,
     SetSecurityInfo,
     GetSecurityInfo,
     CreateFileW,
+    FileMetadata,
     FlushFileBuffers,
     GetFileInformationByHandle,
+    GetFinalPathNameByHandleW,
     DuplicateHandle,
     SetFilePointerEx,
     ReadFile,
@@ -1301,7 +1306,7 @@ pub enum PackageStagingError {
     UnsupportedPlatform,
     /// A bounded Windows operation failed before classification.
     Io,
-    /// A native StagePackage operation failed; the semantic operation and raw
+    /// A native `StagePackage` operation failed; the semantic operation and raw
     /// Win32 status are retained for durable recovery observability.
     Win32 {
         stage: PackageStagingStage,
@@ -1756,7 +1761,31 @@ fn map_protected_path_error(error: ProtectedPathError) -> PackageStagingError {
         }
         ProtectedPathError::UnsupportedPlatform => PackageStagingError::UnsupportedPlatform,
         ProtectedPathError::AclMismatch => PackageStagingError::SecurityMismatch,
-        ProtectedPathError::Io | ProtectedPathError::SizeExceeded => PackageStagingError::Io,
+        ProtectedPathError::Io => PackageStagingError::Io,
+        ProtectedPathError::IdentityMismatch => PackageStagingError::IdentityMismatch,
+        ProtectedPathError::Win32 { stage, code } => PackageStagingError::Win32 {
+            stage: match stage {
+                ProtectedPathStage::KnownFolderPath => PackageStagingStage::KnownFolderPath,
+                ProtectedPathStage::CanonicalizePath => PackageStagingStage::CanonicalizePath,
+                ProtectedPathStage::SymlinkMetadata => PackageStagingStage::SymlinkMetadata,
+                ProtectedPathStage::CreateFileW => PackageStagingStage::CreateFileW,
+                ProtectedPathStage::FileMetadata => PackageStagingStage::FileMetadata,
+                ProtectedPathStage::GetFileInformationByHandle => {
+                    PackageStagingStage::GetFileInformationByHandle
+                }
+                ProtectedPathStage::GetFinalPathNameByHandleW => {
+                    PackageStagingStage::GetFinalPathNameByHandleW
+                }
+            },
+            code,
+        },
+        ProtectedPathError::SizeExceeded => PackageStagingError::BoundExceeded,
+    }
+}
+
+impl From<ProtectedPathError> for PackageStagingError {
+    fn from(error: ProtectedPathError) -> Self {
+        map_protected_path_error(error)
     }
 }
 
@@ -4626,6 +4655,63 @@ mod tests {
         let json = serde_json::to_string(&error).unwrap_or_else(|_| unreachable!());
         assert!(json.contains("FLUSH_FILE_BUFFERS"));
         assert!(json.contains("\"code\":5"));
+    }
+
+    #[test]
+    fn protected_path_errors_retain_bounded_semantics_at_package_boundary() {
+        assert_eq!(
+            map_protected_path_error(ProtectedPathError::Io),
+            PackageStagingError::Io
+        );
+        assert_eq!(
+            map_protected_path_error(ProtectedPathError::SizeExceeded),
+            PackageStagingError::BoundExceeded
+        );
+        assert_eq!(
+            map_protected_path_error(ProtectedPathError::IdentityMismatch),
+            PackageStagingError::IdentityMismatch
+        );
+        for (protected, package) in [
+            (
+                ProtectedPathStage::KnownFolderPath,
+                PackageStagingStage::KnownFolderPath,
+            ),
+            (
+                ProtectedPathStage::CanonicalizePath,
+                PackageStagingStage::CanonicalizePath,
+            ),
+            (
+                ProtectedPathStage::SymlinkMetadata,
+                PackageStagingStage::SymlinkMetadata,
+            ),
+            (
+                ProtectedPathStage::CreateFileW,
+                PackageStagingStage::CreateFileW,
+            ),
+            (
+                ProtectedPathStage::FileMetadata,
+                PackageStagingStage::FileMetadata,
+            ),
+            (
+                ProtectedPathStage::GetFileInformationByHandle,
+                PackageStagingStage::GetFileInformationByHandle,
+            ),
+            (
+                ProtectedPathStage::GetFinalPathNameByHandleW,
+                PackageStagingStage::GetFinalPathNameByHandleW,
+            ),
+        ] {
+            assert_eq!(
+                map_protected_path_error(ProtectedPathError::Win32 {
+                    stage: protected,
+                    code: 8,
+                }),
+                PackageStagingError::Win32 {
+                    stage: package,
+                    code: 8,
+                }
+            );
+        }
     }
 
     #[test]

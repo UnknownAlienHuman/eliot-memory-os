@@ -2310,6 +2310,8 @@ fn map_protected_error(error: ProtectedPathError) -> InstallerRootError {
         }
         ProtectedPathError::ReparsePoint => InstallerRootError::ReparsePoint,
         ProtectedPathError::AclMismatch => InstallerRootError::SecurityMismatch,
+        ProtectedPathError::IdentityMismatch => InstallerRootError::IdentityMismatch,
+        ProtectedPathError::Win32 { .. } => InstallerRootError::Indeterminate,
         ProtectedPathError::UnsupportedPlatform => InstallerRootError::UnsupportedPlatform,
         ProtectedPathError::Io | ProtectedPathError::SizeExceeded => {
             InstallerRootError::Indeterminate
