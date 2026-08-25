@@ -1,0 +1,150 @@
+{
+  "schema_version": "eliot-external-audit-consolidation-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "observed_source_revision": "1122e21b081a82a6a335c53f018e9ae60846cdd5",
+  "observed_worktree_state": "DIRTY_ACTIVE_RECOVERY",
+  "normative_authority": {
+    "canonical_external_directory": "C:\\Development\\Rust\\docs\\ELIOT Arhitecture",
+    "repository_projection_directory": "docs/normative",
+    "projection_authority_status": "NOT_AUTHORITY"
+  },
+  "sessions": [
+    {
+      "provider_id": "opencode-go",
+      "model_id": "ox-alpha-free",
+      "session_id": "ses_fcbd04e81ffeKd9Ru6gMGpH8FQ",
+      "scope": "W1-01 current-state and correction-options audit",
+      "stdout_receipt": {
+        "file_name": "eliot-w1-01-options.stdout.log",
+        "sha256": "e5e8f633dc77eedd67267a38ad9a37b530949a2813d6d1722666da5c8b9951ae",
+        "byte_length": 159291
+      },
+      "verdict": "CHALLENGE_JUSTIFIED",
+      "findings": [
+        "The module inventory algorithm remains reusable, but current inventory bytes are stale after host-state edits.",
+        "The result is not a canonical TerminalWorkUpdate: it uses a non-product disposition, omits attempt_id and evidence_digest, and carries denied extra fields.",
+        "The result verifier does not enforce an exact full envelope or tamper every result-field family."
+      ]
+    },
+    {
+      "provider_id": "opencode-go",
+      "model_id": "ox-alpha-free",
+      "session_id": "ses_fcbd04e64ffeSwzSYKOW5w4JGL",
+      "scope": "W1-05 and W1-06 stop-condition and correction-options audit",
+      "stdout_receipt": {
+        "file_name": "eliot-w1-0506-options.stdout.log",
+        "sha256": "71c909ebb6a9b16cd127fe97a507ec14427ce763e8fb4b431a0e3fc348ce1616",
+        "byte_length": 289902
+      },
+      "verdict": "BOTH_STOP_CONDITIONS_JUSTIFIED",
+      "findings": [
+        "W1-05 binds a stale mechanism-review digest and uses revision and Git-index-category assertions that self-invalidate across integration.",
+        "W1-05 does not verify every result-envelope field despite claiming full recomputation.",
+        "W1-06 reads scripts/build-eliot-windows-x64-release.ps1 as a witness without including it in the declared inputs digest.",
+        "W1-06 accepts semantic JSON equivalence where the recovery mechanism requires canonical byte identity."
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "stealth/ox-alpha",
+      "session_id": "ses_fcbcfc3dfffeu69anHQRkO3eI9",
+      "scope": "independent W1 challenge-package and umbrella-authorization audit",
+      "stdout_receipt": {
+        "file_name": "eliot-w1-package-router-103249.stdout.log",
+        "sha256": "c6f6e57210728358b3cb3f4378ca07a755bba8b53e72b0ed915982e7d275d523",
+        "byte_length": 105588
+      },
+      "verdict": "UMBRELLA_SAFE_ONLY_WITH_EXPLICIT_CONDITIONS",
+      "findings": [
+        "The result-envelope contract must be resolved before any challenged item is retried.",
+        "An umbrella may authorize exactly one next mechanism-changed attempt for W1-01, W1-02, W1-05, and W1-06; any later failure requires a new decision.",
+        "Challenge status fields must be explicitly changed; prose elsewhere is not authorization.",
+        "W1-02 currently links stale authorization provenance and must bind its V3 rejection."
+      ]
+    },
+    {
+      "provider_id": "opencode-go",
+      "model_id": "ox-alpha-free",
+      "session_id": "ses_fcbcfc3e0ffeZVy3XyKxzGiajZ",
+      "scope": "W0 local-verifier proof-ceiling audit",
+      "stdout_receipt": {
+        "file_name": "eliot-w0-local-103249.stdout.log",
+        "sha256": "35199a25502952a7db89274e955b0316762791e165bfff068da4b841d60bbea6",
+        "byte_length": 114473
+      },
+      "verdict": "LOCAL_PASS_CANNOT_CLOSE_W0",
+      "findings": [
+        "A local verifier pass can prove only the current mutable worktree and does not replace a green hosted-main receipt.",
+        "Native Linux result parity and an admitted bootstrap-brief receipt remain outside the current local proof.",
+        "The aggregate verifier does not bind a source revision or worktree digest."
+      ]
+    },
+    {
+      "provider_id": "claude-code",
+      "provider_version": "2.1.237",
+      "model_id": "claude-opus-5",
+      "session_id": "aa24b553-bc92-455c-a34c-b07a9178ae90",
+      "scope": "read-only RECOVERY_PROGRAM v1.3 contract audit and W0-W7 requirement matrix against canonical external documentation",
+      "session_transcript_receipt": {
+        "file_name": "aa24b553-bc92-455c-a34c-b07a9178ae90.jsonl",
+        "sha256": "3d1d7a76b4e3d47af11ccf9a57a89a413180a019f65d9e2424b5de2c304ec2e4",
+        "byte_length": 799729,
+        "structured_output_line": 243,
+        "structured_output_line_sha256": "7754b448b5d75613d90ec122935a9332eac7b76f1c63bc2563976d34496f6109",
+        "structured_output_line_byte_length": 73781
+      },
+      "verdict": "V1_3_ACCEPT_WITH_MANDATORY_CORRECTIONS",
+      "findings": [
+        "The evidence-only BootstrapWorkResult wrapper is the smallest truthful program revision; a W1 terminal_update would be fabricated because no production AgentRouteProvider or ReceiptVerificationPort can admit and bind it.",
+        "The provider-bound attempt_id guarantee is enforced at apply_terminal_updates, not by the AgentAttemptId type alone.",
+        "Program section 2.3 and the W1 gate carried stale text that contradicted the amended section 4.2 and the accepted v1.3 retry decision.",
+        "All seven W1 results must use the v1.3 wrapper before W1 can close, and W2-W7 remain blocked by their predecessor gates."
+      ],
+      "applied_corrections": [
+        "docs/tasks/RECOVERY_PROGRAM_v1.md section 2.3 now names BootstrapWorkResult and the admitted-attempt-only terminal_update rule.",
+        "swarm/gates/W1.md now records RESOLVED_PROGRAM_REVISION_v1.3 and the four bounded one-shot retries."
+      ],
+      "proof_ceiling": "read-only source and canonical-document audit; no runtime execution claim"
+    }
+  ],
+  "current_local_rechecks": [
+    {
+      "work_item_id": "W1-03",
+      "command": "pwsh -NoProfile -File scripts/verify-acceptance-cycle.ps1",
+      "exit": 0,
+      "result": "PASS"
+    },
+    {
+      "work_item_id": "W1-04",
+      "command": "pwsh -NoProfile -File scripts/verify-conformance.ps1",
+      "exit": 0,
+      "result": "PASS"
+    },
+    {
+      "work_item_id": "W1-07",
+      "command": "pwsh -NoProfile -File scripts/verify-composition-roots.ps1",
+      "exit": 0,
+      "result": "PASS"
+    },
+    {
+      "work_item_id": "W1-02",
+      "command": "pwsh -NoProfile -File scripts/verify-refusals.ps1",
+      "exit": 1,
+      "result": "EXPECTED_CHALLENGED_DRIFT",
+      "detail": "redb_journal.rs stored sha256=30ca301f967b8c60b374954170418b90c07e66b248502eaa39453e09ead7cea8 current sha256=01fa448d0a21576b49b0dacc23af6abc1c22f5dee3d996e496450ac76b661438"
+    }
+  ],
+  "integration_disposition": {
+    "accepted_findings": [
+      "W1-03, W1-04, and W1-07 remain reproducible evidence-only artifacts on the current tree.",
+      "The challenged status of W1-01, W1-02, W1-05, and W1-06 is supported by independent external evidence.",
+      "Claude Code 2.1.237 using the verified claude-opus-5 model accepted program revision v1.3 with two mandatory consistency corrections, both now applied."
+    ],
+    "deferred": [
+      "The four v1.3-authorized one-shot W1 retries remain under independent verification.",
+      "No TerminalWorkUpdate admission or cutover decision is recorded.",
+      "W0 and W1 remain open."
+    ],
+    "proof_ceiling": "consolidated external read-only audit evidence plus current focused verifier outcomes"
+  }
+}

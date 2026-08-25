@@ -1,0 +1,66 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "openrouter",
+  "model_id": "stealth/ox-alpha",
+  "agent_profile": "plan",
+  "session_id": "ses_fccbf4de9ffeL1cpHpKbkslv59",
+  "session_isolation": "fresh session; prohibited from RECOVERY_PROGRAM, audit documents, and swarm/results",
+  "observed_source_revision": "1122e21b081a82a6a335c53f018e9ae60846cdd5",
+  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
+  "result": {
+    "work_item_id": "W1-06",
+    "assertions": [
+      {
+        "id": "A1",
+        "claim": "no executable Cargo dependency path joins the named contour-A and contour-B package sets",
+        "verdict": "NOT_FALSIFIED",
+        "measured": {
+          "contour_b_to_contour_a_edges": 0,
+          "contour_a_to_contour_b_edges": 0
+        },
+        "decisive_anchors": [
+          "Cargo.toml:129-136",
+          "Cargo.lock package dependency arrays for eliot, eliot-host, eliot-kernel, eliotd, eliot-app, eliot-engine, and eliot-store"
+        ],
+        "qualification": "both contours share foundation crates; the claim is only absence of a directed edge between the named sets"
+      },
+      {
+        "id": "A2",
+        "claim": "every claimed E2E test is disabled by default",
+        "verdict": "FALSIFIED",
+        "measured": {
+          "unignored_full_stack_ul_t04_harness_tests": 32,
+          "ignored_test_attribute_occurrences": 130
+        },
+        "decisive_anchors": [
+          "crates/eliot-app/tests/ul_convenience_forms.rs:204-207",
+          "crates/eliot-app/tests/support/ul_t04.rs:359-407",
+          "Justfile:17-18",
+          ".github/workflows/candidate-release.yml:80-90"
+        ],
+        "qualification": "the verdict uses the repository-canonical --workspace test gates; it would differ only under the weaker bare default-members interpretation"
+      },
+      {
+        "id": "A3",
+        "claim": "the signed artifact set contains no executable product",
+        "verdict": "FALSIFIED",
+        "measured": {
+          "authenticode_signed_pe_roles": 7,
+          "materializer_required_roles_total": 9,
+          "materializer_required_roles_executable": 6
+        },
+        "decisive_anchors": [
+          "scripts/finalize-eliot-windows-x64-release.ps1:49",
+          "scripts/finalize-eliot-windows-x64-release.ps1:603-619",
+          "scripts/finalize-eliot-windows-x64-release.ps1:858-873",
+          "scripts/build-eliot-windows-x64-release.ps1:18-55",
+          "bins/eliot/src/source_bundle_materializer.rs:41-51"
+        ],
+        "qualification": "the signed set is the authoritative Authenticode release scope, not an unsigned manifest-only or extension-only subset"
+      }
+    ],
+    "program_disposition": "REVISION_REQUIRED_BEFORE_W2"
+  },
+  "proof_ceiling": "static read-only falsification; no Cargo command, signing execution, or runtime test execution"
+}

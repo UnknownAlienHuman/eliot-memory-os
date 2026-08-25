@@ -1,0 +1,597 @@
+# GENERATED FILE - DO NOT EDIT. Content-bound projection of A16.1 and Appendix H.
+schema_version = "eliot-conformance-v2"
+authority_status = "GENERATED_PROJECTION"
+provenance_mode = "CONTENT_BOUND"
+architecture_source_path = "docs/normative/ELIOT_ARCHITECTURE.md"
+implementation_source_path = "docs/normative/ELIOT_IMPLEMENTATION.md"
+generator_path = "scripts/gen-conformance.ps1"
+verifier_path = "scripts/verify-conformance.ps1"
+decision_path = "swarm/challenges/W1-RESULT-ENVELOPE-CONTRACT.md"
+architecture_source_sha256 = "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8"
+implementation_source_sha256 = "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B"
+normalized_pair_sha256 = "D5FF4BE95EE49644CB86058202BA353BE524A2E83EF5FC61DEA1C8DC17F2686A"
+generator_source_sha256 = "B93594C092B8860FA2CBBCC316B1340384277EA4827AD659F25DF24B5998F0CF"
+verifier_source_sha256 = "0984E99F8FC4D2860BD77456202547491DF4ACB4C363E5A1F029751D5DAD4537"
+decision_source_sha256 = "C8A14FCDF73CD77EE5E28875EABEBD91ADA33831B35BE2713B29700F7CA394A4"
+anchor_count = 58
+
+[[requirement]]
+id = "ARCH-INTENT-01"
+class = "Invariant"
+decision = "Намерение выше буквального соблюдения"
+owner = "ImplementationDeviation"
+source_handles = ["I0.4–I0.6"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "deviation outcome and review receipt"
+
+[[requirement]]
+id = "ARCH-CONCIL-01"
+class = "Invariant"
+decision = "Dissent и falsification важнее количества согласных"
+owner = "Agent Coordinator"
+source_handles = ["I13.2–I13.4"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "conflict scenario preserves dissent and tests rivals"
+
+[[requirement]]
+id = "ARCH-DEV-01"
+class = "Contract"
+decision = "Working vertical spine before broad hardening"
+owner = "UNKNOWN"
+source_handles = ["I17–I18"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "D1 real-task demonstration; affected test plan"
+
+[[requirement]]
+id = "ARCH-CORE-01"
+class = "Invariant"
+decision = "Understanding continuity first"
+owner = "state/context owners"
+source_handles = ["I7", "I12"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "cold/resume task continuity scenario"
+
+[[requirement]]
+id = "ARCH-CORE-02"
+class = "Invariant"
+decision = "Four planes, one governed loop"
+owner = "UNKNOWN"
+source_handles = ["I1", "I2", "I12", "I16"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "four-plane process/state trace forms one loop"
+
+[[requirement]]
+id = "ARCH-HELP-01"
+class = "Invariant"
+decision = "ELIOT снижает когнитивную и операционную нагрузку"
+owner = "UNKNOWN"
+source_handles = ["I3", "I7", "I11", "I12"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "user/agent effort and reconstruction comparison"
+
+[[requirement]]
+id = "ARCH-ROLE-01"
+class = "Invariant"
+decision = "Observation, interpretation, authorization и verification разделены"
+owner = "UNKNOWN"
+source_handles = ["I1", "I5", "I8", "I9", "I15"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "no component combines observation, decision, authority and proof silently"
+
+[[requirement]]
+id = "ARCH-ROLE-02"
+class = "Invariant"
+decision = "Responsibility следует компетенции и типу ошибки"
+owner = "UNKNOWN"
+source_handles = ["I6", "I8–I11", "I10.22"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "role/capability/evaluator separation, failure scenarios and explicit owners"
+
+[[requirement]]
+id = "ARCH-AUTH-01"
+class = "Invariant"
+decision = "Authority is explicit, scoped and fenced"
+owner = "UNKNOWN"
+source_handles = ["Kernel", "I5.5–I5.7", "I6.3", "I6.15"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "stale/missing epoch, grant-lineage narrowing/revocation and introduction-scope denial tests"
+
+[[requirement]]
+id = "ARCH-MOD-01"
+class = "Invariant"
+decision = "Small living Kernel; local module failure does not kill the system"
+owner = "UNKNOWN"
+source_handles = ["I1", "I2", "I14.14–I14.16"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "optional module crash while Kernel remains healthy"
+
+[[requirement]]
+id = "ARCH-MOD-02"
+class = "Contract"
+decision = "Depth grows through independently testable micro-modules; physical size/form remain empirical"
+owner = "UNKNOWN"
+source_handles = ["I2", "I14.27", "I17–I20"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "independently understandable/testable micro-modules, portable blueprints and add/replace without Kernel/state rewrite; size and physical form remain empirical"
+
+[[requirement]]
+id = "ARCH-PORT-01"
+class = "Invariant"
+decision = "Organs and execution contours are replaceable; public inheritance transfers, tacit strategy is requalified"
+owner = "UNKNOWN"
+source_handles = ["I2 execution contours", "I7 EBP", "I10 bridges", "I20"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "swap provider/tool/store/sandbox contour through the same capability, conformance and migration contracts"
+
+[[requirement]]
+id = "ARCH-SCOPE-01"
+class = "Invariant"
+decision = "Scope before reuse"
+owner = "UNKNOWN"
+source_handles = ["I4", "I12"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "wrong-scope reuse rejection/revalidation"
+
+[[requirement]]
+id = "ARCH-MEM-01"
+class = "Contract"
+decision = "Capture first; ELIOT organizes later"
+owner = "UNKNOWN"
+source_handles = ["I12.2–I12.3"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "natural observation accepted as candidate"
+
+[[requirement]]
+id = "ARCH-MEM-02"
+class = "Invariant"
+decision = "Semantic fallibility is recoverable through forward revision"
+owner = "UNKNOWN"
+source_handles = ["I5 events", "I12.5", "I12.20–I12.21", "I12.37"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "correction/revocation without history loss; episode source availability is separate; delivery/use/outcome influence remains observable"
+
+[[requirement]]
+id = "ARCH-MEM-03"
+class = "Invariant"
+decision = "Derived memory preserves evidence and lineage"
+owner = "UNKNOWN"
+source_handles = ["I9.7", "I12.20", "I12.25–I12.26"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "transformation preserves evidence/lineage; derived state cannot replace or outlive revoked sources"
+
+[[requirement]]
+id = "ARCH-MEM-04"
+class = "Invariant"
+decision = "Retrieval is not reinforcement; forgetting is not belief revision"
+owner = "UNKNOWN"
+source_handles = ["I5.25", "I12.5", "I12.21"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "cache/retrieval/repetition does not increase support and invalidation removes current influence"
+
+[[requirement]]
+id = "ARCH-LIFE-01"
+class = "Invariant"
+decision = "No semantic teleportation between observation, interpretation, authority and proof"
+owner = "UNKNOWN"
+source_handles = ["I5.4–I5.6", "I12.3–I12.5"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "no model summary directly creates verified/policy state"
+
+[[requirement]]
+id = "ARCH-EPI-01"
+class = "Invariant"
+decision = "Reality corrects; epistemic positions remain defeasible"
+owner = "UNKNOWN"
+source_handles = ["I12.12"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "fresh outlier/conflict and revalidation scenario"
+
+[[requirement]]
+id = "ARCH-EPI-02"
+class = "Contract"
+decision = "Theories earn and lose weight through outcomes"
+owner = "UNKNOWN"
+source_handles = ["I12.18", "I12.22", "I12.29", "I18.47"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "theory weight changes through discriminative outcomes, calibrated evidence, evaluator integrity and staleness"
+
+[[requirement]]
+id = "ARCH-UND-01"
+class = "Invariant"
+decision = "Load-bearing understanding has a public inspectable form"
+owner = "UNKNOWN"
+source_handles = ["I12.1", "I12.10–I12.13"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "decision reconstructed from public evidence/model/unknowns"
+
+[[requirement]]
+id = "ARCH-UND-02"
+class = "Contract"
+decision = "Causal understanding is tested by discriminative prediction and outcomes"
+owner = "UNKNOWN"
+source_handles = ["I12.18"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "discriminative prediction matched to outcome"
+
+[[requirement]]
+id = "ARCH-GROUND-01"
+class = "Contract"
+decision = "Models are tied to tools, graphs, artifacts and verifiers"
+owner = "UNKNOWN"
+source_handles = ["I10.8–I10.10", "I10.20–I10.22", "I12.9–I12.10", "I12.35–I12.37"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "exact source/build/test/verifier, professional, multimodal, artifact and episode anchors with explicit coverage/ambiguity"
+
+[[requirement]]
+id = "ARCH-SELF-01"
+class = "Contract"
+decision = "ELIOT maintains evidence-linked self-knowledge without self-certification"
+owner = "UNKNOWN"
+source_handles = ["I4.8", "I12.1", "I17"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "ELIOT change packet contains Architecture and conformance gaps"
+
+[[requirement]]
+id = "ARCH-CTX-01"
+class = "Contract"
+decision = "Decision sufficiency before context optimization"
+owner = "UNKNOWN"
+source_handles = ["I7.24–I7.26", "I12.13–I12.16"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "tool/context surface retains decision-changing distinctions under budget and material omission remains reversible"
+
+[[requirement]]
+id = "ARCH-CTX-02"
+class = "Contract"
+decision = "Observable state drives proactive memory"
+owner = "UNKNOWN"
+source_handles = ["I7.10", "I12.6–I12.8"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "file/error/task event proactively delivers memory"
+
+[[requirement]]
+id = "ARCH-CTX-03"
+class = "Contract"
+decision = "Decision locality is route-profiled"
+owner = "UNKNOWN"
+source_handles = ["I7.11", "I12.13–I12.18"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "route/profile position and decision-local tail tests"
+
+[[requirement]]
+id = "ARCH-CTX-04"
+class = "Contract"
+decision = "Retrieval proposes candidates; Context Compiler admits influence"
+owner = "UNKNOWN"
+source_handles = ["I12.13", "I12.26"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "retrieval proposes; admission/suppression is separately traced and reversible"
+
+[[requirement]]
+id = "ARCH-ATTN-01"
+class = "Contract"
+decision = "Critical Attention is state, not a message"
+owner = "UNKNOWN"
+source_handles = ["I13.7–I13.8", "I11.5"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "delivered/acknowledged item remains blocking until disposition"
+
+[[requirement]]
+id = "ARCH-SKL-01"
+class = "Contract"
+decision = "Skills are short, intent-dense and challengeable"
+owner = "UNKNOWN"
+source_handles = ["I7.12–I7.13"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "skill brevity, ambiguity and cross-route scenario tests"
+
+[[requirement]]
+id = "ARCH-WDG-01"
+class = "Contract"
+decision = "Independent supervision"
+owner = "UNKNOWN"
+source_handles = ["I1", "I8"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "Watchdog sees daemon failure via independent route"
+
+[[requirement]]
+id = "ARCH-WDG-02"
+class = "Contract"
+decision = "Watchdog supervises preservation of declared intent, observable outcomes, security and recovery"
+owner = "UNKNOWN"
+source_handles = ["I8.4–I8.8"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "missing hooks/bypass/injection becomes evidence-backed signal"
+
+[[requirement]]
+id = "ARCH-DRM-01"
+class = "Invariant"
+decision = "Dreamer is an AI service, not an owner or authority"
+owner = "UNKNOWN"
+source_handles = ["I9.1–I9.7"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "Dreamer result remains candidate; no direct write"
+
+[[requirement]]
+id = "ARCH-DRM-02"
+class = "Contract"
+decision = "Dreamer expands hypothesis space and orientation"
+owner = "UNKNOWN"
+source_handles = ["I9.3–I9.7"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "orientation/research output preserves rivals and unknowns"
+
+[[requirement]]
+id = "ARCH-DRM-03"
+class = "Contract"
+decision = "Dreamer agents/swarm are human-governed by budget and policy"
+owner = "UNKNOWN"
+source_handles = ["I3.6", "I9.8–I9.10"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "denied over-budget/unapproved model or swarm launch"
+
+[[requirement]]
+id = "ARCH-DRM-04"
+class = "Invariant"
+decision = "Researcher acquires, Dreamer interprets, Governor governs"
+owner = "UNKNOWN"
+source_handles = ["I9.14", "I10"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "acquisition/synthesis/governance process separation"
+
+[[requirement]]
+id = "ARCH-ACT-01"
+class = "Contract"
+decision = "Effect defines impact and authority"
+owner = "UNKNOWN"
+source_handles = ["I6.3", "I6.6"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "deterministic impact classification and authority gate"
+
+[[requirement]]
+id = "ARCH-SWM-01"
+class = "Contract"
+decision = "Swarm is a bounded, context-minimal staged evidence pipeline"
+owner = "UNKNOWN"
+source_handles = ["I10.15", "I17", "I18.11", "I18.49"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "bounded context-minimal staged work units, durable evidence/disclosure lineage, exact introduction sets and no shared-chat/vote-as-proof control plane"
+
+[[requirement]]
+id = "ARCH-SWM-02"
+class = "Contract"
+decision = "Swarm coordination is durable, idempotent and epoch-fenced"
+owner = "UNKNOWN"
+source_handles = ["I10.15", "I14.6", "I18.11"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "agent/controller loss and idempotent reassignment"
+
+[[requirement]]
+id = "ARCH-LONG-01"
+class = "Invariant"
+decision = "Long work lives in durable state"
+owner = "UNKNOWN"
+source_handles = ["I10.15", "I14.6"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "restart/resume long job from checkpoint and durable graph"
+
+[[requirement]]
+id = "ARCH-FIN-01"
+class = "Invariant"
+decision = "Completion is proof-bearing; other finish states remain explicit"
+owner = "UNKNOWN"
+source_handles = ["I7.9", "I6.7", "I14.7"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "exact eight outcomes; only proof yields VERIFIED_COMPLETE"
+
+[[requirement]]
+id = "ARCH-HUM-01"
+class = "Invariant"
+decision = "Human keeps value authority and practical control"
+owner = "UNKNOWN"
+source_handles = ["I3", "I11"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "Human can observe/intervene without per-action micromanagement"
+
+[[requirement]]
+id = "ARCH-SEC-01"
+class = "Invariant"
+decision = "Assume compromise; preserve control and recovery"
+owner = "UNKNOWN"
+source_handles = ["I8", "I15", "I15.18"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "injected/compromised component and over-broad disclosure/capability surface are contained, revocable and recoverable"
+
+[[requirement]]
+id = "ARCH-SEC-02"
+class = "Invariant"
+decision = "One governed canonical transition path"
+owner = "UNKNOWN"
+source_handles = ["I5", "I15.8"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "direct DB path absent/detected; one canonical receipt path"
+
+[[requirement]]
+id = "ARCH-SEC-03"
+class = "Invariant"
+decision = "Influence remains origin-bound and revocable"
+owner = "UNKNOWN"
+source_handles = ["I5.26", "I12.20", "I15.5–I15.7", "I15.18"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "backward influence and disclosure revocation, declassification evidence and clean restore"
+
+[[requirement]]
+id = "ARCH-SEC-04"
+class = "Invariant"
+decision = "Model output remains candidate until governed transition"
+owner = "UNKNOWN"
+source_handles = ["I9", "I12.3", "I15.6"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "model output cannot promote itself"
+
+[[requirement]]
+id = "ARCH-PRIV-01"
+class = "Contract"
+decision = "Erasure propagates and is not undone by restore"
+owner = "UNKNOWN"
+source_handles = ["I5.14", "I5.26", "I15.14", "I15.18"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "purge/disclosure closure across projections, ORS, backup, provider and model routes without resurrection"
+
+[[requirement]]
+id = "ARCH-RES-01"
+class = "Invariant"
+decision = "Fail locally, recover globally"
+owner = "UNKNOWN"
+source_handles = ["I1", "I13", "I14"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "local process/module failure preserves independent work"
+
+[[requirement]]
+id = "ARCH-RES-02"
+class = "Contract"
+decision = "Self-repair is bounded and verified"
+owner = "UNKNOWN"
+source_handles = ["I8.12", "I13.9–I13.11", "I14.14"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "bounded repair attempts then quarantine/escalation"
+
+[[requirement]]
+id = "ARCH-RES-03"
+class = "Invariant"
+decision = "Restore/migration cannot resurrect invalid state"
+owner = "UNKNOWN"
+source_handles = ["I5.13", "I12.20", "I15.14"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "restore issues new epochs and respects purge/revocation"
+
+[[requirement]]
+id = "ARCH-ORD-01"
+class = "Invariant"
+decision = "Parallel where independent; ordered where causal"
+owner = "UNKNOWN"
+source_handles = ["I5.7", "I14.8"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "independent scopes concurrent; conflicting scopes ordered"
+
+[[requirement]]
+id = "ARCH-OBS-01"
+class = "Invariant"
+decision = "Logs, metrics, audit and reports are distinct"
+owner = "UNKNOWN"
+source_handles = ["I16", "I18.47"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "separate production evidence, measurement, audit, reports and evaluator integrity"
+
+[[requirement]]
+id = "ARCH-RES-04"
+class = "Invariant"
+decision = "Degradation is visible and local"
+owner = "UNKNOWN"
+source_handles = ["I7.10", "I14.4–I14.12"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "degraded capability visible and only dependent effect blocked"
+
+[[requirement]]
+id = "ARCH-RES-05"
+class = "Contract"
+decision = "Recovery produces reusable knowledge"
+owner = "UNKNOWN"
+source_handles = ["I13.9–I13.11", "I14.25", "I12.24"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "recovery outcome produces evidence-backed failure/repair/improvement candidate"
+
+[[requirement]]
+id = "ARCH-LEARN-01"
+class = "Invariant"
+decision = "Learning changes external inheritance through grounded outcomes"
+owner = "UNKNOWN"
+source_handles = ["I12.18–I12.24", "I12.30"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "grounded outcome changes external epistemic/procedural/meta inheritance through governed candidates"
+
+[[requirement]]
+id = "ARCH-META-01"
+class = "Contract"
+decision = "Self-improvement is advisory, isolated, evidence-driven and falsifiable"
+owner = "UNKNOWN"
+source_handles = ["I12.21", "I12.24", "I17", "I18.12", "I18.47"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "improvement remains outcome-linked, isolated, advisory/experimental, evaluator-scoped, replayed, canaried and rollbackable; active generation does not rewrite itself"
+
+[[requirement]]
+id = "ARCH-ECON-01"
+class = "Contract"
+decision = "Cost is an authority boundary"
+owner = "UNKNOWN"
+source_handles = ["I3.6", "I9.8–I9.10", "I14.4"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "budget denial/checkpoint and disclosed route/cost"
+
+[[requirement]]
+id = "ARCH-DEV-02"
+class = "Contract"
+decision = "Depth grows through independently testable layers, edge proofs and Product Pulses"
+owner = "UNKNOWN"
+source_handles = ["I17", "I18", "I20"]
+support = "UNKNOWN"
+invalidation = []
+observable_proof = "capability depth added through independently testable modules, affected-edge proofs and Product Pulses while core intent/contracts remain"
+

@@ -1,48 +1,650 @@
 {
-  "schema_version": "eliot-external-audit-result-v1",
+  "schema_version": "eliot.bootstrap-work-result.v1",
   "authority_status": "EVIDENCE_ONLY",
-  "provider_id": "opencode-go",
-  "model_id": "ox-alpha-free",
-  "agent_profile": "plan",
-  "session_id": "ses_fccf606fcffeCw3AOMDCG4YIiu",
-  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
-  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
-  "result": {
-    "work_item_id": "W1-03",
-    "disposition": "ACCEPTED_WITH_LIMITATIONS",
-    "blocker_ledger": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md",
-    "ledger_cells": ["C0-12", "C0-13", "A-01", "A-03", "A-05", "G-03", "G-10"],
-    "cycles": [
-      "C0-12 <-> Q-01/consumers",
-      "A-01/A-03/A-05 <-> P-03",
-      "A-01 <-> C0-06"
+  "work_item_id": "W1-03",
+  "structured_result": {
+    "disposition": "completed",
+    "artifacts": [
+      {
+        "path": "swarm/inventory/acceptance-cycle.md",
+        "kind": "inventory",
+        "sha256": "741e05333ad07ce12f43eab8c67717432ac4f5ee7ddf2ec467c5c92396a15518"
+      },
+      {
+        "path": "swarm/decisions/W1-03-A01-RECOVERABLE-DEVIATION.md",
+        "kind": "decision",
+        "sha256": "20c4a3af643c719e0699d130e80c8695cf3d1e5582c094bd43949cb189c85418"
+      }
     ],
-    "minimum_vertex_cut_claim": {
-      "cells": ["C0-12", "A-01"],
-      "size": 2,
-      "status": "AUDITOR_HYPOTHESIS_NOT_EXECUTION_PROVEN"
+    "evidence": [
+      "Static content-bound acceptance graph generated from the seven-cell ledger; no runtime, provider, activation, or terminal proof is claimed."
+    ],
+    "discriminator_before": {
+      "name": "result-envelope-shape",
+      "value": "legacy W1-03 result fields were top-level",
+      "status": "observed"
     },
-    "staleness_findings": [
-      "The tracked ledger predates the current source revision and contains more cells than the seven named by the recovery program.",
-      "A DispatchPermit issuer is now present at crates/kernel/eliot-kernel-core/src/authority_controller.rs:472-504.",
-      "commit_canonical was found as a definition with zero callers in the audited source inventory."
+    "discriminator_after": {
+      "name": "result-envelope-shape",
+      "value": "eliot.bootstrap-work-result.v1 with rich structured_result",
+      "status": "verified"
+    },
+    "uncertainty": [
+      "The graph is a static acceptance/document graph; no Cargo, runtime, provider, or canonical-result execution evidence exists."
+    ],
+    "unresolved_questions": [
+      "Root must independently decide whether the proposed A-01 Recoverable Deviation is authorized; this artifact does not activate it."
+    ],
+    "proposed_effects": [
+      "If separately authorized, only the typed A-01 pre-execution PLAN_GAP/UNAVAILABLE boundary may change; no product source is changed here."
     ],
     "evidence_lineage": [
-      "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md",
-      "crates/kernel/eliot-kernel-core/src/authority_controller.rs:472-504",
-      "source-only search for commit_canonical callers"
-    ]
-  },
-  "integration_disposition": {
-    "accepted_findings": [
-      "The named blocker ledger exists and is tracked.",
-      "Its cycle analysis is stale against at least one current source anchor.",
-      "The proposed two-cell cut is useful only as a revalidation hypothesis."
+      {
+        "path": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md",
+        "sha256": "1ea03c0ac5ee46abaa2201589c5c8356f1ef23550b5696cf3312b85e9aebeefb",
+        "role": "paused-cell ledger"
+      },
+      {
+        "path": "docs/tasks/RECOVERY_PROGRAM_v1.md",
+        "sha256": "688c8f947a52f81ccdb204f0390fa6ef9c7930c6ccc72aa6cabb3070b9c3bd0a",
+        "role": "tracked recovery program §5.2"
+      },
+      {
+        "path": "docs/ARCHITECTURE_CONTRACT.md",
+        "sha256": "5f2ce7992e027847c678544261482e5e89aaa7a8a6a468c35aaa1d8df711e386",
+        "role": "repository architecture contract; W0 verifier input"
+      },
+      {
+        "path": "docs/normative/ELIOT_ARCHITECTURE.md",
+        "sha256": "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8",
+        "role": "repository normative Architecture projection; W0 verified"
+      },
+      {
+        "path": "docs/normative/ELIOT_IMPLEMENTATION.md",
+        "sha256": "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b",
+        "role": "repository normative Implementation projection; W0 verified"
+      },
+      {
+        "path": "docs/normative/INDEX.md",
+        "sha256": "75832cc59f8267e788757112ab6e7a6d8be723e48907c8508bd99f5185384465",
+        "role": "repository normative index projection; W0 verified"
+      },
+      {
+        "path": "docs/normative/README.md",
+        "sha256": "73fe1441d1629ff7abda3929eea2f32333d452b60f92f86eb3d87acb6a948b2c",
+        "role": "repository normative README projection; W0 verified"
+      },
+      {
+        "path": "docs/normative/PROJECTION_NOTICE.md",
+        "sha256": "51f836c9be9fff478cf0472cfe17669a19e45a7ae093c4ae082eb19386820224",
+        "role": "repository normative projection notice; W0 verified"
+      },
+      {
+        "path": "docs/normative/projection-manifest.tsv",
+        "sha256": "1d280b15b5acb99bfc0e1e2a6c4dab669a0d5d9967191383d4e3ea9d04e8db1c",
+        "role": "repository normative projection manifest; W0 verifier input"
+      },
+      {
+        "path": "scripts/verify-normative.ps1",
+        "sha256": "b960ed2f487ddbcaa827ca525d152643f10acb630034c8040b4af7897b252363",
+        "role": "W0 normative verification chain"
+      }
     ],
-    "rejected_or_deferred_proposals": [
-      "Do not use the historical ledger as current execution truth without rebuilding it from the current source graph.",
-      "Do not start W2 from the unverified minimum-cut claim."
+    "authority_ceiling": "EVIDENCE_ONLY; no terminal completion, release WIP, activation, or wave authorization.",
+    "authority_boundary": "Static content-bound acceptance graph evidence only.",
+    "canonical_terminal_work_update_claim": "NOT_CLAIMED",
+    "result_contract_status": "GLOBAL_RESULT_CONTRACT_UNRESOLVED",
+    "work_item_id": "W1-03",
+    "verdict": "PROPOSAL_ONLY_NOT_ACTIVATED",
+    "ledger_cells_exactly": [
+      "C0-12",
+      "C0-13",
+      "A-01",
+      "A-03",
+      "A-05",
+      "G-03",
+      "G-10"
     ],
-    "proof_ceiling": "source and tracked-ledger inventory only; no Cargo or runtime execution"
+    "source_documents": [
+      {
+        "path": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md",
+        "role": "paused-cell ledger",
+        "sha256": "1ea03c0ac5ee46abaa2201589c5c8356f1ef23550b5696cf3312b85e9aebeefb",
+        "anchors": [
+          {
+            "line": 9,
+            "needle": "### C0-12"
+          },
+          {
+            "line": 24,
+            "needle": "### C0-13"
+          },
+          {
+            "line": 39,
+            "needle": "### A-01 / A-03 / A-05"
+          },
+          {
+            "line": 52,
+            "needle": "### G-03"
+          },
+          {
+            "line": 65,
+            "needle": "### G-10"
+          }
+        ]
+      },
+      {
+        "path": "docs/tasks/RECOVERY_PROGRAM_v1.md",
+        "role": "tracked recovery program §5.2",
+        "sha256": "688c8f947a52f81ccdb204f0390fa6ef9c7930c6ccc72aa6cabb3070b9c3bd0a",
+        "anchors": [
+          {
+            "line": 461,
+            "needle": "### 5.2. "
+          }
+        ]
+      },
+      {
+        "path": "docs/ARCHITECTURE_CONTRACT.md",
+        "role": "repository architecture contract; W0 verifier input",
+        "sha256": "5f2ce7992e027847c678544261482e5e89aaa7a8a6a468c35aaa1d8df711e386",
+        "anchors": [
+          {
+            "line": 1,
+            "needle": "# Architecture authority"
+          },
+          {
+            "line": 10,
+            "needle": "| Authority | Canonical file | Revision | SHA-256 |"
+          }
+        ]
+      },
+      {
+        "path": "docs/normative/ELIOT_ARCHITECTURE.md",
+        "role": "repository normative Architecture projection; W0 verified",
+        "sha256": "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8",
+        "anchors": [
+          {
+            "line": 1,
+            "needle": "# ELIOT Architecture"
+          },
+          {
+            "line": 4,
+            "needle": "**Версия:** 4.5-draft"
+          }
+        ]
+      },
+      {
+        "path": "docs/normative/ELIOT_IMPLEMENTATION.md",
+        "role": "repository normative Implementation projection; W0 verified",
+        "sha256": "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b",
+        "anchors": [
+          {
+            "line": 1,
+            "needle": "# ELIOT Implementation"
+          },
+          {
+            "line": 4,
+            "needle": "**Версия:** 0.29-draft"
+          }
+        ]
+      },
+      {
+        "path": "docs/normative/INDEX.md",
+        "role": "repository normative index projection; W0 verified",
+        "sha256": "75832cc59f8267e788757112ab6e7a6d8be723e48907c8508bd99f5185384465",
+        "anchors": [
+          {
+            "line": 1,
+            "needle": "# ELIOT: предметный индекс"
+          }
+        ]
+      },
+      {
+        "path": "docs/normative/README.md",
+        "role": "repository normative README projection; W0 verified",
+        "sha256": "73fe1441d1629ff7abda3929eea2f32333d452b60f92f86eb3d87acb6a948b2c",
+        "anchors": [
+          {
+            "line": 1,
+            "needle": "# ELIOT: индекс документации"
+          }
+        ]
+      },
+      {
+        "path": "docs/normative/PROJECTION_NOTICE.md",
+        "role": "repository normative projection notice; W0 verified",
+        "sha256": "51f836c9be9fff478cf0472cfe17669a19e45a7ae093c4ae082eb19386820224",
+        "anchors": [
+          {
+            "line": 1,
+            "needle": "# Normative projection notice"
+          },
+          {
+            "line": 3,
+            "needle": "byte-for-byte projection"
+          }
+        ]
+      },
+      {
+        "path": "docs/normative/projection-manifest.tsv",
+        "role": "repository normative projection manifest; W0 verifier input",
+        "sha256": "1d280b15b5acb99bfc0e1e2a6c4dab669a0d5d9967191383d4e3ea9d04e8db1c",
+        "anchors": [
+          {
+            "line": 1,
+            "needle": "schema_version\teliot-normative-projection-v1"
+          },
+          {
+            "line": 3,
+            "needle": "authority_status\tNOT_AUTHORITY"
+          }
+        ]
+      },
+      {
+        "path": "scripts/verify-normative.ps1",
+        "role": "W0 normative verification chain",
+        "sha256": "b960ed2f487ddbcaa827ca525d152643f10acb630034c8040b4af7897b252363",
+        "anchors": [
+          {
+            "line": 14,
+            "needle": "$manifestPath"
+          },
+          {
+            "line": 128,
+            "needle": "NORMATIVE_VERIFY: PASS"
+          }
+        ]
+      }
+    ],
+    "provenance": {
+      "repository_architecture_contract": {
+        "path": "docs/ARCHITECTURE_CONTRACT.md",
+        "role": "repository architecture contract; W0 verifier input",
+        "sha256": "5f2ce7992e027847c678544261482e5e89aaa7a8a6a468c35aaa1d8df711e386",
+        "anchors": [
+          {
+            "line": 1,
+            "needle": "# Architecture authority"
+          },
+          {
+            "line": 10,
+            "needle": "| Authority | Canonical file | Revision | SHA-256 |"
+          }
+        ]
+      },
+      "repository_normative_projection_chain": {
+        "projection_files": [
+          {
+            "path": "docs/normative/ELIOT_ARCHITECTURE.md",
+            "role": "repository normative Architecture projection; W0 verified",
+            "sha256": "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8",
+            "anchors": [
+              {
+                "line": 1,
+                "needle": "# ELIOT Architecture"
+              },
+              {
+                "line": 4,
+                "needle": "**Версия:** 4.5-draft"
+              }
+            ]
+          },
+          {
+            "path": "docs/normative/ELIOT_IMPLEMENTATION.md",
+            "role": "repository normative Implementation projection; W0 verified",
+            "sha256": "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b",
+            "anchors": [
+              {
+                "line": 1,
+                "needle": "# ELIOT Implementation"
+              },
+              {
+                "line": 4,
+                "needle": "**Версия:** 0.29-draft"
+              }
+            ]
+          },
+          {
+            "path": "docs/normative/INDEX.md",
+            "role": "repository normative index projection; W0 verified",
+            "sha256": "75832cc59f8267e788757112ab6e7a6d8be723e48907c8508bd99f5185384465",
+            "anchors": [
+              {
+                "line": 1,
+                "needle": "# ELIOT: предметный индекс"
+              }
+            ]
+          },
+          {
+            "path": "docs/normative/README.md",
+            "role": "repository normative README projection; W0 verified",
+            "sha256": "73fe1441d1629ff7abda3929eea2f32333d452b60f92f86eb3d87acb6a948b2c",
+            "anchors": [
+              {
+                "line": 1,
+                "needle": "# ELIOT: индекс документации"
+              }
+            ]
+          },
+          {
+            "path": "docs/normative/PROJECTION_NOTICE.md",
+            "role": "repository normative projection notice; W0 verified",
+            "sha256": "51f836c9be9fff478cf0472cfe17669a19e45a7ae093c4ae082eb19386820224",
+            "anchors": [
+              {
+                "line": 1,
+                "needle": "# Normative projection notice"
+              },
+              {
+                "line": 3,
+                "needle": "byte-for-byte projection"
+              }
+            ]
+          }
+        ],
+        "manifest": {
+          "path": "docs/normative/projection-manifest.tsv",
+          "role": "repository normative projection manifest; W0 verifier input",
+          "sha256": "1d280b15b5acb99bfc0e1e2a6c4dab669a0d5d9967191383d4e3ea9d04e8db1c",
+          "anchors": [
+            {
+              "line": 1,
+              "needle": "schema_version\teliot-normative-projection-v1"
+            },
+            {
+              "line": 3,
+              "needle": "authority_status\tNOT_AUTHORITY"
+            }
+          ]
+        },
+        "verifier": {
+          "path": "scripts/verify-normative.ps1",
+          "role": "W0 normative verification chain",
+          "sha256": "b960ed2f487ddbcaa827ca525d152643f10acb630034c8040b4af7897b252363",
+          "anchors": [
+            {
+              "line": 14,
+              "needle": "$manifestPath"
+            },
+            {
+              "line": 128,
+              "needle": "NORMATIVE_VERIFY: PASS"
+            }
+          ]
+        },
+        "manifest_authority_status": "NOT_AUTHORITY",
+        "chain_claim": "W0_NORMATIVE_VERIFIER_ENFORCES_REPOSITORY_PROJECTION_AND_CONTRACT_HASHES"
+      },
+      "external_canonical_equality": "W0_NORMATIVE_VERIFIER_CHAIN_ONLY; NOT_REASSERTED_BY_W1-03",
+      "portable_binding": "REPOSITORY_RELATIVE_PATHS_ONLY; NO_EXTERNAL_CANONICAL_PATH_READ"
+    },
+    "inventory_document": {
+      "path": "swarm/inventory/acceptance-cycle.md",
+      "sha256": "741e05333ad07ce12f43eab8c67717432ac4f5ee7ddf2ec467c5c92396a15518"
+    },
+    "root_decision": {
+      "path": "swarm/decisions/W1-03-A01-RECOVERABLE-DEVIATION.md",
+      "sha256": "20c4a3af643c719e0699d130e80c8695cf3d1e5582c094bd43949cb189c85418",
+      "status": "ACCEPTED_RECOVERABLE_DEVIATION"
+    },
+    "nodes": [
+      {
+        "id": "C0-12",
+        "criterion": "Versioned, schema-bound security/disclosure/influence contract; fail-closed construction; provider-issued verifier, declassification, disclosure and selection evidence; Q-01 duplicate owner removed.",
+        "ledger_anchor": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:9-22"
+      },
+      {
+        "id": "C0-13",
+        "criterion": "Canonical-byte/revision-bound evaluation contract; provider-issued independent evidence; closed verdict/outcome matrix; exact fence/source/artifact/proof-ceiling bindings.",
+        "ledger_anchor": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:24-37"
+      },
+      {
+        "id": "A-01",
+        "criterion": "Admitted agent launch path with exact authority, freshness, integrity, taint, privacy, verifier, fence and effect checks; NARROW seals unit/scope/route; no raw launch bypass.",
+        "ledger_anchor": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:39-50"
+      },
+      {
+        "id": "A-03",
+        "criterion": "The A-03 member of the admitted-launch trio must use the same canonical admission and provider-issued execution boundary; no local authority surrogate.",
+        "ledger_anchor": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:39-50"
+      },
+      {
+        "id": "A-05",
+        "criterion": "The A-05 member of the admitted-launch trio must use the same canonical admission and provider-issued execution boundary; no local authority surrogate.",
+        "ledger_anchor": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:39-50"
+      },
+      {
+        "id": "G-03",
+        "criterion": "Owner-admitted TaskContract from TaskSelectionEvidence, WorkScope/project identity and source binding; verification bound to task revision/fence/artifact/freshness/proof ceiling; durable canonical lifecycle.",
+        "ledger_anchor": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:52-63"
+      },
+      {
+        "id": "G-10",
+        "criterion": "RequestMeta-bound asynchronous blueprint/registry with verifier-bound fresh readiness, complete route fingerprint, resolved bindings and exact Cargo integration.",
+        "ledger_anchor": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:65-76"
+      }
+    ],
+    "edges": [
+      {
+        "id": "E1",
+        "from": "C0-12",
+        "to": "C0-13",
+        "dependency_class": "proof/evidence",
+        "directness": "derived_provider_consumer_from_explicit_ledger_requirements",
+        "statement": "C0-13 cannot close independence and exact evidence bindings while canonical security/source-assurance evidence remains caller-mintable or duplicated.",
+        "evidence": [
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:17-20",
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:30-37",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:I7.27",
+          "docs/architecture/ELIOT_ARCHITECTURE.md:A5.5"
+        ]
+      },
+      {
+        "id": "E2",
+        "from": "C0-13",
+        "to": "G-03",
+        "dependency_class": "proof/evidence",
+        "directness": "derived_acceptance_binding_not_runtime_call_edge",
+        "statement": "G-03 verification acceptance needs the independent verdict, revision/fence, artifact and proof-ceiling bindings owned by C0-13.",
+        "evidence": [
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:30-37",
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:56-63",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:I7.9",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:I18.1"
+        ]
+      },
+      {
+        "id": "E3",
+        "from": "G-03",
+        "to": "A-01",
+        "dependency_class": "product",
+        "directness": "ledger_explicit_cross_cell_prerequisite",
+        "statement": "The admitted launch cannot seal task, work unit, scope and revision if G-03 has not supplied owner-admitted TaskContract and task evidence.",
+        "evidence": [
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:45-48",
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:56-58",
+          "docs/tasks/RECOVERY_PROGRAM_v1.md:432-440",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:I1.8"
+        ]
+      },
+      {
+        "id": "E4",
+        "from": "G-10",
+        "to": "A-01",
+        "dependency_class": "product",
+        "directness": "derived_route_readiness_prerequisite",
+        "statement": "A-01 NARROW launch decision needs registry-owned selected route, binding and readiness; G-10 lacks those provider-bound facts.",
+        "evidence": [
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:47-48",
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:69-74",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:I3.4",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:P.3"
+        ]
+      },
+      {
+        "id": "E5",
+        "from": "A-01",
+        "to": "C0-13",
+        "dependency_class": "proof/evidence",
+        "directness": "derived_candidate_to_independent_verdict",
+        "statement": "A-01 may produce only candidate launch/provider results; C0-13 is the independent-verdict boundary required before acceptance.",
+        "evidence": [
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:41-46",
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:31-37",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:I7.27",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:I7.9"
+        ]
+      },
+      {
+        "id": "E6",
+        "from": "A-03",
+        "to": "C0-13",
+        "dependency_class": "proof/evidence",
+        "directness": "derived_shared_trio_boundary",
+        "statement": "A-03 has no separate acceptance oracle; its result remains candidate evidence until C0-13 independent-verdict conditions hold.",
+        "evidence": [
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:39-50",
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:31-37",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:I18.1"
+        ]
+      },
+      {
+        "id": "E7",
+        "from": "A-05",
+        "to": "C0-13",
+        "dependency_class": "proof/evidence",
+        "directness": "derived_shared_trio_boundary",
+        "statement": "A-05 has no separate acceptance oracle; its result remains candidate evidence until C0-13 independent-verdict conditions hold.",
+        "evidence": [
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:39-50",
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:31-37",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:I18.1"
+        ]
+      },
+      {
+        "id": "E8",
+        "from": "G-10",
+        "to": "C0-12",
+        "dependency_class": "proof/evidence",
+        "directness": "derived_source_provenance_and_route_binding",
+        "statement": "G-10 readiness/provenance/route evidence must consume canonical security, source-assurance and disclosure semantics.",
+        "evidence": [
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:70-73",
+          "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:17-20",
+          "docs/architecture/ELIOT_ARCHITECTURE.md:A12.4",
+          "docs/architecture/ELIOT_IMPLEMENTATION.md:I7.27"
+        ]
+      }
+    ],
+    "external_dependencies_not_nodes": [
+      {
+        "consumer": "C0-12",
+        "provider": "Q-01",
+        "kind": "product/proof",
+        "evidence": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:19-22"
+      },
+      {
+        "consumer": "A-01",
+        "provider": "P-03",
+        "kind": "product",
+        "evidence": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:45-50"
+      },
+      {
+        "consumer": "A-01",
+        "provider": "C0-06",
+        "kind": "product/proof",
+        "evidence": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:46-50"
+      },
+      {
+        "consumer": "A-01",
+        "provider": "C0-07",
+        "kind": "proof",
+        "evidence": "reports/audit/ELIOT_IMPLEMENTATION_BLOCKERS_20260814.md:47-50"
+      }
+    ],
+    "strongly_connected_components": [
+      {
+        "nodes": [
+          "A-01",
+          "C0-13",
+          "G-03"
+        ],
+        "witness_cycle": [
+          "C0-13",
+          "G-03",
+          "A-01",
+          "C0-13"
+        ],
+        "interpretation": "one mixed product/proof SCC; acceptance deadlock, not an executed runtime cycle"
+      },
+      {
+        "nodes": [
+          "C0-12"
+        ],
+        "interpretation": "singleton in the seven-cell internal graph; external Q-01 closure remains outside"
+      },
+      {
+        "nodes": [
+          "A-03"
+        ],
+        "interpretation": "singleton; shared-trio candidate evidence only"
+      },
+      {
+        "nodes": [
+          "A-05"
+        ],
+        "interpretation": "singleton; shared-trio candidate evidence only"
+      },
+      {
+        "nodes": [
+          "G-10"
+        ],
+        "interpretation": "singleton; feeds A-01 and C0-12 with no evidenced return edge"
+      }
+    ],
+    "minimum_cut": {
+      "scope": "seven-cell internal graph only",
+      "cut_type": "minimum vertex cut that breaks the witness SCC",
+      "size": 1,
+      "equal_minimum_cuts": [
+        [
+          "A-01"
+        ],
+        [
+          "C0-13"
+        ],
+        [
+          "G-03"
+        ]
+      ],
+      "selected_cut_for_proposal": [
+        "A-01"
+      ],
+      "selected_cut_for_deviation": [
+        "A-01"
+      ],
+      "edge_cut_alternatives": [
+        [
+          "E2"
+        ],
+        [
+          "E3"
+        ],
+        [
+          "E5"
+        ]
+      ]
+    },
+    "recoverable_deviation": {
+      "status": "ACCEPTED_RECOVERABLE_DEVIATION",
+      "cell": "A-01",
+      "owner": "Root / Sol for the deviation decision; Luna-A / Integration Owner for any later bounded execution",
+      "reason": "Break only the internal acceptance SCC at the launch consumer while provider evidence is unavailable; accepting the deviation does not satisfy A-01 acceptance.",
+      "scope": "A-01 pre-execution typed PLAN_GAP/UNAVAILABLE candidate only; A-03 and A-05 remain blocked.",
+      "review_condition": "Independently executed provider-issued P-03 and C0-06 evidence plus the unchanged A-01/A-03/A-05 trio gate.",
+      "rollback": "Revoke this proposal, restore normal A-01 admission, retain negative evidence, and rerun graph/trio checks."
+    },
+    "proof_ceiling": "Static content-bound ledger/document graph only; no Cargo, runtime, provider, or canonical-result execution proof."
   }
 }

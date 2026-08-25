@@ -1,52 +1,172 @@
 {
-  "schema_version": "eliot-external-audit-result-v1",
+  "schema_version": "eliot.bootstrap-work-result.v1",
   "authority_status": "EVIDENCE_ONLY",
-  "provider_id": "opencode-go",
-  "model_id": "ox-alpha-free",
-  "agent_profile": "plan",
-  "session_id": "ses_fccfbec6bffeJF33pz7OdKurJx",
-  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
-  "result": {
+  "work_item_id": "W1-07",
+  "structured_result": {
+    "disposition": "completed",
+    "schema_version": "eliot-composition-root-audit-result-v3",
+    "authority_status": "EVIDENCE_ONLY",
     "work_item_id": "W1-07",
-    "disposition": "ACCEPTED_WITH_LIMITATIONS",
-    "bin_target_count": 22,
-    "classification": {
-      "structurally_reachable_success": 14,
-      "typed_refusal_or_no_core_success": 6,
-      "test_only": 2,
-      "unresolved": 0
+    "provider_id": "codex-luna-w1-07",
+    "agent_profile": "implementation",
+    "artifacts": [
+      {
+        "path": "swarm/inventory/composition-roots.json",
+        "sha256": "ce03fda3474277959415b1035a064964ff453a05f4d332179b1d147ced497a44",
+        "kind": "inventory"
+      }
+    ],
+    "evidence": [
+      "Static Cargo-metadata composition-root census with source anchors, call-chain witnesses, falsifiers, and canonical commit census; no live runtime PASS is claimed."
+    ],
+    "discriminator_before": {
+      "name": "result-envelope-shape",
+      "value": "legacy W1-07 result fields were top-level",
+      "status": "observed"
     },
-    "refusal_roots": [
-      "eliot-native-worker",
+    "discriminator_after": {
+      "name": "result-envelope-shape",
+      "value": "eliot.bootstrap-work-result.v1 with rich structured_result",
+      "status": "verified"
+    },
+    "uncertainty": [
+      "Classification is static source reachability evidence; it is not live runtime execution or product acceptance."
+    ],
+    "unresolved_questions": [
+      "No cutover or architecture decision is made by this registry; the W1 ContractChallenge remains evidence-only."
+    ],
+    "proposed_effects": [
+      "Any future cutover or runtime repair requires a separately admitted work item and independent gate; this artifact changes no product code."
+    ],
+    "evidence_lineage": [
+      {
+        "path": "swarm/inventory/composition-roots.json",
+        "sha256": "ce03fda3474277959415b1035a064964ff453a05f4d332179b1d147ced497a44",
+        "role": "generated composition-root registry"
+      }
+    ],
+    "authority_ceiling": "EVIDENCE_ONLY; no terminal completion, release WIP, activation, or wave authorization.",
+    "registry": {
+      "path": "swarm/inventory/composition-roots.json",
+      "generator": "scripts/gen-composition-roots.ps1",
+      "verifier": "scripts/verify-composition-roots.ps1",
+      "schema_version": "eliot-composition-root-registry-v2",
+      "cargo_metadata_target_count": 22,
+      "target_set_digest": "bc000e30676905f3c8854970fc47554ca74a8acdf6c0815f069b8a333116fd59",
+      "registry_sha256": "ce03fda3474277959415b1035a064964ff453a05f4d332179b1d147ced497a44"
+    },
+    "classification": {
+      "useful_work": 16,
+      "typed_refusal": 5,
+      "idle_only": 1,
+      "unknown": 0
+    },
+    "recovery_program_5_1": [
+      {
+        "target": "eliot-agent-bridge",
+        "classification": "typed_refusal",
+        "anchor": "bins/eliot-agent-bridge/src/main.rs:65, bins/eliot-agent-bridge/src/lib.rs:451, bins/eliot-agent-bridge/src/lib.rs:457, bins/eliot-agent-bridge/src/main.rs:155, bins/eliot-agent-bridge/src/main.rs:93",
+        "finding": "kernel_ports reaches KernelClient::load/probe and unconditionally returns KernelAdmissionRequired before stdin loop",
+        "falsifier": "kernel_ports has a reachable Ok branch that supplies admitted ports and main enters the request loop"
+      },
+      {
+        "target": "eliot-dreamer",
+        "classification": "typed_refusal",
+        "anchor": "bins/eliot-dreamer/src/main.rs:17, bins/eliot-dreamer/src/main.rs:25",
+        "finding": "both connect branches produce an error response and ExitCode 78; the Ok branch is also KernelAdmissionRequired",
+        "falsifier": "the Ok(connect()) branch constructs a usable admitted job port and a success exit path"
+      },
+      {
+        "target": "eliot-doctor",
+        "classification": "typed_refusal",
+        "anchor": "bins/eliot-doctor/src/main.rs:15",
+        "finding": "main emits the Kernel admission refusal and unconditionally exits 78",
+        "falsifier": "main has any reachable branch that performs a diagnostic operation and returns success"
+      },
+      {
+        "target": "eliotd",
+        "classification": "idle_only",
+        "anchor": "bins/eliotd/src/main.rs:61, bins/eliotd/src/main.rs:158, bins/eliotd/src/main.rs:160, bins/eliotd/src/main.rs:161, bins/eliotd/src/main.rs:165, bins/eliotd/src/main.rs:166",
+        "finding": "run_loop selects only ctrl_c and five-second Kernel health; no task/submission ingress is wired",
+        "falsifier": "run_loop gains a reachable task/admission/submission input path beyond ctrl_c and health"
+      }
+    ],
+    "additional_findings": [
+      {
+        "target": "eliot-native-worker",
+        "classification": "typed_refusal",
+        "anchor": "bins/eliot-native-worker/src/main.rs:8-15",
+        "finding": "KernelNativeWorkerClient::connect cannot yield a session-bound process request; main emits typed refusal and exits 78"
+      },
+      {
+        "target": "eliot-wasm-host",
+        "classification": "typed_refusal",
+        "anchor": "bins/eliot-wasm-host/src/main.rs:30-35",
+        "finding": "after argument parsing, main unconditionally emits KERNEL_ADMISSION_REQUIRED and exits"
+      },
+      {
+        "target": "eliot-testd",
+        "classification": "useful_work",
+        "anchor": "bins/eliot-testd/src/main.rs:53 and :98",
+        "finding": "main reaches Ready, stdin dispatch, Status and Cancel; only Submit is bound to UnavailableProcessIssuer and is typed unavailable",
+        "predicate": "reachable_effect_partial_refusal",
+        "refusal_scope": "Submit only"
+      }
+    ],
+    "all_targets": [
+      "eliot",
+      "eliot-agent-bridge",
+      "eliot-campaign-executor",
+      "eliot-credential-suite-guard",
       "eliot-doctor",
       "eliot-dreamer",
+      "eliot-governor",
+      "eliot-host",
+      "eliot-kernel",
+      "eliot-live-canary",
+      "eliot-mod-research",
+      "eliot-native-worker",
+      "eliot-notify",
+      "eliot-opencode-bootstrap",
+      "eliot-process-guardian",
+      "eliot-runtime-compiler",
+      "eliot-store-surreal",
+      "eliot-testd",
+      "eliot-user-broker",
       "eliot-wasm-host",
-      "eliot-agent-bridge",
-      "eliot-testd core submit path"
+      "eliot-watchdog",
+      "eliotd"
     ],
-    "test_only_roots": [
-      "eliot-credential-suite-guard",
-      "eliot-process-guardian"
-    ],
-    "uncertainty": "Static reachable success is not a live observed PASS. eliot-testd has a live transport/readiness loop but its core submit capability is a typed refusal, so its bucket is purpose-dependent.",
-    "evidence_lineage": [
-      "cargo metadata --no-deps --format-version 1",
-      "22 bin entrypoint source inventories",
-      "scripts/run-isolated-tests.ps1:330-331",
-      "docs/normative/ELIOT_ARCHITECTURE.md:2501-2523",
-      "docs/normative/ELIOT_IMPLEMENTATION.md:293"
-    ]
-  },
-  "integration_disposition": {
-    "accepted_findings": [
-      "The recovery program's count 21 is stale; current metadata has 22 bin targets.",
-      "Six roots lack a structurally reachable core success path under the stated discriminator.",
-      "Two guard binaries are test-harness roots."
-    ],
-    "deferred": [
-      "No reachable-success root is CURRENT_VERIFIED without runtime evidence.",
-      "No packaging or cutover decision follows from this inventory alone."
-    ],
-    "proof_ceiling": "static composition-root inventory only"
+    "verification": {
+      "kind": "structured_evidence_only",
+      "result": "PASS",
+      "commands": [
+        "pwsh -NoProfile -File scripts/gen-composition-roots.ps1 -Check",
+        "pwsh -NoProfile -File scripts/verify-composition-roots.ps1 -SelfTest",
+        "pwsh -NoProfile -File scripts/verify-composition-roots.ps1"
+      ],
+      "self_tests": [
+        "synthetic tamper rejected",
+        "synthetic missing target rejected",
+        "synthetic duplicate target rejected",
+        "classification/predicate mismatch rejected",
+        "omitted commit_canonical caller rejected",
+        "cached plus nonignored-untracked Rust census enforced",
+        "CRLF fixture distinguished from canonical LF"
+      ],
+      "proof_ceiling": "static composition-root reachability; no live runtime PASS claim; no TerminalWorkUpdate claim"
+    },
+    "integration_disposition": {
+      "accepted_findings": [
+        "Current cargo metadata census is 22 binary targets, not the historical 21.",
+        "Every target has a checked manifest/main/call-chain witness, gate condition, effect boundary and falsifier.",
+        "The registry-wide canonical commit invariant records one workspace-Rust definition and zero callers."
+      ],
+      "deferred": [
+        "No cutover or architecture decision is made by this registry.",
+        "Static useful_work is not a live observed PASS.",
+        "The W1 result-envelope ContractChallenge remains open; this artifact is evidence only."
+      ]
+    }
   }
 }
