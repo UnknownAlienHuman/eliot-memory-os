@@ -73,6 +73,7 @@ try {
 
     $steps = @(
         [pscustomobject]@{ Id = 'modules-generated-bytes'; Description = 'fresh W1-01 generation is byte-identical to modules.json' },
+        [pscustomobject]@{ Id = 'modules-envelope-check'; Description = 'W1-01 generator owns an exact inventory plus evidence envelope pair' },
         [pscustomobject]@{ Id = 'modules-selftest'; Description = 'W1-01 independent verifier mutation fixtures' },
         [pscustomobject]@{ Id = 'refusals-selftest'; Description = 'W1-02 independent verifier mutation fixtures' },
         [pscustomobject]@{ Id = 'conformance-generator-selftest'; Description = 'W1-04 generator mutation fixtures' },
@@ -80,6 +81,7 @@ try {
         [pscustomobject]@{ Id = 'contour-generator-selftest'; Description = 'W1-05 generator mutation fixtures' },
         [pscustomobject]@{ Id = 'contour-verifier-selftest'; Description = 'W1-05 independent oracle mutation fixtures' },
         [pscustomobject]@{ Id = 'premises-generated-bytes'; Description = 'fresh W1-06 generation is byte-identical to premises inventory' },
+        [pscustomobject]@{ Id = 'premises-envelope-check'; Description = 'W1-06 generator owns an exact inventory plus evidence envelope pair' },
         [pscustomobject]@{ Id = 'premises-verifier-selftest'; Description = 'W1-06 independent oracle mutation fixtures' },
         [pscustomobject]@{ Id = 'composition-verifier-selftest'; Description = 'W1-07 independent oracle mutation fixtures' },
         [pscustomobject]@{ Id = 'acceptance-cycle-selftest'; Description = 'W1-03 repository binding and digest mutation fixtures' },
@@ -112,16 +114,18 @@ try {
     Write-Output "ELIOT_W1_VERIFY_PROFILE=$ProfileVersion"
     Write-Output "W1_VERIFY_ROOT=$repoRoot"
 
-    Invoke-NativeStep 'modules-generated-bytes' $pwsh @('-NoProfile', '-File', $paths.GenModules, '-OutputPath', $tempModules)
+    Invoke-NativeStep 'modules-generated-bytes' $pwsh @('-NoProfile', '-File', $paths.GenModules, '-OutputPath', $tempModules, '-InventoryOnly')
     Assert-SameFile 'modules-generated-bytes' $paths.ModulesInventory $tempModules
+    Invoke-NativeStep 'modules-envelope-check' $pwsh @('-NoProfile', '-File', $paths.GenModules, '-Check')
     Invoke-NativeStep 'modules-selftest' $pwsh @('-NoProfile', '-File', $paths.VerifyModules, '-SelfTest')
     Invoke-NativeStep 'refusals-selftest' $pwsh @('-NoProfile', '-File', $paths.VerifyRefusals, '-SelfTest')
     Invoke-NativeStep 'conformance-generator-selftest' $pwsh @('-NoProfile', '-File', $paths.GenConformance, '-SelfTest')
     Invoke-NativeStep 'conformance-verifier-selftest' $pwsh @('-NoProfile', '-File', $paths.VerifyConformance, '-SelfTest')
     Invoke-NativeStep 'contour-generator-selftest' $pwsh @('-NoProfile', '-File', $paths.GenContour, '-SelfTest')
     Invoke-NativeStep 'contour-verifier-selftest' $pwsh @('-NoProfile', '-File', $paths.VerifyContour, '-SelfTest')
-    Invoke-NativeStep 'premises-generated-bytes' $pwsh @('-NoProfile', '-File', $paths.GenPremises, '-OutputPath', $tempPremises)
+    Invoke-NativeStep 'premises-generated-bytes' $pwsh @('-NoProfile', '-File', $paths.GenPremises, '-OutputPath', $tempPremises, '-InventoryOnly')
     Assert-SameFile 'premises-generated-bytes' $paths.PremisesInventory $tempPremises
+    Invoke-NativeStep 'premises-envelope-check' $pwsh @('-NoProfile', '-File', $paths.GenPremises, '-Check')
     Invoke-NativeStep 'premises-verifier-selftest' $pwsh @('-NoProfile', '-File', $paths.VerifyPremises, '-SelfTest')
     Invoke-NativeStep 'composition-verifier-selftest' $pwsh @('-NoProfile', '-File', $paths.VerifyComposition, '-SelfTest')
     Invoke-NativeStep 'acceptance-cycle-selftest' $pwsh @('-NoProfile', '-File', $paths.VerifyAcceptance, '-SelfTest')

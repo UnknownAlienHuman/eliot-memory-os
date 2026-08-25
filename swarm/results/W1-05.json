@@ -6,11 +6,70 @@
     "schema_version": "eliot-w1-05-result-v4",
     "authority_status": "EVIDENCE_ONLY",
     "work_item_id": "W1-05",
-    "observed_worktree_state": "DIRTY_CONCURRENT_CHANGES_OUTSIDE_OWNERSHIP",
+    "disposition": "EVIDENCE_ONLY",
+    "artifacts": {
+      "inventory": {
+        "path": "swarm/inventory/contour-cut.json",
+        "sha256": "4D51AD27885F4A5FAE20668383EA7A09E4199AA642DF8D87E9AC857EE1B3AFFD"
+      },
+      "generator": {
+        "path": "scripts/gen-contour-cut.ps1",
+        "sha256": "3EC1004D94363A5A3D76FA7EABEECB7BE0971E6B765645FBEAA831FB2C71F8B6"
+      },
+      "verifier": {
+        "path": "scripts/verify-contour-cut.ps1",
+        "sha256": "BEE22C5536E832F3423391F2B1EA246419CAED9DDC081357E581B589600ECBD7"
+      },
+      "generator_sha256": "3EC1004D94363A5A3D76FA7EABEECB7BE0971E6B765645FBEAA831FB2C71F8B6",
+      "verifier_sha256": "BEE22C5536E832F3423391F2B1EA246419CAED9DDC081357E581B589600ECBD7",
+      "inventory_sha256": "4D51AD27885F4A5FAE20668383EA7A09E4199AA642DF8D87E9AC857EE1B3AFFD"
+    },
+    "evidence": [
+      "content-bound path plus byte source census",
+      "observational Git category fields",
+      "full-envelope and per-family tamper verification"
+    ],
+    "discriminator_before": {
+      "status": "TEMPLATE_CONTROLLED_RESULT_REJECTED",
+      "reason": "Generic evidence fields were inherited from the previous result file"
+    },
+    "discriminator_after": {
+      "status": "FULL_FROM_ZERO_RESULT",
+      "content_bound": true,
+      "categories_observational": true
+    },
+    "uncertainty": "Static declared-grammar census only; no runtime liveness or cutover authority.",
+    "unresolved_questions": [
+      "Runtime invocation and authenticated contour join remain unproven",
+      "Root cutover decision remains pending"
+    ],
+    "proposed_effects": [
+      "Preserve EVIDENCE_ONLY",
+      "Do not select cutover"
+    ],
+    "evidence_lineage": {
+      "program_authority": {
+        "path": "swarm/decisions/W1-RESULT-ENVELOPE-PROGRAM-REVISION-v1.3.md",
+        "sha256": "CEF38CB93BBE2093443E63D9DFA1A80B4F7AFF5F47FE9F5995678FEF13260AA8"
+      },
+      "challenge": {
+        "path": "swarm/challenges/W1-05-MECHANISM-REVIEW.md",
+        "sha256": "61114FEF7C1AC8510B5CC25D3AD50A915B0D14CF0F01A78A6437DD11722A0803"
+      },
+      "inventory": {
+        "path": "swarm/inventory/contour-cut.json",
+        "sha256": "4D51AD27885F4A5FAE20668383EA7A09E4199AA642DF8D87E9AC857EE1B3AFFD"
+      }
+    },
+    "observed_worktree_state": "CONTENT_BOUND_SOURCE_UNION; GIT_CATEGORIES_OBSERVATIONAL_ONLY",
     "mechanism_review": {
       "path": "swarm/challenges/W1-05-MECHANISM-REVIEW.md",
       "sha256": "61114FEF7C1AC8510B5CC25D3AD50A915B0D14CF0F01A78A6437DD11722A0803",
       "status": "LINKED"
+    },
+    "program_authority": {
+      "path": "swarm/decisions/W1-RESULT-ENVELOPE-PROGRAM-REVISION-v1.3.md",
+      "sha256": "CEF38CB93BBE2093443E63D9DFA1A80B4F7AFF5F47FE9F5995678FEF13260AA8"
     },
     "changed_files": [
       "scripts/gen-contour-cut.ps1",
@@ -93,7 +152,7 @@
           "canonical-write-symbol": 1
         },
         "provenance": "content_bound_path_plus_bytes",
-        "rust_files_sha256": "7582B139A37872178158AA035C9A12155114C3ADB815B63405AFCA0F2B83E546"
+        "rust_files_sha256": "3DA6A0819BF0B6B2FAB416B3EA4B7B544CF32B5C8AE65C0E5DC41DA9AEE5B9FD"
       },
       "edge_class_counts": {
         "canonical_write_definition": 1,
@@ -210,18 +269,18 @@
         "status": "VERIFIED_ONE_DEFINITION_ZERO_CALLERS"
       },
       "inventory_summary_sha256": "799F8CFE73A6BBC1F9805E21B033DF960D49BB418DB23CF4B90A72DBB56801D4",
-      "source_scan_sha256": "695F0A67A6C9497D6C85D058C926C853F06D27E249FDF12D89A3471373D8556B",
+      "source_scan_sha256": "E2DEDDF9C2C7E6027DA2E1090FD915280C67123B6DC2FA40017FB946E6D218BC",
       "canonical_write_proof_sha256": "906131F43C3E0643E3BC78C3783CE6E90AE02D501ED73D1C3249B0F9FD633FD1",
       "regression_fixtures_sha256": "5432291D8A66B39F1F1BC711C579C2DBE73F25EB5B2F0A0376E033F7B8664864",
       "cutover_decision": "PENDING_ROOT"
     },
     "findings": [
-      "The third-attempt mechanism scans the deterministic union of 546 Git-cached and 0 non-ignored-untracked Rust files by direct file reads; it claims completeness only for the 18 declared motifs over that current file set, never semantic/runtime exhaustiveness.",
+      "The full-from-zero mechanism scans the deterministic union of 546 Git-cached and 0 non-ignored-untracked Rust files by direct file reads; it claims completeness only for the 18 declared motifs over that current file set, never semantic/runtime exhaustiveness.",
       "Dynamic and qualified process constructors are emitted with exact local target resolution when available and UNKNOWN_PROCESS_TARGET otherwise. Windows suspended-job wrappers, process-executor symbols, Windows CreateProcess APIs, Tokio/Std/qualified constructors, and named-pipe client/server/transport/authentication operations are represented.",
       "Regression rows include workspace/tools/eliot-runtime-compiler/src/lib.rs:3222, bins/eliot-mod-research/src/lib.rs:72, bins/eliot-host/src/lib.rs:5197, crates/instrument/eliot-process-executor/src/lib.rs:478, crates/eliot-app/src/runtime_bootstrap.rs:71, and the cached bins/eliot/tests/bootstrap_brief.rs fixture.",
       "The bins/eliot/src/main.rs:604 legacy eliot-governor.exe coexistence check is negative_observation/non_join, not a launch/control join. Other legacy/process-state observations are likewise non-join evidence.",
       "schema_version remains schema_observation only; write_receipt/write_receipt_by_id remains unknown state-write evidence; GovernorConfig roles remain import/parse/type_reference and never imply runtime join.",
-      "Exact §5.1 proof over the cached plus non-ignored-untracked Rust union is one commit_canonical definition in governor composition and zero callers; the independent verifier recomputes anchors and tamper-tests this proof.",
+      "Exact §5.1 proof over the cached plus non-ignored-untracked Rust union is one commit_canonical definition at crates/governor/eliot-governor/src/composition.rs:1292 and zero callers; the independent verifier recomputes anchors and tamper-tests this proof.",
       "No cutover A, B, or C is selected; §5.2 decision authority remains Root."
     ],
     "verification": [
@@ -236,61 +295,11 @@
       "The source census is complete only for the declared grammar over the current cached plus non-ignored-untracked Rust union; it is not a semantic/runtime call graph.",
       "Dynamic targets and IPC endpoints remain UNKNOWN unless exact local evidence resolves them; package names, imports, wrappers, and symbols do not imply a runtime connection.",
       "Proof ceiling excludes runtime liveness, authenticated invocation traces, signed bundle validation, parity, Product Pulse, and cutover selection.",
-      "The worktree contains concurrent changes outside W1-05 ownership; this envelope records the observed revision and artifact hashes only."
+      "Git category and concurrent-worktree observations are non-authoritative; this envelope binds current source bytes, explicit policy constants, and artifact hashes only."
     ],
     "external_routing_evidence": [
       "ses_fccf606fcffeCw3AOMDCG4YIiu",
       "ses_fcc6cdf37ffeO3ylWsg4uFG2ct"
-    ],
-    "program_authority": {
-      "path": "swarm/decisions/W1-RESULT-ENVELOPE-PROGRAM-REVISION-v1.3.md",
-      "sha256": "CEF38CB93BBE2093443E63D9DFA1A80B4F7AFF5F47FE9F5995678FEF13260AA8"
-    },
-    "disposition": "EVIDENCE_ONLY",
-    "artifacts": {
-      "inventory": {
-        "path": "swarm/inventory/contour-cut.json",
-        "sha256": "EABF51056D13D4F9ABDABBAEA30A4C037F7BFD245D1B57BB4D8C2FD827B9A11B"
-      },
-      "generator": {
-        "path": "scripts/gen-contour-cut.ps1",
-        "sha256": "C0311D94367FAB706697045C8DB3A556D1F89DB7EA07C00AE435DC7D9FC842E6"
-      },
-      "verifier": {
-        "path": "scripts/verify-contour-cut.ps1",
-        "sha256": "327C2C7A7FE2109221ABDEAD111140E4C3C078D4D1CAE72C40B7DF27B695B8AF"
-      },
-      "generator_sha256": "C0311D94367FAB706697045C8DB3A556D1F89DB7EA07C00AE435DC7D9FC842E6",
-      "verifier_sha256": "327C2C7A7FE2109221ABDEAD111140E4C3C078D4D1CAE72C40B7DF27B695B8AF",
-      "inventory_sha256": "EABF51056D13D4F9ABDABBAEA30A4C037F7BFD245D1B57BB4D8C2FD827B9A11B"
-    },
-    "evidence": [
-      "content-bound path plus byte source census",
-      "observational Git category fields",
-      "full-envelope and per-family tamper verification"
-    ],
-    "discriminator_before": {
-      "status": "THIRD_ATTEMPT_REJECTED",
-      "reason": "HEAD and Git index category were treated as provenance"
-    },
-    "discriminator_after": {
-      "status": "MECHANISM_CHANGED_IN_PROGRESS",
-      "content_bound": true,
-      "categories_observational": true
-    },
-    "uncertainty": "Static declared-grammar census only; no runtime liveness or cutover authority.",
-    "unresolved_questions": [
-      "Runtime invocation and authenticated contour join remain unproven",
-      "Root cutover decision remains pending"
-    ],
-    "proposed_effects": [
-      "Preserve EVIDENCE_ONLY",
-      "Do not select cutover"
-    ],
-    "evidence_lineage": {
-      "program_authority": "swarm/decisions/W1-RESULT-ENVELOPE-PROGRAM-REVISION-v1.3.md",
-      "challenge": "swarm/challenges/W1-05-MECHANISM-REVIEW.md",
-      "inventory_digest": "C5D27C0B1EB45F7A80BAECD7434935D16170712E1BD88A15A62D0E4CDF92222C"
-    }
+    ]
   }
 }

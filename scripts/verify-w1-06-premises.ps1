@@ -3,8 +3,7 @@ param(
     [string]$RepoRoot = (Join-Path $PSScriptRoot '..'),
     [string]$InventoryPath = (Join-Path $PSScriptRoot '..\swarm\inventory\w1-06-premises.json'),
     [string]$ResultPath = (Join-Path $PSScriptRoot '..\swarm\results\W1-06-revised.json'),
-    [switch]$SelfTest,
-    [switch]$RegenerateResult
+    [switch]$SelfTest
 )
 
 Set-StrictMode -Version Latest
@@ -213,7 +212,7 @@ function AssertRegeneratedInventory([string]$Path) {
     $tmp = [IO.Path]::GetTempFileName()
     try {
         $gen = Join-Path $root 'scripts/gen-w1-06-premises.ps1'
-        & pwsh -NoLogo -NoProfile -File $gen -RepoRoot $root -OutputPath $tmp | Out-Null
+        & pwsh -NoLogo -NoProfile -File $gen -RepoRoot $root -OutputPath $tmp -InventoryOnly | Out-Null
         if (-not [Linq.Enumerable]::SequenceEqual([IO.File]::ReadAllBytes($Path), [IO.File]::ReadAllBytes($tmp))) { Fail 'inventory raw bytes differ from deterministic generator output' }
     } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
@@ -221,10 +220,11 @@ try {
     $root = (Resolve-Path $RepoRoot).Path
     $invCandidate = $InventoryPath.Replace('/', [IO.Path]::DirectorySeparatorChar); $invPath = if ([IO.Path]::IsPathRooted($invCandidate)) { [IO.Path]::GetFullPath($invCandidate) } else { [IO.Path]::GetFullPath((Join-Path $root $invCandidate)) }
     $resCandidate = $ResultPath.Replace('/', [IO.Path]::DirectorySeparatorChar); $resPath = if ([IO.Path]::IsPathRooted($resCandidate)) { [IO.Path]::GetFullPath($resCandidate) } else { [IO.Path]::GetFullPath((Join-Path $root $resCandidate)) }
-    $inventory = AssertInventory $invPath; AssertRegeneratedInventory $invPath; if ($RegenerateResult) { [IO.File]::WriteAllText($resPath, (SerializeJson (ExpectedResult $inventory)), $Utf8) }; $null = AssertResult $resPath $inventory
+    $inventory = AssertInventory $invPath; AssertRegeneratedInventory $invPath; $null = AssertResult $resPath $inventory
     if ($SelfTest) {
+        $canonicalResultBefore = [IO.File]::ReadAllBytes($resPath)
         $tmp = [IO.Path]::GetTempFileName(); try {
-            $gen = Join-Path $root 'scripts/gen-w1-06-premises.ps1'; & pwsh -NoLogo -NoProfile -File $gen -RepoRoot $root -OutputPath $tmp | Out-Null; $a = [IO.File]::ReadAllBytes($tmp); & pwsh -NoLogo -NoProfile -File $gen -RepoRoot $root -OutputPath $tmp | Out-Null; $b = [IO.File]::ReadAllBytes($tmp); if (-not [Linq.Enumerable]::SequenceEqual($a, $b)) { Fail 'generator byte determinism failed' }
+            $gen = Join-Path $root 'scripts/gen-w1-06-premises.ps1'; & pwsh -NoLogo -NoProfile -File $gen -RepoRoot $root -OutputPath $tmp -InventoryOnly | Out-Null; $a = [IO.File]::ReadAllBytes($tmp); & pwsh -NoLogo -NoProfile -File $gen -RepoRoot $root -OutputPath $tmp -InventoryOnly | Out-Null; $b = [IO.File]::ReadAllBytes($tmp); if (-not [Linq.Enumerable]::SequenceEqual($a, $b)) { Fail 'generator byte determinism failed' }
             $inventoryCases = @('top-level-add','top-level-remove','e2e-field','e2e-path','witness-field','provenance-field','provenance-path','universe-file','digest-field')
             foreach ($case in $inventoryCases) {
                 $j = Get-Content -Raw $tmp | ConvertFrom-Json
@@ -265,6 +265,7 @@ try {
                 $bad = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($bad, ($j | ConvertTo-Json -Depth 50 -Compress), $Utf8); $failed = $false; try { $null = AssertResult $bad $inventory } catch { $failed = $true }; Remove-Item -LiteralPath $bad -Force -ErrorAction SilentlyContinue; if (-not $failed) { Fail "result tamper accepted: $case" }
             }
         } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        if (-not [Linq.Enumerable]::SequenceEqual($canonicalResultBefore, [IO.File]::ReadAllBytes($resPath))) { Fail 'inventory-only self-test mutated canonical result' }
     }
     Write-Output $(if ($SelfTest) { 'verified: content-bound cached+nonignored-untracked source universe, full inventory/result exact oracle, challenge/reference content binding, path safety, byte determinism, and broad inventory/result tamper matrix' } else { 'verified: content-bound source universe, full inventory/result deterministic oracle, challenge/reference content binding, path safety, and proof ceilings' }); exit 0
 } catch { Write-Error $_.Exception.Message; exit 1 }

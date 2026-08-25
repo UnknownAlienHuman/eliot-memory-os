@@ -2,6 +2,8 @@
 param(
     [string]$RepoRoot = (Join-Path $PSScriptRoot '..'),
     [string]$OutputPath = (Join-Path $PSScriptRoot '..\swarm\inventory\w1-06-premises.json'),
+    [string]$ResultPath = (Join-Path $PSScriptRoot '..\swarm\results\W1-06-revised.json'),
+    [switch]$InventoryOnly,
     [switch]$Check
 )
 
@@ -9,13 +11,31 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $Utf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $Schema = 'eliot.w1-06-premises.v3'
-$Generator = 'gen-w1-06-premises.ps1/4.0.0'
+$Generator = 'gen-w1-06-premises.ps1/4.1.0'
 
 function Fail([string]$Message) { throw "W1_06_PREMISES_GENERATE_FAIL: $Message" }
 function Rel([string]$Path) { ([IO.Path]::GetRelativePath($root, $Path)).Replace('\','/') }
 function Sha([byte[]]$Bytes) { ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes))).ToLowerInvariant() }
 function ShaText([string]$Text) { Sha $Utf8.GetBytes($Text) }
 function ReadText([string]$Path) { try { $Utf8.GetString([IO.File]::ReadAllBytes($Path)) } catch { Fail "invalid UTF-8: $Path" } }
+function FileDigest([string]$Path) {
+    AssertRelative $Path 'linked file'
+    $full = Join-Path $root ($Path.Replace('/', [IO.Path]::DirectorySeparatorChar))
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { Fail "missing linked file $Path" }
+    Sha ([IO.File]::ReadAllBytes($full))
+}
+function SerializeJson($Value) { return (($Value | ConvertTo-Json -Depth 50 -Compress) + "`n") }
+function AssertBytes([string]$Path, [byte[]]$Expected, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Fail "$Label missing: $(Rel $Path)" }
+    if (-not [Linq.Enumerable]::SequenceEqual([IO.File]::ReadAllBytes($Path), $Expected)) { Fail "$Label bytes differ: $(Rel $Path)" }
+}
+function WriteAtomic([string]$Path, [byte[]]$Bytes) {
+    $parent = Split-Path -Parent $Path
+    [IO.Directory]::CreateDirectory($parent) | Out-Null
+    $temporary = Join-Path $parent ('.{0}.{1}.tmp' -f ([IO.Path]::GetFileName($Path)), [guid]::NewGuid().ToString('N'))
+    try { [IO.File]::WriteAllBytes($temporary, $Bytes); Move-Item -LiteralPath $temporary -Destination $Path -Force }
+    finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+}
 function CargoMeta {
     $psi=[Diagnostics.ProcessStartInfo]::new(); $psi.FileName='cargo'; $psi.Arguments='metadata --locked --format-version 1'; $psi.WorkingDirectory=$root; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true; $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
     $p=[Diagnostics.Process]::new(); $p.StartInfo=$psi; if(-not $p.Start()){Fail 'could not start cargo metadata'}; $out=$p.StandardOutput.ReadToEnd(); $err=$p.StandardError.ReadToEnd(); $p.WaitForExit(); if($p.ExitCode -ne 0){Fail "cargo metadata exited $($p.ExitCode): $err"}; try {[pscustomobject]@{doc=$out|ConvertFrom-Json;raw=$out}}catch{Fail 'cargo metadata emitted invalid JSON'}
@@ -66,8 +86,90 @@ function ParseE2e([object]$Meta,[string[]]$Files) {
     }; return @($rows | Sort-Object path,line,test_name -Culture '')
 }
 
+function ExpectedResult($Inventory, [byte[]]$InventoryBytes) {
+    $programPath = 'swarm/decisions/W1-RESULT-ENVELOPE-PROGRAM-REVISION-v1.3.md'
+    $challengePath = 'swarm/challenges/W1-06-FALSIFICATION.md'
+    $claims = @(
+        [ordered]@{ id='A1-original-contour-linkage'; verdict='TRUE'; measured=[ordered]@{ cross_contour_cargo_edges=0; contour_a=@('eliot-app','eliot-engine','eliot-store'); contour_b=@('eliot','eliot-host','eliot-kernel','eliotd') }; qualification='This is only the directed Cargo edge premise; shared foundations, IPC, and runtime resources are not covered.' },
+        [ordered]@{ id='A2-original-all-e2e-disabled'; verdict='FALSE'; measured=[ordered]@{ unignored_full_stack_candidates=[int]$Inventory.e2e_inventory.summary.unignored_full_stack }; qualification='The historical 132 identity inventory is not assumed; the generated current candidate inventory falsifies the literal all-disabled premise.' },
+        [ordered]@{ id='A3-original-signed-set-no-executable'; verdict='FALSE'; measured=[ordered]@{ signed_executable_roles=7 }; qualification='The finalizer role table contains seven executable PE roles.' },
+        [ordered]@{ id='C1-authenticode-signed-set-membership'; verdict='TRUE'; measured=[ordered]@{ authenticode_pe_roles=7; all_roles_measured_executable=$true; governor_role_present=$false; predicate_matches=$true }; witnesses=@('scripts/finalize-eliot-windows-x64-release.ps1:function Get-AuthenticodeRoleDefinitions','scripts/finalize-eliot-windows-x64-release.ps1:Governor remains outside exact signing scope'); proof_ceiling='static role-table evidence; no certificate or on-disk bundle verification' },
+        [ordered]@{ id='C2-source-bundle-release-materializer-membership'; verdict='TRUE'; measured=[ordered]@{ required_roles=9; executable_roles=6; json_roles=3; ordered_exact=$true; predicate_matches=$true }; witnesses=@('bins/eliot/src/source_bundle_materializer.rs:pub const REQUIRED_ROLES','bins/eliot/src/source_bundle_materializer.rs:validate_role_inventory(&REQUIRED_ROLES)','scripts/build-eliot-windows-x64-release.ps1:$runtimeArtifactPlan = Get-RuntimeArtifactPlan'); proof_ceiling='static ordered role-set evidence; no materialization execution' },
+        [ordered]@{ id='C3-production-launch-reachability'; verdict='UNKNOWN'; measured=[ordered]@{ static_handoff_anchors=4; runtime_receipt_observed=$false; predicate_matches=$null }; witnesses=@('scripts/invoke-eliot-windows-x64-production.ps1:function Invoke-ProductionEliotMaterializeSourceBundle','scripts/invoke-eliot-windows-x64-production.ps1:EliotReleaseTrustedCliProcess::CreateSuspended','scripts/invoke-eliot-windows-x64-production.ps1:ResumeAndWait','scripts/invoke-eliot-windows-x64-production.ps1:SOURCE_BUNDLE_MATERIALIZED'); unknown_reasons=@('No signed bundle, process execution, exit-code readback, or receipt was observed by this source oracle.','Executable presence and static launch code do not prove production reachability.') },
+        [ordered]@{ id='C4-governor-constitutive-authority'; verdict='TRUE'; measured=[ordered]@{ eliotd_governor_dependency=$true; daemon_governor_construction=$true; canonical_commit_owner=$true; predicate_matches=$true }; witnesses=@('bins/eliotd/Cargo.toml:eliot-governor.workspace','bins/eliotd/src/lib.rs:GovernorComposition::new(kernel','crates/governor/eliot-governor/src/composition.rs:pub async fn commit_canonical'); proof_ceiling='static Cargo/source composition evidence; no running daemon or write receipt' }
+    )
+    $s = $Inventory.e2e_inventory.summary
+    $checks = @(
+        'cargo metadata --locked --format-version 1',
+        'C1/C2 role set membership, duplicate rejection, and order',
+        'per-role executable classification derived from each signed path extension',
+        'C1-C4 witness source digests and anchor ranges',
+        'inventory document digest and canonical Cargo metadata digest',
+        'content-bound provenance with cached+nonignored-untracked source universe',
+        'full inventory field set, counts, premises, and proof ceilings',
+        'full result envelope binding, challenge/reference digests, and path safety',
+        'byte determinism',
+        'inventory field-add/remove/path/content-universe and nested tamper self-tests',
+        'result envelope every-field tamper matrix'
+    )
+    $structured = [ordered]@{
+        disposition='EVIDENCE_ONLY'
+        artifacts=[ordered]@{
+            inventory=[ordered]@{path='swarm/inventory/w1-06-premises.json';sha256=(Sha $InventoryBytes)}
+            generator=[ordered]@{path='scripts/gen-w1-06-premises.ps1';sha256=(FileDigest 'scripts/gen-w1-06-premises.ps1')}
+            verifier=[ordered]@{path='scripts/verify-w1-06-premises.ps1';sha256=(FileDigest 'scripts/verify-w1-06-premises.ps1')}
+        }
+        evidence=@('content-bound cached plus nonignored-untracked source universe','C1-C4 static premise evidence','C3 runtime reachability remains UNKNOWN')
+        discriminator_before=[ordered]@{ status='V4_REJECTED'; reason='release-builder witness was outside declared input universe and result equality was semantic' }
+        discriminator_after=[ordered]@{ status='MECHANISM_CHANGED_IN_PROGRESS'; input_universe_includes_release_builder=$true; canonical_raw_bytes=$true }
+        uncertainty='Static evidence only; no signed bundle or runtime receipt was observed.'
+        unresolved_questions=@('C3 production launch reachability remains UNKNOWN','W2 remains blocked by the declared boundary')
+        proposed_effects=@('Preserve EVIDENCE_ONLY','Do not authorize cutover or W2')
+        evidence_lineage=[ordered]@{ program_authority='swarm/decisions/W1-RESULT-ENVELOPE-PROGRAM-REVISION-v1.3.md'; challenge='swarm/challenges/W1-06-V4-MECHANISM-REVIEW.md'; inventory_digest=$Inventory.document_digest; input_digest=$Inventory.generated_from.inputs_digest }
+        source_of_truth='swarm/inventory/w1-06-premises.json'
+        source_content_digest=$Inventory.generated_from.inputs_digest
+        inventory_schema_version=$Inventory.schema_version
+        inventory_document_digest=$Inventory.document_digest
+        claims=$claims
+        e2e_inventory=[ordered]@{
+            inventory_schema='eliot.w1-06-e2e.v1'
+            full_stack_candidates=[int]$s.full_stack_tests
+            ignored_by_default=[int]$s.ignored_by_default
+            unignored_full_stack=[int]$s.unignored_full_stack
+            ci_included=[int]$s.ci_included
+            ci_excluded=[int]$s.ci_excluded
+            gate_basis=@('scripts/verify.ps1','.github/workflows/ci.yml','.github/workflows/candidate-release.yml','cargo test --workspace default gate')
+            classification_scope='generated candidates under cached plus nonignored-untracked integration-test paths with full-stack/UL/runtime markers; each row records default gate, ignore, feature, environment, prerequisites, and CI inclusion'
+        }
+        verification=[ordered]@{ generator='scripts/gen-w1-06-premises.ps1'; verifier='scripts/verify-w1-06-premises.ps1'; checks=$checks; command='pwsh -NoLogo -NoProfile -File scripts/verify-w1-06-premises.ps1 -SelfTest'; observed_result='PASS' }
+        independent_openrouter_reviews=@(
+            [ordered]@{ session_id='ses_fccbf4de9ffeL1cpHpKbkslv59'; scope='fresh source-only original-premise falsification' },
+            [ordered]@{ session_id='ses_fcc616fb4ffeufOS6MRXnDYfDk'; scope='separate current-source original and revised premise falsification' }
+        )
+        program_revision=[ordered]@{ path=$programPath; sha256=(FileDigest $programPath) }
+        challenge_references=@(
+            [ordered]@{ path=$challengePath; sha256=(FileDigest $challengePath); purpose='accepted falsification disposition and evidence boundary' },
+            [ordered]@{ path='swarm/decisions/W1-06-PROGRAM-REVISION-v1.2.md'; sha256=(FileDigest 'swarm/decisions/W1-06-PROGRAM-REVISION-v1.2.md'); purpose='accepted revised premises and proof ceilings' },
+            [ordered]@{ path=$programPath; sha256=(FileDigest $programPath); purpose='exact W1 result-envelope authority and one-shot retry boundary' }
+        )
+        integration_guard='Root accepts only the bounded revised premise set. W2 is not unblocked until W0 passes and remaining W1 inventories are accepted; static membership is not Product Pulse evidence.'
+    }
+    return [pscustomobject][ordered]@{ schema_version='eliot.bootstrap-work-result.v1'; authority_status='EVIDENCE_ONLY'; work_item_id='W1-06'; structured_result=$structured }
+}
+
 try {
-    $root=(Resolve-Path $RepoRoot).Path; $outCandidate=$OutputPath.Replace('/',[IO.Path]::DirectorySeparatorChar); $outFull=if([IO.Path]::IsPathRooted($outCandidate)){[IO.Path]::GetFullPath($outCandidate)}else{[IO.Path]::GetFullPath((Join-Path $root $outCandidate))}; $meta=CargoMeta; $gitFiles=@(GitPaths); $sourcePaths=@(SourceUniverse $gitFiles); $signed=ParseSignedRoles; $material=ParseMaterialRoles
+    $root=(Resolve-Path $RepoRoot).Path
+    if ($InventoryOnly -and $PSBoundParameters.ContainsKey('ResultPath')) { Fail '-InventoryOnly cannot combine with -ResultPath' }
+    $customOutput = $PSBoundParameters.ContainsKey('OutputPath')
+    $customResult = $PSBoundParameters.ContainsKey('ResultPath')
+    if (-not $InventoryOnly -and $customOutput -ne $customResult) { Fail 'custom -OutputPath and -ResultPath must be supplied together unless -InventoryOnly is used' }
+    $outCandidate=$OutputPath.Replace('/',[IO.Path]::DirectorySeparatorChar)
+    $outFull=if([IO.Path]::IsPathRooted($outCandidate)){[IO.Path]::GetFullPath($outCandidate)}else{[IO.Path]::GetFullPath((Join-Path $root $outCandidate))}
+    $resultFull = if ($InventoryOnly) { $null } else {
+        $resultCandidate = $ResultPath.Replace('/',[IO.Path]::DirectorySeparatorChar)
+        if([IO.Path]::IsPathRooted($resultCandidate)){[IO.Path]::GetFullPath($resultCandidate)}else{[IO.Path]::GetFullPath((Join-Path $root $resultCandidate))}
+    }
+    $meta=CargoMeta; $gitFiles=@(GitPaths); $sourcePaths=@(SourceUniverse $gitFiles); $signed=ParseSignedRoles; $material=ParseMaterialRoles
     $wC1=@(Witness 'scripts/finalize-eliot-windows-x64-release.ps1' 'function Get-AuthenticodeRoleDefinitions' 'finalizer Authenticode role definition'; Witness 'scripts/finalize-eliot-windows-x64-release.ps1' 'Governor, Operator UI, and other payload remain outside' 'Governor excluded from exact signing scope')
     $wC2=@(Witness 'bins/eliot/src/source_bundle_materializer.rs' 'pub const REQUIRED_ROLES' 'materializer ordered Phase-A role set'; Witness 'bins/eliot/src/source_bundle_materializer.rs' 'validate_role_inventory\(&REQUIRED_ROLES\)' 'materializer validates exact role inventory'; Witness 'scripts/build-eliot-windows-x64-release.ps1' '\$runtimeArtifactPlan = Get-RuntimeArtifactPlan' 'release builder runtime artifact plan')
     $wC3=@(Witness 'scripts/invoke-eliot-windows-x64-production.ps1' 'function Invoke-ProductionEliotMaterializeSourceBundle' 'authoritative production handoff'; Witness 'scripts/invoke-eliot-windows-x64-production.ps1' '\$process = \[EliotReleaseTrustedCliProcess\]::CreateSuspended' 'suspended trusted CLI child'; Witness 'scripts/invoke-eliot-windows-x64-production.ps1' '\$processOutcome = \$process\.ResumeAndWait\(\)' 'resume and wait boundary'; Witness 'scripts/invoke-eliot-windows-x64-production.ps1' "status = 'SOURCE_BUNDLE_MATERIALIZED'" 'materialization success receipt')
@@ -89,5 +191,17 @@ try {
         [ordered]@{id='C4-governor-constitutive-authority';statement='Governor is the constitutive authority of the production daemon composition.';verdict=if($c4Predicate.matches){'TRUE'}else{'FALSE'};scope='static-composition-authority';predicate=$c4Predicate;witnesses=$wC4;authority_evidence=@('eliotd depends on eliot-governor','DaemonComposition constructs GovernorComposition after authenticated Kernel admission','GovernorComposition owns canonical commit and lifecycle readiness');proof_ceiling='static Cargo/source composition evidence; no running daemon or write receipt'}
     )
     $provenance=[ordered]@{kind='content-bound';source_universe=[ordered]@{mode='git-cached-plus-nonignored-untracked';included_extensions=@('.rs','Cargo.toml','Cargo.lock');explicit_paths=@(ExplicitInputPaths);exclusion_rules=@('nonignored repository files outside .rs/Cargo.toml/Cargo.lock and explicit claim/CI inputs are excluded','test-row heuristic may classify a bound Rust test source as non-full-stack; bytes remain in source universe');path_count=$inputPaths.Count};input_paths=$inputPaths;input_bindings=@($inputBindings);inputs_digest=$inputs;cargo_metadata_digest=(ShaText $canonicalCargo)}; $doc=[ordered]@{schema_version=$Schema;generator_version=$Generator;generated_from=$provenance;cargo=[ordered]@{workspace_members=$members;default_members=$default;package_names=@($meta.doc.packages|Where-Object {$meta.doc.workspace_members -contains $_.id}|ForEach-Object name|Sort-Object -Culture '')};claims=$claims;e2e_inventory=[ordered]@{schema_version='eliot.w1-06-e2e.v1';default_workspace_gate=$workspaceGate;gate_witnesses=@('scripts/verify.ps1','.github/workflows/ci.yml','.github/workflows/candidate-release.yml');tests=$e2e;summary=[ordered]@{full_stack_tests=$e2e.Count;ignored_by_default=@($e2e|Where-Object default_gate -eq 'IGNORED_BY_DEFAULT').Count;unignored_full_stack=@($e2e|Where-Object default_gate -eq 'WORKSPACE_DEFAULT_TEST').Count;ci_included=@($e2e|Where-Object ci_included).Count;ci_excluded=@($e2e|Where-Object {-not $_.ci_included}).Count}}}
-    $canonical=$doc|ConvertTo-Json -Depth 50 -Compress; $doc.document_digest=ShaText $canonical; $serialized=(ConvertTo-Json $doc -Depth 50 -Compress)+"`n"; [IO.Directory]::CreateDirectory((Split-Path $outFull -Parent))|Out-Null; if($Check){if(-not(Test-Path $outFull -PathType Leaf)){Fail "check target missing: $(Rel $outFull)"};$existing=ReadText $outFull;if($existing -cne $serialized){Fail "generated bytes differ: $(Rel $outFull)"};Write-Output "check passed $(Rel $outFull) (C1-C4 + $($e2e.Count) full-stack candidates)"}else{[IO.File]::WriteAllText($outFull,$serialized,$Utf8);Write-Output "generated $(Rel $outFull) (C1-C4 + $($e2e.Count) full-stack candidates)"}
+    $canonical=$doc|ConvertTo-Json -Depth 50 -Compress
+    $doc.document_digest=ShaText $canonical
+    $inventoryBytes=$Utf8.GetBytes((SerializeJson $doc))
+    $resultBytes=if($InventoryOnly){$null}else{$Utf8.GetBytes((SerializeJson (ExpectedResult $doc $inventoryBytes)))}
+    if($Check){
+        AssertBytes $outFull $inventoryBytes 'inventory'
+        if(-not $InventoryOnly){AssertBytes $resultFull $resultBytes 'result envelope'}
+        Write-Output "check passed $(Rel $outFull)$(if($InventoryOnly){''}else{' and '+(Rel $resultFull)}) (C1-C4 + $($e2e.Count) full-stack candidates)"
+    }else{
+        WriteAtomic $outFull $inventoryBytes
+        if(-not $InventoryOnly){WriteAtomic $resultFull $resultBytes}
+        Write-Output "generated $(Rel $outFull)$(if($InventoryOnly){''}else{' and '+(Rel $resultFull)}) (C1-C4 + $($e2e.Count) full-stack candidates)"
+    }
 } catch { Write-Error $_.Exception.Message; exit 1 }

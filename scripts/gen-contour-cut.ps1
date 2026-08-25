@@ -2,7 +2,9 @@
 param(
     [switch]$Check,
     [switch]$SelfTest,
-    [string]$OutputPath
+    [string]$OutputPath,
+    [string]$ResultPath,
+    [switch]$InventoryOnly
 )
 
 Set-StrictMode -Version Latest
@@ -10,6 +12,7 @@ $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $DefaultOutputPath = Join-Path $RepoRoot 'swarm\inventory\contour-cut.json'
+$DefaultResultPath = Join-Path $RepoRoot 'swarm\results\W1-05.json'
 $SchemaVersion = 'eliot-contour-cut-v4'
 $ResultSchemaVersion = 'eliot-w1-05-result-v4'
 $MechanismReviewPath = 'swarm/challenges/W1-05-MECHANISM-REVIEW.md'
@@ -39,6 +42,19 @@ function Get-TextSha256([string]$Text) {
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)))).Replace('-', '').ToUpperInvariant() }
     finally { $sha.Dispose() }
+}
+
+function Get-BytesSha256([byte[]]$Bytes) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '').ToUpperInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Assert-ExactProperties($Object, [string[]]$Expected, [string]$Label) {
+    if ($null -eq $Object) { throw "$Label is null" }
+    $actual = @($Object.PSObject.Properties.Name | Sort-Object)
+    $wanted = @($Expected | Sort-Object)
+    if (($actual -join "`0") -cne ($wanted -join "`0")) { throw "$Label fields differ" }
 }
 
 function Get-ObjectDigest($Value) {
@@ -355,7 +371,180 @@ function New-Inventory {
     return [pscustomobject]@{ schema_version = $SchemaVersion; authority_status = 'EVIDENCE_ONLY'; work_item_id = 'W1-05'; cargo_metadata_sha256 = Get-TextSha256 $metadata.Canonical; mechanism_review = [ordered]@{ path = $MechanismReviewPath; sha256 = Get-Sha256 $reviewAbsolute; status = 'LINKED' }; contours = [ordered]@{ A = $ContourA; B = $ContourB }; cutover_decision = [ordered]@{ status = 'PENDING_ROOT'; owner = 'ROOT'; selected = $null; allowed_options = @('A','B','C') }; source_scan = $sourceScan; rows = $rows; canonical_write_proof = $proof; summary = $summary; proof_ceiling = 'Complete current cached plus non-ignored-untracked Rust file-set census for the declared grammar plus Cargo metadata, content-bound by path and current bytes. This is not a semantic/runtime call graph and does not prove liveness, authenticated invocation, signed bundle, parity, or cutover.'; external_routing_evidence = @('ses_fccf606fcffeCw3AOMDCG4YIiu','ses_fcc6cdf37ffeO3ylWsg4uFG2ct') }
 }
 
-function Write-Inventory($Inventory, [string]$Path) { $parent = Split-Path -Parent $Path; if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }; $json = $Inventory | ConvertTo-Json -Depth 100; [IO.File]::WriteAllText($Path, $json + "`n", (New-Object Text.UTF8Encoding($false))) }
+function Get-JsonBytes($Value) {
+    return [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 100) + "`n")
+}
+
+function Get-ResultProjection($Inventory) {
+    $rows = @($Inventory.rows)
+    $scan = $Inventory.source_scan
+    $summary = $Inventory.summary
+    $proof = $Inventory.canonical_write_proof
+    return [ordered]@{
+        disposition = 'IMPLEMENTED'
+        contour_a = @($Inventory.contours.A)
+        contour_b = @($Inventory.contours.B)
+        rows = [int]$summary.row_count
+        cargo_direct_edges = [ordered]@{
+            A_TO_B = [ordered]@{
+                present = @($rows | Where-Object { $_.edge_class -eq 'cargo_dependency' -and $_.direction -eq 'A_TO_B' -and $_.status -eq 'present' }).Count
+                absent = @($rows | Where-Object { $_.edge_class -eq 'cargo_dependency' -and $_.direction -eq 'A_TO_B' -and $_.status -eq 'absent' }).Count
+            }
+            B_TO_A = [ordered]@{
+                present = @($rows | Where-Object { $_.edge_class -eq 'cargo_dependency' -and $_.direction -eq 'B_TO_A' -and $_.status -eq 'present' }).Count
+                absent = @($rows | Where-Object { $_.edge_class -eq 'cargo_dependency' -and $_.direction -eq 'B_TO_A' -and $_.status -eq 'absent' }).Count
+            }
+        }
+        source_scan = [ordered]@{
+            file_set_kind = $scan.file_set_kind
+            grammar_file_set = $scan.grammar_file_set
+            cached_rust_file_count = [int]$scan.cached_rust_file_count
+            nonignored_untracked_rust_file_count = [int]$scan.nonignored_untracked_rust_file_count
+            union_rust_file_count = [int]$scan.union_rust_file_count
+            grammar_motifs = @($scan.grammar).Count
+            hit_count = $scan.hit_count
+            row_count = [int]$scan.row_count
+            motif_hit_counts = $scan.motif_hit_counts
+            motif_row_counts = $scan.motif_row_counts
+            provenance = $scan.provenance
+            rust_files_sha256 = $scan.rust_files_sha256
+        }
+        edge_class_counts = $summary.edge_class_counts
+        status_counts = $summary.status_counts
+        semantic_counts = [ordered]@{
+            negative_observation_non_join = [int]$summary.negative_observation_non_join
+            process_launch_observation = [int]$summary.process_launch_observation
+            process_wrapper_observation = [int]$summary.process_wrapper_observation
+            runtime_ipc_observation = [int]$summary.runtime_ipc_observation
+            launch_control_observation = [int]$summary.launch_control_observation
+            schema_observation = [int]$summary.schema_observation
+            state_write_unknown = [int]$summary.state_write_unknown
+            unknown_process_target = [int]$summary.unknown_process_target
+            unknown_ipc_target = [int]$summary.unknown_ipc_target
+            unknown_launch_target = [int]$summary.unknown_launch_target
+            present = [int]$summary.status_counts.present
+            absent = [int]$summary.status_counts.absent
+            unknown = [int]$summary.status_counts.unknown
+        }
+        regression_fixtures = @($scan.regression_fixtures)
+        canonical_write_proof = [ordered]@{
+            symbol = $proof.symbol
+            source_file_set_kind = $proof.source_file_set_kind
+            rust_file_count = [int]$proof.rust_file_count
+            definition_count = [int]$proof.definition_count
+            caller_count = [int]$proof.caller_count
+            definition = "$($proof.definitions[0].source_path):$($proof.definitions[0].source_line)"
+            status = $proof.status
+        }
+        inventory_summary_sha256 = Get-ObjectDigest $summary
+        source_scan_sha256 = Get-ObjectDigest $scan
+        canonical_write_proof_sha256 = Get-ObjectDigest $proof
+        regression_fixtures_sha256 = Get-ObjectDigest $scan.regression_fixtures
+        cutover_decision = 'PENDING_ROOT'
+    }
+}
+
+function Get-ResultBytes($Inventory, [byte[]]$InventoryBytes) {
+    if ($Inventory.PSObject.Properties.Name -contains 'source_revision') { throw 'revision provenance is forbidden; use content-bound source evidence' }
+
+    $inventoryPath = 'swarm/inventory/contour-cut.json'
+    $generatorRel = 'scripts/gen-contour-cut.ps1'
+    $verifierRel = 'scripts/verify-contour-cut.ps1'
+    $authorityPath = 'swarm/decisions/W1-RESULT-ENVELOPE-PROGRAM-REVISION-v1.3.md'
+    $inventoryHash = Get-BytesSha256 $InventoryBytes
+    $generatorHash = Get-Sha256 (Join-Path $RepoRoot $generatorRel)
+    $verifierHash = Get-Sha256 (Join-Path $RepoRoot $verifierRel)
+    $mechanismHash = Get-Sha256 (Join-Path $RepoRoot $MechanismReviewPath)
+    $authorityAbsolute = Join-Path $RepoRoot $authorityPath
+    if (-not (Test-Path -LiteralPath $authorityAbsolute -PathType Leaf)) { throw "program authority missing: $authorityPath" }
+    $authorityHash = Get-Sha256 $authorityAbsolute
+    $scan = $Inventory.source_scan
+    $summary = $Inventory.summary
+    $proof = $Inventory.canonical_write_proof
+    $fixtures = @{}; foreach ($fixture in @($scan.regression_fixtures)) { $fixtures[[string]$fixture.id] = $fixture }
+    foreach ($id in @('dynamic-command-program','dynamic-command-executable','suspended-job-spawn','suspended-job-spawn-with-limits','dynamic-governor-command','bootstrap-brief')) { if (-not $fixtures.ContainsKey($id)) { throw "result regression fixture missing: $id" } }
+
+    $findings = @(
+        "The full-from-zero mechanism scans the deterministic union of $($scan.cached_rust_file_count) Git-cached and $($scan.nonignored_untracked_rust_file_count) non-ignored-untracked Rust files by direct file reads; it claims completeness only for the $(@($scan.grammar).Count) declared motifs over that current file set, never semantic/runtime exhaustiveness.",
+        'Dynamic and qualified process constructors are emitted with exact local target resolution when available and UNKNOWN_PROCESS_TARGET otherwise. Windows suspended-job wrappers, process-executor symbols, Windows CreateProcess APIs, Tokio/Std/qualified constructors, and named-pipe client/server/transport/authentication operations are represented.',
+        "Regression rows include $($fixtures['dynamic-command-program'].path):$($fixtures['dynamic-command-program'].line), $($fixtures['dynamic-command-executable'].path):$($fixtures['dynamic-command-executable'].line), $($fixtures['suspended-job-spawn'].path):$($fixtures['suspended-job-spawn'].line), $($fixtures['suspended-job-spawn-with-limits'].path):$($fixtures['suspended-job-spawn-with-limits'].line), $($fixtures['dynamic-governor-command'].path):$($fixtures['dynamic-governor-command'].line), and the cached $($fixtures['bootstrap-brief'].path) fixture.",
+        'The bins/eliot/src/main.rs:604 legacy eliot-governor.exe coexistence check is negative_observation/non_join, not a launch/control join. Other legacy/process-state observations are likewise non-join evidence.',
+        'schema_version remains schema_observation only; write_receipt/write_receipt_by_id remains unknown state-write evidence; GovernorConfig roles remain import/parse/type_reference and never imply runtime join.',
+        "Exact §5.1 proof over the cached plus non-ignored-untracked Rust union is one commit_canonical definition at $($proof.definitions[0].source_path):$($proof.definitions[0].source_line) and zero callers; the independent verifier recomputes anchors and tamper-tests this proof.",
+        'No cutover A, B, or C is selected; §5.2 decision authority remains Root.'
+    )
+    $verification = @(
+        'pwsh -NoProfile -File scripts/gen-contour-cut.ps1 -SelfTest: PASS',
+        "pwsh -NoProfile -File scripts/gen-contour-cut.ps1: PASS ($($summary.row_count) rows; $($scan.union_rust_file_count) Rust files)",
+        'pwsh -NoProfile -File scripts/gen-contour-cut.ps1 -Check: PASS',
+        'pwsh -NoProfile -File scripts/verify-contour-cut.ps1 -SelfTest: PASS (omitted edge, source-stage, source/result family envelope, duplicate, negative, and §5.1 tamper checks)',
+        'pwsh -NoProfile -File scripts/verify-contour-cut.ps1: PASS (declared grammar, Cargo edges, source anchors/digests, §5.1 proof, and full result envelope independently recomputed)',
+        'git diff --check -- scripts/gen-contour-cut.ps1 scripts/verify-contour-cut.ps1 swarm/inventory/contour-cut.json swarm/results/W1-05.json: PASS'
+    )
+    $limitations = @(
+        'The source census is complete only for the declared grammar over the current cached plus non-ignored-untracked Rust union; it is not a semantic/runtime call graph.',
+        'Dynamic targets and IPC endpoints remain UNKNOWN unless exact local evidence resolves them; package names, imports, wrappers, and symbols do not imply a runtime connection.',
+        'Proof ceiling excludes runtime liveness, authenticated invocation traces, signed bundle validation, parity, Product Pulse, and cutover selection.',
+        'Git category and concurrent-worktree observations are non-authoritative; this envelope binds current source bytes, explicit policy constants, and artifact hashes only.'
+    )
+    $mechanism = [ordered]@{ path = $MechanismReviewPath; sha256 = $mechanismHash; status = 'LINKED' }
+    $authority = [ordered]@{ path = $authorityPath; sha256 = $authorityHash }
+    $artifacts = [ordered]@{
+        inventory = [ordered]@{ path = $inventoryPath; sha256 = $inventoryHash }
+        generator = [ordered]@{ path = $generatorRel; sha256 = $generatorHash }
+        verifier = [ordered]@{ path = $verifierRel; sha256 = $verifierHash }
+        generator_sha256 = $generatorHash
+        verifier_sha256 = $verifierHash
+        inventory_sha256 = $inventoryHash
+    }
+    $structured = [ordered]@{
+        schema_version = $ResultSchemaVersion
+        authority_status = 'EVIDENCE_ONLY'
+        work_item_id = 'W1-05'
+        disposition = 'EVIDENCE_ONLY'
+        artifacts = $artifacts
+        evidence = @('content-bound path plus byte source census','observational Git category fields','full-envelope and per-family tamper verification')
+        discriminator_before = [ordered]@{ status = 'TEMPLATE_CONTROLLED_RESULT_REJECTED'; reason = 'Generic evidence fields were inherited from the previous result file' }
+        discriminator_after = [ordered]@{ status = 'FULL_FROM_ZERO_RESULT'; content_bound = $true; categories_observational = $true }
+        uncertainty = 'Static declared-grammar census only; no runtime liveness or cutover authority.'
+        unresolved_questions = @('Runtime invocation and authenticated contour join remain unproven','Root cutover decision remains pending')
+        proposed_effects = @('Preserve EVIDENCE_ONLY','Do not select cutover')
+        evidence_lineage = [ordered]@{
+            program_authority = [ordered]@{ path = $authorityPath; sha256 = $authorityHash }
+            challenge = [ordered]@{ path = $MechanismReviewPath; sha256 = $mechanismHash }
+            inventory = [ordered]@{ path = $inventoryPath; sha256 = $inventoryHash }
+        }
+        observed_worktree_state = 'CONTENT_BOUND_SOURCE_UNION; GIT_CATEGORIES_OBSERVATIONAL_ONLY'
+        mechanism_review = $mechanism
+        program_authority = $authority
+        changed_files = @($generatorRel,$verifierRel,$inventoryPath,'swarm/results/W1-05.json',$MechanismReviewPath)
+        result = Get-ResultProjection $Inventory
+        findings = $findings
+        verification = $verification
+        limitations = $limitations
+        external_routing_evidence = @('ses_fccf606fcffeCw3AOMDCG4YIiu','ses_fcc6cdf37ffeO3ylWsg4uFG2ct')
+    }
+    $wrapper = [ordered]@{
+        schema_version = 'eliot.bootstrap-work-result.v1'
+        authority_status = 'EVIDENCE_ONLY'
+        work_item_id = 'W1-05'
+        structured_result = $structured
+    }
+    return Get-JsonBytes $wrapper
+}
+
+function Assert-BytesEqual([string]$Path, [byte[]]$Expected, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Label missing: $Path" }
+    if (-not [Linq.Enumerable]::SequenceEqual([IO.File]::ReadAllBytes($Path), $Expected)) { throw "$Label stale/non-deterministic: $Path" }
+}
+
+function Write-Atomic([string]$Path, [byte[]]$Bytes) {
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $temporary = Join-Path $parent ('.{0}.{1}.tmp' -f ([IO.Path]::GetFileName($Path)), [guid]::NewGuid().ToString('N'))
+    try { [IO.File]::WriteAllBytes($temporary, $Bytes); Move-Item -LiteralPath $temporary -Destination $Path -Force }
+    finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+}
 
 function Invoke-SelfTest {
     $inventory = New-Inventory; Assert-Inventory $inventory
@@ -389,9 +578,28 @@ function Invoke-SelfTest {
     Write-Output "SELFTEST PASS: direct-read union, omitted-edge, synthetic cached+untracked fixture, commit proof, and cutover tamper checks ($($inventory.summary.row_count) rows)"
 }
 
-if ($SelfTest) { if ($Check -or $PSBoundParameters.ContainsKey('OutputPath')) { throw '-SelfTest cannot combine with -Check or -OutputPath' }; Invoke-SelfTest; exit 0 }
-if ($Check -and $PSBoundParameters.ContainsKey('OutputPath')) { throw '-Check rejects an alternate -OutputPath' }
-$target = if ($PSBoundParameters.ContainsKey('OutputPath')) { [IO.Path]::GetFullPath($OutputPath) } else { $DefaultOutputPath }
-$inventory = New-Inventory; Assert-Inventory $inventory; $expected = ($inventory | ConvertTo-Json -Depth 100) + "`n"
-if ($Check) { if (-not (Test-Path -LiteralPath $target)) { throw "Generated inventory missing: $target" }; if ((Get-Content -LiteralPath $target -Raw) -cne $expected) { throw "Generated inventory stale/non-deterministic: $target" }; Write-Output "CHECK PASS: $target ($($inventory.summary.row_count) rows; $($inventory.source_scan.union_rust_file_count) Rust files)"; exit 0 }
-Write-Inventory $inventory $target; Write-Output "GENERATED: $target ($($inventory.summary.row_count) rows; $($inventory.source_scan.union_rust_file_count) Rust files)"
+if ($SelfTest) {
+    if ($Check -or $InventoryOnly -or $PSBoundParameters.ContainsKey('OutputPath') -or $PSBoundParameters.ContainsKey('ResultPath')) { throw '-SelfTest cannot combine with generation/check output options' }
+    Invoke-SelfTest
+    exit 0
+}
+if ($InventoryOnly -and $PSBoundParameters.ContainsKey('ResultPath')) { throw '-InventoryOnly cannot combine with -ResultPath' }
+$customOutput = $PSBoundParameters.ContainsKey('OutputPath')
+$customResult = $PSBoundParameters.ContainsKey('ResultPath')
+if (-not $InventoryOnly -and $customOutput -ne $customResult) { throw 'custom -OutputPath and -ResultPath must be supplied together unless -InventoryOnly is used' }
+if ($Check -and ($customOutput -or $customResult)) { throw '-Check validates canonical output and result paths only' }
+$target = if ($customOutput) { [IO.Path]::GetFullPath($OutputPath) } else { $DefaultOutputPath }
+$resultTarget = if ($InventoryOnly) { $null } elseif ($customResult) { [IO.Path]::GetFullPath($ResultPath) } else { $DefaultResultPath }
+$inventory = New-Inventory
+Assert-Inventory $inventory
+$inventoryBytes = Get-JsonBytes $inventory
+$resultBytes = if ($InventoryOnly) { $null } else { Get-ResultBytes $inventory $inventoryBytes }
+if ($Check) {
+    Assert-BytesEqual $target $inventoryBytes 'generated inventory'
+    Assert-BytesEqual $resultTarget $resultBytes 'generated result envelope'
+    Write-Output "CHECK PASS: $target and $resultTarget ($($inventory.summary.row_count) rows; $($inventory.source_scan.union_rust_file_count) Rust files)"
+    exit 0
+}
+Write-Atomic $target $inventoryBytes
+if (-not $InventoryOnly) { Write-Atomic $resultTarget $resultBytes }
+Write-Output "GENERATED: $target$(if ($InventoryOnly) { '' } else { ' and ' + $resultTarget }) ($($inventory.summary.row_count) rows; $($inventory.source_scan.union_rust_file_count) Rust files)"
