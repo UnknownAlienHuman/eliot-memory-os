@@ -92,7 +92,11 @@ try {
         }
         observations = $observations.ToArray()
     }
-    $json = $document | ConvertTo-Json -Depth 8 -Compress
+    # Keep each stdout record bounded for hosted Windows runners.  A compact
+    # document currently exceeds 64 KiB on one line even though the payload is
+    # valid; pretty JSON preserves the complete evidence while giving the
+    # runner ordinary line boundaries to stream.
+    $json = $document | ConvertTo-Json -Depth 8
     Write-Output $json
     exit 0
 }
