@@ -1793,6 +1793,10 @@ mod tests {
     use tokio::time::Instant;
 
     const FIXTURE_ENV: &str = "ELIOT_SUPERVISED_PROCESS_FIXTURE";
+    const TEST_SUCCESS_RUNTIME_MS: u64 = 60_000;
+    const TEST_SUCCESS_CONTEXT_TIMEOUT_MS: u64 = 60_000;
+    const TEST_IDLE_RUNTIME_MS: u64 = 30_000;
+    const TEST_IDLE_CONTEXT_TIMEOUT_MS: u64 = 60_000;
 
     #[test]
     fn production_operation_runtime_routes_to_default_daemon_instance() -> Result<()> {
@@ -2011,10 +2015,14 @@ mod tests {
                     route_policy: eliot_types::ProviderRoutePolicy::for_route(
                         eliot_types::AgentHostId::Antigravity,
                         "provider-runner-fixture",
-                        eliot_types::ProviderDeclaredBudget::new(5_000, 32 * 1024),
+                        eliot_types::ProviderDeclaredBudget::new(
+                            TEST_SUCCESS_RUNTIME_MS,
+                            32 * 1024,
+                        ),
                     ),
                     cancellation: CancellationToken::new(),
-                    deadline: Instant::now() + Duration::from_secs(5),
+                    deadline: Instant::now()
+                        + Duration::from_millis(TEST_SUCCESS_CONTEXT_TIMEOUT_MS),
                     runtime_contract_sha256: None,
                     role_lease_id: None,
                     role_lease_epoch: None,
@@ -2024,6 +2032,9 @@ mod tests {
             .await?;
         assert_eq!(spawned_pid, output.reap_receipt.root_pid);
         assert_eq!(output.exit_code, Some(0));
+        assert!(!output.timed_out);
+        assert!(!output.reap_receipt.forced_termination);
+        assert!(output.worker_error.is_none(), "{:?}", output.worker_error);
         assert!(output.stdout_truncated);
         assert!(output.stderr_truncated);
         assert!(output.reap_receipt.proves_complete_reap());
@@ -2115,9 +2126,15 @@ mod tests {
 
     #[tokio::test]
     async fn supervised_process_drains_bidirectional_pressure_and_caps_output() -> Result<()> {
-        let output =
-            run_supervised_process(fixture_spec("pipe-pressure", 5_000)?, context(5_000)).await?;
+        let output = run_supervised_process(
+            fixture_spec("pipe-pressure", TEST_SUCCESS_RUNTIME_MS)?,
+            context(TEST_SUCCESS_CONTEXT_TIMEOUT_MS),
+        )
+        .await?;
         assert_eq!(output.exit_code, Some(0));
+        assert!(!output.timed_out);
+        assert!(!output.reap_receipt.forced_termination);
+        assert!(output.worker_error.is_none(), "{:?}", output.worker_error);
         assert!(output.stdout_total_bytes >= 96 * 1024);
         assert!(output.stderr_total_bytes >= 96 * 1024);
         assert_eq!(output.stdout.len(), 32 * 1024);
@@ -2149,14 +2166,14 @@ mod tests {
 
     #[tokio::test]
     async fn supervised_process_idle_output_deadline_cancels_and_reaps() -> Result<()> {
-        let mut spec = fixture_spec("idle-output", 5_000)?;
+        let mut spec = fixture_spec("idle-output", TEST_IDLE_RUNTIME_MS)?;
         spec.stdin_payload = Some(Vec::new());
         spec.timeout_profile = eliot_types::ProviderRoutePolicy::for_route(
             eliot_types::AgentHostId::Codex,
             "supervised-process-idle-output-fixture",
-            eliot_types::ProviderDeclaredBudget::new(30_000, 32 * 1024)
+            eliot_types::ProviderDeclaredBudget::new(TEST_IDLE_RUNTIME_MS, 32 * 1024)
                 .with_spawn_deadline_ms(Some(1_000))
-                .with_first_output_deadline_ms(Some(3_000))
+                .with_first_output_deadline_ms(None)
                 .with_idle_output_deadline_ms(Some(100))
                 .with_cancellation_grace_ms(20)
                 .with_cleanup_grace_ms(2_000)
@@ -2167,8 +2184,12 @@ mod tests {
         // This test asserts the provider profile's idle-output cause.  Keep the
         // caller-owned wall clock outside the assertion window so scheduler
         // delay before `spawn_blocking` cannot legitimately win first.
-        let output = run_supervised_process(spec, context(60_000)).await?;
+        let output = run_supervised_process(spec, context(TEST_IDLE_CONTEXT_TIMEOUT_MS)).await?;
         assert!(output.timed_out);
+        assert_eq!(
+            output.timeout_class,
+            Some(eliot_types::ProviderTimeoutClass::IdleOutputTimeout)
+        );
         assert!(
             output
                 .worker_error
@@ -2176,11 +2197,24 @@ mod tests {
                 .is_some_and(|error| error.contains("idle output deadline exceeded"))
         );
         assert!(
+            !output
+                .worker_error
+                .as_deref()
+                .is_some_and(|error| error.contains("first output deadline exceeded"))
+        );
+        assert!(
+            !output
+                .worker_error
+                .as_deref()
+                .is_some_and(|error| error.contains("absolute runtime deadline exceeded"))
+        );
+        assert!(
             output
                 .stdout
                 .windows(b"ready".len())
                 .any(|window| window == b"ready")
         );
+        assert!(output.reap_receipt.forced_termination);
         assert!(output.reap_receipt.proves_complete_reap());
         Ok(())
     }
