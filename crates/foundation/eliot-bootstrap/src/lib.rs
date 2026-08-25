@@ -9,10 +9,21 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_rules::{RuleCatalogue, RuleClass};
+#[cfg(test)]
+use std::collections::BTreeMap;
+
+use eliot_agent_api::AgentWorkUnitBrief;
+use eliot_contracts::{
+    ContractIdentity, ContractVersion, Revision, canonical_json_bytes, sha256_hex,
+};
+#[cfg(test)]
+use eliot_rules::{BindingReason, ExcludedRule};
+use eliot_rules::{
+    NormativeCoverageManifest, PairAndCatalogueRevision, ReasonCodeEntry, ReasonDirectiveRegistry,
+    RuleCatalogue,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -251,8 +262,6 @@ pub struct NormativePair {
     pub architecture_sha256: String,
     /// Implementation document digest.
     pub implementation_sha256: String,
-    /// Runtime document digest.
-    pub runtime_sha256: String,
 }
 
 impl NormativePair {
@@ -266,8 +275,7 @@ impl NormativePair {
             &self.implementation_sha256,
             source.to_owned(),
             "implementation_sha256",
-        )?;
-        digest(&self.runtime_sha256, source.to_owned(), "runtime_sha256")
+        )
     }
 }
 
@@ -406,58 +414,63 @@ fn validate_records(records: &[EvidenceRecord], source: &str) -> Result<(), Boot
     Ok(())
 }
 
-/// Compiles a deterministic current-system evidence snapshot.
-pub fn compile_current_system_evidence_snapshot(
-    source: SourceProjection<CurrentSystemEvidenceSource>,
-) -> Result<CurrentSystemEvidenceSnapshot, BootstrapCompileError> {
-    let (source_id, revision, input) = require(source)?;
-    input.normative_pair.validate(&source_id)?;
-    text(
-        &input.selected_repository_root,
-        source_id.clone(),
-        "selected_repository_root",
-    )?;
-    text(
-        &input.selected_source_head,
-        source_id.clone(),
-        "selected_source_head",
-    )?;
-    text(
-        &input.external_state_root,
-        source_id.clone(),
-        "external_state_root",
-    )?;
-    if let Some(reference) = &input.dirty_delta_artifact_ref {
-        text(reference, source_id.clone(), "dirty_delta_artifact_ref")?;
-    }
-    exact_strings(
-        &input.unavailable_domains,
-        &source_id,
-        "unavailable_domains",
-    )?;
-    validate_records(&input.records, &source_id)?;
+/// Normative `I:209` compiler for deterministic current-system evidence.
+pub struct CurrentSystemEvidenceCompiler;
 
-    let mut records = input.records;
-    records.sort_by(|left, right| left.key.cmp(&right.key));
-    let mut unavailable_domains = input.unavailable_domains;
-    unavailable_domains.sort();
-    let mut snapshot = CurrentSystemEvidenceSnapshot {
-        schema_version: "eliot-current-system-evidence-snapshot-v1".to_owned(),
-        normative_pair: input.normative_pair,
-        source_projection_ref: format!("{source_id}@{revision}"),
-        selected_repository_root: input.selected_repository_root,
-        selected_source_head: input.selected_source_head,
-        dirty_delta_artifact_ref: input.dirty_delta_artifact_ref,
-        external_state_root: input.external_state_root,
-        records,
-        unavailable_domains,
-        snapshot_sha256: String::new(),
-    };
-    snapshot.snapshot_sha256 = content_digest(&snapshot, "snapshot", |value| {
-        value.snapshot_sha256.clear();
-    })?;
-    snapshot.validate()?;
-    Ok(snapshot)
+impl CurrentSystemEvidenceCompiler {
+    /// Compiles a deterministic current-system evidence snapshot.
+    pub fn compile(
+        source: SourceProjection<CurrentSystemEvidenceSource>,
+    ) -> Result<CurrentSystemEvidenceSnapshot, BootstrapCompileError> {
+        let (source_id, revision, input) = require(source)?;
+        input.normative_pair.validate(&source_id)?;
+        text(
+            &input.selected_repository_root,
+            source_id.clone(),
+            "selected_repository_root",
+        )?;
+        text(
+            &input.selected_source_head,
+            source_id.clone(),
+            "selected_source_head",
+        )?;
+        text(
+            &input.external_state_root,
+            source_id.clone(),
+            "external_state_root",
+        )?;
+        if let Some(reference) = &input.dirty_delta_artifact_ref {
+            text(reference, source_id.clone(), "dirty_delta_artifact_ref")?;
+        }
+        exact_strings(
+            &input.unavailable_domains,
+            &source_id,
+            "unavailable_domains",
+        )?;
+        validate_records(&input.records, &source_id)?;
+
+        let mut records = input.records;
+        records.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut unavailable_domains = input.unavailable_domains;
+        unavailable_domains.sort();
+        let mut snapshot = CurrentSystemEvidenceSnapshot {
+            schema_version: "eliot-current-system-evidence-snapshot-v2".to_owned(),
+            normative_pair: input.normative_pair,
+            source_projection_ref: format!("{source_id}@{revision}"),
+            selected_repository_root: input.selected_repository_root,
+            selected_source_head: input.selected_source_head,
+            dirty_delta_artifact_ref: input.dirty_delta_artifact_ref,
+            external_state_root: input.external_state_root,
+            records,
+            unavailable_domains,
+            snapshot_sha256: String::new(),
+        };
+        snapshot.snapshot_sha256 = content_digest(&snapshot, "snapshot", |value| {
+            value.snapshot_sha256.clear();
+        })?;
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
 }
 
 /// Input to the bootstrap rule catalogue compiler.
@@ -544,7 +557,7 @@ pub fn compile_bootstrap_rule_catalogue(
             detail: error.to_string(),
         })?;
     let mut catalogue = BootstrapRuleCatalogue {
-        schema_version: "eliot-bootstrap-rule-catalogue-v1".to_owned(),
+        schema_version: "eliot-bootstrap-rule-catalogue-v2".to_owned(),
         normative_pair: input.normative_pair,
         catalogue: provider_catalogue,
         catalogue_sha256: String::new(),
@@ -607,6 +620,58 @@ pub struct BootstrapCoverage {
     pub unavailable_surface_ids: Vec<String>,
 }
 
+impl BootstrapCoverage {
+    /// Derives the public coverage view from the sole disposition authority.
+    pub fn from_manifest(manifest: &NormativeCoverageManifest) -> Self {
+        let mut included_rule_ids = manifest
+            .included_rule_bindings
+            .iter()
+            .map(|binding| {
+                format!(
+                    "{}@{}",
+                    binding.rule_ref.rule_id,
+                    binding.rule_ref.revision.value()
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut excluded_rule_ids = manifest
+            .excluded_with_reason
+            .iter()
+            .map(|excluded| {
+                format!(
+                    "{}@{}",
+                    excluded.rule_ref.rule_id,
+                    excluded.rule_ref.revision.value()
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut unavailable_surface_ids = manifest.not_searched_scopes.clone();
+        included_rule_ids.sort();
+        excluded_rule_ids.sort();
+        unavailable_surface_ids.sort();
+        Self {
+            included_rule_ids,
+            excluded_rule_ids,
+            unavailable_surface_ids,
+        }
+    }
+
+    fn validate_bijective(
+        &self,
+        manifest: &NormativeCoverageManifest,
+    ) -> Result<(), BootstrapCompileError> {
+        if *self != Self::from_manifest(manifest) {
+            return Err(BootstrapCompileError::ProviderValidation {
+                provider: "eliot-rules",
+                detail:
+                    "bootstrap coverage is not a bijective projection of the normative manifest"
+                        .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Immutable deterministic bootstrap brief.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -621,6 +686,8 @@ pub struct BootstrapBrief {
     pub catalogue_sha256: String,
     /// Exact source/rule references used in compilation.
     pub source_refs: Vec<String>,
+    /// Sole normative disposition authority for this brief.
+    pub normative_coverage_manifest: NormativeCoverageManifest,
     /// Explicit coverage and unavailable surfaces.
     pub coverage: BootstrapCoverage,
     /// Content address of all preceding fields.
@@ -654,6 +721,8 @@ impl BootstrapBrief {
             "brief",
             "unavailable_surface_ids",
         )?;
+        self.coverage
+            .validate_bijective(&self.normative_coverage_manifest)?;
         let mut all = self.coverage.included_rule_ids.clone();
         all.extend(self.coverage.excluded_rule_ids.clone());
         exact_strings(&all, "brief", "rule_coverage")?;
@@ -663,6 +732,7 @@ impl BootstrapBrief {
     }
 }
 
+#[cfg(test)]
 fn validate_brief_inputs(source: &BootstrapBriefSource) -> Result<(), BootstrapCompileError> {
     source.snapshot.validate()?;
     source.catalogue.validate()?;
@@ -696,8 +766,54 @@ fn validate_brief_inputs(source: &BootstrapBriefSource) -> Result<(), BootstrapC
     Ok(())
 }
 
-/// Compiles a bootstrap brief from already compiled immutable artifacts.
-pub fn compile_bootstrap_brief(
+#[cfg(test)]
+fn exclusion_manifest_for_catalogue(
+    catalogue: &RuleCatalogue,
+) -> Result<(NormativeCoverageManifest, ReasonDirectiveRegistry), BootstrapCompileError> {
+    let registry = ReasonDirectiveRegistry {
+        reasons: vec![ReasonCodeEntry {
+            code: "NORMATIVE_COVERAGE_INCOMPLETE".to_owned(),
+            description: "The provider-owned normative catalogue is incomplete; no rule is permission to proceed.".to_owned(),
+        }],
+        directives: Vec::new(),
+    };
+    let manifest = NormativeCoverageManifest {
+        pair_and_catalogue_revision: PairAndCatalogueRevision {
+            normative_pair_identity: catalogue.normative_pair_identity.clone(),
+            catalogue_revision: catalogue.catalogue_revision,
+        },
+        searched_rule_scopes: Vec::new(),
+        included_rule_bindings: Vec::new(),
+        excluded_with_reason: catalogue
+            .entries
+            .iter()
+            .map(|entry| ExcludedRule {
+                rule_ref: entry.rule_ref.clone(),
+                reason: BindingReason {
+                    code: "NORMATIVE_COVERAGE_INCOMPLETE".to_owned(),
+                    detail: "Provider coverage is incomplete; this rule is not included."
+                        .to_owned(),
+                },
+            })
+            .collect(),
+        not_searched_scopes: Vec::new(),
+        searched_and_absent_questions: Vec::new(),
+        stale_or_conflicting_rules: Vec::new(),
+        expansion_handles: Vec::new(),
+    };
+    manifest
+        .validate_against(catalogue, &registry)
+        .map_err(|error| BootstrapCompileError::ProviderValidation {
+            provider: "eliot-rules",
+            detail: error.to_string(),
+        })?;
+    Ok((manifest, registry))
+}
+
+/// Legacy test oracle for the pre-provider compiler shape. Production callers
+/// use [`BootstrapBriefCompiler::compile`], which cannot accept a caller catalogue.
+#[cfg(test)]
+fn compile_bootstrap_brief(
     source: BootstrapBriefSource,
 ) -> Result<BootstrapBrief, BootstrapCompileError> {
     validate_brief_inputs(&source)?;
@@ -720,68 +836,24 @@ pub fn compile_bootstrap_brief(
             });
         }
     }
-    let included_rule_ids = source
-        .catalogue
-        .catalogue
-        .entries
-        .iter()
-        .filter(|rule| {
-            matches!(
-                rule.class,
-                RuleClass::HardBoundary | RuleClass::Contract | RuleClass::Guardrail
-            )
-        })
-        .map(|rule| {
-            format!(
-                "{}@{}",
-                rule.rule_ref.rule_id,
-                rule.rule_ref.revision.value()
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut excluded_rule_ids = source
-        .catalogue
-        .catalogue
-        .entries
-        .iter()
-        .filter(|rule| {
-            let identity = format!(
-                "{}@{}",
-                rule.rule_ref.rule_id,
-                rule.rule_ref.revision.value()
-            );
-            !included_rule_ids.contains(&identity)
-        })
-        .map(|rule| {
-            format!(
-                "{}@{}",
-                rule.rule_ref.rule_id,
-                rule.rule_ref.revision.value()
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut unavailable_surface_ids = surfaces
+    let (mut normative_coverage_manifest, _registry) =
+        exclusion_manifest_for_catalogue(&source.catalogue.catalogue)?;
+    normative_coverage_manifest.not_searched_scopes = surfaces
         .values()
         .filter(|surface| !surface.status.is_complete())
         .map(|surface| surface.surface_id.clone())
         .collect::<Vec<_>>();
+    normative_coverage_manifest.not_searched_scopes.sort();
     let mut source_refs = source.source_refs;
     source_refs.sort();
-    let mut included_rule_ids = included_rule_ids;
-    included_rule_ids.sort();
-    excluded_rule_ids.sort();
-    unavailable_surface_ids.sort();
     let mut brief = BootstrapBrief {
-        schema_version: "eliot-bootstrap-brief-v1".to_owned(),
+        schema_version: "eliot-bootstrap-brief-v2".to_owned(),
         profile: source.profile,
         snapshot_sha256: source.snapshot.snapshot_sha256,
         catalogue_sha256: source.catalogue.catalogue_sha256,
         source_refs,
-        coverage: BootstrapCoverage {
-            included_rule_ids,
-            excluded_rule_ids,
-            unavailable_surface_ids,
-        },
+        normative_coverage_manifest: normative_coverage_manifest.clone(),
+        coverage: BootstrapCoverage::from_manifest(&normative_coverage_manifest),
         brief_sha256: String::new(),
     };
     brief.brief_sha256 = content_digest(&brief, "brief", |value| {
@@ -823,12 +895,15 @@ fn validate_content_digest<T: Serialize + Clone>(
 pub fn contract_identity() -> Result<eliot_contracts::ContractIdentity, BootstrapCompileError> {
     eliot_contracts::contract_identity(
         CONTRACT_NAME,
-        eliot_contracts::ContractVersion::new(1, 0, 0),
+        eliot_contracts::ContractVersion::new(2, 0, 0),
         &serde_json::json!({
             "source_projection": schemars::schema_for!(SourceProjection<String>),
             "current_system_evidence_snapshot": schemars::schema_for!(CurrentSystemEvidenceSnapshot),
             "bootstrap_rule_catalogue": schemars::schema_for!(BootstrapRuleCatalogue),
             "bootstrap_brief": schemars::schema_for!(BootstrapBrief),
+            "provider_normative_projection": schemars::schema_for!(ProviderNormativeProjection),
+            "bootstrap_failure_draft": schemars::schema_for!(BootstrapFailureDraft),
+            "bootstrap_improvement_draft": schemars::schema_for!(BootstrapImprovementDraft),
         }),
     )
     .map_err(|error| BootstrapCompileError::Canonicalization {
@@ -848,15 +923,455 @@ pub fn protocol_provider_identity()
     })
 }
 
+/// Stable provider identity for the first honest bootstrap projection.
+pub const NORMATIVE_PROVIDER_ID: &str = "eliot-normative-provider";
+/// Stable provider source revision.  It changes whenever this projection
+/// policy changes, independently of a caller's work-unit revision.
+pub const NORMATIVE_PROVIDER_REVISION: &str = "eliot-normative-provider-v2";
+/// Source revision bound to the frozen Architecture/Implementation pair.
+pub const NORMATIVE_SOURCE_REVISION: &str = "architecture-implementation-pair-v1";
+/// Designated reason for an unavailable generated Contract Catalogue.
+pub const NORMATIVE_COVERAGE_INCOMPLETE: &str = "NORMATIVE_COVERAGE_INCOMPLETE";
+
+/// Whether the provider has a complete generated catalogue or an explicit gap.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NormativeProjectionStatus {
+    Complete,
+    Gap,
+}
+
+/// Provider-owned normative projection.  There is intentionally no caller
+/// catalogue or registry parameter on the constructor: until the canonical
+/// generated catalogue is activated, this provider emits a typed GAP.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderNormativeProjection {
+    pub status: NormativeProjectionStatus,
+    pub provider_id: String,
+    pub provider_revision: String,
+    pub source_revision: String,
+    pub normative_pair: NormativePair,
+    pub catalogue: RuleCatalogue,
+    pub registry: ReasonDirectiveRegistry,
+    pub manifest: NormativeCoverageManifest,
+    pub catalogue_sha256: String,
+    pub registry_sha256: String,
+}
+
+fn provider_identity(pair: &NormativePair) -> Result<ContractIdentity, BootstrapCompileError> {
+    eliot_contracts::contract_identity(
+        NORMATIVE_PROVIDER_ID,
+        ContractVersion::new(2, 0, 0),
+        &serde_json::json!({
+            "source_revision": NORMATIVE_SOURCE_REVISION,
+            "normative_pair": pair,
+        }),
+    )
+    .map_err(|error| BootstrapCompileError::Canonicalization {
+        artifact: "normative-provider",
+        reason: error.to_string(),
+    })
+}
+
+fn provider_registry() -> ReasonDirectiveRegistry {
+    ReasonDirectiveRegistry {
+        reasons: vec![ReasonCodeEntry {
+            code: NORMATIVE_COVERAGE_INCOMPLETE.to_owned(),
+            description: "The generated Contract Catalogue is not activated; no rule is permission to proceed.".to_owned(),
+        }],
+        directives: Vec::new(),
+    }
+}
+
+/// Builds the provider-owned GAP projection for the frozen normative pair.
+pub fn provider_normative_gap() -> Result<ProviderNormativeProjection, BootstrapCompileError> {
+    let normative_pair = capture::current_normative_pair();
+    let identity = provider_identity(&normative_pair)?;
+    let catalogue = RuleCatalogue {
+        normative_pair_identity: identity.clone(),
+        catalogue_revision: Revision::new(1).map_err(|error| {
+            BootstrapCompileError::ProviderValidation {
+                provider: "eliot-rules",
+                detail: error.to_string(),
+            }
+        })?,
+        entries: Vec::new(),
+    };
+    let registry = provider_registry();
+    let manifest = NormativeCoverageManifest {
+        pair_and_catalogue_revision: PairAndCatalogueRevision {
+            normative_pair_identity: identity,
+            catalogue_revision: catalogue.catalogue_revision,
+        },
+        searched_rule_scopes: Vec::new(),
+        included_rule_bindings: Vec::new(),
+        excluded_with_reason: Vec::new(),
+        not_searched_scopes: vec![
+            "provider".to_owned(),
+            "runtime".to_owned(),
+            "store".to_owned(),
+            "integrations".to_owned(),
+        ],
+        searched_and_absent_questions: Vec::new(),
+        stale_or_conflicting_rules: Vec::new(),
+        expansion_handles: Vec::new(),
+    };
+    let mut projection = ProviderNormativeProjection {
+        status: NormativeProjectionStatus::Gap,
+        provider_id: NORMATIVE_PROVIDER_ID.to_owned(),
+        provider_revision: NORMATIVE_PROVIDER_REVISION.to_owned(),
+        source_revision: NORMATIVE_SOURCE_REVISION.to_owned(),
+        normative_pair,
+        catalogue,
+        registry,
+        manifest,
+        catalogue_sha256: String::new(),
+        registry_sha256: String::new(),
+    };
+    projection.catalogue_sha256 = canonical_digest(&projection.catalogue, "normative-catalogue")?;
+    projection.registry_sha256 = canonical_digest(&projection.registry, "normative-registry")?;
+    projection.validate()?;
+    Ok(projection)
+}
+
+impl ProviderNormativeProjection {
+    /// Validates frozen identity, provider provenance, digests and gap shape.
+    pub fn validate(&self) -> Result<(), BootstrapCompileError> {
+        if self.status != NormativeProjectionStatus::Gap
+            || self.provider_id != NORMATIVE_PROVIDER_ID
+            || self.provider_revision != NORMATIVE_PROVIDER_REVISION
+            || self.source_revision != NORMATIVE_SOURCE_REVISION
+            || self.normative_pair != capture::current_normative_pair()
+        {
+            return Err(BootstrapCompileError::ProviderValidation {
+                provider: NORMATIVE_PROVIDER_ID,
+                detail: "provider normative identity is not the frozen GAP projection".to_owned(),
+            });
+        }
+        self.normative_pair.validate("normative-provider")?;
+        self.catalogue
+            .validate()
+            .map_err(|error| BootstrapCompileError::ProviderValidation {
+                provider: "eliot-rules",
+                detail: error.to_string(),
+            })?;
+        if !self.catalogue.entries.is_empty() {
+            return Err(BootstrapCompileError::ProviderValidation {
+                provider: "eliot-rules",
+                detail: "GAP projection must not contain synthetic rules".to_owned(),
+            });
+        }
+        self.registry
+            .validate()
+            .map_err(|error| BootstrapCompileError::ProviderValidation {
+                provider: "eliot-rules",
+                detail: error.to_string(),
+            })?;
+        if !self
+            .registry
+            .reasons
+            .iter()
+            .any(|reason| reason.code == NORMATIVE_COVERAGE_INCOMPLETE)
+        {
+            return Err(BootstrapCompileError::ProviderValidation {
+                provider: "eliot-rules",
+                detail: "GAP projection is missing designated reason".to_owned(),
+            });
+        }
+        self.manifest
+            .validate_against(&self.catalogue, &self.registry)
+            .map_err(|error| BootstrapCompileError::ProviderValidation {
+                provider: "eliot-rules",
+                detail: error.to_string(),
+            })?;
+        if !self.manifest.included_rule_bindings.is_empty()
+            || !self.manifest.excluded_with_reason.is_empty()
+        {
+            return Err(BootstrapCompileError::ProviderValidation {
+                provider: "eliot-rules",
+                detail: "GAP manifest must contain no rule dispositions".to_owned(),
+            });
+        }
+        if canonical_digest(&self.catalogue, "normative-catalogue")? != self.catalogue_sha256
+            || canonical_digest(&self.registry, "normative-registry")? != self.registry_sha256
+        {
+            return Err(BootstrapCompileError::DigestMismatch {
+                artifact: "normative-provider",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Normative `I:209` compiler for one provider-owned bootstrap brief.
+pub struct BootstrapBriefCompiler;
+
+impl BootstrapBriefCompiler {
+    /// Builds the provider-owned rule/scope projection for one canonical seed.
+    pub fn compile(
+        seed: AgentWorkUnitBrief,
+        snapshot: &CurrentSystemEvidenceSnapshot,
+    ) -> Result<BootstrapBrief, BootstrapCompileError> {
+        seed.validate()
+            .map_err(|error| BootstrapCompileError::ProviderValidation {
+                provider: "eliot-agent-api",
+                detail: error.to_string(),
+            })?;
+        snapshot.validate()?;
+        let canonical_pair = capture::current_normative_pair();
+        if snapshot.normative_pair != canonical_pair {
+            return Err(BootstrapCompileError::ConflictingIdentity {
+                source_id: "current-system-evidence".to_owned(),
+                identity: "normative_pair".to_owned(),
+            });
+        }
+        let projection = provider_normative_gap()?;
+        let snapshot_sha256 = snapshot.snapshot_sha256.clone();
+        let catalogue_sha256 = projection.catalogue_sha256.clone();
+        let mut source_refs = seed.source_refs;
+        source_refs.push(snapshot_sha256.clone());
+        source_refs.push(catalogue_sha256.clone());
+        source_refs.sort();
+        source_refs.dedup();
+        let manifest = projection.manifest;
+        let mut brief = BootstrapBrief {
+            schema_version: "eliot-bootstrap-brief-v2".to_owned(),
+            profile: BootstrapBriefProfile::Recovery,
+            snapshot_sha256,
+            catalogue_sha256,
+            source_refs,
+            normative_coverage_manifest: manifest.clone(),
+            coverage: BootstrapCoverage::from_manifest(&manifest),
+            brief_sha256: String::new(),
+        };
+        brief.brief_sha256 = content_digest(&brief, "brief", |value| value.brief_sha256.clear())?;
+        brief.validate()?;
+        Ok(brief)
+    }
+}
+
+/// How a bootstrap draft may be reconciled into the canonical evidence store.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DraftImportDisposition {
+    CandidateOnly,
+    Imported,
+    Rejected,
+}
+
+/// Provider-owned inputs shared by the candidate failure and improvement drafts.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapDraftInput {
+    pub source_identity: String,
+    pub normative_pair: NormativePair,
+    pub snapshot_ref: String,
+    pub catalogue_ref: String,
+    pub owner: String,
+    pub discriminator: String,
+    pub import_disposition: DraftImportDisposition,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapFailureDraft {
+    pub source_identity: String,
+    pub normative_pair: NormativePair,
+    pub snapshot_ref: String,
+    pub catalogue_ref: String,
+    pub work_unit_id: String,
+    pub owner: String,
+    pub discriminator: String,
+    pub import_disposition: DraftImportDisposition,
+    pub canonical_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapImprovementDraft {
+    pub source_identity: String,
+    pub normative_pair: NormativePair,
+    pub snapshot_ref: String,
+    pub catalogue_ref: String,
+    pub work_unit_id: String,
+    pub owner: String,
+    pub discriminator: String,
+    pub import_disposition: DraftImportDisposition,
+    pub canonical_digest: String,
+}
+
+macro_rules! draft_impl {
+    ($name:ident) => {
+        impl $name {
+            pub fn new(
+                input: BootstrapDraftInput,
+                seed: &AgentWorkUnitBrief,
+            ) -> Result<Self, BootstrapCompileError> {
+                seed.validate()
+                    .map_err(|error| BootstrapCompileError::ProviderValidation {
+                        provider: "eliot-agent-api",
+                        detail: error.to_string(),
+                    })?;
+                for (value, field) in [
+                    (&input.source_identity, "source_identity"),
+                    (&input.snapshot_ref, "snapshot_ref"),
+                    (&input.catalogue_ref, "catalogue_ref"),
+                    (&input.owner, "owner"),
+                    (&input.discriminator, "discriminator"),
+                ] {
+                    text(value, "bootstrap-draft".to_owned(), field)?;
+                }
+                input.normative_pair.validate("bootstrap-draft")?;
+                digest(
+                    &input.snapshot_ref,
+                    "bootstrap-draft".to_owned(),
+                    "snapshot_ref",
+                )?;
+                digest(
+                    &input.catalogue_ref,
+                    "bootstrap-draft".to_owned(),
+                    "catalogue_ref",
+                )?;
+                let mut draft = Self {
+                    source_identity: input.source_identity,
+                    normative_pair: input.normative_pair,
+                    snapshot_ref: input.snapshot_ref,
+                    catalogue_ref: input.catalogue_ref,
+                    work_unit_id: seed.id.clone().into(),
+                    owner: input.owner,
+                    discriminator: input.discriminator,
+                    import_disposition: input.import_disposition,
+                    canonical_digest: String::new(),
+                };
+                draft.canonical_digest = draft_digest(&draft)?;
+                Ok(draft)
+            }
+
+            pub fn validate(&self) -> Result<(), BootstrapCompileError> {
+                text(
+                    &self.source_identity,
+                    "bootstrap-draft".to_owned(),
+                    "source_identity",
+                )?;
+                text(
+                    &self.work_unit_id,
+                    "bootstrap-draft".to_owned(),
+                    "work_unit_id",
+                )?;
+                text(&self.owner, "bootstrap-draft".to_owned(), "owner")?;
+                text(
+                    &self.discriminator,
+                    "bootstrap-draft".to_owned(),
+                    "discriminator",
+                )?;
+                self.normative_pair.validate("bootstrap-draft")?;
+                digest(
+                    &self.snapshot_ref,
+                    "bootstrap-draft".to_owned(),
+                    "snapshot_ref",
+                )?;
+                digest(
+                    &self.catalogue_ref,
+                    "bootstrap-draft".to_owned(),
+                    "catalogue_ref",
+                )?;
+                digest(
+                    &self.canonical_digest,
+                    "bootstrap-draft".to_owned(),
+                    "canonical_digest",
+                )?;
+                if draft_digest(self)? != self.canonical_digest {
+                    return Err(BootstrapCompileError::DigestMismatch {
+                        artifact: "bootstrap-draft",
+                    });
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+draft_impl!(BootstrapFailureDraft);
+draft_impl!(BootstrapImprovementDraft);
+
+fn canonical_digest<T: Serialize>(
+    value: &T,
+    artifact: &'static str,
+) -> Result<String, BootstrapCompileError> {
+    canonical_json_bytes(value)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| BootstrapCompileError::Canonicalization {
+            artifact,
+            reason: error.to_string(),
+        })
+}
+
+fn draft_digest<T>(value: &T) -> Result<String, BootstrapCompileError>
+where
+    T: Serialize + Clone + DraftDigestValue,
+{
+    let mut unsigned = value.clone();
+    unsigned.clear_digest();
+    canonical_digest(&unsigned, "bootstrap-draft")
+}
+
+trait DraftDigestValue {
+    fn clear_digest(&mut self);
+}
+
+impl DraftDigestValue for BootstrapFailureDraft {
+    fn clear_digest(&mut self) {
+        self.canonical_digest.clear();
+    }
+}
+
+impl DraftDigestValue for BootstrapImprovementDraft {
+    fn clear_digest(&mut self) {
+        self.canonical_digest.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    fn seed() -> AgentWorkUnitBrief {
+        AgentWorkUnitBrief {
+            id: match eliot_agent_api::WorkUnitId::new("W0-06") {
+                Ok(id) => id,
+                Err(error) => panic!("fixture identity must be valid: {error}"),
+            },
+            objective: "emit an honest bootstrap gap".to_owned(),
+            causal_property: "missing normative coverage remains visible".to_owned(),
+            scope_ref: "eliot-bootstrap".to_owned(),
+            expected_outputs: vec!["BootstrapBrief".to_owned()],
+            source_refs: vec!["a".repeat(64)],
+            verifier_ref: "unit-test".to_owned(),
+            integration_owner: "Luna-A".to_owned(),
+            contract_revision: "W0".to_owned(),
+            budget: eliot_agent_api::BudgetEnvelope {
+                context_tokens: 1,
+                wall_time_ms: 1,
+                output_bytes: 1,
+                cost_microunits: 1,
+                max_depth: 1,
+                max_descendants: 0,
+            },
+            effect_ceiling: eliot_agent_api::EffectCeiling {
+                scope_ref: "eliot-bootstrap".to_owned(),
+                allowed: BTreeSet::from([eliot_agent_api::EffectKind::Observe]),
+                max_external_effects: 0,
+            },
+            stop_condition: "stop after candidate".to_owned(),
+        }
+    }
 
     fn pair() -> NormativePair {
         NormativePair {
             architecture_sha256: "a".repeat(64),
             implementation_sha256: "b".repeat(64),
-            runtime_sha256: "c".repeat(64),
         }
     }
 
@@ -884,7 +1399,7 @@ mod tests {
     fn rule_source() -> Result<SourceProjection<BootstrapRuleSource>, Box<dyn std::error::Error>> {
         let normative_pair_identity = eliot_contracts::contract_identity(
             "eliot.rules.test",
-            eliot_contracts::ContractVersion::new(1, 0, 0),
+            eliot_contracts::ContractVersion::new(2, 0, 0),
             &serde_json::json!({"fixture": "rules"}),
         )?;
         let revision = eliot_contracts::Revision::new(1)?;
@@ -916,8 +1431,8 @@ mod tests {
 
     #[test]
     fn snapshot_is_deterministic_and_sorted() -> Result<(), Box<dyn std::error::Error>> {
-        let first = compile_current_system_evidence_snapshot(evidence_source())?;
-        let second = compile_current_system_evidence_snapshot(evidence_source())?;
+        let first = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
+        let second = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
         assert_eq!(first, second);
         assert_eq!(first.records[0].key, "source.head");
         first.validate()?;
@@ -932,7 +1447,7 @@ mod tests {
             SourceStatus::Partial,
         );
         assert!(matches!(
-            compile_current_system_evidence_snapshot(source),
+            CurrentSystemEvidenceCompiler::compile(source),
             Err(BootstrapCompileError::SourceUnavailable {
                 status: SourceStatus::Partial,
                 ..
@@ -947,7 +1462,7 @@ mod tests {
             value.unavailable_domains.push("runtime".to_owned());
         }
         assert!(matches!(
-            compile_current_system_evidence_snapshot(source),
+            CurrentSystemEvidenceCompiler::compile(source),
             Err(BootstrapCompileError::InvalidExactArray {
                 field: "unavailable_domains",
                 ..
@@ -957,7 +1472,7 @@ mod tests {
 
     #[test]
     fn forged_snapshot_digest_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
-        let mut snapshot = compile_current_system_evidence_snapshot(evidence_source())?;
+        let mut snapshot = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
         snapshot.snapshot_sha256 = "d".repeat(64);
         assert!(matches!(
             snapshot.validate(),
@@ -990,7 +1505,7 @@ mod tests {
     #[test]
     fn brief_binds_snapshot_and_catalogue_without_authority()
     -> Result<(), Box<dyn std::error::Error>> {
-        let snapshot = compile_current_system_evidence_snapshot(evidence_source())?;
+        let snapshot = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
         let catalogue = compile_bootstrap_rule_catalogue(rule_source()?)?;
         let snapshot_ref = snapshot.snapshot_sha256.clone();
         let catalogue_ref = catalogue.catalogue_sha256.clone();
@@ -1007,13 +1522,14 @@ mod tests {
             source_refs: vec![snapshot_ref, catalogue_ref],
         })?;
         brief.validate()?;
-        assert_eq!(brief.coverage.included_rule_ids, vec!["R-1@1"]);
+        assert!(brief.coverage.included_rule_ids.is_empty());
+        assert_eq!(brief.coverage.excluded_rule_ids, vec!["R-1@1"]);
         Ok(())
     }
 
     #[test]
     fn brief_requires_exact_artifact_references() -> Result<(), Box<dyn std::error::Error>> {
-        let snapshot = compile_current_system_evidence_snapshot(evidence_source())?;
+        let snapshot = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
         let catalogue = compile_bootstrap_rule_catalogue(rule_source()?)?;
         let error = compile_bootstrap_brief(BootstrapBriefSource {
             profile: BootstrapBriefProfile::Control,
@@ -1030,6 +1546,113 @@ mod tests {
             })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn provider_gap_is_owned_empty_and_byte_stable() -> Result<(), Box<dyn std::error::Error>> {
+        let first = provider_normative_gap()?;
+        let second = provider_normative_gap()?;
+        assert_eq!(first, second);
+        assert_eq!(first.status, NormativeProjectionStatus::Gap);
+        assert!(first.catalogue.entries.is_empty());
+        assert!(first.manifest.included_rule_bindings.is_empty());
+        assert!(first.manifest.excluded_with_reason.is_empty());
+        assert!(
+            first
+                .registry
+                .reasons
+                .iter()
+                .any(|reason| { reason.code == NORMATIVE_COVERAGE_INCOMPLETE })
+        );
+        assert_eq!(serde_json::to_vec(&first)?, serde_json::to_vec(&second)?);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_gap_rejects_identity_and_reason_tampering() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut identity_tampered = provider_normative_gap()?;
+        identity_tampered.source_revision = "caller-revision".to_owned();
+        assert!(identity_tampered.validate().is_err());
+
+        let mut reason_tampered = provider_normative_gap()?;
+        reason_tampered.registry.reasons.clear();
+        assert!(reason_tampered.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_is_bijective_projection_of_manifest() -> Result<(), Box<dyn std::error::Error>> {
+        let projection = provider_normative_gap()?;
+        let coverage = BootstrapCoverage::from_manifest(&projection.manifest);
+        coverage.validate_bijective(&projection.manifest)?;
+        let mut forged = coverage;
+        forged.unavailable_surface_ids.push("fake".to_owned());
+        assert!(forged.validate_bijective(&projection.manifest).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_gap_brief_and_drafts_are_deterministic() -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = evidence_source();
+        let value = source
+            .value
+            .as_mut()
+            .ok_or("complete evidence fixture must carry a value")?;
+        value.normative_pair = capture::current_normative_pair();
+        let snapshot = CurrentSystemEvidenceCompiler::compile(source)?;
+        let snapshot_ref = snapshot.snapshot_sha256.clone();
+        let first = BootstrapBriefCompiler::compile(seed(), &snapshot)?;
+        let second = BootstrapBriefCompiler::compile(seed(), &snapshot)?;
+        assert_eq!(serde_json::to_vec(&first)?, serde_json::to_vec(&second)?);
+
+        let pair = current_normative_pair_for_test();
+        let failure = BootstrapFailureDraft::new(
+            BootstrapDraftInput {
+                source_identity: "capture".to_owned(),
+                normative_pair: pair.clone(),
+                snapshot_ref: snapshot_ref.clone(),
+                catalogue_ref: first.catalogue_sha256.clone(),
+                owner: "Luna-A".to_owned(),
+                discriminator: "missing-catalogue".to_owned(),
+                import_disposition: DraftImportDisposition::CandidateOnly,
+            },
+            &seed(),
+        )?;
+        let improvement = BootstrapImprovementDraft::new(
+            BootstrapDraftInput {
+                source_identity: "capture".to_owned(),
+                normative_pair: pair,
+                snapshot_ref,
+                catalogue_ref: first.catalogue_sha256,
+                owner: "Luna-A".to_owned(),
+                discriminator: "activate-catalogue".to_owned(),
+                import_disposition: DraftImportDisposition::CandidateOnly,
+            },
+            &seed(),
+        )?;
+        assert_eq!(serde_json::to_vec(&failure)?, serde_json::to_vec(&failure)?);
+        failure.validate()?;
+        improvement.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_gap_brief_rejects_a_noncanonical_snapshot_pair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
+        assert!(matches!(
+            BootstrapBriefCompiler::compile(seed(), &snapshot),
+            Err(BootstrapCompileError::ConflictingIdentity {
+                ref source_id,
+                ref identity,
+            }) if source_id == "current-system-evidence" && identity == "normative_pair"
+        ));
+        Ok(())
+    }
+
+    fn current_normative_pair_for_test() -> NormativePair {
+        capture::current_normative_pair()
     }
 
     #[test]

@@ -1,0 +1,121 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "opencode-go",
+  "model_id": "ox-alpha-free",
+  "agent_profile": "plan",
+  "session_id": "ses_fccf606e6ffeZICkvz8uMb5vmM",
+  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
+  "result": {
+    "work_item_id": "W0-03-post",
+    "findings": [
+      {
+        "id": "F1",
+        "severity": "PASS",
+        "check": "deterministic STU",
+        "detail": "scripts/measure-stu.ps1 derives input set from git ls-files --cached sorted Ordinal (L18-32), validates strict UTF-8 (L34,L59-64), computes ceil(bytes/3) exactly per I2.16:2937 fallback formula (L65), emits schema eliot-stu-observation-v1; no timestamps, locale, or environment inputs; executed live: exit=0, observations=544"
+      },
+      {
+        "id": "F2",
+        "severity": "PASS",
+        "check": "no size-only nonzero exit path",
+        "detail": "thresholds 45000/100000 only assign provisional_label (L66-74); every observation carries blocking=false (L80); document status PROVISIONAL_NON_BLOCKING (L86); sole nonzero exits are integrity preconditions: git failure, empty tracked set, invalid UTF-8, missing or root-escaping path (L20-63) - never file size; empirical proof: run passed with 7 files AT_OR_ABOVE_100000 (largest crates/kernel/eliot-installation/src/lib.rs stu=450338) and 15 AT_OR_ABOVE_45000; conforms to I2.16:3017 ('crossing a numeric band alone records profile evidence ... crate is not failed'), :3001, :16688 and to W0-03 disposition rejecting the fail component"
+      },
+      {
+        "id": "F3",
+        "severity": "PASS",
+        "check": "125/6 topology assertion",
+        "detail": "ci.yml:57-68 'Workspace topology baseline' parses cargo metadata --locked --format-version 1 --no-deps, throws unless packages==125 and workspace_default_members==6, publishes counts to GITHUB_STEP_SUMMARY; fail-closed against silent member drift"
+      },
+      {
+        "id": "F4",
+        "severity": "PASS_WITH_NOTE",
+        "check": "exact shared local/CI profile",
+        "detail": "ci.yml:87-89 executes pwsh -NoProfile -File scripts/verify.ps1; profile is versioned eliot-verify-v1 declaring 8 steps (metadata, fmt, normative, stu-evidence, workspace-check --locked --workspace --all-targets, workspace-clippy --locked --workspace --all-targets -D warnings, workspace-tests --locked --workspace, cargo-deny check); local Justfile verify/verify-list (Justfile:33-37) alias the same script byte-for-byte; executed verify -List confirms the 8-step identity; NOTE: legacy Justfile quick/metadata/fmt-check/check recipes (Justfile:5-12,31) remain as narrower parallel entry points outside the versioned profile - residual drift surface"
+      },
+      {
+        "id": "F5",
+        "severity": "PASS_WITH_NUANCE",
+        "check": "cargo-deny 0.20.2 pin and digest evidence",
+        "detail": "ci.yml:70-85 installs with cargo install --locked --version 0.20.2, regex-verifies binary identity '^cargo-deny 0\\.20\\.2', then records version, resolved path and SHA-256 of the installed binary into GITHUB_STEP_SUMMARY - a provenance/digest receipt satisfying I18.21:17527 and I15.9:15158 ('Use cargo deny or equivalent'); NUANCE: the SHA-256 is recorded post-hoc, not compared against a pre-declared expected digest, so a tampered registry artifact would be logged rather than rejected; crates.io registry + Cargo.lock-style locked install mitigates"
+      },
+      {
+        "id": "F6",
+        "severity": "INFO",
+        "check": "policy/config conformance",
+        "detail": "deny.toml unchanged (licenses allow-list MIT/Apache-2.0/BSD-2-Clause/Unicode-3.0, multiple-versions warn, wildcards deny, unknown registry/git deny) consistent with I15.9:15160-15178 default license policy; no hidden CI-only verifier list remains: previous inline default-members fmt/check/clippy steps were removed in favor of the shared profile"
+      }
+    ],
+    "defects": [
+      {
+        "id": "D1",
+        "severity": "LOW",
+        "detail": "cargo-deny digest is evidence-after-the-fact; I18.21 pinning would be stronger if an expected SHA-256 constant were asserted before execution"
+      },
+      {
+        "id": "D2",
+        "severity": "LOW",
+        "detail": "legacy Justfile quick target duplicates a stale narrow subset of eliot-verify-v1; future edits to verify.ps1 will silently diverge from quick"
+      },
+      {
+        "id": "D3",
+        "severity": "LOW",
+        "detail": "stu-evidence prints all 544 observation records to stdout on every CI/local run; log noise grows linearly with repository size; consider summary-only output plus optional full-artifact flag"
+      },
+      {
+        "id": "D4",
+        "severity": "LOW",
+        "detail": "cargo install cargo-deny compiles from source uncached (~/.cargo/bin not in actions/cache paths, ci.yml:49-55); combined with first full-workspace test run, the 45-minute job timeout (ci.yml:31) is a real cold-cache risk"
+      },
+      {
+        "id": "D5",
+        "severity": "INFO",
+        "detail": "stu-evidence is blocking on measurement-integrity defects (invalid UTF-8, missing tracked file); correct as a precondition but should stay explicitly distinguished from size semantics in any future profile documentation"
+      }
+    ],
+    "disposition": {
+      "decision": "ACCEPT",
+      "rationale": "all five audited checks hold: deterministic measurement, zero size-only failure paths empirically exercised at 7 files above the would-be fail threshold, fail-closed 125/6 topology gate, one versioned shared local/CI verification profile, pinned cargo-deny with recorded digest receipt; implementation matches the safe proposal accepted in the prior W0-03 audit (warn-only evidence, no hard 100k failure)",
+      "blockers": [],
+      "residual_conditions": [
+        "optional hardening D1-D4; none gate acceptance"
+      ]
+    },
+    "verifier_evidence": [
+      {
+        "command": "pwsh -NoProfile -File scripts/verify.ps1 -List",
+        "exit": 0,
+        "output_head": "ELIOT_VERIFY_PROFILE=eliot-verify-v1; 01 metadata | 02 fmt | 03 normative | 04 stu-evidence | 05 workspace-check | 06 workspace-clippy | 07 workspace-tests | 08 cargo-deny"
+      },
+      {
+        "command": "pwsh -NoProfile -File scripts/measure-stu.ps1",
+        "exit": 0,
+        "output_summary": "schema=eliot-stu-observation-v1 status=PROVISIONAL_NON_BLOCKING observations=544 labels BELOW_45000=522 AT_OR_ABOVE_45000=15 AT_OR_ABOVE_100000=7 max=crates/kernel/eliot-installation/src/lib.rs stu=450338 blocking=false"
+      }
+    ],
+    "evidence_lineage": [
+      ".github/workflows/ci.yml:14-15,26-31,49-55,57-68,70-89,91-92",
+      "scripts/verify.ps1:9,47-56,58-65,69-73",
+      "scripts/measure-stu.ps1:7-10,17-32,34-65,66-81,84-97",
+      "deny.toml:1-20",
+      "Justfile:31-37",
+      "docs/normative/ELIOT_IMPLEMENTATION.md:2936-2944 (STU fallback definition),3017 (band crossing records evidence, no size failure),16688 (bands never create refusal),17520-17533 (I18.21 parity, pinned identities, digest receipts),15142-15178 (I15.9 supply chain, cargo deny mandate)",
+      "executed read-only: git-free file reads plus the two user-permitted scripts; no cargo check/clippy/test/build/deny, no edits, no writes"
+    ],
+    "proof_ceiling": {
+      "declared": "CandidateArtifact / read-only evidence ceiling",
+      "assessment": "conformant: CI emits step-summary receipts and non-authoritative STU observations; nothing here promotes candidate evidence to current truth; measurement artifacts carry explicit PROVISIONAL_NON_BLOCKING status and blocking=false, so no automated refusal authority exists anywhere in this change"
+    }
+  },
+  "integration_disposition": {
+    "accepted_findings": [
+      "The nonblocking STU implementation matches the accepted canonical challenge.",
+      "Workspace topology and pinned cargo-deny are structurally present in the shared profile."
+    ],
+    "deferred": [
+      "Hosted CI execution and the full W0 verifier remain unobserved."
+    ],
+    "proof_ceiling": "read-only source and bounded script audit; not a hosted CI receipt"
+  }
+}

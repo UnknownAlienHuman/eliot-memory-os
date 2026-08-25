@@ -17,7 +17,8 @@ use eliot_installation::{
 };
 #[cfg(windows)]
 use eliot_platform_windows::{
-    PackageFileSpec, PackageManifest, TrustedSourceBundle, protected_program_data_root,
+    PackageFileSpec, PackageManifest, TrustedSourceBundle, prepare_protected_directory,
+    protected_program_data_root,
 };
 use serde_json::Value;
 
@@ -35,6 +36,29 @@ fn assert_installation_error(output: &Value, code: &str) {
     assert_eq!(output["completed"], false);
     assert_eq!(output["scope"], "bounded_all_effects_or_exact_rollback");
     assert!(output["detail"].is_string());
+}
+
+fn assert_installation_not_healthy(
+    output: &Value,
+    host_state_root: &Path,
+    registry_state: &str,
+    registry_reason: &str,
+) {
+    assert_eq!(output["contract"], "eliot.runtime.live");
+    assert_eq!(output["status"], "NOT_HEALTHY");
+    assert_eq!(output["completed"], false);
+    assert_eq!(output["deadline_exceeded"], false);
+    assert_eq!(output["scope"], "bounded_all_effects_or_exact_rollback");
+    assert_eq!(output["host_state_root"].as_str(), host_state_root.to_str());
+    assert_eq!(
+        output["components"]["installation_registry"][registry_state]["reason"].as_str(),
+        Some(registry_reason)
+    );
+    let expected_gap = format!("registry: {registry_reason}");
+    assert!(output["gaps"].as_array().is_some_and(|gaps| {
+        gaps.iter()
+            .any(|gap| gap.as_str() == Some(expected_gap.as_str()))
+    }));
 }
 
 #[cfg(windows)]
@@ -346,17 +370,19 @@ fn installation_status_reports_missing_registry_under_retained_root() {
         std::process::id()
     ));
     fs::create_dir_all(&temp_root).expect("create status cwd fixture");
-    let host_state_root = protected_program_data_root()
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let installation_key = format!("{:032x}{nonce:032x}", std::process::id());
+    let installation_root = protected_program_data_root()
         .expect("ProgramData root")
-        .join("Eliot");
+        .join("Eliot")
+        .join("installations")
+        .join(installation_key);
+    let host_state_root = installation_root.join("host");
+    prepare_protected_directory(&host_state_root).expect("create retained Host root fixture");
     let registry = host_state_root.join("installation-registry.redb");
-    let expected_code = match fs::symlink_metadata(&host_state_root) {
-        Ok(metadata) if metadata.is_dir() => "INSTALLATION_STATUS_INVALID",
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            "INSTALLATION_STATUS_UNAVAILABLE"
-        }
-        Ok(_) | Err(_) => "INSTALLATION_STATUS_INVALID",
-    };
     let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
         .current_dir(&temp_root)
         .args([
@@ -369,9 +395,16 @@ fn installation_status_reports_missing_registry_under_retained_root() {
         .expect("run missing registry status command");
 
     assert!(!result.status.success());
+    assert_eq!(result.status.code(), Some(2));
     assert!(!registry.exists(), "status created a missing registry");
     let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
-    assert_installation_error(&output, expected_code);
+    assert_installation_not_healthy(
+        &output,
+        &host_state_root,
+        "Missing",
+        "registry does not exist; status never creates it",
+    );
+    let _ = fs::remove_dir_all(installation_root);
     let _ = fs::remove_dir_all(temp_root);
 }
 
@@ -383,9 +416,17 @@ fn installation_status_rejects_a_wrong_installation_root_without_creation() {
         std::process::id()
     ));
     fs::create_dir_all(&temp_root).expect("create wrong-root cwd fixture");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
     let wrong_host_root = protected_program_data_root()
         .expect("ProgramData root")
-        .join("Eliot");
+        .join(format!(
+            "eliot-installation-wrong-root-{}-{nonce}",
+            std::process::id()
+        ));
+    prepare_protected_directory(&wrong_host_root).expect("create wrong retained root fixture");
     let registry = wrong_host_root.join("installation-registry.redb");
     let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
         .current_dir(&temp_root)
@@ -399,9 +440,16 @@ fn installation_status_rejects_a_wrong_installation_root_without_creation() {
         .expect("run wrong-root status command");
 
     assert!(!result.status.success());
+    assert_eq!(result.status.code(), Some(2));
     assert!(!registry.exists(), "status created a wrong-root registry");
     let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
-    assert_installation_error(&output, "INSTALLATION_STATUS_INVALID");
+    assert_installation_not_healthy(
+        &output,
+        &wrong_host_root,
+        "Unavailable",
+        "installation_registry.host_root is invalid: retained root must end in Eliot/installations/<sha256-key>/host",
+    );
+    let _ = fs::remove_dir_all(wrong_host_root);
     let _ = fs::remove_dir_all(temp_root);
 }
 

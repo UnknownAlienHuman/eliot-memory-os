@@ -10,7 +10,9 @@ use std::cmp::Ordering;
 #[cfg(windows)]
 use std::collections::HashSet;
 use std::fmt;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
@@ -2572,35 +2574,35 @@ impl PackageStager {
                 return Err(PackageStagingError::IdentityMismatch);
             }
             verify_system_security(&root, true)?;
+            let expectations = marker
+                .authorization
+                .expected_files
+                .iter()
+                .map(|file| StagedFileReceipt {
+                    relative_path: file.relative_path.clone(),
+                    source_identity: file.source_identity,
+                    destination_identity: FileIdentity {
+                        volume_serial_number: 0,
+                        file_index: 0,
+                    },
+                    size: file.size,
+                    sha256: file.sha256.clone(),
+                    security_descriptor_sha256: String::new(),
+                    pe: None,
+                    authenticode: None,
+                })
+                .collect::<Vec<_>>();
+            inspect_published_destination_at_installation_root(
+                installation_root,
+                manifest,
+                &expectations,
+            )
         }
         #[cfg(not(windows))]
         {
-            let _ = marker_root_identity;
-            return Err(PackageStagingError::UnsupportedPlatform);
+            let _ = (installation_root, manifest, marker_root_identity, marker);
+            Err(PackageStagingError::UnsupportedPlatform)
         }
-        let expectations = marker
-            .authorization
-            .expected_files
-            .iter()
-            .map(|file| StagedFileReceipt {
-                relative_path: file.relative_path.clone(),
-                source_identity: file.source_identity,
-                destination_identity: FileIdentity {
-                    volume_serial_number: 0,
-                    file_index: 0,
-                },
-                size: file.size,
-                sha256: file.sha256.clone(),
-                security_descriptor_sha256: String::new(),
-                pe: None,
-                authenticode: None,
-            })
-            .collect::<Vec<_>>();
-        inspect_published_destination_at_installation_root(
-            installation_root,
-            manifest,
-            &expectations,
-        )
     }
 
     /// Inspect a manifest without adopting an existing generation.
@@ -3414,6 +3416,14 @@ fn enumerate_trusted_source_tree(
 }
 
 #[cfg(not(windows))]
+fn enumerate_trusted_source_tree(
+    _root: &Path,
+    _manifest: &PackageManifest,
+) -> Result<Vec<TreeEntry>, PackageStagingError> {
+    Err(PackageStagingError::UnsupportedPlatform)
+}
+
+#[cfg(not(windows))]
 fn enumerate_tree(
     _root: &Path,
     _manifest: &PackageManifest,
@@ -4001,6 +4011,16 @@ fn cleanup_created_handle(
     }
 }
 
+#[cfg(not(windows))]
+fn cleanup_created_handle(
+    file: std::fs::File,
+    identity: FileIdentity,
+    original: PackageStagingError,
+) -> PackageStagingError {
+    let _ = (file, identity, original);
+    PackageStagingError::UnsupportedPlatform
+}
+
 #[cfg(windows)]
 fn snapshot_source_file(
     path: &Path,
@@ -4424,11 +4444,29 @@ fn delete_open_handle(
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     fn file(path: &str, executable: bool) -> PackageFileSpec {
         PackageFileSpec {
             relative_path: path.to_owned(),
             executable,
             expected_size: 1024,
+        }
+    }
+
+    #[cfg(windows)]
+    fn security_fixture_unavailable(error: &PackageStagingError) -> bool {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER, ERROR_PRIVILEGE_NOT_HELD,
+        };
+
+        match error {
+            PackageStagingError::Io | PackageStagingError::SecurityMismatch => true,
+            PackageStagingError::Win32 { code, .. } => matches!(
+                *code,
+                ERROR_ACCESS_DENIED | ERROR_INVALID_OWNER | ERROR_PRIVILEGE_NOT_HELD
+            ),
+            _ => false,
         }
     }
 
@@ -4442,23 +4480,21 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn hash_file_returns_single_sha256_for_file_contents() {
+    fn hash_file_returns_single_sha256_for_file_contents() -> TestResult {
         let path = std::env::temp_dir().join(format!(
             "eliot-package-hash-file-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::write(&path, b"abc").expect("write");
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .expect("open");
+        std::fs::write(&path, b"abc")?;
+        let mut file = std::fs::OpenOptions::new().read(true).open(&path)?;
         assert_eq!(
-            hash_file(&mut file).expect("hash"),
+            hash_file(&mut file)?,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         drop(file);
-        std::fs::remove_file(path).expect("cleanup");
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]
@@ -4512,27 +4548,23 @@ mod tests {
     }
 
     #[test]
-    fn relative_path_and_manifest_digest_are_stable_under_reordering() {
+    fn relative_path_and_manifest_digest_are_stable_under_reordering() -> TestResult {
         let first = PackageManifest::new(
             "g1",
             vec![file("Bin/Z.dll", false), file("Bin/A.exe", true)],
-        )
-        .expect("manifest");
+        )?;
         let second = PackageManifest::new(
             "g1",
             vec![file("Bin/A.exe", true), file("Bin/Z.dll", false)],
-        )
-        .expect("manifest");
+        )?;
         assert_eq!(first.canonical_digest(), second.canonical_digest());
-        assert_eq!(
-            validate_relative_text("bin/A.exe").expect("path").as_str(),
-            "bin/A.exe"
-        );
+        assert_eq!(validate_relative_text("bin/A.exe")?.as_str(), "bin/A.exe");
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn unicode_ordinal_component_order_and_collision_are_explicit() {
+    fn unicode_ordinal_component_order_and_collision_are_explicit() -> TestResult {
         let manifest = PackageManifest::new(
             "g1",
             vec![
@@ -4540,13 +4572,12 @@ mod tests {
                 file("zeta.txt", false),
                 file("alpha.txt", false),
             ],
-        )
-        .expect("unicode manifest");
+        )?;
         let mut expected = manifest
             .files
             .iter()
-            .map(|file| validate_relative_text(&file.relative_path).expect("path"))
-            .collect::<Vec<_>>();
+            .map(|file| validate_relative_text(&file.relative_path))
+            .collect::<Result<Vec<_>, _>>()?;
         expected.sort_by(ordinal_path_cmp);
         assert_eq!(
             manifest
@@ -4566,6 +4597,7 @@ mod tests {
             ),
             Err(PackageStagingError::ManifestCollision)
         );
+        Ok(())
     }
 
     #[test]
@@ -4643,7 +4675,7 @@ mod tests {
     }
 
     #[test]
-    fn package_stage_win32_error_retains_operation_and_raw_status() {
+    fn package_stage_win32_error_retains_operation_and_raw_status() -> TestResult {
         let error = PackageStagingError::Win32 {
             stage: PackageStagingStage::FlushFileBuffers,
             code: 5,
@@ -4652,9 +4684,10 @@ mod tests {
             error.to_string(),
             "FlushFileBuffers failed with Win32 status 0x00000005"
         );
-        let json = serde_json::to_string(&error).unwrap_or_else(|_| unreachable!());
+        let json = serde_json::to_string(&error)?;
         assert!(json.contains("FLUSH_FILE_BUFFERS"));
         assert!(json.contains("\"code\":5"));
+        Ok(())
     }
 
     #[test]
@@ -4715,7 +4748,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_authenticode_provider_buffers_fail_closed_before_der_slice() {
+    fn malformed_authenticode_provider_buffers_fail_closed_before_der_slice() -> TestResult {
         let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr();
         assert!(!provider_chain_is_bounded(0, dangling));
         assert!(!provider_chain_is_bounded(1, std::ptr::null::<u8>()));
@@ -4745,11 +4778,12 @@ mod tests {
         assert_eq!(
             provider_der_length(
                 dangling,
-                u32::try_from(MAX_AUTHENTICODE_CERT_DER_BYTES + 1).expect("bound fits"),
+                u32::try_from(MAX_AUTHENTICODE_CERT_DER_BYTES + 1)?,
             ),
             None
         );
         assert_eq!(provider_der_length(dangling, 1), Some(1));
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -4781,18 +4815,18 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn authenticode_retained_handle_blocks_write_and_substitution() {
+    fn authenticode_retained_handle_blocks_write_and_substitution() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-authenticode-contour-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let path = root.join("app.exe");
         let replacement = root.join("replacement.exe");
-        std::fs::write(&path, b"before").expect("write");
-        let mut file = open_trusted_source_file(&path).expect("retained handle");
-        let before = observe_authenticode_handle(&mut file).expect("before observation");
+        std::fs::write(&path, b"before")?;
+        let mut file = open_trusted_source_file(&path)?;
+        let before = observe_authenticode_handle(&mut file)?;
         assert_eq!(before.sha256, hex_digest(b"before"));
         assert!(
             std::fs::write(&path, b"after!").is_err(),
@@ -4802,28 +4836,27 @@ mod tests {
             std::fs::rename(&path, &replacement).is_err(),
             "retained Authenticode handle must block path substitution"
         );
-        let after = observe_authenticode_handle(&mut file).expect("after observation");
+        let after = observe_authenticode_handle(&mut file)?;
         assert_eq!(after.sha256, before.sha256);
-        compare_authenticode_observations(&path, &before, &after)
-            .expect("same-handle observation remains stable");
+        compare_authenticode_observations(&path, &before, &after)?;
         drop(file);
-        std::fs::remove_file(&path).expect("file cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_file(&path)?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[test]
-    fn exact_tree_matching_rejects_extra_missing_and_kind_mismatch() {
+    fn exact_tree_matching_rejects_extra_missing_and_kind_mismatch() -> TestResult {
         let manifest = PackageManifest::new(
             "generation",
             vec![file("bin/app.exe", true), file("readme.txt", false)],
-        )
-        .expect("manifest");
-        let expected = expected_tree(&manifest).expect("expected tree");
-        ensure_tree_matches_manifest(&expected, &manifest).expect("exact tree");
+        )?;
+        let expected = expected_tree(&manifest)?;
+        ensure_tree_matches_manifest(&expected, &manifest)?;
 
         let mut extra = expected.clone();
         extra.push(TreeEntry {
-            relative: validate_relative_text("foreign.txt").expect("path"),
+            relative: validate_relative_text("foreign.txt")?,
             kind: TreeEntryKind::File,
         });
         assert_eq!(
@@ -4842,18 +4875,18 @@ mod tests {
         let entry = wrong_kind
             .iter_mut()
             .find(|entry| entry.kind == TreeEntryKind::File)
-            .expect("file entry");
+            .ok_or(std::io::Error::other("expected file entry"))?;
         entry.kind = TreeEntryKind::Directory;
         assert_eq!(
             ensure_tree_matches_manifest(&wrong_kind, &manifest),
             Err(PackageStagingError::TreeMismatch)
         );
+        Ok(())
     }
 
     #[test]
-    fn directory_receipt_is_bound_to_the_manifest_and_security_digest() {
-        let manifest =
-            PackageManifest::new("generation", vec![file("bin/app.bin", false)]).expect("manifest");
+    fn directory_receipt_is_bound_to_the_manifest_and_security_digest() -> TestResult {
+        let manifest = PackageManifest::new("generation", vec![file("bin/app.bin", false)])?;
         let receipt = StagingReceipt {
             generation: manifest.generation.clone(),
             root_path: PathBuf::from(r"C:\ProgramData\Eliot\generation"),
@@ -4872,7 +4905,7 @@ mod tests {
             files: Vec::new(),
             manifest_sha256: manifest.canonical_digest(),
         };
-        validate_receipt_directories(&receipt, &manifest).expect("directory receipt");
+        validate_receipt_directories(&receipt, &manifest)?;
 
         let mut foreign = receipt.clone();
         foreign.directories[0].relative_path = "foreign".to_owned();
@@ -4888,17 +4921,19 @@ mod tests {
             validate_receipt_directories(&wrong_security, &manifest),
             Err(PackageStagingError::SecurityMismatch)
         );
+        Ok(())
     }
 
     #[test]
-    fn parser_rejects_truncated_and_x86_and_accepts_minimal_amd64() {
+    fn parser_rejects_truncated_and_x86_and_accepts_minimal_amd64() -> TestResult {
         assert_eq!(parse_pe_coff(b"MZ"), Err(PeCoffError::Truncated));
         let mut x86 = minimal_pe(0x14c, 0x10b);
         assert_eq!(parse_pe_coff(&x86), Err(PeCoffError::WrongArchitecture));
         x86[0x3c] = 0xff;
         assert_eq!(parse_pe_coff(&x86), Err(PeCoffError::InvalidSignature));
         let amd64 = minimal_pe(0x8664, 0x20b);
-        assert_eq!(parse_pe_coff(&amd64).expect("amd64").machine, 0x8664);
+        assert_eq!(parse_pe_coff(&amd64)?.machine, 0x8664);
+        Ok(())
     }
 
     fn minimal_pe(machine: u16, magic: u16) -> Vec<u8> {
@@ -4907,16 +4942,18 @@ mod tests {
         let section_end = pe_offset + 4 + 20 + optional_size + 40;
         let mut bytes = vec![0_u8; section_end];
         bytes[..2].copy_from_slice(b"MZ");
-        bytes[0x3c..0x40].copy_from_slice(&u32::try_from(pe_offset).expect("offset").to_le_bytes());
+        let Ok(pe_offset_u32) = u32::try_from(pe_offset) else {
+            unreachable!("minimal PE offset must fit in u32");
+        };
+        bytes[0x3c..0x40].copy_from_slice(&pe_offset_u32.to_le_bytes());
         bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
         let coff = pe_offset + 4;
         bytes[coff..coff + 2].copy_from_slice(&machine.to_le_bytes());
         bytes[coff + 2..coff + 4].copy_from_slice(&1_u16.to_le_bytes());
-        bytes[coff + 16..coff + 18].copy_from_slice(
-            &u16::try_from(optional_size)
-                .expect("optional size")
-                .to_le_bytes(),
-        );
+        let Ok(optional_size_u16) = u16::try_from(optional_size) else {
+            unreachable!("minimal PE optional header size must fit in u16");
+        };
+        bytes[coff + 16..coff + 18].copy_from_slice(&optional_size_u16.to_le_bytes());
         bytes[coff + 18..coff + 20].copy_from_slice(&2_u16.to_le_bytes());
         bytes[coff + 20..coff + 22].copy_from_slice(&magic.to_le_bytes());
         bytes
@@ -4924,29 +4961,30 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn unsigned_authenticode_never_returns_valid_evidence() {
+    fn unsigned_authenticode_never_returns_valid_evidence() -> TestResult {
         let path = std::env::temp_dir().join(format!(
             "eliot-package-unsigned-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::write(&path, b"MZ unsigned fixture").expect("write");
-        let file = open_existing_file(&path).expect("open");
-        let identity = file_identity_from_open_handle(&file).expect("identity");
-        let mut reader = file.try_clone().expect("clone");
+        std::fs::write(&path, b"MZ unsigned fixture")?;
+        let file = open_existing_file(&path)?;
+        let identity = file_identity_from_open_handle(&file)?;
+        let mut reader = file.try_clone()?;
         let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).expect("read");
+        reader.read_to_end(&mut bytes)?;
         let sha256 = hex_digest(&bytes);
         let result = WindowsAuthenticodeVerifier.verify(&path, identity, &sha256);
         let _ = std::fs::remove_file(path);
         if let Ok(evidence) = result {
             assert_ne!(evidence.verdict, AuthenticodeVerdict::Valid);
         }
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn junction_is_rejected_by_no_follow_directory_open_and_enumeration() {
+    fn junction_is_rejected_by_no_follow_directory_open_and_enumeration() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-package-reparse-{}",
             super::super::unique_suffix()
@@ -4955,28 +4993,28 @@ mod tests {
             "eliot-package-reparse-outside-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
-        std::fs::create_dir(&outside).expect("outside");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(&outside)?;
         let junction = root.join("junction");
         let output = std::process::Command::new("cmd.exe")
             .args(["/D", "/C", "mklink", "/J"])
             .arg(&junction)
             .arg(&outside)
-            .output()
-            .expect("mklink");
+            .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
             let privilege_specific = output.status.code() == Some(5)
                 || stderr.contains("privilege")
                 || stderr.contains("access is denied");
             if privilege_specific {
-                eprintln!(
-                    "SKIP junction source observation: privilege-specific mklink failure: {}",
+                assert!(
+                    privilege_specific,
+                    "junction source observation skipped: privilege-specific mklink failure: {}",
                     stderr.trim()
                 );
-                std::fs::remove_dir(&root).expect("root cleanup");
-                std::fs::remove_dir(&outside).expect("outside cleanup");
-                return;
+                std::fs::remove_dir(&root)?;
+                std::fs::remove_dir(&outside)?;
+                return Ok(());
             }
             panic!(
                 "mklink /J failed for a non-privilege reason: {}",
@@ -4987,31 +5025,32 @@ mod tests {
             open_existing_directory(&junction),
             Err(PackageStagingError::ReparsePoint)
         ));
-        let manifest = PackageManifest::new("generation", Vec::new()).expect("manifest");
+        let manifest = PackageManifest::new("generation", Vec::new())?;
         assert_eq!(
             enumerate_tree(&root, &manifest),
             Err(PackageStagingError::ReparsePoint)
         );
-        let source = TrustedSourceBundle::open(&root).expect("retained source");
+        let source = TrustedSourceBundle::open(&root)?;
         assert_eq!(source.observe(), Err(PackageStagingError::ReparsePoint));
         drop(source);
-        std::fs::remove_dir(&junction).expect("junction cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
-        std::fs::remove_dir(&outside).expect("outside cleanup");
+        std::fs::remove_dir(&junction)?;
+        std::fs::remove_dir(&root)?;
+        std::fs::remove_dir(&outside)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn hardlink_is_rejected_by_single_link_identity_guard() {
+    fn hardlink_is_rejected_by_single_link_identity_guard() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-package-hardlink-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let original = root.join("original.bin");
         let link = root.join("link.bin");
-        std::fs::write(&original, b"hardlink fixture").expect("write");
-        std::fs::hard_link(&original, &link).expect("hard link");
+        std::fs::write(&original, b"hardlink fixture")?;
+        std::fs::hard_link(&original, &link)?;
         assert!(matches!(
             open_existing_file(&original),
             Err(PackageStagingError::IdentityMismatch)
@@ -5020,27 +5059,28 @@ mod tests {
             open_existing_file(&link),
             Err(PackageStagingError::IdentityMismatch)
         ));
-        let source = TrustedSourceBundle::open(&root).expect("source root");
+        let source = TrustedSourceBundle::open(&root)?;
         assert_eq!(source.observe(), Err(PackageStagingError::IdentityMismatch));
         drop(source);
-        std::fs::remove_file(&link).expect("link cleanup");
-        std::fs::remove_file(&original).expect("original cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_file(&link)?;
+        std::fs::remove_file(&original)?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn trusted_source_observation_is_bounded_sorted_and_read_only() {
+    fn trusted_source_observation_is_bounded_sorted_and_read_only() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-package-source-observe-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
-        std::fs::create_dir(root.join("bin")).expect("bin");
-        std::fs::write(root.join("bin/z.txt"), b"z").expect("z");
-        std::fs::write(root.join("a.txt"), b"a").expect("a");
-        let source = TrustedSourceBundle::open(&root).expect("retained source");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(root.join("bin"))?;
+        std::fs::write(root.join("bin/z.txt"), b"z")?;
+        std::fs::write(root.join("a.txt"), b"a")?;
+        let source = TrustedSourceBundle::open(&root)?;
         let moved = root.with_file_name(format!(
             "eliot-package-source-observe-moved-{}",
             super::super::unique_suffix()
@@ -5049,7 +5089,7 @@ mod tests {
             std::fs::rename(&root, &moved).is_err(),
             "retained ancestor contour must block substitution"
         );
-        let observed = source.observe().expect("source observation");
+        let observed = source.observe()?;
         assert_eq!(observed.total_bytes, 2);
         assert_eq!(
             observed
@@ -5063,33 +5103,32 @@ mod tests {
         assert_eq!(observed.files[0].sha256, hex_digest(b"a"));
         assert!(root.join("a.txt").is_file());
         drop(source);
-        std::fs::remove_file(root.join("bin/z.txt")).expect("z cleanup");
-        std::fs::remove_dir(root.join("bin")).expect("bin cleanup");
-        std::fs::remove_file(root.join("a.txt")).expect("a cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_file(root.join("bin/z.txt"))?;
+        std::fs::remove_dir(root.join("bin"))?;
+        std::fs::remove_file(root.join("a.txt"))?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn trusted_source_file_lease_retains_hash_and_blocks_mutation() {
+    fn trusted_source_file_lease_retains_hash_and_blocks_mutation() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-package-source-file-lease-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let path = root.join("generation.json");
         let bytes = br#"{"generation":1}"#;
-        std::fs::write(&path, bytes).expect("generation fixture");
+        std::fs::write(&path, bytes)?;
 
-        let source = TrustedSourceBundle::open(&root).expect("retained source");
-        let lease = source
-            .retain_file("generation.json")
-            .expect("retained generation file");
+        let source = TrustedSourceBundle::open(&root)?;
+        let lease = source.retain_file("generation.json")?;
         assert_eq!(lease.relative_path(), "generation.json");
         assert_eq!(lease.size(), bytes.len() as u64);
         assert_eq!(lease.sha256(), hex_digest(bytes));
-        assert_eq!(lease.read_bounded(4096).expect("retained bytes"), bytes);
+        assert_eq!(lease.read_bounded(4096)?, bytes);
         assert!(
             std::fs::write(&path, b"tampered").is_err(),
             "retained source file must deny a competing writer"
@@ -5102,81 +5141,83 @@ mod tests {
             std::fs::rename(&root, &moved).is_err(),
             "retained source contour must deny rename"
         );
-        assert_eq!(lease.read(4096).expect("second retained read"), bytes);
+        assert_eq!(lease.read(4096)?, bytes);
         drop(lease);
         drop(source);
-        std::fs::remove_file(path).expect("file cleanup");
-        std::fs::remove_dir(root).expect("root cleanup");
+        std::fs::remove_file(path)?;
+        std::fs::remove_dir(root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn trusted_source_observation_rejects_empty_child_directories() {
+    fn trusted_source_observation_rejects_empty_child_directories() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-package-source-empty-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
-        std::fs::create_dir(root.join("empty")).expect("empty");
-        let source = TrustedSourceBundle::open(&root).expect("retained source");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(root.join("empty"))?;
+        let source = TrustedSourceBundle::open(&root)?;
         assert_eq!(source.observe(), Err(PackageStagingError::TreeMismatch));
         drop(source);
-        std::fs::remove_dir(root.join("empty")).expect("empty cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_dir(root.join("empty"))?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn trusted_source_observation_rejects_file_and_depth_bounds() {
+    fn trusted_source_observation_rejects_file_and_depth_bounds() -> TestResult {
         let file_root = std::env::temp_dir().join(format!(
             "eliot-package-source-file-bound-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&file_root).expect("file root");
+        std::fs::create_dir(&file_root)?;
         for index in 0..=MAX_PACKAGE_FILES {
-            std::fs::write(file_root.join(format!("file-{index}.bin")), []).expect("file");
+            std::fs::write(file_root.join(format!("file-{index}.bin")), [])?;
         }
-        let source = TrustedSourceBundle::open(&file_root).expect("retained source");
+        let source = TrustedSourceBundle::open(&file_root)?;
         assert_eq!(source.observe(), Err(PackageStagingError::BoundExceeded));
         drop(source);
         for index in 0..=MAX_PACKAGE_FILES {
-            std::fs::remove_file(file_root.join(format!("file-{index}.bin")))
-                .expect("file cleanup");
+            std::fs::remove_file(file_root.join(format!("file-{index}.bin")))?;
         }
-        std::fs::remove_dir(&file_root).expect("file root cleanup");
+        std::fs::remove_dir(&file_root)?;
 
         let depth_root = std::env::temp_dir().join(format!(
             "eliot-package-source-depth-bound-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&depth_root).expect("depth root");
+        std::fs::create_dir(&depth_root)?;
         let mut deep = depth_root.clone();
         for index in 0..=MAX_PACKAGE_PATH_DEPTH {
             deep.push(format!("d{index}"));
         }
-        std::fs::create_dir_all(&deep).expect("deep dirs");
-        std::fs::write(deep.join("file.bin"), b"deep").expect("deep file");
-        let source = TrustedSourceBundle::open(&depth_root).expect("retained depth source");
+        std::fs::create_dir_all(&deep)?;
+        std::fs::write(deep.join("file.bin"), b"deep")?;
+        let source = TrustedSourceBundle::open(&depth_root)?;
         assert_eq!(source.observe(), Err(PackageStagingError::BoundExceeded));
         drop(source);
-        std::fs::remove_dir_all(&depth_root).expect("depth cleanup");
+        std::fs::remove_dir_all(&depth_root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn trusted_source_observation_post_read_identity_seam_rejects_replacement() {
+    fn trusted_source_observation_post_read_identity_seam_rejects_replacement() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-package-source-toctou-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let path = root.join("mutable.bin");
-        std::fs::write(&path, b"before").expect("before");
-        let file = open_trusted_source_file(&path).expect("open");
+        std::fs::write(&path, b"before")?;
+        let file = open_trusted_source_file(&path)?;
         let mut hook_write_succeeded = false;
         let result = observe_source_handle_with_post_read_hook(&file, &path, 64, || {
             if std::fs::write(&path, b"replacement-with-a-different-size").is_ok() {
@@ -5193,23 +5234,24 @@ mod tests {
             assert!(std::fs::write(&path, b"replacement-with-a-different-size").is_err());
         }
         drop(file);
-        std::fs::remove_file(&path).expect("file cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_file(&path)?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn trusted_source_same_size_overwrite_is_blocked_or_detected() {
+    fn trusted_source_same_size_overwrite_is_blocked_or_detected() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-package-source-same-size-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let path = root.join("same.bin");
-        std::fs::write(&path, b"AAAAAA").expect("before");
+        std::fs::write(&path, b"AAAAAA")?;
         let before_hash = hex_digest(b"AAAAAA");
-        let file = open_trusted_source_file(&path).expect("open");
+        let file = open_trusted_source_file(&path)?;
         let mut hook_write_succeeded = false;
         let result = observe_source_handle_with_post_read_hook(&file, &path, 64, || {
             if std::fs::write(&path, b"BBBBBB").is_ok() {
@@ -5219,28 +5261,29 @@ mod tests {
         if hook_write_succeeded {
             assert!(result.is_err(), "same-size mutation must be detected");
         } else {
-            let observed = result.expect("blocked same-size write should still observe original");
+            let observed = result?;
             assert_eq!(observed.sha256, before_hash);
             assert_eq!(observed.size, 6);
         }
         drop(file);
-        assert_eq!(std::fs::read(&path).expect("read"), b"AAAAAA");
-        std::fs::remove_file(&path).expect("file cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        assert_eq!(std::fs::read(&path)?, b"AAAAAA");
+        std::fs::remove_file(&path)?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn trusted_source_observer_fails_closed_when_writer_holds_file() {
+    fn trusted_source_observer_fails_closed_when_writer_holds_file() -> TestResult {
         use std::os::windows::fs::OpenOptionsExt as _;
         let root = std::env::temp_dir().join(format!(
             "eliot-package-writer-hold-{}-{}",
             std::process::id(),
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let path = root.join("held.bin");
-        std::fs::write(&path, b"held").expect("before");
+        std::fs::write(&path, b"held")?;
         let writer = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -5251,8 +5294,7 @@ mod tests {
                     .read(true)
                     .write(true)
                     .open(&path)
-            })
-            .expect("writer hold");
+            })?;
         let trusted_open = open_trusted_source_file(&path);
         assert!(
             trusted_open.is_err(),
@@ -5264,7 +5306,7 @@ mod tests {
                 | PackageStagingError::RootUnavailable
                 | PackageStagingError::Win32 { .. })
         ));
-        let source = TrustedSourceBundle::open(&root).expect("source");
+        let source = TrustedSourceBundle::open(&root)?;
         let observed = source.observe();
         assert!(
             observed.is_err(),
@@ -5272,22 +5314,23 @@ mod tests {
         );
         drop(writer);
         drop(source);
-        std::fs::remove_file(&path).expect("file cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_file(&path)?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn staging_copies_from_retained_handle_not_reopened_path() {
+    fn staging_copies_from_retained_handle_not_reopened_path() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-package-retained-copy-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let source_path = root.join("source.bin");
         let dest_path = root.join("dest.bin");
-        std::fs::write(&source_path, b"retained").expect("source");
-        let snapshot = snapshot_source_file(&source_path, 8).expect("snapshot");
+        std::fs::write(&source_path, b"retained")?;
+        let snapshot = snapshot_source_file(&source_path, 8)?;
         let original_hash = snapshot.sha256.clone();
         let original_size = snapshot.size;
         let original_identity = snapshot.identity;
@@ -5296,60 +5339,52 @@ mod tests {
             writer_attempt.is_err(),
             "exclusive snapshot handle must block writer"
         );
-        let mut dest = std::fs::File::create(&dest_path).expect("dest");
-        let copied_hash = copy_source_to_destination(&snapshot, &mut dest, 8).expect("copy");
+        let mut dest = std::fs::File::create(&dest_path)?;
+        let copied_hash = copy_source_to_destination(&snapshot, &mut dest, 8)?;
         assert_eq!(copied_hash, original_hash);
         drop(dest);
-        assert_eq!(std::fs::read(&dest_path).expect("read dest"), b"retained");
+        assert_eq!(std::fs::read(&dest_path)?, b"retained");
         drop(snapshot);
-        std::fs::write(&source_path, b"mutated")
-            .expect("mutate after handle closed should succeed");
-        assert_eq!(
-            std::fs::read(&source_path).expect("read mutated"),
-            b"mutated"
-        );
+        std::fs::write(&source_path, b"mutated")?;
+        assert_eq!(std::fs::read(&source_path)?, b"mutated");
         assert_ne!(original_hash, hex_digest(b"mutated"));
         assert_eq!(original_size, 8);
         let _ = original_identity;
-        std::fs::remove_file(&source_path).expect("source cleanup");
-        std::fs::remove_file(&dest_path).expect("dest cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_file(&source_path)?;
+        std::fs::remove_file(&dest_path)?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn source_snapshot_copy_reports_hash_and_size_changes() {
+    fn source_snapshot_copy_reports_hash_and_size_changes() -> TestResult {
         use std::io::Write as _;
 
         let root = std::env::temp_dir().join(format!(
             "eliot-package-copy-fault-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let source_path = root.join("source.bin");
         let destination_path = root.join("destination.bin");
-        std::fs::write(&source_path, b"before").expect("source");
-        let snapshot = snapshot_source_file(&source_path, 6).expect("snapshot");
+        std::fs::write(&source_path, b"before")?;
+        let snapshot = snapshot_source_file(&source_path, 6)?;
         let writer_blocked = std::fs::OpenOptions::new()
             .write(true)
             .open(&source_path)
             .is_err();
         if writer_blocked {
-            let mut destination = std::fs::File::create(&destination_path).expect("destination");
-            let copied = copy_source_to_destination(&snapshot, &mut destination, 6)
-                .expect("copy blocked writer should retain original bytes");
+            let mut destination = std::fs::File::create(&destination_path)?;
+            let copied = copy_source_to_destination(&snapshot, &mut destination, 6)?;
             assert_eq!(copied, snapshot.sha256);
             drop(destination);
         } else {
-            let mut changed = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&source_path)
-                .expect("open source");
-            changed.write_all(b"after!").expect("mutate source");
+            let mut changed = std::fs::OpenOptions::new().write(true).open(&source_path)?;
+            changed.write_all(b"after!")?;
             drop(changed);
-            let mut destination = std::fs::File::create(&destination_path).expect("destination");
-            let copied = copy_source_to_destination(&snapshot, &mut destination, 6)
-                .expect("copy changed bytes");
+            let mut destination = std::fs::File::create(&destination_path)?;
+            let copied = copy_source_to_destination(&snapshot, &mut destination, 6)?;
             assert_ne!(
                 copied, snapshot.sha256,
                 "changed source must fail hash proof"
@@ -5358,26 +5393,24 @@ mod tests {
         }
         drop(snapshot);
 
-        std::fs::write(&source_path, b"before").expect("reset source");
-        let snapshot = snapshot_source_file(&source_path, 6).expect("snapshot");
+        std::fs::write(&source_path, b"before")?;
+        let snapshot = snapshot_source_file(&source_path, 6)?;
         let writer_blocked = std::fs::OpenOptions::new()
             .append(true)
             .open(&source_path)
             .is_err();
         if writer_blocked {
-            let mut destination = std::fs::File::create(&destination_path).expect("destination");
-            let copied = copy_source_to_destination(&snapshot, &mut destination, 6)
-                .expect("copy should succeed with original bytes when writer blocked");
+            let mut destination = std::fs::File::create(&destination_path)?;
+            let copied = copy_source_to_destination(&snapshot, &mut destination, 6)?;
             assert_eq!(copied, snapshot.sha256);
             drop(destination);
         } else {
             let mut appended = std::fs::OpenOptions::new()
                 .append(true)
-                .open(&source_path)
-                .expect("append source");
-            appended.write_all(b"-size").expect("grow source");
+                .open(&source_path)?;
+            appended.write_all(b"-size")?;
             drop(appended);
-            let mut destination = std::fs::File::create(&destination_path).expect("destination");
+            let mut destination = std::fs::File::create(&destination_path)?;
             assert_eq!(
                 copy_source_to_destination(&snapshot, &mut destination, 6),
                 Err(PackageStagingError::SizeMismatch)
@@ -5385,23 +5418,24 @@ mod tests {
             drop(destination);
         }
         drop(snapshot);
-        std::fs::remove_file(&source_path).expect("source cleanup");
-        std::fs::remove_file(&destination_path).expect("destination cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_file(&source_path)?;
+        std::fs::remove_file(&destination_path)?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn destination_readback_rejects_identity_and_security_mismatch() {
+    fn destination_readback_rejects_identity_and_security_mismatch() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-package-readback-fault-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let path = root.join("destination.bin");
-        std::fs::write(&path, b"readback").expect("write");
-        let file = open_existing_file(&path).expect("open");
-        let identity = file_identity_from_open_handle(&file).expect("identity");
+        std::fs::write(&path, b"readback")?;
+        let file = open_existing_file(&path)?;
+        let identity = file_identity_from_open_handle(&file)?;
         let wrong_identity = FileIdentity {
             file_index: identity.file_index.saturating_add(1),
             ..identity
@@ -5415,61 +5449,63 @@ mod tests {
             Err(PackageStagingError::SecurityMismatch)
         );
         drop(file);
-        std::fs::remove_file(&path).expect("file cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_file(&path)?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn create_new_file_collision_never_overwrites_existing_bytes() {
+    fn create_new_file_collision_never_overwrites_existing_bytes() -> TestResult {
         use std::io::Write as _;
 
         let root = std::env::temp_dir().join(format!(
             "eliot-package-create-new-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let path = root.join("immutable.bin");
         let (mut first, _) = match create_destination_file(&path) {
             Ok(file) => file,
-            Err(PackageStagingError::Io | PackageStagingError::SecurityMismatch) => {
+            Err(error) if security_fixture_unavailable(&error) => {
                 // The fixture needs a token able to apply the production
                 // SystemService ACL; the test remains useful on developer
                 // machines where that policy is unavailable.
-                std::fs::remove_dir(&root).expect("root cleanup");
-                return;
+                std::fs::remove_dir(&root)?;
+                return Ok(());
             }
             Err(error) => panic!("create-new fixture failed: {error}"),
         };
-        first.write_all(b"sentinel").expect("write");
-        flush_file_buffers(&first).expect("flush");
+        first.write_all(b"sentinel")?;
+        flush_file_buffers(&first)?;
         drop(first);
         assert!(matches!(
             create_destination_file(&path),
             Err(PackageStagingError::GenerationExists)
         ));
-        assert_eq!(std::fs::read(&path).expect("readback"), b"sentinel");
-        std::fs::remove_file(&path).expect("file cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        assert_eq!(std::fs::read(&path)?, b"sentinel");
+        std::fs::remove_file(&path)?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn create_new_generation_root_collision_is_never_adopted() {
+    fn create_new_generation_root_collision_is_never_adopted() -> TestResult {
         let parent = std::env::temp_dir().join(format!(
             "eliot-package-generation-parent-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&parent).expect("parent");
+        std::fs::create_dir(&parent)?;
         let generation = parent.join("generation");
         let first = match create_generation_root(&generation) {
             Ok(root) => root,
-            Err(PackageStagingError::Io | PackageStagingError::SecurityMismatch) => {
+            Err(error) if security_fixture_unavailable(&error) => {
                 // The fixture needs a token able to apply the production
                 // SystemService ACL; the test remains useful on developer
                 // machines where that policy is unavailable.
-                std::fs::remove_dir(&parent).expect("parent cleanup");
-                return;
+                std::fs::remove_dir(&parent)?;
+                return Ok(());
             }
             Err(error) => panic!("generation create fixture failed: {error}"),
         };
@@ -5478,65 +5514,67 @@ mod tests {
             create_generation_root(&generation),
             Err(PackageStagingError::GenerationExists)
         ));
-        std::fs::remove_dir(&generation).expect("generation cleanup");
-        std::fs::remove_dir(&parent).expect("parent cleanup");
+        std::fs::remove_dir(&generation)?;
+        std::fs::remove_dir(&parent)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn exact_root_delete_uses_a_delete_capable_no_follow_handle() {
+    fn exact_root_delete_uses_a_delete_capable_no_follow_handle() -> TestResult {
         let parent = std::env::temp_dir().join(format!(
             "eliot-package-generation-delete-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&parent).expect("parent");
+        std::fs::create_dir(&parent)?;
         let generation = parent.join("generation");
         let root = match create_generation_root(&generation) {
             Ok(root) => root,
-            Err(PackageStagingError::Io | PackageStagingError::SecurityMismatch) => {
-                std::fs::remove_dir(&parent).expect("parent cleanup");
-                return;
+            Err(error) if security_fixture_unavailable(&error) => {
+                std::fs::remove_dir(&parent)?;
+                return Ok(());
             }
             Err(error) => panic!("generation delete fixture failed: {error}"),
         };
-        let identity = file_identity_from_open_handle(&root).expect("identity");
+        let identity = file_identity_from_open_handle(&root)?;
         drop(root);
-        let root = open_existing_directory_for_delete(&generation).expect("delete handle");
-        delete_open_handle(root, identity).expect("delete root");
+        let root = open_existing_directory_for_delete(&generation)?;
+        delete_open_handle(root, identity)?;
         assert!(!generation.exists());
-        std::fs::remove_dir(&parent).expect("parent cleanup");
+        std::fs::remove_dir(&parent)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn nested_directory_creation_is_create_only_and_reverse_owned_delete() {
+    fn nested_directory_creation_is_create_only_and_reverse_owned_delete() -> TestResult {
         let parent = std::env::temp_dir().join(format!(
             "eliot-package-nested-directory-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&parent).expect("parent");
+        std::fs::create_dir(&parent)?;
         let first_path = parent.join("bin");
         let second_path = first_path.join("x64");
         let (first, first_identity, _) = match create_destination_directory(&first_path) {
             Ok(directory) => directory,
-            Err(PackageStagingError::Io | PackageStagingError::SecurityMismatch) => {
-                std::fs::remove_dir(&parent).expect("parent cleanup");
-                return;
+            Err(error) if security_fixture_unavailable(&error) => {
+                std::fs::remove_dir(&parent)?;
+                return Ok(());
             }
             Err(error) => panic!("nested directory fixture failed: {error}"),
         };
-        let (second, second_identity, _) =
-            create_destination_directory(&second_path).expect("second directory");
+        let (second, second_identity, _) = create_destination_directory(&second_path)?;
         assert!(second_path.is_dir());
         let substituted = parent.join("bin-substituted");
         assert!(
             std::fs::rename(&first_path, &substituted).is_err(),
             "retained native child handle must block StagePackage child substitution"
         );
-        delete_open_handle(second, second_identity).expect("second delete");
-        delete_open_handle(first, first_identity).expect("first delete");
+        delete_open_handle(second, second_identity)?;
+        delete_open_handle(first, first_identity)?;
         assert!(!first_path.exists());
-        std::fs::remove_dir(&parent).expect("parent cleanup");
+        std::fs::remove_dir(&parent)?;
+        Ok(())
     }
 
     #[test]
@@ -5604,16 +5642,16 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn rollback_delete_refuses_foreign_identity_and_keeps_file() {
+    fn rollback_delete_refuses_foreign_identity_and_keeps_file() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-package-rollback-fault-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("root");
+        std::fs::create_dir(&root)?;
         let path = root.join("owned.bin");
-        std::fs::write(&path, b"owned").expect("write");
-        let handle = open_existing_file_for_delete(&path).expect("open for delete");
-        let identity = file_identity_from_open_handle(&handle).expect("identity");
+        std::fs::write(&path, b"owned")?;
+        let handle = open_existing_file_for_delete(&path)?;
+        let identity = file_identity_from_open_handle(&handle)?;
         let foreign = FileIdentity {
             file_index: identity.file_index.saturating_add(1),
             ..identity
@@ -5623,37 +5661,37 @@ mod tests {
             Err(PackageStagingError::IdentityMismatch)
         );
         assert!(path.exists(), "foreign receipt must not delete the file");
-        std::fs::remove_file(&path).expect("file cleanup");
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_file(&path)?;
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn exact_rollback_refuses_foreign_content_before_root_delete() {
+    fn exact_rollback_refuses_foreign_content_before_root_delete() -> TestResult {
         use std::io::Write as _;
 
         let parent = std::env::temp_dir().join(format!(
             "eliot-package-rollback-foreign-{}",
             super::super::unique_suffix()
         ));
-        std::fs::create_dir(&parent).expect("parent");
+        std::fs::create_dir(&parent)?;
         let generation = parent.join("generation");
         let root_file = match create_generation_root(&generation) {
             Ok(root) => root,
-            Err(PackageStagingError::Io | PackageStagingError::SecurityMismatch) => {
-                std::fs::remove_dir(&parent).expect("parent cleanup");
-                return;
+            Err(error) if security_fixture_unavailable(&error) => {
+                std::fs::remove_dir(&parent)?;
+                return Ok(());
             }
             Err(error) => panic!("rollback fixture failed: {error}"),
         };
         let owned_path = generation.join("owned.bin");
-        let (mut owned_file, owned_identity) =
-            create_destination_file(&owned_path).expect("owned file");
-        owned_file.write_all(b"owned").expect("owned bytes");
-        flush_file_buffers(&owned_file).expect("owned flush");
+        let (mut owned_file, owned_identity) = create_destination_file(&owned_path)?;
+        owned_file.write_all(b"owned")?;
+        flush_file_buffers(&owned_file)?;
         let foreign_path = generation.join("foreign.bin");
-        std::fs::write(&foreign_path, b"foreign").expect("foreign bytes");
-        let root_identity = file_identity_from_open_handle(&root_file).expect("root identity");
+        std::fs::write(&foreign_path, b"foreign")?;
+        let root_identity = file_identity_from_open_handle(&root_file)?;
         let created = CreatedTree {
             root_path: generation.clone(),
             root_identity,
@@ -5670,10 +5708,11 @@ mod tests {
         );
         assert!(!owned_path.exists(), "owned file should be removed first");
         assert!(foreign_path.exists(), "foreign content must remain");
-        let foreign = open_existing_file_for_delete(&foreign_path).expect("foreign delete");
-        let foreign_identity = file_identity_from_open_handle(&foreign).expect("identity");
-        delete_open_handle(foreign, foreign_identity).expect("foreign cleanup");
-        std::fs::remove_dir(&generation).expect("generation cleanup");
-        std::fs::remove_dir(&parent).expect("parent cleanup");
+        let foreign = open_existing_file_for_delete(&foreign_path)?;
+        let foreign_identity = file_identity_from_open_handle(&foreign)?;
+        delete_open_handle(foreign, foreign_identity)?;
+        std::fs::remove_dir(&generation)?;
+        std::fs::remove_dir(&parent)?;
+        Ok(())
     }
 }

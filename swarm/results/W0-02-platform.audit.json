@@ -1,0 +1,210 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "opencode-go",
+  "model_id": "ox-alpha-free",
+  "agent_profile": "plan",
+  "session_id": "ses_fccf606fcffeCw3AOMDCG4YIiu",
+  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
+  "result": {
+    "work_item_id": "W0-02",
+    "disposition": "completed",
+    "diagnosis": {
+      "policy_state": "Root Cargo.toml:310-326 defines workspace lints (rust unsafe_code=forbid; clippy all/pedantic warn, unwrap_used/expect_used/todo/dbg_macro/print_stdout/print_stderr warn, four targeted allows). crates/kernel/eliot-platform-windows/Cargo.toml does NOT inherit ([lints] workspace = true absent); it declares its own tables. Uncommitted working-tree diff (git diff HEAD) shows the crate table previously carried ONLY all/pedantic/module_name_repetitions/must_use_candidate (+rust unsafe_code=allow, unsafe_op_in_unsafe_fn=deny) and the change ADDS dbg_macro/expect_used/missing_errors_doc/missing_panics_doc/print_stderr/print_stdout/todo/unwrap_used - i.e. the eight-entry restoration mirroring workspace values exactly.",
+      "expansion_mechanism": "Because the crate opt-outs of workspace lints, at HEAD unwrap_used/expect_used were simply NOT ENABLED for this crate, so clippy --workspace --all-targets -- -D warnings passed despite 250 unwrap/expect call sites. Restoring the lints re-enabled them; -D warnings promotes every warn to an error, so all 250 sites became hard failures at once, plus pedantic too_many_lines on over-long production functions (owned_directory_retirement.rs:329 spans lines 328-452, ~124 lines > default 100). The expansion is arithmetic, not a regression: the debt predates restoration; restoration made it visible.",
+      "test_vs_production_split": "All 250 unwrap/expect occurrences sit inside #[cfg(test)] code; production unwrap()/expect() count is ZERO. Per-file verification matched every hit line number against cfg-test module boundaries (lib.rs cfg-test at 13343/15080/15090, hits 15191-15941; package_staging.rs cfg-test 4259/4423, hits 4451-5677; owned_directory_retirement.rs cfg(all(test,windows)) at 651, hits 657-731; tcp_listener_owner.rs cfg-test 373, hits 381-575; installer_root.rs tests from 2055, hits 2707/2722/2817; installer_authority_key.rs and supervision_authority_key.rs zero hits). Production .unwrap_or(0) at owned_directory_retirement.rs:293,403 is not flagged by unwrap_used.",
+      "manifest_residual_risk": "The fix duplicates workspace values instead of inheriting them, so drift remains possible; today the clippy tables are value-identical. The one real divergence is deliberate: rust unsafe_code=allow vs workspace forbid is required because this FFI crate calls SetFileInformationByHandle etc. under unsafe (owned_directory_retirement.rs:611-621 with SAFETY comment); full inheritance is impossible without a workspace-side carve-out. This needs an explicit Architecture-owner note rather than silent divergence."
+    },
+    "exact_inventory_by_file": {
+      "lib.rs": {
+        "total_unwrap_expect": 41,
+        "production": 0,
+        "test": 41,
+        "cfg_test_anchors": [
+          13343,
+          15080,
+          15090
+        ],
+        "hit_line_ranges": "15191-15941",
+        "existing_scoped_allows": [
+          [
+            "lib.rs:3421",
+            "allow(clippy::too_many_lines)"
+          ],
+          [
+            "lib.rs:13265",
+            "allow(clippy::unnecessary_wraps)"
+          ]
+        ]
+      },
+      "package_staging.rs": {
+        "total_unwrap_expect": 178,
+        "production": 0,
+        "test": 178,
+        "cfg_test_anchors": [
+          4259,
+          4423
+        ],
+        "hit_line_ranges": "4451-5677"
+      },
+      "owned_directory_retirement.rs": {
+        "total_unwrap_expect": 14,
+        "production": 0,
+        "test": 14,
+        "cfg_test_anchors": [
+          651
+        ],
+        "hit_lines": [
+          657,
+          658,
+          667,
+          670,
+          672,
+          677,
+          678,
+          680,
+          703,
+          708,
+          712,
+          726,
+          729,
+          731
+        ],
+        "production_too_many_lines": {
+          "anchor": "fn retire_owned_directory_exact_inner",
+          "lines": "328-452",
+          "approx_body_lines": 124,
+          "threshold_default": 100
+        }
+      },
+      "tcp_listener_owner.rs": {
+        "total_unwrap_expect": 14,
+        "production": 0,
+        "test": 14,
+        "cfg_test_anchors": [
+          373
+        ],
+        "hit_line_ranges": "381-575"
+      },
+      "installer_root.rs": {
+        "total_unwrap_expect": 3,
+        "production": 0,
+        "test": 3,
+        "cfg_test_anchors": [
+          143,
+          145,
+          147,
+          155,
+          157,
+          159,
+          435,
+          463,
+          501,
+          823,
+          2055,
+          2450
+        ],
+        "hit_lines": [
+          2707,
+          2722,
+          2817
+        ],
+        "existing_scoped_allows": [
+          [
+            "installer_root.rs:1600",
+            "allow(clippy::needless_return)"
+          ],
+          [
+            "installer_root.rs:1614",
+            "allow(clippy::needless_return)"
+          ],
+          [
+            "installer_root.rs:1873",
+            "allow(clippy::too_many_lines)"
+          ]
+        ]
+      },
+      "installer_authority_key.rs": {
+        "total_unwrap_expect": 0
+      },
+      "supervision_authority_key.rs": {
+        "total_unwrap_expect": 0
+      }
+    },
+    "remediation_lanes": [
+      {
+        "lane_id": "P1-owned-directory-refactor",
+        "file": "crates/kernel/eliot-platform-windows/src/owned_directory_retirement.rs",
+        "kind": "production_refactor",
+        "content": "Split fn retire_owned_directory_exact_inner (328-452) into private phase helpers: bind_and_verify_directory (validation+handle identity, 340-369), retain_and_verify_children (371-422), commit_delete_dispositions (424-451); keep the public signature and orchestration body under 100 lines so no allow is needed. Preserve before_delete hook semantics and CommittedUnknown ordering exactly.",
+        "discriminator": "existing tests exact_tree_is_retired_by_handle_identity and concurrent_child_substitution_is_blocked_and_extra_create_fails_precommit (which call the inner fn directly) must pass unchanged before and after"
+      },
+      {
+        "lane_id": "T1-package-staging-tests",
+        "file": "package_staging.rs",
+        "scope": "both #[cfg(test)] mods (4259,4423)",
+        "count": 178,
+        "content": "largest lane; place one module-scoped attribute pair at the top of each test mod; convert shared fixture/helper returns to Result<T, Box<dyn std::error::Error>> with ? so most expects collapse into propagation; keep bare expects only where they are the assertion oracle"
+      },
+      {
+        "lane_id": "T2-lib-tests",
+        "file": "lib.rs",
+        "scope": "three #[cfg(test)] mods",
+        "count": 41,
+        "same_pattern_as": "T1"
+      },
+      {
+        "lane_id": "T3-tcp-listener-tests",
+        "file": "tcp_listener_owner.rs",
+        "scope": "#[cfg(test)] mod at 373",
+        "count": 14,
+        "same_pattern_as": "T1"
+      },
+      {
+        "lane_id": "T4-owned-directory-tests",
+        "file": "owned_directory_retirement.rs",
+        "scope": "#[cfg(all(test,windows))] mod tests at 651",
+        "count": 14,
+        "note": "fixture() is the ideal Result conversion target; identity() helper becomes ?-propagating"
+      },
+      {
+        "lane_id": "T5-installer-root-tests",
+        "file": "installer_root.rs",
+        "scope": "test region from 2055",
+        "count": 3,
+        "smallest_lane": "candidate for full honest-Result conversion with zero allows"
+      }
+    ],
+    "lane_rules": "one writer per file (R6/I17.15); lanes are disjoint by file so they parallelize safely; order P1 before T4 (same file); each lane proves itself via cargo check -p eliot-platform-windows --all-targets plus its own ModuleTestCapsule slice, never workspace-wide cargo",
+    "production_refactor": {
+      "required": "exactly one production finding family in scope: too_many_lines at owned_directory_retirement.rs:329 (328-452)",
+      "approach": "mechanical phase extraction into private #[cfg(windows)] helpers within the same file; no signature changes; no error-type changes; no new unwraps introduced",
+      "explicitly_not_required": "no production unwrap/expect exists to convert (verified zero); mark_delete SAFETY block stays untouched"
+    },
+    "prohibited_shortcuts": [
+      "crate-wide or file-top-level #![allow(clippy::unwrap_used, clippy::expect_used)] outside #[cfg(test)] modules - masks future production panics",
+      "removing or downgrading unwrap_used/expect_used/pedantic in either Cargo.toml (policy lowering, violates W0-02 premise)",
+      "reverting the manifest to omit the restored lints to make warnings disappear",
+      "switching -D warnings off for the crate or excluding it from --workspace gates",
+      "deleting or #[ignore]-ing the affected tests to shrink findings",
+      "catch_unwind wrappers or debug_assert replacements for expects",
+      "hand-waving the unsafe_code=allow divergence instead of recording it as an owner-signed platform exception"
+    ],
+    "scoped_allow_assessment": {
+      "verdict": "contractually acceptable when and only when strictly test-scoped",
+      "basis": "the 250 findings are exclusively #[cfg(test)]; expect() in tests doubles as the assertion oracle, so blanket Result-conversion trades oracle clarity for ceremony; module-scoped attributes inside #[cfg(test)] mod blocks cannot leak into production compilation units, are grep-auditable, and match the precedent already accepted in-tree (five existing function-scoped clippy allows); under A0.6 this qualifies as a bounded deviation provided each attribute carries owner/review condition implicitly through the W0-02 lane record",
+      "preferred_order": "1) Result<T, Box<dyn Error>> + ? conversion for fixture/helper functions, 2) module-scoped #[allow(clippy::expect_used)] (add clippy::unwrap_used only where a test genuinely uses it) placed at mod level, never file level, 3) leave assertion-oracle expects in place under the scoped allow",
+      "non_negotiable": "any occurrence later found in production code must be converted to typed Result, never allowed"
+    },
+    "proof_ceiling": "Static-analysis ceiling: no cargo/clippy execution was permitted, so the authoritative finding list and exact error count are derived arithmetically (250 cfg(test)-confined sites + observed >100-line production function + unknown additional pedantic findings across the 15k-line lib.rs and package_staging.rs that only the compiler can enumerate); cfg-boundary classification was done by line-number comparison against cfg(test)/cfg(all(test,windows)) anchors and could misclassify if an item-scoped cfg(test) attribute governs a region between anchors (checked for the five mid-file anchors in installer_root.rs; none contain unwrap/expect); non-Windows cfg paths and the test-support feature combination were not compiled; the claim that clippy tables are value-identical to workspace was verified by direct list comparison, not by cargo resolution."
+  },
+  "integration_disposition": {
+    "accepted_findings": [
+      "Restoring the effective lint policy exposes large test-target debt.",
+      "No lint suppression or policy weakening is accepted."
+    ],
+    "binding_root_decision": "swarm/challenges/W0-02-FFI-LINT-INHERITANCE.md",
+    "proof_ceiling": "read-only source audit; root Cargo diagnostics remain acceptance evidence"
+  }
+}

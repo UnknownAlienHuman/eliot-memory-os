@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex};
 const MAX_PROVIDER_OUTPUT_BYTES: u64 = 1_048_576;
 const MAX_MCP_REFERENCE_OUTPUT_BYTES: u64 = 1_048_576;
 const MCP_REFERENCE_TIMEOUT: Duration = Duration::from_secs(20);
-const MCP_SMOKE_PRE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
+const MCP_SMOKE_PRE_PROVIDER_TIMEOUT: Duration = Duration::from_mins(1);
 const PROVIDER_CLEANUP_GRACE_SECONDS: u64 = 15;
 const EXTERNAL_ADAPTER_VERSION: &str = "eliot-external-agent-adapter-v1";
 const MCP_SMOKE_PHASE_SCHEMA_VERSION: &str = "eliot-external-agent-smoke-phase-v1";
@@ -2287,7 +2287,7 @@ async fn run_auth_smoke(config_path: &Path, host: AgentHostId, model: &str) -> R
                 stdin_payload: None,
                 route_policy,
                 cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
-                deadline: tokio::time::Instant::now() + Duration::from_secs(120),
+                deadline: tokio::time::Instant::now() + Duration::from_mins(2),
                 runtime_contract_sha256: None,
                 role_lease_id: None,
                 role_lease_epoch: None,

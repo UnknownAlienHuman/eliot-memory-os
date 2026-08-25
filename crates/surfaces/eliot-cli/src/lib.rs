@@ -98,6 +98,7 @@ pub enum CommandArguments {
     },
     BootstrapBrief {
         work_unit: String,
+        repo_root: String,
     },
     RecoveryStatus,
     Ui,
@@ -207,7 +208,13 @@ impl CommandArguments {
                 Self::validate_absolute_path(repo_root, "repo_root")?;
                 Self::validate_absolute_path(output_path, "output_path")
             }
-            Self::BootstrapBrief { work_unit } => Self::validate_text(work_unit, "work_unit"),
+            Self::BootstrapBrief {
+                work_unit,
+                repo_root,
+            } => {
+                Self::validate_absolute_path(work_unit, "work_unit")?;
+                Self::validate_absolute_path(repo_root, "repo_root")
+            }
             Self::DevPulse { objective_id } => Self::validate_text(objective_id, "objective_id"),
             Self::InstrumentRun { profile, scope } => {
                 Self::validate_text(profile, "profile")?;
@@ -282,6 +289,15 @@ pub enum CommandResult {
     /// canonical state or grants authority from it.
     Forwarded {
         payload: Value,
+    },
+    /// A locally compiled bootstrap brief with explicit normative coverage.
+    BootstrapBrief {
+        brief: Box<eliot_bootstrap::BootstrapBrief>,
+    },
+    Unimplemented {
+        architecture_anchor: String,
+        work_item_id: String,
+        detail: String,
     },
     Unavailable {
         reason: UnavailableReason,
@@ -1011,6 +1027,11 @@ pub enum CommandAvailability {
         dependency: &'static str,
         detail: &'static str,
     },
+    Unimplemented {
+        architecture_anchor: &'static str,
+        work_item_id: &'static str,
+        detail: &'static str,
+    },
 }
 
 /// Direct C0 provider identity with the actual provider contract shape digest.
@@ -1037,17 +1058,14 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: CommandId::BootstrapBrief,
-        usage: "eliot bootstrap brief --work-unit <file-or-id>",
+        usage: "eliot bootstrap brief --work-unit <ABSOLUTE> --repo-root <ABSOLUTE>",
         summary: "compile a route-bounded brief and coverage manifest",
         owner: "eliot-cli",
         required_work_id: "A-06",
         argument_kind: ArgumentKind::WorkUnit,
-        effect: EffectClass::Read,
+        effect: EffectClass::Candidate,
         proof_ceiling: ProofCeiling::CandidateArtifact,
-        availability: CommandAvailability::PlanGap {
-            missing_work_id: "A-06",
-            dependency: "eliot-mcp",
-        },
+        availability: CommandAvailability::Admitted,
     },
     CommandSpec {
         id: CommandId::RecoveryStatus,
@@ -1511,6 +1529,15 @@ impl CommandCatalogue {
                     detail: detail.to_owned(),
                 },
             },
+            CommandAvailability::Unimplemented {
+                architecture_anchor,
+                work_item_id,
+                detail,
+            } => CommandResult::Unimplemented {
+                architecture_anchor: architecture_anchor.to_owned(),
+                work_item_id: work_item_id.to_owned(),
+                detail: detail.to_owned(),
+            },
         };
         let response = CommandResponse {
             request: request.request.clone(),
@@ -1545,6 +1572,33 @@ impl CommandCatalogue {
             effect: spec.effect,
             proof_ceiling: spec.proof_ceiling,
             result: CommandResult::Forwarded { payload },
+        };
+        response.validate_for(self, request)?;
+        Ok(response)
+    }
+
+    /// Binds a locally compiled bootstrap brief to the admitted bootstrap
+    /// command. The typed result is deliberately distinct from a forwarded
+    /// Kernel payload and carries no authority beyond candidate evidence.
+    pub fn bootstrap_brief_response(
+        self,
+        request: &CommandRequest,
+        brief: eliot_bootstrap::BootstrapBrief,
+    ) -> Result<CommandResponse, CliError> {
+        self.validate()?;
+        request.validate()?;
+        if request.command != CommandId::BootstrapBrief {
+            return Err(CliError::ResultMismatch);
+        }
+        let spec = self.find(request.command)?;
+        let response = CommandResponse {
+            request: request.request.clone(),
+            command: request.command,
+            effect: spec.effect,
+            proof_ceiling: spec.proof_ceiling,
+            result: CommandResult::BootstrapBrief {
+                brief: Box::new(brief),
+            },
         };
         response.validate_for(self, request)?;
         Ok(response)
@@ -1586,35 +1640,60 @@ impl CommandResponse {
         if self.effect != spec.effect || self.proof_ceiling != spec.proof_ceiling {
             return Err(CliError::ResultMismatch);
         }
-        match (&spec.availability, &self.result) {
-            (CommandAvailability::Admitted, CommandResult::Forwarded { .. }) => {}
-            (
-                CommandAvailability::PlanGap {
-                    missing_work_id,
-                    dependency,
-                },
-                CommandResult::Unavailable {
-                    reason:
-                        UnavailableReason::PlanGap {
-                            missing_work_id: actual,
-                            dependency: actual_dependency,
-                        },
-                },
-            ) if actual == missing_work_id && actual_dependency == dependency => {}
-            (
-                CommandAvailability::Unsupported { dependency, detail },
-                CommandResult::Unavailable {
-                    reason:
-                        UnavailableReason::Unsupported {
-                            dependency: actual_dependency,
-                            detail: actual_detail,
-                        },
-                },
-            ) if actual_dependency == dependency && actual_detail == detail => {}
-            _ => return Err(CliError::ResultMismatch),
-        }
+        validate_result_for(spec.id, &spec.availability, &self.result)?;
         Ok(())
     }
+}
+
+fn validate_result_for(
+    command: CommandId,
+    availability: &CommandAvailability,
+    result: &CommandResult,
+) -> Result<(), CliError> {
+    match (availability, result) {
+        (CommandAvailability::Admitted, CommandResult::Forwarded { .. }) => {}
+        (CommandAvailability::Admitted, CommandResult::BootstrapBrief { .. })
+            if command == CommandId::BootstrapBrief => {}
+        (
+            CommandAvailability::PlanGap {
+                missing_work_id,
+                dependency,
+            },
+            CommandResult::Unavailable {
+                reason:
+                    UnavailableReason::PlanGap {
+                        missing_work_id: actual,
+                        dependency: actual_dependency,
+                    },
+            },
+        ) if actual == missing_work_id && actual_dependency == dependency => {}
+        (
+            CommandAvailability::Unsupported { dependency, detail },
+            CommandResult::Unavailable {
+                reason:
+                    UnavailableReason::Unsupported {
+                        dependency: actual_dependency,
+                        detail: actual_detail,
+                    },
+            },
+        ) if actual_dependency == dependency && actual_detail == detail => {}
+        (
+            CommandAvailability::Unimplemented {
+                architecture_anchor,
+                work_item_id,
+                detail,
+            },
+            CommandResult::Unimplemented {
+                architecture_anchor: actual_architecture_anchor,
+                work_item_id: actual_work_item_id,
+                detail: actual_detail,
+            },
+        ) if actual_architecture_anchor == architecture_anchor
+            && actual_work_item_id == work_item_id
+            && actual_detail == detail => {}
+        _ => return Err(CliError::ResultMismatch),
+    }
+    Ok(())
 }
 
 /// Validates an arbitrary generated catalogue fixture for duplicate/order negatives.
@@ -1659,7 +1738,12 @@ pub fn validate_catalogue(
         }
         if spec.availability == CommandAvailability::Admitted
             && spec.required_work_id != "A-11"
-            && spec.id != CommandId::SystemSnapshot
+            // A-06 owns the two one-shot D0 compilers. They execute locally
+            // and do not acquire Kernel or MCP authority.
+            && !matches!(
+                spec.id,
+                CommandId::SystemSnapshot | CommandId::BootstrapBrief
+            )
         {
             return Err(CatalogueError::InvalidProvider(id.to_owned()));
         }
@@ -1841,6 +1925,8 @@ struct SchemaAvailability {
     code: &'static str,
     dependency: &'static str,
     missing_work_id: Option<&'static str>,
+    architecture_anchor: Option<&'static str>,
+    work_item_id: Option<&'static str>,
     detail: Option<&'static str>,
 }
 
@@ -1850,6 +1936,8 @@ fn schema_command(spec: &CommandSpec) -> SchemaCommand {
             code: "ADMITTED",
             dependency: "eliot-cli",
             missing_work_id: None,
+            architecture_anchor: None,
+            work_item_id: None,
             detail: None,
         },
         CommandAvailability::PlanGap {
@@ -1859,12 +1947,28 @@ fn schema_command(spec: &CommandSpec) -> SchemaCommand {
             code: "PLAN_GAP",
             dependency,
             missing_work_id: Some(missing_work_id),
+            architecture_anchor: None,
+            work_item_id: None,
             detail: None,
         },
         CommandAvailability::Unsupported { dependency, detail } => SchemaAvailability {
             code: "UNSUPPORTED",
             dependency,
             missing_work_id: None,
+            architecture_anchor: None,
+            work_item_id: None,
+            detail: Some(detail),
+        },
+        CommandAvailability::Unimplemented {
+            architecture_anchor,
+            work_item_id,
+            detail,
+        } => SchemaAvailability {
+            code: "UNIMPLEMENTED",
+            dependency: "eliot-cli",
+            missing_work_id: None,
+            architecture_anchor: Some(architecture_anchor),
+            work_item_id: Some(work_item_id),
             detail: Some(detail),
         },
     };
@@ -1886,12 +1990,73 @@ const fn availability_code(availability: CommandAvailability) -> &'static str {
         CommandAvailability::Admitted => "ADMITTED",
         CommandAvailability::PlanGap { .. } => "PLAN_GAP",
         CommandAvailability::Unsupported { .. } => "UNSUPPORTED",
+        CommandAvailability::Unimplemented { .. } => "UNIMPLEMENTED",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opening_fence(line: &str) -> Option<(char, usize)> {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let marker = trimmed.chars().next()?;
+        if !matches!(marker, '`' | '~') {
+            return None;
+        }
+        let width = trimmed
+            .chars()
+            .take_while(|character| *character == marker)
+            .count();
+        (width >= 3).then_some((marker, width))
+    }
+
+    fn closes_fence(line: &str, marker: char, minimum_width: usize) -> bool {
+        let trimmed = line.trim_matches(|character| character == ' ' || character == '\t');
+        trimmed.chars().count() >= minimum_width
+            && trimmed.chars().all(|character| character == marker)
+    }
+
+    fn normative_heading_exists(text: &str, anchor: &str) -> bool {
+        let mut fence = None;
+        let heading_prefix = format!("{anchor}.");
+        for line in text.lines() {
+            if let Some((marker, width)) = fence {
+                if closes_fence(line, marker, width) {
+                    fence = None;
+                }
+                continue;
+            }
+            if let Some(opening) = opening_fence(line) {
+                fence = Some(opening);
+                continue;
+            }
+
+            let trimmed = line.trim_start_matches([' ', '\t']);
+            let hashes = trimmed
+                .chars()
+                .take_while(|character| *character == '#')
+                .count();
+            if !(1..=6).contains(&hashes) {
+                continue;
+            }
+            let heading = trimmed[hashes..].trim_start_matches([' ', '\t']);
+            if heading
+                .strip_prefix(&heading_prefix)
+                .is_some_and(|remainder| remainder.starts_with(' ') || remainder.starts_with('\t'))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn normative_heading_scanner_ignores_info_string_fences() {
+        let fixture = "```text\n## A9.9. fenced example\n```\n## A0.8. real heading\n";
+        assert!(!normative_heading_exists(fixture, "A9.9"));
+        assert!(normative_heading_exists(fixture, "A0.8"));
+    }
 
     #[test]
     fn provider_identity_comes_from_actual_contract_shapes() -> Result<(), CatalogueError> {
@@ -1907,6 +2072,105 @@ mod tests {
                 .iter()
                 .all(|provider| provider.shape_sha256.len() == 64)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unimplemented_result_requires_exact_field_correlation() {
+        let availability = CommandAvailability::Unimplemented {
+            architecture_anchor: "A0.8",
+            work_item_id: "W0-01",
+            detail: "implementation is intentionally bounded to a later work item",
+        };
+        let result = CommandResult::Unimplemented {
+            architecture_anchor: "A0.8".to_owned(),
+            work_item_id: "W0-01".to_owned(),
+            detail: "implementation is intentionally bounded to a later work item".to_owned(),
+        };
+        assert!(validate_result_for(CommandId::BootstrapBrief, &availability, &result).is_ok());
+
+        for result in [
+            CommandResult::Unimplemented {
+                architecture_anchor: "A0.9".to_owned(),
+                work_item_id: "W0-01".to_owned(),
+                detail: "implementation is intentionally bounded to a later work item".to_owned(),
+            },
+            CommandResult::Unimplemented {
+                architecture_anchor: "A0.8".to_owned(),
+                work_item_id: "W0-02".to_owned(),
+                detail: "implementation is intentionally bounded to a later work item".to_owned(),
+            },
+            CommandResult::Unimplemented {
+                architecture_anchor: "A0.8".to_owned(),
+                work_item_id: "W0-01".to_owned(),
+                detail: "different detail".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                validate_result_for(CommandId::BootstrapBrief, &availability, &result),
+                Err(CliError::ResultMismatch)
+            );
+        }
+        assert_eq!(
+            validate_result_for(
+                CommandId::BootstrapBrief,
+                &availability,
+                &CommandResult::Unavailable {
+                    reason: UnavailableReason::PlanGap {
+                        missing_work_id: "W0-01".to_owned(),
+                        dependency: "eliot-cli".to_owned(),
+                    },
+                },
+            ),
+            Err(CliError::ResultMismatch)
+        );
+    }
+
+    #[test]
+    fn typed_unimplemented_anchors_resolve_to_normative_headings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let architecture =
+            std::fs::read_to_string(repository_root.join("docs/normative/ELIOT_ARCHITECTURE.md"))?;
+        let implementation = std::fs::read_to_string(
+            repository_root.join("docs/normative/ELIOT_IMPLEMENTATION.md"),
+        )?;
+        let normative_pair = format!("{architecture}\n{implementation}");
+        let mut checked = 0_usize;
+
+        for spec in CommandCatalogue::current().commands() {
+            if let CommandAvailability::Unimplemented {
+                architecture_anchor,
+                ..
+            } = spec.availability
+            {
+                assert!(
+                    normative_heading_exists(&normative_pair, architecture_anchor),
+                    "catalogue Unimplemented anchor {architecture_anchor} is not a normative heading"
+                );
+                checked += 1;
+            }
+        }
+
+        for result in [CommandResult::Unimplemented {
+            architecture_anchor: "A0.8".to_owned(),
+            work_item_id: "W0-01".to_owned(),
+            detail: "typed oracle fixture".to_owned(),
+        }] {
+            if let CommandResult::Unimplemented {
+                architecture_anchor,
+                ..
+            } = result
+            {
+                assert!(
+                    normative_heading_exists(&normative_pair, &architecture_anchor),
+                    "result Unimplemented anchor {architecture_anchor} is not a normative heading"
+                );
+                checked += 1;
+            }
+        }
+
+        assert_ne!(checked, 0, "typed anchor oracle did not examine any values");
         Ok(())
     }
 }

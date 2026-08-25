@@ -6,13 +6,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    FileIdentity, OwnedSecurityDescriptor, ProtectedPathError, current_process_sid,
-    current_user_local_app_data_root, file_identity_from_handle, protected_program_data_root,
-    sid_to_string,
+    FileIdentity, ProtectedPathError, current_user_local_app_data_root, protected_program_data_root,
+};
+
+#[cfg(windows)]
+use super::{
+    OwnedSecurityDescriptor, current_process_sid, file_identity_from_handle, sid_to_string,
 };
 
 #[cfg(not(windows))]
-use super::final_windows_path_from_handle;
+struct OwnedSecurityDescriptor;
 
 const RECEIPT_LIMIT: u64 = 16 * 1024;
 
@@ -1870,13 +1873,23 @@ fn verify_protected_file_security(
 }
 
 #[cfg(windows)]
-#[allow(clippy::too_many_lines)]
 fn verify_security_exact(
     file: &std::fs::File,
     expected: &OwnedSecurityDescriptor,
     expected_owner: &str,
 ) -> Result<String, InstallerRootError> {
     use std::os::windows::io::AsRawHandle as _;
+
+    verify_security_exact_handle(file.as_raw_handle(), expected, expected_owner)
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_lines)]
+fn verify_security_exact_handle(
+    handle: std::os::windows::io::RawHandle,
+    expected: &OwnedSecurityDescriptor,
+    expected_owner: &str,
+) -> Result<String, InstallerRootError> {
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
@@ -1891,9 +1904,9 @@ fn verify_security_exact(
     let mut owner: PSID = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let status = unsafe {
-        // SAFETY: the file handle is live and outputs point to valid locals.
+        // SAFETY: Windows validates the opaque handle and outputs point to valid locals.
         GetSecurityInfo(
-            file.as_raw_handle().cast(),
+            handle.cast(),
             SE_FILE_OBJECT,
             security,
             &raw mut owner,
@@ -1986,6 +1999,14 @@ fn verify_security_exact(
 #[cfg(windows)]
 fn observe_security_descriptor_digest(file: &std::fs::File) -> Result<String, InstallerRootError> {
     use std::os::windows::io::AsRawHandle as _;
+
+    observe_security_descriptor_digest_handle(file.as_raw_handle())
+}
+
+#[cfg(windows)]
+fn observe_security_descriptor_digest_handle(
+    handle: std::os::windows::io::RawHandle,
+) -> Result<String, InstallerRootError> {
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
@@ -1994,9 +2015,9 @@ fn observe_security_descriptor_digest(file: &std::fs::File) -> Result<String, In
 
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let status = unsafe {
-        // SAFETY: the handle is live and the descriptor output points to a valid local.
+        // SAFETY: Windows validates the opaque handle and the output points to a valid local.
         GetSecurityInfo(
-            file.as_raw_handle().cast(),
+            handle.cast(),
             SE_FILE_OBJECT,
             INSTALLER_SECURITY_QUERY_MASK,
             std::ptr::null_mut(),
@@ -2233,6 +2254,8 @@ fn validate_existing_ancestors(path: &Path) -> Result<(), InstallerRootError> {
                         return Err(InstallerRootError::ReparsePoint);
                     }
                 }
+                #[cfg(not(windows))]
+                let _ = metadata;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(InstallerRootError::Indeterminate),
@@ -2399,7 +2422,8 @@ fn canonical_path_from_handle(
     file: &std::fs::File,
     _stage: InstallerRootStage,
 ) -> Result<PathBuf, InstallerRootError> {
-    final_windows_path_from_handle(file).map_err(map_protected_error)
+    let _ = file;
+    Err(InstallerRootError::UnsupportedPlatform)
 }
 
 #[cfg(windows)]
@@ -2436,7 +2460,8 @@ fn file_identity_from_handle_staged(
     file: &std::fs::File,
     _stage: InstallerRootStage,
 ) -> Result<FileIdentity, InstallerRootError> {
-    file_identity_from_handle(file).map_err(|_| InstallerRootError::Indeterminate)
+    let _ = file;
+    Err(InstallerRootError::UnsupportedPlatform)
 }
 
 fn digest_text(value: &str) -> String {
@@ -3440,52 +3465,20 @@ mod primitive_tests {
 
     #[test]
     fn security_readback_status_preserves_stage_and_win32_code() {
-        use std::mem::ManuallyDrop;
-        use std::os::windows::io::AsRawHandle as _;
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_HANDLE};
+        use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
 
-        let fixture = Fixture::new();
-        let path = fixture.root.join("closed-security-handle");
-        std::fs::write(&path, b"fixture")
-            .unwrap_or_else(|error| panic!("security fixture write failed: {error}"));
-        let file = ManuallyDrop::new(
-            std::fs::File::open(&path)
-                .unwrap_or_else(|error| panic!("security fixture open failed: {error}")),
-        );
-        let handle = (*file).as_raw_handle();
-        assert_ne!(
-            unsafe {
-                // SAFETY: the handle is live and is intentionally closed to exercise
-                // the raw GetSecurityInfo failure branch.
-                CloseHandle(handle.cast())
-            },
-            0
-        );
         let expected = expected_descriptor(InstallerRootProfile::UserMode, false)
             .unwrap_or_else(|error| panic!("expected descriptor failed: {error:?}"));
         assert_eq!(
-            verify_security_exact(&file, &expected, "S-1-5-21-invalid"),
+            verify_security_exact_handle(std::ptr::null_mut(), &expected, "S-1-5-21-invalid"),
             Err(InstallerRootError::Win32 {
                 stage: InstallerRootStage::Readback,
                 code: ERROR_INVALID_HANDLE,
             })
         );
 
-        let file = ManuallyDrop::new(
-            std::fs::File::open(&path)
-                .unwrap_or_else(|error| panic!("second security fixture open failed: {error}")),
-        );
-        let handle = (*file).as_raw_handle();
-        assert_ne!(
-            unsafe {
-                // SAFETY: the handle is live and is intentionally closed to exercise
-                // the raw descriptor-observation failure branch.
-                CloseHandle(handle.cast())
-            },
-            0
-        );
         assert_eq!(
-            observe_security_descriptor_digest(&file),
+            observe_security_descriptor_digest_handle(std::ptr::null_mut()),
             Err(InstallerRootError::Win32 {
                 stage: InstallerRootStage::Readback,
                 code: ERROR_INVALID_HANDLE,

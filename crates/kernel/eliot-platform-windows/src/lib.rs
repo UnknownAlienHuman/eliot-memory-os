@@ -6,7 +6,20 @@
 //! implementation details never escape this crate.
 
 #![deny(unsafe_op_in_unsafe_fn)]
+// Non-Windows builds retain the public typed-unavailability surface while the
+// private Win32 mechanisms are intentionally unreachable. Keep dead-code
+// enforcement strict on Windows, where those mechanisms must remain live.
+#![cfg_attr(not(windows), allow(dead_code))]
+#![cfg_attr(
+    not(windows),
+    allow(
+        clippy::needless_return,
+        clippy::unnecessary_wraps,
+        clippy::unused_self
+    )
+)]
 
+#[cfg(windows)]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1087,7 +1100,7 @@ impl ProtectedPathLease {
         }
         #[cfg(not(windows))]
         {
-            let _ = (create, path);
+            let _ = (create, path, components);
             Err(ProtectedPathError::UnsupportedPlatform)
         }
     }
@@ -1245,7 +1258,7 @@ impl ProtectedRuntimePathLease {
         }
         #[cfg(not(windows))]
         {
-            let _ = (canonical, components);
+            let _ = (canonical, components, exclusive);
             Err(ProtectedPathError::UnsupportedPlatform)
         }
     }
@@ -1976,16 +1989,21 @@ fn current_process_sid() -> Result<String, ProtectedPathError> {
     result
 }
 
+#[cfg(not(windows))]
+fn current_process_sid() -> Result<String, ProtectedPathError> {
+    Err(ProtectedPathError::UnsupportedPlatform)
+}
+
 #[cfg(windows)]
 fn open_user_owned_directory(path: &Path, sid: &str) -> Result<std::fs::File, ProtectedPathError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
+        FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
     };
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
-    options.access_mode(FILE_GENERIC_READ | WRITE_DAC);
+    options.access_mode(FILE_GENERIC_READ | WRITE_DAC | WRITE_OWNER);
     options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
@@ -2062,20 +2080,20 @@ fn open_user_owned_file(path: &Path, sid: &str) -> Result<std::fs::File, Protect
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
     };
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
-    options.access_mode(FILE_GENERIC_READ | WRITE_DAC);
+    options.access_mode(FILE_GENERIC_READ | WRITE_DAC | WRITE_OWNER);
     options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
     let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
-    if !metadata.is_file() {
-        return Err(ProtectedPathError::InvalidPath);
-    }
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(ProtectedPathError::ReparsePoint);
+    }
+    if !metadata.is_file() {
+        return Err(ProtectedPathError::InvalidPath);
     }
     protect_user_owned_opened_handle(&file, false, sid)?;
     Ok(file)
@@ -2099,11 +2117,11 @@ fn open_user_owned_file_read_only(
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
     let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
-    if !metadata.is_file() {
-        return Err(ProtectedPathError::InvalidPath);
-    }
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(ProtectedPathError::ReparsePoint);
+    }
+    if !metadata.is_file() {
+        return Err(ProtectedPathError::InvalidPath);
     }
     ensure_single_user_file_link(&file)?;
     verify_user_owned_opened_handle_read_only(&file, sid)?;
@@ -2371,13 +2389,22 @@ fn pin_protected_directory(path: &Path) -> Result<std::fs::File, ProtectedPathEr
 #[cfg(windows)]
 fn open_protected_directory(path: &Path) -> Result<std::fs::File, ProtectedPathError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    #[cfg(any(test, feature = "test-support"))]
+    use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
     };
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
-    options.access_mode(FILE_GENERIC_READ | WRITE_DAC);
+    let access = FILE_GENERIC_READ | WRITE_DAC;
+    #[cfg(any(test, feature = "test-support"))]
+    let access = if test_protected_root().is_some() {
+        access | WRITE_OWNER
+    } else {
+        access
+    };
+    options.access_mode(access);
     options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
@@ -2421,21 +2448,30 @@ fn open_protected_file(path: &Path, create: bool) -> Result<std::fs::File, Prote
     }
     .map_err(|_| ProtectedPathError::Io)?;
     let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
-    if !metadata.is_file() {
-        return Err(ProtectedPathError::InvalidPath);
-    }
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(ProtectedPathError::ReparsePoint);
+    }
+    if !metadata.is_file() {
+        return Err(ProtectedPathError::InvalidPath);
     }
     Ok(file)
 }
 
 #[cfg(windows)]
 fn legacy_protected_file_access_mode() -> u32 {
+    #[cfg(any(test, feature = "test-support"))]
+    use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_GENERIC_READ, FILE_GENERIC_WRITE, WRITE_DAC,
     };
-    FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC
+    let access = FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC;
+    #[cfg(any(test, feature = "test-support"))]
+    let access = if test_protected_root().is_some() {
+        access | WRITE_OWNER
+    } else {
+        access
+    };
+    access
 }
 
 #[cfg(windows)]
@@ -2541,8 +2577,8 @@ fn protect_user_owned_opened_handle(
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     if !valid_sid_text(sid) {
@@ -2560,13 +2596,18 @@ fn protect_user_owned_opened_handle(
     let dacl = expected
         .dacl()
         .map_err(|_| ProtectedPathError::AclMismatch)?;
-    let security = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    let owner = expected
+        .owner()
+        .map_err(|_| ProtectedPathError::AclMismatch)?;
+    let security = OWNER_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | PROTECTED_DACL_SECURITY_INFORMATION;
     let status = unsafe {
         windows_sys::Win32::Security::Authorization::SetSecurityInfo(
             file.as_raw_handle().cast(),
             SE_FILE_OBJECT,
             security,
-            std::ptr::null_mut(),
+            owner,
             std::ptr::null_mut(),
             dacl,
             std::ptr::null(),
@@ -2575,20 +2616,21 @@ fn protect_user_owned_opened_handle(
     if status != 0 {
         return Err(ProtectedPathError::AclMismatch);
     }
+    let mut observed_owner: PSID = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let status = unsafe {
         GetSecurityInfo(
             file.as_raw_handle().cast(),
             SE_FILE_OBJECT,
             security,
-            std::ptr::null_mut(),
+            &raw mut observed_owner,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             &raw mut descriptor,
         )
     };
-    if status != ERROR_SUCCESS || descriptor.is_null() {
+    if status != ERROR_SUCCESS || descriptor.is_null() || observed_owner.is_null() {
         if !descriptor.is_null() {
             unsafe { LocalFree(descriptor.cast()) };
         }
@@ -2618,8 +2660,9 @@ fn protect_user_owned_opened_handle(
         GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
             && control & SE_DACL_PROTECTED != 0
     };
+    let owner_matches = sid_to_string(observed_owner).is_ok_and(|observed| observed == sid);
     unsafe { LocalFree(descriptor.cast()) };
-    if !dacl_matches || !protected {
+    if !owner_matches || !dacl_matches || !protected {
         return Err(ProtectedPathError::AclMismatch);
     }
     Ok(())
@@ -3846,16 +3889,17 @@ impl OwnedDirectoryPublication {
     ///
     /// Returns only pre-commit path, destination-race, identity or I/O errors.
     pub fn publish(
-        mut self,
+        self,
         precommit_temporary_identity: FileIdentity,
     ) -> Result<DirectoryPublicationOutcome, DirectoryPublicationError> {
         #[cfg(windows)]
         {
-            self.publish_inner(precommit_temporary_identity, || {}, None)
+            let mut publication = self;
+            publication.publish_inner(precommit_temporary_identity, || {}, None)
         }
         #[cfg(not(windows))]
         {
-            let _ = precommit_temporary_identity;
+            let _ = (self, precommit_temporary_identity);
             Err(DirectoryPublicationError::UnsupportedPlatform)
         }
     }
@@ -6724,7 +6768,10 @@ impl OwnedSecurityDescriptor {
     /// Administrators group.  The descriptor is protected from inheriting a
     /// weaker parent DACL before it is applied to the opened no-follow handle.
     fn for_protected_storage() -> Result<Self, WindowsAdapterError> {
-        Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;BA)")
+        // Use the concrete file-all mask because Windows expands generic `GA`
+        // before storing a file-object DACL. The post-write byte proof below
+        // must compare the descriptor that Windows actually persists.
+        Self::from_sddl("D:P(A;;FA;;;SY)(A;;FA;;;BA)")
     }
 
     fn for_installer_system_object(directory: bool) -> Result<Self, WindowsAdapterError> {
@@ -6768,11 +6815,14 @@ impl OwnedSecurityDescriptor {
         if !valid_sid_text(sid) {
             return Err(WindowsAdapterError::InvalidInput);
         }
+        // Bind the owner explicitly.  An elevated interactive token can use
+        // BUILTIN\Administrators as its default owner even though its user SID
+        // is still the intended owner of this per-user contour.
         // `FA` is the concrete file-all mask. Windows expands generic `GA`
         // before storing the DACL, so using `GA` would defeat byte proof.
         let inheritance = if directory { "OICI" } else { "" };
         Self::from_sddl(&format!(
-            "D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;{sid})"
+            "O:{sid}D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;{sid})"
         ))
     }
 
@@ -15180,32 +15230,34 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn missing_known_folder_root_is_provisional_absence() {
+    fn missing_known_folder_root_is_provisional_absence() -> Result<(), Box<dyn std::error::Error>>
+    {
         let root = std::env::temp_dir().join(format!(
             "eliot-local-config-absent-{}-{}",
             std::process::id(),
             unique_suffix()
         ));
         let config = root.join("config").join("governor.toml");
-        let observed = observe_fixed_local_app_data_config(&root, &config, 4096)
-            .expect("missing root observation");
+        let observed = observe_fixed_local_app_data_config(&root, &config, 4096)?;
         assert!(observed.is_provisional_absent());
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn missing_known_folder_config_directory_is_provisional_absence() {
+    fn missing_known_folder_config_directory_is_provisional_absence()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(
             "eliot-local-config-parent-absent-{}-{}",
             std::process::id(),
             unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("known-folder root fixture");
+        std::fs::create_dir(&root)?;
         let config = root.join("config").join("governor.toml");
-        let observed = observe_fixed_local_app_data_config(&root, &config, 4096)
-            .expect("missing config directory observation");
+        let observed = observe_fixed_local_app_data_config(&root, &config, 4096)?;
         assert!(observed.is_provisional_absent());
-        std::fs::remove_dir(&root).expect("root cleanup");
+        std::fs::remove_dir(&root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -15556,26 +15608,31 @@ mod tests {
             protected_program_data_path(Path::new("../outside")),
             Err(ProtectedPathError::InvalidPath)
         );
+        #[cfg(windows)]
         assert_eq!(
             protected_program_data_path(Path::new("C:/outside")),
             Err(ProtectedPathError::InvalidPath)
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            protected_program_data_path(Path::new("C:/outside")),
+            Err(ProtectedPathError::UnsupportedPlatform)
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn retained_process_lease_rejects_identity_or_digest_substitution() {
+    fn retained_process_lease_rejects_identity_or_digest_substitution()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!("eliot-process-lease-{}", unique_suffix()));
         let working = root.join("work");
         let executable = root.join("worker.bin");
-        std::fs::create_dir_all(&working).expect("working directory");
+        std::fs::create_dir_all(&working)?;
         let original = b"original executable bytes";
-        std::fs::write(&executable, original).expect("executable");
-        let platform = WindowsPlatform::new(&root).expect("platform");
+        std::fs::write(&executable, original)?;
+        let platform = WindowsPlatform::new(&root)?;
         let digest = sha256_hex(original);
-        let lease = platform
-            .retain_process_path_lease(&executable, &working, &digest)
-            .expect("retained launch lease");
+        let lease = platform.retain_process_path_lease(&executable, &working, &digest)?;
 
         assert!(std::fs::write(&executable, b"substituted executable bytes").is_err());
         assert!(lease.validate(&executable, &working, &digest).is_ok());
@@ -15594,6 +15651,7 @@ mod tests {
                 .is_err()
         );
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
@@ -15708,111 +15766,101 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn test_support_unknown_publication_retains_exact_reopen_identity() {
+    fn test_support_unknown_publication_retains_exact_reopen_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(
             "eliot-platform-receipt-root-{}-{}",
             std::process::id(),
             unique_suffix()
         ));
-        std::fs::create_dir_all(&root).expect("test root");
+        std::fs::create_dir_all(&root)?;
         let root_override = test_support::override_protected_root(&root);
         let host = root.join("host");
-        prepare_protected_directory(&host).expect("protected host root");
+        prepare_protected_directory(&host)?;
         let path = host.join("eliotd-receipt.json");
         test_support::force_next_owned_runtime_receipt_unknown();
         let PublicationOutcome::Unknown(unknown) =
-            publish_atomic_owned_runtime_receipt(&path, b"receipt", None).expect("publication")
+            publish_atomic_owned_runtime_receipt(&path, b"receipt", None)?
         else {
             panic!("failpoint must preserve unknown outcome");
         };
-        let lease = ProtectedRuntimePathLease::open_existing_absolute(&path)
-            .expect("exact post-commit lease");
+        let lease = ProtectedRuntimePathLease::open_existing_absolute(&path)?;
         assert_eq!(lease.identity(), unknown.expected_identity);
-        assert_eq!(lease.read_bounded(64).expect("readback"), b"receipt");
+        assert_eq!(lease.read_bounded(64)?, b"receipt");
         drop(lease);
         drop(root_override);
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn production_owned_receipt_publication_enforces_identity_and_content_fence() {
+    fn production_owned_receipt_publication_enforces_identity_and_content_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(
             "eliot-platform-receipt-cas-{}-{}",
             std::process::id(),
             unique_suffix()
         ));
-        std::fs::create_dir_all(&root).expect("test root");
+        std::fs::create_dir_all(&root)?;
         let root_override = test_support::override_protected_root(&root);
         let host = root.join("host");
-        prepare_protected_directory(&host).expect("protected host root");
+        prepare_protected_directory(&host)?;
         let path = host.join("eliotd-receipt.json");
 
         let PublicationOutcome::Published(first) =
-            publish_atomic_owned_runtime_receipt(&path, b"receipt-v1", None).expect("first")
+            publish_atomic_owned_runtime_receipt(&path, b"receipt-v1", None)?
         else {
             panic!("first publication must be classified");
         };
-        let first_lease =
-            ProtectedRuntimePathLease::open_existing_absolute(&path).expect("first receipt lease");
+        let first_lease = ProtectedRuntimePathLease::open_existing_absolute(&path)?;
         assert_eq!(first_lease.identity(), first.identity);
-        let first_bytes = first_lease.read_bounded(64).expect("first readback");
+        let first_bytes = first_lease.read_bounded(64)?;
         let precondition = PublicationPrecondition::from_bytes(first.identity, &first_bytes);
         drop(first_lease);
 
         let PublicationOutcome::Published(second) =
-            publish_atomic_owned_runtime_receipt(&path, b"receipt-v2", Some(&precondition))
-                .expect("compare-and-swap publication")
+            publish_atomic_owned_runtime_receipt(&path, b"receipt-v2", Some(&precondition))?
         else {
             panic!("compare-and-swap publication must be classified");
         };
         assert_ne!(second.identity, first.identity);
-        let second_lease =
-            ProtectedRuntimePathLease::open_existing_absolute(&path).expect("second receipt lease");
+        let second_lease = ProtectedRuntimePathLease::open_existing_absolute(&path)?;
         assert_eq!(second_lease.identity(), second.identity);
-        assert_eq!(
-            second_lease.read_bounded(64).expect("second readback"),
-            b"receipt-v2"
-        );
+        assert_eq!(second_lease.read_bounded(64)?, b"receipt-v2");
         drop(second_lease);
 
-        assert_eq!(
+        let Err(error) =
             publish_atomic_owned_runtime_receipt(&path, b"receipt-v3", Some(&precondition))
-                .expect_err("stale compare-and-swap must fail closed"),
-            PortError::IdentityConflict
-        );
-        let final_lease =
-            ProtectedRuntimePathLease::open_existing_absolute(&path).expect("final receipt lease");
-        assert_eq!(
-            final_lease.read_bounded(64).expect("final readback"),
-            b"receipt-v2"
-        );
+        else {
+            panic!("stale compare-and-swap must fail closed");
+        };
+        assert_eq!(error, PortError::IdentityConflict);
+        let final_lease = ProtectedRuntimePathLease::open_existing_absolute(&path)?;
+        assert_eq!(final_lease.read_bounded(64)?, b"receipt-v2");
         drop(final_lease);
         drop(root_override);
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn exclusive_runtime_read_lease_blocks_writers() {
+    fn exclusive_runtime_read_lease_blocks_writers() -> Result<(), Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(
             "eliot-platform-exclusive-lease-{}-{}",
             std::process::id(),
             unique_suffix()
         ));
-        std::fs::create_dir_all(&root).expect("test root");
+        std::fs::create_dir_all(&root)?;
         let root_override = test_support::override_protected_root(&root);
         let host = root.join("host");
-        prepare_protected_directory(&host).expect("protected host root");
+        prepare_protected_directory(&host)?;
         let path = host.join("generation.json");
-        std::fs::write(&path, b"generation").expect("generation fixture");
+        std::fs::write(&path, b"generation")?;
 
-        let lease = ProtectedRuntimePathLease::open_existing_absolute_exclusive(&path)
-            .expect("exclusive runtime lease");
-        assert_eq!(
-            lease.read_bounded(64).expect("retained read"),
-            b"generation"
-        );
+        let lease = ProtectedRuntimePathLease::open_existing_absolute_exclusive(&path)?;
+        assert_eq!(lease.read_bounded(64)?, b"generation");
         assert!(
             std::fs::write(&path, b"tampered").is_err(),
             "exclusive lease must deny a competing writer"
@@ -15820,20 +15868,22 @@ mod tests {
         drop(lease);
         drop(root_override);
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn concurrent_owned_receipt_create_is_atomic_no_replace() {
+    fn concurrent_owned_receipt_create_is_atomic_no_replace()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(
             "eliot-platform-receipt-create-race-{}-{}",
             std::process::id(),
             unique_suffix()
         ));
-        std::fs::create_dir_all(&root).expect("test root");
+        std::fs::create_dir_all(&root)?;
         let root_override = test_support::override_protected_root(&root);
         let host = root.join("host");
-        prepare_protected_directory(&host).expect("protected host root");
+        prepare_protected_directory(&host)?;
         drop(root_override);
 
         let path = host.join("eliotd-receipt.json");
@@ -15857,7 +15907,9 @@ mod tests {
         let mut conflicts = 0;
         let mut published_bytes = None;
         for thread in threads {
-            let (bytes, outcome) = thread.join().expect("publisher thread");
+            let Ok((bytes, outcome)) = thread.join() else {
+                panic!("publisher thread panicked");
+            };
             match outcome {
                 Ok(PublicationOutcome::Published(_)) => {
                     published += 1;
@@ -15869,35 +15921,36 @@ mod tests {
         }
         assert_eq!(published, 1);
         assert_eq!(conflicts, 1);
-        assert_eq!(
-            std::fs::read(&path).expect("committed receipt"),
-            published_bytes.expect("one published value")
-        );
+        let committed = std::fs::read(&path)?;
+        let Some(published_bytes) = published_bytes else {
+            panic!("one published value");
+        };
+        assert_eq!(committed, published_bytes);
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn concurrent_owned_receipt_substitution_preserves_exact_predecessor_cas() {
+    fn concurrent_owned_receipt_substitution_preserves_exact_predecessor_cas()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(
             "eliot-platform-receipt-replace-race-{}-{}",
             std::process::id(),
             unique_suffix()
         ));
-        std::fs::create_dir_all(&root).expect("test root");
+        std::fs::create_dir_all(&root)?;
         let root_override = test_support::override_protected_root(&root);
         let host = root.join("host");
-        prepare_protected_directory(&host).expect("protected host root");
+        prepare_protected_directory(&host)?;
         let path = host.join("eliotd-receipt.json");
         let PublicationOutcome::Published(initial) =
-            publish_atomic_owned_runtime_receipt(&path, b"predecessor", None)
-                .expect("initial publication")
+            publish_atomic_owned_runtime_receipt(&path, b"predecessor", None)?
         else {
             panic!("initial publication must be known");
         };
-        let initial_lease =
-            ProtectedRuntimePathLease::open_existing_absolute(&path).expect("initial lease");
-        let initial_bytes = initial_lease.read_bounded(64).expect("initial bytes");
+        let initial_lease = ProtectedRuntimePathLease::open_existing_absolute(&path)?;
+        let initial_bytes = initial_lease.read_bounded(64)?;
         let precondition = PublicationPrecondition::from_bytes(initial.identity, &initial_bytes);
         drop(initial_lease);
         drop(root_override);
@@ -15924,7 +15977,9 @@ mod tests {
         let mut conflicts = 0;
         let mut published_bytes = None;
         for thread in threads {
-            let (bytes, outcome) = thread.join().expect("publisher thread");
+            let Ok((bytes, outcome)) = thread.join() else {
+                panic!("publisher thread panicked");
+            };
             match outcome {
                 Ok(PublicationOutcome::Published(_)) => {
                     published += 1;
@@ -15936,11 +15991,13 @@ mod tests {
         }
         assert_eq!(published, 1);
         assert_eq!(conflicts, 1);
-        assert_eq!(
-            std::fs::read(&path).expect("committed receipt"),
-            published_bytes.expect("one published value")
-        );
+        let committed = std::fs::read(&path)?;
+        let Some(published_bytes) = published_bytes else {
+            panic!("one published value");
+        };
+        assert_eq!(committed, published_bytes);
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
@@ -16398,6 +16455,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn service_bootstrap_arguments_preserve_typed_order_and_substitution() {
         let bootstrap = ServiceBootstrapArguments::new(
@@ -16474,6 +16532,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn host_bootstrap_root_is_typed_and_ordered_before_effect_nonce() {
         let host_root = PathBuf::from(
@@ -16628,6 +16687,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn service_bootstrap_nonce_is_typed_and_part_of_canonical_argv() {
         let bootstrap = ServiceBootstrapArguments::new(
@@ -16765,6 +16825,7 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
     #[test]
     fn service_configuration_mismatch_is_not_acceptable() {
         let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
@@ -17235,7 +17296,9 @@ mod tests {
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
         let path = root.join("entry");
         std::fs::write(&path, b"original").unwrap_or_else(|_| unreachable!());
-        let error = create_new_file(&path, b"replacement").expect_err("must not truncate");
+        let Err(error) = create_new_file(&path, b"replacement") else {
+            panic!("must not truncate");
+        };
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&path).unwrap_or_default(), b"original");
         let _ = std::fs::remove_dir_all(root);
@@ -18400,6 +18463,44 @@ mod tests {
             UserOwnedPathLease::open_existing(&root_lease, &target),
             Err(ProtectedPathError::ReparsePoint | ProtectedPathError::Io)
         ));
+        drop(root_lease);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_owned_portable_dev_rejects_file_reparse_without_touching_target() {
+        use std::os::windows::fs::symlink_file;
+
+        let root =
+            std::env::temp_dir().join(format!("eliot-user-owned-file-reparse-{}", unique_suffix()));
+        let outside = std::env::temp_dir().join(format!(
+            "eliot-user-owned-file-reparse-outside-{}",
+            unique_suffix()
+        ));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        std::fs::create_dir(&outside).unwrap_or_else(|_| unreachable!());
+        let outside_file = outside.join("state.bin");
+        std::fs::write(&outside_file, b"must-not-open-or-mutate")
+            .unwrap_or_else(|_| unreachable!());
+        let root_lease = UserOwnedRootLease::open_existing(&root)
+            .unwrap_or_else(|error| panic!("root lease failed: {error}"));
+        let linked = root.join("state.bin");
+        if symlink_file(&outside_file, &linked).is_err() {
+            drop(root_lease);
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+        assert!(matches!(
+            UserOwnedPathLease::open_existing(&root_lease, &linked),
+            Err(ProtectedPathError::ReparsePoint | ProtectedPathError::Io)
+        ));
+        assert_eq!(
+            std::fs::read(&outside_file).unwrap_or_default(),
+            b"must-not-open-or-mutate"
+        );
         drop(root_lease);
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside);

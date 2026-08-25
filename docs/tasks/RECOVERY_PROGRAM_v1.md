@@ -4,7 +4,7 @@
 **Норматив:** `ELIOT_ARCHITECTURE.md 4.5-draft` + `ELIOT_IMPLEMENTATION.md 0.29-draft` (SHA-256 сверены)
 **Состав:** Sol (Codex main) + Luna-A/B/C (Codex sub) + 5 Ox Alpha (OpenCode Go) + 2 Ox Alpha (OpenRouter) + Antigravity (Gemini 3.7 flash)
 **Статус документа:** каркас и основные задания. Мелкие решения — за Sol. Это не третья нормативная книга и не источник authority.
-**Ревизия:** v1.1 — учтены проверенные находки внешнего аудита `ELIOT_CODEX_DEEP_ROOT_CAUSE_AUDIT_20260824.md` (что принято и что отклонено — Приложение В).
+**Ревизия:** v1.3 — v1.2 плюс явный evidence-only `BootstrapWorkResult`, разрешающий конфликт между §2.2/§2.3, §4.2 и текущим четырёхполевым Rust `TerminalWorkUpdate`; решение записано в `swarm/decisions/W1-RESULT-ENVELOPE-PROGRAM-REVISION-v1.3.md`.
 
 ---
 
@@ -108,7 +108,7 @@ swarm/
   plan/<wave>/plan.json          AdmittedSwarmPlan, подписан Sol, immutable внутри волны
   briefs/<work-item-id>.json     AgentWorkUnitBrief (профиль ниже)
   claims/<work-item-id>.json     write/path claims + BuildFingerprint + lane
-  results/<work-item-id>.json    TerminalWorkUpdate + structured result
+  results/<work-item-id>.json    BootstrapWorkResult; terminal_update only after a real admitted attempt
   challenges/<work-item-id>.md   ContractChallenge, если возвращён
   gates/<wave>.md                отчёт гейта + вердикт Luna-C
   inventory/                     артефакты волны W1
@@ -251,20 +251,36 @@ AgentWorkUnitBrief:            # профиль BOOTSTRAP-MIN
 ### 4.2. Что обязан вернуть исполнитель
 
 ```yaml
-TerminalWorkUpdate:
+BootstrapWorkResult:             # BootstrapDraft wrapper, не product authority
+  schema_version: eliot.bootstrap-work-result.v1
+  authority_status: EVIDENCE_ONLY
   work_item_id:
-  disposition:  completed | challenged | blocked | failed
-  artifacts:            # пути/коммиты
-  evidence:             # вывод proof_command дословно, включая неуспех
-  discriminator_before: # доказательство, что дискриминатор падал ДО правки
-  discriminator_after:
-  uncertainty:
-  unresolved_questions:
-  proposed_effects:     # что ещё придётся тронуть, но НЕ тронуто
-  evidence_lineage:
+  terminal_update:               # поле ОПУСКАЕТСЯ без реально admitted attempt
+    work_item_id:                 # если присутствует — точный Rust TerminalWorkUpdate
+    attempt_id:
+    disposition: COMPLETED | PARTIAL | FAILED | CANCELLED | UNKNOWN_OUTCOME
+    evidence_digest:
+  structured_result:
+    disposition: completed | challenged | blocked | failed
+    artifacts:                   # пути/коммиты
+    evidence:                    # вывод proof_command дословно, включая неуспех
+    discriminator_before:        # доказательство, что дискриминатор падал ДО правки
+    discriminator_after:
+    uncertainty:
+    unresolved_questions:
+    proposed_effects:            # что ещё придётся тронуть, но НЕ тронуто
+    evidence_lineage:
 ```
 
-`disposition: completed` без пары `discriminator_before` / `discriminator_after` не принимается. Это единственный барьер против proxy-оптимизации.
+`terminal_update` не допускает `null`, неполных или синтетических значений. Оно
+присутствует только после реально admitted attempt и сериализуется без
+дополнительных полей как текущий `eliot-swarm::TerminalWorkUpdate`. Во всех
+read-only W1 результатах поле отсутствует, а богатый профиль остаётся внутри
+`structured_result` с authority ceiling `EVIDENCE_ONLY`.
+
+`structured_result.disposition: completed` без пары `discriminator_before` /
+`discriminator_after` не принимается. Это единственный барьер против
+proxy-оптимизации.
 
 ### 4.3. `ContractChallenge` — обязанность, не право
 
@@ -364,17 +380,47 @@ eliot bootstrap brief --work-unit <seed>                → Admitted, выдаё
 | `W1-04` | `docs/conformance.toml`: 58 якорей `A16.1` → owner, source_handles, support (`UNKNOWN` по умолчанию), invalidation. Генератор, не ручной файл | Ox ×1 |
 | `W1-05` | Карта разреза контуров: точный минимальный список рёбер, соединяющих контур A (`eliot-app`/`eliot-engine`/`eliot-store`) и контур B (`eliot`/`eliot-host`/`eliot-kernel`/`eliotd`), с оценкой каждого | Antigravity + Ox ×1 |
 | `W1-06` | **Независимо, без доступа к результатам W1-01…05 и к аудиту:** попытка фальсификации трёх утверждений — (1) контуры не связаны, (2) все 132 E2E выключены, (3) подписываемый набор не содержит исполняемого продукта | Ox OpenRouter ×2 |
-| `W1-07` | **Реестр композиционных корней без пути успеха.** Для каждого из 21 бинаря установить: может ли его `main()` вообще дойти до полезной работы, или всякий путь заканчивается типизированным отказом. Четыре известных случая — в §5.1; задача в том, чтобы найти остальные | Ox ×1 + Antigravity |
+| `W1-07` | **Реестр композиционных корней без пути успеха.** Для каждого binary target из текущего Cargo metadata (на ревизии `1122e21b` их 22, историческое число 21 устарело) установить: может ли его `main()` вообще дойти до полезной работы, или всякий путь заканчивается типизированным отказом. Четыре известных случая — в §5.1; задача в том, чтобы найти остальные | Ox ×1 + Antigravity |
 
 **DoD W1:**
 ```text
 четыре артефакта в git, машинно-генерируемые, воспроизводимые одной командой;
-W1-06 не опроверг ни одно из трёх утверждений, либо опроверг — и тогда программа
-пересматривается до начала W2 (это нормальный, а не аварийный исход);
+исходные утверждения W1-06 разрешены пересмотром v1.2 ниже, а revised-premises
+воспроизводимы и прошли два независимых OpenRouter-аудита;
 W1-03 назвал конкретный разрез цикла приёмки.
 ```
 
 **Решение Sol по итогам W1-03:** одна ячейка получает `Recoverable Deviation` по `A0.6` (owner, причина, scope, review condition, rollback). Без явного разрыва цикла ни одна из семи не закроется никогда.
+
+#### Пересмотр W1-06, v1.2
+
+Два исходных утверждения действительно опровергнуты, поэтому они больше не
+могут быть входными предпосылками W2:
+
+1. отсутствие прямых Cargo-рёбер между именованными контурами подтверждено,
+   но широкое «контуры не связаны» остаётся `UNKNOWN` до полного census
+   runtime/process/IPC-рёбер W1-05;
+2. «все 132 E2E выключены» — `FALSE`: в default workspace gate есть
+   неигнорируемые full-stack тесты; число `331/82/249` — воспроизводимая
+   эвристическая текущая выборка, а не новая нормативная константа;
+3. «подписываемый набор не содержит исполняемого продукта» — `FALSE`:
+   Authenticode scope содержит семь PE-ролей, materializer — шесть executable
+   и три JSON-роли. Это доказывает состав, но не работоспособность продукта.
+
+Вместо них W2 получает четыре более узкие проверяемые предпосылки:
+
+- `C1`: точный Authenticode role set — статически `TRUE`;
+- `C2`: точный ordered materializer role set — статически `TRUE`;
+- `C3`: production launch reachability — `UNKNOWN` до реального receipt; это
+  измеряемая цель W2, а не условие, которое W2 обязан предположить истинным;
+- `C4`: Governor представлен как constitutive authority в Cargo/source
+  composition — статически `TRUE`, без утверждения о runtime-вызове
+  `commit_canonical`.
+
+Пересмотр снимает только kill-condition исходных ложных предпосылок. Он не
+разблокирует W2 сам по себе: W0 должен пройти, а W1-инвентари и их независимые
+oracle должны быть приняты Root. Никакой signed-set или static-source факт не
+засчитывается как Product Pulse.
 
 ---
 
@@ -636,7 +682,8 @@ Kill-условия программы (пересмотр целиком):
 ```text
 Pulse #1 не удаётся закрыть за два полных цикла W2 → предпосылка «dogfood — рабочая опора» ложна,
   выбирается другая опорная точка, а не третья попытка;
-W1-06 опроверг хотя бы одно из трёх базовых утверждений аудита;
+новые наблюдения опровергли revised-premise C1, C2 или C4 либо дали runtime
+  receipt, несовместимый с C3, и пересмотр v1.2 не был обновлён;
 после W3 стоимость координации выросла сильнее, чем упала стоимость реконструкции
   (I18.38: разрез полезен только если снижает суммарную стоимость).
 ```

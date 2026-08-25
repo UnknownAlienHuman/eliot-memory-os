@@ -275,7 +275,7 @@ impl CognitiveProjectionCoordinator {
     /// persisted on the claimed lease and never falsify canonical commits.
     pub async fn run(mut self) -> Result<(), EngineError> {
         let mut armed = false;
-        let mut delay = Duration::from_secs(86_400);
+        let mut delay = Duration::from_hours(24);
         loop {
             tokio::select! {
                 _ = &mut self.shutdown => {
@@ -295,7 +295,7 @@ impl CognitiveProjectionCoordinator {
             }
 
             if !armed {
-                delay = Duration::from_secs(86_400);
+                delay = Duration::from_hours(24);
                 continue;
             }
             match self.background_step().await {
@@ -307,7 +307,7 @@ impl CognitiveProjectionCoordinator {
                 }
                 Ok(BackgroundStep::Dormant) => {
                     armed = false;
-                    delay = Duration::from_secs(86_400);
+                    delay = Duration::from_hours(24);
                 }
                 Err(_) => {
                     // Claim/inventory transport failure has no lease to mutate.

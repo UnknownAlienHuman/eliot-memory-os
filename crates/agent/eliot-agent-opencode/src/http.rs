@@ -13,7 +13,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 const DEFAULT_MAX_HEADER_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
-const DEFAULT_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_ABSOLUTE_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

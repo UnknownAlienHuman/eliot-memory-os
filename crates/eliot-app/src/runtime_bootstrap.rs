@@ -15,7 +15,7 @@ use std::os::windows::process::CommandExt as _;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const START_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 const OWNED_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 

@@ -974,16 +974,16 @@ impl GenerationPackagePlanner {
                 )?
             }
         };
-        if let Some(expected_staging_root) = roots.expected_staging_root()? {
-            if !crate::same_windows_root(
+        if let Some(expected_staging_root) = roots.expected_staging_root()?
+            && !crate::same_windows_root(
                 input.staging_root.as_str(),
                 expected_staging_root.as_str(),
-            )? {
-                return Err(InstallationError::ProfileViolation(
-                    "SystemService/UserMode staging_root must equal profile_anchor_root\\Eliot\\packages"
-                        .to_owned(),
-                ));
-            }
+            )?
+        {
+            return Err(InstallationError::ProfileViolation(
+                "SystemService/UserMode staging_root must equal profile_anchor_root\\Eliot\\packages"
+                    .to_owned(),
+            ));
         }
         let source =
             TrustedSourceBundle::open(Path::new(input.source_root.as_str())).map_err(|error| {
@@ -1518,7 +1518,7 @@ impl GenerationPackagePlanner {
                 static_template: phase_b_static_template.clone(),
                 host_state_root_digest: crate::phase_b_host_state_root_digest(&candidate)?,
                 watchdog_selector_digest: crate::phase_b_watchdog_selector_digest(&candidate)?,
-                supervision_authority: SupervisionAuthorityProvisionPlan {
+                supervision_authority: Box::new(SupervisionAuthorityProvisionPlan {
                     installation_id: input.installation_epoch.installation.clone(),
                     candidate_generation: input.generation.clone(),
                     authority_generation,
@@ -1563,8 +1563,8 @@ impl GenerationPackagePlanner {
                     })?,
                     service_sid_type:
                         eliot_runtime_contracts::SUPERVISION_AUTHORITY_SERVICE_SID_TYPE,
-                },
-                provision: StoreCredentialProvisionPlan {
+                }),
+                provision: Box::new(StoreCredentialProvisionPlan {
                     host_state_root: roots.host_state_root.clone(),
                     expected_host_executable: candidate.host_executable_path.clone(),
                     target: candidate.store_credential_target.clone(),
@@ -1578,7 +1578,7 @@ impl GenerationPackagePlanner {
                     )?,
                     generation: authority_generation,
                     config_digest: candidate.config_digest.clone(),
-                },
+                }),
             });
         }
         let planned_changes = effects

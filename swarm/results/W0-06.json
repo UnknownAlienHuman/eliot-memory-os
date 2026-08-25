@@ -1,0 +1,51 @@
+{
+  "schema_version": "eliot-work-result-v2",
+  "work_item_id": "W0-06",
+  "source_revision": "1122e21b081a82a6a335c53f018e9ae60846cdd5",
+  "disposition": "VERIFIED_FOCUSED_V2",
+  "contract_challenge": "swarm/challenges/W0-06-BOOTSTRAP-BRIEF-ADMISSION.md",
+  "implemented": [
+    "provider-owned honest GAP catalogue, reason registry, manifest and exact normative-pair identity",
+    "pure compiler bound to a validated CurrentSystemEvidenceSnapshot rather than a caller digest",
+    "typed failure and improvement drafts with canonical content digests",
+    "admitted one-shot eliot bootstrap brief route with explicit absolute work-unit and repository roots",
+    "Candidate effect and CandidateArtifact proof ceiling with no Kernel or MCP dependency",
+    "synced staged publication using cross-platform hard-link no-clobber, byte readback and digest verification",
+    "typed JSON error envelope and exit classes 2, 65, 66, 75 and 78",
+    "source-snapshot exclusion for generated bootstrap drafts, preventing self-referential identities",
+    "NormativePair v2 contains exactly Architecture and Implementation identities; runtime availability remains evidence rather than a third normative document",
+    "v1 candidate drafts remain immutable historical evidence and are not silently migrated"
+  ],
+  "executed_evidence": [
+    "cargo clippy -p eliot-bootstrap -p eliot -p eliot-cli --all-targets --locked -- -D warnings -> PASS",
+    "cargo test -p eliot-bootstrap --lib --locked -> 19 passed",
+    "cargo test -p eliot --test bootstrap_brief --test system_snapshot --locked -> 3 + 20 passed",
+    "cargo test -p eliot-cli --all-targets --locked -> 7 + 9 passed",
+    "canonical_normative_pair_contains_only_architecture_and_implementation -> PASS"
+  ],
+  "external_review": {
+    "provider_id": "openrouter",
+    "model_id": "stealth/ox-alpha",
+    "session_id": "ses_fcce93da4ffeBiiJcGbsAiOoVF",
+    "authority_status": "EVIDENCE_ONLY",
+    "accepted_findings_fixed": [
+      "A-06 bootstrap admission was added explicitly to the local D0 provider invariant",
+      "the executable Bootstrap Brief clap route and typed response were completed",
+      "caller digest injection was removed by accepting the validated snapshot object",
+      "non-complete scopes are projected through NormativeCoverageManifest",
+      "Unix rename overwrite risk was replaced with hard-link no-clobber"
+    ],
+    "rejected_or_stale_findings": [
+      "the audit inspected bins/eliot before the concurrent CLI worker added the Bootstrap subcommand",
+      "its fenced-heading claim was unrelated to W0-06 and contradicted the current info-string-aware scanners"
+    ]
+  },
+  "normative_pair_correction": {
+    "provider_revision": "eliot-normative-provider-v2",
+    "rule_catalogue_schema": "eliot-bootstrap-rule-catalogue-v2",
+    "brief_schema": "eliot-bootstrap-brief-v2",
+    "runtime_status": "NOT_RUNNING",
+    "runtime_role": "CURRENT_SYSTEM_EVIDENCE_ONLY"
+  },
+  "proof_ceiling": "Focused source, strict Clippy, unit and subprocess verification after the v2 NormativePair correction. Full workspace W0 and hosted CI remain required."
+}

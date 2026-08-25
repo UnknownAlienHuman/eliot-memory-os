@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
+const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
+const WIN32_ERROR_PATH_NOT_FOUND: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ComponentState {
@@ -3801,7 +3803,11 @@ fn inspect_host_journal_retained(
                     }
                     eliot_platform_windows::ProtectedPathError::InvalidPath
                     | eliot_platform_windows::ProtectedPathError::InvalidRoot
-                    | eliot_platform_windows::ProtectedPathError::Io => {
+                    | eliot_platform_windows::ProtectedPathError::Io
+                    | eliot_platform_windows::ProtectedPathError::Win32 {
+                        code: WIN32_ERROR_FILE_NOT_FOUND | WIN32_ERROR_PATH_NOT_FOUND,
+                        ..
+                    } => {
                         return (
                             HostJournalContour {
                                 state: ComponentState::Missing {
@@ -5308,10 +5314,10 @@ mod honest_tests {
                 eliot_installation::ResourceGeneration::genesis(),
             ),
             supervision_authority: eliot_installation::SupervisionAuthorityBinding::Provisioned {
-                authority: fixture_provisioned_supervision_authority(
+                authority: Box::new(fixture_provisioned_supervision_authority(
                     installation_epoch.installation.as_str(),
                     generation.as_str(),
-                ),
+                )),
             },
             authority_descriptor_path: fixture_path(&portable_root, "authority.json"),
             authority_descriptor_digest: fixture_handle("7".repeat(64)),
@@ -5584,6 +5590,42 @@ mod honest_tests {
         write_registry_value(host_root, &registry_with_pending_value(transaction));
     }
 
+    fn write_unbound_transaction_fixture(
+        host_root: &Path,
+        transaction: &eliot_installation::InstallationTransaction,
+    ) {
+        // The planner proof is deliberately in-memory only. Persist the exact
+        // versioned wire shape that a legal bound transaction leaves behind so
+        // read-only status tests do not call or weaken production admission.
+        #[derive(serde::Serialize)]
+        struct TransactionEnvelope<'a> {
+            wire_version: eliot_contracts::ContractVersion,
+            transaction: &'a eliot_installation::InstallationTransaction,
+        }
+
+        let path = host_root.join("installation-transaction.redb");
+        let database = redb::Database::create(path).expect("create transaction fixture db");
+        let write = database
+            .begin_write()
+            .expect("begin transaction fixture write");
+        {
+            let mut table = write
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                    "installation_transactions_v7",
+                ))
+                .expect("open transaction fixture table");
+            let bytes = serde_json::to_vec(&TransactionEnvelope {
+                wire_version: transaction.transaction_wire_version,
+                transaction,
+            })
+            .expect("transaction fixture bytes");
+            table
+                .insert(transaction.transaction_id.as_str(), bytes.as_slice())
+                .expect("insert transaction fixture");
+        }
+        write.commit().expect("commit transaction fixture");
+    }
+
     fn ensure_host_dir(host_root: &Path) {
         std::fs::create_dir_all(host_root).expect("create host dir");
         if let Some(parent) = host_root.parent() {
@@ -5596,12 +5638,7 @@ mod honest_tests {
         let (base, host_root) = temp_portable_host("txn-unprofiled");
         let transaction = portable_transaction_for_host(&host_root);
         write_registry_with_pending(&host_root, &transaction);
-        let tx_path = host_root.join("installation-transaction.redb");
-        eliot_installation::RedbInstallationTransactionStore::create_planned_at_exact_path(
-            &tx_path,
-            &transaction,
-        )
-        .expect("create transaction store");
+        write_unbound_transaction_fixture(&host_root, &transaction);
         let report = collect(&host_root);
         assert_eq!(report.status, "NOT_HEALTHY");
         assert!(report.transaction_stage.stage.is_none());
@@ -5628,12 +5665,7 @@ mod honest_tests {
         write_registry_value(&host_root, &registry);
         let registry_path = host_root.join("installation-registry.redb");
         let before = std::fs::read(&registry_path).expect("registry before");
-        let tx_path = host_root.join("installation-transaction.redb");
-        eliot_installation::RedbInstallationTransactionStore::create_planned_at_exact_path(
-            &tx_path,
-            &transaction,
-        )
-        .expect("create transaction store");
+        write_unbound_transaction_fixture(&host_root, &transaction);
 
         let report = collect(&host_root);
         assert!(report.transaction_stage.stage.is_none());
@@ -5663,12 +5695,8 @@ mod honest_tests {
             .runtime_state_roots
             .host_state_root = fixture_handle(other_root.to_string_lossy().into_owned());
         write_registry_with_pending(&host_root, &transaction);
-        let tx_path = host_root.join("installation-transaction.redb");
         let valid_tx = portable_transaction_for_host(&host_root);
-        eliot_installation::RedbInstallationTransactionStore::create_planned_at_exact_path(
-            &tx_path, &valid_tx,
-        )
-        .expect("create store");
+        write_unbound_transaction_fixture(&host_root, &valid_tx);
         let report = collect(&host_root);
         assert!(report.transaction_stage.stage.is_none());
         assert!(matches!(
@@ -5735,11 +5763,7 @@ mod honest_tests {
         assert!(!tx_path.exists());
         assert!(report.transaction_stage.stage.is_none());
         assert_eq!(report.status, "NOT_HEALTHY");
-        eliot_installation::RedbInstallationTransactionStore::create_planned_at_exact_path(
-            &tx_path,
-            &transaction,
-        )
-        .expect("create");
+        write_unbound_transaction_fixture(&host_root, &transaction);
         assert!(tx_path.exists());
         let canonical_before = std::fs::canonicalize(&tx_path).expect("canonical");
         let len_before = std::fs::metadata(&tx_path).expect("metadata").len();

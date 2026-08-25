@@ -1914,7 +1914,7 @@ impl WatchdogConfig {
                 control_concurrency_reserve: 1,
                 fairness_quantum: 4,
                 restart_budget: self.restart_budget,
-                restart_window: Duration::from_secs(60),
+                restart_window: Duration::from_mins(1),
                 restart_backoff: Duration::from_millis(250),
                 shutdown_grace: self.shutdown_grace,
             },
@@ -3534,6 +3534,25 @@ mod tests {
                 eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
             ),
         };
+        let service_control_grant = match role {
+            InstallerServiceRole::Host => serde_json::Value::Null,
+            InstallerServiceRole::Watchdog => {
+                let principal_sid = "S-1-5-80-1-2-3-4-5";
+                let security_descriptor_digest =
+                    match eliot_platform_windows::watchdog_service_security_descriptor_digest(
+                        principal_sid,
+                    ) {
+                        Ok(digest) => digest,
+                        Err(error) => panic!("Watchdog control-grant fixture: {error}"),
+                    };
+                serde_json::json!({
+                    "principal_service": eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+                    "principal_sid": principal_sid,
+                    "access_mask": eliot_platform_windows::ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                    "security_descriptor_digest": security_descriptor_digest,
+                })
+            }
+        };
         let request = ServiceRegistrationRequest::with_bootstrap(
             service_name,
             display_name,
@@ -3564,6 +3583,7 @@ mod tests {
             },
             "registration_nonce": registration_nonce,
             "configuration_digest": request.expected_configuration_digest(),
+            "service_control_grant": service_control_grant,
         });
         let approval = serde_json::from_value(wire)
             .unwrap_or_else(|error| panic!("approval fixture: {error}"));

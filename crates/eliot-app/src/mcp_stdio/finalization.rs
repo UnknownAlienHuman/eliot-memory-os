@@ -79,7 +79,7 @@ pub(super) async fn acquire_managed_finalization_process_lock(
                         Err(_) => {}
                     }
                 }
-                if started.elapsed() >= std::time::Duration::from_secs(180) {
+                if started.elapsed() >= std::time::Duration::from_mins(3) {
                     anyhow::bail!(
                         "timed out waiting for managed finalization process lock for {invocation_id}"
                     );
@@ -143,7 +143,7 @@ pub(super) async fn acquire_task_transition_process_lock(
                         Err(_) => {}
                     }
                 }
-                if started.elapsed() >= std::time::Duration::from_secs(180) {
+                if started.elapsed() >= std::time::Duration::from_mins(3) {
                     anyhow::bail!("timed out waiting for task transition lock for {task_id}");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;

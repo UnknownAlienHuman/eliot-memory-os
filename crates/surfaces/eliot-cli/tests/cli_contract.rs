@@ -2,6 +2,7 @@ use eliot_cli::{
     CommandArguments, CommandCatalogue, CommandId, CommandRequest, CommandResult,
     UnavailableReason, validate_catalogue,
 };
+use eliot_receipts::{EffectClass, ProofCeiling};
 use serde_json::{Value, json};
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
@@ -15,7 +16,11 @@ fn request_json(command: &str) -> Value {
     let arguments = match command {
         "ui" => json!({"kind": "ui"}),
         "dashboard" => json!({"kind": "dashboard"}),
-        "bootstrap-brief" => json!({"kind": "bootstrap_brief", "work_unit": "work-unit-1"}),
+        "bootstrap-brief" => json!({
+            "kind": "bootstrap_brief",
+            "work_unit": "C:\\Development\\Rust\\projects\\eliot-memory-os\\work-unit.json",
+            "repo_root": "C:\\Development\\Rust\\projects\\eliot-memory-os"
+        }),
         "doctor-integration" => json!({"kind": "doctor_integration", "profile": "default"}),
         _ => json!({
             "kind": "system_snapshot",
@@ -148,6 +153,29 @@ fn help_and_schema_are_deterministic_projections_of_one_catalogue() {
 }
 
 #[test]
+fn bootstrap_brief_is_admitted_with_candidate_ceiling_and_explicit_roots() {
+    let spec = must(
+        CommandCatalogue::current()
+            .commands()
+            .iter()
+            .find(|spec| spec.id == CommandId::BootstrapBrief)
+            .ok_or("bootstrap brief command"),
+    );
+    assert_eq!(spec.effect, EffectClass::Candidate);
+    assert_eq!(spec.proof_ceiling, ProofCeiling::CandidateArtifact);
+    assert!(matches!(
+        spec.availability,
+        eliot_cli::CommandAvailability::Admitted
+    ));
+    let request = request("bootstrap-brief");
+    assert!(request.validate().is_ok());
+    assert!(matches!(
+        request.arguments,
+        CommandArguments::BootstrapBrief { .. }
+    ));
+}
+
+#[test]
 fn unknown_and_duplicate_commands_fail_closed() {
     let unknown = serde_json::from_value::<CommandRequest>(request_json("future-command"));
     assert!(unknown.is_err());
@@ -225,6 +253,51 @@ fn missing_a06_and_a08_operations_are_typed_unavailable() {
 }
 
 #[test]
+fn unimplemented_wire_kind_is_distinct_from_unavailable() {
+    let result = CommandResult::Unimplemented {
+        architecture_anchor: "A0.8".to_owned(),
+        work_item_id: "W0-01".to_owned(),
+        detail: "implementation is intentionally bounded to a later work item".to_owned(),
+    };
+    let wire = must(serde_json::to_value(&result));
+    assert_eq!(
+        wire.get("kind").and_then(Value::as_str),
+        Some("UNIMPLEMENTED")
+    );
+    assert_eq!(
+        wire.get("architecture_anchor").and_then(Value::as_str),
+        Some("A0.8")
+    );
+    assert_eq!(
+        wire.get("work_item_id").and_then(Value::as_str),
+        Some("W0-01")
+    );
+    assert_eq!(
+        wire.get("detail").and_then(Value::as_str),
+        Some("implementation is intentionally bounded to a later work item")
+    );
+    assert!(matches!(
+        must(serde_json::from_value::<CommandResult>(wire.clone())),
+        CommandResult::Unimplemented { .. }
+    ));
+
+    let unavailable = must(serde_json::to_value(CommandResult::Unavailable {
+        reason: UnavailableReason::PlanGap {
+            missing_work_id: "W0-01".to_owned(),
+            dependency: "eliot-cli".to_owned(),
+        },
+    }));
+    assert_eq!(
+        unavailable.get("kind").and_then(Value::as_str),
+        Some("UNAVAILABLE")
+    );
+    assert_ne!(
+        unavailable.get("kind").and_then(Value::as_str),
+        wire.get("kind").and_then(Value::as_str)
+    );
+}
+
+#[test]
 fn admitted_snapshot_result_preserves_effect_and_exact_correlation() {
     let catalogue = CommandCatalogue::current();
     let request = request("system-snapshot");
@@ -260,7 +333,7 @@ fn typed_arguments_enforce_bijection_and_nonblank_fields() {
     ));
 
     let mut blank = request("bootstrap-brief");
-    if let CommandArguments::BootstrapBrief { work_unit } = &mut blank.arguments {
+    if let CommandArguments::BootstrapBrief { work_unit, .. } = &mut blank.arguments {
         work_unit.clear();
     }
     assert!(matches!(
@@ -269,7 +342,7 @@ fn typed_arguments_enforce_bijection_and_nonblank_fields() {
     ));
 
     let mut control = request("bootstrap-brief");
-    if let CommandArguments::BootstrapBrief { work_unit } = &mut control.arguments {
+    if let CommandArguments::BootstrapBrief { work_unit, .. } = &mut control.arguments {
         work_unit.push('\n');
     }
     assert!(control.validate().is_err());

@@ -8,8 +8,8 @@ description = "Persistent scheduling and state core for the ELIOT instrument tes
 
 [dependencies]
 blake3 = "1.8.5"
-eliot-instrument-api = { path = "../eliot-instrument-api" }
-eliot-process = { path = "../../kernel/eliot-process" }
+eliot-instrument-api = { path = "../eliot-instrument-api", version = "0.1.0" }
+eliot-process = { path = "../../kernel/eliot-process", version = "0.1.0" }
 redb = "4.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }

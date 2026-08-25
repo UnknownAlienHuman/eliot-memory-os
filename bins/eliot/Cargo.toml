@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+eliot-agent-api.workspace = true
+eliot-contracts.workspace = true
 clap.workspace = true
 eliot-bootstrap.workspace = true
 eliot-cli.workspace = true

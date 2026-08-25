@@ -1,0 +1,33 @@
+{
+  "schema_version": "eliot-verifier-failure-evidence-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "work_item_id": "W0-02",
+  "package": "eliot-windows-ipc",
+  "source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "worktree_state": "DIRTY_W0_CONCURRENT",
+  "disposition": "ORDER_OR_TIMING_DEPENDENT_UNRESOLVED",
+  "successful_checks": [
+    "cargo fmt --all -- --check",
+    "cargo clippy -p eliot-windows-ipc --all-targets --locked -- -D warnings",
+    "cargo test -p eliot-windows-ipc --locked tests::suspended_job_retains_short_lived_descendant_handle_identity -- --exact --nocapture"
+  ],
+  "failed_check": "cargo test -p eliot-windows-ipc --all-targets --locked",
+  "failed_attempts": 2,
+  "repeated_test": "tests::suspended_job_retains_short_lived_descendant_handle_identity",
+  "observed_failure": "after 200 ms only the PowerShell root remained in live Job identities; no descendant was observed",
+  "failed_suite_summary": "21 passed; 1 failed",
+  "change_relationship": "the W0-02 patch only replaces test unwrap/expect with Result propagation and binds the same Command before spawn; it does not change production job tracking",
+  "uncertainty": [
+    "the exact filtered test passed once",
+    "the full suite failed twice",
+    "pre-existing flakiness has not been proven against a clean baseline",
+    "suite ordering, scheduler timing, or shared process pressure may be causal"
+  ],
+  "stop_rule": "no further blind reruns after two repeated full-suite failures",
+  "next_options": [
+    "diagnose and harden the test's descendant-observation synchronization as a separately owned change",
+    "reproduce on the clean frozen revision in an isolated worktree before attributing regression",
+    "retain the blocker and continue unrelated W0 lanes"
+  ],
+  "proof_ceiling": "this evidence proves repeatability in the current dirty worktree, not root cause or product regression"
+}

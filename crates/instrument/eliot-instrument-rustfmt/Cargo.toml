@@ -7,6 +7,6 @@ license = "MIT"
 description = "Provider-neutral rustfmt instrumentation adapter"
 
 [dependencies]
-eliot-instrument-api = { path = "../eliot-instrument-api" }
-eliot-process = { path = "../../kernel/eliot-process" }
+eliot-instrument-api = { path = "../eliot-instrument-api", version = "0.1.0" }
+eliot-process = { path = "../../kernel/eliot-process", version = "0.1.0" }
 thiserror = "2.0.18"

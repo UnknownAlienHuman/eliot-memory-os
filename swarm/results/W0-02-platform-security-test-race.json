@@ -1,0 +1,29 @@
+{
+  "schema_version": "eliot-verifier-evidence-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "work_item_id": "W0-02",
+  "package": "eliot-platform-windows",
+  "source_revision": "1122e21b081a82a6a335c53f018e9ae60846cdd5",
+  "worktree_state": "DIRTY_W0_CONCURRENT",
+  "disposition": "TEST_SEAM_FIXED_VERIFIED_LOCAL",
+  "failing_test": "installer_root::primitive_tests::security_readback_status_preserves_stage_and_win32_code",
+  "root_cause": "the test closed a live File HANDLE and then reused its stale numeric value; Windows could recycle that value before GetSecurityInfo, producing a different valid object and a truthful code other than ERROR_INVALID_HANDLE",
+  "observed_failures": [
+    "full package suite: observe_security_descriptor_digest returned Win32 Readback code 5 instead of code 6",
+    "isolated old test: verify_security_exact returned SecurityMismatch instead of Win32 Readback code 6",
+    "first replacement used INVALID_HANDLE_VALUE, which aliases the current-process pseudo-handle and therefore returned SecurityMismatch"
+  ],
+  "independent_probe": {
+    "mechanism": "direct PowerShell P/Invoke to GetSecurityInfo with SE_FILE_OBJECT and a NULL handle",
+    "status": 6,
+    "descriptor": 0
+  },
+  "fix": "product wrappers now delegate to private raw-handle helpers; the test passes NULL directly and never constructs a Rust File from or after an invalid handle",
+  "successful_checks": [
+    "cargo test -p eliot-platform-windows --locked installer_root::primitive_tests::security_readback_status_preserves_stage_and_win32_code -- --exact",
+    "cargo clippy -p eliot-platform-windows --all-targets --locked -- -D warnings",
+    "cargo test -p eliot-platform-windows --all-targets --locked"
+  ],
+  "suite_summary": "198 passed; 0 failed",
+  "proof_ceiling": "local Windows proof for the current dirty worktree; no hosted CI or clean-clone receipt"
+}

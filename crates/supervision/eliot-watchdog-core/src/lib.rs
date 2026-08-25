@@ -155,6 +155,10 @@ pub struct WatchdogConfig {
 }
 
 impl Default for WatchdogConfig {
+    #[allow(
+        clippy::duration_suboptimal_units,
+        reason = "Duration::from_mins requires Rust 1.91, but this crate supports Rust 1.89"
+    )]
     fn default() -> Self {
         Self {
             restart_window: Duration::from_secs(300),

@@ -1077,7 +1077,7 @@ pub enum HostCredentialControlResponse {
     /// Host-owned Phase-B publication and activation handoff completed.
     PhaseBReady {
         /// Secret-free dynamic overlay receipt.
-        receipt: HostPhaseBMaterializationReceipt,
+        receipt: Box<HostPhaseBMaterializationReceipt>,
     },
     /// Credential and marker were both authoritatively absent after delete.
     Deleted {

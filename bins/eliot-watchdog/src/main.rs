@@ -407,11 +407,9 @@ mod tests {
 
     #[test]
     fn watchdog_has_no_non_scm_root_fallback() {
-        let error = run_watchdog(Arc::new(AtomicBool::new(true)), None)
-            .expect_err("Watchdog must refuse a launch without validated SCM bootstrap");
         assert_eq!(
-            error,
-            "SCM bootstrap is required for Runtime contour selection"
+            run_watchdog(Arc::new(AtomicBool::new(true)), None),
+            Err("SCM bootstrap is required for Runtime contour selection".to_owned())
         );
     }
 }

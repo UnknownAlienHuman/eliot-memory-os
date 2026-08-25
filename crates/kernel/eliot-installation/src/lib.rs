@@ -175,7 +175,7 @@ const LEGACY_PHASE_B_ZERO_DIGEST: &str =
 /// Current installation contract revision.
 ///
 /// Version 4 makes the typed pending/provisioned supervision authority a
-/// mandatory member of every RuntimeLaunchDescriptor projection.
+/// mandatory member of every `RuntimeLaunchDescriptor` projection.
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 /// Breaking wire revision for durable [`InstallationTransaction`] records.
 ///
@@ -1292,7 +1292,7 @@ impl RuntimeStateRoots {
 
     /// Returns the exact one-leaf-at-a-time hierarchy admitted by the
     /// installer. System/User plans include every missing shared and runtime
-    /// parent; PortableDev intentionally retains its pre-existing contour.
+    /// parent; `PortableDev` intentionally retains its pre-existing contour.
     fn installer_root_hierarchy(
         &self,
     ) -> Result<Vec<(&'static str, PlatformHandle)>, InstallationError> {
@@ -1315,7 +1315,13 @@ impl RuntimeStateRoots {
             hierarchy.push(("installations_root", installations_root));
         }
         hierarchy.push(("installation_root", self.installation_root.clone()));
-        if self.profile != InstallationProfile::PortableDev {
+        if self.profile == InstallationProfile::PortableDev {
+            hierarchy.extend(
+                self.root_fields()
+                    .into_iter()
+                    .map(|(field, root)| (field, root.clone())),
+            );
+        } else {
             hierarchy.push(("canary_evidence_root", self.canary_evidence_root()?));
             let kernel_root = PlatformHandle::new(joined_windows_path(
                 self.installation_root.as_str(),
@@ -1342,12 +1348,6 @@ impl RuntimeStateRoots {
             hierarchy.push(("store_work_root", self.store_work_root.clone()));
             hierarchy.push(("store_temp_root", self.store_temp_root.clone()));
             hierarchy.push(("watchdog_state_root", self.watchdog_state_root.clone()));
-        } else {
-            hierarchy.extend(
-                self.root_fields()
-                    .into_iter()
-                    .map(|(field, root)| (field, root.clone())),
-            );
         }
         Ok(hierarchy)
     }
@@ -1954,7 +1954,7 @@ pub enum SupervisionAuthorityBinding {
     /// Exact public receipt returned by the installer-owned key effect.
     Provisioned {
         /// Public authority binding. Only Kernel consumes `key_reference`.
-        authority: ProvisionedSupervisionAuthority,
+        authority: Box<ProvisionedSupervisionAuthority>,
     },
 }
 
@@ -2289,8 +2289,9 @@ impl RuntimeLaunchDescriptor {
                 },
                 Some(authority),
             ) if supervision_lease_scope_id.as_str() == authority.supervision_lease_scope_id => {
-                overlay.supervision_authority =
-                    SupervisionAuthorityBinding::Provisioned { authority };
+                overlay.supervision_authority = SupervisionAuthorityBinding::Provisioned {
+                    authority: Box::new(authority),
+                };
             }
             (SupervisionAuthorityBinding::Provisioned { .. }, None) => {}
             _ => {
@@ -8647,16 +8648,16 @@ fn validate_package_binding(
     effects: &[InstallerEffectPlan],
 ) -> Result<(), InstallationError> {
     let roots = &candidate_manifest.runtime_launch.runtime_state_roots;
-    if let Some(expected_staging_root) = roots.expected_staging_root()? {
-        if !same_windows_root(
+    if let Some(expected_staging_root) = roots.expected_staging_root()?
+        && !same_windows_root(
             transaction_staging_root.as_str(),
             expected_staging_root.as_str(),
-        )? {
-            return Err(InstallationError::ProfileViolation(
-                "SystemService/UserMode staging_root must equal profile_anchor_root\\Eliot\\packages"
-                    .to_owned(),
-            ));
-        }
+        )?
+    {
+        return Err(InstallationError::ProfileViolation(
+            "SystemService/UserMode staging_root must equal profile_anchor_root\\Eliot\\packages"
+                .to_owned(),
+        ));
     }
     let expected_manifest_digest = candidate_manifest_digest(candidate_manifest)?;
     let mut package_count = 0_u8;
@@ -9537,10 +9538,10 @@ pub enum InstallerEffectPlan {
         /// Exact immutable Watchdog selector binding.
         watchdog_selector_digest: PlatformHandle,
         /// Installer-owned service-SID sealed signing-key effect plan.
-        supervision_authority: SupervisionAuthorityProvisionPlan,
+        supervision_authority: Box<SupervisionAuthorityProvisionPlan>,
         /// Exact bundled credential provision contract repeated for Host
         /// admission; no secret bytes cross this boundary.
-        provision: StoreCredentialProvisionPlan,
+        provision: Box<StoreCredentialProvisionPlan>,
     },
 }
 
@@ -13199,6 +13200,10 @@ impl InstallationEffectObservation {
         self.validate_with_service_absence(false)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "W3-02 will extract the effect-observation capability cell"
+    )]
     fn validate_for_effect(&self, effect: &InstallerEffectPlan) -> Result<(), InstallationError> {
         self.validate_with_service_absence(matches!(
             effect,
@@ -13902,6 +13907,10 @@ impl WindowsInstallationEffectPort {
         Ok(value)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "W3-02 will extract the Phase-B capability cell"
+    )]
     fn phase_b_request(
         &self,
         request: &InstallationEffectRequest,
@@ -13994,7 +14003,7 @@ impl WindowsInstallationEffectPort {
             operation,
             request.transaction_id.clone(),
             request.effect_id.clone(),
-            provision.clone(),
+            provision.as_ref().clone(),
             request.plan_digest.clone(),
         )
         .map_err(|_| PortError::InvalidRequestMetadata)?;
@@ -14034,7 +14043,7 @@ impl WindowsInstallationEffectPort {
                 {
                     return PortOutcome::Unknown(UnknownReason::Indeterminate);
                 }
-                PortOutcome::Known(receipt)
+                PortOutcome::Known(*receipt)
             }
             Ok(HostCredentialControlResponse::Unknown { .. }) => {
                 PortOutcome::Unknown(UnknownReason::Indeterminate)
@@ -15271,7 +15280,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                     self.primitive.create_attempt(&spec, &expected),
                 ) {
                     Ok(created) => created,
-                    Err(outcome) => return outcome,
+                    Err(outcome) => return *outcome,
                 };
                 if created.disposition == InstallerRootCreateDisposition::AlreadyExists {
                     return PortOutcome::Known(InstallationEffectExecution {
@@ -16843,6 +16852,10 @@ fn reconcile_package(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "W3-02 will extract the package capability cell"
+)]
 fn execute_package(
     request: &InstallationEffectRequest,
     ownership_key: &[u8],
@@ -16914,12 +16927,10 @@ fn execute_package(
             if snapshot.source_bundle_identity != stager.source().identity() {
                 return PortOutcome::Unknown(UnknownReason::Indeterminate);
             }
-            let authorization = match stage_package_authorization(
-                request,
-                Some(stager.installation_root_identity()),
-            ) {
-                Ok(authorization) => authorization,
-                Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+            let Ok(authorization) =
+                stage_package_authorization(request, Some(stager.installation_root_identity()))
+            else {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
             };
             match stager.stage_authorized(manifest, &authorization, ownership_key) {
                 Ok(receipt) => {
@@ -17035,7 +17046,7 @@ fn secret_outcome<T>(error: eliot_platform_windows::WindowsAdapterError) -> Port
 
 fn map_root_create_attempt(
     attempt: Result<InstallerRootCreateAttempt, InstallerRootError>,
-) -> Result<InstallerRootPrimitiveCreate, PortOutcome<InstallationEffectExecution>> {
+) -> Result<InstallerRootPrimitiveCreate, Box<PortOutcome<InstallationEffectExecution>>> {
     match attempt {
         Ok(InstallerRootCreateAttempt::Complete(created)) => Ok(created),
         Ok(InstallerRootCreateAttempt::Failed {
@@ -17043,7 +17054,7 @@ fn map_root_create_attempt(
             error,
         }) => {
             let pending = port_pending(root_execution_error::<()>(error));
-            Err(PortOutcome::Partial {
+            Err(Box::new(PortOutcome::Partial {
                 value: InstallationEffectExecution {
                     evidence: Vec::new(),
                     create_disposition: Some(InstallationCreateDisposition::Created),
@@ -17054,19 +17065,20 @@ fn map_root_create_attempt(
                     service_runtime_lineage: None,
                 },
                 missing: vec![pending],
-            })
+            }))
         }
-        Ok(InstallerRootCreateAttempt::Failed { error, .. }) => Err(root_execution_error(error)),
+        Ok(InstallerRootCreateAttempt::Failed { error, .. }) | Err(error) => {
+            Err(Box::new(root_execution_error(error)))
+        }
         Ok(InstallerRootCreateAttempt::PreconditionRace { pending_ref }) => {
-            Err(PortOutcome::Error(PortError::ProviderReference {
+            Err(Box::new(PortOutcome::Error(PortError::ProviderReference {
                 error: ProviderError {
                     code: ProviderErrorCode::Failed,
                     retryable: false,
                 },
                 reference: PlatformHandle::new(pending_ref).unwrap_or_else(|_| unreachable!()),
-            }))
+            })))
         }
-        Err(error) => Err(root_execution_error(error)),
     }
 }
 
@@ -19036,6 +19048,10 @@ where
         clippy::too_many_arguments,
         reason = "the persisted applied receipt is one atomic effect record"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "W3-02 will extract transaction persistence"
+    )]
     fn persist_applied(
         &mut self,
         mut transaction: InstallationTransaction,
@@ -19396,6 +19412,10 @@ fn increment_revision(transaction: &mut InstallationTransaction) -> Result<(), I
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "W3-02 will extract the effect-request capability cell"
+)]
 fn effect_request(
     transaction: &InstallationTransaction,
     index: usize,
@@ -19908,9 +19928,10 @@ mod tests {
                     .stale_after_created_load
                     .lock()
                     .unwrap_or_else(|_| unreachable!()) = false;
-                let mut stale = state.as_ref().cloned().unwrap_or_else(|| unreachable!());
-                stale.revision = stale.revision.saturating_sub(1);
-                return Ok(Some(stale));
+                let mut stale_transaction =
+                    state.as_ref().cloned().unwrap_or_else(|| unreachable!());
+                stale_transaction.revision = stale_transaction.revision.saturating_sub(1);
+                return Ok(Some(stale_transaction));
             }
             if exact_created_transaction
                 && *self
@@ -21051,7 +21072,7 @@ mod tests {
                 },
                 host_state_root_digest: test_handle("b".repeat(64)),
                 watchdog_selector_digest: test_handle("c".repeat(64)),
-                supervision_authority: SupervisionAuthorityProvisionPlan {
+                supervision_authority: Box::new(SupervisionAuthorityProvisionPlan {
                     installation_id: test_handle("installation:test"),
                     candidate_generation: test_handle("generation:candidate"),
                     authority_generation: ResourceGeneration::genesis(),
@@ -21064,8 +21085,8 @@ mod tests {
                     ),
                     host_service_name: test_handle(SUPERVISION_AUTHORITY_HOST_SERVICE),
                     service_sid_type: SUPERVISION_AUTHORITY_SERVICE_SID_TYPE,
-                },
-                provision,
+                }),
+                provision: Box::new(provision),
             });
         }
         let changes = effects
@@ -21450,9 +21471,12 @@ mod tests {
                         }
                     };
                 }
-                InstallerEffectPlan::ProvisionStoreCredential { provision, .. }
-                | InstallerEffectPlan::MaterializePhaseB { provision, .. } => {
+                InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
                     provision.expected_host_executable = manifest.host_executable_path.clone();
+                }
+                InstallerEffectPlan::MaterializePhaseB { provision, .. } => {
+                    provision.as_mut().expected_host_executable =
+                        manifest.host_executable_path.clone();
                 }
                 InstallerEffectPlan::CreateRoot { .. }
                 | InstallerEffectPlan::ApplyAcl { .. }
@@ -24618,7 +24642,7 @@ mod tests {
 
     #[test]
     fn production_root_create_mapping_preserves_partial_created_and_typed_race_reference() {
-        let partial = map_root_create_attempt(Ok(InstallerRootCreateAttempt::Failed {
+        let partial = *map_root_create_attempt(Ok(InstallerRootCreateAttempt::Failed {
             disposition: InstallerRootCreateDisposition::Created,
             error: InstallerRootError::Win32 {
                 stage: InstallerRootStage::Readback,
@@ -24639,7 +24663,7 @@ mod tests {
             vec![test_handle("installer-root-win32-v2:readback:00000005")]
         );
 
-        let race = map_root_create_attempt(Ok(InstallerRootCreateAttempt::PreconditionRace {
+        let race = *map_root_create_attempt(Ok(InstallerRootCreateAttempt::PreconditionRace {
             pending_ref: "installer-root-absence-race-v1:precondition",
         }))
         .err()

@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 use crate::model::store_rebind_transition;
 use crate::*;
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
 fn h(value: &str) -> PlatformHandle {
     PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
 }
@@ -485,7 +487,7 @@ fn exact_clean_marker(
 }
 
 #[test]
-fn stopped_genesis_without_runtime_contour_accepts_exact_clean_marker_and_replays() {
+fn stopped_genesis_without_runtime_contour_accepts_exact_clean_marker_and_replays() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
     let journal = HostStateJournal::open(MemoryBackend::default(), host.clone())
@@ -509,7 +511,8 @@ fn stopped_genesis_without_runtime_contour_accepts_exact_clean_marker_and_replay
 
     let backend = journal.into_backend().unwrap_or_else(|_| unreachable!());
     let reopened = HostStateJournal::open(backend, host).unwrap_or_else(|_| unreachable!());
-    assert!(reopened.snapshot().unwrap().clean_marker.is_some());
+    assert!(reopened.snapshot()?.clean_marker.is_some());
+    Ok(())
 }
 
 #[test]
@@ -677,18 +680,16 @@ fn wake(
 }
 
 #[test]
-fn lifecycle_matrix_rejects_skips_and_allows_declared_path() {
+fn lifecycle_matrix_rejects_skips_and_allows_declared_path() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
-    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone()).unwrap();
-    journal
-        .append(activation(
-            &host,
-            &generation,
-            "start",
-            ActivationState::Starting,
-        ))
-        .unwrap();
+    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone())?;
+    journal.append(activation(
+        &host,
+        &generation,
+        "start",
+        ActivationState::Starting,
+    ))?;
     assert!(matches!(
         journal.append(activation(
             &host,
@@ -715,21 +716,20 @@ fn lifecycle_matrix_rejects_skips_and_allows_declared_path() {
         ActivationState::Active,
         "active",
     );
+    Ok(())
 }
 
 #[test]
-fn same_generation_activation_cannot_change_activation_identity() {
+fn same_generation_activation_cannot_change_activation_identity() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
-    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone()).unwrap();
-    journal
-        .append(activation(
-            &host,
-            &generation,
-            "activation-start",
-            ActivationState::Starting,
-        ))
-        .unwrap();
+    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone())?;
+    journal.append(activation(
+        &host,
+        &generation,
+        "activation-start",
+        ActivationState::Starting,
+    ))?;
     let mut next = activation(
         &host,
         &generation,
@@ -741,17 +741,18 @@ fn same_generation_activation_cannot_change_activation_identity() {
     };
     changed.activation_id = h("different-activation");
     assert_eq!(journal.append(next), Err(JournalError::StaleFence));
-    assert_eq!(journal.snapshot().unwrap().sequence, 1);
+    assert_eq!(journal.snapshot()?.sequence, 1);
+    Ok(())
 }
 
 #[test]
-fn exact_replay_is_idempotent_and_changed_payload_conflicts() {
+fn exact_replay_is_idempotent_and_changed_payload_conflicts() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
-    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone()).unwrap();
+    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone())?;
     let record = activation(&host, &generation, "same", ActivationState::Starting);
-    let first = journal.append(record.clone()).unwrap();
-    let replay = journal.append(record.clone()).unwrap();
+    let first = journal.append(record.clone())?;
+    let replay = journal.append(record.clone())?;
     assert_eq!(first.sequence(), replay.sequence());
     assert_eq!(replay.disposition(), AppendDisposition::Replayed);
     let mut conflict = record;
@@ -763,24 +764,17 @@ fn exact_replay_is_idempotent_and_changed_payload_conflicts() {
         journal.append(conflict),
         Err(JournalError::IdempotencyConflict)
     );
-    assert_eq!(journal.snapshot().unwrap().sequence, 1);
+    assert_eq!(journal.snapshot()?.sequence, 1);
+    Ok(())
 }
 
 #[test]
-fn wake_lifecycle_is_fenced_and_terminal_states_do_not_revive() {
+fn wake_lifecycle_is_fenced_and_terminal_states_do_not_revive() -> TestResult {
     let (journal, host, generation) = active_journal();
-    journal
-        .append(wake(&host, &generation, "w1", "wake-one", "PENDING"))
-        .unwrap();
-    journal
-        .append(wake(&host, &generation, "w2", "wake-one", "CLAIMED"))
-        .unwrap();
-    journal
-        .append(wake(&host, &generation, "w3", "wake-one", "STARTED"))
-        .unwrap();
-    journal
-        .append(wake(&host, &generation, "w4", "wake-one", "SATISFIED"))
-        .unwrap();
+    journal.append(wake(&host, &generation, "w1", "wake-one", "PENDING"))?;
+    journal.append(wake(&host, &generation, "w2", "wake-one", "CLAIMED"))?;
+    journal.append(wake(&host, &generation, "w3", "wake-one", "STARTED"))?;
+    journal.append(wake(&host, &generation, "w4", "wake-one", "SATISFIED"))?;
     assert!(matches!(
         journal.append(wake(&host, &generation, "w5", "wake-one", "PENDING")),
         Err(JournalError::IllegalTransition {
@@ -788,6 +782,7 @@ fn wake_lifecycle_is_fenced_and_terminal_states_do_not_revive() {
             ..
         })
     ));
+    Ok(())
 }
 
 #[test]
@@ -816,7 +811,7 @@ fn dependency_lifecycle_rejects_illegal_first_active_record() {
 }
 
 #[test]
-fn dependency_requires_manifest_requester_and_complete_lifecycle_budget() {
+fn dependency_requires_manifest_requester_and_complete_lifecycle_budget() -> TestResult {
     let (journal, host, generation) = active_journal();
     let record = HostStateRecord::Dependency(dependency_record(
         &host,
@@ -824,7 +819,7 @@ fn dependency_requires_manifest_requester_and_complete_lifecycle_budget() {
         "dependency-required-fields",
         DependencyState::Starting,
     ));
-    let encoded = serde_json::to_value(&record).unwrap();
+    let encoded = serde_json::to_value(&record)?;
 
     for missing in ["process_manifest", "requester_identity", "lifecycle_budget"] {
         let mut value = encoded.clone();
@@ -849,24 +844,23 @@ fn dependency_requires_manifest_requester_and_complete_lifecycle_budget() {
 
     let mut blank_manifest = encoded;
     blank_manifest["dependency"]["process_manifest"]["invocation_hash"] = json!(" ");
-    let malformed: HostStateRecord = serde_json::from_value(blank_manifest).unwrap();
+    let malformed: HostStateRecord = serde_json::from_value(blank_manifest)?;
     assert!(matches!(
         journal.append(malformed),
         Err(JournalError::Invalid(_))
     ));
+    Ok(())
 }
 
 #[test]
-fn dependency_manifest_and_requester_are_immutable_within_process_generation() {
+fn dependency_manifest_and_requester_are_immutable_within_process_generation() -> TestResult {
     let (journal, host, generation) = active_journal();
-    journal
-        .append(HostStateRecord::Dependency(dependency_record(
-            &host,
-            &generation,
-            "dependency-start-immutable",
-            DependencyState::Starting,
-        )))
-        .unwrap();
+    journal.append(HostStateRecord::Dependency(dependency_record(
+        &host,
+        &generation,
+        "dependency-start-immutable",
+        DependencyState::Starting,
+    )))?;
     let mut next = dependency_record(
         &host,
         &generation,
@@ -878,10 +872,11 @@ fn dependency_manifest_and_requester_are_immutable_within_process_generation() {
         journal.append(HostStateRecord::Dependency(next)),
         Err(JournalError::StaleFence)
     );
+    Ok(())
 }
 
 #[test]
-fn dependency_wake_and_drain_replay_or_conflict_by_exact_identity() {
+fn dependency_wake_and_drain_replay_or_conflict_by_exact_identity() -> TestResult {
     let (journal, host, generation) = active_journal();
     let dependency = HostStateRecord::Dependency(DependencyRecord {
         fence: fence(&host, &generation),
@@ -909,9 +904,9 @@ fn dependency_wake_and_drain_replay_or_conflict_by_exact_identity() {
     });
 
     for record in [&dependency, &wake, &drain] {
-        journal.append(record.clone()).unwrap();
+        journal.append(record.clone())?;
         assert_eq!(
-            journal.append(record.clone()).unwrap().disposition(),
+            journal.append(record.clone())?.disposition(),
             AppendDisposition::Replayed
         );
     }
@@ -945,61 +940,60 @@ fn dependency_wake_and_drain_replay_or_conflict_by_exact_identity() {
         journal.append(drain_conflict),
         Err(JournalError::IdempotencyConflict)
     );
+    Ok(())
 }
 
 #[test]
-fn partial_transaction_never_commits_ram_and_remains_reconcilable() {
+fn partial_transaction_never_commits_ram_and_remains_reconcilable() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
     let journal = HostStateJournal::open(
         MemoryBackend::with_fault(FaultPoint::FlushUnknown),
         host.clone(),
-    )
-    .unwrap();
-    let error = journal
-        .append(activation(
-            &host,
-            &generation,
-            "partial",
-            ActivationState::Starting,
-        ))
-        .unwrap_err();
-    let JournalError::OutcomeUnknown { transaction_id } = error else {
-        panic!("expected a typed unknown outcome");
+    )?;
+    let transaction_id = match journal.append(activation(
+        &host,
+        &generation,
+        "partial",
+        ActivationState::Starting,
+    )) {
+        Err(JournalError::OutcomeUnknown { transaction_id }) => transaction_id,
+        other => panic!("expected a typed unknown outcome, got {other:?}"),
     };
-    assert_eq!(journal.snapshot().unwrap().sequence, 0);
+    assert_eq!(journal.snapshot()?.sequence, 0);
     assert_eq!(
-        journal.reconcile(&transaction_id).unwrap(),
+        journal.reconcile(&transaction_id)?,
         ReconcileOutcome::StillUnknown
     );
-    let backend = journal.into_backend().unwrap();
-    let reopened = HostStateJournal::open(backend, host).unwrap();
+    let backend = journal.into_backend()?;
+    let reopened = HostStateJournal::open(backend, host)?;
     assert_eq!(
-        reopened.reconcile(&transaction_id).unwrap(),
+        reopened.reconcile(&transaction_id)?,
         ReconcileOutcome::StillUnknown
     );
-    assert_eq!(reopened.snapshot().unwrap().sequence, 0);
+    assert_eq!(reopened.snapshot()?.sequence, 0);
+    Ok(())
 }
 
 #[test]
-fn unknown_prepare_is_exposed_with_stable_transaction_identity() {
+fn unknown_prepare_is_exposed_with_stable_transaction_identity() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
     let journal = HostStateJournal::open(
         MemoryBackend::with_fault(FaultPoint::PrepareUnknown),
         host.clone(),
-    )
-    .unwrap();
-    let error = journal
-        .append(activation(
+    )?;
+    assert!(matches!(
+        journal.append(activation(
             &host,
             &generation,
             "prepare-unknown",
             ActivationState::Starting,
-        ))
-        .unwrap_err();
-    assert!(matches!(error, JournalError::OutcomeUnknown { .. }));
-    assert_eq!(journal.snapshot().unwrap().sequence, 0);
+        )),
+        Err(JournalError::OutcomeUnknown { .. })
+    ));
+    assert_eq!(journal.snapshot()?.sequence, 0);
+    Ok(())
 }
 
 #[test]
@@ -1069,14 +1063,13 @@ fn foreign_prepared_transaction_fails_closed_on_enumeration() {
 }
 
 #[test]
-fn backend_failures_are_not_misreported_as_unknown_outcomes() {
+fn backend_failures_are_not_misreported_as_unknown_outcomes() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
     let journal = HostStateJournal::open(
         MemoryBackend::with_fault(FaultPoint::AppendFailed),
         host.clone(),
-    )
-    .unwrap();
+    )?;
     assert!(matches!(
         journal.append(activation(
             &host,
@@ -1086,16 +1079,16 @@ fn backend_failures_are_not_misreported_as_unknown_outcomes() {
         )),
         Err(JournalError::Backend(BackendError::Failed(_)))
     ));
-    assert_eq!(journal.snapshot().unwrap().sequence, 0);
+    assert_eq!(journal.snapshot()?.sequence, 0);
+    Ok(())
 }
 
 #[test]
-fn missing_platform_provider_is_an_honest_plan_gap() {
+fn missing_platform_provider_is_an_honest_plan_gap() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
     let journal =
-        HostStateJournal::open(MemoryBackend::with_fault(FaultPoint::PlanGap), host.clone())
-            .unwrap();
+        HostStateJournal::open(MemoryBackend::with_fault(FaultPoint::PlanGap), host.clone())?;
     assert_eq!(
         journal.append(activation(
             &host,
@@ -1107,126 +1100,126 @@ fn missing_platform_provider_is_an_honest_plan_gap() {
             dependency: "P-01 eliot-platform",
         })
     );
-    assert_eq!(journal.snapshot().unwrap().sequence, 0);
+    assert_eq!(journal.snapshot()?.sequence, 0);
+    Ok(())
 }
 
 #[test]
-fn postcommit_unknown_reconciles_without_blind_retry() {
+fn postcommit_unknown_reconciles_without_blind_retry() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
     let journal = HostStateJournal::open(
         MemoryBackend::with_fault(FaultPoint::CommitAfterUnknown),
         host.clone(),
-    )
-    .unwrap();
+    )?;
     let record = activation(&host, &generation, "postcommit", ActivationState::Starting);
-    let error = journal.append(record.clone()).unwrap_err();
-    let JournalError::OutcomeUnknown { transaction_id } = error else {
-        panic!("expected a typed unknown outcome");
+    let transaction_id = match journal.append(record.clone()) {
+        Err(JournalError::OutcomeUnknown { transaction_id }) => transaction_id,
+        other => panic!("expected a typed unknown outcome, got {other:?}"),
     };
-    assert_eq!(journal.snapshot().unwrap().sequence, 0);
+    assert_eq!(journal.snapshot()?.sequence, 0);
     assert_eq!(
-        journal.reconcile(&transaction_id).unwrap(),
+        journal.reconcile(&transaction_id)?,
         ReconcileOutcome::Committed
     );
-    assert_eq!(journal.snapshot().unwrap().sequence, 1);
+    assert_eq!(journal.snapshot()?.sequence, 1);
     assert_eq!(
-        journal.append(record).unwrap().disposition(),
+        journal.append(record)?.disposition(),
         AppendDisposition::Replayed
     );
+    Ok(())
 }
 
 #[test]
-fn committed_transaction_from_foreign_host_epoch_cannot_reconcile_as_committed() {
+fn committed_transaction_from_foreign_host_epoch_cannot_reconcile_as_committed() -> TestResult {
     let old_host = host(1);
     let generation = step("activation-lineage", 1);
     let old = HostStateJournal::open(
         MemoryBackend::with_fault(FaultPoint::CommitAfterUnknown),
         old_host.clone(),
-    )
-    .unwrap();
-    let error = old
-        .append(activation(
-            &old_host,
-            &generation,
-            "foreign-host-commit",
-            ActivationState::Starting,
-        ))
-        .unwrap_err();
-    let JournalError::OutcomeUnknown { transaction_id } = error else {
-        unreachable!();
+    )?;
+    let transaction_id = match old.append(activation(
+        &old_host,
+        &generation,
+        "foreign-host-commit",
+        ActivationState::Starting,
+    )) {
+        Err(JournalError::OutcomeUnknown { transaction_id }) => transaction_id,
+        other => panic!("expected a typed unknown outcome, got {other:?}"),
     };
-    let backend = old.into_backend().unwrap();
-    let foreign = HostStateJournal::open(backend, host(2)).unwrap();
+    let backend = old.into_backend()?;
+    let foreign = HostStateJournal::open(backend, host(2))?;
     assert_eq!(
         foreign.reconcile(&transaction_id),
         Err(JournalError::StaleFence)
     );
-    assert_eq!(foreign.snapshot().unwrap().sequence, 0);
+    assert_eq!(foreign.snapshot()?.sequence, 0);
+    Ok(())
 }
 
 #[test]
-fn committed_backend_receipt_must_match_durable_operation_checksum() {
+fn committed_backend_receipt_must_match_durable_operation_checksum() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
     let journal = HostStateJournal::open(
         MemoryBackend::with_fault(FaultPoint::CommitAfterUnknown),
         host.clone(),
-    )
-    .unwrap();
-    let error = journal
-        .append(activation(
-            &host,
-            &generation,
-            "tampered-commit",
-            ActivationState::Starting,
-        ))
-        .unwrap_err();
-    let JournalError::OutcomeUnknown { transaction_id } = error else {
-        unreachable!();
+    )?;
+    let transaction_id = match journal.append(activation(
+        &host,
+        &generation,
+        "tampered-commit",
+        ActivationState::Starting,
+    )) {
+        Err(JournalError::OutcomeUnknown { transaction_id }) => transaction_id,
+        other => panic!("expected a typed unknown outcome, got {other:?}"),
     };
-    let mut backend = journal.into_backend().unwrap();
+    let mut backend = journal.into_backend()?;
     backend.rewrite_committed_checksum_for_test(&transaction_id, "fnv1a64-deadbeefdeadbeef");
     assert!(matches!(
         HostStateJournal::open(backend, host),
         Err(JournalError::IdempotencyConflict)
     ));
+    Ok(())
 }
 
 #[test]
-fn crash_reopen_replays_committed_state() {
+fn crash_reopen_replays_committed_state() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
-    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone()).unwrap();
-    journal
-        .append(activation(
-            &host,
-            &generation,
-            "durable",
-            ActivationState::Starting,
-        ))
-        .unwrap();
-    let backend = journal.into_backend().unwrap();
-    let reopened = HostStateJournal::open(backend, host).unwrap();
-    let state = reopened.snapshot().unwrap();
+    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone())?;
+    journal.append(activation(
+        &host,
+        &generation,
+        "durable",
+        ActivationState::Starting,
+    ))?;
+    let backend = journal.into_backend()?;
+    let reopened = HostStateJournal::open(backend, host)?;
+    let state = reopened.snapshot()?;
     assert_eq!(state.sequence, 1);
-    assert_eq!(state.activation.unwrap().state, ActivationState::Starting);
+    assert_eq!(
+        state
+            .activation
+            .ok_or_else(|| std::io::Error::other("required activation record missing"))?
+            .state,
+        ActivationState::Starting
+    );
+    Ok(())
 }
 
 #[test]
-fn replay_rejects_torn_checksum_version_and_sequence_frames() {
+fn replay_rejects_torn_checksum_version_and_sequence_frames() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
-    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone()).unwrap();
-    journal
-        .append(activation(
-            &host,
-            &generation,
-            "corruption",
-            ActivationState::Starting,
-        ))
-        .unwrap();
-    let image = journal.into_backend().unwrap().durable_image().clone();
+    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone())?;
+    journal.append(activation(
+        &host,
+        &generation,
+        "corruption",
+        ActivationState::Starting,
+    ))?;
+    let image = journal.into_backend()?.durable_image().clone();
     let bytes = &image.epochs[0].bytes;
 
     let mut torn = bytes.clone();
@@ -1279,64 +1272,61 @@ fn replay_rejects_torn_checksum_version_and_sequence_frames() {
         HostStateJournal::<MemoryBackend>::replay_bytes(&sequence, host),
         Err(JournalError::Sequence | JournalError::Checksum { .. })
     ));
+    Ok(())
 }
 
 #[test]
-fn new_epoch_retains_prior_evidence_until_explicit_retirement() {
+fn new_epoch_retains_prior_evidence_until_explicit_retirement() -> TestResult {
     let old_host = host(1);
     let old_activation = step("activation-lineage", 1);
-    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone()).unwrap();
+    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone())?;
     old.append(activation(
         &old_host,
         &old_activation,
         "old-start",
         ActivationState::Starting,
-    ))
-    .unwrap();
-    let backend = old.into_backend().unwrap();
+    ))?;
+    let backend = old.into_backend()?;
     let new_host = host(2);
     let new_activation = step("new-activation-lineage", 1);
-    let new = HostStateJournal::open(backend, new_host.clone()).unwrap();
-    assert_eq!(new.snapshot().unwrap().retained_epochs.len(), 1);
+    let new = HostStateJournal::open(backend, new_host.clone())?;
+    assert_eq!(new.snapshot()?.retained_epochs.len(), 1);
     new.append(activation(
         &new_host,
         &new_activation,
         "new-start",
         ActivationState::Starting,
-    ))
-    .unwrap();
+    ))?;
     new.append(HostStateRecord::EpochRetirement(EpochRetirementRecord {
         fence: fence(&new_host, &new_activation),
         operation: operation("retire-old"),
         retired_host: old_host.clone(),
         retirement_evidence_refs: vec![h("retirement-proof")],
         retired_at: h("t-retired"),
-    }))
-    .unwrap();
+    }))?;
     assert!(
-        new.snapshot()
-            .unwrap()
+        new.snapshot()?
             .retained_epochs
             .iter()
             .any(|item| item.host == old_host && item.retired)
     );
-    let backend = new.into_backend().unwrap();
-    let reopened = HostStateJournal::open(backend, new_host).unwrap();
-    assert!(reopened.snapshot().unwrap().retained_epochs[0].retired);
+    let backend = new.into_backend()?;
+    let reopened = HostStateJournal::open(backend, new_host)?;
+    assert!(reopened.snapshot()?.retained_epochs[0].retired);
+    Ok(())
 }
 
 #[test]
-fn distinct_root_lineage_requires_explicit_recovery_evidence() {
+fn distinct_root_lineage_requires_explicit_recovery_evidence() -> TestResult {
     let old_host = host(1);
-    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone()).unwrap();
+    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone())?;
     old.append(activation(
         &old_host,
         &step("activation-lineage", 1),
         "old-root-start",
         ActivationState::Starting,
-    ))
-    .unwrap();
-    let backend = old.into_backend().unwrap();
+    ))?;
+    let backend = old.into_backend()?;
     let unrelated_root = HostInstallationEpoch {
         installation: old_host.installation,
         epoch: step("unadmitted-root-lineage", 1),
@@ -1360,20 +1350,21 @@ fn distinct_root_lineage_requires_explicit_recovery_evidence() {
         HostStateJournal::open(backend, unproven_recovery),
         Err(JournalError::Invalid(_))
     ));
+    Ok(())
 }
 
 #[test]
-fn restore_migration_and_break_glass_create_new_root_lineages_without_retiring_old_evidence() {
+fn restore_migration_and_break_glass_create_new_root_lineages_without_retiring_old_evidence()
+-> TestResult {
     let old_host = host(1);
-    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone()).unwrap();
+    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone())?;
     old.append(activation(
         &old_host,
         &step("activation-lineage", 1),
         "old-recovery-source",
         ActivationState::Starting,
-    ))
-    .unwrap();
-    let backend = old.into_backend().unwrap();
+    ))?;
+    let backend = old.into_backend()?;
 
     for (reason, lineage) in [
         (RecoveryLineageReason::Restore, "restored-host-lineage"),
@@ -1383,27 +1374,26 @@ fn restore_migration_and_break_glass_create_new_root_lineages_without_retiring_o
             "break-glass-host-lineage",
         ),
     ] {
-        let recovered =
-            HostStateJournal::open(backend.clone(), recovery_host(reason, lineage)).unwrap();
-        let retained = recovered.snapshot().unwrap().retained_epochs;
+        let recovered = HostStateJournal::open(backend.clone(), recovery_host(reason, lineage))?;
+        let retained = recovered.snapshot()?.retained_epochs;
         assert_eq!(retained.len(), 1);
         assert!(retained[0].replay_verified);
         assert!(!retained[0].retired);
     }
+    Ok(())
 }
 
 #[test]
-fn corruption_recovery_preserves_raw_epoch_evidence_until_explicit_retirement() {
+fn corruption_recovery_preserves_raw_epoch_evidence_until_explicit_retirement() -> TestResult {
     let old_host = host(1);
-    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone()).unwrap();
+    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone())?;
     old.append(activation(
         &old_host,
         &step("activation-lineage", 1),
         "old-corrupt-source",
         ActivationState::Starting,
-    ))
-    .unwrap();
-    let mut backend = old.into_backend().unwrap();
+    ))?;
+    let mut backend = old.into_backend()?;
     backend.corrupt_epoch_for_test(0);
     let corrupt_bytes = backend.durable_image().epochs[0].bytes.clone();
 
@@ -1412,50 +1402,46 @@ fn corruption_recovery_preserves_raw_epoch_evidence_until_explicit_retirement() 
         "corruption-recovery-lineage",
     );
     let recovered_activation = step("recovered-activation-lineage", 1);
-    let recovered = HostStateJournal::open(backend, recovered_host.clone()).unwrap();
-    let retained = recovered.snapshot().unwrap().retained_epochs;
+    let recovered = HostStateJournal::open(backend, recovered_host.clone())?;
+    let retained = recovered.snapshot()?.retained_epochs;
     assert_eq!(retained.len(), 1);
     assert!(!retained[0].replay_verified);
     assert!(!retained[0].forensic_digest.is_empty());
     assert!(!retained[0].retired);
 
-    recovered
-        .append(activation(
-            &recovered_host,
-            &recovered_activation,
-            "recovered-start",
-            ActivationState::Starting,
-        ))
-        .unwrap();
-    recovered
-        .append(HostStateRecord::EpochRetirement(EpochRetirementRecord {
-            fence: fence(&recovered_host, &recovered_activation),
-            operation: operation("retire-corrupt-epoch"),
-            retired_host: old_host,
-            retirement_evidence_refs: vec![h("manual-retirement-evidence")],
-            retired_at: h("t-corrupt-retired"),
-        }))
-        .unwrap();
-    let backend = recovered.into_backend().unwrap();
+    recovered.append(activation(
+        &recovered_host,
+        &recovered_activation,
+        "recovered-start",
+        ActivationState::Starting,
+    ))?;
+    recovered.append(HostStateRecord::EpochRetirement(EpochRetirementRecord {
+        fence: fence(&recovered_host, &recovered_activation),
+        operation: operation("retire-corrupt-epoch"),
+        retired_host: old_host,
+        retirement_evidence_refs: vec![h("manual-retirement-evidence")],
+        retired_at: h("t-corrupt-retired"),
+    }))?;
+    let backend = recovered.into_backend()?;
     assert_eq!(backend.durable_image().epochs[0].bytes, corrupt_bytes);
     assert_eq!(backend.durable_image().epochs.len(), 2);
-    let reopened = HostStateJournal::open(backend, recovered_host).unwrap();
-    assert!(reopened.snapshot().unwrap().retained_epochs[0].retired);
+    let reopened = HostStateJournal::open(backend, recovered_host)?;
+    assert!(reopened.snapshot()?.retained_epochs[0].retired);
+    Ok(())
 }
 
 #[test]
-fn cross_lineage_epoch_is_not_ordered_or_adopted() {
+fn cross_lineage_epoch_is_not_ordered_or_adopted() -> TestResult {
     let old_host = host(1);
     let generation = step("activation-lineage", 1);
-    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone()).unwrap();
+    let old = HostStateJournal::open(MemoryBackend::default(), old_host.clone())?;
     old.append(activation(
         &old_host,
         &generation,
         "old",
         ActivationState::Starting,
-    ))
-    .unwrap();
-    let backend = old.into_backend().unwrap();
+    ))?;
+    let backend = old.into_backend()?;
     let unrelated = HostInstallationEpoch {
         installation: old_host.installation.clone(),
         epoch: EpochTransition {
@@ -1469,30 +1455,27 @@ fn cross_lineage_epoch_is_not_ordered_or_adopted() {
         HostStateJournal::open(backend, unrelated),
         Err(JournalError::EpochLineageConflict | JournalError::RecoveryRequiresNewEpoch)
     ));
+    Ok(())
 }
 
 #[test]
-fn committed_drain_cannot_be_cancelled_into_same_generation() {
+fn committed_drain_cannot_be_cancelled_into_same_generation() -> TestResult {
     let (journal, host, generation) = active_journal();
     let drain_generation = step("activation-lineage", 1);
-    journal
-        .append(HostStateRecord::Drain(DrainRecord {
-            fence: fence(&host, &generation),
-            operation: operation("drain-request"),
-            drain_generation: drain_generation.clone(),
-            state: DrainState::Requested,
-            evidence_refs: vec![h("drain-request-evidence")],
-        }))
-        .unwrap();
-    journal
-        .append(HostStateRecord::Drain(DrainRecord {
-            fence: fence(&host, &generation),
-            operation: operation("drain-start"),
-            drain_generation: drain_generation.clone(),
-            state: DrainState::Draining,
-            evidence_refs: vec![h("drain-start-evidence")],
-        }))
-        .unwrap();
+    journal.append(HostStateRecord::Drain(DrainRecord {
+        fence: fence(&host, &generation),
+        operation: operation("drain-request"),
+        drain_generation: drain_generation.clone(),
+        state: DrainState::Requested,
+        evidence_refs: vec![h("drain-request-evidence")],
+    }))?;
+    journal.append(HostStateRecord::Drain(DrainRecord {
+        fence: fence(&host, &generation),
+        operation: operation("drain-start"),
+        drain_generation: drain_generation.clone(),
+        state: DrainState::Draining,
+        evidence_refs: vec![h("drain-start-evidence")],
+    }))?;
     advance_activation(
         &journal,
         &host,
@@ -1500,21 +1483,19 @@ fn committed_drain_cannot_be_cancelled_into_same_generation() {
         ActivationState::Draining,
         "activation-draining",
     );
-    journal
-        .append(HostStateRecord::DrainCommit(DrainCommitRecord {
-            fence: fence(&host, &generation),
-            operation: operation("drain-commit"),
-            drain_generation,
-            last_admission_closed_at: h("t-admission-closed"),
-            lease_and_pending_operation_snapshot: vec![h("lease-snapshot")],
-            authority_epochs_fenced: vec![epoch("authority-lineage", 1)],
-            processes_modules_and_store_branches_to_stop: vec![h("kernel-process")],
-            wake_during_drain_disposition: WakeDisposition::QueueNextGeneration,
-            irreversible_stage: h("authority-fenced"),
-            recovery_owner: h("host-recovery"),
-            committed_at: h("t-committed"),
-        }))
-        .unwrap();
+    journal.append(HostStateRecord::DrainCommit(DrainCommitRecord {
+        fence: fence(&host, &generation),
+        operation: operation("drain-commit"),
+        drain_generation,
+        last_admission_closed_at: h("t-admission-closed"),
+        lease_and_pending_operation_snapshot: vec![h("lease-snapshot")],
+        authority_epochs_fenced: vec![epoch("authority-lineage", 1)],
+        processes_modules_and_store_branches_to_stop: vec![h("kernel-process")],
+        wake_during_drain_disposition: WakeDisposition::QueueNextGeneration,
+        irreversible_stage: h("authority-fenced"),
+        recovery_owner: h("host-recovery"),
+        committed_at: h("t-committed"),
+    }))?;
     assert!(matches!(
         journal.append(activation(
             &host,
@@ -1527,10 +1508,11 @@ fn committed_drain_cannot_be_cancelled_into_same_generation() {
             ..
         })
     ));
+    Ok(())
 }
 
 #[test]
-fn observation_variant_cannot_bypass_host_fence_and_unknown_fields_fail() {
+fn observation_variant_cannot_bypass_host_fence_and_unknown_fields_fail() -> TestResult {
     let bare_observation = json!({
         "observation": {
             "record_id": "obs-1",
@@ -1546,31 +1528,33 @@ fn observation_variant_cannot_bypass_host_fence_and_unknown_fields_fail() {
     let host = host(1);
     let generation = step("activation-lineage", 1);
     let record = activation(&host, &generation, "serde", ActivationState::Starting);
-    let mut value = serde_json::to_value(record).unwrap();
+    let mut value = serde_json::to_value(record)?;
     value["activation"]["unexpected"] = json!(true);
     assert!(serde_json::from_value::<HostStateRecord>(value).is_err());
+    Ok(())
 }
 
 #[test]
-fn semantic_validation_rejects_transparently_deserialized_blank_nested_handle() {
+fn semantic_validation_rejects_transparently_deserialized_blank_nested_handle() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
     let record = activation(&host, &generation, "blank", ActivationState::Starting);
-    let mut value = serde_json::to_value(record).unwrap();
+    let mut value = serde_json::to_value(record)?;
     value["activation"]["requested_capabilities"][0] = json!(" ");
-    let malformed: HostStateRecord = serde_json::from_value(value).unwrap();
-    let journal = HostStateJournal::open(MemoryBackend::default(), host).unwrap();
+    let malformed: HostStateRecord = serde_json::from_value(value)?;
+    let journal = HostStateJournal::open(MemoryBackend::default(), host)?;
     assert!(matches!(
         journal.append(malformed),
         Err(JournalError::Invalid(_))
     ));
+    Ok(())
 }
 
 #[test]
-fn checked_sequence_overflow_fails_without_backend_mutation() {
+fn checked_sequence_overflow_fails_without_backend_mutation() -> TestResult {
     let host = host(1);
     let generation = step("activation-lineage", 1);
-    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone()).unwrap();
+    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone())?;
     journal.set_sequence_for_test(u64::MAX);
     assert_eq!(
         journal.append(activation(
@@ -1581,10 +1565,11 @@ fn checked_sequence_overflow_fails_without_backend_mutation() {
         )),
         Err(JournalError::Sequence)
     );
+    Ok(())
 }
 
 #[test]
-fn concurrent_unique_wakes_are_serialized_and_poison_is_typed() {
+fn concurrent_unique_wakes_are_serialized_and_poison_is_typed() -> TestResult {
     let (journal, host, generation) = active_journal();
     let journal = Arc::new(journal);
     let mut workers = Vec::new();
@@ -1603,15 +1588,19 @@ fn concurrent_unique_wakes_are_serialized_and_poison_is_typed() {
         }));
     }
     for worker in workers {
-        assert!(worker.join().unwrap().is_ok());
+        let result = worker
+            .join()
+            .map_err(|_| std::io::Error::other("wake worker panicked"))?;
+        assert!(result.is_ok());
     }
-    assert_eq!(journal.snapshot().unwrap().wakes.len(), 8);
+    assert_eq!(journal.snapshot()?.wakes.len(), 8);
     journal.poison_state_for_test();
     assert_eq!(journal.snapshot(), Err(JournalError::Synchronization));
+    Ok(())
 }
 
 #[test]
-fn kernel_record_requires_approved_artifact_explicit_pipes_and_active_evidence() {
+fn kernel_record_requires_approved_artifact_explicit_pipes_and_active_evidence() -> TestResult {
     let (journal, host, generation) = active_journal();
     let idle = HostStateRecord::Kernel(kernel_record(
         &host,
@@ -1619,7 +1608,7 @@ fn kernel_record_requires_approved_artifact_explicit_pipes_and_active_evidence()
         "kernel-required-fields",
         KernelActivationState::Idle,
     ));
-    let encoded = serde_json::to_value(idle).unwrap();
+    let encoded = serde_json::to_value(idle)?;
     for missing in [
         "approved_artifact_hash",
         "active_pipe_identity",
@@ -1669,6 +1658,7 @@ fn kernel_record_requires_approved_artifact_explicit_pipes_and_active_evidence()
         journal.append(HostStateRecord::Kernel(missing_readiness)),
         Err(JournalError::Invalid(_))
     ));
+    Ok(())
 }
 
 #[test]
@@ -1836,7 +1826,7 @@ fn kernel_old_terminated_rejects_opaque_or_incomplete_disposition() {
 }
 
 #[test]
-fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() {
+fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() -> TestResult {
     let (journal, host, generation) = active_journal();
     for (state, op) in [
         (KernelActivationState::Idle, "nonce-idle"),
@@ -1903,14 +1893,14 @@ fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() {
         .unwrap_or_else(|error| panic!("active transition failed: {error}"));
     assert_eq!(
         journal
-            .snapshot()
-            .unwrap()
+            .snapshot()?
             .kernel
-            .unwrap()
+            .ok_or_else(|| std::io::Error::other("required kernel record missing"))?
             .one_time_nonce
             .state(),
         NonceState::Consumed
     );
+    Ok(())
 }
 
 #[test]
@@ -2203,7 +2193,7 @@ fn direct_child_reopen_requires_and_accepts_exact_prior_kernel_source() {
 }
 
 #[test]
-fn kernel_append_must_bind_current_eliot_activation_identity() {
+fn kernel_append_must_bind_current_eliot_activation_identity() -> TestResult {
     let (journal, host, generation) = active_journal();
     let mut kernel = kernel_record(
         &host,
@@ -2216,7 +2206,8 @@ fn kernel_append_must_bind_current_eliot_activation_identity() {
         journal.append(HostStateRecord::Kernel(kernel)),
         Err(JournalError::StaleFence)
     );
-    assert!(journal.snapshot().unwrap().kernel.is_none());
+    assert!(journal.snapshot()?.kernel.is_none());
+    Ok(())
 }
 
 #[test]
@@ -2256,7 +2247,7 @@ fn kernel_transition_matrix_rejects_activation_without_handoff() {
 }
 
 #[test]
-fn preactivation_failure_and_manual_recovery_reject_active_pipe_identity() {
+fn preactivation_failure_and_manual_recovery_reject_active_pipe_identity() -> TestResult {
     let (journal, host, generation) = active_journal();
     journal
         .append(HostStateRecord::Kernel(kernel_record(
@@ -2275,7 +2266,10 @@ fn preactivation_failure_and_manual_recovery_reject_active_pipe_identity() {
         )))
         .unwrap_or_else(|_| unreachable!());
 
-    let shadow = journal.snapshot().unwrap().kernel.unwrap();
+    let shadow = journal
+        .snapshot()?
+        .kernel
+        .ok_or_else(|| std::io::Error::other("required kernel record missing"))?;
     let mut failed_with_pipe = shadow.clone();
     failed_with_pipe.operation = operation("failure-with-pipe");
     failed_with_pipe.state = KernelActivationState::Failed;
@@ -2294,7 +2288,10 @@ fn preactivation_failure_and_manual_recovery_reject_active_pipe_identity() {
         .append(HostStateRecord::Kernel(failed))
         .unwrap_or_else(|_| unreachable!());
 
-    let failed = journal.snapshot().unwrap().kernel.unwrap();
+    let failed = journal
+        .snapshot()?
+        .kernel
+        .ok_or_else(|| std::io::Error::other("required kernel record missing"))?;
     let mut manual_with_pipe = failed.clone();
     manual_with_pipe.operation = operation("manual-with-pipe");
     manual_with_pipe.state = KernelActivationState::ManualRecovery;
@@ -2313,13 +2310,18 @@ fn preactivation_failure_and_manual_recovery_reject_active_pipe_identity() {
         .append(HostStateRecord::Kernel(manual))
         .unwrap_or_else(|_| unreachable!());
     assert_eq!(
-        journal.snapshot().unwrap().kernel.unwrap().state,
+        journal
+            .snapshot()?
+            .kernel
+            .ok_or_else(|| std::io::Error::other("required kernel record missing"))?
+            .state,
         KernelActivationState::ManualRecovery
     );
+    Ok(())
 }
 
 #[test]
-fn typed_nonce_lifecycle_keeps_host_and_kernel_credentials_separate() {
+fn typed_nonce_lifecycle_keeps_host_and_kernel_credentials_separate() -> TestResult {
     let host_epoch = host(1);
     assert_eq!(
         host_epoch.host_process_nonce().as_handle(),
@@ -2332,10 +2334,10 @@ fn typed_nonce_lifecycle_keeps_host_and_kernel_credentials_separate() {
     let issued = OneTimeNonceState::issued(activation_nonce);
     assert!(!format!("{issued:?}").contains(&"a".repeat(64)));
     assert_eq!(issued.state(), NonceState::Issued);
-    assert_eq!(issued.consume().unwrap().state(), NonceState::Consumed);
-    assert_eq!(issued.revoke().unwrap().state(), NonceState::Revoked);
+    assert_eq!(issued.consume()?.state(), NonceState::Consumed);
+    assert_eq!(issued.revoke()?.state(), NonceState::Revoked);
     assert!(OneTimeNonceState::unissued().consume().is_err());
-    assert!(issued.consume().unwrap().revoke().is_err());
+    assert!(issued.consume()?.revoke().is_err());
 
     // Public decoding cannot create an opaque activation permit. Compatibility
     // is owned only by the journal replay boundary exercised below.
@@ -2346,6 +2348,7 @@ fn typed_nonce_lifecycle_keeps_host_and_kernel_credentials_separate() {
         }))
         .is_err()
     );
+    Ok(())
 }
 
 #[test]
@@ -2485,9 +2488,9 @@ fn opaque_legacy_nonce_is_rejected_by_live_append_but_accepted_during_replay() {
 }
 
 #[test]
-fn direct_child_generation_is_exact_and_overflow_safe() {
+fn direct_child_generation_is_exact_and_overflow_safe() -> TestResult {
     let parent = step("kernel-direct-child", 9);
-    let child = parent.direct_child().unwrap();
+    let child = parent.direct_child()?;
     assert_eq!(child.current.sequence, 10);
     assert_eq!(child.current.lineage, parent.current.lineage);
     assert_eq!(child.parent.as_ref(), Some(&parent.current));
@@ -2503,12 +2506,16 @@ fn direct_child_generation_is_exact_and_overflow_safe() {
         }),
     };
     assert_eq!(overflow.direct_child(), Err(JournalError::Sequence));
+    Ok(())
 }
 
 #[test]
-fn active_failure_retains_consumed_nonce_and_exact_process_job_binding() {
+fn active_failure_retains_consumed_nonce_and_exact_process_job_binding() -> TestResult {
     let (journal, _, _) = active_kernel_journal();
-    let active = journal.snapshot().unwrap().kernel.unwrap();
+    let active = journal
+        .snapshot()?
+        .kernel
+        .ok_or_else(|| std::io::Error::other("required kernel record missing"))?;
 
     let mut revoked = active.clone();
     revoked.operation = operation("active-failed-revoked");
@@ -2540,18 +2547,25 @@ fn active_failure_retains_consumed_nonce_and_exact_process_job_binding() {
         .append(HostStateRecord::Kernel(failed))
         .unwrap_or_else(|error| panic!("Active to Failed was rejected: {error}"));
 
-    let failed = journal.snapshot().unwrap().kernel.unwrap();
+    let failed = journal
+        .snapshot()?
+        .kernel
+        .ok_or_else(|| std::io::Error::other("required kernel record missing"))?;
     assert_eq!(failed.state, KernelActivationState::Failed);
     assert_eq!(failed.one_time_nonce.state(), NonceState::Consumed);
     assert!(failed.active_pipe_identity.is_some());
     assert!(failed.candidate_job_binding.is_some());
+    Ok(())
 }
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn failed_kernel_restart_requires_exact_direct_child_and_terminated_prior() {
+fn failed_kernel_restart_requires_exact_direct_child_and_terminated_prior() -> TestResult {
     let (journal, host, activation_generation) = active_kernel_journal();
-    let active = journal.snapshot().unwrap().kernel.unwrap();
+    let active = journal
+        .snapshot()?
+        .kernel
+        .ok_or_else(|| std::io::Error::other("required kernel record missing"))?;
     let mut failed = active;
     failed.operation = operation("restart-failed");
     failed.state = KernelActivationState::Failed;
@@ -2559,8 +2573,11 @@ fn failed_kernel_restart_requires_exact_direct_child_and_terminated_prior() {
     journal
         .append(HostStateRecord::Kernel(failed))
         .unwrap_or_else(|error| panic!("failed state was rejected: {error}"));
-    let failed = journal.snapshot().unwrap().kernel.unwrap();
-    let direct_child = failed.direct_child_generation().unwrap();
+    let failed = journal
+        .snapshot()?
+        .kernel
+        .ok_or_else(|| std::io::Error::other("required kernel record missing"))?;
+    let direct_child = failed.direct_child_generation()?;
     let prior = PriorKernelDisposition::Terminated(PriorKernelSource {
         host: failed.fence.host.clone(),
         activation_identity: failed.activation_identity.clone(),
@@ -2581,7 +2598,7 @@ fn failed_kernel_restart_requires_exact_direct_child_and_terminated_prior() {
         "restart-skipped-generation",
         KernelActivationState::ShadowNoAuthority,
     );
-    skipped.kernel_generation = direct_child.direct_child().unwrap();
+    skipped.kernel_generation = direct_child.direct_child()?;
     skipped.prior_kernel_disposition = prior.clone();
     rebind_candidate(&mut skipped, "kernel-job-skipped", 3003, 30, 2);
     assert_eq!(
@@ -2608,8 +2625,14 @@ fn failed_kernel_restart_requires_exact_direct_child_and_terminated_prior() {
     journal
         .append(HostStateRecord::Kernel(next))
         .unwrap_or_else(|error| panic!("direct-child restart was rejected: {error}"));
-    let snapshot = journal.snapshot().unwrap();
-    assert_eq!(snapshot.kernel.unwrap().kernel_generation, direct_child);
+    let snapshot = journal.snapshot()?;
+    assert_eq!(
+        snapshot
+            .kernel
+            .ok_or_else(|| std::io::Error::other("required kernel record missing"))?
+            .kernel_generation,
+        direct_child
+    );
     assert_eq!(snapshot.prior_kernel, Some(failed));
 
     for (state, op) in [
@@ -2686,8 +2709,11 @@ fn failed_kernel_restart_requires_exact_direct_child_and_terminated_prior() {
         .append(HostStateRecord::Kernel(failed_next))
         .unwrap_or_else(|error| panic!("second failed generation was rejected: {error}"));
 
-    let failed_next = journal.snapshot().unwrap().kernel.unwrap();
-    let grandchild = failed_next.direct_child_generation().unwrap();
+    let failed_next = journal
+        .snapshot()?
+        .kernel
+        .ok_or_else(|| std::io::Error::other("required kernel record missing"))?;
+    let grandchild = failed_next.direct_child_generation()?;
     let prior_next = PriorKernelDisposition::Terminated(PriorKernelSource {
         host: failed_next.fence.host.clone(),
         activation_identity: failed_next.activation_identity.clone(),
@@ -2742,10 +2768,11 @@ fn failed_kernel_restart_requires_exact_direct_child_and_terminated_prior() {
         journal.append(HostStateRecord::Kernel(reused_ancestor_nonce)),
         Err(JournalError::Invalid(_))
     ));
+    Ok(())
 }
 
 #[test]
-fn failure_after_issuance_revokes_exact_nonce() {
+fn failure_after_issuance_revokes_exact_nonce() -> TestResult {
     let (journal, host, generation) = active_journal();
     for (state, op) in [
         (KernelActivationState::Idle, "issued-failure-idle"),
@@ -2772,7 +2799,10 @@ fn failure_after_issuance_revokes_exact_nonce() {
             )))
             .unwrap_or_else(|error| panic!("Kernel setup failed: {error}"));
     }
-    let issued = journal.snapshot().unwrap().kernel.unwrap();
+    let issued = journal
+        .snapshot()?
+        .kernel
+        .ok_or_else(|| std::io::Error::other("required kernel record missing"))?;
 
     let mut consumed = issued.clone();
     consumed.operation = operation("issued-failure-consumed");
@@ -2792,14 +2822,14 @@ fn failure_after_issuance_revokes_exact_nonce() {
         .unwrap_or_else(|error| panic!("issued nonce was not revocable: {error}"));
     assert_eq!(
         journal
-            .snapshot()
-            .unwrap()
+            .snapshot()?
             .kernel
-            .unwrap()
+            .ok_or_else(|| std::io::Error::other("required kernel record missing"))?
             .one_time_nonce
             .state(),
         NonceState::Revoked
     );
+    Ok(())
 }
 
 fn readiness_observation(
@@ -2970,9 +3000,12 @@ fn readiness_observation_wire_requires_explicit_supervision_predecessor_field() 
 }
 
 #[test]
-fn repeat_readiness_is_a_fresh_host_observation_bound_to_active_kernel() {
+fn repeat_readiness_is_a_fresh_host_observation_bound_to_active_kernel() -> TestResult {
     let (journal, _, _) = active_kernel_journal();
-    let active = journal.snapshot().unwrap().kernel.unwrap();
+    let active = journal
+        .snapshot()?
+        .kernel
+        .ok_or_else(|| std::io::Error::other("required kernel record missing"))?;
     let approved = ReadinessApprovedContour {
         config_digest: digest_handle('d'),
         store_fence: h("store-fence-generation-1"),
@@ -3017,11 +3050,12 @@ fn repeat_readiness_is_a_fresh_host_observation_bound_to_active_kernel() {
     journal
         .append_readiness_observation(second, &approved)
         .unwrap_or_else(|error| panic!("fresh repeat readiness was rejected: {error}"));
-    assert_eq!(journal.snapshot().unwrap().readiness_observations.len(), 2);
+    assert_eq!(journal.snapshot()?.readiness_observations.len(), 2);
+    Ok(())
 }
 
 #[test]
-fn journal_service_facade_delegates_to_the_single_journal_owner() {
+fn journal_service_facade_delegates_to_the_single_journal_owner() -> TestResult {
     let host = host(1);
     let generation = step("service-facade-activation", 1);
     let service = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())
@@ -3034,7 +3068,8 @@ fn journal_service_facade_delegates_to_the_single_journal_owner() {
             ActivationState::Starting,
         ))
         .unwrap_or_else(|error| panic!("service append failed: {error}"));
-    assert_eq!(service.snapshot().unwrap().sequence, 1);
+    assert_eq!(service.snapshot()?.sequence, 1);
+    Ok(())
 }
 
 #[test]

@@ -8893,7 +8893,7 @@ impl McpClient {
         writeln!(self.stdin)?;
         self.stdin.flush()?;
 
-        let line = match self.stdout_lines.recv_timeout(Duration::from_secs(180)) {
+        let line = match self.stdout_lines.recv_timeout(Duration::from_mins(3)) {
             Ok(Ok(line)) => line,
             Ok(Err(message)) => {
                 return Err(std::io::Error::new(ErrorKind::UnexpectedEof, message).into());
@@ -9122,7 +9122,7 @@ impl TestLock {
             fs::create_dir_all(parent)?;
         }
         let started = Instant::now();
-        let timeout = Duration::from_secs(600);
+        let timeout = Duration::from_mins(10);
         loop {
             match OpenOptions::new()
                 .write(true)

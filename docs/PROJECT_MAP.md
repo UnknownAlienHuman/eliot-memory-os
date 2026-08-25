@@ -17,7 +17,7 @@ nodes and 268,208 edges; it is useful for navigation only and may lag source.
 workspace members, all version `0.1.0`, with the default runtime members
 `eliot`, `eliot-host`, `eliot-kernel`, `eliot-store-surreal`, `eliot-watchdog`,
 and `eliotd`. The workspace is Rust 2024 and MSVC; the workspace manifest
-declares `rust-version = "1.89"`, while the checked-in `rust-toolchain.toml`
+declares `rust-version = "1.94"`, while the checked-in `rust-toolchain.toml`
 selects channel `1.97.1`. Cargo output is redirected by the developer
 configuration to the ELIOT build root, not a repository `target/`.
 

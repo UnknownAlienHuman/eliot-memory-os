@@ -15,6 +15,14 @@ authority.
   `C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B`.
 - Bootstrap contract revision: `recovery-w0-w1-r1-d40a0a1`.
 
+The bootstrap contract remains historical evidence for the original admission
+attempt. The current recovery source revision is
+`1122e21b081a82a6a335c53f018e9ae60846cdd5`; current W1 generators bind that
+HEAD plus explicit dirty-worktree/source digests. W1-06 falsification triggered
+the local task-program amendment v1.2 in
+`decisions/W1-06-PROGRAM-REVISION-v1.2.md`; it does not rewrite the original
+bootstrap evidence.
+
 The canonical normative files remain in
 `C:\Development\Rust\docs\ELIOT Arhitecture`. `docs/normative/` is a pinned,
 CI-verifiable projection only.

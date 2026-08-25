@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn scm_tick_skips_full_operations_until_exact_lease_is_due() {
+    fn scm_tick_skips_full_operations_until_exact_lease_is_due() -> Result<(), HostError> {
         let mut spy = ScmCallGraphSpy {
             next_tick: HostLivenessTick::HealthyLeasePreserved,
             liveness_ticks: 0,
@@ -768,7 +768,7 @@ mod tests {
         };
 
         assert_eq!(
-            run_scm_contour_tick(&mut spy).unwrap(),
+            run_scm_contour_tick(&mut spy)?,
             ScmContourTickOutcome::LeasePreserved
         );
         assert_eq!(spy.liveness_ticks, 1);
@@ -779,7 +779,7 @@ mod tests {
 
         spy.next_tick = HostLivenessTick::FullReconcileDue;
         assert_eq!(
-            run_scm_contour_tick(&mut spy).unwrap(),
+            run_scm_contour_tick(&mut spy)?,
             ScmContourTickOutcome::Reconciled(HostBranchDisposition::Healthy)
         );
         assert_eq!(spy.liveness_ticks, 2);
@@ -787,6 +787,7 @@ mod tests {
         assert_eq!(spy.file_digest_verifications, 1);
         assert_eq!(spy.pipe_exchanges, 1);
         assert_eq!(spy.durable_journal_operations, 1);
+        Ok(())
     }
 
     #[test]
@@ -843,10 +844,9 @@ mod process_bootstrap_tests {
     }
 
     #[test]
-    fn process_bootstrap_and_start_service_zero_arg_callback_are_distinct() {
+    fn process_bootstrap_and_start_service_zero_arg_callback_are_distinct() -> Result<(), String> {
         let process_args = valid_process_args();
-        let process = parse_process_bootstrap(process_args.clone())
-            .unwrap_or_else(|error| panic!("process bootstrap: {error}"));
+        let process = parse_process_bootstrap(process_args.clone())?;
         assert!(
             process
                 .registration_nonce()
@@ -861,5 +861,6 @@ mod process_bootstrap_tests {
         let callback_with_process_args =
             std::iter::once(OsString::from(SERVICE_NAME)).chain(process_args);
         assert!(HostLaunchOptions::validate_service_main_argv(callback_with_process_args).is_err());
+        Ok(())
     }
 }

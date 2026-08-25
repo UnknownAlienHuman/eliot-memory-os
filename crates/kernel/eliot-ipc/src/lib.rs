@@ -1686,7 +1686,9 @@ mod tests {
     use eliot_protocol::{EncodingProfile, FrameKind, MessageType, ProtocolPayload};
     use std::collections::BTreeMap;
 
-    fn module_generation(epoch: u64) -> ModuleGeneration {
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn module_generation(epoch: u64) -> Result<ModuleGeneration, serde_json::Error> {
         serde_json::from_value(serde_json::json!({
             "module_id": "module.test",
             "generation": 1,
@@ -1708,7 +1710,6 @@ mod tests {
                 "integration_revision": null
             }
         }))
-        .expect("canonical module generation")
     }
 
     fn limits() -> TransportLimits {
@@ -1722,24 +1723,25 @@ mod tests {
     }
 
     #[test]
-    fn queue_preserves_control_reserve() {
-        let mut queue = AdmissionQueue::new(limits()).expect("valid limits");
-        let first = queue.admit(8, false).expect("normal one");
-        queue.admit(8, false).expect("normal two");
-        queue.admit(8, false).expect("normal three");
+    fn queue_preserves_control_reserve() -> TestResult {
+        let mut queue = AdmissionQueue::new(limits())?;
+        let first = queue.admit(8, false)?;
+        queue.admit(8, false)?;
+        queue.admit(8, false)?;
         assert!(matches!(
             queue.admit(8, false),
             Err(TransportError::Backpressure)
         ));
-        queue.admit(8, true).expect("control reserve");
-        queue.release(first).expect("release exact reservation");
+        queue.admit(8, true)?;
+        queue.release(first)?;
         assert_eq!(queue.usage(), (3, 24));
+        Ok(())
     }
 
     #[test]
-    fn invalid_limits_and_identity_fail_closed() {
+    fn invalid_limits_and_identity_fail_closed() -> TestResult {
         assert!(AdmissionQueue::new(TransportLimits::default()).is_ok());
-        let process = ProcessBinding::from_observation(1, 2, "C:/eliot-test.exe").expect("process");
+        let process = ProcessBinding::from_observation(1, 2, "C:/eliot-test.exe")?;
         let invalid = PeerIdentity::Authenticated {
             process_id: 0,
             user_identity: String::new(),
@@ -1752,8 +1754,7 @@ mod tests {
         };
         assert_eq!(invalid.validate(), Err(TransportError::UnauthenticatedPeer));
         assert!(invalid.process_binding().is_none());
-        let valid_process =
-            ProcessBinding::from_observation(7, 11, "C:/eliot-valid.exe").expect("process");
+        let valid_process = ProcessBinding::from_observation(7, 11, "C:/eliot-valid.exe")?;
         let valid = PeerIdentity::Authenticated {
             process_id: 7,
             user_identity: "sid".to_owned(),
@@ -1764,7 +1765,9 @@ mod tests {
                 session: "session".to_owned(),
             },
         };
-        let observed = valid.process_binding().expect("valid process evidence");
+        let observed = valid
+            .process_binding()
+            .ok_or_else(|| std::io::Error::other("valid process evidence missing"))?;
         assert_eq!(observed.process_id(), 7);
         assert_eq!(observed.start_time_100ns(), 11);
         assert_eq!(observed.image_path(), "C:/eliot-valid.exe");
@@ -1776,6 +1779,7 @@ mod tests {
             Err(TransportError::PeerIdentityUnavailable)
         );
         assert!(unavailable.process_binding().is_none());
+        Ok(())
     }
 
     #[test]
@@ -1799,7 +1803,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_epoch_duplicate_conflict_and_reap_are_explicit() {
+    fn stale_epoch_duplicate_conflict_and_reap_are_explicit() -> TestResult {
         let mut session = Session {
             connection_id: "c".into(),
             protocol_version: ProtocolVersion::CURRENT,
@@ -1807,7 +1811,7 @@ mod tests {
                 reason: PeerIdentityUnavailable::ProviderProofNotComposed,
             },
             authority_epoch: 4,
-            module_generation: module_generation(4),
+            module_generation: module_generation(4)?,
             launch_nonce: "nonce".into(),
             capabilities: Vec::new(),
             privacy_classes: Vec::new(),
@@ -1818,24 +1822,21 @@ mod tests {
         assert!(!session.accepts(3, 2));
         let frame = heartbeat();
         let mut ledger = ReplayLedger::default();
+        assert_eq!(ledger.observe("event", &frame)?, ReplayDisposition::New);
         assert_eq!(
-            ledger.observe("event", &frame).expect("new"),
-            ReplayDisposition::New
-        );
-        assert_eq!(
-            ledger.observe("event", &frame).expect("duplicate"),
+            ledger.observe("event", &frame)?,
             ReplayDisposition::Duplicate
         );
         let mut changed = frame.clone();
         changed.connection_id = "other".into();
         assert_eq!(
-            ledger.observe("event", &changed).expect("conflict"),
+            ledger.observe("event", &changed)?,
             ReplayDisposition::Conflict
         );
         let mut cancellation = CancellationRegistry::default();
-        cancellation.register("request").expect("registration");
-        cancellation.cancel("request").expect("cancel");
-        cancellation.reap("request").expect("reap");
+        cancellation.register("request")?;
+        cancellation.cancel("request")?;
+        cancellation.reap("request")?;
         assert_eq!(
             cancellation.state("request"),
             Some(CancellationState::Reaped)
@@ -1852,10 +1853,11 @@ mod tests {
         );
         session.fence();
         assert!(!session.accepts(4, 2));
+        Ok(())
     }
 
     #[test]
-    fn partial_frame_decoder_recovers_across_reads() {
+    fn partial_frame_decoder_recovers_across_reads() -> TestResult {
         let frame = heartbeat();
         let frame_limits = TransportLimits {
             max_frame_bytes: 512,
@@ -1864,21 +1866,12 @@ mod tests {
             control_reserve: 1,
             operation_timeout: Duration::from_secs(1),
         };
-        let wire = encode_frame(&frame, frame_limits).expect("encode");
+        let wire = encode_frame(&frame, frame_limits)?;
         let split = wire.len() / 2;
         let mut decoder = FrameDecoder::new();
-        assert_eq!(
-            decoder
-                .push(&wire[..split], frame_limits)
-                .expect("first read"),
-            None
-        );
-        assert_eq!(
-            decoder
-                .push(&wire[split..], frame_limits)
-                .expect("second read"),
-            Some(frame)
-        );
+        assert_eq!(decoder.push(&wire[..split], frame_limits)?, None);
+        assert_eq!(decoder.push(&wire[split..], frame_limits)?, Some(frame));
+        Ok(())
     }
 
     #[test]
@@ -1900,15 +1893,11 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_oversized_fragment_before_buffer_growth() {
+    fn decoder_rejects_oversized_fragment_before_buffer_growth() -> TestResult {
         let mut decoder = FrameDecoder::new();
         let limits = limits();
         let mut fragment = vec![0_u8; 4 + limits.max_frame_bytes + 1];
-        fragment[..4].copy_from_slice(
-            &u32::try_from(limits.max_frame_bytes + 1)
-                .unwrap()
-                .to_le_bytes(),
-        );
+        fragment[..4].copy_from_slice(&u32::try_from(limits.max_frame_bytes + 1)?.to_le_bytes());
         assert!(matches!(
             decoder.push(&fragment, limits),
             Err(TransportError::Protocol(
@@ -1916,43 +1905,35 @@ mod tests {
             ))
         ));
         assert_eq!(decoder.bytes.len(), 0);
+        Ok(())
     }
 
     #[test]
-    fn bound_ledgers_reject_conflicts_and_remain_bounded() {
-        let key =
-            BoundIdentity::new("stream", module_generation(1), "cancel").expect("bound identity");
+    fn bound_ledgers_reject_conflicts_and_remain_bounded() -> TestResult {
+        let key = BoundIdentity::new("stream", module_generation(1)?, "cancel")?;
         let frame = heartbeat();
-        let mut replay = ReplayLedger::with_capacity(1).expect("capacity");
+        let mut replay = ReplayLedger::with_capacity(1)?;
         assert_eq!(
-            replay.observe_bound(key.clone(), &frame).expect("new"),
+            replay.observe_bound(key.clone(), &frame)?,
             ReplayDisposition::New
         );
         assert_eq!(
-            replay
-                .observe_bound(key.clone(), &frame)
-                .expect("duplicate"),
+            replay.observe_bound(key.clone(), &frame)?,
             ReplayDisposition::Duplicate
         );
         let mut conflict = frame.clone();
         conflict.connection_id = "different".into();
         assert_eq!(
-            replay
-                .observe_bound(key.clone(), &conflict)
-                .expect("conflict"),
+            replay.observe_bound(key.clone(), &conflict)?,
             ReplayDisposition::Conflict
         );
-        let mut cancellation = CancellationRegistry::with_capacity(1).expect("capacity");
+        let mut cancellation = CancellationRegistry::with_capacity(1)?;
         assert_eq!(
-            cancellation
-                .register_bound(key.clone(), "request-a")
-                .expect("new"),
+            cancellation.register_bound(key.clone(), "request-a")?,
             CancellationDisposition::New
         );
         assert_eq!(
-            cancellation
-                .register_bound(key.clone(), "request-b")
-                .expect("conflict"),
+            cancellation.register_bound(key.clone(), "request-b")?,
             CancellationDisposition::Conflict
         );
         assert_eq!(
@@ -1964,24 +1945,22 @@ mod tests {
             cancellation.cancel_bound(&key),
             CancellationDisposition::Duplicate
         );
+        Ok(())
     }
 
     #[test]
-    fn registry_full_is_distinct_from_conflict_and_preserves_duplicate() {
-        let mut ledger = ReplayLedger::with_capacity(1).expect("capacity");
+    fn registry_full_is_distinct_from_conflict_and_preserves_duplicate() -> TestResult {
+        let mut ledger = ReplayLedger::with_capacity(1)?;
         let frame = heartbeat();
         let mut conflict = frame.clone();
         conflict.connection_id = "other".into();
+        assert_eq!(ledger.observe("first", &frame)?, ReplayDisposition::New);
         assert_eq!(
-            ledger.observe("first", &frame).expect("new"),
-            ReplayDisposition::New
-        );
-        assert_eq!(
-            ledger.observe("first", &frame).expect("duplicate"),
+            ledger.observe("first", &frame)?,
             ReplayDisposition::Duplicate
         );
         assert_eq!(
-            ledger.observe("first", &conflict).expect("conflict"),
+            ledger.observe("first", &conflict)?,
             ReplayDisposition::Conflict
         );
         assert_eq!(
@@ -1989,9 +1968,10 @@ mod tests {
             Err(TransportError::RegistryFull)
         );
         assert_eq!(
-            ledger.observe("first", &frame).expect("still duplicate"),
+            ledger.observe("first", &frame)?,
             ReplayDisposition::Duplicate
         );
+        Ok(())
     }
 
     #[test]
@@ -2012,39 +1992,36 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test(flavor = "current_thread")]
-    async fn real_named_pipe_connect_disconnect_reports_identity_gap() {
+    async fn real_named_pipe_connect_disconnect_reports_identity_gap() -> TestResult {
         use tokio::net::windows::named_pipe::ServerOptions;
 
         let name = format!(r"\\.\pipe\eliot\test\{}", std::process::id());
-        let server = ServerOptions::new().create(&name).expect("test pipe");
+        let server = ServerOptions::new().create(&name)?;
         let server_task = tokio::spawn(async move { server.connect().await });
-        let client = NamedPipeTransport::connect(&name, Duration::from_secs(2))
-            .await
-            .expect("client connection");
-        let server_result = server_task.await.expect("server task");
-        server_result.expect("server connection");
+        let client = NamedPipeTransport::connect(&name, Duration::from_secs(2)).await?;
+        let server_result = server_task.await?;
+        server_result?;
         assert_eq!(
             client.peer_identity(),
             &PeerIdentity::Unavailable {
                 reason: PeerIdentityUnavailable::ProviderProofNotComposed,
             }
         );
+        Ok(())
     }
 
     #[cfg(windows)]
     #[tokio::test(flavor = "current_thread")]
-    async fn explicit_acl_pipe_authenticates_handle_bound_server_identity() {
-        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-            .expect("current token expectation");
+    async fn explicit_acl_pipe_authenticates_handle_bound_server_identity() -> TestResult {
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()?;
         let name = format!(
             r"\\.\pipe\eliot\authenticated\{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
+                .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         );
-        let mut server = NamedPipeServer::create(&name, &expectation).expect("secured pipe");
+        let mut server = NamedPipeServer::create(&name, &expectation)?;
         let server_expectation = expectation.clone();
         let server_task = tokio::spawn(async move {
             server
@@ -2054,12 +2031,8 @@ mod tests {
         });
         let client =
             NamedPipeTransport::connect_authenticated(&name, Duration::from_secs(2), &expectation)
-                .await
-                .expect("authenticated client");
-        let server = server_task
-            .await
-            .expect("server task")
-            .expect("server connection");
+                .await?;
+        let server = server_task.await??;
         assert!(matches!(
             client.peer_identity(),
             PeerIdentity::Authenticated { .. }
@@ -2069,31 +2042,28 @@ mod tests {
             PeerIdentity::Authenticated { .. }
         ));
         assert_eq!(
-            eliot_platform_windows::current_process_named_pipe_expectation()
-                .expect("server reverted to its process token"),
+            eliot_platform_windows::current_process_named_pipe_expectation()?,
             expectation
         );
+        Ok(())
     }
 
     #[cfg(windows)]
     #[tokio::test(flavor = "current_thread")]
-    async fn handle_bound_authentication_rejects_wrong_session() {
-        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-            .expect("current token expectation");
+    async fn handle_bound_authentication_rejects_wrong_session() -> TestResult {
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()?;
         let wrong_session = eliot_platform_windows::NamedPipePeerExpectation::new(
             expectation.expected_sid(),
             expectation.expected_session_id().wrapping_add(1),
-        )
-        .expect("inert mismatched expectation");
+        )?;
         let name = format!(
             r"\\.\pipe\eliot\wrong-session\{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
+                .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         );
-        let server = NamedPipeServer::create(&name, &expectation).expect("secured pipe");
+        let server = NamedPipeServer::create(&name, &expectation)?;
         let server_task =
             tokio::spawn(async move { server.wait_for_client(Duration::from_secs(2)).await });
         let result = NamedPipeTransport::connect_authenticated(
@@ -2102,38 +2072,35 @@ mod tests {
             &wrong_session,
         )
         .await;
-        server_task
-            .await
-            .expect("server task")
-            .expect("server connection");
+        let server_result = server_task.await?;
+        assert!(server_result.is_ok(), "{server_result:?}");
         assert!(matches!(result, Err(TransportError::UnauthenticatedPeer)));
+        Ok(())
     }
 
     #[cfg(windows)]
     #[tokio::test(flavor = "current_thread")]
-    async fn real_named_pipe_partial_frame_is_not_decoded() {
+    async fn real_named_pipe_partial_frame_is_not_decoded() -> TestResult {
         use tokio::io::AsyncWriteExt;
 
         let name = format!(r"\\.\pipe\eliot\test-partial\{}", std::process::id());
-        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-            .expect("current token expectation");
-        let mut server = NamedPipeServer::create(&name, &expectation).expect("test pipe");
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()?;
+        let mut server = NamedPipeServer::create(&name, &expectation)?;
         let server_expectation = expectation.clone();
         let server_task = tokio::spawn(async move {
             server
                 .wait_for_authenticated_client(Duration::from_secs(2), &server_expectation)
                 .await
-                .expect("authenticated server connection");
+                .map_err(|error| error.to_string())?;
             server
                 .inner
                 .write_all(&[5, 0, 0, 0, b'{'])
                 .await
-                .expect("partial frame write");
+                .map_err(|error| error.to_string())
         });
         let mut client =
             NamedPipeTransport::connect_authenticated(&name, Duration::from_secs(2), &expectation)
-                .await
-                .expect("authenticated client connection");
+                .await?;
         assert!(matches!(
             client.receive_frame(limits()).await,
             Err(TransportError::Protocol(ProtocolError::PartialFrame {
@@ -2141,30 +2108,35 @@ mod tests {
                 actual: 1,
             }))
         ));
-        server_task.await.expect("server task");
+        let server_result = server_task.await?;
+        assert!(server_result.is_ok(), "{server_result:?}");
+        Ok(())
     }
 
     #[cfg(windows)]
     #[tokio::test(flavor = "current_thread")]
-    async fn server_rejects_wrong_authentication_preface_before_client_authority() {
+    async fn server_rejects_wrong_authentication_preface_before_client_authority() -> TestResult {
         use tokio::io::AsyncWriteExt;
         use tokio::net::windows::named_pipe::ClientOptions;
 
-        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-            .expect("current token expectation");
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()?;
         let name = format!(
             r"\\.\pipe\eliot\wrong-preface\{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
+                .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         );
-        let mut server = NamedPipeServer::create(&name, &expectation).expect("secured pipe");
+        let mut server = NamedPipeServer::create(&name, &expectation)?;
         let client_name = name.clone();
         let client = tokio::spawn(async move {
-            let mut client = ClientOptions::new().open(client_name).expect("raw client");
-            client.write_all(b"NOT-ELIO").await.expect("wrong preface");
+            let mut client = ClientOptions::new()
+                .open(client_name)
+                .map_err(|error| error.to_string())?;
+            client
+                .write_all(b"NOT-ELIO")
+                .await
+                .map_err(|error| error.to_string())
         });
         assert_eq!(
             server
@@ -2176,29 +2148,28 @@ mod tests {
             server.peer_identity(),
             PeerIdentity::Unavailable { .. }
         ));
-        client.await.expect("client task");
+        let client_result = client.await?;
+        assert!(client_result.is_ok(), "{client_result:?}");
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn authenticated_pipe_child_process() {
+    fn authenticated_pipe_child_process() -> TestResult {
         let Ok(name) = std::env::var("ELIOT_P02_PIPE_CHILD") else {
-            return;
+            return Ok(());
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("child runtime");
+            .build()?;
         runtime.block_on(async move {
-            let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-                .expect("child expectation");
+            let expectation = eliot_platform_windows::current_process_named_pipe_expectation()?;
             let mut transport = NamedPipeTransport::connect_authenticated(
                 &name,
                 Duration::from_secs(5),
                 &expectation,
             )
-            .await
-            .expect("child authenticated connection");
+            .await?;
             assert_eq!(
                 transport
                     .send_frame(&heartbeat(), TransportLimits::default())
@@ -2206,40 +2177,34 @@ mod tests {
                 Ok(DeliveryOutcome::Delivered)
             );
             assert_eq!(
-                transport
-                    .receive_frame(TransportLimits::default())
-                    .await
-                    .expect("server acknowledgement"),
+                transport.receive_frame(TransportLimits::default()).await?,
                 heartbeat()
             );
-        });
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
     }
 
     #[cfg(windows)]
     #[tokio::test(flavor = "current_thread")]
-    async fn server_authenticates_distinct_client_pid_sid_session_and_process() {
-        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-            .expect("current token expectation");
+    async fn server_authenticates_distinct_client_pid_sid_session_and_process() -> TestResult {
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()?;
         let name = format!(
             r"\\.\pipe\eliot\client-binding\{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
+                .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         );
-        let mut server = NamedPipeServer::create(&name, &expectation).expect("secured pipe");
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test image"))
+        let mut server = NamedPipeServer::create(&name, &expectation)?;
+        let mut child = std::process::Command::new(std::env::current_exe()?)
             .arg("--exact")
             .arg("tests::authenticated_pipe_child_process")
             .arg("--nocapture")
             .env("ELIOT_P02_PIPE_CHILD", &name)
-            .spawn()
-            .expect("pipe client process");
+            .spawn()?;
         server
             .wait_for_authenticated_client(Duration::from_secs(5), &expectation)
-            .await
-            .expect("server authenticated client");
+            .await?;
         match server.peer_identity() {
             PeerIdentity::Authenticated {
                 process_id, proof, ..
@@ -2249,13 +2214,12 @@ mod tests {
                 assert!(proof.process.start_time_100ns() > 0);
                 assert!(!proof.process.image_path().is_empty());
             }
-            PeerIdentity::Unavailable { .. } => panic!("client proof must be composed"),
+            PeerIdentity::Unavailable { .. } => {
+                return Err(std::io::Error::other("client proof must be composed").into());
+            }
         }
         assert_eq!(
-            server
-                .receive_frame(TransportLimits::default())
-                .await
-                .expect("child frame"),
+            server.receive_frame(TransportLimits::default()).await?,
             heartbeat()
         );
         assert_eq!(
@@ -2264,18 +2228,19 @@ mod tests {
                 .await,
             Ok(DeliveryOutcome::Delivered)
         );
-        assert!(child.wait().expect("child exit").success());
+        assert!(child.wait()?.success());
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn installer_control_pipe_dacl_binds_admin_client_and_local_service_host() {
+    fn installer_control_pipe_dacl_binds_admin_client_and_local_service_host() -> TestResult {
         let expectation =
-            eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
-                .expect("administrator expectation");
+            eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()?;
         assert_eq!(
             pipe_security_sddl(&expectation),
             "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)"
         );
+        Ok(())
     }
 }

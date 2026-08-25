@@ -940,7 +940,7 @@ where
         config_path,
         &command,
         "governor-doctor",
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         SupervisedChildKind::Verifier,
     )?;
     if !output.status.success() {

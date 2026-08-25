@@ -1282,6 +1282,40 @@ fn load_verified_published_receipt(
     })
 }
 
+fn verify_resumed_bundle(
+    publication: &OwnedDirectoryPublication,
+    journal: &SourceBundlePublicationJournal,
+    precommit_files: &[MaterializedRolePrecommitReceipt],
+    manifest: &PackageManifest,
+    expected: &[PackageArtifactDigest],
+) -> Result<(), MaterializeError> {
+    let bundle = publication.trusted_source_bundle().map_err(|error| {
+        MaterializeError::Platform(format!("open resumed source bundle: {error}"))
+    })?;
+    if bundle.identity() != journal.source_identity {
+        return Err(MaterializeError::Invalid(
+            "resumed temporary directory identity differs from the durable journal".to_owned(),
+        ));
+    }
+    let observed = validate_published_observation(&bundle, manifest, expected)?;
+    for prepared in precommit_files {
+        let actual = observed.get(&prepared.relative_path).ok_or_else(|| {
+            MaterializeError::Invalid(format!("resumed role missing: {}", prepared.relative_path))
+        })?;
+        if actual.identity != prepared.temporary_identity
+            || actual.size != prepared.size
+            || actual.sha256 != prepared.sha256
+            || actual.pe != prepared.pe
+        {
+            return Err(MaterializeError::Invalid(format!(
+                "resumed role differs from the durable journal: {}",
+                prepared.relative_path
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn resume_intent_publication(
     store: &RedbInstallationTransactionStore,
     journal: &SourceBundlePublicationJournal,
@@ -1305,37 +1339,13 @@ fn resume_intent_publication(
         }
     };
     let (manifest, expected, _) = typed_bundle_from_journal(journal)?;
-    let verification = (|| {
-        let bundle = publication.trusted_source_bundle().map_err(|error| {
-            MaterializeError::Platform(format!("open resumed source bundle: {error}"))
-        })?;
-        if bundle.identity() != journal.source_identity {
-            return Err(MaterializeError::Invalid(
-                "resumed temporary directory identity differs from the durable journal".to_owned(),
-            ));
-        }
-        let observed = validate_published_observation(&bundle, &manifest, &expected)?;
-        for prepared in &precommit_files {
-            let actual = observed.get(&prepared.relative_path).ok_or_else(|| {
-                MaterializeError::Invalid(format!(
-                    "resumed role missing: {}",
-                    prepared.relative_path
-                ))
-            })?;
-            if actual.identity != prepared.temporary_identity
-                || actual.size != prepared.size
-                || actual.sha256 != prepared.sha256
-                || actual.pe != prepared.pe
-            {
-                return Err(MaterializeError::Invalid(format!(
-                    "resumed role differs from the durable journal: {}",
-                    prepared.relative_path
-                )));
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = verification {
+    if let Err(error) = verify_resumed_bundle(
+        &publication,
+        journal,
+        &precommit_files,
+        &manifest,
+        &expected,
+    ) {
         return persist_unknown_publication(
             store,
             journal,

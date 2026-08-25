@@ -139,7 +139,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 license = "MIT"
 
 [workspace.dependencies]
@@ -257,7 +257,7 @@ eliot-research-exchange = { path = "crates/research/eliot-research-exchange", ve
 eliot-research-exchange-api = { path = "crates/research/eliot-research-exchange-api", version = "0.1.0" }
 eliot-researcher = { path = "crates/research/eliot-researcher", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
-wasmtime = { version = "=40.0.0", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "=47.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wat = "=1.256.0"
 jsonc-parser = { version = "0.33.0", features = ["cst", "serde_json"] }
 redb = "4.1.0"
@@ -322,5 +322,4 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 print_stderr = "warn"
 print_stdout = "warn"
-todo = "warn"
 unwrap_used = "warn"

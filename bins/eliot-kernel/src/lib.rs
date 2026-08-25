@@ -4216,7 +4216,7 @@ impl KernelComposition {
                 control_concurrency_reserve: 1,
                 fairness_quantum: 8,
                 restart_budget: 3,
-                restart_window: Duration::from_secs(60),
+                restart_window: Duration::from_mins(1),
                 restart_backoff: Duration::from_millis(100),
                 shutdown_grace: Duration::from_secs(5),
             },

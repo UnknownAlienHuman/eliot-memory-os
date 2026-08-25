@@ -771,7 +771,7 @@ async fn run_weekly_ul_exam_scheduler(
     daemon: std::sync::Arc<mcp_stdio::McpDaemon>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    let mut interval = tokio::time::interval(Duration::from_mins(1));
     loop {
         tokio::select! {
             _ = interval.tick() => {

@@ -1,0 +1,82 @@
+{
+  "schema_version": "eliot.bootstrap-work-result.v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "work_item_id": "W0-08",
+  "structured_result": {
+    "disposition": "LOCAL_ACCEPTED_HOSTED_PENDING",
+    "evidence_status": "ACCEPT",
+    "cleanup": {
+      "authorization": "recoverable cleanup only",
+      "initial_root": "C:\\ProgramData\\Eliot",
+      "initial_inventory": {
+        "files": 69,
+        "directories": 68,
+        "bytes": 61088
+      },
+      "initial_quarantine": "C:\\Users\\kleym\\AppData\\Local\\Temp\\Eliot-W0-08-quarantine-20260824-210500",
+      "postfocused_quarantine": "C:\\Users\\kleym\\AppData\\Local\\Temp\\Eliot-W0-08-quarantine-postfocused-20260824-210900",
+      "postaggregate_quarantine": "C:\\Users\\kleym\\AppData\\Local\\Temp\\Eliot-W0-08-quarantine-postaggregate-20260824-220000",
+      "source_absent_before_aggregate": true,
+      "post_test_state": "empty scaffolding (0 files, 1 descendant directory) moved recoverably after aggregate; source root absent",
+      "irreversible_deletion_claimed": false
+    },
+    "root_quiescent_verification": {
+      "command": "pwsh -NoProfile -File scripts/verify.ps1",
+      "profile": "eliot-verify-v3",
+      "exit": 0,
+      "duration_seconds": 940.5,
+      "completion_snapshot": "2026-08-24T21:29:37.0912001-04:00",
+      "head": "1122e21b081a82a6a335c53f018e9ae60846cdd5",
+      "branch": "main",
+      "status_entries": 139,
+      "status_manifest_sha1": "5e340265b7a75ec2b624efa2c864787490a2e8af",
+      "tracked_diff_sha1": "df483249e660bfdcdd8c285d0d83c6d48034cc26",
+      "steps": [
+        {"name": "metadata", "result": "PASS"},
+        {"name": "lint-policy", "result": "PASS"},
+        {"name": "fmt", "result": "PASS"},
+        {"name": "normative", "result": "PASS"},
+        {"name": "unimplemented-generated", "result": "PASS"},
+        {"name": "unimplemented-oracle", "result": "PASS"},
+        {"name": "stu-evidence", "result": "PROVISIONAL_NON_BLOCKING"},
+        {"name": "workspace-check", "result": "PASS"},
+        {"name": "workspace-clippy", "result": "PASS"},
+        {"name": "workspace-tests", "result": "PASS"},
+        {"name": "cargo-deny", "result": "PASS"}
+      ],
+      "raw_full_log_persisted": false,
+      "raw_full_log_note": "Raw full log was not persisted; no complete log is fabricated here."
+    },
+    "independent_luna_c": {
+      "command": "pwsh -NoProfile -File scripts/verify.ps1",
+      "verdict": "ACCEPT",
+      "exit": 0,
+      "duration_seconds": 994.4,
+      "steps": "same eleven profile steps PASS, with stu-evidence PROVISIONAL_NON_BLOCKING",
+      "lint_policy": {
+        "ffi_profiles": 5,
+        "inherited_profiles": 6,
+        "clippy_keys": 11
+      },
+      "normative": {
+        "files": 4,
+        "authority": "NOT_AUTHORITY"
+      },
+      "unimplemented": {
+        "rows": 0,
+        "status": "HONEST_EMPTY"
+      },
+      "cargo_deny": "duplicate windows-link warning observed and nonfatal",
+      "process_counts": {
+        "pre_matching": {"cargo": 0, "rustc": 0, "surreal": 0, "eliot": 0},
+        "post_matching": {"cargo": 0, "rustc": 0, "surreal": 0, "eliot": 0},
+        "during_note": "Unrelated concurrent W1/Surreal/Eliot processes appeared outside the verifier subtree and were not terminated."
+      }
+    },
+    "proof_ceiling": "EVIDENCE_ONLY; local aggregate verification is not a hosted-main receipt and does not close W0-09.",
+    "uncertainty": [
+      "Hosted main remains red on old committed HEAD at run 32713931368; W0-09 is pending.",
+      "No native Linux receipt is claimed under ROOT-DIRECTIVE-v1.4."
+    ]
+  }
+}

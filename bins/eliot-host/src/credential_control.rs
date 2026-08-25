@@ -1161,8 +1161,10 @@ mod tests {
             recovery: None,
         };
         assert_ne!(
-            host_owner_epoch_digest(&parent).unwrap(),
-            host_owner_epoch_digest(&child).unwrap()
+            host_owner_epoch_digest(&parent)
+                .unwrap_or_else(|error| panic!("parent epoch digest: {error}")),
+            host_owner_epoch_digest(&child)
+                .unwrap_or_else(|error| panic!("child epoch digest: {error}"))
         );
     }
 

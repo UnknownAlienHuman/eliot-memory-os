@@ -9,6 +9,7 @@
 //! identity previously recorded by the installer.
 
 use std::fmt;
+#[cfg(windows)]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -17,14 +18,14 @@ use eliot_runtime_contracts::{
     InstallationActivationApprovalTrustAnchor, InstallationActivationError,
 };
 
-use super::{
-    FileIdentity, ProtectedPathError, ProtectedRootLease, WindowsAdapterError,
-    file_identity_from_handle, final_windows_path_from_handle, protected_program_data_path,
-    verify_exact_file_security, windows_paths_equal,
-};
+use super::{FileIdentity, WindowsAdapterError};
 
 #[cfg(windows)]
-use super::{OwnedKernelHandle, OwnedSecurityDescriptor, fill_system_random, is_reparse_point};
+use super::{
+    OwnedKernelHandle, OwnedSecurityDescriptor, ProtectedPathError, ProtectedRootLease,
+    file_identity_from_handle, fill_system_random, final_windows_path_from_handle,
+    is_reparse_point, protected_program_data_path, verify_exact_file_security, windows_paths_equal,
+};
 #[cfg(windows)]
 use std::sync::Arc;
 
@@ -207,15 +208,16 @@ pub struct InstallationAuthorityKeySigner {
 
 impl fmt::Debug for InstallationAuthorityKeySigner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("InstallationAuthorityKeySigner")
+        let mut debug = formatter.debug_struct("InstallationAuthorityKeySigner");
+        debug
             .field("metadata", &self.metadata)
             .field("signing_seed", &"<redacted>")
             .field("signer", &"<redacted>")
             .field("slot_handle", &"<retained>")
-            .field("contour", &"<retained>")
-            .field("root_identity", &self.root_identity)
-            .finish_non_exhaustive()
+            .field("contour", &"<retained>");
+        #[cfg(windows)]
+        debug.field("root_identity", &self.root_identity);
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -348,6 +350,7 @@ impl WindowsInstallationAuthorityKeyStore {
         }
         #[cfg(not(windows))]
         {
+            let _ = key_root;
             Err(InstallationAuthorityKeyError::UnsupportedPlatform)
         }
     }

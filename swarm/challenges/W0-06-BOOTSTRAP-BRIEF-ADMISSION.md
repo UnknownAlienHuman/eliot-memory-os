@@ -1,6 +1,36 @@
 # W0-06 ContractChallenge: bootstrap brief admission
 
-Status: `CONTRACT_CHALLENGE_OPEN`
+Status: `CONTRACT_CHALLENGE_ACCEPTED`
+
+## Root disposition
+
+Root accepts the bounded D0 admission mechanism implemented for W0-06:
+
+1. `eliot-bootstrap` owns an honest empty `Gap` projection for the exact
+   frozen normative pair. Callers cannot supply its catalogue, registry,
+   provider identity, source revision, or rule dispositions.
+2. `compile_provider_gap_brief` consumes a validated
+   `CurrentSystemEvidenceSnapshot`, rejects a noncanonical normative pair, and
+   derives the snapshot reference itself. A bare caller-provided digest is not
+   accepted as evidence.
+3. `BootstrapCoverage` is derived only from `NormativeCoverageManifest`; GAP
+   scopes remain explicit and no synthetic rule is emitted.
+4. `BootstrapFailureDraft` and `BootstrapImprovementDraft` are typed,
+   canonical-JSON, content-addressed candidate artifacts. The CLI publishes by
+   synced staging plus cross-platform hard-link no-clobber, exact readback, and
+   digest verification under the explicit repository root.
+5. `eliot bootstrap brief --work-unit <ABSOLUTE> --repo-root <ABSOLUTE>` is a
+   one-shot local D0 route with `Candidate` effect and
+   `CandidateArtifact` ceiling. It neither calls Kernel nor depends on MCP.
+6. The command returns typed JSON and the accepted exits are `0` candidate
+   produced, `2` invalid input, `65` digest mismatch, `66` unavailable source,
+   `75` publication outcome unknown, and `78` contract challenge.
+
+Focused Clippy passed for `eliot`, `eliot-cli`, and `eliot-bootstrap` after the
+NormativePair correction. Focused tests passed: 19 `eliot-bootstrap` library
+tests, 3 bootstrap subprocess tests, 20 system-snapshot subprocess tests, and
+16 `eliot-cli` tests. The full W0 workspace gate remains a separate required
+receipt.
 
 ## Authority boundary
 
@@ -30,40 +60,23 @@ working tree. It:
 Keeping that candidate would create a second, caller-authored ontology and a
 false admission claim.
 
-## Current fail-closed state
+## Current bounded state
 
-- `CommandId::BootstrapBrief` remains `PlanGap` with work item `A-06`.
-- The existing pure bootstrap compiler remains available as library code.
-- No production CLI route, synthetic zero-entry catalogue, evidence writer, or
-  admission receipt is claimed.
+- `CommandId::BootstrapBrief` is locally admitted as a D0 candidate-producing
+  command; it is no longer reported as `PlanGap` by the CLI provider table.
+- The provider owns the honest GAP catalogue and its revision. Callers cannot
+  inject rule classes, dispositions, support states, or evidence outcomes.
+- The command captures the current repository snapshot, emits append-only
+  content-addressed drafts, and verifies exact bytes and digests on reread.
+- `NormativePair` contains exactly the Architecture and Implementation SHA-256
+  identities. Runtime evidence remains a snapshot source with an explicit
+  availability state; it is not a third normative document.
+- The pair correction is versioned by the v2 provider and artifact schema
+  identities, and `canonical_normative_pair_contains_only_architecture_and_implementation`
+  prevents reintroducing a runtime digest into the pair.
+- Existing v1 candidate drafts remain immutable historical evidence. They are
+  not silently rewritten or promoted.
 
-## Required owner decisions
-
-Admission is blocked until the contract owners define all of:
-
-1. a provider-owned empty/gap `RuleCatalogue` identity and revision for the
-   exact normative pair;
-2. the typed `BootstrapFailureDraft` and `BootstrapImprovementDraft` owner,
-   canonical schema, and evidence root;
-3. an append-only create-new, canonical-JSON, digest/readback contract;
-4. an explicit absolute repository/evidence-root CLI contract;
-5. the local admitted response contract and typed exit codes;
-6. whether evidence-only incomplete coverage is represented as
-   `NORMATIVE_COVERAGE_INCOMPLETE` while still returning candidate output.
-
-## Minimum acceptance evidence
-
-- Seed accepts only profile plus canonical `AgentWorkUnitBrief`; caller-owned
-  catalogues, rule classes, support states, and evidence outcomes are rejected.
-- Brief coverage and `NormativeCoverageManifest` are bijectively consistent.
-- Gap mode identifies unsearched provider/runtime/store/integration scopes and
-  never invents rule dispositions.
-- Draft writes are content-addressed, create-new, idempotent on identical
-  reread, and reject tampering.
-- CLI requires an absolute root and returns structured, tested exits for
-  success, malformed input, and unavailable evidence storage.
-- The command remains Kernel/MCP-independent and is classified as a candidate
-  write effect with `ProofCeiling::CandidateArtifact`.
-
-Until these conditions are owned and implemented, W0-06 is not admitted and
-the W0 gate remains open.
+This accepts only the local candidate route. It does not claim a Kernel/MCP
+admission receipt, canonical write authority, runtime availability, or product
+completion. W0 still depends on the aggregate verifier and independent gate.

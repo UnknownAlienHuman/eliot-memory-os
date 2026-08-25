@@ -39,6 +39,8 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
 [lints.rust]
@@ -56,5 +58,4 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 print_stderr = "warn"
 print_stdout = "warn"
-todo = "warn"
 unwrap_used = "warn"

@@ -1387,43 +1387,46 @@ fn _assert_sealed_only_coordinator_can_advance() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    fn missing(message: &'static str) -> std::io::Error {
+        std::io::Error::other(message)
+    }
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    fn h(v: &str) -> PlatformHandle {
-        PlatformHandle::new(v).unwrap()
+    fn h(v: &str) -> TestResult<PlatformHandle> {
+        PlatformHandle::new(v).map_err(Into::into)
     }
-    fn digest_handle(c: char) -> PlatformHandle {
+    fn digest_handle(c: char) -> TestResult<PlatformHandle> {
         h(&c.to_string().repeat(64))
     }
-    fn identity(op: &str) -> ScmOperationIdentity {
-        ScmOperationIdentity {
-            installation: h("test-installation"),
-            service: h(CANONICAL_SERVICE),
-            approval_digest: digest_handle('a'),
-            config_digest: digest_handle('b'),
-            operation_id: h(op),
-            request_digest: digest_handle('c'),
-        }
+    fn identity(op: &str) -> TestResult<ScmOperationIdentity> {
+        Ok(ScmOperationIdentity {
+            installation: h("test-installation")?,
+            service: h(CANONICAL_SERVICE)?,
+            approval_digest: digest_handle('a')?,
+            config_digest: digest_handle('b')?,
+            operation_id: h(op)?,
+            request_digest: digest_handle('c')?,
+        })
     }
-    fn temp_path(label: &str) -> PathBuf {
+    fn temp_path(label: &str) -> TestResult<PathBuf> {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
-        std::env::temp_dir().join(format!("scm-op-{label}-{pid}-{nanos}-{n}.redb"))
+        Ok(std::env::temp_dir().join(format!("scm-op-{label}-{pid}-{nanos}-{n}.redb")))
     }
-    fn fingerprint(path: &Path) -> (Vec<u8>, std::time::SystemTime) {
-        (
-            std::fs::read(path).unwrap(),
-            std::fs::metadata(path).unwrap().modified().unwrap(),
-        )
+    fn fingerprint(path: &Path) -> TestResult<(Vec<u8>, std::time::SystemTime)> {
+        Ok((std::fs::read(path)?, std::fs::metadata(path)?.modified()?))
     }
-    fn sha_of(rec: &ScmOperationRecord) -> String {
-        normalized_sha(rec).unwrap()
+    fn sha_of(rec: &ScmOperationRecord) -> TestResult<String> {
+        normalized_sha(rec).map_err(Into::into)
     }
 
     #[derive(Serialize)]
@@ -1476,7 +1479,7 @@ mod tests {
             .collect()
     }
 
-    fn unanchored_current_sha(record: &ScmOperationRecord) -> String {
+    fn unanchored_current_sha(record: &ScmOperationRecord) -> TestResult<String> {
         let digest = UnanchoredCurrentRecordDigest {
             magic: &record.magic,
             version: record.version,
@@ -1492,10 +1495,10 @@ mod tests {
             prior_sha256: &record.prior_sha256,
             history: unanchored_history(record),
         };
-        sha256_hex(&serde_json::to_vec(&digest).unwrap())
+        Ok(sha256_hex(&serde_json::to_vec(&digest)?))
     }
 
-    fn legacy_v1_sha(record: &ScmOperationRecord) -> String {
+    fn legacy_v1_sha(record: &ScmOperationRecord) -> TestResult<String> {
         let digest = LegacyV1RecordDigest {
             magic: LEGACY_SCM_STORE_MAGIC_V1,
             version: 1,
@@ -1510,65 +1513,62 @@ mod tests {
             prior_sha256: &record.prior_sha256,
             history: unanchored_history(record),
         };
-        sha256_hex(&serde_json::to_vec(&digest).unwrap())
+        Ok(sha256_hex(&serde_json::to_vec(&digest)?))
     }
 
-    fn create(store: &ScmOperationStore, identity: ScmOperationIdentity) -> ScmOperationRecord {
+    fn create(
+        store: &ScmOperationStore,
+        identity: ScmOperationIdentity,
+    ) -> TestResult<ScmOperationRecord> {
         let coordinator = store.coordinator();
-        store.create_operation(&coordinator, identity).unwrap()
+        store
+            .create_operation(&coordinator, identity)
+            .map_err(Into::into)
     }
 
     #[test]
-    fn transition_monotonic() {
-        let path = temp_path("mono");
-        let store = ScmOperationStore::open(&path).unwrap();
-        let id = identity("op-mono");
-        let r1 = create(&store, id.clone());
+    fn transition_monotonic() -> TestResult {
+        let path = temp_path("mono")?;
+        let store = ScmOperationStore::open(&path)?;
+        let id = identity("op-mono")?;
+        let r1 = create(&store, id.clone())?;
         assert_eq!(r1.state(), ScmOperationState::StopIntentCommitted);
         let coord = store.coordinator();
-        let s1 = sha_of(&r1);
-        let r2 = store
-            .advance_to(
-                &coord,
-                &id,
-                r1.revision(),
-                &s1,
-                ScmOperationState::StopObserved,
-            )
-            .unwrap();
+        let s1 = sha_of(&r1)?;
+        let r2 = store.advance_to(
+            &coord,
+            &id,
+            r1.revision(),
+            &s1,
+            ScmOperationState::StopObserved,
+        )?;
         assert_eq!(r2.state(), ScmOperationState::StopObserved);
-        let s2 = sha_of(&r2);
-        let r3 = store
-            .advance_to(
-                &coord,
-                &id,
-                r2.revision(),
-                &s2,
-                ScmOperationState::StartIntentCommitted,
-            )
-            .unwrap();
-        let s3 = sha_of(&r3);
-        let r4 = store
-            .advance_to(
-                &coord,
-                &id,
-                r3.revision(),
-                &s3,
-                ScmOperationState::StartedObserved,
-            )
-            .unwrap();
-        let s4 = sha_of(&r4);
-        let r5 = store
-            .advance_to(
-                &coord,
-                &id,
-                r4.revision(),
-                &s4,
-                ScmOperationState::Completed,
-            )
-            .unwrap();
+        let s2 = sha_of(&r2)?;
+        let r3 = store.advance_to(
+            &coord,
+            &id,
+            r2.revision(),
+            &s2,
+            ScmOperationState::StartIntentCommitted,
+        )?;
+        let s3 = sha_of(&r3)?;
+        let r4 = store.advance_to(
+            &coord,
+            &id,
+            r3.revision(),
+            &s3,
+            ScmOperationState::StartedObserved,
+        )?;
+        let s4 = sha_of(&r4)?;
+        let r5 = store.advance_to(
+            &coord,
+            &id,
+            r4.revision(),
+            &s4,
+            ScmOperationState::Completed,
+        )?;
         assert_eq!(r5.state(), ScmOperationState::Completed);
-        let s5 = sha_of(&r5);
+        let s5 = sha_of(&r5)?;
         assert_eq!(
             store.advance_to(
                 &coord,
@@ -1583,50 +1583,48 @@ mod tests {
             })
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn idempotent_replay_create_and_transition() {
-        let path = temp_path("replay");
-        let store = ScmOperationStore::open(&path).unwrap();
-        let id = identity("op-replay");
-        let r1 = create(&store, id.clone());
-        let r1b = create(&store, id.clone());
+    fn idempotent_replay_create_and_transition() -> TestResult {
+        let path = temp_path("replay")?;
+        let store = ScmOperationStore::open(&path)?;
+        let id = identity("op-replay")?;
+        let r1 = create(&store, id.clone())?;
+        let r1b = create(&store, id.clone())?;
         assert_eq!(r1, r1b);
         let coord = store.coordinator();
-        let s1 = sha_of(&r1);
-        let r2 = store
-            .advance_to(
-                &coord,
-                &id,
-                r1.revision(),
-                &s1,
-                ScmOperationState::StopObserved,
-            )
-            .unwrap();
-        let r2_replay = store
-            .advance_to(
-                &coord,
-                &id,
-                r1.revision(),
-                &s1,
-                ScmOperationState::StopObserved,
-            )
-            .unwrap();
+        let s1 = sha_of(&r1)?;
+        let r2 = store.advance_to(
+            &coord,
+            &id,
+            r1.revision(),
+            &s1,
+            ScmOperationState::StopObserved,
+        )?;
+        let r2_replay = store.advance_to(
+            &coord,
+            &id,
+            r1.revision(),
+            &s1,
+            ScmOperationState::StopObserved,
+        )?;
         assert_eq!(r2, r2_replay);
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn digest_conflict() {
-        let path = temp_path("digest");
-        let store = ScmOperationStore::open(&path).unwrap();
-        let id = identity("op-digest");
-        let r1 = create(&store, id.clone());
+    fn digest_conflict() -> TestResult {
+        let path = temp_path("digest")?;
+        let store = ScmOperationStore::open(&path)?;
+        let id = identity("op-digest")?;
+        let r1 = create(&store, id.clone())?;
         let mut bad = id.clone();
-        bad.approval_digest = digest_handle('d');
+        bad.approval_digest = digest_handle('d')?;
         let coord = store.coordinator();
-        let s1 = sha_of(&r1);
+        let s1 = sha_of(&r1)?;
         assert_eq!(
             store.advance_to(
                 &coord,
@@ -1638,16 +1636,17 @@ mod tests {
             Err(ScmOperationStoreError::DigestConflict)
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn same_revision_drift_conflict() {
-        let path = temp_path("drift");
-        let store = ScmOperationStore::open(&path).unwrap();
-        let id = identity("op-drift");
-        let r1 = create(&store, id.clone());
+    fn same_revision_drift_conflict() -> TestResult {
+        let path = temp_path("drift")?;
+        let store = ScmOperationStore::open(&path)?;
+        let id = identity("op-drift")?;
+        let r1 = create(&store, id.clone())?;
         let coord = store.coordinator();
-        let s1 = sha_of(&r1);
+        let s1 = sha_of(&r1)?;
         let mut bad_sha = s1.clone();
         bad_sha.replace_range(0..1, "f");
         assert_eq!(
@@ -1671,61 +1670,61 @@ mod tests {
             Err(ScmOperationStoreError::Conflict)
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn crash_reopen_preserves() {
-        let path = temp_path("crash");
-        let id = identity("op-crash");
+    fn crash_reopen_preserves() -> TestResult {
+        let path = temp_path("crash")?;
+        let id = identity("op-crash")?;
         let (rev, sha) = {
-            let store = ScmOperationStore::open(&path).unwrap();
-            let r1 = create(&store, id.clone());
+            let store = ScmOperationStore::open(&path)?;
+            let r1 = create(&store, id.clone())?;
             let coord = store.coordinator();
-            let s1 = sha_of(&r1);
-            let r2 = store
-                .advance_to(
-                    &coord,
-                    &id,
-                    r1.revision(),
-                    &s1,
-                    ScmOperationState::StopObserved,
-                )
-                .unwrap();
-            (r2.revision(), sha_of(&r2))
-        };
-        let store2 = ScmOperationStore::open(&path).unwrap();
-        let loaded = store2.load_operation(&id).unwrap().unwrap();
-        assert_eq!(loaded.revision(), rev);
-        assert_eq!(sha_of(&loaded), sha);
-        let coord2 = store2.coordinator();
-        let r3 = store2
-            .advance_to(
-                &coord2,
+            let s1 = sha_of(&r1)?;
+            let r2 = store.advance_to(
+                &coord,
                 &id,
-                loaded.revision(),
-                &sha_of(&loaded),
-                ScmOperationState::StartIntentCommitted,
-            )
-            .unwrap();
+                r1.revision(),
+                &s1,
+                ScmOperationState::StopObserved,
+            )?;
+            (r2.revision(), sha_of(&r2)?)
+        };
+        let store2 = ScmOperationStore::open(&path)?;
+        let loaded = store2
+            .load_operation(&id)?
+            .ok_or_else(|| missing("operation missing after reopen"))?;
+        assert_eq!(loaded.revision(), rev);
+        assert_eq!(sha_of(&loaded)?, sha);
+        let coord2 = store2.coordinator();
+        let r3 = store2.advance_to(
+            &coord2,
+            &id,
+            loaded.revision(),
+            &sha_of(&loaded)?,
+            ScmOperationState::StartIntentCommitted,
+        )?;
         assert_eq!(r3.state(), ScmOperationState::StartIntentCommitted);
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn unknown_query_is_query_only() {
-        let path = temp_path("unknown");
-        let store = ScmOperationStore::open(&path).unwrap();
-        let id = identity("op-unknown");
-        let r1 = create(&store, id.clone());
+    fn unknown_query_is_query_only() -> TestResult {
+        let path = temp_path("unknown")?;
+        let store = ScmOperationStore::open(&path)?;
+        let id = identity("op-unknown")?;
+        let r1 = create(&store, id.clone())?;
         let coord = store.coordinator();
-        let s1 = sha_of(&r1);
-        let u = store
-            .quarantine_to_unknown(&coord, &id, r1.revision(), &s1)
-            .unwrap();
+        let s1 = sha_of(&r1)?;
+        let u = store.quarantine_to_unknown(&coord, &id, r1.revision(), &s1)?;
         assert_eq!(u.state(), ScmOperationState::Unknown);
-        let q = store.query_operation(&id).unwrap().unwrap();
+        let q = store
+            .query_operation(&id)?
+            .ok_or_else(|| missing("operation missing after quarantine"))?;
         assert_eq!(q.state(), ScmOperationState::Unknown);
-        let sq = sha_of(&q);
+        let sq = sha_of(&q)?;
         assert_eq!(
             store.advance_to(
                 &coord,
@@ -1737,142 +1736,165 @@ mod tests {
             Err(ScmOperationStoreError::Quarantined)
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn response_loss_query_never_authorizes_resend() {
-        let path = temp_path("resend");
-        let id = identity("op-resend");
-        let store = ScmOperationStore::open(&path).unwrap();
-        let r1 = create(&store, id.clone());
-        let q = store.query_operation(&id).unwrap().unwrap();
+    fn response_loss_query_never_authorizes_resend() -> TestResult {
+        let path = temp_path("resend")?;
+        let id = identity("op-resend")?;
+        let store = ScmOperationStore::open(&path)?;
+        let r1 = create(&store, id.clone())?;
+        let q = store
+            .query_operation(&id)?
+            .ok_or_else(|| missing("operation missing before reopen"))?;
         assert_eq!(q.state(), ScmOperationState::StopIntentCommitted);
         assert_eq!(r1, q);
         drop(store);
-        let store2 = ScmOperationStore::open(&path).unwrap();
-        let q2 = store2.query_operation(&id).unwrap().unwrap();
+        let store2 = ScmOperationStore::open(&path)?;
+        let q2 = store2
+            .query_operation(&id)?
+            .ok_or_else(|| missing("operation missing after reopen"))?;
         assert_eq!(q2.state(), ScmOperationState::StopIntentCommitted);
         assert_eq!(q2.revision(), r1.revision());
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn corruption_is_fail_closed() {
-        let path = temp_path("corrupt");
-        let id = identity("op-corrupt");
+    fn corruption_is_fail_closed() -> TestResult {
+        let path = temp_path("corrupt")?;
+        let id = identity("op-corrupt")?;
         {
-            let store = ScmOperationStore::open(&path).unwrap();
-            create(&store, id.clone());
+            let store = ScmOperationStore::open(&path)?;
+            create(&store, id.clone())?;
         }
         {
-            let db = Database::open(&path).unwrap();
-            let w = db.begin_write().unwrap();
+            let db = Database::open(&path)?;
+            let w = db.begin_write()?;
             {
-                let mut t = w.open_table(OPS_TABLE).unwrap();
-                t.insert(id.key().as_str(), b"not-json".as_slice()).unwrap();
+                let mut t = w.open_table(OPS_TABLE)?;
+                t.insert(id.key().as_str(), b"not-json".as_slice())?;
             }
-            w.commit().unwrap();
+            w.commit()?;
         }
-        let store2 = ScmOperationStore::open(&path).unwrap();
+        let store2 = ScmOperationStore::open(&path)?;
         assert_eq!(
-            store2.load_operation(&id).unwrap_err(),
+            store2
+                .load_operation(&id)
+                .err()
+                .ok_or_else(|| missing("expected corrupt load error"))?,
             ScmOperationStoreError::Corrupt
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn legacy_version_is_distinct() {
-        let path = temp_path("legacy");
+    fn legacy_version_is_distinct() -> TestResult {
+        let path = temp_path("legacy")?;
         {
-            let store = ScmOperationStore::open(&path).unwrap();
-            create(&store, identity("op-legacy"));
+            let store = ScmOperationStore::open(&path)?;
+            create(&store, identity("op-legacy")?)?;
             drop(store);
-            let db = Database::open(&path).unwrap();
-            let w = db.begin_write().unwrap();
+            let db = Database::open(&path)?;
+            let w = db.begin_write()?;
             {
-                let mut t = w.open_table(META_TABLE).unwrap();
+                let mut t = w.open_table(META_TABLE)?;
                 let m = StoreMeta {
                     magic: SCM_STORE_MAGIC.to_owned(),
                     version: 99,
                 };
-                let b = serde_json::to_vec(&m).unwrap();
-                t.insert(META_KEY, b.as_slice()).unwrap();
+                let b = serde_json::to_vec(&m)?;
+                t.insert(META_KEY, b.as_slice())?;
             }
-            w.commit().unwrap();
+            w.commit()?;
         }
-        let err = ScmOperationStore::open(&path).unwrap_err();
+        let err = ScmOperationStore::open(&path)
+            .err()
+            .ok_or_else(|| missing("expected legacy version error"))?;
         assert_eq!(err, ScmOperationStoreError::Legacy { version: 99 });
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn v1_store_requires_explicit_migration() {
-        let path = temp_path("legacy-v1-store");
+    fn v1_store_requires_explicit_migration() -> TestResult {
+        let path = temp_path("legacy-v1-store")?;
         {
-            let store = ScmOperationStore::open(&path).unwrap();
-            create(&store, identity("op-legacy-v1-store"));
+            let store = ScmOperationStore::open(&path)?;
+            create(&store, identity("op-legacy-v1-store")?)?;
         }
         {
-            let database = Database::open(&path).unwrap();
-            let write = database.begin_write().unwrap();
+            let database = Database::open(&path)?;
+            let write = database.begin_write()?;
             {
-                let mut table = write.open_table(META_TABLE).unwrap();
+                let mut table = write.open_table(META_TABLE)?;
                 let meta = StoreMeta {
                     magic: LEGACY_SCM_STORE_MAGIC_V1.to_owned(),
                     version: 1,
                 };
-                let bytes = serde_json::to_vec(&meta).unwrap();
-                table.insert(META_KEY, bytes.as_slice()).unwrap();
+                let bytes = serde_json::to_vec(&meta)?;
+                table.insert(META_KEY, bytes.as_slice())?;
             }
-            write.commit().unwrap();
+            write.commit()?;
         }
         assert_eq!(
-            ScmOperationStore::open_existing(&path).unwrap_err(),
+            ScmOperationStore::open_existing(&path)
+                .err()
+                .ok_or_else(|| missing("expected legacy store error"))?,
             ScmOperationStoreError::Legacy { version: 1 }
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn missing_table_is_distinct() {
-        let path = temp_path("missing");
+    fn missing_table_is_distinct() -> TestResult {
+        let path = temp_path("missing")?;
         {
-            let db = Database::create(&path).unwrap();
-            let w = db.begin_write().unwrap();
+            let db = Database::create(&path)?;
+            let w = db.begin_write()?;
             {
-                let mut t = w.open_table(META_TABLE).unwrap();
+                let mut t = w.open_table(META_TABLE)?;
                 let m = StoreMeta {
                     magic: SCM_STORE_MAGIC.to_owned(),
                     version: SCM_STORE_VERSION,
                 };
-                let b = serde_json::to_vec(&m).unwrap();
-                t.insert(META_KEY, b.as_slice()).unwrap();
+                let b = serde_json::to_vec(&m)?;
+                t.insert(META_KEY, b.as_slice())?;
             }
-            w.commit().unwrap();
+            w.commit()?;
         }
-        let e = ScmOperationStore::open_existing(&path).unwrap_err();
+        let e = ScmOperationStore::open_existing(&path)
+            .err()
+            .ok_or_else(|| missing("expected missing table error"))?;
         assert_eq!(e, ScmOperationStoreError::MissingTable);
         assert_eq!(
-            ScmOperationStore::open_existing("nonexistent/missing.redb").unwrap_err(),
+            ScmOperationStore::open_existing("nonexistent/missing.redb")
+                .err()
+                .ok_or_else(|| missing("expected missing file error"))?,
             ScmOperationStoreError::MissingFile
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn open_existing_is_read_only_for_blank_database() {
-        let path = temp_path("blank-read-only");
+    fn open_existing_is_read_only_for_blank_database() -> TestResult {
+        let path = temp_path("blank-read-only")?;
         {
-            let database = Database::create(&path).unwrap();
+            let database = Database::create(&path)?;
             drop(database);
         }
         assert_eq!(
-            ScmOperationStore::open_existing(&path).unwrap_err(),
+            ScmOperationStore::open_existing(&path)
+                .err()
+                .ok_or_else(|| missing("expected missing table error"))?,
             ScmOperationStoreError::MissingTable
         );
-        let database = Database::open(&path).unwrap();
-        let read = database.begin_read().unwrap();
+        let database = Database::open(&path)?;
+        let read = database.begin_read()?;
         assert!(matches!(
             read.open_table(META_TABLE),
             Err(redb::TableError::TableDoesNotExist(_))
@@ -1880,163 +1902,175 @@ mod tests {
         drop(read);
         drop(database);
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn open_existing_and_query_leave_bytes_and_mtime_unchanged() {
-        let path = temp_path("read-only-fingerprint");
-        let id = identity("op-read-only-fingerprint");
+    fn open_existing_and_query_leave_bytes_and_mtime_unchanged() -> TestResult {
+        let path = temp_path("read-only-fingerprint")?;
+        let id = identity("op-read-only-fingerprint")?;
         {
-            let store = ScmOperationStore::open(&path).unwrap();
-            create(&store, id.clone());
+            let store = ScmOperationStore::open(&path)?;
+            create(&store, id.clone())?;
         }
-        let before = fingerprint(&path);
-        let existing = ScmOperationStore::open_existing(&path).unwrap();
+        let before = fingerprint(&path)?;
+        let existing = ScmOperationStore::open_existing(&path)?;
         assert_eq!(
             existing
-                .query_operation(&id)
-                .unwrap()
-                .unwrap()
+                .query_operation(&id)?
+                .ok_or_else(|| missing("operation missing during read-only query"))?
                 .operation_id(),
             &id.operation_id
         );
         drop(existing);
-        assert_eq!(fingerprint(&path), before);
+        assert_eq!(fingerprint(&path)?, before);
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn missing_index_with_existing_record_is_corrupt() {
-        let path = temp_path("missing-index");
-        let id = identity("op-missing-index");
+    fn missing_index_with_existing_record_is_corrupt() -> TestResult {
+        let path = temp_path("missing-index")?;
+        let id = identity("op-missing-index")?;
         {
-            let store = ScmOperationStore::open(&path).unwrap();
-            create(&store, id.clone());
+            let store = ScmOperationStore::open(&path)?;
+            create(&store, id.clone())?;
         }
         {
-            let database = Database::open(&path).unwrap();
-            let write = database.begin_write().unwrap();
+            let database = Database::open(&path)?;
+            let write = database.begin_write()?;
             {
-                let mut index = write.open_table(INDEX_TABLE).unwrap();
-                index.remove(id.stable_key().as_str()).unwrap();
+                let mut index = write.open_table(INDEX_TABLE)?;
+                index.remove(id.stable_key().as_str())?;
             }
-            write.commit().unwrap();
+            write.commit()?;
         }
-        let store = ScmOperationStore::open_existing(&path).unwrap();
+        let store = ScmOperationStore::open_existing(&path)?;
         assert_eq!(
-            store.query_operation(&id).unwrap_err(),
+            store
+                .query_operation(&id)
+                .err()
+                .ok_or_else(|| missing("expected corrupt query error"))?,
             ScmOperationStoreError::Corrupt
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn index_binds_stable_key_and_record_key() {
-        let path = temp_path("index-binding");
-        let id = identity("op-index-binding");
+    fn index_binds_stable_key_and_record_key() -> TestResult {
+        let path = temp_path("index-binding")?;
+        let id = identity("op-index-binding")?;
         {
-            let store = ScmOperationStore::open(&path).unwrap();
-            create(&store, id.clone());
+            let store = ScmOperationStore::open(&path)?;
+            create(&store, id.clone())?;
         }
         {
-            let database = Database::open(&path).unwrap();
-            let write = database.begin_write().unwrap();
+            let database = Database::open(&path)?;
+            let write = database.begin_write()?;
             {
-                let mut index = write.open_table(INDEX_TABLE).unwrap();
+                let mut index = write.open_table(INDEX_TABLE)?;
                 let entry = ScmOperationIndexEntry {
                     magic: SCM_INDEX_MAGIC.to_owned(),
                     version: SCM_INDEX_VERSION,
                     stable_key: "other-stable".to_owned(),
                     record_key: id.key(),
                 };
-                let bytes = serde_json::to_vec(&entry).unwrap();
-                index
-                    .insert(id.stable_key().as_str(), bytes.as_slice())
-                    .unwrap();
+                let bytes = serde_json::to_vec(&entry)?;
+                index.insert(id.stable_key().as_str(), bytes.as_slice())?;
             }
-            write.commit().unwrap();
+            write.commit()?;
         }
-        let store = ScmOperationStore::open_existing(&path).unwrap();
+        let store = ScmOperationStore::open_existing(&path)?;
         assert_eq!(
-            store.query_operation(&id).unwrap_err(),
-            ScmOperationStoreError::Corrupt
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn duplicate_stable_identity_is_corrupt_even_when_index_points_to_one_record() {
-        let path = temp_path("duplicate-stable");
-        let id = identity("op-duplicate-stable");
-        {
-            let store = ScmOperationStore::open(&path).unwrap();
-            create(&store, id.clone());
-        }
-        {
-            let database = Database::open(&path).unwrap();
-            let write = database.begin_write().unwrap();
-            {
-                let mut operations = write.open_table(OPS_TABLE).unwrap();
-                let mut envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
-                    operations.get(id.key().as_str()).unwrap().unwrap().value(),
-                )
-                .unwrap();
-                envelope.record.request_digest = digest_handle('d');
-                envelope.record.checksum = normalized_sha(&envelope.record).unwrap();
-                let duplicate_key = envelope.record.key();
-                let bytes = serde_json::to_vec(&envelope).unwrap();
-                operations
-                    .insert(duplicate_key.as_str(), bytes.as_slice())
-                    .unwrap();
-            }
-            write.commit().unwrap();
-        }
-        let store = ScmOperationStore::open_existing(&path).unwrap();
-        assert_eq!(
-            store.query_operation(&id).unwrap_err(),
-            ScmOperationStoreError::Corrupt
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn current_checksum_and_predecessor_history_are_verified() {
-        let path = temp_path("checksum-history");
-        let id = identity("op-checksum-history");
-        let record = {
-            let store = ScmOperationStore::open(&path).unwrap();
-            let first = create(&store, id.clone());
-            let coordinator = store.coordinator();
             store
-                .advance_to(
-                    &coordinator,
-                    &id,
-                    first.revision(),
-                    first.checksum(),
-                    ScmOperationState::StopObserved,
-                )
-                .unwrap()
+                .query_operation(&id)
+                .err()
+                .ok_or_else(|| missing("expected corrupt query error"))?,
+            ScmOperationStoreError::Corrupt
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_stable_identity_is_corrupt_even_when_index_points_to_one_record() -> TestResult {
+        let path = temp_path("duplicate-stable")?;
+        let id = identity("op-duplicate-stable")?;
+        {
+            let store = ScmOperationStore::open(&path)?;
+            create(&store, id.clone())?;
+        }
+        {
+            let database = Database::open(&path)?;
+            let write = database.begin_write()?;
+            {
+                let mut operations = write.open_table(OPS_TABLE)?;
+                let mut envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
+                    operations
+                        .get(id.key().as_str())?
+                        .ok_or_else(|| missing("operation record missing"))?
+                        .value(),
+                )?;
+                envelope.record.request_digest = digest_handle('d')?;
+                envelope.record.checksum = normalized_sha(&envelope.record)?;
+                let duplicate_key = envelope.record.key();
+                let bytes = serde_json::to_vec(&envelope)?;
+                operations.insert(duplicate_key.as_str(), bytes.as_slice())?;
+            }
+            write.commit()?;
+        }
+        let store = ScmOperationStore::open_existing(&path)?;
+        assert_eq!(
+            store
+                .query_operation(&id)
+                .err()
+                .ok_or_else(|| missing("expected corrupt query error"))?,
+            ScmOperationStoreError::Corrupt
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn current_checksum_and_predecessor_history_are_verified() -> TestResult {
+        let path = temp_path("checksum-history")?;
+        let id = identity("op-checksum-history")?;
+        let record = {
+            let store = ScmOperationStore::open(&path)?;
+            let first = create(&store, id.clone())?;
+            let coordinator = store.coordinator();
+            store.advance_to(
+                &coordinator,
+                &id,
+                first.revision(),
+                first.checksum(),
+                ScmOperationState::StopObserved,
+            )?
         };
         {
-            let database = Database::open(&path).unwrap();
-            let write = database.begin_write().unwrap();
+            let database = Database::open(&path)?;
+            let write = database.begin_write()?;
             {
-                let mut operations = write.open_table(OPS_TABLE).unwrap();
+                let mut operations = write.open_table(OPS_TABLE)?;
                 let mut envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
-                    operations.get(id.key().as_str()).unwrap().unwrap().value(),
-                )
-                .unwrap();
+                    operations
+                        .get(id.key().as_str())?
+                        .ok_or_else(|| missing("operation record missing"))?
+                        .value(),
+                )?;
                 envelope.record.checksum = "0".repeat(64);
-                let bytes = serde_json::to_vec(&envelope).unwrap();
-                operations
-                    .insert(id.key().as_str(), bytes.as_slice())
-                    .unwrap();
+                let bytes = serde_json::to_vec(&envelope)?;
+                operations.insert(id.key().as_str(), bytes.as_slice())?;
             }
-            write.commit().unwrap();
+            write.commit()?;
         }
-        let store = ScmOperationStore::open_existing(&path).unwrap();
+        let store = ScmOperationStore::open_existing(&path)?;
         assert_eq!(
-            store.query_operation(&id).unwrap_err(),
+            store
+                .query_operation(&id)
+                .err()
+                .ok_or_else(|| missing("expected corrupt query error"))?,
             ScmOperationStoreError::Corrupt
         );
         drop(store);
@@ -2044,161 +2078,164 @@ mod tests {
         // A current checksum can be recomputed, but an invalid predecessor
         // link must still fail closed.
         {
-            let database = Database::open(&path).unwrap();
-            let write = database.begin_write().unwrap();
+            let database = Database::open(&path)?;
+            let write = database.begin_write()?;
             {
-                let mut operations = write.open_table(OPS_TABLE).unwrap();
+                let mut operations = write.open_table(OPS_TABLE)?;
                 let mut envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
-                    operations.get(id.key().as_str()).unwrap().unwrap().value(),
-                )
-                .unwrap();
+                    operations
+                        .get(id.key().as_str())?
+                        .ok_or_else(|| missing("operation record missing"))?
+                        .value(),
+                )?;
                 envelope.record.checksum = record.checksum().to_owned();
                 envelope.record.prior_sha256 = "d".repeat(64);
-                envelope.record.checksum = normalized_sha(&envelope.record).unwrap();
-                let bytes = serde_json::to_vec(&envelope).unwrap();
-                operations
-                    .insert(id.key().as_str(), bytes.as_slice())
-                    .unwrap();
+                envelope.record.checksum = normalized_sha(&envelope.record)?;
+                let bytes = serde_json::to_vec(&envelope)?;
+                operations.insert(id.key().as_str(), bytes.as_slice())?;
             }
-            write.commit().unwrap();
+            write.commit()?;
         }
-        let store = ScmOperationStore::open_existing(&path).unwrap();
+        let store = ScmOperationStore::open_existing(&path)?;
         assert_eq!(
-            store.query_operation(&id).unwrap_err(),
+            store
+                .query_operation(&id)
+                .err()
+                .ok_or_else(|| missing("expected corrupt query error"))?,
             ScmOperationStoreError::Corrupt
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn tampered_middle_history_link_is_rejected_after_current_checksum_recomputed() {
-        let path = temp_path("history-anchor-tamper");
-        let id = identity("op-history-anchor-tamper");
+    fn tampered_middle_history_link_is_rejected_after_current_checksum_recomputed() -> TestResult {
+        let path = temp_path("history-anchor-tamper")?;
+        let id = identity("op-history-anchor-tamper")?;
         {
-            let store = ScmOperationStore::open(&path).unwrap();
-            let first = create(&store, id.clone());
+            let store = ScmOperationStore::open(&path)?;
+            let first = create(&store, id.clone())?;
             let coordinator = store.coordinator();
-            let second = store
-                .advance_to(
-                    &coordinator,
-                    &id,
-                    first.revision(),
-                    first.checksum(),
-                    ScmOperationState::StopObserved,
-                )
-                .unwrap();
-            store
-                .advance_to(
-                    &coordinator,
-                    &id,
-                    second.revision(),
-                    second.checksum(),
-                    ScmOperationState::StartIntentCommitted,
-                )
-                .unwrap();
+            let second = store.advance_to(
+                &coordinator,
+                &id,
+                first.revision(),
+                first.checksum(),
+                ScmOperationState::StopObserved,
+            )?;
+            store.advance_to(
+                &coordinator,
+                &id,
+                second.revision(),
+                second.checksum(),
+                ScmOperationState::StartIntentCommitted,
+            )?;
         }
         {
-            let database = Database::open(&path).unwrap();
-            let write = database.begin_write().unwrap();
+            let database = Database::open(&path)?;
+            let write = database.begin_write()?;
             {
-                let mut operations = write.open_table(OPS_TABLE).unwrap();
+                let mut operations = write.open_table(OPS_TABLE)?;
                 let mut envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
-                    operations.get(id.key().as_str()).unwrap().unwrap().value(),
-                )
-                .unwrap();
+                    operations
+                        .get(id.key().as_str())?
+                        .ok_or_else(|| missing("operation record missing"))?
+                        .value(),
+                )?;
                 assert_eq!(envelope.record.history.len(), 2);
                 envelope.record.history[0].checksum = "d".repeat(64);
                 // Recompute the current checksum to prove the independent
                 // history anchor, rather than only the current-record digest,
                 // catches this tamper.
-                envelope.record.checksum = normalized_sha(&envelope.record).unwrap();
-                let bytes = serde_json::to_vec(&envelope).unwrap();
-                operations
-                    .insert(id.key().as_str(), bytes.as_slice())
-                    .unwrap();
+                envelope.record.checksum = normalized_sha(&envelope.record)?;
+                let bytes = serde_json::to_vec(&envelope)?;
+                operations.insert(id.key().as_str(), bytes.as_slice())?;
             }
-            write.commit().unwrap();
+            write.commit()?;
         }
-        let store = ScmOperationStore::open_existing(&path).unwrap();
+        let store = ScmOperationStore::open_existing(&path)?;
         assert_eq!(
-            store.query_operation(&id).unwrap_err(),
+            store
+                .query_operation(&id)
+                .err()
+                .ok_or_else(|| missing("expected corrupt query error"))?,
             ScmOperationStoreError::Corrupt
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn stripping_all_anchors_and_recomputing_current_checksum_is_rejected() {
-        let path = temp_path("history-anchor-strip");
-        let id = identity("op-history-anchor-strip");
+    fn stripping_all_anchors_and_recomputing_current_checksum_is_rejected() -> TestResult {
+        let path = temp_path("history-anchor-strip")?;
+        let id = identity("op-history-anchor-strip")?;
         let record = {
-            let store = ScmOperationStore::open(&path).unwrap();
-            let first = create(&store, id.clone());
+            let store = ScmOperationStore::open(&path)?;
+            let first = create(&store, id.clone())?;
             let coordinator = store.coordinator();
-            let second = store
-                .advance_to(
-                    &coordinator,
-                    &id,
-                    first.revision(),
-                    first.checksum(),
-                    ScmOperationState::StopObserved,
-                )
-                .unwrap();
-            store
-                .advance_to(
-                    &coordinator,
-                    &id,
-                    second.revision(),
-                    second.checksum(),
-                    ScmOperationState::StartIntentCommitted,
-                )
-                .unwrap()
+            let second = store.advance_to(
+                &coordinator,
+                &id,
+                first.revision(),
+                first.checksum(),
+                ScmOperationState::StopObserved,
+            )?;
+            store.advance_to(
+                &coordinator,
+                &id,
+                second.revision(),
+                second.checksum(),
+                ScmOperationState::StartIntentCommitted,
+            )?
         };
         assert_eq!(record.history.len(), 2);
 
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&encode_record(&record).unwrap()).unwrap();
-        let record_object = value["record"].as_object_mut().unwrap();
-        for link in record_object["history"].as_array_mut().unwrap() {
+        let mut value: serde_json::Value = serde_json::from_slice(&encode_record(&record)?)?;
+        let record_object = value["record"]
+            .as_object_mut()
+            .ok_or_else(|| missing("record object missing"))?;
+        for link in record_object["history"]
+            .as_array_mut()
+            .ok_or_else(|| missing("history array missing"))?
+        {
             assert!(
                 link.as_object_mut()
-                    .unwrap()
+                    .ok_or_else(|| missing("history link object missing"))?
                     .remove("chain_sha256")
                     .is_some()
             );
         }
         record_object.insert(
             "checksum".to_owned(),
-            serde_json::Value::String(unanchored_current_sha(&record)),
+            serde_json::Value::String(unanchored_current_sha(&record)?),
         );
-        let tampered = serde_json::to_vec(&value).unwrap();
+        let tampered = serde_json::to_vec(&value)?;
         assert_eq!(
             decode_record(&tampered),
             Err(ScmOperationStoreError::Corrupt)
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn current_record_roundtrip_requires_explicit_anchored_provenance() {
-        let path = temp_path("history-v2-roundtrip");
-        let id = identity("op-history-v2-roundtrip");
+    fn current_record_roundtrip_requires_explicit_anchored_provenance() -> TestResult {
+        let path = temp_path("history-v2-roundtrip")?;
+        let id = identity("op-history-v2-roundtrip")?;
         let record = {
-            let store = ScmOperationStore::open(&path).unwrap();
-            let first = create(&store, id.clone());
+            let store = ScmOperationStore::open(&path)?;
+            let first = create(&store, id.clone())?;
             let coordinator = store.coordinator();
-            store
-                .advance_to(
-                    &coordinator,
-                    &id,
-                    first.revision(),
-                    first.checksum(),
-                    ScmOperationState::StopObserved,
-                )
-                .unwrap()
+            store.advance_to(
+                &coordinator,
+                &id,
+                first.revision(),
+                first.checksum(),
+                ScmOperationState::StopObserved,
+            )?
         };
-        let encoded = encode_record(&record).unwrap();
-        let envelope: ScmOperationRecordEnvelope = serde_json::from_slice(&encoded).unwrap();
+        let encoded = encode_record(&record)?;
+        let envelope: ScmOperationRecordEnvelope = serde_json::from_slice(&encoded)?;
         assert_eq!(envelope.version, SCM_RECORD_ENVELOPE_VERSION);
         assert_eq!(envelope.record.version, SCM_RECORD_VERSION);
         assert_eq!(
@@ -2212,73 +2249,77 @@ mod tests {
                 .iter()
                 .all(|link| is_sha256(&link.chain_sha256))
         );
-        assert_eq!(decode_record(&encoded).unwrap(), record);
+        assert_eq!(decode_record(&encoded)?, record);
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn downgraded_unanchored_v1_record_is_migration_input_not_current_truth() {
-        let path = temp_path("history-v1-migration");
-        let id = identity("op-history-v1-migration");
+    fn downgraded_unanchored_v1_record_is_migration_input_not_current_truth() -> TestResult {
+        let path = temp_path("history-v1-migration")?;
+        let id = identity("op-history-v1-migration")?;
         let record = {
-            let store = ScmOperationStore::open(&path).unwrap();
-            let first = create(&store, id.clone());
+            let store = ScmOperationStore::open(&path)?;
+            let first = create(&store, id.clone())?;
             let coordinator = store.coordinator();
-            store
-                .advance_to(
-                    &coordinator,
-                    &id,
-                    first.revision(),
-                    first.checksum(),
-                    ScmOperationState::StopObserved,
-                )
-                .unwrap()
+            store.advance_to(
+                &coordinator,
+                &id,
+                first.revision(),
+                first.checksum(),
+                ScmOperationState::StopObserved,
+            )?
         };
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&encode_record(&record).unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&encode_record(&record)?)?;
         value["magic"] = serde_json::json!(LEGACY_SCM_RECORD_ENVELOPE_MAGIC_V1);
         value["version"] = serde_json::json!(1);
-        let record_object = value["record"].as_object_mut().unwrap();
+        let record_object = value["record"]
+            .as_object_mut()
+            .ok_or_else(|| missing("record object missing"))?;
         record_object.insert(
             "magic".to_owned(),
             serde_json::json!(LEGACY_SCM_STORE_MAGIC_V1),
         );
         record_object.insert("version".to_owned(), serde_json::json!(1));
         assert!(record_object.remove("history_format").is_some());
-        for link in record_object["history"].as_array_mut().unwrap() {
+        for link in record_object["history"]
+            .as_array_mut()
+            .ok_or_else(|| missing("history array missing"))?
+        {
             assert!(
                 link.as_object_mut()
-                    .unwrap()
+                    .ok_or_else(|| missing("history link object missing"))?
                     .remove("chain_sha256")
                     .is_some()
             );
         }
         record_object.insert(
             "checksum".to_owned(),
-            serde_json::Value::String(legacy_v1_sha(&record)),
+            serde_json::Value::String(legacy_v1_sha(&record)?),
         );
-        let legacy_envelope = serde_json::to_vec(&value).unwrap();
+        let legacy_envelope = serde_json::to_vec(&value)?;
         assert_eq!(
             decode_record(&legacy_envelope),
             Err(ScmOperationStoreError::Legacy { version: 1 })
         );
 
-        let legacy_record = serde_json::to_vec(&value["record"]).unwrap();
+        let legacy_record = serde_json::to_vec(&value["record"])?;
         assert_eq!(
             decode_record(&legacy_record),
             Err(ScmOperationStoreError::Legacy { version: 1 })
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn coordinator_is_bound_to_its_store() {
-        let path = temp_path("owner-a");
-        let other_path = temp_path("owner-b");
-        let store = ScmOperationStore::open(&path).unwrap();
-        let other = ScmOperationStore::open(&other_path).unwrap();
-        let id = identity("op-owner");
-        let record = create(&store, id.clone());
+    fn coordinator_is_bound_to_its_store() -> TestResult {
+        let path = temp_path("owner-a")?;
+        let other_path = temp_path("owner-b")?;
+        let store = ScmOperationStore::open(&path)?;
+        let other = ScmOperationStore::open(&other_path)?;
+        let id = identity("op-owner")?;
+        let record = create(&store, id.clone())?;
         let coordinator = store.coordinator();
         assert_eq!(
             other.advance_to(
@@ -2292,15 +2333,16 @@ mod tests {
         );
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(other_path);
+        Ok(())
     }
 
     #[test]
-    fn create_requires_the_store_bound_coordinator() {
-        let path = temp_path("create-owner-a");
-        let other_path = temp_path("create-owner-b");
-        let store = ScmOperationStore::open(&path).unwrap();
-        let other = ScmOperationStore::open(&other_path).unwrap();
-        let id = identity("op-create-owner");
+    fn create_requires_the_store_bound_coordinator() -> TestResult {
+        let path = temp_path("create-owner-a")?;
+        let other_path = temp_path("create-owner-b")?;
+        let store = ScmOperationStore::open(&path)?;
+        let other = ScmOperationStore::open(&other_path)?;
+        let id = identity("op-create-owner")?;
         let other_coordinator = other.coordinator();
         assert_eq!(
             store.create_operation(&other_coordinator, id.clone()),
@@ -2310,27 +2352,32 @@ mod tests {
         assert!(store.create_operation(&coordinator, id).is_ok());
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(other_path);
+        Ok(())
     }
 
     #[test]
-    fn record_envelope_rejects_unversioned_legacy_payload() {
-        let path = temp_path("record-envelope");
-        let id = identity("op-record-envelope");
+    fn record_envelope_rejects_unversioned_legacy_payload() -> TestResult {
+        let path = temp_path("record-envelope")?;
+        let id = identity("op-record-envelope")?;
         {
-            let store = ScmOperationStore::open(&path).unwrap();
-            create(&store, id.clone());
+            let store = ScmOperationStore::open(&path)?;
+            create(&store, id.clone())?;
         }
         {
-            let database = Database::open(&path).unwrap();
-            let write = database.begin_write().unwrap();
+            let database = Database::open(&path)?;
+            let write = database.begin_write()?;
             {
-                let mut operations = write.open_table(OPS_TABLE).unwrap();
+                let mut operations = write.open_table(OPS_TABLE)?;
                 let envelope: ScmOperationRecordEnvelope = serde_json::from_slice(
-                    operations.get(id.key().as_str()).unwrap().unwrap().value(),
-                )
-                .unwrap();
-                let mut legacy = serde_json::to_value(&envelope.record).unwrap();
-                let legacy_object = legacy.as_object_mut().unwrap();
+                    operations
+                        .get(id.key().as_str())?
+                        .ok_or_else(|| missing("operation record missing"))?
+                        .value(),
+                )?;
+                let mut legacy = serde_json::to_value(&envelope.record)?;
+                let legacy_object = legacy
+                    .as_object_mut()
+                    .ok_or_else(|| missing("legacy record object missing"))?;
                 legacy_object.insert(
                     "magic".to_owned(),
                     serde_json::json!(LEGACY_SCM_STORE_MAGIC_V1),
@@ -2339,21 +2386,23 @@ mod tests {
                 assert!(legacy_object.remove("history_format").is_some());
                 legacy_object.insert(
                     "checksum".to_owned(),
-                    serde_json::Value::String(legacy_v1_sha(&envelope.record)),
+                    serde_json::Value::String(legacy_v1_sha(&envelope.record)?),
                 );
-                let bytes = serde_json::to_vec(&legacy).unwrap();
-                operations
-                    .insert(id.key().as_str(), bytes.as_slice())
-                    .unwrap();
+                let bytes = serde_json::to_vec(&legacy)?;
+                operations.insert(id.key().as_str(), bytes.as_slice())?;
             }
-            write.commit().unwrap();
+            write.commit()?;
         }
-        let store = ScmOperationStore::open_existing(&path).unwrap();
+        let store = ScmOperationStore::open_existing(&path)?;
         assert_eq!(
-            store.query_operation(&id).unwrap_err(),
+            store
+                .query_operation(&id)
+                .err()
+                .ok_or_else(|| missing("expected legacy query error"))?,
             ScmOperationStoreError::Legacy { version: 1 }
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]

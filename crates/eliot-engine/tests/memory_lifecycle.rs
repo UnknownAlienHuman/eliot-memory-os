@@ -495,7 +495,7 @@ async fn lock_tests() -> TestResult<TestLock> {
         {
             Ok(_file) => return Ok(TestLock { lock_path }),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                if started.elapsed() > Duration::from_secs(600) {
+                if started.elapsed() > Duration::from_mins(10) {
                     return Err("timed out waiting for shared DB test lock".into());
                 }
                 sleep(Duration::from_millis(50)).await;
@@ -529,7 +529,7 @@ async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
         {
             Ok(file) => break file,
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                if started.elapsed() > Duration::from_secs(600) {
+                if started.elapsed() > Duration::from_mins(10) {
                     return Err("timed out waiting for migration lock".into());
                 }
                 sleep(Duration::from_millis(50)).await;

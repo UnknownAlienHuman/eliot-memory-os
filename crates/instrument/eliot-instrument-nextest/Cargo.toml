@@ -7,9 +7,9 @@ license = "MIT"
 description = "Provider-neutral nextest instrumentation adapter"
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-instrument-api = { path = "../eliot-instrument-api" }
-eliot-process = { path = "../../kernel/eliot-process" }
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-instrument-api = { path = "../eliot-instrument-api", version = "0.1.0" }
+eliot-process = { path = "../../kernel/eliot-process", version = "0.1.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 thiserror = "2.0.18"

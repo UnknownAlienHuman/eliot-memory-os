@@ -7,6 +7,7 @@ license.workspace = true
 description = "ELIOT canonical generated CLI catalogue and thin client contracts"
 
 [dependencies]
+eliot-bootstrap.workspace = true
 eliot-contracts.workspace = true
 eliot-observation-contracts.workspace = true
 eliot-ipc.workspace = true

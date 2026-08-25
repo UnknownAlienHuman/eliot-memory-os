@@ -308,7 +308,7 @@ async fn main() {
                     break;
                 }
                 result = front_door.wait_for_authenticated_client(
-                    std::time::Duration::from_secs(86_400),
+                    std::time::Duration::from_hours(24),
                     &principal,
                 ) => {
                     if let Err(error) = result {

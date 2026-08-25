@@ -7,6 +7,7 @@ license.workspace = true
 description = "ELIOT D0 pure bootstrap snapshot, rule, and brief compilers"
 
 [dependencies]
+eliot-agent-api.workspace = true
 eliot-contracts.workspace = true
 eliot-protocol.workspace = true
 eliot-rules.workspace = true

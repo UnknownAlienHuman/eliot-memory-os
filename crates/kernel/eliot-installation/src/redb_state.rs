@@ -271,7 +271,7 @@ impl RedbInstallationTransactionStore {
     ///
     /// This is the only public read boundary that promotes a publication row
     /// to authoritative materialized state. It reuses the central live
-    /// verifier, including sealed WinTrust verification of all six executable
+    /// verifier, including sealed `WinTrust` verification of all six executable
     /// identities and hashes.
     ///
     /// # Errors
@@ -1384,6 +1384,10 @@ fn insert_planned(
         .map_err(|error| InstallationError::Platform(error.to_string()))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "W3-02 will extract the publication journal capability cell"
+)]
 fn validate_publication_journal(
     journal: &SourceBundlePublicationJournal,
 ) -> Result<(), InstallationError> {
@@ -2275,6 +2279,10 @@ mod tests {
         ))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "W3-01 will extract the installation test surface"
+    )]
     fn publication_journal_fixture(
         output_bundle: &std::path::Path,
     ) -> SourceBundlePublicationJournal {
@@ -2529,6 +2537,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "W3-01 will extract the installation test surface"
+    )]
     fn source_publication_journal_is_readback_bound_and_replay_safe() {
         let directory = std::env::temp_dir().join(format!(
             "eliot-installation-source-publication-journal-{}",

@@ -1,0 +1,198 @@
+{
+  "schema_version": "eliot-external-audit-result-v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "provider_id": "openrouter",
+  "model_id": "stealth/ox-alpha",
+  "agent_profile": "plan",
+  "session_id": "ses_fccfbeaf9ffeaDOd0YEWApllhB",
+  "observed_source_revision": "d40a0a1e03f8a5afabffb669f4a6acfb6ea848f0",
+  "observed_worktree_state": "DIRTY_W0_CONCURRENT",
+  "retry_of": "swarm/results/W0-06-router.invalid.json",
+  "result": {
+    "work_item_id": "W0-06-independent",
+    "disposition": "CONTRACT_CHALLENGE",
+    "contradictions": [
+      {
+        "id": "caller-owned-rule-catalogue",
+        "claim": "The typed seed carries the entire RuleCatalogue and ReasonDirectiveRegistry as caller-supplied bytes; validation covers internal shape, canonical entry order, and self-digest plus a normative_pair string equality against a snapshot whose pair identity is a hardcoded constant, but nothing binds catalogue content to the canonical Implementation pair or the docs/normative projection that W0-04 produced; the doc comment asserts provider ownership that no mechanism attests",
+        "anchors": [
+          "crates/foundation/eliot-bootstrap/src/lib.rs:603-634 BootstrapBriefSeed.rule_source",
+          "crates/foundation/eliot-bootstrap/src/lib.rs:473-483 BootstrapRuleSource fields",
+          "crates/foundation/eliot-bootstrap/src/lib.rs:548-578 compile_bootstrap_rule_catalogue validates shape and digest only",
+          "crates/foundation/eliot-bootstrap/src/lib.rs:873-879 sole cross-check is pair identity equality",
+          "crates/foundation/eliot-bootstrap/src/capture.rs:36-45 current_normative_pair returns three hardcoded SHA-256 strings"
+        ],
+        "severity": "high"
+      },
+      {
+        "id": "contradictory-coverage-dispositions",
+        "claim": "One emitted artifact carries two conflicting dispositions for every hard rule: BootstrapCoverage includes all HardBoundary, Contract, and Guardrail entries by class, while NormativeCoverageManifest sets included_rule_bindings empty and marks every catalogue entry excluded with one lexicographically-minimum boilerplate reason stating the seed supplied no rule selection; the manifest validator enforces one-disposition-per-rule only inside the manifest, so it cannot detect the cross-field conflict; this inverts the required silence-is-not-permission property into silence dressed as coverage",
+        "anchors": [
+          "crates/foundation/eliot-bootstrap/src/lib.rs:788-806 class-based included_rule_ids",
+          "crates/foundation/eliot-bootstrap/src/lib.rs:807-827 excluded remainder",
+          "crates/foundation/eliot-bootstrap/src/lib.rs:933-971 manifest compiles empty inclusions and blanket exclusions, reason text at line 962",
+          "crates/foundation/eliot-bootstrap/src/lib.rs:891-898 both fields assembled into one BootstrapBriefArtifact",
+          "crates/foundation/eliot-rules/src/lib.rs:530-571 validate_against scope limited to intra-manifest uniqueness"
+        ],
+        "severity": "high"
+      },
+      {
+        "id": "missing-append-only-drafts",
+        "claim": "Canonical I17.2 prescribes that eliot bootstrap brief write content-addressed append-only BootstrapFailureDraft and BootstrapImprovementDraft artifacts under the repository or external audit evidence root carrying source identity, owner, discriminator, and import disposition; neither type exists anywhere in the tree and the Brief handler performs no filesystem write, printing to stdout only, with no output-path argument",
+        "anchors": [
+          "C:/Development/Rust/docs/ELIOT Arhitecture/ELIOT_IMPLEMENTATION.md:16281",
+          "repo-wide rg for BootstrapFailureDraft and BootstrapImprovementDraft returned zero matches in rust sources",
+          "bins/eliot/src/main.rs:304-312 Brief takes only work_unit",
+          "bins/eliot/src/main.rs:2658-2674 stdout println is the sole emission"
+        ],
+        "severity": "high"
+      },
+      {
+        "id": "implicit-cwd-repository-root",
+        "claim": "The Brief handler derives repository_root from std::env::current_dir, so identical seeds bind different evidence or fail depending on the invocation directory; the sibling system snapshot command instead requires an explicit absolute repo_root argument and capture rejects non-absolute roots and non-git-root mismatches, making the two lanes of the same D0 toolset inconsistent with each other and with local-CI parity",
+        "anchors": [
+          "bins/eliot/src/main.rs:2665 current_dir call",
+          "bins/eliot/src/main.rs:295-300 SnapshotCommand explicit absolute repo_root and output",
+          "crates/foundation/eliot-bootstrap/src/capture.rs:154-173 absolute and git-root enforcement",
+          "ELIOT_IMPLEMENTATION.md lines 17520-17531 I18.21 parity requirements"
+        ],
+        "severity": "medium"
+      },
+      {
+        "id": "untyped-exit-behavior",
+        "claim": "The bootstrap lane flattens the typed BootstrapCompileError through error.to_string into anyhow, always returns exit code zero on success, and lets failures fall out through the generic anyhow path as unstructured stderr with default exit status one; other lanes in the same binary define typed exit constants and machine-readable JSON error envelopes, and even the crate own ContractChallenge variant becomes indistinguishable from any string at the process boundary",
+        "anchors": [
+          "bins/eliot/src/main.rs:2669 error.to_string erasure",
+          "bins/eliot/src/main.rs:2671 unconditional Ok zero",
+          "bins/eliot/src/main.rs:321-333 main join and process exit path",
+          "bins/eliot/src/main.rs:50-52 INVALID_REQUEST_EXIT 2, FRONT_DOOR_CLOSED_EXIT 69, UNKNOWN_OUTCOME_EXIT 75",
+          "bins/eliot/src/main.rs:2744-2787 write_json_error envelope pattern used elsewhere",
+          "crates/foundation/eliot-bootstrap/src/lib.rs:943-946 ContractChallenge variant exists but is erased"
+        ],
+        "severity": "medium"
+      },
+      {
+        "id": "governed-surface-divergence",
+        "claim": "The governed catalogue still declares bootstrap brief as PlanGap blocked on A-06 and eliot-mcp, mapping requests to typed Unavailable results, while the clap subcommand executes the compiled handler directly without consulting CommandSpec availability; recovery step three, flipping the spec Admitted the way Snapshot was flipped, was not performed, and the spec usage text still says file-or-id although the parser accepts only absolute files",
+        "anchors": [
+          "crates/surfaces/eliot-cli/src/lib.rs:1038-1051 PlanGap spec retained",
+          "crates/surfaces/eliot-cli/src/lib.rs:1040 usage text file-or-id versus bins/eliot/src/main.rs:308-310 absolute_path value_parser",
+          "bins/eliot/src/main.rs:79-83 and 338-348 direct clap dispatch bypassing catalogue availability",
+          "docs/tasks/RECOVERY_PROGRAM_v1.md:329-338 four-step scope including step three flip"
+        ],
+        "severity": "high"
+      }
+    ],
+    "required_owner_decisions": [
+      {
+        "decision": "Bind rule_source provenance to the W0-04 projection: require catalogue and registry digests to match docs/normative projection-manifest entries or a signed provider artifact bound to the hardcoded pair hashes; until decided, the seed field must fail closed rather than accept arbitrary catalogue bytes"
+      },
+      {
+        "decision": "Name the single disposition authority: either BootstrapCoverage derives from NormativeCoverageManifest or vice versa; forbid divergent included sets inside one artifact"
+      },
+      {
+        "decision": "Assign drafts ownership per I17.2 line 16281: which component writes BootstrapFailureDraft and BootstrapImprovementDraft, the exact evidence root policy, content-address naming, and the future import-or-reject receipt path"
+      },
+      {
+        "decision": "Require explicit absolute repo_root for brief, matching the snapshot lane, or justify cwd discovery as a recorded profile dependency under I18.21"
+      },
+      {
+        "decision": "Extend the exit taxonomy: distinct nonzero codes plus write_json_error envelopes for ContractChallenge, SourceUnavailable, and DigestMismatch classes on the bootstrap lane"
+      },
+      {
+        "decision": "Complete recovery step three: flip CommandId::BootstrapBrief to Admitted only after the above land, correcting usage text to absolute-file semantics"
+      }
+    ],
+    "smallest_safe_next_step": "Pure-library change confined to crates/foundation/eliot-bootstrap/src/lib.rs: make compile_normative_coverage_manifest derive included_rule_bindings and excluded_with_reason from the same class-based selection already computed in compile_bootstrap_brief at lines 788-827, keeping registry-backed BindingReason codes for exclusions, then add one cross-artifact assertion in compile_bootstrap_brief_seed that no rule id appears both included in the brief and excluded in the manifest; no new IO, no CLI signature change, immediately removes the internal contradiction and creates the regression oracle for everything else.",
+    "required_tests": [
+      {
+        "name": "cross_artifact_disposition_consistency",
+        "shape": "compile any seed whose catalogue contains a HardBoundary entry; assert the id appears in coverage_manifest.included_rule_bindings and absent from excluded_with_reason; must fail on current HEAD construction"
+      },
+      {
+        "name": "catalogue_binding_falsifier",
+        "shape": "seed asserting the correct hardcoded pair identity but carrying a foreign fabricated catalogue must fail closed once provenance binding lands; record current accept behavior as the documented pre-fix baseline"
+      },
+      {
+        "name": "cwd_independence",
+        "shape": "identical seed and repository captured from two different process working directories must produce byte-identical artifacts after explicit repo_root lands; today output differs or errors by cwd"
+      },
+      {
+        "name": "bootstrap_exit_taxonomy",
+        "shape": "induce BootstrapCompileError ContractChallenge; assert distinct nonzero exit code and machine-readable envelope on stderr, never generic exit one"
+      },
+      {
+        "name": "draft_append_only_publication",
+        "shape": "second brief emission targeting an existing draft destination must fail no-clobber; reuse the StagedSnapshotArtifact hard-link pattern from capture.rs lines 270-331"
+      }
+    ],
+    "evidence_lineage": {
+      "read_only_commands": [
+        [
+          "rg",
+          "-n",
+          "--no-heading",
+          "bootstrap brief|NormativeCoverageManifest|work-unit|work_unit",
+          "crates",
+          "bins"
+        ],
+        [
+          "rg",
+          "-n",
+          "--no-heading",
+          "BootstrapFailureDraft|BootstrapImprovementDraft",
+          "."
+        ],
+        [
+          "rg",
+          "-n",
+          "fn run_bootstrap|fn load_input|fn absolute_path",
+          "bins/eliot/src/main.rs"
+        ],
+        [
+          "rg",
+          "-n",
+          "write_json_error|_EXIT",
+          "bins/eliot/src/main.rs"
+        ],
+        [
+          "rg",
+          "-n",
+          "I2.16|I17.2 heading scan",
+          "authority implementation doc"
+        ],
+        [
+          "rg",
+          "-n",
+          "-C1",
+          "W0-06",
+          "docs/tasks/RECOVERY_PROGRAM_v1.md"
+        ]
+      ],
+      "file_reads": [
+        "bins/eliot/src/main.rs lines 60-129, 295-349, 2600-2684",
+        "crates/foundation/eliot-bootstrap/src/lib.rs lines 1-130, 430-559, 560-734, 735-914, 915-1024",
+        "crates/foundation/eliot-bootstrap/src/capture.rs full",
+        "crates/foundation/eliot-rules/src/lib.rs lines 400-613",
+        "crates/surfaces/eliot-cli/src/lib.rs lines 1028-1072",
+        "crates/surfaces/eliot-cli/tests/cli_contract.rs lines 140-219",
+        "ELIOT_IMPLEMENTATION.md I17.2 lines 16246-16320",
+        "docs/tasks/RECOVERY_PROGRAM_v1.md lines 173-176, 298-346, 688-691, 763-766"
+      ],
+      "excluded": [
+        "no cargo execution per instruction",
+        "no edits or git mutations",
+        "swarm ledgers and prior session outputs not relied upon"
+      ]
+    },
+    "proof_ceiling": "Read-only review establishes source text and structural facts only: compilation health of the touched crates, actual behavior of executed invocations, and whether any operator has ever run brief against a real seed are unverified because execution was forbidden; equality between the hardcoded pair hashes in capture.rs and the external authority pair under C:/Development/Rust/docs was not recomputed; the catalogue-fabrication acceptance claim rests on code reading of the validation path rather than a reproduced exploit; and given concurrent W0-wave edits observed earlier in this working tree, every anchor is valid for the read moment only, so re-run the two discriminators, the repo-wide rg for BootstrapFailureDraft and the lib.rs line 788 versus line 947 disposition comparison, immediately before acting on this challenge."
+  },
+  "integration_disposition": {
+    "accepted_findings": [
+      "Independent OpenRouter audit agrees that current admission is a ContractChallenge.",
+      "The rejected product candidate cannot be used as acceptance evidence."
+    ],
+    "binding_root_decision": "swarm/challenges/W0-06-BOOTSTRAP-BRIEF-ADMISSION.md",
+    "proof_ceiling": "read-only external audit; no admission or runtime proof"
+  }
+}

@@ -372,26 +372,26 @@ fn unique_process_id(matches: &[u32]) -> Result<u32, TcpListenerOwnerError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-
     use super::*;
 
     #[test]
-    fn endpoint_requires_exact_localhost_and_nonzero_port() {
-        assert!(validate_endpoint("127.0.0.1:1".parse().unwrap()).is_ok());
-        assert!(validate_endpoint("[::1]:1".parse().unwrap()).is_ok());
+    fn endpoint_requires_exact_localhost_and_nonzero_port() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert!(validate_endpoint("127.0.0.1:1".parse()?).is_ok());
+        assert!(validate_endpoint("[::1]:1".parse()?).is_ok());
         assert_eq!(
-            validate_endpoint("0.0.0.0:1".parse().unwrap()),
+            validate_endpoint("0.0.0.0:1".parse()?),
             Err(TcpListenerOwnerError::InvalidEndpoint)
         );
         assert_eq!(
-            validate_endpoint("127.0.0.2:1".parse().unwrap()),
+            validate_endpoint("127.0.0.2:1".parse()?),
             Err(TcpListenerOwnerError::InvalidEndpoint)
         );
         assert_eq!(
-            validate_endpoint("127.0.0.1:0".parse().unwrap()),
+            validate_endpoint("127.0.0.1:0".parse()?),
             Err(TcpListenerOwnerError::InvalidEndpoint)
         );
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -415,8 +415,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn malformed_row_count_and_port_fail_closed() {
-        let words = vec![usize::try_from(2_u32).unwrap()];
+    fn malformed_row_count_and_port_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let words = vec![usize::try_from(2_u32)?];
         assert!(matches!(
             decode_rows::<windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCPROW_OWNER_PID>(
                 &words,
@@ -430,10 +430,14 @@ mod tests {
             Err(TcpListenerOwnerError::MalformedTable)
         );
         assert_eq!(decode_port(0), Err(TcpListenerOwnerError::MalformedTable));
+        Ok(())
     }
 
     #[cfg(windows)]
-    fn constructed_table<Row: Copy>(rows: &[Row], row_offset: usize) -> (Vec<usize>, usize) {
+    fn constructed_table<Row: Copy>(
+        rows: &[Row],
+        row_offset: usize,
+    ) -> Result<(Vec<usize>, usize), std::num::TryFromIntError> {
         let byte_len = row_offset + std::mem::size_of_val(rows);
         let word_size = std::mem::size_of::<usize>();
         let word_count = byte_len.div_ceil(word_size);
@@ -442,7 +446,7 @@ mod tests {
         // SAFETY: the allocation is word-aligned and sized for the count,
         // explicit table padding, and all complete rows written below.
         unsafe {
-            std::ptr::write_unaligned(base.cast::<u32>(), u32::try_from(rows.len()).unwrap());
+            std::ptr::write_unaligned(base.cast::<u32>(), u32::try_from(rows.len())?);
             for (index, row) in rows.iter().enumerate() {
                 std::ptr::write_unaligned(
                     base.add(row_offset + index * std::mem::size_of::<Row>())
@@ -451,7 +455,7 @@ mod tests {
                 );
             }
         }
-        (words, byte_len)
+        Ok((words, byte_len))
     }
 
     #[cfg(windows)]
@@ -459,23 +463,27 @@ mod tests {
         address: Ipv4Addr,
         port: u16,
         process_id: u32,
-    ) -> windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCPROW_OWNER_PID {
+    ) -> Result<
+        windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCPROW_OWNER_PID,
+        std::num::TryFromIntError,
+    > {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             MIB_TCP_STATE_LISTEN, MIB_TCPROW_OWNER_PID,
         };
         // SAFETY: this Windows POD table row permits all-zero initialization;
         // every field used by the selector is assigned immediately below.
         let mut row: MIB_TCPROW_OWNER_PID = unsafe { std::mem::zeroed() };
-        row.dwState = u32::try_from(MIB_TCP_STATE_LISTEN).unwrap();
+        row.dwState = u32::try_from(MIB_TCP_STATE_LISTEN)?;
         row.dwLocalAddr = u32::from(address).to_be();
         row.dwLocalPort = u32::from(port.to_be());
         row.dwOwningPid = process_id;
-        row
+        Ok(row)
     }
 
     #[cfg(windows)]
     #[test]
-    fn constructed_ipv4_tables_cover_padding_endian_wildcard_duplicates_and_pid_zero() {
+    fn constructed_ipv4_tables_cover_padding_endian_wildcard_duplicates_and_pid_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
         };
@@ -484,36 +492,38 @@ mod tests {
         let port = 0x1234;
         let row_offset = std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table);
         let rows = [
-            ipv4_row(Ipv4Addr::UNSPECIFIED, port, 8),
-            ipv4_row(address, port, 41),
+            ipv4_row(Ipv4Addr::UNSPECIFIED, port, 8)?,
+            ipv4_row(address, port, 41)?,
         ];
-        let (words, byte_len) = constructed_table(&rows, row_offset);
-        let decoded = decode_rows::<MIB_TCPROW_OWNER_PID>(&words, byte_len, row_offset).unwrap();
+        let (words, byte_len) = constructed_table(&rows, row_offset)?;
+        let decoded = decode_rows::<MIB_TCPROW_OWNER_PID>(&words, byte_len, row_offset)?;
         assert_eq!(decoded.len(), 2);
         assert_eq!(select_ipv4_owner(&decoded, address, port), Ok(41));
         assert_eq!(decode_port(decoded[1].dwLocalPort), Ok(port));
 
-        let duplicate = [ipv4_row(address, port, 41), ipv4_row(address, port, 41)];
+        let duplicate = [ipv4_row(address, port, 41)?, ipv4_row(address, port, 41)?];
         assert_eq!(
             select_ipv4_owner(&duplicate, address, port),
             Err(TcpListenerOwnerError::Ambiguous)
         );
         assert_eq!(
-            select_ipv4_owner(&[ipv4_row(address, port, 0)], address, port),
+            select_ipv4_owner(&[ipv4_row(address, port, 0)?], address, port),
             Err(TcpListenerOwnerError::MalformedTable)
         );
 
-        let mut wrong_endian = ipv4_row(address, port, 41);
+        let mut wrong_endian = ipv4_row(address, port, 41)?;
         wrong_endian.dwLocalPort = u32::from(port);
         assert_eq!(
             select_ipv4_owner(&[wrong_endian], address, port),
             Err(TcpListenerOwnerError::Missing)
         );
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn constructed_ipv6_table_preserves_alignment_padding_and_scope() {
+    fn constructed_ipv6_table_preserves_alignment_padding_and_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             MIB_TCP_STATE_LISTEN, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
         };
@@ -523,11 +533,11 @@ mod tests {
         let mut row: MIB_TCP6ROW_OWNER_PID = unsafe { std::mem::zeroed() };
         row.ucLocalAddr = Ipv6Addr::LOCALHOST.octets();
         row.dwLocalPort = u32::from(0x2345_u16.to_be());
-        row.dwState = u32::try_from(MIB_TCP_STATE_LISTEN).unwrap();
+        row.dwState = u32::try_from(MIB_TCP_STATE_LISTEN)?;
         row.dwOwningPid = 51;
         let row_offset = std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table);
-        let (words, byte_len) = constructed_table(&[row], row_offset);
-        let decoded = decode_rows::<MIB_TCP6ROW_OWNER_PID>(&words, byte_len, row_offset).unwrap();
+        let (words, byte_len) = constructed_table(&[row], row_offset)?;
+        let decoded = decode_rows::<MIB_TCP6ROW_OWNER_PID>(&words, byte_len, row_offset)?;
         assert_eq!(
             select_ipv6_owner(&decoded, Ipv6Addr::LOCALHOST, 0x2345),
             Ok(51)
@@ -538,14 +548,17 @@ mod tests {
             select_ipv6_owner(&[scoped], Ipv6Addr::LOCALHOST, 0x2345),
             Err(TcpListenerOwnerError::Missing)
         );
+        Ok(())
     }
 
     #[cfg(windows)]
-    fn assert_current_process_owns(listener: &std::net::TcpListener) {
+    fn assert_current_process_owns(
+        listener: &std::net::TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use std::thread::sleep;
         use std::time::{Duration, Instant};
 
-        let endpoint = listener.local_addr().unwrap();
+        let endpoint = listener.local_addr()?;
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             match observe_loopback_tcp_listener_owner(endpoint) {
@@ -560,19 +573,24 @@ mod tests {
                 outcome => panic!("listener owner observation failed: {outcome:?}"),
             }
         }
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn current_process_owns_a_bounded_real_ipv4_loopback_listener() {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        assert_current_process_owns(&listener);
+    fn current_process_owns_a_bounded_real_ipv4_loopback_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        assert_current_process_owns(&listener)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn current_process_owns_a_bounded_real_ipv6_loopback_listener() {
-        let listener = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
-        assert_current_process_owns(&listener);
+    fn current_process_owns_a_bounded_real_ipv6_loopback_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0))?;
+        assert_current_process_owns(&listener)?;
+        Ok(())
     }
 }

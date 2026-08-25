@@ -53,5 +53,24 @@ Root execution rule:
 - rerun focused and then workspace Clippy after every bounded lane;
 - treat every count as revision-bound evidence, not as a timeless requirement.
 
-The inheritance deviation is accepted; W0-02 implementation remains open until
-the resulting effective policy is warning-free.
+## Closure evidence
+
+The inheritance deviation remains accepted, and the implementation condition
+is now satisfied locally:
+
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` passed on
+  the current recovery worktree;
+- safe packages inherit `[lints] workspace = true`;
+- the five intentional FFI packages duplicate the exact workspace Clippy
+  table and add only their minimal Rust unsafe exception;
+- `scripts/verify-lint-policy.ps1` independently compares those five Clippy
+  tables with `[workspace.lints.clippy]`, rejects any extra unsafe-exception
+  package, and checks the six safe packages' exact workspace inheritance;
+- `scripts/verify.ps1` profile `eliot-verify-v3` runs that drift guard before
+  compilation;
+- the Rust 1.89 `eliot-watchdog-core` package retains `Duration::from_secs(300)`
+  under one function-level, reasoned compatibility allow rather than raising
+  its MSRV or suppressing the lint crate-wide.
+
+This closes W0-02's local warning-free condition. Hosted CI remains a distinct
+receipt and is not inferred from the local pass.

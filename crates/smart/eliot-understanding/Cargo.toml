@@ -8,7 +8,7 @@ description = "ELIOT deterministic project-understanding and context synthesis o
 
 [dependencies]
 blake3.workspace = true
-eliot-context = { path = "../eliot-context" }
+eliot-context = { path = "../eliot-context", version = "0.1.0" }
 eliot-contracts.workspace = true
 schemars.workspace = true
 serde.workspace = true

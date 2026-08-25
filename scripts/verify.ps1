@@ -6,7 +6,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ProfileVersion = 'eliot-verify-v1'
+$ProfileVersion = 'eliot-verify-v3'
 
 function Fail([string] $Message) {
     throw "VERIFY_FAIL: $Message"
@@ -38,16 +38,31 @@ try {
     if (-not (Test-Path -LiteralPath $normativeVerifier -PathType Leaf)) {
         Fail 'normative verifier is missing'
     }
+    $lintPolicyVerifier = Join-Path $repoRoot 'scripts/verify-lint-policy.ps1'
+    if (-not (Test-Path -LiteralPath $lintPolicyVerifier -PathType Leaf)) {
+        Fail 'lint policy verifier is missing'
+    }
     $stuMeasure = Join-Path $repoRoot 'scripts/measure-stu.ps1'
     if (-not (Test-Path -LiteralPath $stuMeasure -PathType Leaf)) {
         Fail 'STU measurement script is missing'
+    }
+    $unimplementedGenerator = Join-Path $repoRoot 'scripts/gen-unimplemented.ps1'
+    if (-not (Test-Path -LiteralPath $unimplementedGenerator -PathType Leaf)) {
+        Fail 'unimplemented registry generator is missing'
+    }
+    $unimplementedVerifier = Join-Path $repoRoot 'scripts/verify-unimplemented.ps1'
+    if (-not (Test-Path -LiteralPath $unimplementedVerifier -PathType Leaf)) {
+        Fail 'independent unimplemented registry verifier is missing'
     }
 
     $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
     $steps = @(
         [pscustomobject]@{ Id = 'metadata'; Description = 'cargo metadata --locked --no-deps --format-version 1'; FilePath = 'cargo'; Arguments = @('metadata', '--locked', '--no-deps', '--format-version', '1'); SuppressOutput = $true },
+        [pscustomobject]@{ Id = 'lint-policy'; Description = 'workspace inheritance and intentional FFI lint-profile equality'; FilePath = $pwsh; Arguments = @('-NoProfile', '-File', $lintPolicyVerifier); SuppressOutput = $false },
         [pscustomobject]@{ Id = 'fmt'; Description = 'cargo fmt --all -- --check'; FilePath = 'cargo'; Arguments = @('fmt', '--all', '--', '--check'); SuppressOutput = $false },
         [pscustomobject]@{ Id = 'normative'; Description = 'scripts/verify-normative.ps1'; FilePath = $pwsh; Arguments = @('-NoProfile', '-File', $normativeVerifier); SuppressOutput = $false },
+        [pscustomobject]@{ Id = 'unimplemented-generated'; Description = 'generated docs/UNIMPLEMENTED.md matches tracked structured markers'; FilePath = $pwsh; Arguments = @('-NoProfile', '-File', $unimplementedGenerator, '-Check'); SuppressOutput = $false },
+        [pscustomobject]@{ Id = 'unimplemented-oracle'; Description = 'independent source-to-registry bijection'; FilePath = $pwsh; Arguments = @('-NoProfile', '-File', $unimplementedVerifier); SuppressOutput = $false },
         [pscustomobject]@{ Id = 'stu-evidence'; Description = 'provisional non-blocking STU observations for tracked Rust source'; FilePath = $pwsh; Arguments = @('-NoProfile', '-File', $stuMeasure); SuppressOutput = $false },
         [pscustomobject]@{ Id = 'workspace-check'; Description = 'cargo check --locked --workspace --all-targets'; FilePath = 'cargo'; Arguments = @('check', '--locked', '--workspace', '--all-targets'); SuppressOutput = $false },
         [pscustomobject]@{ Id = 'workspace-clippy'; Description = 'cargo clippy --locked --workspace --all-targets -- -D warnings'; FilePath = 'cargo'; Arguments = @('clippy', '--locked', '--workspace', '--all-targets', '--', '-D', 'warnings'); SuppressOutput = $false },

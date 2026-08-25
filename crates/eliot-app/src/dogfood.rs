@@ -25,7 +25,7 @@ use std::os::windows::process::CommandExt as _;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MANIFEST_VERSION: &str = "eliot-dogfood-l3-v1";
 const PROVIDER_KILL_SWITCH: &str = "ELIOT_DISABLE_REAL_PROVIDER";
-const DOGFOOD_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DOGFOOD_PROVIDER_TIMEOUT: Duration = Duration::from_mins(30);
 const DOGFOOD_PROVIDER_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const DOGFOOD_CODEX_ENABLED_TOOLS: &[&str] = &[
     "eliot_task_state",

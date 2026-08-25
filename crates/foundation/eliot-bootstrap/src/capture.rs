@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CurrentSystemEvidenceSnapshot, CurrentSystemEvidenceSource, EvidenceEvaluation, EvidenceRecord,
-    NormativePair, SourceProjection, compile_current_system_evidence_snapshot,
+    CurrentSystemEvidenceCompiler, CurrentSystemEvidenceSnapshot, CurrentSystemEvidenceSource,
+    EvidenceEvaluation, EvidenceRecord, NormativePair, SourceProjection,
 };
 
 const SNAPSHOT_TEMP_CREATE_ATTEMPTS: usize = 128;
@@ -38,8 +38,6 @@ pub fn current_normative_pair() -> NormativePair {
         architecture_sha256: "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
             .to_owned(),
         implementation_sha256: "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
-            .to_owned(),
-        runtime_sha256: "f4f7cc6040063549febece872039952901024c8a66ea2a79811ce49cac395b8a"
             .to_owned(),
     }
 }
@@ -65,7 +63,7 @@ pub struct SnapshotExecutionReceipt {
 impl SnapshotExecutionReceipt {
     fn new(snapshot: &CurrentSystemEvidenceSnapshot) -> Result<Self, CaptureError> {
         let mut receipt = Self {
-            schema_version: "eliot-current-system-evidence-receipt-v1".to_owned(),
+            schema_version: "eliot-current-system-evidence-receipt-v2".to_owned(),
             snapshot_sha256: snapshot.snapshot_sha256.clone(),
             repository_root: snapshot.selected_repository_root.clone(),
             source_head: snapshot.selected_source_head.clone(),
@@ -243,7 +241,7 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
             ],
         },
     );
-    let snapshot = compile_current_system_evidence_snapshot(source)
+    let snapshot = CurrentSystemEvidenceCompiler::compile(source)
         .map_err(|error| CaptureError::SnapshotValidation(error.to_string()))?;
     let receipt = SnapshotExecutionReceipt::new(&snapshot)?;
     let artifact = SnapshotExecutionArtifact { snapshot, receipt };
@@ -439,14 +437,36 @@ fn git_output<const N: usize>(
 }
 
 fn dirty_delta_binding(repository_root: &Path) -> Result<Option<String>, CaptureError> {
+    // Candidate drafts are outputs of the bootstrap compiler. Feeding those
+    // bytes back into its source snapshot would make repeated compilation
+    // self-referential and would hide tampering behind a new content address.
+    const DRAFT_EXCLUDE: &str = ":(exclude).eliot/evidence/bootstrap-drafts/**";
     let status = git_output(
         repository_root,
-        ["status", "--porcelain=v1", "--untracked-files=all"],
+        [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            ".",
+            DRAFT_EXCLUDE,
+        ],
     )?;
-    let diff = git_output(repository_root, ["diff", "--binary", "HEAD", "--"])?;
+    let diff = git_output(
+        repository_root,
+        ["diff", "--binary", "HEAD", "--", ".", DRAFT_EXCLUDE],
+    )?;
     let untracked_paths = git_output(
         repository_root,
-        ["ls-files", "--others", "--exclude-standard", "-z"],
+        [
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+            DRAFT_EXCLUDE,
+        ],
     )?;
     if status.is_empty() && diff.is_empty() && untracked_paths.is_empty() {
         return Ok(None);
@@ -483,6 +503,26 @@ fn same_path(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_normative_pair_contains_only_architecture_and_implementation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pair = current_normative_pair();
+        assert_eq!(
+            pair.architecture_sha256,
+            "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
+        );
+        assert_eq!(
+            pair.implementation_sha256,
+            "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
+        );
+        let value = serde_json::to_value(&pair)?;
+        let object = value.as_object().ok_or("normative pair is not an object")?;
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, ["architecture_sha256", "implementation_sha256"]);
+        Ok(())
+    }
 
     fn git(repo: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
         let output = Command::new("git")
@@ -590,6 +630,42 @@ mod tests {
         assert_eq!(first.snapshot.selected_source_head.len(), 40);
         assert!(first.snapshot.dirty_delta_artifact_ref.is_some());
         first.validate()?;
+        let _ = fs::remove_dir_all(repository_root);
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_draft_outputs_do_not_feed_back_into_source_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let repository_root = std::env::temp_dir().join(format!(
+            "eliot-snapshot-output-exclusion-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&repository_root)?;
+        git(&repository_root, &["init", "-q"])?;
+        git(&repository_root, &["config", "user.name", "eliot-test"])?;
+        git(
+            &repository_root,
+            &["config", "user.email", "eliot-test@example.invalid"],
+        )?;
+        fs::write(repository_root.join("tracked.txt"), "source\n")?;
+        git(&repository_root, &["add", "tracked.txt"])?;
+        git(
+            &repository_root,
+            &["-c", "commit.gpgSign=false", "commit", "-qm", "initial"],
+        )?;
+
+        let before = capture_snapshot(&repository_root)?;
+        let drafts = repository_root.join(".eliot/evidence/bootstrap-drafts");
+        fs::create_dir_all(&drafts)?;
+        fs::write(drafts.join("candidate.json"), "{\"candidate\":true}\n")?;
+        let after = capture_snapshot(&repository_root)?;
+        assert_eq!(before.snapshot, after.snapshot);
+        assert_eq!(before.receipt.dirty_delta_artifact_ref, None);
+        assert_eq!(after.receipt.dirty_delta_artifact_ref, None);
         let _ = fs::remove_dir_all(repository_root);
         Ok(())
     }

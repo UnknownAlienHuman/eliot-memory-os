@@ -44,6 +44,7 @@ use std::{
 };
 use tracing_subscriber::EnvFilter;
 
+mod bootstrap_draft;
 mod source_bundle_materializer;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -75,6 +76,11 @@ enum Command {
         #[command(subcommand)]
         command: SystemCommand,
     },
+    /// Compile a typed work-unit bootstrap brief and publish evidence only.
+    Bootstrap {
+        #[command(subcommand)]
+        command: BootstrapCommand,
+    },
     /// Inspect or validate the governed installation transaction surfaces.
     Installation {
         #[command(subcommand)]
@@ -88,6 +94,19 @@ enum Command {
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
     Ui,
+}
+
+#[derive(Debug, Subcommand)]
+enum BootstrapCommand {
+    /// Compile one brief from an existing `AgentWorkUnitBrief` seed.
+    Brief {
+        /// Absolute path to the typed `AgentWorkUnitBrief` JSON seed.
+        #[arg(long)]
+        work_unit: PathBuf,
+        /// Absolute repository root; never inferred from the current directory.
+        #[arg(long)]
+        repo_root: PathBuf,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -329,10 +348,36 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Command::System { command } => run_system(command),
+        Command::Bootstrap { command } => Ok(run_bootstrap(command)),
         Command::Installation { command } => run_installation(command),
         Command::Runtime { command } => run_runtime(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
+    }
+}
+
+fn run_bootstrap(command: BootstrapCommand) -> i32 {
+    match command {
+        BootstrapCommand::Brief {
+            work_unit,
+            repo_root,
+        } => match bootstrap_draft::execute(&work_unit, &repo_root) {
+            Ok(success) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "response": success.response,
+                        "draft_path": success.draft_path,
+                        "draft_sha256": success.draft_sha256,
+                    })
+                );
+                0
+            }
+            Err(error) => {
+                println!("{}", error.envelope());
+                error.exit_code()
+            }
+        },
     }
 }
 
@@ -1050,7 +1095,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
                     write_installation_error("INSTALLATION_PLAN_INVALID", &error.to_string());
                     return Ok(INVALID_REQUEST_EXIT);
                 }
-            };
+            }
             let value: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(value) => value,
                 Err(error) => {

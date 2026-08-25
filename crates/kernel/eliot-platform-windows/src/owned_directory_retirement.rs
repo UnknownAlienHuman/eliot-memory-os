@@ -326,6 +326,42 @@ fn observe_owned_directory_exact_inner(
 }
 
 #[cfg(windows)]
+fn retain_children_for_retirement(
+    expected_path: &Path,
+    expected_entries: &[OwnedDirectoryRetirementEntry],
+) -> Result<Vec<RetainedChild>, OwnedDirectoryRetirementError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let mut retained = Vec::with_capacity(expected_entries.len());
+    for entry in expected_entries {
+        let child_path = expected_path.join(&entry.file_name);
+        let mut file = open_file_for_delete(&child_path)?;
+        let observed_path = crate::final_windows_path_from_handle(&file)
+            .map_err(|_| OwnedDirectoryRetirementError::Io)?;
+        let identity = crate::file_identity_from_handle(&file)
+            .map_err(|_| OwnedDirectoryRetirementError::Io)?;
+        if !crate::windows_paths_equal(&observed_path, &child_path) || identity != entry.identity {
+            return Err(OwnedDirectoryRetirementError::IdentityMismatch);
+        }
+        let metadata = file
+            .metadata()
+            .map_err(|_| OwnedDirectoryRetirementError::Io)?;
+        if metadata.len() > 1024 * 1024 {
+            return Err(OwnedDirectoryRetirementError::ContentMismatch);
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        file.read_to_end(&mut bytes)
+            .map_err(|_| OwnedDirectoryRetirementError::Io)?;
+        if format!("{:x}", Sha256::digest(&bytes)) != entry.sha256 {
+            return Err(OwnedDirectoryRetirementError::ContentMismatch);
+        }
+        retained.push(RetainedChild { file, identity });
+    }
+    Ok(retained)
+}
+
+#[cfg(windows)]
 fn retire_owned_directory_exact_inner<BeforeDelete>(
     path: &Path,
     expected: &OwnedDirectoryRetirementPrecondition,
@@ -334,9 +370,6 @@ fn retire_owned_directory_exact_inner<BeforeDelete>(
 where
     BeforeDelete: FnOnce(),
 {
-    use sha2::{Digest as _, Sha256};
-    use std::io::Read as _;
-
     crate::validate_directory_publication_absolute(path).map_err(map_directory_error)?;
     let parent = path
         .parent()
@@ -383,31 +416,7 @@ where
         return Err(OwnedDirectoryRetirementError::UnexpectedEntry);
     }
 
-    let mut retained = Vec::with_capacity(expected_entries.len());
-    for entry in &expected_entries {
-        let child_path = expected_path.join(&entry.file_name);
-        let mut file = open_file_for_delete(&child_path)?;
-        let observed_path = crate::final_windows_path_from_handle(&file)
-            .map_err(|_| OwnedDirectoryRetirementError::Io)?;
-        let identity = crate::file_identity_from_handle(&file)
-            .map_err(|_| OwnedDirectoryRetirementError::Io)?;
-        if !crate::windows_paths_equal(&observed_path, &child_path) || identity != entry.identity {
-            return Err(OwnedDirectoryRetirementError::IdentityMismatch);
-        }
-        let metadata = file
-            .metadata()
-            .map_err(|_| OwnedDirectoryRetirementError::Io)?;
-        if metadata.len() > 1024 * 1024 {
-            return Err(OwnedDirectoryRetirementError::ContentMismatch);
-        }
-        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-        file.read_to_end(&mut bytes)
-            .map_err(|_| OwnedDirectoryRetirementError::Io)?;
-        if format!("{:x}", Sha256::digest(&bytes)) != entry.sha256 {
-            return Err(OwnedDirectoryRetirementError::ContentMismatch);
-        }
-        retained.push(RetainedChild { file, identity });
-    }
+    let retained = retain_children_for_retirement(&expected_path, &expected_entries)?;
     crate::verify_directory_publication_contour(&contour).map_err(map_directory_error)?;
     before_delete();
     if read_exact_child_names(&expected_path)? != expected_names {
@@ -653,68 +662,75 @@ mod tests {
     use super::*;
     use sha2::{Digest as _, Sha256};
 
-    fn identity(path: &Path) -> FileIdentity {
-        let file = open_file_for_delete(path).expect("retained file");
-        crate::file_identity_from_handle(&file).expect("file identity")
+    fn identity(path: &Path) -> Result<FileIdentity, Box<dyn std::error::Error>> {
+        let file = open_file_for_delete(path)?;
+        Ok(crate::file_identity_from_handle(&file)?)
     }
 
-    fn fixture() -> (std::path::PathBuf, OwnedDirectoryRetirementPrecondition) {
+    fn fixture() -> Result<
+        (std::path::PathBuf, OwnedDirectoryRetirementPrecondition),
+        Box<dyn std::error::Error>,
+    > {
         let root = std::env::temp_dir().join(format!(
             "eliot-owned-directory-retirement-{}-{}",
             std::process::id(),
             crate::unique_suffix()
         ));
-        std::fs::create_dir(&root).expect("fixture root");
+        std::fs::create_dir(&root)?;
         let destination = root.join("bundle");
-        let publication =
-            crate::OwnedDirectoryPublication::create(&destination).expect("prepare publication");
+        let publication = crate::OwnedDirectoryPublication::create(&destination)?;
         for (name, bytes) in [("a.json", b"a".as_slice()), ("b.json", b"b".as_slice())] {
-            std::fs::write(publication.temporary_path().join(name), bytes).expect("child write");
+            std::fs::write(publication.temporary_path().join(name), bytes)?;
         }
         let temporary_identity = publication.temporary_identity();
-        publication
-            .publish(temporary_identity)
-            .expect("publish bundle");
-        let directory = open_directory_for_delete(&destination).expect("retained directory");
-        let directory_identity =
-            crate::file_identity_from_handle(&directory).expect("directory identity");
+        let _ = publication.publish(temporary_identity)?;
+        let directory = open_directory_for_delete(&destination)?;
+        let directory_identity = crate::file_identity_from_handle(&directory)?;
         drop(directory);
         let entries = [("a.json", b"a".as_slice()), ("b.json", b"b".as_slice())]
             .into_iter()
-            .map(|(name, bytes)| OwnedDirectoryRetirementEntry {
-                file_name: name.to_owned(),
-                identity: identity(&destination.join(name)),
-                sha256: format!("{:x}", Sha256::digest(bytes)),
+            .map(|(name, bytes)| {
+                identity(&destination.join(name)).map(|file_identity| {
+                    OwnedDirectoryRetirementEntry {
+                        file_name: name.to_owned(),
+                        identity: file_identity,
+                        sha256: format!("{:x}", Sha256::digest(bytes)),
+                    }
+                })
             })
-            .collect();
-        (
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
             destination,
             OwnedDirectoryRetirementPrecondition {
                 directory_identity,
                 entries,
             },
-        )
+        ))
     }
 
     #[test]
-    fn exact_tree_is_retired_by_handle_identity() {
-        let (path, expected) = fixture();
-        let observed = observe_owned_directory_exact(&path, &["a.json", "b.json"], 64)
-            .expect("exact observation");
+    fn exact_tree_is_retired_by_handle_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let (path, expected) = fixture()?;
+        let observed = observe_owned_directory_exact(&path, &["a.json", "b.json"], 64)?;
         assert_eq!(observed.bytes("a.json"), Some(b"a".as_slice()));
         assert_eq!(observed.bytes("b.json"), Some(b"b".as_slice()));
         assert_eq!(observed.retirement_precondition(), expected);
         assert_eq!(
-            retire_owned_directory_exact(&path, &expected).expect("retirement"),
+            retire_owned_directory_exact(&path, &expected)?,
             OwnedDirectoryRetirementOutcome::Retired
         );
         assert!(!path.exists());
-        let _ = std::fs::remove_dir_all(path.parent().expect("fixture parent"));
+        std::fs::remove_dir_all(
+            path.parent()
+                .ok_or_else(|| std::io::Error::other("fixture parent missing"))?,
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn concurrent_child_substitution_is_blocked_and_extra_create_fails_precommit() {
-        let (path, expected) = fixture();
+    fn concurrent_child_substitution_is_blocked_and_extra_create_fails_precommit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (path, expected) = fixture()?;
         let child = path.join("a.json");
         let moved = path.join("a-moved.json");
         let intruder = path.join("intruder.json");
@@ -723,11 +739,18 @@ mod tests {
                 std::fs::rename(&child, &moved).is_err(),
                 "retained no-delete-sharing child must block substitution"
             );
-            std::fs::write(&intruder, b"intruder").expect("concurrent create");
+            assert!(
+                std::fs::write(&intruder, b"intruder").is_ok(),
+                "concurrent create"
+            );
         });
         assert_eq!(outcome, Err(OwnedDirectoryRetirementError::UnexpectedEntry));
-        assert_eq!(std::fs::read(child).expect("original child"), b"a");
+        assert_eq!(std::fs::read(child)?, b"a");
         assert!(intruder.exists());
-        let _ = std::fs::remove_dir_all(path.parent().expect("fixture parent"));
+        std::fs::remove_dir_all(
+            path.parent()
+                .ok_or_else(|| std::io::Error::other("fixture parent missing"))?,
+        )?;
+        Ok(())
     }
 }

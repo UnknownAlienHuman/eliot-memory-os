@@ -1,0 +1,37 @@
+{
+  "schema_version": "eliot.bootstrap-work-result.v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "work_item_id": "W0-07",
+  "structured_result": {
+    "disposition": "LOCAL_ACCEPTED",
+    "evidence_status": "ACCEPT",
+    "implementation": {
+      "manifest": "bins/eliot-watchdog/Cargo.toml",
+      "dependency": "eliot-platform-windows.workspace=true",
+      "normal_dependency": true,
+      "dev_dependency": true,
+      "test_support_feature_scope": "dev-dependency only",
+      "feature_declaration": "features=[\"test-support\"]"
+    },
+    "verification": {
+      "normal_tree": {
+        "command": "cargo tree -p eliot-watchdog -e normal",
+        "exit": 0,
+        "eliot_platform_windows_entries": 4,
+        "test_support_annotations": 0
+      },
+      "focused_clippy": {
+        "scope": "eliot-watchdog focused Clippy",
+        "flag": "-D warnings",
+        "result": "PASS"
+      },
+      "focused_tests": {
+        "scope": "eliot-watchdog focused tests",
+        "passed": 45,
+        "result": "PASS"
+      }
+    },
+    "proof_ceiling": "EVIDENCE_ONLY; focused dependency, Clippy, and test evidence; no hosted or terminal completion authority is claimed.",
+    "uncertainty": []
+  }
+}

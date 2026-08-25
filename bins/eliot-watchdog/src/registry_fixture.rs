@@ -15,16 +15,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
 use eliot_installation::{
-    CandidateManifest, InstallationEpoch, InstallationProfile, PlatformHandle,
-    RuntimeLaunchDescriptor, RuntimeStateRoots,
+    CandidateManifest, INSTALLATION_REGISTRY_WIRE_VERSION, InstallationEpoch, InstallationProfile,
+    PHASE_B_PENDING_MARKER, PHASE_B_PENDING_SCM_DIGEST, PlatformHandle, RuntimeLaunchDescriptor,
+    RuntimeStateRoots, phase_b_scm_selector,
 };
 use eliot_platform_windows::{
-    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
+    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
+    ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
     ELIOT_WATCHDOG_SERVICE_NAME, InstallerRootPrimitiveSpec, InstallerRootProfile, ServiceAccount,
     ServiceBootstrapArguments, ServiceRegistrationRequest, ServiceStartMode,
-    WindowsInstallerRootPrimitive, protected_program_data_root,
+    WindowsInstallerRootPrimitive, prepare_protected_directory,
+    test_support::{self, ProtectedRootOverride},
+    watchdog_service_security_descriptor_digest,
 };
 use redb::{Database, TableDefinition};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
@@ -36,6 +41,7 @@ static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 /// A unique protected per-installation Host root and its fixed registry file.
 pub struct RegistryFixture {
     program_data: PathBuf,
+    _protected_root_override: ProtectedRootOverride,
     host_root: PathBuf,
     registry_path: PathBuf,
     installation_key: String,
@@ -51,8 +57,6 @@ impl RegistryFixture {
     /// `ProtectedRuntimePathLease::open_existing_absolute`.
     #[must_use]
     pub fn new() -> Self {
-        let program_data = protected_program_data_root()
-            .unwrap_or_else(|error| panic!("ProgramData fixture root unavailable: {error}"));
         let unique = format!(
             "{}:{:?}:{}",
             std::process::id(),
@@ -62,14 +66,31 @@ impl RegistryFixture {
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
         );
         let installation_key = sha256_hex(unique.as_bytes());
+        let fixture_root = std::env::temp_dir().join(format!(
+            "eliot-watchdog-protected-root-{}-{}",
+            std::process::id(),
+            &installation_key[..16]
+        ));
+        std::fs::create_dir_all(&fixture_root).unwrap_or_else(|error| {
+            panic!(
+                "failed to create disposable protected fixture root {}: {error}",
+                fixture_root.display()
+            )
+        });
+        let protected_root_override = test_support::override_protected_root(&fixture_root);
+        let program_data = fixture_root;
+        let installation_root = program_data
+            .join("Eliot")
+            .join("installations")
+            .join(&installation_key);
         let host_root = program_data
             .join("Eliot")
             .join("installations")
             .join(&installation_key)
             .join("host");
-        std::fs::create_dir_all(&host_root).unwrap_or_else(|error| {
+        prepare_protected_directory(&host_root).unwrap_or_else(|error| {
             panic!(
-                "failed to create unique protected fixture parent {}: {error}",
+                "failed to provision unique protected fixture parent {}: {error}",
                 host_root.display()
             )
         });
@@ -105,12 +126,13 @@ impl RegistryFixture {
         let registry_path = host_root.join("installation-registry.redb");
         let root_spec = InstallerRootPrimitiveSpec {
             root: host_root.clone(),
-            installation_root: program_data.join("Eliot"),
+            installation_root,
             profile_anchor: program_data.clone(),
             profile: InstallerRootProfile::SystemService,
         };
         Self {
             program_data,
+            _protected_root_override: protected_root_override,
             host_root,
             registry_path,
             installation_key,
@@ -137,7 +159,7 @@ impl RegistryFixture {
         let descriptor_path = self.authority_descriptor_path(generation);
         ServiceBootstrapArguments::new(
             descriptor_path,
-            Self::digest(generation),
+            PHASE_B_PENDING_SCM_DIGEST,
             &self.installation_key,
             generation,
             std::iter::empty::<String>(),
@@ -335,7 +357,11 @@ impl RegistryFixture {
         pending_activation: Option<Value>,
     ) -> Value {
         json!({
-            "registry_wire_version": { "major": 4, "minor": 0, "patch": 0 },
+            "registry_wire_version": {
+                "major": INSTALLATION_REGISTRY_WIRE_VERSION.major,
+                "minor": INSTALLATION_REGISTRY_WIRE_VERSION.minor,
+                "patch": INSTALLATION_REGISTRY_WIRE_VERSION.patch,
+            },
             "revision": 1,
             "generations": generations,
             "service_registration_approvals": service_registration_approvals,
@@ -343,6 +369,7 @@ impl RegistryFixture {
             "last_known_good_generation": Value::Null,
             "pending_activation": pending_activation,
             "last_terminal_activation": Value::Null,
+            "active_phase_b_rebind": Value::Null,
         })
     }
 
@@ -434,9 +461,14 @@ impl RegistryFixture {
         } else {
             Self::digest(generation + 200)
         };
+        let descriptor_digest =
+            phase_b_scm_selector(&manifest.runtime_launch.authority_descriptor_digest)
+                .unwrap_or_else(|error| {
+                    panic!("select service bootstrap descriptor digest: {error}")
+                });
         let bootstrap = ServiceBootstrapArguments::new(
             PathBuf::from(manifest.runtime_launch.authority_descriptor_path.as_str()),
-            manifest.runtime_launch.authority_descriptor_digest.as_str(),
+            descriptor_digest.as_str(),
             manifest
                 .runtime_launch
                 .installation_epoch
@@ -465,6 +497,20 @@ impl RegistryFixture {
             bootstrap,
         )
         .unwrap_or_else(|error| panic!("invalid service approval request: {error}"));
+        let service_control_grant = if host {
+            Value::Null
+        } else {
+            let principal_sid = "S-1-5-80-1-2-3-4-5";
+            let security_descriptor_digest =
+                watchdog_service_security_descriptor_digest(principal_sid)
+                    .unwrap_or_else(|error| panic!("Watchdog control-grant fixture: {error}"));
+            json!({
+                "principal_service": ELIOT_HOST_SERVICE_NAME,
+                "principal_sid": principal_sid,
+                "access_mask": ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                "security_descriptor_digest": security_descriptor_digest,
+            })
+        };
         json!({
             "transaction_id": format!("transaction:{}", manifest.generation.as_str()),
             "generation": manifest.generation,
@@ -476,37 +522,32 @@ impl RegistryFixture {
             "automatic_start": true,
             "service_bootstrap": {
                 "descriptor_path": manifest.runtime_launch.authority_descriptor_path,
-                "descriptor_digest": manifest.runtime_launch.authority_descriptor_digest,
+                "descriptor_digest": descriptor_digest,
                 "installation_id": manifest.runtime_launch.installation_epoch.installation,
                 "plan_generation": generation,
                 "host_state_root": manifest.runtime_launch.runtime_state_roots.host_state_root,
             },
             "registration_nonce": nonce,
             "configuration_digest": request.expected_configuration_digest(),
+            "service_control_grant": service_control_grant,
         })
     }
 
     fn manifest(&self, generation: u64) -> CandidateManifest {
-        let roots = RuntimeStateRoots::derive_profiled(
-            InstallationProfile::SystemService,
-            PlatformHandle::new(self.program_data.to_string_lossy().into_owned())
-                .unwrap_or_else(|error| panic!("invalid ProgramData handle: {error}")),
-            &self.installation_key,
-        )
-        .unwrap_or_else(|error| panic!("derive fixture runtime roots: {error}"));
+        let roots = self.runtime_roots();
         let generation_handle = handle(format!("generation-{generation}"));
         let authority_descriptor_path = self.authority_descriptor_path(generation);
         let config_path = self
             .artifact_root
             .join(format!("generation-{generation}.json"));
-        let authority_digest = Self::digest(generation);
+        let authority_digest = PHASE_B_PENDING_MARKER.to_owned();
         let kernel_digest = Self::digest(10);
         let eliotd_digest = Self::digest(11);
         let eliotd_config_digest = Self::digest(12);
         let eliotd_descriptor_digest = Self::digest(13);
         let store_bridge_digest = Self::digest(14);
-        let store_bootstrap_digest = Self::digest(15);
-        let canonical_store_digest = Self::digest(16);
+        let store_bootstrap_digest = PHASE_B_PENDING_MARKER.to_owned();
+        let canonical_store_digest = Self::digest(21);
         let host_digest = Self::digest(17);
         let watchdog_digest = Self::digest(18);
         let kernel_path = self.artifact_root.join("eliot-kernel.exe");
@@ -585,7 +626,7 @@ impl RegistryFixture {
             host_artifact_digest: handle(host_digest),
             watchdog_executable_path: path_handle(&watchdog_path),
             watchdog_artifact_digest: handle(watchdog_digest),
-            descriptor_digest: handle("0".repeat(64)),
+            descriptor_digest: handle(Self::digest(22)),
         };
         runtime_launch.kernel_arguments = vec![
             handle("--work-root"),
@@ -657,6 +698,67 @@ impl RegistryFixture {
             .join(format!("authority-{generation}.json"))
     }
 
+    fn runtime_roots(&self) -> RuntimeStateRoots {
+        #[derive(Serialize)]
+        struct UnsignedRoots<'a> {
+            profile: InstallationProfile,
+            profile_anchor_root: &'a PlatformHandle,
+            installation_root: &'a PlatformHandle,
+            host_state_root: &'a PlatformHandle,
+            kernel_ors_root: &'a PlatformHandle,
+            kernel_work_root: &'a PlatformHandle,
+            store_data_root: &'a PlatformHandle,
+            store_work_root: &'a PlatformHandle,
+            store_temp_root: &'a PlatformHandle,
+            watchdog_state_root: &'a PlatformHandle,
+        }
+
+        let installation_root = self
+            .program_data
+            .join("Eliot")
+            .join("installations")
+            .join(&self.installation_key);
+        let make = |suffix: &str| handle(installation_root.join(suffix).to_string_lossy());
+        let profile_anchor_root = handle(self.program_data.to_string_lossy());
+        let installation_root = handle(installation_root.to_string_lossy());
+        let host_state_root = make("host");
+        let kernel_ors_root = make("kernel\\state");
+        let kernel_work_root = make("kernel\\work");
+        let store_data_root = make("store\\data");
+        let store_work_root = make("store\\work");
+        let store_temp_root = make("store\\tmp");
+        let watchdog_state_root = make("watchdog");
+        let unsigned = UnsignedRoots {
+            profile: InstallationProfile::SystemService,
+            profile_anchor_root: &profile_anchor_root,
+            installation_root: &installation_root,
+            host_state_root: &host_state_root,
+            kernel_ors_root: &kernel_ors_root,
+            kernel_work_root: &kernel_work_root,
+            store_data_root: &store_data_root,
+            store_work_root: &store_work_root,
+            store_temp_root: &store_temp_root,
+            watchdog_state_root: &watchdog_state_root,
+        };
+        let roots_digest = sha256_hex(
+            &serde_json::to_vec(&unsigned)
+                .unwrap_or_else(|error| panic!("serialize fixture runtime roots: {error}")),
+        );
+        RuntimeStateRoots {
+            profile: InstallationProfile::SystemService,
+            profile_anchor_root,
+            installation_root,
+            host_state_root,
+            kernel_ors_root,
+            kernel_work_root,
+            store_data_root,
+            store_work_root,
+            store_temp_root,
+            watchdog_state_root,
+            roots_digest: handle(roots_digest),
+        }
+    }
+
     fn digest(value: u64) -> String {
         let nibble = b"0123456789abcdef"[(value % 16) as usize] as char;
         std::iter::repeat_n(nibble, 64).collect()
@@ -709,11 +811,7 @@ impl Default for RegistryFixture {
 
 impl Drop for RegistryFixture {
     fn drop(&mut self) {
-        let installation_parent = self.host_root.parent().and_then(Path::parent);
-        let _ = std::fs::remove_dir_all(self.host_root.parent().unwrap_or(&self.host_root));
-        if let Some(path) = installation_parent {
-            let _ = std::fs::remove_dir(path);
-        }
+        let _ = std::fs::remove_dir_all(&self.program_data);
         let _ = std::fs::remove_dir_all(&self.artifact_root);
     }
 }

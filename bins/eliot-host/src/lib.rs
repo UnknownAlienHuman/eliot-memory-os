@@ -460,12 +460,18 @@ pub fn validate_host_scm_bootstrap(
 }
 
 #[cfg(test)]
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[cfg(test)]
+type TestError = Box<dyn std::error::Error>;
+
+#[cfg(test)]
 mod launch_options_tests {
     use super::*;
     use eliot_platform_windows::ServiceBootstrapArguments;
 
-    fn valid_bootstrap() -> ServiceBootstrapArguments {
-        ServiceBootstrapArguments::new(
+    fn valid_bootstrap() -> Result<ServiceBootstrapArguments, TestError> {
+        Ok(ServiceBootstrapArguments::new(
             std::env::temp_dir().join("eliot-authority.json"),
             "a".repeat(64),
             "installation-7",
@@ -475,23 +481,21 @@ mod launch_options_tests {
         .and_then(|bootstrap| {
             bootstrap.with_host_state_root(std::env::temp_dir().join("eliot-host-state"))
         })
-        .and_then(|bootstrap| bootstrap.with_registration_nonce("b".repeat(64)))
-        .unwrap_or_else(|error| panic!("{error}"))
+        .and_then(|bootstrap| bootstrap.with_registration_nonce("b".repeat(64)))?)
     }
 
-    fn valid_args() -> Vec<OsString> {
-        valid_bootstrap()
+    fn valid_args() -> Result<Vec<OsString>, TestError> {
+        Ok(valid_bootstrap()?
             .argv()
             .into_iter()
             .map(OsString::from)
-            .collect()
+            .collect())
     }
 
     #[test]
-    fn launch_options_parse_exact_registration_contract() {
-        let bootstrap = valid_bootstrap();
-        let options =
-            HostLaunchOptions::parse(bootstrap.argv()).unwrap_or_else(|error| panic!("{error}"));
+    fn launch_options_parse_exact_registration_contract() -> TestResult {
+        let bootstrap = valid_bootstrap()?;
+        let options = HostLaunchOptions::parse(bootstrap.argv())?;
         assert_eq!(
             options.config_descriptor_path(),
             &std::env::temp_dir().join("eliot-authority.json")
@@ -507,44 +511,48 @@ mod launch_options_tests {
             options.registration_nonce().map(PlatformHandle::as_str),
             Some("b".repeat(64).as_str())
         );
+        Ok(())
     }
 
     #[test]
-    fn launch_options_reject_missing_duplicate_reordered_unknown_and_substituted_args() {
-        let mut missing = valid_args();
+    fn launch_options_reject_missing_duplicate_reordered_unknown_and_substituted_args() -> TestResult
+    {
+        let mut missing = valid_args()?;
         missing.drain(8..10);
         assert!(HostLaunchOptions::parse(missing).is_err());
 
-        let mut duplicate = valid_args();
+        let mut duplicate = valid_args()?;
         duplicate[8] = OsString::from("--config-descriptor");
         assert!(HostLaunchOptions::parse(duplicate).is_err());
 
-        let mut reordered = valid_args();
+        let mut reordered = valid_args()?;
         reordered.swap(0, 2);
         reordered.swap(1, 3);
         assert!(HostLaunchOptions::parse(reordered).is_err());
 
-        let mut unknown = valid_args();
+        let mut unknown = valid_args()?;
         unknown[8] = OsString::from("--unknown");
         assert!(HostLaunchOptions::parse(unknown).is_err());
 
-        let mut substituted = valid_args();
+        let mut substituted = valid_args()?;
         substituted[1] = OsString::from("relative-authority.json");
         assert!(HostLaunchOptions::parse(substituted).is_err());
+        Ok(())
     }
 
     #[test]
-    fn system_service_launch_options_require_registration_nonce() {
-        let mut without_nonce = valid_args();
+    fn system_service_launch_options_require_registration_nonce() -> TestResult {
+        let mut without_nonce = valid_args()?;
         without_nonce.truncate(10);
         assert!(HostLaunchOptions::parse(without_nonce.clone()).is_ok());
         assert!(HostLaunchOptions::parse_system_service(without_nonce).is_err());
-        assert!(HostLaunchOptions::parse_system_service(valid_args()).is_ok());
+        assert!(HostLaunchOptions::parse_system_service(valid_args()?).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn process_and_service_main_argv_have_distinct_contracts() {
-        let process_args = valid_args();
+    fn process_and_service_main_argv_have_distinct_contracts() -> TestResult {
+        let process_args = valid_args()?;
         assert!(HostLaunchOptions::parse_system_service(process_args.clone()).is_ok());
         assert!(
             HostLaunchOptions::validate_service_main_argv([OsString::from(SERVICE_NAME)]).is_ok()
@@ -556,6 +564,7 @@ mod launch_options_tests {
         assert!(
             HostLaunchOptions::validate_service_main_argv(std::iter::empty::<OsString>()).is_err()
         );
+        Ok(())
     }
 }
 
@@ -2869,7 +2878,7 @@ const DEFAULT_READINESS_CADENCE: std::time::Duration = std::time::Duration::from
 #[cfg(windows)]
 const MIN_READINESS_CADENCE: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(windows)]
-const MAX_READINESS_CADENCE: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_READINESS_CADENCE: std::time::Duration = std::time::Duration::from_mins(1);
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10735,7 +10744,9 @@ impl HostComposition {
             Ok(receipt)
         })();
         match result {
-            Ok(receipt) => HostCredentialControlResponse::PhaseBReady { receipt },
+            Ok(receipt) => HostCredentialControlResponse::PhaseBReady {
+                receipt: Box::new(receipt),
+            },
             Err(_error) => HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref("phase-b", "MaterializePhaseB", intent),
             },
@@ -10933,7 +10944,9 @@ impl HostComposition {
             phase_b_public_receipt(intent, materialization, &self.host)
         })();
         match result {
-            Ok(receipt) => HostCredentialControlResponse::PhaseBReady { receipt },
+            Ok(receipt) => HostCredentialControlResponse::PhaseBReady {
+                receipt: Box::new(receipt),
+            },
             Err(_error) => HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref("phase-b-query", "ReconcilePhaseB", intent),
             },
@@ -11097,13 +11110,11 @@ impl HostComposition {
             HostError::ProcessContour("Store process is missing before Kernel restart".to_owned())
         })?;
         let store_job_before = self.jobs.store_name().to_owned();
-        let store_fence_before = self
-            .journal
-            .snapshot()?
-            .readiness_observations
-            .last()
-            .map(|o| o.store_fence.clone())
-            .unwrap_or_else(|| PlatformHandle::new("0".repeat(64)).unwrap());
+        let store_fence_before = match self.journal.snapshot()?.readiness_observations.last() {
+            Some(observation) => observation.store_fence.clone(),
+            None => PlatformHandle::new("0".repeat(64))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        };
         let current_kernel =
             self.journal.snapshot()?.kernel.clone().ok_or_else(|| {
                 HostError::ProcessContour("no active Kernel to restart".to_owned())
@@ -11241,7 +11252,7 @@ impl HostComposition {
                     operation_id: PlatformHandle::new(
                         kernel_generation.current.lineage.as_str().to_owned(),
                     )
-                    .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap()),
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
                     activate_request_digest: transaction_id.as_str().to_owned(),
                 };
                 let _ = self.journal.reconcile(&transaction_id)?;
@@ -11284,20 +11295,15 @@ impl HostComposition {
                     .to_owned(),
             ));
         }
-        let ready_digest =
-            PlatformHandle::new(sha256_json(&ready_receipt).unwrap_or_else(|_| "0".repeat(64)))
-                .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap());
-        let activation_digest = PlatformHandle::new(
-            sha256_json(&activation_receipt).unwrap_or_else(|_| "0".repeat(64)),
-        )
-        .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap());
-        let store_fence = self
-            .journal
-            .snapshot()?
-            .readiness_observations
-            .last()
-            .map(|o| o.store_fence.clone())
-            .unwrap_or_else(|| PlatformHandle::new("0".repeat(64)).unwrap());
+        let ready_digest = PlatformHandle::new(sha256_json(&ready_receipt)?)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let activation_digest = PlatformHandle::new(sha256_json(&activation_receipt)?)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let store_fence = match self.journal.snapshot()?.readiness_observations.last() {
+            Some(observation) => observation.store_fence.clone(),
+            None => PlatformHandle::new("0".repeat(64))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        };
         let old_gen_handle = PlatformHandle::new(format!(
             "{:x}",
             Sha256::digest(
@@ -11309,7 +11315,7 @@ impl HostComposition {
                 .as_bytes()
             )
         ))
-        .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap());
+        .map_err(|error| HostError::Platform(error.to_string()))?;
         let new_gen_handle = PlatformHandle::new(format!(
             "{:x}",
             Sha256::digest(
@@ -11321,7 +11327,7 @@ impl HostComposition {
                 .as_bytes()
             )
         ))
-        .unwrap_or_else(|_| PlatformHandle::new("0".repeat(64)).unwrap());
+        .map_err(|error| HostError::Platform(error.to_string()))?;
         let mut receipt = HostKernelRestartReceipt {
             mutation_digest: request.mutation_digest.clone(),
             request_digest: request.request_digest.clone(),
@@ -11330,7 +11336,8 @@ impl HostComposition {
             store_fence,
             activation_receipt_digest: activation_digest,
             ready_receipt_digest: ready_digest,
-            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("0".repeat(64))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
         };
         receipt.receipt_digest = receipt.computed_digest().map_err(HostError::Platform)?;
         receipt.validate().map_err(HostError::Platform)?;
@@ -11682,7 +11689,8 @@ impl HostComposition {
             kernel_generation: kernel_generation_digest,
             activation_nonce_digest,
             ready_receipt_digest: readiness_observation.ready_receipt_digest.clone(),
-            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("0".repeat(64))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
         };
         receipt.receipt_digest = receipt.computed_digest().map_err(HostError::Platform)?;
         receipt.validate().map_err(HostError::Platform)?;
@@ -12150,7 +12158,9 @@ impl HostComposition {
         )?;
         self.jobs.store = Some(new_child);
         let (new_proc, new_store_job_name) = {
-            let new_store = self.jobs.store.as_ref().unwrap();
+            let new_store = self.jobs.store.as_ref().ok_or_else(|| {
+                HostError::ProcessContour("relaunched Store Job is missing".to_owned())
+            })?;
             let new_proc = new_store.evidence().process().clone();
             if new_proc == old_proc {
                 return Err(HostError::ProcessContour(
@@ -12289,7 +12299,8 @@ impl HostComposition {
             kernel_generation: kernel_gen_handle,
             activation_nonce_digest,
             ready_receipt_digest: ready_digest,
-            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("0".repeat(64))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
         };
         receipt.receipt_digest = receipt.computed_digest().map_err(HostError::Platform)?;
         receipt.validate().map_err(HostError::Platform)?;
@@ -16115,18 +16126,17 @@ mod watchdog_service_tests {
         launch: &RuntimeLaunchDescriptor,
         role: InstallerServiceRole,
         nonce: &str,
-    ) -> (InstallerServiceRegistrationApproval, PathBuf) {
+    ) -> Result<(InstallerServiceRegistrationApproval, PathBuf), TestError> {
         let root = std::env::temp_dir().join(format!(
             "eliot-host-scm-approval-{}",
             Uuid::new_v4().simple()
         ));
-        std::fs::create_dir_all(&root).unwrap_or_else(|_| unreachable!());
+        std::fs::create_dir_all(&root)?;
         let executable_path = root.join(match role {
             InstallerServiceRole::Host => "eliot-host.exe",
             InstallerServiceRole::Watchdog => "eliot-watchdog.exe",
         });
-        std::fs::write(&executable_path, b"approved service fixture")
-            .unwrap_or_else(|_| unreachable!());
+        std::fs::write(&executable_path, b"approved service fixture")?;
         let service_name = match role {
             InstallerServiceRole::Host => ELIOT_HOST_SERVICE_NAME,
             InstallerServiceRole::Watchdog => ELIOT_WATCHDOG_SERVICE_NAME,
@@ -16135,11 +16145,10 @@ mod watchdog_service_tests {
             InstallerServiceRole::Host => "Eliot Host",
             InstallerServiceRole::Watchdog => "Eliot Watchdog",
         };
+        let descriptor_digest = phase_b_scm_selector(&launch.authority_descriptor_digest)?;
         let bootstrap = ServiceBootstrapArguments::new(
             PathBuf::from(launch.authority_descriptor_path.as_str()),
-            phase_b_scm_selector(&launch.authority_descriptor_digest)
-                .unwrap_or_else(|_| unreachable!())
-                .as_str(),
+            descriptor_digest.as_str(),
             launch.installation_epoch.installation.as_str(),
             launch.authority_generation.value(),
             Vec::<String>::new(),
@@ -16149,8 +16158,7 @@ mod watchdog_service_tests {
                 launch.runtime_state_roots.host_state_root.as_str(),
             ))
         })
-        .and_then(|value| value.with_registration_nonce(nonce))
-        .unwrap_or_else(|_| unreachable!());
+        .and_then(|value| value.with_registration_nonce(nonce))?;
         let request = ServiceRegistrationRequest::with_bootstrap(
             service_name,
             display_name,
@@ -16158,8 +16166,22 @@ mod watchdog_service_tests {
             ServiceStartMode::Automatic,
             ServiceAccount::LocalService,
             bootstrap,
-        )
-        .unwrap_or_else(|_| unreachable!());
+        )?;
+        let service_control_grant = match role {
+            InstallerServiceRole::Host => None,
+            InstallerServiceRole::Watchdog => {
+                let principal_sid = "S-1-5-80-1-2-3-4-5";
+                Some(serde_json::json!({
+                    "principal_service": ELIOT_HOST_SERVICE_NAME,
+                    "principal_sid": principal_sid,
+                    "access_mask": eliot_platform_windows::ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                    "security_descriptor_digest":
+                        eliot_platform_windows::watchdog_service_security_descriptor_digest(
+                            principal_sid,
+                        )?,
+                }))
+            }
+        };
         let value = serde_json::json!({
             "transaction_id": "transaction:host-scm-test",
             "generation": launch.generation,
@@ -16174,17 +16196,17 @@ mod watchdog_service_tests {
             "automatic_start": true,
             "service_bootstrap": {
                 "descriptor_path": launch.authority_descriptor_path,
-                "descriptor_digest": phase_b_scm_selector(&launch.authority_descriptor_digest)
-                    .unwrap_or_else(|_| unreachable!()),
+                "descriptor_digest": descriptor_digest,
                 "installation_id": launch.installation_epoch.installation,
                 "plan_generation": launch.authority_generation.value(),
                 "host_state_root": launch.runtime_state_roots.host_state_root,
             },
             "registration_nonce": nonce,
             "configuration_digest": request.expected_configuration_digest(),
+            "service_control_grant": service_control_grant,
         });
-        let approval = serde_json::from_value(value).unwrap_or_else(|_| unreachable!());
-        (approval, root)
+        let approval = serde_json::from_value(value)?;
+        Ok((approval, root))
     }
 
     fn service_observation(state: ServiceState) -> eliot_platform::ServiceObservation {
@@ -16367,9 +16389,9 @@ mod watchdog_service_tests {
     }
 
     #[test]
-    fn production_inspection_selects_scm_only_for_system_service() {
+    fn production_inspection_selects_scm_only_for_system_service() -> TestResult {
         let (manifest, root) =
-            super::journal_tests::liveness_manifest_with_distinct_store_digests();
+            super::journal_tests::liveness_manifest_with_distinct_store_digests()?;
         assert_eq!(
             select_watchdog_approval_for_inspection(&ApprovedGenerationRegistry::new(), &manifest)
                 .unwrap_or_else(|_| unreachable!()),
@@ -16386,14 +16408,16 @@ mod watchdog_service_tests {
             .is_err()
         );
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
-    fn production_active_and_pending_start_pass_bridge_and_digest_through_shared_port() {
+    fn production_active_and_pending_start_pass_bridge_and_digest_through_shared_port() -> TestResult
+    {
         let (manifest, root) =
-            super::journal_tests::liveness_manifest_with_distinct_store_digests();
+            super::journal_tests::liveness_manifest_with_distinct_store_digests()?;
         let (pending_manifest, pending_root) =
-            super::journal_tests::liveness_manifest_with_distinct_store_digests();
+            super::journal_tests::liveness_manifest_with_distinct_store_digests()?;
         let mut spy = SpyApprovedHostStartup::default();
         start_approved_manifest_contour(&mut spy, &manifest, HostStartupBranch::Active, None)
             .unwrap_or_else(|_| unreachable!());
@@ -16430,6 +16454,7 @@ mod watchdog_service_tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(pending_root);
+        Ok(())
     }
 
     #[test]
@@ -16437,39 +16462,39 @@ mod watchdog_service_tests {
         clippy::too_many_lines,
         reason = "the single matrix keeps role, nonce, generation, and bootstrap substitutions bound to the same approved registration fixture"
     )]
-    fn approved_registration_reconstructs_exact_role_scoped_bootstrap_and_rejects_substitution() {
+    fn approved_registration_reconstructs_exact_role_scoped_bootstrap_and_rejects_substitution()
+    -> TestResult {
         let (manifest, manifest_root) =
-            super::journal_tests::liveness_manifest_with_distinct_store_digests();
+            super::journal_tests::liveness_manifest_with_distinct_store_digests()?;
         let (host, host_root) = approved_registration_fixture(
             &manifest.runtime_launch,
             InstallerServiceRole::Host,
             &"a".repeat(64),
-        );
+        )?;
         let (watchdog, watchdog_root) = approved_registration_fixture(
             &manifest.runtime_launch,
             InstallerServiceRole::Watchdog,
             &"b".repeat(64),
-        );
+        )?;
         let host_approved_request = host
             .service_registration_request()
-            .unwrap_or_else(|_| unreachable!());
+            .map_err(|error| std::io::Error::other(format!("host approval request: {error}")))?;
         let host_image = PlatformHandle::new(
             host_approved_request
                 .binary_path()
                 .to_string_lossy()
                 .into_owned(),
-        )
-        .unwrap_or_else(|_| unreachable!());
-        let watchdog_approved_request = watchdog
-            .service_registration_request()
-            .unwrap_or_else(|_| unreachable!());
+        )?;
+        let watchdog_approved_request =
+            watchdog.service_registration_request().map_err(|error| {
+                std::io::Error::other(format!("watchdog approval request: {error}"))
+            })?;
         let watchdog_image = PlatformHandle::new(
             watchdog_approved_request
                 .binary_path()
                 .to_string_lossy()
                 .into_owned(),
-        )
-        .unwrap_or_else(|_| unreachable!());
+        )?;
         let mut launch = manifest.runtime_launch.clone();
         launch.host_executable_path = host_image.clone();
         launch.watchdog_executable_path = watchdog_image.clone();
@@ -16478,19 +16503,17 @@ mod watchdog_service_tests {
             &host,
             InstallerServiceRole::Host,
             &host_image,
-        )
-        .unwrap_or_else(|_| unreachable!());
+        )?;
         let watchdog_request = approved_service_registration_request(
             &launch,
             &watchdog,
             InstallerServiceRole::Watchdog,
             &watchdog_image,
-        )
-        .unwrap_or_else(|_| unreachable!());
+        )?;
         assert_eq!(host_request, host_approved_request);
         assert_eq!(watchdog_request, watchdog_approved_request);
         let mut live_generation_launch = launch.clone();
-        let live_generation = ResourceGeneration::new(9).unwrap_or_else(|_| unreachable!());
+        let live_generation = ResourceGeneration::new(9)?;
         live_generation_launch.authority_generation = live_generation;
         live_generation_launch
             .authority_state_fence
@@ -16534,8 +16557,7 @@ mod watchdog_service_tests {
                 .and_then(|value| value.registration_nonce())
         );
 
-        let pending_marker =
-            PlatformHandle::new(PHASE_B_PENDING_MARKER).unwrap_or_else(|_| unreachable!());
+        let pending_marker = PlatformHandle::new(PHASE_B_PENDING_MARKER)?;
         let mut pending_scm_launch = launch.clone();
         pending_scm_launch.authority_descriptor_digest = pending_marker.clone();
         pending_scm_launch.store_bootstrap_descriptor_digest = pending_marker.clone();
@@ -16543,59 +16565,47 @@ mod watchdog_service_tests {
         pending_scm_launch.kernel_arguments[9] = pending_marker;
         pending_scm_launch.supervision_authority =
             eliot_installation::SupervisionAuthorityBinding::Pending {
-                supervision_lease_scope_id: PlatformHandle::new("test-supervision-scope")
-                    .unwrap_or_else(|_| unreachable!()),
+                supervision_lease_scope_id: PlatformHandle::new("test-supervision-scope")?,
             };
-        pending_scm_launch = pending_scm_launch
-            .with_computed_digest()
-            .unwrap_or_else(|_| unreachable!());
+        pending_scm_launch = pending_scm_launch.with_computed_digest()?;
         let (pending_watchdog, pending_watchdog_root) = approved_registration_fixture(
             &pending_scm_launch,
             InstallerServiceRole::Watchdog,
             &"c".repeat(64),
-        );
+        )?;
         let pending_watchdog_image = PlatformHandle::new(
             pending_watchdog
-                .service_registration_request()
-                .unwrap_or_else(|_| unreachable!())
+                .service_registration_request()?
                 .binary_path()
                 .to_string_lossy()
                 .into_owned(),
-        )
-        .unwrap_or_else(|_| unreachable!());
+        )?;
         pending_scm_launch.watchdog_executable_path = pending_watchdog_image.clone();
-        pending_scm_launch = pending_scm_launch
-            .with_computed_digest()
-            .unwrap_or_else(|_| unreachable!());
-        let intermediate = pending_scm_launch
-            .with_phase_b_pending_bootstrap_overlay(
-                pending_scm_launch.authority_generation,
-                pending_scm_launch.authority_state_fence.clone(),
-                launch.authority_descriptor_digest.clone(),
-                launch.eliotd_descriptor_digest.clone(),
-                test_provisioned_supervision_authority(
-                    launch.installation_epoch.installation.as_str(),
-                    launch.generation.as_str(),
-                    launch.authority_generation,
-                ),
-            )
-            .unwrap_or_else(|_| unreachable!());
-        let live_overlay = intermediate
-            .with_phase_b_materialization(
-                intermediate.authority_generation,
-                intermediate.authority_state_fence.clone(),
-                launch.authority_descriptor_digest.clone(),
-                launch.store_bootstrap_descriptor_digest.clone(),
-                launch.eliotd_descriptor_digest.clone(),
-            )
-            .unwrap_or_else(|_| unreachable!());
+        pending_scm_launch = pending_scm_launch.with_computed_digest()?;
+        let intermediate = pending_scm_launch.with_phase_b_pending_bootstrap_overlay(
+            pending_scm_launch.authority_generation,
+            pending_scm_launch.authority_state_fence.clone(),
+            launch.authority_descriptor_digest.clone(),
+            launch.eliotd_descriptor_digest.clone(),
+            test_provisioned_supervision_authority(
+                launch.installation_epoch.installation.as_str(),
+                launch.generation.as_str(),
+                launch.authority_generation,
+            ),
+        )?;
+        let live_overlay = intermediate.with_phase_b_materialization(
+            intermediate.authority_generation,
+            intermediate.authority_state_fence.clone(),
+            launch.authority_descriptor_digest.clone(),
+            launch.store_bootstrap_descriptor_digest.clone(),
+            launch.eliotd_descriptor_digest.clone(),
+        )?;
         let pending_watchdog_request = approved_service_registration_request(
             &pending_scm_launch,
             &pending_watchdog,
             InstallerServiceRole::Watchdog,
             &pending_watchdog_image,
-        )
-        .unwrap_or_else(|_| unreachable!());
+        )?;
         assert_eq!(
             pending_watchdog_request
                 .bootstrap()
@@ -16619,8 +16629,7 @@ mod watchdog_service_tests {
             .is_err()
         );
         let mut substituted_launch = launch.clone();
-        substituted_launch.generation =
-            PlatformHandle::new("generation:substituted").unwrap_or_else(|_| unreachable!());
+        substituted_launch.generation = PlatformHandle::new("generation:substituted")?;
         assert!(
             approved_service_registration_request(
                 &substituted_launch,
@@ -16630,12 +16639,10 @@ mod watchdog_service_tests {
             )
             .is_err()
         );
-        let mut missing_nonce_value =
-            serde_json::to_value(&host).unwrap_or_else(|_| unreachable!());
+        let mut missing_nonce_value = serde_json::to_value(&host)?;
         missing_nonce_value["registration_nonce"] = serde_json::Value::String(String::new());
         let missing_nonce =
-            serde_json::from_value::<InstallerServiceRegistrationApproval>(missing_nonce_value)
-                .unwrap_or_else(|_| unreachable!());
+            serde_json::from_value::<InstallerServiceRegistrationApproval>(missing_nonce_value)?;
         assert!(
             approved_service_registration_request(
                 &launch,
@@ -16649,6 +16656,7 @@ mod watchdog_service_tests {
         let _ = std::fs::remove_dir_all(watchdog_root);
         let _ = std::fs::remove_dir_all(pending_watchdog_root);
         let _ = std::fs::remove_dir_all(manifest_root);
+        Ok(())
     }
 
     #[test]
@@ -16973,13 +16981,13 @@ mod journal_tests {
     }
 
     #[test]
-    fn production_termination_binding_rejects_root_and_authority_substitution() {
+    fn production_termination_binding_rejects_root_and_authority_substitution() -> TestResult {
         let job = KernelJobBinding {
-            job_name: PlatformHandle::new("eliot-kernel-job").unwrap(),
-            owner: PlatformHandle::new("Kernel").unwrap(),
+            job_name: PlatformHandle::new("eliot-kernel-job")?,
+            owner: PlatformHandle::new("Kernel")?,
             root_pid: 42,
             root_start_time_100ns: 10,
-            root_image_path: PlatformHandle::new("C:\\eliot\\eliot-kernel.exe").unwrap(),
+            root_image_path: PlatformHandle::new("C:\\eliot\\eliot-kernel.exe")?,
             root_volume_serial_number: 7,
             root_file_index: 11,
         };
@@ -16988,7 +16996,7 @@ mod journal_tests {
             owner: "Kernel".to_owned(),
             state: ServiceProcessState::Starting,
             health: HealthVector::healthy(),
-            authority_epoch: AuthorityEpoch::new(7).unwrap(),
+            authority_epoch: AuthorityEpoch::new(7)?,
         };
         let matches = |process_id, start_time, image, job_name, expected| {
             exact_termination_binding_matches(
@@ -17049,15 +17057,15 @@ mod journal_tests {
             "eliot-kernel-job",
             &substituted_process_id,
         ));
+        Ok(())
     }
 
     #[test]
-    fn runtime_control_unknown_ref_preserves_request_identity_across_reopen() {
+    fn runtime_control_unknown_ref_preserves_request_identity_across_reopen() -> TestResult {
         let request = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RestartKernel,
-            PlatformHandle::new("reopen-request-17").unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("reopen-request-17")?,
+        )?;
         let pending_ref = runtime_control_unknown_ref("kernel-restart-reconcile", &request);
         assert!(pending_ref.as_str().contains("RestartKernel"));
         assert!(pending_ref.as_str().contains(request.request_id.as_str()));
@@ -17066,17 +17074,17 @@ mod journal_tests {
                 .as_str()
                 .contains(request.request_digest.as_str())
         );
-        let error_digest = sha256_json(&"injected-failure").unwrap();
+        let error_digest = sha256_json(&"injected-failure")?;
         assert!(!pending_ref.as_str().contains(&error_digest));
+        Ok(())
     }
 
     #[test]
-    fn store_termination_evidence_requires_complete_single_attempt() {
+    fn store_termination_evidence_requires_complete_single_attempt() -> TestResult {
         let request = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RecoverStore,
-            PlatformHandle::new("termination-evidence-request").unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("termination-evidence-request")?,
+        )?;
         let mut evidence = StoreRecoveryTerminationEvidence {
             wire: "eliot.host.runtime-control.v2".to_owned(),
             operation: HostRuntimeControlOperation::RecoverStore,
@@ -17118,6 +17126,7 @@ mod journal_tests {
                 .validate_for_digest(request.mutation_digest.as_str())
                 .is_err()
         );
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -17136,41 +17145,36 @@ mod journal_tests {
         clippy::too_many_lines,
         reason = "the fixture establishes one complete durable activation contour for Host-level request/response/journal tests"
     )]
-    fn active_readiness_fixture() -> ReadinessFixture {
+    fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
         let host = test_host();
-        let activation_generation =
-            root_epoch(fresh_identity("readiness-activation-lineage").unwrap());
-        let activation_id = fresh_identity("readiness-activation").unwrap();
+        let activation_generation = root_epoch(fresh_identity("readiness-activation-lineage")?);
+        let activation_id = fresh_identity("readiness-activation")?;
         let journal =
-            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone()).unwrap();
+            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
         append_reconciled(
             &journal,
-            HostStateRecord::Activation(
-                initial_activation_record(
-                    &host,
-                    &activation_id,
-                    &activation_generation,
-                    ActivationState::Starting,
-                    "readiness-starting",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
-        let kernel_artifact = PlatformHandle::new("a".repeat(64)).unwrap();
-        let store_artifact = PlatformHandle::new("b".repeat(64)).unwrap();
-        let config = PlatformHandle::new("c".repeat(64)).unwrap();
-        let job_name = PlatformHandle::new("Local\\Eliot-Host-Kernel-readiness").unwrap();
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &activation_generation,
+                ActivationState::Starting,
+                "readiness-starting",
+            )?),
+        )?;
+        let kernel_artifact = PlatformHandle::new("a".repeat(64))?;
+        let store_artifact = PlatformHandle::new("b".repeat(64))?;
+        let config = PlatformHandle::new("c".repeat(64))?;
+        let job_name = PlatformHandle::new("Local\\Eliot-Host-Kernel-readiness")?;
         let image = "C:\\eliot\\eliot-kernel.exe".to_owned();
         let candidate = HostKernelCandidateBinding {
             installation_id: host.installation.clone(),
-            host_epoch: AuthorityEpoch::new(host.epoch.current.sequence).unwrap(),
-            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            host_epoch: AuthorityEpoch::new(host.epoch.current.sequence)?,
+            kernel_epoch: AuthorityEpoch::new(2)?,
             activation_id: activation_id.clone(),
             artifact_hash: kernel_artifact.clone(),
             config_hash: config.clone(),
             job_object_id: job_name.clone(),
-            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE)?,
             host_process: HostProcessBinding {
                 process_id: 7,
                 start_time_100ns: 9,
@@ -17198,15 +17202,15 @@ mod journal_tests {
                 host.epoch.current.lineage.as_str(),
                 "readiness-kernel-lineage",
             ),
-            restart_budget: RestartBudget::new(1, 1).unwrap(),
+            restart_budget: RestartBudget::new(1, 1)?,
             containment_action: None,
         };
         let durable_job = KernelJobBinding {
             job_name,
-            owner: PlatformHandle::new("Kernel").unwrap(),
+            owner: PlatformHandle::new("Kernel")?,
             root_pid: 42,
             root_start_time_100ns: 10,
-            root_image_path: PlatformHandle::new(image).unwrap(),
+            root_image_path: PlatformHandle::new(image)?,
             root_volume_serial_number: 1,
             root_file_index: 2,
         };
@@ -17219,7 +17223,7 @@ mod journal_tests {
             candidate.pipe_identity.clone(),
             durable_job,
             PriorKernelDisposition::NoPriorKernel,
-            root_epoch(fresh_identity("readiness-kernel-lineage").unwrap()),
+            root_epoch(fresh_identity("readiness-kernel-lineage")?),
             ServiceProcessRecord {
                 process_id: "pid:42:start:10".to_owned(),
                 owner: "Kernel".to_owned(),
@@ -17227,49 +17231,42 @@ mod journal_tests {
                 health: HealthVector::healthy(),
                 authority_epoch: candidate.kernel_epoch,
             },
-        )
-        .unwrap();
-        driver.handoff_prepared().unwrap();
-        driver.prior_disposition_committed().unwrap();
-        let permit = driver
-            .issue_nonce(&candidate, ResourceGeneration::genesis())
-            .unwrap();
-        driver.activating().unwrap();
+        )?;
+        driver.handoff_prepared()?;
+        driver.prior_disposition_committed()?;
+        let permit = driver.issue_nonce(&candidate, ResourceGeneration::genesis())?;
+        driver.activating()?;
         let activation = KernelActivationReceipt::issue(&permit);
         let initial_ready = KernelReadyReceipt {
             activation_id: activation_id.clone(),
             activation_operation_id: activation.operation_id.clone(),
             activation_nonce_digest: activation.activation_nonce_digest.clone(),
             process: eliot_kernel_service::ProcessObservation {
-                process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
+                process_id: PlatformHandle::new("pid:42:start:10")?,
                 job_object_id: candidate.job_object_id.clone(),
                 state: ServiceProcessState::Ready,
                 health: HealthVector::healthy(),
-                evidence_refs: vec![PlatformHandle::new("initial-process-proof").unwrap()],
+                evidence_refs: vec![PlatformHandle::new("initial-process-proof")?],
             },
             health: HealthVector::healthy(),
-            evidence_refs: vec![PlatformHandle::new("initial-ready-proof").unwrap()],
+            evidence_refs: vec![PlatformHandle::new("initial-ready-proof")?],
         };
-        driver
-            .active(&candidate, &activation, &initial_ready)
-            .unwrap();
+        driver.active(&candidate, &activation, &initial_ready)?;
         drop(driver);
         let requirement = HostStoreBootstrapRequirement {
-            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)
-                .unwrap(),
-            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-readiness")
-                .unwrap(),
+            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)?,
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-readiness")?,
             store_generation: ResourceGeneration::genesis(),
             state_fence: StateFence::new(candidate.kernel_epoch, ResourceGeneration::genesis()),
-            launch_nonce: PlatformHandle::new("store-launch-nonce").unwrap(),
-            connection_id: PlatformHandle::new("store-connection").unwrap(),
-            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            launch_nonce: PlatformHandle::new("store-launch-nonce")?,
+            connection_id: PlatformHandle::new("store-connection")?,
+            expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
             expected_peer_session_id: 0,
             approved_artifact_hash: store_artifact.clone(),
             approved_config_hash: config.clone(),
             timeout_ms: 5_000,
         };
-        ReadinessFixture {
+        Ok(ReadinessFixture {
             journal,
             candidate,
             activation,
@@ -17277,7 +17274,7 @@ mod journal_tests {
             kernel_artifact,
             store_artifact,
             config,
-        }
+        })
     }
 
     #[cfg(windows)]
@@ -17287,19 +17284,13 @@ mod journal_tests {
     )]
     fn readiness_supervision_snapshot(
         fixture: &ReadinessFixture,
-    ) -> eliot_ors::SupervisionLeaseSnapshot {
+    ) -> Result<eliot_ors::SupervisionLeaseSnapshot, TestError> {
         use eliot_runtime_contracts::{SupervisionLeaseSigner as _, SupervisionLeaseVerifier as _};
 
-        let now_ms = u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("test clock after Unix epoch")
-                .as_millis(),
-        )
-        .expect("test time fits u64");
+        let now_ms = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
         let issued_at_ms = now_ms.saturating_sub(1_000);
         let binding = eliot_ors::SupervisionLeaseBinding {
-            scope_ref: eliot_ors::OperationIdentity::new("scope-readiness").unwrap(),
+            scope_ref: eliot_ors::OperationIdentity::new("scope-readiness")?,
             observation_scope: eliot_runtime_contracts::SupervisionObservationScope {
                 targets: vec!["kernel-readiness".to_owned()],
                 sensor_profile: "kernel-heartbeat".to_owned(),
@@ -17308,16 +17299,14 @@ mod journal_tests {
             },
             installation_id: eliot_ors::OperationIdentity::new(
                 fixture.candidate.installation_id.as_str(),
-            )
-            .unwrap(),
+            )?,
             host_epoch: fixture.candidate.host_epoch,
             activation_id: eliot_ors::OperationIdentity::new(
                 fixture.candidate.activation_id.as_str(),
-            )
-            .unwrap(),
+            )?,
             activation_generation: fixture.activation.generation,
             kernel_epoch: fixture.candidate.kernel_epoch,
-            watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
+            watchdog_epoch: AuthorityEpoch::new(1)?,
             generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
                 target_id: "kernel-readiness".to_owned(),
                 target_generation: fixture.activation.generation,
@@ -17344,14 +17333,12 @@ mod journal_tests {
             ticket_id: eliot_ors::OperationIdentity::new(format!(
                 "readiness-ticket-{}",
                 Uuid::new_v4().simple()
-            ))
-            .unwrap(),
+            ))?,
             operation_id: eliot_ors::OperationIdentity::new(format!(
                 "readiness-operation-{}",
                 Uuid::new_v4().simple()
-            ))
-            .unwrap(),
-            lease_id: eliot_ors::OperationIdentity::new("readiness-supervision-lease").unwrap(),
+            ))?,
+            lease_id: eliot_ors::OperationIdentity::new("readiness-supervision-lease")?,
             expected_revision: None,
             operation: eliot_ors::SupervisionLeaseOperation::Commit,
             binding,
@@ -17361,29 +17348,20 @@ mod journal_tests {
             std::process::id(),
             Uuid::new_v4().simple()
         ));
-        let store = eliot_ors::RedbRecoveryStore::open(&path).expect("test ORS");
-        let stage = store
-            .prepare_supervision_lease(request)
-            .expect("test supervision stage");
+        let store = eliot_ors::RedbRecoveryStore::open(&path)?;
+        let stage = store.prepare_supervision_lease(request)?;
         let signer = eliot_runtime_contracts::Ed25519SupervisionLeaseSigner::from_secret_key(
             "readiness-kernel",
             "readiness-key",
             [7; 32],
-        )
-        .expect("test signer");
-        let envelope = stage
-            .ticket
-            .expected_payload()
-            .expect("test supervision payload")
-            .sign(&signer)
-            .expect("test supervision signature");
+        )?;
+        let envelope = stage.ticket.expected_payload()?.sign(&signer)?;
         let anchor = eliot_runtime_contracts::SupervisionTrustAnchor::new(
             envelope.payload.installation_id.clone(),
             signer.signer_id(),
             signer.key_id(),
             signer.public_key().to_vec(),
-        )
-        .expect("test trust anchor");
+        )?;
         let generation = &envelope.payload.generation_binding;
         let context = eliot_runtime_contracts::SupervisionLeaseVerificationContext {
             now_ms,
@@ -17410,30 +17388,29 @@ mod journal_tests {
                 revocation_epoch: envelope.payload.revocation_epoch,
             },
         };
-        let verified = anchor
-            .verify(&envelope, &context)
-            .expect("test supervision verification");
-        let snapshot = store
-            .commit_supervision_lease(&stage.ticket, &verified)
-            .expect("test supervision commit");
+        let verified = anchor.verify(&envelope, &context)?;
+        let snapshot = store.commit_supervision_lease(&stage.ticket, &verified)?;
         drop(store);
         let _ = std::fs::remove_file(path);
-        snapshot
+        Ok(snapshot)
     }
 
     #[cfg(windows)]
     fn probe_exchange(
         fixture: &ReadinessFixture,
         validation_revision: u64,
-    ) -> (
-        KernelControlRequest,
-        KernelControlResponse,
-        KernelReadyReceipt,
-    ) {
+    ) -> Result<
+        (
+            KernelControlRequest,
+            KernelControlResponse,
+            KernelReadyReceipt,
+        ),
+        TestError,
+    > {
         let request = KernelControlRequest {
             wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
             wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
-            message_id: fresh_identity("test-kernel-probe").unwrap(),
+            message_id: fresh_identity("test-kernel-probe")?,
             sequence: 1,
             peer_process_id: 7,
             generation: ResourceGeneration::genesis(),
@@ -17441,28 +17418,27 @@ mod journal_tests {
             command: KernelControlCommand::ProbeReady,
             payload_digest: String::new(),
         }
-        .with_computed_digest()
-        .unwrap();
-        let mut evidence_refs = KernelReadyReceipt::probe_binding_evidence(&request).unwrap();
+        .with_computed_digest()?;
+        let mut evidence_refs = KernelReadyReceipt::probe_binding_evidence(&request)?;
         evidence_refs.extend([
-            PlatformHandle::new(format!("kernel-store-validation:{validation_revision}")).unwrap(),
-            PlatformHandle::new("kernel-store-health:manifest-ready").unwrap(),
+            PlatformHandle::new(format!("kernel-store-validation:{validation_revision}"))?,
+            PlatformHandle::new("kernel-store-health:manifest-ready")?,
         ]);
         let ready = KernelReadyReceipt {
             activation_id: fixture.candidate.activation_id.clone(),
             activation_operation_id: fixture.activation.operation_id.clone(),
             activation_nonce_digest: fixture.activation.activation_nonce_digest.clone(),
             process: eliot_kernel_service::ProcessObservation {
-                process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
+                process_id: PlatformHandle::new("pid:42:start:10")?,
                 job_object_id: fixture.candidate.job_object_id.clone(),
                 state: ServiceProcessState::Ready,
                 health: HealthVector::healthy(),
-                evidence_refs: vec![PlatformHandle::new("repeat-process-proof").unwrap()],
+                evidence_refs: vec![PlatformHandle::new("repeat-process-proof")?],
             },
             health: HealthVector::healthy(),
             evidence_refs,
         };
-        let supervision_lease = readiness_supervision_snapshot(fixture);
+        let supervision_lease = readiness_supervision_snapshot(fixture)?;
         let response = KernelControlResponse {
             wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
             wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
@@ -17476,81 +17452,80 @@ mod journal_tests {
             error: None,
             payload_digest: String::new(),
         }
-        .with_computed_digest()
-        .unwrap();
-        (request, response, ready)
+        .with_computed_digest()?;
+        Ok((request, response, ready))
     }
 
     #[cfg(windows)]
     fn authenticated_proof(
         fixture: &ReadinessFixture,
         validation_revision: u64,
-    ) -> AuthenticatedKernelReadiness {
-        let (request, response, _ready) = probe_exchange(fixture, validation_revision);
-        let ready = validate_probe_response(&request, &fixture.activation, &response).unwrap();
-        let supervision_lease = response.supervision_lease.clone().unwrap();
+    ) -> Result<AuthenticatedKernelReadiness, TestError> {
+        let (request, response, _ready) = probe_exchange(fixture, validation_revision)?;
+        let ready = validate_probe_response(&request, &fixture.activation, &response)?;
+        let supervision_lease = response
+            .supervision_lease
+            .clone()
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         let store_fence = validated_store_proof_fence(
             &fixture.requirement,
             &ready,
             &fixture.store_artifact,
             &fixture.config,
             request.generation,
-        )
-        .unwrap();
-        AuthenticatedKernelReadiness {
+        )?;
+        Ok(AuthenticatedKernelReadiness {
             request,
             response,
             ready,
             supervision_lease,
             store_fence,
-            peer_evidence: PlatformHandle::new("kernel-peer:test-authenticated").unwrap(),
-        }
+            peer_evidence: PlatformHandle::new("kernel-peer:test-authenticated")?,
+        })
     }
 
     #[cfg(windows)]
-    fn test_published_supervision_identity() -> PublishedSupervisionIdentity {
-        PublishedSupervisionIdentity {
-            lease_id: PlatformHandle::new("supervision-lease:test-readiness").unwrap(),
-            ors_receipt_digest: PlatformHandle::new("a".repeat(64)).unwrap(),
-            publication_digest: PlatformHandle::new("b".repeat(64)).unwrap(),
-        }
+    fn test_published_supervision_identity() -> Result<PublishedSupervisionIdentity, TestError> {
+        Ok(PublishedSupervisionIdentity {
+            lease_id: PlatformHandle::new("supervision-lease:test-readiness")?,
+            ors_receipt_digest: PlatformHandle::new("a".repeat(64))?,
+            publication_digest: PlatformHandle::new("b".repeat(64))?,
+        })
     }
 
     #[cfg(windows)]
-    fn readiness_contour(fixture: &ReadinessFixture) -> ReadinessContourIdentity {
-        let state = fixture.journal.snapshot().unwrap();
-        let active = state.kernel.unwrap();
+    fn readiness_contour(
+        fixture: &ReadinessFixture,
+    ) -> Result<ReadinessContourIdentity, TestError> {
+        let state = fixture.journal.snapshot()?;
+        let active = state
+            .kernel
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         let active_kernel_record_checksum =
-            PlatformHandle::new(record_checksum(&HostStateRecord::Kernel(active)).unwrap())
-                .unwrap();
-        let supervision = test_published_supervision_identity();
-        let store_proof_fence = state
-            .readiness_observations
-            .last()
-            .filter(|observation| {
-                observation.active_kernel_record_checksum == active_kernel_record_checksum
-                    && supervision.is_bound_by(&observation.evidence_refs).unwrap()
-            })
-            .map(|observation| observation.store_fence.clone());
-        ReadinessContourIdentity {
-            approved_generation: PlatformHandle::new("approved-generation").unwrap(),
+            PlatformHandle::new(record_checksum(&HostStateRecord::Kernel(active))?)?;
+        let supervision = test_published_supervision_identity()?;
+        let store_proof_fence = match state.readiness_observations.last() {
+            Some(observation)
+                if observation.active_kernel_record_checksum == active_kernel_record_checksum
+                    && supervision.is_bound_by(&observation.evidence_refs)? =>
+            {
+                Some(observation.store_fence.clone())
+            }
+            _ => None,
+        };
+        Ok(ReadinessContourIdentity {
+            approved_generation: PlatformHandle::new("approved-generation")?,
             approved_kernel_artifact: fixture.kernel_artifact.clone(),
             approved_store_artifact: fixture.store_artifact.clone(),
             approved_config: fixture.config.clone(),
             active_kernel_record_checksum,
-            candidate_binding_digest: PlatformHandle::new(
-                fixture.candidate.compute_digest().unwrap(),
-            )
-            .unwrap(),
-            store_requirement_digest: PlatformHandle::new(
-                sha256_json(&fixture.requirement).unwrap(),
-            )
-            .unwrap(),
+            candidate_binding_digest: PlatformHandle::new(fixture.candidate.compute_digest()?)?,
+            store_requirement_digest: PlatformHandle::new(sha256_json(&fixture.requirement)?)?,
             store_proof_fence,
             supervision_lease_id: Some(supervision.lease_id),
             supervision_ors_receipt_digest: Some(supervision.ors_receipt_digest),
             watchdog_publication_digest: Some(supervision.publication_digest),
-        }
+        })
     }
 
     #[cfg(windows)]
@@ -17559,7 +17534,7 @@ mod journal_tests {
         reason = "the fixture constructs one fully validated split Store launch descriptor for the production liveness boundary"
     )]
     pub(super) fn liveness_manifest_with_distinct_store_digests()
-    -> (CandidateManifest, std::path::PathBuf) {
+    -> Result<(CandidateManifest, std::path::PathBuf), TestError> {
         fn handle(value: impl Into<String>) -> PlatformHandle {
             PlatformHandle::new(value.into()).unwrap_or_else(|_| unreachable!())
         }
@@ -17574,13 +17549,9 @@ mod journal_tests {
         ));
         let portable = root.join("portable");
         std::fs::create_dir_all(&portable).unwrap_or_else(|_| unreachable!());
-        drop(
-            UserOwnedRootLease::open_existing(&portable)
-                .unwrap_or_else(|error| panic!("portable root lease: {error}")),
-        );
+        drop(UserOwnedRootLease::open_existing(&portable)?);
         let portable_handle = handle(portable.to_string_lossy().into_owned());
-        let runtime_state_roots = RuntimeStateRoots::derive_portable(portable_handle.clone())
-            .unwrap_or_else(|error| panic!("portable roots: {error}"));
+        let runtime_state_roots = RuntimeStateRoots::derive_portable(portable_handle.clone())?;
         let generation = handle("generation:liveness-store-split");
         let kernel_digest = handle("a".repeat(64));
         let bridge_digest = handle("b".repeat(64));
@@ -17608,11 +17579,11 @@ mod journal_tests {
                 ResourceGeneration::genesis(),
             ),
             supervision_authority: eliot_installation::SupervisionAuthorityBinding::Provisioned {
-                authority: test_provisioned_supervision_authority(
+                authority: Box::new(test_provisioned_supervision_authority(
                     "installation:liveness-store-split",
                     generation.as_str(),
                     ResourceGeneration::genesis(),
-                ),
+                )),
             },
             authority_descriptor_path: authority_path.clone(),
             authority_descriptor_digest: handle("9".repeat(64)),
@@ -17684,9 +17655,7 @@ mod journal_tests {
             watchdog_artifact_digest: handle("7".repeat(64)),
             descriptor_digest: handle("0".repeat(64)),
         };
-        runtime_launch = runtime_launch
-            .with_computed_digest()
-            .unwrap_or_else(|error| panic!("runtime launch descriptor: {error}"));
+        runtime_launch = runtime_launch.with_computed_digest()?;
         let manifest = CandidateManifest {
             generation,
             components: vec![handle("component:kernel"), handle("component:store")],
@@ -17708,10 +17677,8 @@ mod journal_tests {
             runtime_state_roots_digest: runtime_state_roots.roots_digest.clone(),
             runtime_launch,
         };
-        manifest
-            .validate()
-            .unwrap_or_else(|error| panic!("liveness manifest: {error}"));
-        (manifest, root)
+        manifest.validate()?;
+        Ok((manifest, root))
     }
 
     #[cfg(all(windows, feature = "test-support"))]
@@ -17749,11 +17716,10 @@ mod journal_tests {
 
     #[cfg(windows)]
     #[test]
-    fn phase_b_materialization_reuses_exact_bytes_and_rejects_substitution() {
-        let (_manifest, root) = liveness_manifest_with_distinct_store_digests();
+    fn phase_b_materialization_reuses_exact_bytes_and_rejects_substitution() -> TestResult {
+        let (_manifest, root) = liveness_manifest_with_distinct_store_digests()?;
         let portable = root.join("portable");
-        let portable_lease = UserOwnedRootLease::open_existing(&portable)
-            .expect("portable root lease for Phase-B publication");
+        let portable_lease = UserOwnedRootLease::open_existing(&portable)?;
         let destination = portable.join("phase-b-recovery.json");
         let desired = br#"{"host_epoch":1,"nonce":"fresh"}"#;
         let (digest, identity) = phase_b_materialize_file(
@@ -17763,14 +17729,10 @@ mod journal_tests {
             desired,
             &[],
             "Phase-B recovery fixture",
-        )
-        .expect("initial Phase-B publication");
+        )?;
         assert_ne!(identity.file_index, 0);
         assert_ne!(identity.volume_serial_number, 0);
-        assert_eq!(
-            std::fs::read(&destination).expect("published bytes"),
-            desired
-        );
+        assert_eq!(std::fs::read(&destination)?, desired);
 
         let (replayed_digest, replayed_identity) = phase_b_materialize_file(
             InstallationProfile::PortableDev,
@@ -17779,38 +17741,37 @@ mod journal_tests {
             desired,
             &[&digest],
             "Phase-B recovery fixture",
-        )
-        .expect("exact crash/resume replay");
+        )?;
         assert_eq!(replayed_digest, digest);
         assert_eq!(replayed_identity, identity);
 
-        std::fs::write(&destination, b"substituted").expect("substitute fixture bytes");
-        let error = phase_b_materialize_file(
+        std::fs::write(&destination, b"substituted")?;
+        let Err(error) = phase_b_materialize_file(
             InstallationProfile::PortableDev,
             Some(&portable_lease),
             &destination,
             desired,
             &[&digest],
             "Phase-B recovery fixture",
-        )
-        .expect_err("substituted bytes must not be overwritten");
+        ) else {
+            return Err(std::io::Error::other("substituted bytes must not be overwritten").into());
+        };
         assert!(error.to_string().contains("neither the immutable template"));
         drop(portable_lease);
-        std::fs::remove_dir_all(root).expect("remove Phase-B fixture root");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn phase_b_retains_immutable_template_across_live_replacement() {
-        let (_manifest, root) = liveness_manifest_with_distinct_store_digests();
+    fn phase_b_retains_immutable_template_across_live_replacement() -> TestResult {
+        let (_manifest, root) = liveness_manifest_with_distinct_store_digests()?;
         let portable = root.join("portable");
-        let portable_lease = UserOwnedRootLease::open_existing(&portable)
-            .expect("portable root lease for template retention");
+        let portable_lease = UserOwnedRootLease::open_existing(&portable)?;
         let destination = portable.join("generation.json");
         let template = br#"{"runtime_launch":{"phase":"template"}}"#;
-        std::fs::write(&destination, template).expect("write Phase-A template");
-        let template_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(template)))
-            .expect("template digest");
+        std::fs::write(&destination, template)?;
+        let template_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(template)))?;
         assert_eq!(
             phase_b_template_bytes(
                 InstallationProfile::PortableDev,
@@ -17818,8 +17779,7 @@ mod journal_tests {
                 &destination,
                 &template_digest,
                 "Store config",
-            )
-            .expect("retain Phase-A template"),
+            )?,
             template
         );
 
@@ -17831,8 +17791,7 @@ mod journal_tests {
             live,
             &[&template_digest],
             "Store config",
-        )
-        .expect("publish live replacement");
+        )?;
         assert_eq!(
             phase_b_template_bytes(
                 InstallationProfile::PortableDev,
@@ -17840,15 +17799,12 @@ mod journal_tests {
                 &destination,
                 &template_digest,
                 "Store config",
-            )
-            .expect("replay retained Phase-A template"),
+            )?,
             template
         );
 
-        let retained_path =
-            phase_b_template_path(&destination, "Store config").expect("retained template path");
-        std::fs::write(&retained_path, b"substituted-template")
-            .expect("substitute retained template");
+        let retained_path = phase_b_template_path(&destination, "Store config")?;
+        std::fs::write(&retained_path, b"substituted-template")?;
         assert!(
             phase_b_template_bytes(
                 InstallationProfile::PortableDev,
@@ -17860,60 +17816,51 @@ mod journal_tests {
             .is_err()
         );
         drop(portable_lease);
-        std::fs::remove_dir_all(root).expect("remove template retention fixture root");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn phase_b_live_epoch_and_manifest_digest_are_observed_not_synthesized() {
+    fn phase_b_live_epoch_and_manifest_digest_are_observed_not_synthesized() -> TestResult {
         let host = test_host();
         let live = phase_b_live_installation_epoch(&host);
         assert_eq!(live.installation, host.installation);
         assert_eq!(live.lineage_id, host.epoch.current.lineage);
         assert_eq!(live.sequence, host.epoch.current.sequence);
 
-        let (manifest, root) = liveness_manifest_with_distinct_store_digests();
-        let expected = manifest
-            .compute_digest()
-            .expect("immutable manifest digest");
-        assert_eq!(
-            phase_b_manifest_digest(&manifest).expect("Phase-B manifest digest"),
-            expected
-        );
-        std::fs::remove_dir_all(root).expect("remove Phase-B manifest fixture root");
+        let (manifest, root) = liveness_manifest_with_distinct_store_digests()?;
+        let expected = manifest.compute_digest()?;
+        assert_eq!(phase_b_manifest_digest(&manifest)?, expected);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn approved_host_artifact_path_and_digest_fail_closed() {
-        let (mut manifest, root) = liveness_manifest_with_distinct_store_digests();
+    fn approved_host_artifact_path_and_digest_fail_closed() -> TestResult {
+        let (mut manifest, root) = liveness_manifest_with_distinct_store_digests()?;
         let approved_path = PathBuf::from(manifest.host_executable_path.as_str());
         let approved_bytes = b"approved-host-fixture";
-        std::fs::write(&approved_path, approved_bytes).expect("write approved Host fixture");
-        let approved_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(approved_bytes)))
-            .expect("approved Host digest");
+        std::fs::write(&approved_path, approved_bytes)?;
+        let approved_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(approved_bytes)))?;
         manifest.host_artifact_digest = approved_digest.clone();
         manifest.runtime_launch.host_artifact_digest = approved_digest;
-        manifest.runtime_launch.descriptor_digest = PlatformHandle::new(
-            manifest
-                .runtime_launch
-                .compute_digest()
-                .expect("runtime launch digest"),
-        )
-        .expect("runtime launch digest handle");
-        manifest.validate().expect("approved Host manifest");
+        manifest.runtime_launch.descriptor_digest =
+            PlatformHandle::new(manifest.runtime_launch.compute_digest()?)?;
+        manifest.validate()?;
 
-        verify_host_artifact_at(&manifest, &approved_path).expect("approved Host artifact");
+        verify_host_artifact_at(&manifest, &approved_path)?;
 
         let substituted_path = approved_path.with_file_name("substituted-host.exe");
-        std::fs::write(&substituted_path, approved_bytes).expect("write substituted Host fixture");
+        std::fs::write(&substituted_path, approved_bytes)?;
         assert!(verify_host_artifact_at(&manifest, &substituted_path).is_err());
 
-        std::fs::write(&approved_path, b"tampered-host-fixture")
-            .expect("tamper approved Host fixture");
+        std::fs::write(&approved_path, b"tampered-host-fixture")?;
         assert!(verify_host_artifact_at(&manifest, &approved_path).is_err());
 
-        std::fs::remove_dir_all(root).expect("remove Host artifact fixture");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -17925,13 +17872,13 @@ mod journal_tests {
         manifest: &mut CandidateManifest,
         host: &HostInstallationEpoch,
         descriptor_generation: ResourceGeneration,
-    ) {
-        fn write_digest(path: &Path, bytes: &[u8]) -> PlatformHandle {
+    ) -> Result<(), TestError> {
+        fn write_digest(path: &Path, bytes: &[u8]) -> Result<PlatformHandle, TestError> {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("fixture parent");
+                std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(path, bytes).expect("fixture write");
-            PlatformHandle::new(format!("{:x}", Sha256::digest(bytes))).expect("fixture digest")
+            std::fs::write(path, bytes)?;
+            Ok(PlatformHandle::new(format!("{:x}", Sha256::digest(bytes)))?)
         }
 
         let launch = &mut manifest.runtime_launch;
@@ -17939,24 +17886,24 @@ mod journal_tests {
             launch.runtime_state_roots.kernel_work_root.as_str(),
             launch.runtime_state_roots.store_work_root.as_str(),
         ] {
-            std::fs::create_dir_all(directory).expect("fixture work root");
+            std::fs::create_dir_all(directory)?;
         }
         let kernel_digest = write_digest(
             Path::new(manifest.kernel_executable_path.as_str()),
             b"kernel-fixture",
-        );
+        )?;
         let store_digest = write_digest(
             Path::new(manifest.store_bridge_executable_path.as_str()),
             b"store-fixture",
-        );
+        )?;
         let eliotd_digest = write_digest(
             Path::new(launch.eliotd_executable_path.as_str()),
             b"eliotd-fixture",
-        );
+        )?;
         let eliotd_config_digest = write_digest(
             Path::new(launch.eliotd_config_path.as_str()),
             b"governor-config-fixture",
-        );
+        )?;
         manifest.kernel_artifact_digest = kernel_digest.clone();
         manifest.store_bridge_artifact_digest = store_digest.clone();
         launch.kernel_artifact_digest = kernel_digest.clone();
@@ -17969,8 +17916,7 @@ mod journal_tests {
         // pending bootstrap marker to avoid a self-referential semantic hash.
         // Host's in-memory live launch overlays the exact published bootstrap
         // digest before process admission.
-        let pending_marker =
-            PlatformHandle::new(PHASE_B_PENDING_MARKER).expect("Phase-B pending marker");
+        let pending_marker = PlatformHandle::new(PHASE_B_PENDING_MARKER)?;
         launch.store_bootstrap_descriptor_digest = pending_marker.clone();
         launch.kernel_arguments[5] = pending_marker;
 
@@ -17995,38 +17941,34 @@ mod journal_tests {
             "credential_ref": launch.store_credential_target.as_str(),
             "runtime_launch": launch,
         });
-        let semantic_config_hash = semantic_store_config_hash_from_json(
-            &serde_json::to_vec(&config_without_hash).expect("config without hash"),
-        )
-        .expect("semantic config hash");
+        let semantic_config_hash =
+            semantic_store_config_hash_from_json(&serde_json::to_vec(&config_without_hash)?)?;
         let mut config = config_without_hash;
         config["approved_config_hash"] =
             serde_json::Value::String(semantic_config_hash.as_str().to_owned());
-        let config_bytes = serde_json::to_vec(&config).expect("config bytes");
+        let config_bytes = serde_json::to_vec(&config)?;
         let store_config_digest =
-            write_digest(Path::new(manifest.config_path.as_str()), &config_bytes);
+            write_digest(Path::new(manifest.config_path.as_str()), &config_bytes)?;
         manifest.config_digest = store_config_digest;
 
         let requirement = HostStoreBootstrapRequirement {
-            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)
-                .expect("store route"),
-            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")
-                .expect("store pipe"),
+            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)?,
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")?,
             store_generation: launch.authority_generation,
             state_fence: launch.authority_state_fence.clone(),
             launch_nonce: nonce,
-            connection_id: PlatformHandle::new("host-descriptor-test-store").expect("connection"),
-            expected_peer_sid: PlatformHandle::new("S-1-5-19").expect("peer sid"),
+            connection_id: PlatformHandle::new("host-descriptor-test-store")?,
+            expected_peer_sid: PlatformHandle::new("S-1-5-19")?,
             expected_peer_session_id: 0,
             approved_artifact_hash: store_digest,
             approved_config_hash: semantic_config_hash,
             timeout_ms: 5_000,
         };
-        let bootstrap_bytes = serde_json::to_vec(&requirement).expect("bootstrap bytes");
+        let bootstrap_bytes = serde_json::to_vec(&requirement)?;
         let bootstrap_digest = write_digest(
             Path::new(launch.store_bootstrap_descriptor_path.as_str()),
             &bootstrap_bytes,
-        );
+        )?;
         launch.store_bootstrap_descriptor_digest = bootstrap_digest.clone();
         launch.kernel_arguments[5] = bootstrap_digest;
 
@@ -18037,13 +17979,13 @@ mod journal_tests {
             executable: launch.eliotd_executable_path.clone(),
             executable_sha256: eliotd_digest.as_str().to_owned(),
             arguments: vec![
-                PlatformHandle::new("--config-descriptor").expect("argument"),
+                PlatformHandle::new("--config-descriptor")?,
                 launch.eliotd_config_path.clone(),
-                PlatformHandle::new("--config-descriptor-sha256").expect("argument"),
+                PlatformHandle::new("--config-descriptor-sha256")?,
                 eliotd_config_digest,
-                PlatformHandle::new("--launch-nonce").expect("argument"),
+                PlatformHandle::new("--launch-nonce")?,
                 eliotd_nonce.clone(),
-                PlatformHandle::new("--executable-sha256").expect("argument"),
+                PlatformHandle::new("--executable-sha256")?,
                 eliotd_digest,
             ],
             working_directory: launch.kernel_work_root.clone(),
@@ -18054,47 +17996,47 @@ mod journal_tests {
             generation: descriptor_generation,
             descriptor_sha256: String::new(),
         }
-        .with_computed_digest()
-        .expect("eliotd descriptor");
-        let descriptor_bytes = serde_json::to_vec(&descriptor).expect("descriptor bytes");
+        .with_computed_digest()?;
+        let descriptor_bytes = serde_json::to_vec(&descriptor)?;
         let descriptor_digest = write_digest(
             Path::new(launch.eliotd_descriptor_path.as_str()),
             &descriptor_bytes,
-        );
+        )?;
         launch.eliotd_descriptor_digest = descriptor_digest.clone();
         launch.kernel_arguments[15] = descriptor_digest;
-        launch.descriptor_digest =
-            PlatformHandle::new(launch.compute_digest().expect("runtime launch digest"))
-                .expect("runtime launch digest handle");
+        launch.descriptor_digest = PlatformHandle::new(launch.compute_digest()?)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn production_initial_and_relaunch_reject_descriptor_generation_substitution() {
+    fn production_initial_and_relaunch_reject_descriptor_generation_substitution() -> TestResult {
         let host = test_host();
-        let (mut manifest, root) = liveness_manifest_with_distinct_store_digests();
+        let (mut manifest, root) = liveness_manifest_with_distinct_store_digests()?;
         let substituted_generation =
-            ResourceGeneration::new(manifest.runtime_launch.authority_generation.value() + 1)
-                .expect("substituted generation");
-        materialize_descriptor_bound_host_fixture(&mut manifest, &host, substituted_generation);
+            ResourceGeneration::new(manifest.runtime_launch.authority_generation.value() + 1)?;
+        materialize_descriptor_bound_host_fixture(&mut manifest, &host, substituted_generation)?;
         let config_path = PathBuf::from(manifest.config_path.as_str());
-        let mut initial = HostJobBranches::new(&host).expect("initial branches");
-        let initial_error = initial
-            .start_approved(
-                Path::new(manifest.kernel_executable_path.as_str()),
-                Path::new(manifest.store_bridge_executable_path.as_str()),
-                &manifest.generation,
-                &manifest.config_digest,
-                &config_path,
-                &manifest.kernel_executable_path,
-                &manifest.store_bridge_executable_path,
-                &manifest.config_path,
-                &manifest.kernel_artifact_digest,
-                &manifest.store_bridge_artifact_digest,
-                &host,
-                &manifest.runtime_launch,
+        let mut initial = HostJobBranches::new(&host)?;
+        let Err(initial_error) = initial.start_approved(
+            Path::new(manifest.kernel_executable_path.as_str()),
+            Path::new(manifest.store_bridge_executable_path.as_str()),
+            &manifest.generation,
+            &manifest.config_digest,
+            &config_path,
+            &manifest.kernel_executable_path,
+            &manifest.store_bridge_executable_path,
+            &manifest.config_path,
+            &manifest.kernel_artifact_digest,
+            &manifest.store_bridge_artifact_digest,
+            &host,
+            &manifest.runtime_launch,
+        ) else {
+            return Err(std::io::Error::other(
+                "initial descriptor generation substitution must fail",
             )
-            .expect_err("initial descriptor generation substitution must fail");
+            .into());
+        };
         assert!(
             initial_error
                 .to_string()
@@ -18104,51 +18046,38 @@ mod journal_tests {
         assert!(initial.kernel.is_none());
         assert!(initial.store.is_none());
 
-        let mut relaunch = HostJobBranches::new(&host).expect("relaunch branches");
+        let mut relaunch = HostJobBranches::new(&host)?;
         let portable_root = PathBuf::from(
             manifest
                 .runtime_launch
                 .portable_root
                 .as_ref()
-                .expect("portable root")
+                .ok_or_else(|| std::io::Error::other("test option invariant"))?
                 .as_str(),
         );
-        let portable_lease =
-            UserOwnedRootLease::open_existing(&portable_root).expect("portable root lease");
+        let portable_lease = UserOwnedRootLease::open_existing(&portable_root)?;
         relaunch.kernel_executable = Some(PathBuf::from(manifest.kernel_executable_path.as_str()));
-        relaunch.kernel_lease = Some(
-            open_launch_lease(
-                manifest.runtime_launch.profile,
-                Some(&portable_lease),
-                Path::new(manifest.kernel_executable_path.as_str()),
-            )
-            .expect("kernel lease"),
-        );
-        relaunch.config_lease = Some(
-            open_launch_lease(
-                manifest.runtime_launch.profile,
-                Some(&portable_lease),
-                &config_path,
-            )
-            .expect("config lease"),
-        );
-        relaunch.config_pin = Some(PinnedRuntimeFile::open(&config_path).expect("config pin"));
-        relaunch.eliotd_config_lease = Some(
-            open_launch_lease(
-                manifest.runtime_launch.profile,
-                Some(&portable_lease),
-                Path::new(manifest.runtime_launch.eliotd_config_path.as_str()),
-            )
-            .expect("eliotd config lease"),
-        );
-        relaunch.eliotd_descriptor_lease = Some(
-            open_launch_lease(
-                manifest.runtime_launch.profile,
-                Some(&portable_lease),
-                Path::new(manifest.runtime_launch.eliotd_descriptor_path.as_str()),
-            )
-            .expect("eliotd descriptor lease"),
-        );
+        relaunch.kernel_lease = Some(open_launch_lease(
+            manifest.runtime_launch.profile,
+            Some(&portable_lease),
+            Path::new(manifest.kernel_executable_path.as_str()),
+        )?);
+        relaunch.config_lease = Some(open_launch_lease(
+            manifest.runtime_launch.profile,
+            Some(&portable_lease),
+            &config_path,
+        )?);
+        relaunch.config_pin = Some(PinnedRuntimeFile::open(&config_path)?);
+        relaunch.eliotd_config_lease = Some(open_launch_lease(
+            manifest.runtime_launch.profile,
+            Some(&portable_lease),
+            Path::new(manifest.runtime_launch.eliotd_config_path.as_str()),
+        )?);
+        relaunch.eliotd_descriptor_lease = Some(open_launch_lease(
+            manifest.runtime_launch.profile,
+            Some(&portable_lease),
+            Path::new(manifest.runtime_launch.eliotd_descriptor_path.as_str()),
+        )?);
         relaunch.portable_root = Some(portable_lease);
         relaunch.launch = Some(manifest.runtime_launch.clone());
         let Err(relaunch_error) = relaunch.relaunch_kernel(
@@ -18170,12 +18099,13 @@ mod journal_tests {
         );
         assert!(relaunch.kernel.is_none());
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn host_launch_options_bind_exact_manifest_and_require_registry_evidence() {
-        let (manifest, root) = liveness_manifest_with_distinct_store_digests();
+    fn host_launch_options_bind_exact_manifest_and_require_registry_evidence() -> TestResult {
+        let (manifest, root) = liveness_manifest_with_distinct_store_digests()?;
         let options = HostLaunchOptions {
             config_descriptor_path: PathBuf::from(
                 manifest.runtime_launch.authority_descriptor_path.as_str(),
@@ -18194,7 +18124,7 @@ mod journal_tests {
                     .host_state_root
                     .as_str(),
             ),
-            registration_nonce: Some(PlatformHandle::new("e".repeat(64)).unwrap()),
+            registration_nonce: Some(PlatformHandle::new("e".repeat(64))?),
         };
         assert!(HostComposition::validate_launch_options_for_manifest(&options, &manifest).is_ok());
 
@@ -18262,12 +18192,13 @@ mod journal_tests {
             .is_err()
         );
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn production_start_and_relaunch_store_cwd_use_canonical_store_root() {
-        let (manifest, root) = liveness_manifest_with_distinct_store_digests();
+    fn production_start_and_relaunch_store_cwd_use_canonical_store_root() -> TestResult {
+        let (manifest, root) = liveness_manifest_with_distinct_store_digests()?;
         for directory in [
             manifest
                 .runtime_launch
@@ -18280,29 +18211,27 @@ mod journal_tests {
                 .store_work_root
                 .as_str(),
         ] {
-            std::fs::create_dir_all(directory).unwrap_or_else(|error| panic!("{error}"));
+            std::fs::create_dir_all(directory)?;
         }
         let portable_root = manifest
             .runtime_launch
             .portable_root
             .as_ref()
-            .map_or_else(|| unreachable!(), |path| PathBuf::from(path.as_str()));
-        let lease = UserOwnedRootLease::open_existing(&portable_root)
-            .unwrap_or_else(|error| panic!("portable root lease: {error}"));
+            .ok_or_else(|| std::io::Error::other("portable root missing"))
+            .map(|path| PathBuf::from(path.as_str()))?;
+        let lease = UserOwnedRootLease::open_existing(&portable_root)?;
         let config_path = portable_root.join("generation.json");
-        std::fs::write(&config_path, b"fixture").unwrap_or_else(|error| panic!("{error}"));
+        std::fs::write(&config_path, b"fixture")?;
         let start = HostJobBranches::approved_working_directories(
             &manifest.runtime_launch,
             Some(&lease),
             &config_path,
-        )
-        .unwrap_or_else(|error| panic!("start cwd: {error}"));
+        )?;
         let relaunch = HostJobBranches::approved_working_directories(
             &manifest.runtime_launch,
             Some(&lease),
             &config_path,
-        )
-        .unwrap_or_else(|error| panic!("relaunch cwd: {error}"));
+        )?;
         assert_eq!(start, relaunch);
         assert_ne!(start.0, start.1);
         assert_eq!(
@@ -18313,17 +18242,17 @@ mod journal_tests {
                     .runtime_state_roots
                     .store_work_root
                     .as_str(),
-            )
-            .unwrap_or_else(|error| panic!("{error}"))
+            )?
         );
         drop(lease);
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn host_controller_liveness_tick_uses_bridge_digest_not_provider_digest() {
-        let (manifest, root) = liveness_manifest_with_distinct_store_digests();
+    fn host_controller_liveness_tick_uses_bridge_digest_not_provider_digest() -> TestResult {
+        let (manifest, root) = liveness_manifest_with_distinct_store_digests()?;
         assert_ne!(
             manifest.store_bridge_artifact_digest,
             manifest.canonical_store_artifact_digest
@@ -18379,36 +18308,41 @@ mod journal_tests {
             selected_store.as_ref(),
             Some(&manifest.canonical_store_artifact_digest)
         );
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn ready_repeat_appends_fresh_proofs_without_mutating_activation_authority() {
-        let fixture = active_readiness_fixture();
-        let before = fixture.journal.snapshot().unwrap().kernel.unwrap();
-        let first = authenticated_proof(&fixture, 7);
+    fn ready_repeat_appends_fresh_proofs_without_mutating_activation_authority() -> TestResult {
+        let fixture = active_readiness_fixture()?;
+        let before = fixture
+            .journal
+            .snapshot()?
+            .kernel
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
+        let first = authenticated_proof(&fixture, 7)?;
         let first_disposition = append_authenticated_kernel_readiness(
             &fixture.journal,
             &first,
             &fixture.kernel_artifact,
             &fixture.config,
-            &test_published_supervision_identity(),
+            &test_published_supervision_identity()?,
         )
-        .map(|_| HostBranchDisposition::Healthy)
-        .unwrap();
-        let second = authenticated_proof(&fixture, 8);
+        .map(|_| HostBranchDisposition::Healthy)?;
+        let second = authenticated_proof(&fixture, 8)?;
         let second_disposition = append_authenticated_kernel_readiness(
             &fixture.journal,
             &second,
             &fixture.kernel_artifact,
             &fixture.config,
-            &test_published_supervision_identity(),
+            &test_published_supervision_identity()?,
         )
-        .map(|_| HostBranchDisposition::Healthy)
-        .unwrap();
-        let state = fixture.journal.snapshot().unwrap();
-        let after = state.kernel.unwrap();
+        .map(|_| HostBranchDisposition::Healthy)?;
+        let state = fixture.journal.snapshot()?;
+        let after = state
+            .kernel
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         assert_eq!(first_disposition, HostBranchDisposition::Healthy);
         assert_eq!(second_disposition, HostBranchDisposition::Healthy);
         assert_eq!(state.readiness_observations.len(), 2);
@@ -18424,14 +18358,21 @@ mod journal_tests {
         assert_eq!(after.one_time_nonce, before.one_time_nonce);
         assert_eq!(after.kernel_generation, before.kernel_generation);
         assert_eq!(
-            after.process.unwrap().authority_epoch,
-            before.process.unwrap().authority_epoch
+            after
+                .process
+                .ok_or_else(|| std::io::Error::other("test option invariant"))?
+                .authority_epoch,
+            before
+                .process
+                .ok_or_else(|| std::io::Error::other("test option invariant"))?
+                .authority_epoch
         );
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn readiness_lease_separates_cheap_polling_from_expired_repeat() {
+    fn readiness_lease_separates_cheap_polling_from_expired_repeat() -> TestResult {
         assert_eq!(
             ReadinessCadence::default().0,
             std::time::Duration::from_secs(5)
@@ -18439,29 +18380,31 @@ mod journal_tests {
         assert!(ReadinessCadence::bounded(std::time::Duration::from_millis(249)).is_err());
         assert!(ReadinessCadence::bounded(std::time::Duration::from_secs(61)).is_err());
 
-        let fixture = active_readiness_fixture();
-        let contour = readiness_contour(&fixture);
+        let fixture = active_readiness_fixture()?;
+        let contour = readiness_contour(&fixture)?;
         let mut gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
         let now = std::time::Instant::now();
         let probes = std::cell::Cell::new(0_u8);
         let admit = |revision| -> Result<ReadinessContourIdentity, HostError> {
             probes.set(probes.get() + 1);
-            let proof = authenticated_proof(&fixture, revision);
+            let proof = authenticated_proof(&fixture, revision)
+                .map_err(|error| HostError::Platform(error.to_string()))?;
             append_authenticated_kernel_readiness(
                 &fixture.journal,
                 &proof,
                 &fixture.kernel_artifact,
                 &fixture.config,
-                &test_published_supervision_identity(),
+                &test_published_supervision_identity()
+                    .map_err(|error| HostError::Platform(error.to_string()))?,
             )?;
-            Ok(readiness_contour(&fixture))
+            readiness_contour(&fixture).map_err(|error| HostError::Platform(error.to_string()))
         };
 
         let first =
             reconcile_authenticated_readiness(&mut gate, Ok(contour.clone()), now, || admit(20));
         assert_eq!(first, HostBranchDisposition::Healthy);
         assert_eq!(probes.get(), 1);
-        let journaled_contour = readiness_contour(&fixture);
+        let journaled_contour = readiness_contour(&fixture)?;
 
         let cheap = classify_liveness_tick(
             &mut gate,
@@ -18478,7 +18421,7 @@ mod journal_tests {
             Some(Ok(journaled_contour.clone())),
             (now + DEFAULT_READINESS_CADENCE)
                 .checked_sub(std::time::Duration::from_millis(1))
-                .unwrap(),
+                .ok_or_else(|| std::io::Error::other("test instant underflow"))?,
         );
         assert_eq!(before_expiry, HostLivenessTick::HealthyLeasePreserved);
 
@@ -18497,58 +18440,53 @@ mod journal_tests {
         );
         assert_eq!(expired, HostBranchDisposition::Healthy);
         assert_eq!(probes.get(), 2);
-        assert_eq!(
-            fixture
-                .journal
-                .snapshot()
-                .unwrap()
-                .readiness_observations
-                .len(),
-            2
-        );
+        assert_eq!(fixture.journal.snapshot()?.readiness_observations.len(), 2);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn production_fast_path_invalidates_every_exact_contour_field() {
-        let fixture = active_readiness_fixture();
-        let mut exact = readiness_contour(&fixture);
-        exact.store_proof_fence = Some(PlatformHandle::new("store-proof-exact").unwrap());
-        let changed = |label: &str| PlatformHandle::new(format!("changed-{label}")).unwrap();
+    fn production_fast_path_invalidates_every_exact_contour_field() -> TestResult {
+        let fixture = active_readiness_fixture()?;
+        let mut exact = readiness_contour(&fixture)?;
+        exact.store_proof_fence = Some(PlatformHandle::new("store-proof-exact")?);
+        let changed = |label: &str| -> Result<PlatformHandle, TestError> {
+            Ok(PlatformHandle::new(format!("changed-{label}"))?)
+        };
         let mut variants = Vec::new();
 
         let mut contour = exact.clone();
-        contour.approved_generation = changed("generation");
+        contour.approved_generation = changed("generation")?;
         variants.push(("approved_generation", contour));
         let mut contour = exact.clone();
-        contour.approved_kernel_artifact = changed("kernel-artifact");
+        contour.approved_kernel_artifact = changed("kernel-artifact")?;
         variants.push(("approved_kernel_artifact", contour));
         let mut contour = exact.clone();
-        contour.approved_store_artifact = changed("store-artifact");
+        contour.approved_store_artifact = changed("store-artifact")?;
         variants.push(("approved_store_artifact", contour));
         let mut contour = exact.clone();
-        contour.approved_config = changed("config");
+        contour.approved_config = changed("config")?;
         variants.push(("approved_config", contour));
         let mut contour = exact.clone();
-        contour.active_kernel_record_checksum = changed("kernel-checksum");
+        contour.active_kernel_record_checksum = changed("kernel-checksum")?;
         variants.push(("active_kernel_record_checksum", contour));
         let mut contour = exact.clone();
-        contour.candidate_binding_digest = changed("candidate-binding");
+        contour.candidate_binding_digest = changed("candidate-binding")?;
         variants.push(("candidate_binding_digest", contour));
         let mut contour = exact.clone();
-        contour.store_requirement_digest = changed("store-requirement");
+        contour.store_requirement_digest = changed("store-requirement")?;
         variants.push(("store_requirement_digest", contour));
         let mut contour = exact.clone();
-        contour.store_proof_fence = Some(changed("store-proof"));
+        contour.store_proof_fence = Some(changed("store-proof")?);
         variants.push(("store_proof_fence", contour));
         let mut contour = exact.clone();
-        contour.supervision_lease_id = Some(changed("supervision-lease"));
+        contour.supervision_lease_id = Some(changed("supervision-lease")?);
         variants.push(("supervision_lease_id", contour));
         let mut contour = exact.clone();
-        contour.supervision_ors_receipt_digest = Some(changed("supervision-ors-receipt"));
+        contour.supervision_ors_receipt_digest = Some(changed("supervision-ors-receipt")?);
         variants.push(("supervision_ors_receipt_digest", contour));
         let mut contour = exact.clone();
-        contour.watchdog_publication_digest = Some(changed("watchdog-publication"));
+        contour.watchdog_publication_digest = Some(changed("watchdog-publication")?);
         variants.push(("watchdog_publication_digest", contour));
 
         let now = std::time::Instant::now();
@@ -18580,12 +18518,12 @@ mod journal_tests {
         );
 
         let mut renewed = exact.clone();
-        renewed.supervision_ors_receipt_digest = Some(changed("renewed-supervision-ors-receipt"));
-        renewed.watchdog_publication_digest = Some(changed("renewed-watchdog-publication"));
+        renewed.supervision_ors_receipt_digest = Some(changed("renewed-supervision-ors-receipt")?);
+        renewed.watchdog_publication_digest = Some(changed("renewed-watchdog-publication")?);
         assert_ne!(renewed, exact);
         assert!(renewed.same_probe_input_contour(&exact));
         let mut foreign_incarnation = renewed;
-        foreign_incarnation.supervision_lease_id = Some(changed("foreign-supervision-lease"));
+        foreign_incarnation.supervision_lease_id = Some(changed("foreign-supervision-lease")?);
         assert!(!foreign_incarnation.same_probe_input_contour(&exact));
 
         let mut missing_gate = HostReadinessGate::default();
@@ -18601,29 +18539,29 @@ mod journal_tests {
             ),
             HostLivenessTick::ReadinessRetryPending
         );
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn production_readiness_supervision_fence_rejects_substitution_and_post_publish_renewal() {
-        let fixture = active_readiness_fixture();
-        let proof = authenticated_proof(&fixture, 44);
-        let exact = test_published_supervision_identity();
+    fn production_readiness_supervision_fence_rejects_substitution_and_post_publish_renewal()
+    -> TestResult {
+        let fixture = active_readiness_fixture()?;
+        let proof = authenticated_proof(&fixture, 44)?;
+        let exact = test_published_supervision_identity()?;
         append_authenticated_kernel_readiness(
             &fixture.journal,
             &proof,
             &fixture.kernel_artifact,
             &fixture.config,
             &exact,
-        )
-        .unwrap();
+        )?;
         let observation = fixture
             .journal
-            .snapshot()
-            .unwrap()
+            .snapshot()?
             .readiness_observations
             .pop()
-            .unwrap();
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         assert!(readiness_supervision_fence_matches(
             &exact,
             true,
@@ -18635,7 +18573,7 @@ mod journal_tests {
             &observation.evidence_refs,
         ));
         let mut substituted = exact.clone();
-        substituted.publication_digest = PlatformHandle::new("c".repeat(64)).unwrap();
+        substituted.publication_digest = PlatformHandle::new("c".repeat(64))?;
         assert!(!readiness_supervision_fence_matches(
             &substituted,
             true,
@@ -18644,18 +18582,19 @@ mod journal_tests {
         let mut renewed = proof.supervision_lease.clone();
         renewed.receipt.receipt_sha256 = "d".repeat(64);
         assert!(require_exact_supervision_head(&proof.supervision_lease, || Ok(renewed)).is_err());
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn degraded_recovery_becomes_healthy_only_after_journaled_probe() {
-        let fixture = active_readiness_fixture();
-        let contour = readiness_contour(&fixture);
+    fn degraded_recovery_becomes_healthy_only_after_journaled_probe() -> TestResult {
+        let fixture = active_readiness_fixture()?;
+        let contour = readiness_contour(&fixture)?;
         let mut gate = HostReadinessGate::default();
         let degraded = HostBranchDisposition::KernelDegraded;
         gate.branch_degraded();
         assert_ne!(degraded, HostBranchDisposition::Healthy);
-        let proof = authenticated_proof(&fixture, 9);
+        let proof = authenticated_proof(&fixture, 9)?;
         let request_digest = proof.request.payload_digest.clone();
         let response_digest = proof.response.payload_digest.clone();
         let recovered = reconcile_authenticated_readiness(
@@ -18668,13 +18607,14 @@ mod journal_tests {
                     &proof,
                     &fixture.kernel_artifact,
                     &fixture.config,
-                    &test_published_supervision_identity(),
+                    &test_published_supervision_identity()
+                        .map_err(|error| HostError::Platform(error.to_string()))?,
                 )?;
-                Ok(readiness_contour(&fixture))
+                readiness_contour(&fixture).map_err(|error| HostError::Platform(error.to_string()))
             },
         );
         assert_eq!(recovered, HostBranchDisposition::Healthy);
-        let state = fixture.journal.snapshot().unwrap();
+        let state = fixture.journal.snapshot()?;
         assert_eq!(state.readiness_observations.len(), 1);
         assert_eq!(
             state.readiness_observations[0]
@@ -18688,14 +18628,15 @@ mod journal_tests {
                 .as_str(),
             response_digest
         );
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn stale_store_snapshot_and_response_substitution_never_become_healthy() {
-        let fixture = active_readiness_fixture();
-        let (request, response, ready) = probe_exchange(&fixture, 0);
-        validate_probe_response(&request, &fixture.activation, &response).unwrap();
+    fn stale_store_snapshot_and_response_substitution_never_become_healthy() -> TestResult {
+        let fixture = active_readiness_fixture()?;
+        let (request, response, ready) = probe_exchange(&fixture, 0)?;
+        validate_probe_response(&request, &fixture.activation, &response)?;
         let stale_result = validated_store_proof_fence(
             &fixture.requirement,
             &ready,
@@ -18705,51 +18646,49 @@ mod journal_tests {
         );
         assert!(stale_result.is_err());
 
-        let (request, mut substituted, _) = probe_exchange(&fixture, 10);
+        let (request, mut substituted, _) = probe_exchange(&fixture, 10)?;
         substituted.request_digest = "d".repeat(64);
-        substituted = substituted.with_computed_digest().unwrap();
+        substituted = substituted.with_computed_digest()?;
         assert!(validate_probe_response(&request, &fixture.activation, &substituted).is_err());
-        let snapshot = fixture.journal.snapshot().unwrap();
+        let snapshot = fixture.journal.snapshot()?;
         assert!(snapshot.readiness_observations.is_empty());
         assert_eq!(
-            snapshot.kernel.unwrap().state,
+            snapshot
+                .kernel
+                .ok_or_else(|| std::io::Error::other("test option invariant"))?
+                .state,
             KernelActivationState::Active
         );
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn unknown_readiness_journal_outcome_remains_non_healthy() {
-        let fixture = active_readiness_fixture();
-        let proof = authenticated_proof(&fixture, 11);
-        let host = fixture.journal.snapshot().unwrap().host;
-        let backend = fixture.journal.into_backend().unwrap();
+    fn unknown_readiness_journal_outcome_remains_non_healthy() -> TestResult {
+        let fixture = active_readiness_fixture()?;
+        let proof = authenticated_proof(&fixture, 11)?;
+        let host = fixture.journal.snapshot()?.host;
+        let backend = fixture.journal.into_backend()?;
         let journal = HostStateJournalService::from_backend(
             UnknownAppendBackend {
                 image: backend.durable_image().clone(),
                 prepared: None,
             },
             host,
-        )
-        .unwrap();
+        )?;
         let outcome = append_authenticated_kernel_readiness(
             &journal,
             &proof,
             &fixture.kernel_artifact,
             &fixture.config,
-            &test_published_supervision_identity(),
+            &test_published_supervision_identity()?,
         );
         assert!(matches!(
             outcome,
             Err(HostError::Journal(JournalError::OutcomeUnknown { .. }))
         ));
-        assert!(
-            journal
-                .snapshot()
-                .unwrap()
-                .readiness_observations
-                .is_empty()
-        );
+        assert!(journal.snapshot()?.readiness_observations.is_empty());
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -18758,109 +18697,120 @@ mod journal_tests {
         clippy::too_many_lines,
         reason = "the regression spells out HostComposition::stop journal transitions before replay"
     )]
-    fn activation_reopen_starts_a_fresh_child_after_historical_active() {
-        let fixture = active_readiness_fixture();
-        let proof = authenticated_proof(&fixture, 17);
+    fn activation_reopen_starts_a_fresh_child_after_historical_active() -> TestResult {
+        let fixture = active_readiness_fixture()?;
+        let proof = authenticated_proof(&fixture, 17)?;
         append_authenticated_kernel_readiness(
             &fixture.journal,
             &proof,
             &fixture.kernel_artifact,
             &fixture.config,
-            &test_published_supervision_identity(),
-        )
-        .unwrap();
-        let snapshot = fixture.journal.snapshot().unwrap();
+            &test_published_supervision_identity()?,
+        )?;
+        let snapshot = fixture.journal.snapshot()?;
         let control_ready = transition_activation_record(
-            snapshot.activation.as_ref().unwrap(),
+            snapshot
+                .activation
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("test option invariant"))?,
             ActivationState::ControlReady,
             "pending-reopen-control-ready",
-        )
-        .unwrap();
-        append_reconciled(&fixture.journal, HostStateRecord::Activation(control_ready)).unwrap();
-        let ready_snapshot = fixture.journal.snapshot().unwrap();
+        )?;
+        append_reconciled(&fixture.journal, HostStateRecord::Activation(control_ready))?;
+        let ready_snapshot = fixture.journal.snapshot()?;
         let active = transition_activation_record(
-            ready_snapshot.activation.as_ref().unwrap(),
+            ready_snapshot
+                .activation
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("test option invariant"))?,
             ActivationState::Active,
             "pending-reopen-active",
-        )
-        .unwrap();
-        append_reconciled(&fixture.journal, HostStateRecord::Activation(active)).unwrap();
+        )?;
+        append_reconciled(&fixture.journal, HostStateRecord::Activation(active))?;
 
         // Exercise the same durable reducer sequence as HostComposition::stop
         // before writing the clean marker.  The process termination itself is
         // a Windows Job Object effect and is intentionally not fabricated in
         // this in-memory journal fixture; all journal-owned fences remain
         // production-shaped and are validated by the reducer.
-        let historical = fixture.journal.snapshot().unwrap();
-        let historical_activation = historical.activation.as_ref().unwrap().clone();
+        let historical = fixture.journal.snapshot()?;
+        let historical_activation = historical
+            .activation
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?
+            .clone();
         let drain_generation = historical_activation.fence.activation_generation.clone();
         append_reconciled(
             &fixture.journal,
             HostStateRecord::Drain(DrainRecord {
                 fence: historical_activation.fence.clone(),
-                operation: operation("host-drain-request-test").unwrap(),
+                operation: operation("host-drain-request-test")?,
                 drain_generation: drain_generation.clone(),
                 state: DrainState::Requested,
-                evidence_refs: vec![PlatformHandle::new("scm-stop-request-test").unwrap()],
+                evidence_refs: vec![PlatformHandle::new("scm-stop-request-test")?],
             }),
-        )
-        .unwrap();
+        )?;
         append_reconciled(
             &fixture.journal,
             HostStateRecord::Drain(DrainRecord {
                 fence: historical_activation.fence.clone(),
-                operation: operation("host-drain-start-test").unwrap(),
+                operation: operation("host-drain-start-test")?,
                 drain_generation: drain_generation.clone(),
                 state: DrainState::Draining,
-                evidence_refs: vec![PlatformHandle::new("host-admission-closed-test").unwrap()],
+                evidence_refs: vec![PlatformHandle::new("host-admission-closed-test")?],
             }),
-        )
-        .unwrap();
+        )?;
         let draining = transition_activation_record(
-            &fixture.journal.snapshot().unwrap().activation.unwrap(),
+            &fixture
+                .journal
+                .snapshot()?
+                .activation
+                .ok_or_else(|| std::io::Error::other("test option invariant"))?,
             ActivationState::Draining,
             "host-draining-test",
-        )
-        .unwrap();
-        append_reconciled(&fixture.journal, HostStateRecord::Activation(draining)).unwrap();
+        )?;
+        append_reconciled(&fixture.journal, HostStateRecord::Activation(draining))?;
         append_reconciled(
             &fixture.journal,
             HostStateRecord::DrainCommit(DrainCommitRecord {
                 fence: historical_activation.fence.clone(),
-                operation: operation("host-drain-commit-test").unwrap(),
+                operation: operation("host-drain-commit-test")?,
                 drain_generation,
-                last_admission_closed_at: PlatformHandle::new("host-admission-closed-at-test")
-                    .unwrap(),
+                last_admission_closed_at: PlatformHandle::new("host-admission-closed-at-test")?,
                 lease_and_pending_operation_snapshot: Vec::new(),
                 authority_epochs_fenced: vec![historical_activation.lineage.kernel_epoch.clone()],
                 processes_modules_and_store_branches_to_stop: vec![
-                    PlatformHandle::new("canonical-store-branch-test").unwrap(),
-                    PlatformHandle::new("kernel-branch-test").unwrap(),
+                    PlatformHandle::new("canonical-store-branch-test")?,
+                    PlatformHandle::new("kernel-branch-test")?,
                 ],
                 wake_during_drain_disposition: WakeDisposition::QueueNextGeneration,
-                irreversible_stage: PlatformHandle::new("authority-fenced-test").unwrap(),
-                recovery_owner: PlatformHandle::new("host-composition-test").unwrap(),
-                committed_at: PlatformHandle::new("host-drain-committed-at-test").unwrap(),
+                irreversible_stage: PlatformHandle::new("authority-fenced-test")?,
+                recovery_owner: PlatformHandle::new("host-composition-test")?,
+                committed_at: PlatformHandle::new("host-drain-committed-at-test")?,
             }),
-        )
-        .unwrap();
+        )?;
         let stopped_clean = transition_activation_record(
-            &fixture.journal.snapshot().unwrap().activation.unwrap(),
+            &fixture
+                .journal
+                .snapshot()?
+                .activation
+                .ok_or_else(|| std::io::Error::other("test option invariant"))?,
             ActivationState::StoppedClean,
             "host-stopped-clean-test",
-        )
-        .unwrap();
-        append_reconciled(&fixture.journal, HostStateRecord::Activation(stopped_clean)).unwrap();
+        )?;
+        append_reconciled(&fixture.journal, HostStateRecord::Activation(stopped_clean))?;
 
-        let historical = fixture.journal.snapshot().unwrap();
-        let historical_activation = historical.activation.as_ref().unwrap();
+        let historical = fixture.journal.snapshot()?;
+        let historical_activation = historical
+            .activation
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         append_clean_marker(
             &fixture.journal,
             &historical.host,
             &historical_activation.activation_id,
             &historical_activation.fence.activation_generation,
-        )
-        .unwrap();
+        )?;
 
         // Drive the same persisted replay/reopen path used by production Host
         // (with an in-memory durable backend so the test never touches the
@@ -18868,13 +18818,13 @@ mod journal_tests {
         // record is deliberately not accepted as a live contour: a Host-owned
         // kill-on-close Job has already terminated its children by the time a
         // new Host process reaches this path.
-        let durable = fixture.journal.snapshot().unwrap();
+        let durable = fixture.journal.snapshot()?;
         let last_host = durable.host;
         let installation = last_host.installation.clone();
         let prior_generation = durable
             .activation
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| std::io::Error::other("activation record missing"))?
             .fence
             .activation_generation
             .clone();
@@ -18884,8 +18834,7 @@ mod journal_tests {
             reopened_generation,
             store_recovery_fenced,
             active_rebind_recovery,
-        ) = reopen_existing_epoch(fixture.journal, &last_host, &installation, None, None, &[])
-            .unwrap();
+        ) = reopen_existing_epoch(fixture.journal, &last_host, &installation, None, None, &[])?;
         assert!(!store_recovery_fenced.is_fenced());
         assert_eq!(active_rebind_recovery, ActivePhaseBRebindRecoveryKind::None);
         assert_ne!(reopened_host, last_host);
@@ -18893,31 +18842,32 @@ mod journal_tests {
             reopened_host.epoch.parent,
             Some(last_host.epoch.current.clone())
         );
-        assert_eq!(
-            reopened_generation,
-            prior_generation.direct_child().unwrap()
-        );
-        let recovered = reopened.snapshot().unwrap();
+        assert_eq!(reopened_generation, prior_generation.direct_child()?);
+        let recovered = reopened.snapshot()?;
         assert!(recovered.activation.is_none());
         assert!(recovered.prior_kernel.is_some());
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn production_reopen_fails_closed_on_unknown_prepared_append() {
-        let fixture = active_readiness_fixture();
-        let host = fixture.journal.snapshot().unwrap().host;
-        let activation = fixture.journal.snapshot().unwrap().activation.unwrap();
-        let backend = fixture.journal.into_backend().unwrap();
+    fn production_reopen_fails_closed_on_unknown_prepared_append() -> TestResult {
+        let fixture = active_readiness_fixture()?;
+        let host = fixture.journal.snapshot()?.host;
+        let activation = fixture
+            .journal
+            .snapshot()?
+            .activation
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
+        let backend = fixture.journal.into_backend()?;
         let mut faulted_backend = backend;
         faulted_backend.inject_fault(FaultPoint::CommitBeforeUnknown);
-        let journal = HostStateJournalService::from_backend(faulted_backend, host.clone()).unwrap();
+        let journal = HostStateJournalService::from_backend(faulted_backend, host.clone())?;
         let draining = transition_activation_record(
             &activation,
             ActivationState::ControlReady,
             "faulted-reopen-control-ready",
-        )
-        .unwrap();
+        )?;
         let append_result = append_reconciled(&journal, HostStateRecord::Activation(draining));
         assert!(
             matches!(
@@ -18930,47 +18880,49 @@ mod journal_tests {
             reopen_existing_epoch(journal, &host, &host.installation, None, None, &[],),
             Err(HostError::Journal(JournalError::OutcomeUnknown { .. }))
         ));
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn unclean_reopen_allows_durable_active_rebind_retry_before_clean_marker() {
-        let fixture = active_readiness_fixture();
-        let durable = fixture.journal.snapshot().unwrap();
+    fn unclean_reopen_allows_durable_active_rebind_retry_before_clean_marker() -> TestResult {
+        let fixture = active_readiness_fixture()?;
+        let durable = fixture.journal.snapshot()?;
         let last_host = durable.host;
         let installation = last_host.installation.clone();
-        let handle = |value: &str| PlatformHandle::new(value).unwrap();
+        let handle =
+            |value: &str| -> Result<PlatformHandle, TestError> { Ok(PlatformHandle::new(value)?) };
         let static_template = eliot_installation::HostPhaseBStaticTemplate {
-            wire: handle("eliot.host.phase-b-template.v1"),
-            authority_id: handle("authority"),
-            record_id: handle("record"),
-            revision_policy_binding: handle("revision"),
-            contour_refs: vec![handle("contour")],
+            wire: handle("eliot.host.phase-b-template.v1")?,
+            authority_id: handle("authority")?,
+            record_id: handle("record")?,
+            revision_policy_binding: handle("revision")?,
+            contour_refs: vec![handle("contour")?],
         };
         let rebind = eliot_installation::ActivePhaseBRebind {
             intent: ActivePhaseBRebindIntent {
-                wire: handle(ActivePhaseBRebindIntent::WIRE),
-                transaction_id: handle("transaction"),
-                plan_digest: handle("plan"),
-                effect_id: handle("effect"),
-                manifest_digest: handle("manifest"),
-                prior_terminal_digest: handle("terminal"),
-                prior_phase_b_receipt_digest: handle("receipt"),
-                prior_host_epoch_lineage: handle("prior-lineage"),
+                wire: handle(ActivePhaseBRebindIntent::WIRE)?,
+                transaction_id: handle("transaction")?,
+                plan_digest: handle("plan")?,
+                effect_id: handle("effect")?,
+                manifest_digest: handle("manifest")?,
+                prior_terminal_digest: handle("terminal")?,
+                prior_phase_b_receipt_digest: handle("receipt")?,
+                prior_host_epoch_lineage: handle("prior-lineage")?,
                 prior_host_epoch_sequence: 1,
-                prior_host_process_nonce_digest: handle(&"0".repeat(64)),
-                prior_host_owner_epoch: handle("prior-owner"),
-                prior_host_process_identity: handle(&"1".repeat(64)),
-                host_owner_epoch: handle("current-owner"),
-                host_process_identity: handle(&"2".repeat(64)),
-                host_process_nonce_digest: handle(&"3".repeat(64)),
-                host_epoch_lineage: handle("current-lineage"),
+                prior_host_process_nonce_digest: handle(&"0".repeat(64))?,
+                prior_host_owner_epoch: handle("prior-owner")?,
+                prior_host_process_identity: handle(&"1".repeat(64))?,
+                host_owner_epoch: handle("current-owner")?,
+                host_process_identity: handle(&"2".repeat(64))?,
+                host_process_nonce_digest: handle(&"3".repeat(64))?,
+                host_epoch_lineage: handle("current-lineage")?,
                 host_epoch_sequence: 2,
-                activation_generation_lineage: handle("activation-lineage"),
+                activation_generation_lineage: handle("activation-lineage")?,
                 activation_generation_sequence: 2,
                 static_template,
-                static_template_digest: handle("static-digest"),
-                request_digest: handle("request"),
+                static_template_digest: handle("static-digest")?,
+                request_digest: handle("request")?,
             },
             prepared: None,
             receipt: None,
@@ -18983,19 +18935,19 @@ mod journal_tests {
             None,
             Some(&rebind),
             &[],
-        )
-        .unwrap();
+        )?;
         assert_eq!(recovery_kind, ActivePhaseBRebindRecoveryKind::IntentOnly);
         assert_ne!(reopened_host, last_host);
         assert_eq!(
             reopened_host.epoch.parent,
             Some(last_host.epoch.current.clone())
         );
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn production_host_journal_crash_retry_substitution_and_reset_negatives() {
+    fn production_host_journal_crash_retry_substitution_and_reset_negatives() -> TestResult {
         let production_path = std::env::temp_dir()
             .join(format!(
                 "eliot-host-prod-{}-{}",
@@ -19009,31 +18961,32 @@ mod journal_tests {
                 .contains(HOST_JOURNAL_FILE_NAME)
         );
         assert!(!HOST_JOURNAL_FILE_NAME.is_empty());
-        let handle = |value: &str| PlatformHandle::new(value).unwrap();
+        let handle =
+            |value: &str| -> Result<PlatformHandle, TestError> { Ok(PlatformHandle::new(value)?) };
         let static_template = eliot_installation::HostPhaseBStaticTemplate {
-            wire: handle("eliot.host.phase-b-template.v1"),
-            authority_id: handle("authority"),
-            record_id: handle("record"),
-            revision_policy_binding: handle("revision"),
-            contour_refs: vec![handle("contour")],
+            wire: handle("eliot.host.phase-b-template.v1")?,
+            authority_id: handle("authority")?,
+            record_id: handle("record")?,
+            revision_policy_binding: handle("revision")?,
+            contour_refs: vec![handle("contour")?],
         };
         let prior = eliot_installation::PhaseBLiveBinding {
-            manifest_digest: handle(&"f".repeat(64)),
-            authority_descriptor_digest: handle(&"a".repeat(64)),
-            store_bootstrap_descriptor_digest: handle(&"b".repeat(64)),
-            config_file_digest: handle(&"c".repeat(64)),
-            eliotd_descriptor_digest: handle(&"d".repeat(64)),
-            semantic_config_hash: handle(&"0".repeat(64)),
-            host_epoch_lineage: handle("prior-lineage"),
+            manifest_digest: handle(&"f".repeat(64))?,
+            authority_descriptor_digest: handle(&"a".repeat(64))?,
+            store_bootstrap_descriptor_digest: handle(&"b".repeat(64))?,
+            config_file_digest: handle(&"c".repeat(64))?,
+            eliotd_descriptor_digest: handle(&"d".repeat(64))?,
+            semantic_config_hash: handle(&"0".repeat(64))?,
+            host_epoch_lineage: handle("prior-lineage")?,
             host_epoch_sequence: 1,
-            host_process_nonce_digest: handle(&"0".repeat(64)),
-            receipt_digest: handle(&"1".repeat(64)),
-            effect_id: handle("effect"),
-            credential_receipt_digest: handle(&"2".repeat(64)),
-            request_digest: handle(&"3".repeat(64)),
-            host_owner_epoch: handle("prior-owner"),
-            host_process_identity: handle(&"4".repeat(64)),
-            public_receipt_digest: handle(&"e".repeat(64)),
+            host_process_nonce_digest: handle(&"0".repeat(64))?,
+            receipt_digest: handle(&"1".repeat(64))?,
+            effect_id: handle("effect")?,
+            credential_receipt_digest: handle(&"2".repeat(64))?,
+            request_digest: handle(&"3".repeat(64))?,
+            host_owner_epoch: handle("prior-owner")?,
+            host_process_identity: handle(&"4".repeat(64))?,
+            public_receipt_digest: handle(&"e".repeat(64))?,
             provisioned_supervision_authority: test_provisioned_supervision_authority(
                 "installation",
                 "candidate",
@@ -19041,73 +18994,74 @@ mod journal_tests {
             ),
         };
         let fresh_intent = ActivePhaseBRebindIntent::new(
-            handle(&"b".repeat(64)),
-            handle(&"c".repeat(64)),
-            handle("effect"),
-            handle(&"f".repeat(64)),
-            handle(&"a".repeat(64)),
+            handle(&"b".repeat(64))?,
+            handle(&"c".repeat(64))?,
+            handle("effect")?,
+            handle(&"f".repeat(64))?,
+            handle(&"a".repeat(64))?,
             &prior,
-            handle("current-owner"),
-            handle(&"2".repeat(64)),
-            handle(&"3".repeat(64)),
-            handle("current-lineage"),
+            handle("current-owner")?,
+            handle(&"2".repeat(64))?,
+            handle(&"3".repeat(64))?,
+            handle("current-lineage")?,
             2,
-            handle("activation-lineage"),
+            handle("activation-lineage")?,
             2,
             static_template.clone(),
-        )
-        .unwrap();
+        )?;
         assert!(fresh_intent.validate().is_ok());
         let stale_intent = ActivePhaseBRebindIntent::new(
-            handle(&"b".repeat(64)),
-            handle(&"c".repeat(64)),
-            handle("effect"),
-            handle(&"f".repeat(64)),
-            handle(&"a".repeat(64)),
+            handle(&"b".repeat(64))?,
+            handle(&"c".repeat(64))?,
+            handle("effect")?,
+            handle(&"f".repeat(64))?,
+            handle(&"a".repeat(64))?,
             &prior,
-            handle("current-owner"),
-            handle(&"2".repeat(64)),
-            handle(&"3".repeat(64)),
-            handle("current-lineage"),
+            handle("current-owner")?,
+            handle(&"2".repeat(64))?,
+            handle(&"3".repeat(64))?,
+            handle("current-lineage")?,
             1,
-            handle("activation-lineage"),
+            handle("activation-lineage")?,
             2,
             static_template.clone(),
         );
         assert!(stale_intent.is_err());
         let reused = ActivePhaseBRebindIntent::new(
-            handle(&"b".repeat(64)),
-            handle(&"c".repeat(64)),
-            handle("effect"),
-            handle(&"f".repeat(64)),
-            handle(&"a".repeat(64)),
+            handle(&"b".repeat(64))?,
+            handle(&"c".repeat(64))?,
+            handle("effect")?,
+            handle(&"f".repeat(64))?,
+            handle(&"a".repeat(64))?,
             &prior,
-            handle("prior-owner"),
-            handle(&"2".repeat(64)),
-            handle(&"3".repeat(64)),
-            handle("current-lineage"),
+            handle("prior-owner")?,
+            handle(&"2".repeat(64))?,
+            handle(&"3".repeat(64))?,
+            handle("current-lineage")?,
             2,
-            handle("activation-lineage"),
+            handle("activation-lineage")?,
             2,
             static_template,
         );
         assert!(reused.is_err());
         let _ = production_path;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn host_owner_epoch_digest_is_bound_to_exact_direct_child_sequence() {
-        let handle = |value: &str| PlatformHandle::new(value).unwrap();
-        let installation = handle("owner-digest-sequence-installation");
-        let parent = fresh_host_epoch(installation, None).unwrap();
-        let child = child_host_epoch(&parent).unwrap();
+    fn host_owner_epoch_digest_is_bound_to_exact_direct_child_sequence() -> TestResult {
+        let handle =
+            |value: &str| -> Result<PlatformHandle, TestError> { Ok(PlatformHandle::new(value)?) };
+        let installation = handle("owner-digest-sequence-installation")?;
+        let parent = fresh_host_epoch(installation, None)?;
+        let child = child_host_epoch(&parent)?;
         assert_eq!(parent.epoch.current.lineage, child.epoch.current.lineage);
         assert_eq!(parent.epoch.current.sequence, 1);
         assert_eq!(child.epoch.current.sequence, 2);
         assert_ne!(
-            host_owner_epoch_digest(&parent).unwrap(),
-            host_owner_epoch_digest(&child).unwrap(),
+            host_owner_epoch_digest(&parent)?,
+            host_owner_epoch_digest(&child)?,
             "owner proof must not collapse same-lineage parent and direct child"
         );
         let mut overflow = parent;
@@ -19116,6 +19070,7 @@ mod journal_tests {
             child_host_epoch(&overflow).is_err(),
             "direct-child owner epoch minting must fail closed on sequence overflow"
         );
+        Ok(())
     }
 
     #[test]
@@ -19137,107 +19092,93 @@ mod journal_tests {
     }
 
     #[test]
-    fn open_activation_clean_stop_and_child_reopen_replay() {
+    fn open_activation_clean_stop_and_child_reopen_replay() -> TestResult {
         let host = test_host();
-        let generation = root_epoch(fresh_identity("test-activation-lineage").unwrap());
-        let activation_id = fresh_identity("test-activation").unwrap();
+        let generation = root_epoch(fresh_identity("test-activation-lineage")?);
+        let activation_id = fresh_identity("test-activation")?;
         let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())
             .unwrap_or_else(|_| unreachable!());
         append_reconciled(
             &journal,
-            HostStateRecord::Activation(
-                initial_activation_record(
-                    &host,
-                    &activation_id,
-                    &generation,
-                    ActivationState::Stopped,
-                    "test-open",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
-        append_clean_marker(&journal, &host, &activation_id, &generation).unwrap();
-        let backend = journal.into_backend().unwrap();
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &generation,
+                ActivationState::Stopped,
+                "test-open",
+            )?),
+        )?;
+        append_clean_marker(&journal, &host, &activation_id, &generation)?;
+        let backend = journal.into_backend()?;
 
-        let child = child_host_epoch(&host).unwrap();
-        let reopened = HostStateJournalService::from_backend(backend, child.clone()).unwrap();
-        assert_eq!(reopened.snapshot().unwrap().retained_epochs.len(), 1);
-        let child_generation = generation.direct_child().unwrap();
-        let child_activation = fresh_identity("test-child-activation").unwrap();
+        let child = child_host_epoch(&host)?;
+        let reopened = HostStateJournalService::from_backend(backend, child.clone())?;
+        assert_eq!(reopened.snapshot()?.retained_epochs.len(), 1);
+        let child_generation = generation.direct_child()?;
+        let child_activation = fresh_identity("test-child-activation")?;
         append_reconciled(
             &reopened,
-            HostStateRecord::Activation(
-                initial_activation_record(
-                    &child,
-                    &child_activation,
-                    &child_generation,
-                    ActivationState::Stopped,
-                    "test-child-open",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
-        assert_eq!(reopened.snapshot().unwrap().sequence, 1);
-        assert!(reopened.snapshot().unwrap().clean_marker.is_none());
+            HostStateRecord::Activation(initial_activation_record(
+                &child,
+                &child_activation,
+                &child_generation,
+                ActivationState::Stopped,
+                "test-child-open",
+            )?),
+        )?;
+        assert_eq!(reopened.snapshot()?.sequence, 1);
+        assert!(reopened.snapshot()?.clean_marker.is_none());
+        Ok(())
     }
 
     #[test]
-    fn unknown_commit_is_reconciled_by_transaction_identity() {
+    fn unknown_commit_is_reconciled_by_transaction_identity() -> TestResult {
         let host = test_host();
-        let generation = root_epoch(fresh_identity("unknown-lineage").unwrap());
-        let activation_id = fresh_identity("unknown-activation").unwrap();
+        let generation = root_epoch(fresh_identity("unknown-lineage")?);
+        let activation_id = fresh_identity("unknown-activation")?;
         let journal = HostStateJournalService::from_backend(
             MemoryBackend::with_fault(FaultPoint::CommitAfterUnknown),
             host.clone(),
-        )
-        .unwrap();
+        )?;
         append_reconciled(
             &journal,
-            HostStateRecord::Activation(
-                initial_activation_record(
-                    &host,
-                    &activation_id,
-                    &generation,
-                    ActivationState::Stopped,
-                    "unknown-open",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
-        assert_eq!(journal.snapshot().unwrap().sequence, 1);
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &generation,
+                ActivationState::Stopped,
+                "unknown-open",
+            )?),
+        )?;
+        assert_eq!(journal.snapshot()?.sequence, 1);
+        Ok(())
     }
 
     #[test]
-    fn torn_current_epoch_fails_closed() {
+    fn torn_current_epoch_fails_closed() -> TestResult {
         let host = test_host();
-        let generation = root_epoch(fresh_identity("torn-lineage").unwrap());
-        let activation_id = fresh_identity("torn-activation").unwrap();
+        let generation = root_epoch(fresh_identity("torn-lineage")?);
+        let activation_id = fresh_identity("torn-activation")?;
         let journal =
-            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone()).unwrap();
+            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
         append_reconciled(
             &journal,
-            HostStateRecord::Activation(
-                initial_activation_record(
-                    &host,
-                    &activation_id,
-                    &generation,
-                    ActivationState::Stopped,
-                    "torn-open",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
-        let backend = journal.into_backend().unwrap();
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &generation,
+                ActivationState::Stopped,
+                "torn-open",
+            )?),
+        )?;
+        let backend = journal.into_backend()?;
         let mut image = backend.durable_image().clone();
         image.epochs[0].bytes.pop();
         assert!(matches!(
             HostStateJournalService::from_backend(ImageBackend { image }, host),
             Err(JournalError::Torn { .. })
         ));
+        Ok(())
     }
 
     #[test]
@@ -19279,39 +19220,34 @@ mod journal_tests {
         clippy::too_many_lines,
         reason = "the regression constructs a real Active+Consumed record and drives stale, unknown, and recovered readiness admissions"
     )]
-    fn reconciled_active_readiness_failure_preserves_contour_then_recovers() {
+    fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> TestResult {
         let host = test_host();
-        let activation_generation =
-            root_epoch(fresh_identity("reconcile-activation-lineage").unwrap());
-        let activation_id = fresh_identity("reconcile-activation").unwrap();
+        let activation_generation = root_epoch(fresh_identity("reconcile-activation-lineage")?);
+        let activation_id = fresh_identity("reconcile-activation")?;
         let journal =
-            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone()).unwrap();
+            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
         append_reconciled(
             &journal,
-            HostStateRecord::Activation(
-                initial_activation_record(
-                    &host,
-                    &activation_id,
-                    &activation_generation,
-                    ActivationState::Starting,
-                    "reconcile-starting",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &activation_generation,
+                ActivationState::Starting,
+                "reconcile-starting",
+            )?),
+        )?;
 
-        let job_name = PlatformHandle::new("Local\\Eliot-Host-Kernel-reconcile").unwrap();
+        let job_name = PlatformHandle::new("Local\\Eliot-Host-Kernel-reconcile")?;
         let kernel_image = "C:\\eliot\\eliot-kernel.exe".to_owned();
         let candidate = HostKernelCandidateBinding {
             installation_id: host.installation.clone(),
-            host_epoch: AuthorityEpoch::new(host.epoch.current.sequence).unwrap(),
-            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            host_epoch: AuthorityEpoch::new(host.epoch.current.sequence)?,
+            kernel_epoch: AuthorityEpoch::new(2)?,
             activation_id: activation_id.clone(),
-            artifact_hash: PlatformHandle::new("a".repeat(64)).unwrap(),
-            config_hash: PlatformHandle::new("c".repeat(64)).unwrap(),
+            artifact_hash: PlatformHandle::new("a".repeat(64))?,
+            config_hash: PlatformHandle::new("c".repeat(64))?,
             job_object_id: job_name.clone(),
-            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE)?,
             host_process: HostProcessBinding {
                 process_id: 7,
                 start_time_100ns: 9,
@@ -19339,19 +19275,19 @@ mod journal_tests {
                 host.epoch.current.lineage.as_str(),
                 "reconcile-kernel-lineage",
             ),
-            restart_budget: RestartBudget::new(1, 1).unwrap(),
+            restart_budget: RestartBudget::new(1, 1)?,
             containment_action: None,
         };
         let durable_job = KernelJobBinding {
             job_name: job_name.clone(),
-            owner: PlatformHandle::new("Kernel").unwrap(),
+            owner: PlatformHandle::new("Kernel")?,
             root_pid: 42,
             root_start_time_100ns: 10,
-            root_image_path: PlatformHandle::new(kernel_image.clone()).unwrap(),
+            root_image_path: PlatformHandle::new(kernel_image.clone())?,
             root_volume_serial_number: 1,
             root_file_index: 2,
         };
-        let kernel_generation = root_epoch(fresh_identity("reconcile-kernel-lineage").unwrap());
+        let kernel_generation = root_epoch(fresh_identity("reconcile-kernel-lineage")?);
         let mut driver = DurableKernelActivationDriver::bind_candidate(
             &journal,
             &host,
@@ -19369,50 +19305,46 @@ mod journal_tests {
                 health: HealthVector::healthy(),
                 authority_epoch: candidate.kernel_epoch,
             },
-        )
-        .unwrap();
-        driver.handoff_prepared().unwrap();
-        driver.prior_disposition_committed().unwrap();
-        let permit = driver
-            .issue_nonce(&candidate, ResourceGeneration::genesis())
-            .unwrap();
-        driver.activating().unwrap();
+        )?;
+        driver.handoff_prepared()?;
+        driver.prior_disposition_committed()?;
+        let permit = driver.issue_nonce(&candidate, ResourceGeneration::genesis())?;
+        driver.activating()?;
         let activation_receipt = KernelActivationReceipt::issue(&permit);
         let ready = KernelReadyReceipt {
             activation_id: activation_id.clone(),
             activation_operation_id: activation_receipt.operation_id.clone(),
             activation_nonce_digest: activation_receipt.activation_nonce_digest.clone(),
             process: eliot_kernel_service::ProcessObservation {
-                process_id: PlatformHandle::new("pid:42:start:10").unwrap(),
+                process_id: PlatformHandle::new("pid:42:start:10")?,
                 job_object_id: job_name,
                 state: ServiceProcessState::Ready,
                 health: HealthVector::healthy(),
-                evidence_refs: vec![PlatformHandle::new("reconcile-process-evidence").unwrap()],
+                evidence_refs: vec![PlatformHandle::new("reconcile-process-evidence")?],
             },
             health: HealthVector::healthy(),
-            evidence_refs: vec![PlatformHandle::new("reconcile-ready-evidence").unwrap()],
+            evidence_refs: vec![PlatformHandle::new("reconcile-ready-evidence")?],
         };
-        driver
-            .active(&candidate, &activation_receipt, &ready)
-            .unwrap();
+        driver.active(&candidate, &activation_receipt, &ready)?;
         drop(driver);
-        let active = journal.snapshot().unwrap().kernel.unwrap();
+        let active = journal
+            .snapshot()?
+            .kernel
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         assert_eq!(active.state, KernelActivationState::Active);
         assert_eq!(active.one_time_nonce.state(), NonceState::Consumed);
 
         let kernel_artifact = candidate.artifact_hash.clone();
-        let store_artifact = PlatformHandle::new("b".repeat(64)).unwrap();
+        let store_artifact = PlatformHandle::new("b".repeat(64))?;
         let config = candidate.config_hash.clone();
         let requirement = HostStoreBootstrapRequirement {
-            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)
-                .unwrap(),
-            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-readiness")
-                .unwrap(),
+            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)?,
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-readiness")?,
             store_generation: ResourceGeneration::genesis(),
             state_fence: StateFence::new(candidate.kernel_epoch, ResourceGeneration::genesis()),
-            launch_nonce: PlatformHandle::new("reconcile-store-launch").unwrap(),
-            connection_id: PlatformHandle::new("reconcile-store-connection").unwrap(),
-            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            launch_nonce: PlatformHandle::new("reconcile-store-launch")?,
+            connection_id: PlatformHandle::new("reconcile-store-connection")?,
+            expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
             expected_peer_session_id: 0,
             approved_artifact_hash: store_artifact.clone(),
             approved_config_hash: config.clone(),
@@ -19427,14 +19359,15 @@ mod journal_tests {
             store_artifact,
             config,
         };
-        let contour = readiness_contour(&fixture);
+        let contour = readiness_contour(&fixture)?;
         let mut gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
         let now = std::time::Instant::now();
         let probes = std::cell::Cell::new(0_u8);
 
         let stale = reconcile_authenticated_readiness(&mut gate, Ok(contour.clone()), now, || {
             probes.set(probes.get() + 1);
-            let (request, response, ready) = probe_exchange(&fixture, 0);
+            let (request, response, ready) = probe_exchange(&fixture, 0)
+                .map_err(|error| HostError::Platform(error.to_string()))?;
             validate_probe_response(&request, &fixture.activation, &response)?;
             let store_proof_fence = validated_store_proof_fence(
                 &fixture.requirement,
@@ -19470,7 +19403,7 @@ mod journal_tests {
             || {
                 probes.set(probes.get() + 1);
                 Err(HostError::Journal(JournalError::OutcomeUnknown {
-                    transaction_id: fresh_identity("readiness-unknown").unwrap(),
+                    transaction_id: fresh_identity("readiness-unknown")?,
                 }))
             },
         );
@@ -19479,14 +19412,17 @@ mod journal_tests {
             gate.last_failure(),
             Some(ReadinessFailureKind::JournalOutcomeUnknown)
         );
-        let retained = fixture.journal.snapshot().unwrap().kernel.unwrap();
+        let retained = fixture
+            .journal
+            .snapshot()?
+            .kernel
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         assert_eq!(retained.state, KernelActivationState::Active);
         assert_eq!(retained.one_time_nonce.state(), NonceState::Consumed);
         assert!(
             fixture
                 .journal
-                .snapshot()
-                .unwrap()
+                .snapshot()?
                 .readiness_observations
                 .is_empty()
         );
@@ -19497,88 +19433,91 @@ mod journal_tests {
             now + DEFAULT_READINESS_CADENCE + DEFAULT_READINESS_CADENCE,
             || {
                 probes.set(probes.get() + 1);
-                let proof = authenticated_proof(&fixture, 12);
+                let proof = authenticated_proof(&fixture, 12)
+                    .map_err(|error| HostError::Platform(error.to_string()))?;
                 append_authenticated_kernel_readiness(
                     &fixture.journal,
                     &proof,
                     &fixture.kernel_artifact,
                     &fixture.config,
-                    &test_published_supervision_identity(),
+                    &test_published_supervision_identity()
+                        .map_err(|error| HostError::Platform(error.to_string()))?,
                 )?;
-                Ok(readiness_contour(&fixture))
+                readiness_contour(&fixture).map_err(|error| HostError::Platform(error.to_string()))
             },
         );
         assert_eq!(recovered, HostBranchDisposition::Healthy);
         assert_eq!(probes.get(), 3);
-        let recovered_state = fixture.journal.snapshot().unwrap();
-        let recovered_kernel = recovered_state.kernel.unwrap();
+        let recovered_state = fixture.journal.snapshot()?;
+        let recovered_kernel = recovered_state
+            .kernel
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         assert_eq!(recovered_kernel.state, KernelActivationState::Active);
         assert_eq!(
             recovered_kernel.one_time_nonce.state(),
             NonceState::Consumed
         );
         assert_eq!(recovered_state.readiness_observations.len(), 1);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn store_rebind_disposition_uses_exact_operation_and_request_identity() {
+    fn store_rebind_disposition_uses_exact_operation_and_request_identity() -> TestResult {
         let host = test_host();
-        let activation_generation = root_epoch(fresh_identity("store-rebind-disposition").unwrap());
-        let activation_id = fresh_identity("store-rebind-disposition-activation").unwrap();
+        let activation_generation = root_epoch(fresh_identity("store-rebind-disposition")?);
+        let activation_id = fresh_identity("store-rebind-disposition-activation")?;
         let journal =
-            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone()).unwrap();
+            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
         append_reconciled(
             &journal,
-            HostStateRecord::Activation(
-                initial_activation_record(
-                    &host,
-                    &activation_id,
-                    &activation_generation,
-                    ActivationState::Starting,
-                    "store-rebind-disposition-starting",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
-        let make_pending = |operation_id: &str, request_digest: &str| StoreRebindRecord {
-            fence: record_fence(&host, &activation_id, &activation_generation),
-            operation: operation(&format!("store-rebind:{operation_id}")).unwrap(),
-            state: StoreRebindState::Pending,
-            operation_id: PlatformHandle::new(operation_id).unwrap(),
-            request_digest: PlatformHandle::new(request_digest).unwrap(),
-            requirement: PlatformHandle::new("a".repeat(64)).unwrap(),
-            candidate_binding_digest: PlatformHandle::new("b".repeat(64)).unwrap(),
-            store_fence: PlatformHandle::new("c".repeat(64)).unwrap(),
-            process_id: 42,
-            process_start_time_100ns: 7,
-            process_image_path: PlatformHandle::new(r"C:\eliot\store.exe").unwrap(),
-            job_name: PlatformHandle::new(r"Local\Eliot-Host-Store-disposition").unwrap(),
-            generation: 1,
-            authority_epoch: 1,
-            receipt_request_digest: None,
-            receipt_store_fence: None,
-        };
-        let first = make_pending("store-rebind-first", &"d".repeat(64));
-        let second = make_pending("store-rebind-second", &"e".repeat(64));
-        append_reconciled(&journal, HostStateRecord::StoreRebind(first)).unwrap();
-        append_reconciled(&journal, HostStateRecord::StoreRebind(second.clone())).unwrap();
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &activation_generation,
+                ActivationState::Starting,
+                "store-rebind-disposition-starting",
+            )?),
+        )?;
+        let make_pending =
+            |operation_id: &str, request_digest: &str| -> Result<StoreRebindRecord, TestError> {
+                Ok(StoreRebindRecord {
+                    fence: record_fence(&host, &activation_id, &activation_generation),
+                    operation: operation(&format!("store-rebind:{operation_id}"))?,
+                    state: StoreRebindState::Pending,
+                    operation_id: PlatformHandle::new(operation_id)?,
+                    request_digest: PlatformHandle::new(request_digest)?,
+                    requirement: PlatformHandle::new("a".repeat(64))?,
+                    candidate_binding_digest: PlatformHandle::new("b".repeat(64))?,
+                    store_fence: PlatformHandle::new("c".repeat(64))?,
+                    process_id: 42,
+                    process_start_time_100ns: 7,
+                    process_image_path: PlatformHandle::new(r"C:\eliot\store.exe")?,
+                    job_name: PlatformHandle::new(r"Local\Eliot-Host-Store-disposition")?,
+                    generation: 1,
+                    authority_epoch: 1,
+                    receipt_request_digest: None,
+                    receipt_store_fence: None,
+                })
+            };
+        let first = make_pending("store-rebind-first", &"d".repeat(64))?;
+        let second = make_pending("store-rebind-second", &"e".repeat(64))?;
+        append_reconciled(&journal, HostStateRecord::StoreRebind(first))?;
+        append_reconciled(&journal, HostStateRecord::StoreRebind(second.clone()))?;
 
         persist_store_rebind_disposition(
             &journal,
             &second.operation_id,
             second.request_digest.as_str(),
             StoreRebindState::Unknown,
-        )
-        .unwrap();
-        let state = journal.snapshot().unwrap();
+        )?;
+        let state = journal.snapshot()?;
         assert_eq!(
             state
                 .store_rebinds
                 .iter()
                 .find(|record| record.operation_id == second.operation_id)
-                .unwrap()
+                .ok_or_else(|| { std::io::Error::other("second rebind missing") })?
                 .state,
             StoreRebindState::Unknown
         );
@@ -19587,13 +19526,13 @@ mod journal_tests {
                 .store_rebinds
                 .iter()
                 .find(|record| record.operation_id.as_str() == "store-rebind-first")
-                .unwrap()
+                .ok_or_else(|| { std::io::Error::other("first rebind missing") })?
                 .state,
             StoreRebindState::Pending
         );
 
-        let third = make_pending("store-rebind-third", &"f".repeat(64));
-        append_reconciled(&journal, HostStateRecord::StoreRebind(third.clone())).unwrap();
+        let third = make_pending("store-rebind-third", &"f".repeat(64))?;
+        append_reconciled(&journal, HostStateRecord::StoreRebind(third.clone()))?;
         let mut substituted_receipt = StoreRebindReceipt {
             operation_id: third.operation_id.clone(),
             request_digest: third.request_digest.as_str().to_owned(),
@@ -19607,8 +19546,8 @@ mod journal_tests {
                 job: third.job_name.clone(),
             },
             candidate_binding_digest: third.candidate_binding_digest.as_str().to_owned(),
-            generation: ResourceGeneration::new(third.generation).unwrap(),
-            authority_epoch: AuthorityEpoch::new(third.authority_epoch).unwrap(),
+            generation: ResourceGeneration::new(third.generation)?,
+            authority_epoch: AuthorityEpoch::new(third.authority_epoch)?,
             store_fence: third.store_fence.as_str().to_owned(),
         };
         substituted_receipt.process_binding.process.process_id += 1;
@@ -19621,57 +19560,62 @@ mod journal_tests {
             )
             .is_err()
         );
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
     fn durable_runtime_restart_physical_reopen_reconciles_exact_receipt_without_resend_and_pending_unknown()
-     {
+    -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-host-runtime-restart-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root)?;
         let completed_mutation_digest = "aa".repeat(32);
         let pending_mutation_digest = "bb".repeat(32);
         let completed_request = HostRuntimeControlRequest::new_with_mutation_digest(
             HostRuntimeControlOperation::RestartKernel,
-            PlatformHandle::new("completed-restart").unwrap(),
-            PlatformHandle::new(completed_mutation_digest.clone()).unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("completed-restart")?,
+            PlatformHandle::new(completed_mutation_digest.clone())?,
+        )?;
         let mut receipt = HostKernelRestartReceipt {
-            mutation_digest: PlatformHandle::new(completed_mutation_digest.clone()).unwrap(),
+            mutation_digest: PlatformHandle::new(completed_mutation_digest.clone())?,
             request_digest: completed_request.request_digest.clone(),
-            old_kernel_generation: PlatformHandle::new("a".repeat(64)).unwrap(),
-            new_kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
-            store_fence: PlatformHandle::new("c".repeat(64)).unwrap(),
-            activation_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
-            ready_receipt_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
-            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+            old_kernel_generation: PlatformHandle::new("a".repeat(64))?,
+            new_kernel_generation: PlatformHandle::new("b".repeat(64))?,
+            store_fence: PlatformHandle::new("c".repeat(64))?,
+            activation_receipt_digest: PlatformHandle::new("d".repeat(64))?,
+            ready_receipt_digest: PlatformHandle::new("e".repeat(64))?,
+            receipt_digest: PlatformHandle::new("0".repeat(64))?,
         };
-        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        receipt.receipt_digest = receipt.computed_digest()?;
         assert!(receipt.validate().is_ok());
-        persist_runtime_restart_receipt(&root, &receipt).unwrap();
-        assert!(!has_runtime_restart_pending(&root, &completed_mutation_digest).unwrap());
+        persist_runtime_restart_receipt(&root, &receipt)?;
+        assert!(!has_runtime_restart_pending(
+            &root,
+            &completed_mutation_digest
+        )?);
         let host = test_host();
         let pending_request = HostRuntimeControlRequest::new_with_mutation_digest(
             HostRuntimeControlOperation::RestartKernel,
-            PlatformHandle::new("pending-restart").unwrap(),
-            PlatformHandle::new(pending_mutation_digest.clone()).unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("pending-restart")?,
+            PlatformHandle::new(pending_mutation_digest.clone())?,
+        )?;
         assert_eq!(
-            persist_runtime_restart_pending(&root, &pending_request, &host).unwrap(),
+            persist_runtime_restart_pending(&root, &pending_request, &host)?,
             RuntimeRestartPendingPublication::Created
         );
-        assert!(has_runtime_restart_pending(&root, &pending_mutation_digest).unwrap());
+        assert!(has_runtime_restart_pending(
+            &root,
+            &pending_mutation_digest
+        )?);
         let stray_pending_path = runtime_restart_pending_path(&root, &completed_mutation_digest);
         assert!(
             !stray_pending_path.exists(),
             "completed receipt must delete pending"
         );
-        let reopened = load_durable_runtime_restarts(&root).unwrap();
+        let reopened = load_durable_runtime_restarts(&root)?;
         assert_eq!(
             reopened.len(),
             1,
@@ -19679,7 +19623,7 @@ mod journal_tests {
         );
         let loaded = reopened
             .get(&completed_mutation_digest)
-            .expect("receipt survives reopen");
+            .ok_or_else(|| std::io::Error::other("completed restart receipt missing"))?;
         assert_eq!(loaded.receipt_digest, receipt.receipt_digest);
         assert_eq!(loaded.mutation_digest.as_str(), completed_mutation_digest);
         let mut executor_calls = 0usize;
@@ -19692,55 +19636,53 @@ mod journal_tests {
         assert_eq!(executor_calls, 0);
         assert_eq!(reconciled.receipt_digest, receipt.receipt_digest);
         assert!(!reopened.contains_key(&pending_mutation_digest));
-        let pending_is_unknown = has_runtime_restart_pending(&root, &pending_mutation_digest)
-            .unwrap()
+        let pending_is_unknown = has_runtime_restart_pending(&root, &pending_mutation_digest)?
             && !reopened.contains_key(&pending_mutation_digest);
         assert!(pending_is_unknown, "pending-only must remain Unknown");
         let pending_reconcile = if reopened.contains_key(&pending_mutation_digest) {
             "Restarted"
-        } else if has_runtime_restart_pending(&root, &pending_mutation_digest).unwrap() {
+        } else if has_runtime_restart_pending(&root, &pending_mutation_digest)? {
             "Unknown"
         } else {
             "Missing"
         };
         assert_eq!(pending_reconcile, "Unknown");
-        let fake_receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+        let fake_receipt_bytes = serde_json::to_vec(&receipt)?;
         let wrong_name_path = runtime_restart_receipt_path(&root, "cc".repeat(32).as_str());
-        std::fs::write(wrong_name_path, &fake_receipt_bytes).unwrap();
+        std::fs::write(wrong_name_path, &fake_receipt_bytes)?;
         assert!(load_durable_runtime_restarts(&root).is_err());
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn durable_runtime_restart_pending_is_no_replace_and_exactly_bound() {
+    fn durable_runtime_restart_pending_is_no_replace_and_exactly_bound() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-host-runtime-restart-pending-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root)?;
         let host = test_host();
-        let mutation_digest = PlatformHandle::new("d1".repeat(32)).unwrap();
+        let mutation_digest = PlatformHandle::new("d1".repeat(32))?;
         let request = HostRuntimeControlRequest::new_with_mutation_digest(
             HostRuntimeControlOperation::RestartKernel,
-            PlatformHandle::new("pending-exact").unwrap(),
+            PlatformHandle::new("pending-exact")?,
             mutation_digest.clone(),
-        )
-        .unwrap();
+        )?;
         assert_eq!(
-            persist_runtime_restart_pending(&root, &request, &host).unwrap(),
+            persist_runtime_restart_pending(&root, &request, &host)?,
             RuntimeRestartPendingPublication::Created
         );
         let path = runtime_restart_pending_path(&root, mutation_digest.as_str());
-        let before = std::fs::read(&path).unwrap();
+        let before = std::fs::read(&path)?;
         assert_eq!(
-            persist_runtime_restart_pending(&root, &request, &host).unwrap(),
+            persist_runtime_restart_pending(&root, &request, &host)?,
             RuntimeRestartPendingPublication::Replay
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&path)?, before);
         assert!(
-            std::fs::read_dir(runtime_restart_store_dir(&root))
-                .unwrap()
+            std::fs::read_dir(runtime_restart_store_dir(&root))?
                 .flatten()
                 .all(
                     |entry| !entry.file_name().to_string_lossy().contains(".pending.")
@@ -19748,54 +19690,54 @@ mod journal_tests {
                 )
         );
 
-        std::fs::write(&path, br"{malformed").unwrap();
-        let malformed_before = std::fs::read(&path).unwrap();
+        std::fs::write(&path, br"{malformed")?;
+        let malformed_before = std::fs::read(&path)?;
         let malformed = persist_runtime_restart_pending(&root, &request, &host);
         assert!(matches!(malformed, Err(HostError::RecoveryRequired(_))));
-        assert_eq!(std::fs::read(&path).unwrap(), malformed_before);
+        assert_eq!(std::fs::read(&path)?, malformed_before);
 
-        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&path)?;
         assert_eq!(
-            persist_runtime_restart_pending(&root, &request, &host).unwrap(),
+            persist_runtime_restart_pending(&root, &request, &host)?,
             RuntimeRestartPendingPublication::Created
         );
-        let exact_before_conflict = std::fs::read(&path).unwrap();
+        let exact_before_conflict = std::fs::read(&path)?;
 
         let conflict_request = HostRuntimeControlRequest::new_with_mutation_digest(
             HostRuntimeControlOperation::RestartKernel,
-            PlatformHandle::new("pending-conflict").unwrap(),
+            PlatformHandle::new("pending-conflict")?,
             mutation_digest,
-        )
-        .unwrap();
+        )?;
         let conflict = persist_runtime_restart_pending(&root, &conflict_request, &host);
         assert!(matches!(conflict, Err(HostError::RecoveryRequired(_))));
-        assert_eq!(std::fs::read(&path).unwrap(), exact_before_conflict);
+        assert_eq!(std::fs::read(&path)?, exact_before_conflict);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn durable_runtime_restart_pending_rejects_unknown_fields_digest_flip_query_and_zero_epoch() {
+    fn durable_runtime_restart_pending_rejects_unknown_fields_digest_flip_query_and_zero_epoch()
+    -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-host-runtime-restart-pending-shape-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root)?;
         let host = test_host();
-        let mutation_digest = PlatformHandle::new("e1".repeat(32)).unwrap();
+        let mutation_digest = PlatformHandle::new("e1".repeat(32))?;
         let request = HostRuntimeControlRequest::new_with_mutation_digest(
             HostRuntimeControlOperation::RestartKernel,
-            PlatformHandle::new("pending-shape").unwrap(),
+            PlatformHandle::new("pending-shape")?,
             mutation_digest.clone(),
-        )
-        .unwrap();
+        )?;
         assert_eq!(
-            persist_runtime_restart_pending(&root, &request, &host).unwrap(),
+            persist_runtime_restart_pending(&root, &request, &host)?,
             RuntimeRestartPendingPublication::Created
         );
         let path = runtime_restart_pending_path(&root, mutation_digest.as_str());
-        let original_bytes = std::fs::read(&path).unwrap();
-        let original = serde_json::from_slice::<serde_json::Value>(&original_bytes).unwrap();
+        let original_bytes = std::fs::read(&path)?;
+        let original = serde_json::from_slice::<serde_json::Value>(&original_bytes)?;
 
         let mut unknown_field = original.clone();
         unknown_field["unexpected"] = serde_json::Value::Bool(true);
@@ -19816,54 +19758,54 @@ mod journal_tests {
             epoch_zero,
             mutation_flip,
         ] {
-            let bytes = serde_json::to_vec(&candidate).unwrap();
-            std::fs::write(&path, &bytes).unwrap();
+            let bytes = serde_json::to_vec(&candidate)?;
+            std::fs::write(&path, &bytes)?;
             let result = persist_runtime_restart_pending(&root, &request, &host);
             assert!(matches!(result, Err(HostError::RecoveryRequired(_))));
-            assert_eq!(std::fs::read(&path).unwrap(), bytes);
-            std::fs::write(&path, &original_bytes).unwrap();
+            assert_eq!(std::fs::read(&path)?, bytes);
+            std::fs::write(&path, &original_bytes)?;
         }
 
         let reconcile = HostRuntimeControlRequest::new_reconcile(
-            PlatformHandle::new("pending-query").unwrap(),
+            PlatformHandle::new("pending-query")?,
             mutation_digest,
-        )
-        .unwrap();
+        )?;
         let result = persist_runtime_restart_pending(&root, &reconcile, &host);
         assert!(matches!(result, Err(HostError::RecoveryRequired(_))));
-        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(std::fs::read(&path)?, original_bytes);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn durable_runtime_restart_receipt_loader_is_fail_closed_before_adoption_or_restart() {
+    fn durable_runtime_restart_receipt_loader_is_fail_closed_before_adoption_or_restart()
+    -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-host-runtime-restart-loader-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root)?;
         let mutation_digest = "a1".repeat(32);
         let request = HostRuntimeControlRequest::new_with_mutation_digest(
             HostRuntimeControlOperation::RestartKernel,
-            PlatformHandle::new("loader-restart").unwrap(),
-            PlatformHandle::new(mutation_digest.clone()).unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("loader-restart")?,
+            PlatformHandle::new(mutation_digest.clone())?,
+        )?;
         let mut receipt = HostKernelRestartReceipt {
             mutation_digest: request.mutation_digest.clone(),
             request_digest: request.request_digest.clone(),
-            old_kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
-            new_kernel_generation: PlatformHandle::new("c".repeat(64)).unwrap(),
-            store_fence: PlatformHandle::new("d".repeat(64)).unwrap(),
-            activation_receipt_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
-            ready_receipt_digest: PlatformHandle::new("f".repeat(64)).unwrap(),
-            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+            old_kernel_generation: PlatformHandle::new("b".repeat(64))?,
+            new_kernel_generation: PlatformHandle::new("c".repeat(64))?,
+            store_fence: PlatformHandle::new("d".repeat(64))?,
+            activation_receipt_digest: PlatformHandle::new("e".repeat(64))?,
+            ready_receipt_digest: PlatformHandle::new("f".repeat(64))?,
+            receipt_digest: PlatformHandle::new("0".repeat(64))?,
         };
-        receipt.receipt_digest = receipt.computed_digest().unwrap();
-        persist_runtime_restart_receipt(&root, &receipt).unwrap();
+        receipt.receipt_digest = receipt.computed_digest()?;
+        persist_runtime_restart_receipt(&root, &receipt)?;
         let exact_path = runtime_restart_receipt_path(&root, &mutation_digest);
-        let exact_bytes = std::fs::read(&exact_path).unwrap();
+        let exact_bytes = std::fs::read(&exact_path)?;
         let mut physical_restart_calls = 0usize;
         let adopt_or_restart = |calls: &mut usize| {
             let loaded = load_durable_runtime_restarts(&root);
@@ -19876,27 +19818,27 @@ mod journal_tests {
         adopt_or_restart(&mut physical_restart_calls);
         assert_eq!(physical_restart_calls, 0, "valid receipt is adopted");
 
-        std::fs::write(&exact_path, br"{malformed").unwrap();
+        std::fs::write(&exact_path, br"{malformed")?;
         assert!(load_durable_runtime_restarts(&root).is_err());
         adopt_or_restart(&mut physical_restart_calls);
         assert_eq!(
             physical_restart_calls, 0,
             "malformed receipt fences admission"
         );
-        std::fs::write(&exact_path, &exact_bytes).unwrap();
+        std::fs::write(&exact_path, &exact_bytes)?;
 
         let wrong_name = runtime_restart_store_dir(&root).join("not-a-digest.receipt.json");
-        std::fs::write(&wrong_name, &exact_bytes).unwrap();
+        std::fs::write(&wrong_name, &exact_bytes)?;
         assert!(load_durable_runtime_restarts(&root).is_err());
         adopt_or_restart(&mut physical_restart_calls);
         assert_eq!(
             physical_restart_calls, 0,
             "wrong-name receipt fences admission"
         );
-        std::fs::remove_file(&wrong_name).unwrap();
+        std::fs::remove_file(&wrong_name)?;
 
         let duplicate_name = runtime_restart_receipt_path(&root, &"b2".repeat(32));
-        std::fs::write(&duplicate_name, &exact_bytes).unwrap();
+        std::fs::write(&duplicate_name, &exact_bytes)?;
         assert!(load_durable_runtime_restarts(&root).is_err());
         adopt_or_restart(&mut physical_restart_calls);
         assert_eq!(
@@ -19904,6 +19846,7 @@ mod journal_tests {
             "conflicting duplicate fences admission"
         );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[cfg(all(windows, feature = "test-support"))]
@@ -19912,47 +19855,42 @@ mod journal_tests {
         clippy::too_many_lines,
         reason = "the regression drives the real redb reopen path with exact outer, termination, and inner durable records"
     )]
-    fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_epoch() {
+    fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_epoch()
+    -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "eliot-host-store-recovery-open-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root)?;
         let journal_path = root.join(HOST_JOURNAL_FILE_NAME);
         let host = fresh_host_epoch(
-            PlatformHandle::new("store-recovery-physical-installation").unwrap(),
+            PlatformHandle::new("store-recovery-physical-installation")?,
             None,
-        )
-        .unwrap();
+        )?;
         let activation_generation =
-            root_epoch(fresh_identity("store-recovery-physical-generation").unwrap());
-        let activation_id = fresh_identity("store-recovery-physical-activation").unwrap();
-        let backend = RedbJournalBackend::open_unprotected_for_test(&journal_path).unwrap();
-        let journal = HostStateJournalService::from_backend(backend, host.clone()).unwrap();
+            root_epoch(fresh_identity("store-recovery-physical-generation")?);
+        let activation_id = fresh_identity("store-recovery-physical-activation")?;
+        let backend = RedbJournalBackend::open_unprotected_for_test(&journal_path)?;
+        let journal = HostStateJournalService::from_backend(backend, host.clone())?;
         append_reconciled(
             &journal,
-            HostStateRecord::Activation(
-                initial_activation_record(
-                    &host,
-                    &activation_id,
-                    &activation_generation,
-                    ActivationState::Starting,
-                    "store-recovery-physical-starting",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &activation_generation,
+                ActivationState::Starting,
+                "store-recovery-physical-starting",
+            )?),
+        )?;
 
-        let mutation_digest = PlatformHandle::new("a7".repeat(32)).unwrap();
+        let mutation_digest = PlatformHandle::new("a7".repeat(32))?;
         let request = HostRuntimeControlRequest::new_with_mutation_digest(
             HostRuntimeControlOperation::RecoverStore,
-            PlatformHandle::new("store-recovery-physical-request").unwrap(),
+            PlatformHandle::new("store-recovery-physical-request")?,
             mutation_digest.clone(),
-        )
-        .unwrap();
+        )?;
         assert_eq!(
-            persist_store_recovery_pending(&root, &request, &host).unwrap(),
+            persist_store_recovery_pending(&root, &request, &host)?,
             StoreRecoveryPendingPublication::Created
         );
         let termination = StoreRecoveryTerminationEvidence {
@@ -19971,29 +19909,25 @@ mod journal_tests {
             root_reaped: true,
             restart_attempt: 1,
         };
-        termination
-            .validate_for_digest(mutation_digest.as_str())
-            .unwrap();
+        termination.validate_for_digest(mutation_digest.as_str())?;
         std::fs::write(
             store_recovery_termination_path(&root, mutation_digest.as_str()),
-            serde_json::to_vec(&termination).unwrap(),
-        )
-        .unwrap();
+            serde_json::to_vec(&termination)?,
+        )?;
 
         let generation = ResourceGeneration::genesis();
         let authority_epoch = AuthorityEpoch::genesis();
         let requirement = HostStoreBootstrapRequirement {
-            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)
-                .unwrap(),
-            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
+            route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)?,
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")?,
             store_generation: generation,
             state_fence: StateFence::new(authority_epoch, generation),
-            launch_nonce: PlatformHandle::new("store-recovery-physical-nonce").unwrap(),
-            connection_id: PlatformHandle::new("store-recovery-physical-connection").unwrap(),
-            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            launch_nonce: PlatformHandle::new("store-recovery-physical-nonce")?,
+            connection_id: PlatformHandle::new("store-recovery-physical-connection")?,
+            expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
             expected_peer_session_id: 0,
-            approved_artifact_hash: PlatformHandle::new("b".repeat(64)).unwrap(),
-            approved_config_hash: PlatformHandle::new("c".repeat(64)).unwrap(),
+            approved_artifact_hash: PlatformHandle::new("b".repeat(64))?,
+            approved_config_hash: PlatformHandle::new("c".repeat(64))?,
             timeout_ms: 5_000,
         };
         let process_binding = StoreProcessBinding {
@@ -20002,10 +19936,10 @@ mod journal_tests {
                 start_time_100ns: 42_020,
                 image_path: r"C:\Eliot\store-new.exe".to_owned(),
             },
-            job: PlatformHandle::new(r"Local\Eliot-Store-new").unwrap(),
+            job: PlatformHandle::new(r"Local\Eliot-Store-new")?,
         };
         let mut handoff = StoreRebindHandoff {
-            operation_id: PlatformHandle::new("store-recovery-physical-inner").unwrap(),
+            operation_id: PlatformHandle::new("store-recovery-physical-inner")?,
             request_digest: "0".repeat(64),
             requirement: requirement.clone(),
             process_binding: process_binding.clone(),
@@ -20014,28 +19948,28 @@ mod journal_tests {
             authority_epoch,
             store_fence: "e".repeat(64),
         };
-        handoff.request_digest = handoff.canonical_request_digest().unwrap();
-        handoff.validate_canonical_digest().unwrap();
-        persist_store_recovery_inner_binding(&root, &request, &host, &handoff).unwrap();
+        handoff.request_digest = handoff.canonical_request_digest()?;
+        handoff.validate_canonical_digest()?;
+        persist_store_recovery_inner_binding(&root, &request, &host, &handoff)?;
         assert_eq!(
-            persist_store_recovery_pending(&root, &request, &host).unwrap(),
+            persist_store_recovery_pending(&root, &request, &host)?,
             StoreRecoveryPendingPublication::Replay
         );
-        persist_store_recovery_inner_binding(&root, &request, &host, &handoff).unwrap();
+        persist_store_recovery_inner_binding(&root, &request, &host, &handoff)?;
         let pending_inner = StoreRebindRecord {
             fence: record_fence(&host, &activation_id, &activation_generation),
-            operation: operation("store-recovery-physical-inner-pending").unwrap(),
+            operation: operation("store-recovery-physical-inner-pending")?,
             state: StoreRebindState::Pending,
             operation_id: handoff.operation_id.clone(),
-            request_digest: PlatformHandle::new(handoff.request_digest.clone()).unwrap(),
-            requirement: PlatformHandle::new(sha256_json(&requirement).unwrap()).unwrap(),
-            candidate_binding_digest: PlatformHandle::new(handoff.candidate_binding_digest.clone())
-                .unwrap(),
-            store_fence: PlatformHandle::new(handoff.store_fence.clone()).unwrap(),
+            request_digest: PlatformHandle::new(handoff.request_digest.clone())?,
+            requirement: PlatformHandle::new(sha256_json(&requirement)?)?,
+            candidate_binding_digest: PlatformHandle::new(
+                handoff.candidate_binding_digest.clone(),
+            )?,
+            store_fence: PlatformHandle::new(handoff.store_fence.clone())?,
             process_id: process_binding.process.process_id,
             process_start_time_100ns: process_binding.process.start_time_100ns,
-            process_image_path: PlatformHandle::new(process_binding.process.image_path.clone())
-                .unwrap(),
+            process_image_path: PlatformHandle::new(process_binding.process.image_path.clone())?,
             job_name: process_binding.job.clone(),
             generation: generation.value(),
             authority_epoch: authority_epoch.value(),
@@ -20045,27 +19979,27 @@ mod journal_tests {
         append_reconciled(
             &journal,
             HostStateRecord::StoreRebind(pending_inner.clone()),
-        )
-        .unwrap();
+        )?;
         let mut committed_inner = pending_inner;
-        committed_inner.operation = operation("store-recovery-physical-inner-commit").unwrap();
+        committed_inner.operation = operation("store-recovery-physical-inner-commit")?;
         committed_inner.state = StoreRebindState::Committed;
         committed_inner.receipt_request_digest = Some(committed_inner.request_digest.clone());
         committed_inner.receipt_store_fence = Some(committed_inner.store_fence.clone());
         append_reconciled(
             &journal,
             HostStateRecord::StoreRebind(committed_inner.clone()),
-        )
-        .unwrap();
+        )?;
 
-        let fences = load_durable_store_recoveries(&root).unwrap();
+        let fences = load_durable_store_recoveries(&root)?;
         assert_eq!(fences.len(), 1);
-        let physical_snapshot = journal.snapshot().unwrap();
-        fences[0]
-            .validate_for_reopen(&host, &physical_snapshot)
-            .unwrap();
+        let physical_snapshot = journal.snapshot()?;
+        fences[0].validate_for_reopen(&host, &physical_snapshot)?;
         let mut substituted = fences[0].clone();
-        substituted.inner.as_mut().unwrap().request_digest = "f".repeat(64);
+        substituted
+            .inner
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?
+            .request_digest = "f".repeat(64);
         assert!(
             substituted
                 .validate_for_reopen(&host, &physical_snapshot)
@@ -20073,8 +20007,7 @@ mod journal_tests {
         );
         drop(journal);
 
-        let reopened_backend =
-            RedbJournalBackend::open_unprotected_for_test(&journal_path).unwrap();
+        let reopened_backend = RedbJournalBackend::open_unprotected_for_test(&journal_path)?;
         let (reopened, reopened_host, _, _, startup_fenced, active_rebind_recovery) =
             open_production_epoch_from_backend(
                 reopened_backend,
@@ -20082,8 +20015,7 @@ mod journal_tests {
                 None,
                 None,
                 &fences,
-            )
-            .unwrap();
+            )?;
         assert!(startup_fenced.is_fenced());
         assert_eq!(active_rebind_recovery, ActivePhaseBRebindRecoveryKind::None);
         assert_eq!(
@@ -20094,7 +20026,7 @@ mod journal_tests {
             reopened_host.epoch.parent, host.epoch.parent,
             "fenced startup must not create a child host epoch"
         );
-        let reopened_state = reopened.snapshot().unwrap();
+        let reopened_state = reopened.snapshot()?;
         assert_eq!(
             reopened_state
                 .activation
@@ -20110,6 +20042,7 @@ mod journal_tests {
         );
         drop(reopened);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[cfg(all(windows, feature = "test-support"))]
@@ -20118,11 +20051,10 @@ mod journal_tests {
         clippy::too_many_lines,
         reason = "the feature-gated regression carries physical redb epoch/rebind recovery through the production Host composition"
     )]
-    fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() {
-        let (mut manifest, root) = liveness_manifest_with_distinct_store_digests();
+    fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestResult {
+        let (mut manifest, root) = liveness_manifest_with_distinct_store_digests()?;
         let portable = root.join("portable");
-        let portable_lease = UserOwnedRootLease::open_existing(&portable)
-            .expect("temporary protected-equivalent PortableDev root");
+        let portable_lease = UserOwnedRootLease::open_existing(&portable)?;
         let installation = manifest
             .runtime_launch
             .installation_epoch
@@ -20132,16 +20064,14 @@ mod journal_tests {
         let registry_path = portable.join("installation-registry.redb");
 
         let (root_journal, root_host, root_activation_generation, root_activation_id, root_kind) =
-            open_test_support_epoch(&journal_path, installation.clone(), None, None)
-                .expect("physical root Host epoch");
+            open_test_support_epoch(&journal_path, installation.clone(), None, None)?;
         assert_eq!(root_kind, ActivePhaseBRebindRecoveryKind::None);
         append_clean_marker(
             &root_journal,
             &root_host,
             &root_activation_id,
             &root_activation_generation,
-        )
-        .expect("root clean marker");
+        )?;
         drop(root_journal);
 
         let (
@@ -20150,8 +20080,7 @@ mod journal_tests {
             first_activation_generation,
             first_activation_id,
             first_kind,
-        ) = open_test_support_epoch(&journal_path, installation.clone(), None, None)
-            .expect("physical direct-child Host epoch");
+        ) = open_test_support_epoch(&journal_path, installation.clone(), None, None)?;
         assert_eq!(first_kind, ActivePhaseBRebindRecoveryKind::None);
         assert_eq!(
             first_host.epoch.parent,
@@ -20162,52 +20091,38 @@ mod journal_tests {
             &mut manifest,
             &first_host,
             descriptor_generation,
-        );
+        )?;
 
         // Keep the candidate in its real Phase-A state. Host's first
         // publication is the only operation allowed to turn these markers
         // into physical Phase-B authority bytes.
-        let pending_phase_b =
-            PlatformHandle::new(PHASE_B_PENDING_MARKER).expect("Phase-B pending marker");
+        let pending_phase_b = PlatformHandle::new(PHASE_B_PENDING_MARKER)?;
         manifest.runtime_launch.authority_descriptor_digest = pending_phase_b.clone();
         manifest.runtime_launch.store_bootstrap_descriptor_digest = pending_phase_b.clone();
         manifest.runtime_launch.kernel_arguments[5] = pending_phase_b.clone();
         manifest.runtime_launch.kernel_arguments[9] = pending_phase_b;
-        manifest.runtime_launch.descriptor_digest = PlatformHandle::new(
-            manifest
-                .runtime_launch
-                .compute_digest()
-                .expect("pending runtime launch digest"),
-        )
-        .expect("pending runtime launch digest handle");
+        manifest.runtime_launch.descriptor_digest =
+            PlatformHandle::new(manifest.runtime_launch.compute_digest()?)?;
         let config_path = Path::new(manifest.config_path.as_str());
-        let mut config = serde_json::from_slice::<serde_json::Value>(
-            &std::fs::read(config_path).expect("Phase-A Store config template"),
-        )
-        .expect("Phase-A Store config JSON");
-        config["runtime_launch"] =
-            serde_json::to_value(&manifest.runtime_launch).expect("pending runtime launch JSON");
+        let mut config = serde_json::from_slice::<serde_json::Value>(&std::fs::read(config_path)?)?;
+        config["runtime_launch"] = serde_json::to_value(&manifest.runtime_launch)?;
         config["approved_config_hash"] =
             serde_json::Value::String(STORE_SEMANTIC_CONFIG_HASH_PENDING.to_owned());
-        let semantic_config_hash = semantic_store_config_hash_from_json(
-            &serde_json::to_vec(&config).expect("pending config without semantic hash"),
-        )
-        .expect("pending semantic config hash");
+        let semantic_config_hash =
+            semantic_store_config_hash_from_json(&serde_json::to_vec(&config)?)?;
         config["approved_config_hash"] =
             serde_json::Value::String(semantic_config_hash.as_str().to_owned());
-        let config_bytes = serde_json::to_vec(&config).expect("pending Store config bytes");
+        let config_bytes = serde_json::to_vec(&config)?;
         manifest.config_digest =
-            PlatformHandle::new(format!("{:x}", Sha256::digest(&config_bytes)))
-                .expect("pending Store config digest");
-        std::fs::write(config_path, config_bytes).expect("rewrite pending Store config template");
+            PlatformHandle::new(format!("{:x}", Sha256::digest(&config_bytes)))?;
+        std::fs::write(config_path, config_bytes)?;
         std::fs::remove_file(Path::new(
             manifest
                 .runtime_launch
                 .store_bootstrap_descriptor_path
                 .as_str(),
-        ))
-        .expect("Phase-A bootstrap remains an absent first-publication destination");
-        manifest.validate().expect("Phase-A fixture manifest");
+        ))?;
+        manifest.validate()?;
 
         let handle = |value: String| PlatformHandle::new(value).unwrap_or_else(|_| unreachable!());
         let mut prior = active_startup_prior_binding(
@@ -20235,28 +20150,23 @@ mod journal_tests {
         };
         let transaction_id = handle("transaction:physical-phase-b".to_owned());
         let plan_digest = handle("8".repeat(64));
-        let owner_lease =
-            HostOwnerLease::acquire(&installation).expect("physical Host owner epoch lease");
-        let registry_store = RedbInstallationRegistry::open_test_support(&registry_path)
-            .expect("physical registry redb");
-        registry_store
-            .seed_active_generation_for_test_support(
-                &owner_lease.activation_capability(),
-                &manifest,
-                &transaction_id,
-                &plan_digest,
-                &commit_fence,
-            )
-            .expect("registry active-generation CAS seed");
-        let registry = registry_store.load().expect("seeded registry readback");
+        let owner_lease = HostOwnerLease::acquire(&installation)?;
+        let registry_store = RedbInstallationRegistry::open_test_support(&registry_path)?;
+        registry_store.seed_active_generation_for_test_support(
+            &owner_lease.activation_capability(),
+            &manifest,
+            &transaction_id,
+            &plan_digest,
+            &commit_fence,
+        )?;
+        let registry = registry_store.load()?;
         let launch_options = HostLaunchOptions {
             config_descriptor_path: PathBuf::from(
                 manifest.runtime_launch.authority_descriptor_path.as_str(),
             ),
             config_descriptor_digest: phase_b_scm_selector(
                 &manifest.runtime_launch.authority_descriptor_digest,
-            )
-            .expect("SCM authority selector"),
+            )?,
             installation: installation.clone(),
             transaction_plan_generation: manifest.runtime_launch.authority_generation.value(),
             host_state_root: PathBuf::from(
@@ -20280,8 +20190,7 @@ mod journal_tests {
                                  activation_generation: EpochTransition,
                                  activation_id: PlatformHandle,
                                  owner_lease: HostOwnerLease| {
-            let jobs =
-                HostJobBranches::new_test_support(&host).expect("physical Host Job branches");
+            let jobs = HostJobBranches::new_test_support(&host)?;
             HostComposition {
                 store_rebind_boundary: HostStoreRebindProductionBoundary,
                 runtime_control_boundary: HostRuntimeControlProductionBoundary,
@@ -20323,18 +20232,19 @@ mod journal_tests {
             .registry
             .active()
             .cloned()
-            .expect("active approved generation");
-        first
-            .rebind_active_phase_b(&first_active, ActivePhaseBRebindRecoveryKind::None)
-            .expect("first physical Phase-B publication");
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
+        first.rebind_active_phase_b(&first_active, ActivePhaseBRebindRecoveryKind::None)?;
         assert!(first.jobs.kernel.is_none());
         assert!(first.jobs.store.is_none());
         let first_rebind = first
             .registry
             .active_phase_b_rebind()
             .cloned()
-            .expect("durable first rebind");
-        let first_receipt = first_rebind.receipt.clone().expect("durable first receipt");
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
+        let first_receipt = first_rebind
+            .receipt
+            .clone()
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         assert!(
             ActivePhaseBRebindRecovery::new(
                 &first_rebind,
@@ -20358,15 +20268,12 @@ mod journal_tests {
             Err(HostError::OwnerLeaseRecovery(_))
         ));
 
-        let registry_after_store = RedbInstallationRegistry::open_test_support(&registry_path)
-            .expect("registry reopen after crash");
-        let registry_after = registry_after_store
-            .load()
-            .expect("registry crash readback");
+        let registry_after_store = RedbInstallationRegistry::open_test_support(&registry_path)?;
+        let registry_after = registry_after_store.load()?;
         let active_rebind_after_crash = registry_after
             .active_phase_b_rebind()
             .cloned()
-            .expect("completed active rebind for recovery");
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         drop(registry_after_store);
         let (
             second_journal,
@@ -20379,8 +20286,7 @@ mod journal_tests {
             installation.clone(),
             None,
             Some(&active_rebind_after_crash),
-        )
-        .expect("direct-child recovery epoch");
+        )?;
         assert_eq!(
             second_kind,
             ActivePhaseBRebindRecoveryKind::CompletedReceipt
@@ -20389,13 +20295,9 @@ mod journal_tests {
             second_host.epoch.parent,
             Some(first_host.epoch.current.clone())
         );
-        let recovery_owner_lease =
-            HostOwnerLease::acquire(&installation).expect("fresh Host owner after crash");
-        let recovery_registry_store = RedbInstallationRegistry::open_test_support(&registry_path)
-            .expect("registry redb for fresh owner");
-        let recovery_registry = recovery_registry_store
-            .load()
-            .expect("fresh registry readback");
+        let recovery_owner_lease = HostOwnerLease::acquire(&installation)?;
+        let recovery_registry_store = RedbInstallationRegistry::open_test_support(&registry_path)?;
+        let recovery_registry = recovery_registry_store.load()?;
         let mut second = build_composition(
             second_journal,
             recovery_registry_store,
@@ -20410,23 +20312,24 @@ mod journal_tests {
             .registry
             .active()
             .cloned()
-            .expect("active generation after recovery");
-        second
-            .rebind_active_phase_b(&second_active, second_kind)
-            .expect("fresh-owner exact rebind");
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
+        second.rebind_active_phase_b(&second_active, second_kind)?;
         assert!(second.jobs.kernel.is_none());
         assert!(second.jobs.store.is_none());
         let current_rebind = second
             .registry
             .active_phase_b_rebind()
             .cloned()
-            .expect("current fresh-owner rebind");
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         assert_eq!(current_rebind.recovery_history.len(), 1);
         assert_eq!(
             current_rebind.recovery_history[0].prior_receipt,
             first_receipt
         );
-        let current_receipt = current_rebind.receipt.clone().expect("fresh receipt");
+        let current_receipt = current_rebind
+            .receipt
+            .clone()
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         assert_ne!(
             current_receipt.host_owner_epoch,
             first_receipt.host_owner_epoch
@@ -20439,12 +20342,7 @@ mod journal_tests {
             current_receipt.host_process_nonce_digest,
             first_receipt.host_process_nonce_digest
         );
-        let file_digest = |path: &Path| {
-            format!(
-                "{:x}",
-                Sha256::digest(std::fs::read(path).expect("exact Phase-B readback"))
-            )
-        };
+        let file_digest = |path: &Path| format!("{:x}", Sha256::digest(std::fs::read(path)?));
         assert_eq!(
             file_digest(Path::new(
                 manifest.runtime_launch.authority_descriptor_path.as_str(),
@@ -20474,54 +20372,45 @@ mod journal_tests {
         let before = [
             std::fs::read(Path::new(
                 manifest.runtime_launch.authority_descriptor_path.as_str(),
-            ))
-            .expect("authority bytes before idempotent retry"),
-            std::fs::read(Path::new(manifest.config_path.as_str()))
-                .expect("config bytes before idempotent retry"),
+            ))?,
+            std::fs::read(Path::new(manifest.config_path.as_str()))?,
             std::fs::read(Path::new(
                 manifest
                     .runtime_launch
                     .store_bootstrap_descriptor_path
                     .as_str(),
-            ))
-            .expect("bootstrap bytes before idempotent retry"),
+            ))?,
             std::fs::read(Path::new(
                 manifest.runtime_launch.eliotd_descriptor_path.as_str(),
-            ))
-            .expect("eliotd bytes before idempotent retry"),
+            ))?,
         ];
-        second
-            .rebind_active_phase_b(&second_active, ActivePhaseBRebindRecoveryKind::None)
-            .expect("exact receipt rehydration");
+        second.rebind_active_phase_b(&second_active, ActivePhaseBRebindRecoveryKind::None)?;
         let retry_receipt = second
             .registry
             .active_phase_b_rebind()
             .and_then(|rebind| rebind.receipt.as_ref())
-            .expect("receipt after idempotent retry");
+            .ok_or_else(|| std::io::Error::other("retry receipt missing"))?;
         assert_eq!(retry_receipt.receipt_digest, current_receipt.receipt_digest);
         let after = [
             std::fs::read(Path::new(
                 manifest.runtime_launch.authority_descriptor_path.as_str(),
-            ))
-            .expect("authority bytes after idempotent retry"),
-            std::fs::read(Path::new(manifest.config_path.as_str()))
-                .expect("config bytes after idempotent retry"),
+            ))?,
+            std::fs::read(Path::new(manifest.config_path.as_str()))?,
             std::fs::read(Path::new(
                 manifest
                     .runtime_launch
                     .store_bootstrap_descriptor_path
                     .as_str(),
-            ))
-            .expect("bootstrap bytes after idempotent retry"),
+            ))?,
             std::fs::read(Path::new(
                 manifest.runtime_launch.eliotd_descriptor_path.as_str(),
-            ))
-            .expect("eliotd bytes after idempotent retry"),
+            ))?,
         ];
         assert_eq!(before, after);
         drop(second);
         drop(portable_lease);
-        std::fs::remove_dir_all(root).expect("remove physical Phase-B fixture root");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }
 
@@ -20540,9 +20429,10 @@ mod tests {
         HostStoreRecoveryReceipt, KERNEL_BOOTSTRAP_ENVIRONMENT, KERNEL_CONTROL_PIPE,
         KernelControlResponse, KernelLaunchBinding, KernelServiceState, PlatformHandle,
         ReconciliationObservation, ReconciliationState, ScmStoreRecoveryRoute,
-        StoreKernelLaunchError, StoreLivenessEvidence, StoreRecoveryRequired,
-        activation_response_or_reconcile, fresh_host_epoch, host_owned_store_recovery_request,
-        launch_store_then_kernel, reconcile_state_machine, route_scm_store_recovery,
+        StoreKernelLaunchError, StoreLivenessEvidence, StoreRecoveryRequired, TestError,
+        TestResult, activation_response_or_reconcile, fresh_host_epoch,
+        host_owned_store_recovery_request, launch_store_then_kernel, reconcile_state_machine,
+        route_scm_store_recovery,
     };
     use eliot_platform_windows::JobObjectIdentity;
 
@@ -20559,13 +20449,11 @@ mod tests {
         }
     }
 
-    fn launch_environment(kernel: Option<&KernelLaunchBinding>) -> BTreeMap<String, String> {
-        let host = fresh_host_epoch(
-            PlatformHandle::new("launch-test-installation").expect("installation"),
-            None,
-        )
-        .expect("host epoch");
-        let roots_digest = PlatformHandle::new("a".repeat(64)).expect("roots digest");
+    fn launch_environment(
+        kernel: Option<&KernelLaunchBinding>,
+    ) -> Result<BTreeMap<String, String>, TestError> {
+        let host = fresh_host_epoch(PlatformHandle::new("launch-test-installation")?, None)?;
+        let roots_digest = PlatformHandle::new("a".repeat(64))?;
         let receipt_binding = kernel.map(|_| {
             (
                 Path::new(r"C:\\ProgramData\\Eliot"),
@@ -20573,7 +20461,7 @@ mod tests {
                 &roots_digest,
             )
         });
-        HostJobBranches::environment_from(
+        Ok(HostJobBranches::environment_from(
             [
                 (OsString::from("Path"), OsString::from(r"C:\\Windows")),
                 (
@@ -20618,11 +20506,11 @@ mod tests {
                 ),
             ],
             &host,
-            &PlatformHandle::new("generation").expect("generation"),
-            &PlatformHandle::new("config-digest").expect("config"),
-            &PlatformHandle::new("artifact-digest").expect("artifact"),
+            &PlatformHandle::new("generation")?,
+            &PlatformHandle::new("config-digest")?,
+            &PlatformHandle::new("artifact-digest")?,
             Path::new(r"C:\\eliot\\config.json"),
-            &JobObjectIdentity::new(r"Local\Eliot-Host-Test").expect("job"),
+            &JobObjectIdentity::new(r"Local\Eliot-Host-Test")?,
             kernel,
             receipt_binding,
         )
@@ -20633,34 +20521,30 @@ mod tests {
                 value.to_string_lossy().into_owned(),
             )
         })
-        .collect()
+        .collect())
     }
 
     #[test]
-    fn fenced_startup_job_projection_has_no_process_or_child_contour() {
-        let host = fresh_host_epoch(
-            PlatformHandle::new("fenced-startup-job-projection").expect("installation"),
-            None,
-        )
-        .expect("host epoch");
-        let jobs = HostJobBranches::new_fenced(&host).expect("fenced job projection");
+    fn fenced_startup_job_projection_has_no_process_or_child_contour() -> TestResult {
+        let host = fresh_host_epoch(PlatformHandle::new("fenced-startup-job-projection")?, None)?;
+        let jobs = HostJobBranches::new_fenced(&host)?;
         assert!(jobs.kernel.is_none());
         assert!(jobs.store.is_none());
         assert!(jobs.kernel_launch_binding.is_none());
         assert!(!jobs.has_recorded_contour());
+        Ok(())
     }
 
     #[test]
-    fn kill_on_close_crash_fence_is_operation_specific_and_never_positive_attach() {
+    fn kill_on_close_crash_fence_is_operation_specific_and_never_positive_attach() -> TestResult {
         assert_eq!(
             HOST_STORE_RECOVERY_KILL_ON_JOB_CLOSE_CRASH_FENCE_DISCRIMINATOR,
             "eliot-host::store-recovery::kill-on-job-close-crash-fence:v1"
         );
         let request = HostRuntimeControlRequest::new_store_reconcile(
-            PlatformHandle::new("store-recovery-crash-fence-query").unwrap(),
-            PlatformHandle::new("a".repeat(64)).unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("store-recovery-crash-fence-query")?,
+            PlatformHandle::new("a".repeat(64))?,
+        )?;
         let pending_ref = super::runtime_control_unknown_ref(
             super::STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON,
             &request,
@@ -20670,20 +20554,20 @@ mod tests {
         assert!(pending_ref.as_str().contains("store-recovery-crash-fence"));
 
         let host = fresh_host_epoch(
-            PlatformHandle::new("store-recovery-crash-fence-host").unwrap(),
+            PlatformHandle::new("store-recovery-crash-fence-host")?,
             None,
-        )
-        .unwrap();
-        let jobs = HostJobBranches::new_fenced(&host).unwrap();
+        )?;
+        let jobs = HostJobBranches::new_fenced(&host)?;
         assert!(jobs.kernel.is_none());
         assert!(jobs.store.is_none());
         assert!(jobs.launch.is_none());
         assert!(jobs.kernel_launch_binding.is_none());
+        Ok(())
     }
 
     #[test]
-    fn store_and_unrelated_child_environment_scrubs_kernel_bootstrap_authority() {
-        let environment = launch_environment(None);
+    fn store_and_unrelated_child_environment_scrubs_kernel_bootstrap_authority() -> TestResult {
+        let environment = launch_environment(None)?;
         assert_eq!(
             environment.get("Path").map(String::as_str),
             Some(r"C:\\Windows")
@@ -20692,19 +20576,20 @@ mod tests {
             assert!(!environment.keys().any(|key| key.eq_ignore_ascii_case(name)));
         }
         assert!(!environment.contains_key("ELIOT_ACTIVATION_NONCE"));
+        Ok(())
     }
 
     #[test]
-    fn kernel_launch_environment_uses_exact_retained_binding() {
+    fn kernel_launch_environment_uses_exact_retained_binding() -> TestResult {
         let binding = KernelLaunchBinding {
-            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).expect("pipe"),
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE)?,
             host_process: HostProcessBinding {
                 process_id: 41,
                 start_time_100ns: 73,
                 image_path: r"C:\\eliot\\eliot-host.exe".to_owned(),
             },
         };
-        let environment = launch_environment(Some(&binding));
+        let environment = launch_environment(Some(&binding))?;
         assert_eq!(
             environment
                 .get("ELIOT_KERNEL_CONTROL_PIPE")
@@ -20756,12 +20641,13 @@ mod tests {
             Some("generation")
         );
         assert!(!environment.contains_key("ELIOT_ACTIVATION_NONCE"));
+        Ok(())
     }
 
     #[test]
-    fn retained_host_binding_rejects_pid_reuse_and_image_substitution() {
+    fn retained_host_binding_rejects_pid_reuse_and_image_substitution() -> TestResult {
         let binding = KernelLaunchBinding {
-            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).expect("pipe"),
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE)?,
             host_process: HostProcessBinding {
                 process_id: 41,
                 start_time_100ns: 73,
@@ -20772,12 +20658,13 @@ mod tests {
         assert!(!binding.matches_observed(42, 73, r"C:\\eliot\\eliot-host.exe"));
         assert!(!binding.matches_observed(41, 74, r"C:\\eliot\\eliot-host.exe"));
         assert!(!binding.matches_observed(41, 73, r"C:\\eliot\\replacement.exe"));
+        Ok(())
     }
 
     #[test]
-    fn cutover_launch_discriminator_selects_only_the_process_that_was_launched() {
-        let candidate = PlatformHandle::new("candidate-generation").expect("candidate");
-        let prior = PlatformHandle::new("prior-generation").expect("prior");
+    fn cutover_launch_discriminator_selects_only_the_process_that_was_launched() -> TestResult {
+        let candidate = PlatformHandle::new("candidate-generation")?;
+        let prior = PlatformHandle::new("prior-generation")?;
         assert_eq!(
             CutoverLaunchOutcome::Candidate.activation_generation(&candidate, &prior),
             &candidate
@@ -20789,11 +20676,12 @@ mod tests {
             .activation_generation(&candidate, &prior),
             &prior
         );
+        Ok(())
     }
 
     #[test]
-    fn activate_response_uncertainty_reconciles_but_exact_rejection_does_not() {
-        let message = PlatformHandle::new("activate-message").expect("message");
+    fn activate_response_uncertainty_reconciles_but_exact_rejection_does_not() -> TestResult {
+        let message = PlatformHandle::new("activate-message")?;
         let digest = "a".repeat(64);
         let response = |message_id: PlatformHandle, error: Option<String>| KernelControlResponse {
             wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
@@ -20813,20 +20701,15 @@ mod tests {
                 Err(HostError::RecoveryRequired("receive lost".to_owned())),
                 &message,
                 &digest,
-            )
-            .expect("unknown receive outcome")
+            )?
             .is_none()
         );
         assert!(
             activation_response_or_reconcile(
-                Ok(response(
-                    PlatformHandle::new("wrong-message").expect("wrong message"),
-                    None,
-                )),
+                Ok(response(PlatformHandle::new("wrong-message")?, None,)),
                 &message,
                 &digest,
-            )
-            .expect("binding loss is unknown")
+            )?
             .is_none()
         );
         assert!(
@@ -20834,8 +20717,7 @@ mod tests {
                 Ok(response(message.clone(), None)),
                 &message,
                 &digest
-            )
-            .expect("missing receipt is unknown")
+            )?
             .is_none()
         );
         assert!(
@@ -20846,6 +20728,7 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
     }
 
     #[test]
@@ -21043,7 +20926,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_live_store_restarts_kernel_once_and_then_is_bounded() {
+    fn reconcile_live_store_restarts_kernel_once_and_then_is_bounded() -> TestResult {
         let kernel_launches = RefCell::new(0);
         let mut state = ReconciliationState {
             store: Some(MockChild { id: 7, live: true }),
@@ -21067,9 +20950,14 @@ mod tests {
             run(&mut state),
             Ok(HostBranchDisposition::LiveAwaitingReadiness)
         );
-        state.kernel.as_mut().expect("kernel restart").live = false;
+        state
+            .kernel
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?
+            .live = false;
         assert_eq!(run(&mut state), Ok(HostBranchDisposition::KernelDegraded));
         assert_eq!(*kernel_launches.borrow(), 1);
+        Ok(())
     }
 
     #[test]
@@ -21175,15 +21063,15 @@ mod tests {
         clippy::too_many_lines,
         reason = "race seam keeps durable ordering evidence adjacent"
     )]
-    fn scm_store_late_dead_shared_route_records_intent_before_replacement() {
+    fn scm_store_late_dead_shared_route_records_intent_before_replacement() -> TestResult {
         let source = include_str!("lib.rs");
         let generic_start = source
             .find("pub fn reconcile(")
-            .expect("HostJobBranches::reconcile source");
+            .ok_or_else(|| std::io::Error::other("generic reconcile anchor missing"))?;
         let generic_end = source[generic_start..]
             .find("fn cutover_with_rollback(")
             .map(|offset| generic_start + offset)
-            .expect("HostJobBranches::reconcile end");
+            .ok_or_else(|| std::io::Error::other("generic cutover anchor missing"))?;
         let generic_source = &source[generic_start..generic_end];
         assert!(
             !generic_source.contains("relaunch_store("),
@@ -21195,25 +21083,20 @@ mod tests {
         );
         let composition_start = source
             .find("pub fn reconcile_approved_contour(")
-            .expect("HostComposition::reconcile_approved_contour source");
+            .ok_or_else(|| std::io::Error::other("composition reconcile anchor missing"))?;
         let composition_end = source[composition_start..]
             .find("fn reconcile_branch_readiness_at(")
             .map(|offset| composition_start + offset)
-            .expect("HostComposition::reconcile_approved_contour end");
+            .ok_or_else(|| std::io::Error::other("composition readiness anchor missing"))?;
         assert!(
             source[composition_start..composition_end].contains("route_scm_store_recovery("),
             "the production SCM seam must own late-dead routing"
         );
         let request = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RecoverStore,
-            PlatformHandle::new("scm-store-recovery-route").unwrap(),
-        )
-        .unwrap();
-        let host = fresh_host_epoch(
-            PlatformHandle::new("scm-store-recovery-route-host").unwrap(),
-            None,
-        )
-        .unwrap();
+            PlatformHandle::new("scm-store-recovery-route")?,
+        )?;
+        let host = fresh_host_epoch(PlatformHandle::new("scm-store-recovery-route-host")?, None)?;
         let root = std::env::temp_dir().join(format!(
             "eliot-host-scm-store-route-{}-{}",
             std::process::id(),
@@ -21242,7 +21125,7 @@ mod tests {
             &request,
             |request| {
                 assert_eq!(request.operation, HostRuntimeControlOperation::RecoverStore);
-                super::persist_store_recovery_pending(&root, request, &host).unwrap();
+                super::persist_store_recovery_pending(&root, request, &host)?;
                 assert!(
                     super::store_recovery_pending_path(&root, request.mutation_digest.as_str())
                         .exists()
@@ -21259,8 +21142,7 @@ mod tests {
                 fresh_readiness = true;
                 Ok(())
             },
-        )
-        .unwrap();
+        )?;
         assert_eq!(generic_reconcile_calls, 1);
         assert_eq!(route, ScmStoreRecoveryRoute::Recovered);
         assert!(fresh_readiness, "Healthy requires fresh readiness evidence");
@@ -21291,8 +21173,7 @@ mod tests {
             None,
             &request,
             |_| Err(HostError::RecoveryRequired("recovery failed".to_owned())),
-        )
-        .unwrap();
+        )?;
         assert_eq!(
             fenced,
             ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::StoreDegraded)
@@ -21307,71 +21188,62 @@ mod tests {
             None,
             &request,
             |_| panic!("invalid Kernel must not invoke Store recovery"),
-        )
-        .unwrap();
+        )?;
         assert_eq!(
             both_fenced,
             ScmStoreRecoveryRoute::Fenced(HostBranchDisposition::BothDegraded)
         );
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
-    fn generic_reconcile_rejects_dead_store_without_durable_host_authority() {
-        let host = fresh_host_epoch(
-            PlatformHandle::new("scm-store-recovery-guard").unwrap(),
-            None,
-        )
-        .unwrap();
-        let mut jobs = HostJobBranches::new_fenced(&host).unwrap();
-        let generation = PlatformHandle::new("generation").unwrap();
-        let config_digest = PlatformHandle::new("config-digest").unwrap();
-        let error = jobs
-            .reconcile(
-                &generation,
-                &config_digest,
-                Path::new(r"C:\Eliot\config.json"),
-                &PlatformHandle::new(r"C:\Eliot\kernel.exe").unwrap(),
-                &PlatformHandle::new(r"C:\Eliot\store.exe").unwrap(),
-                &PlatformHandle::new(r"C:\Eliot\config.json").unwrap(),
-                &PlatformHandle::new("kernel-artifact").unwrap(),
-                &PlatformHandle::new("store-artifact").unwrap(),
-                &host,
-            )
-            .unwrap_err();
+    fn generic_reconcile_rejects_dead_store_without_durable_host_authority() -> TestResult {
+        let host = fresh_host_epoch(PlatformHandle::new("scm-store-recovery-guard")?, None)?;
+        let mut jobs = HostJobBranches::new_fenced(&host)?;
+        let generation = PlatformHandle::new("generation")?;
+        let config_digest = PlatformHandle::new("config-digest")?;
+        let Err(error) = jobs.reconcile(
+            &generation,
+            &config_digest,
+            Path::new(r"C:\Eliot\config.json"),
+            &PlatformHandle::new(r"C:\Eliot\kernel.exe")?,
+            &PlatformHandle::new(r"C:\Eliot\store.exe")?,
+            &PlatformHandle::new(r"C:\Eliot\config.json")?,
+            &PlatformHandle::new("kernel-artifact")?,
+            &PlatformHandle::new("store-artifact")?,
+            &host,
+        ) else {
+            return Err(std::io::Error::other("expected reconciliation error").into());
+        };
         assert!(matches!(
             error,
             HostError::StoreRecoveryRequired(StoreRecoveryRequired::LateDead)
         ));
+        Ok(())
     }
 
     #[test]
-    fn scm_store_recovery_request_identity_is_stable_and_contour_bound() {
-        let host = fresh_host_epoch(
-            PlatformHandle::new("scm-store-recovery-identity").unwrap(),
-            None,
-        )
-        .unwrap();
-        let activation_id = PlatformHandle::new("activation-id").unwrap();
-        let activation_generation = super::root_epoch(PlatformHandle::new("activation").unwrap());
-        let generation = PlatformHandle::new("generation").unwrap();
-        let config = PlatformHandle::new("config").unwrap();
+    fn scm_store_recovery_request_identity_is_stable_and_contour_bound() -> TestResult {
+        let host = fresh_host_epoch(PlatformHandle::new("scm-store-recovery-identity")?, None)?;
+        let activation_id = PlatformHandle::new("activation-id")?;
+        let activation_generation = super::root_epoch(PlatformHandle::new("activation")?);
+        let generation = PlatformHandle::new("generation")?;
+        let config = PlatformHandle::new("config")?;
         let first = host_owned_store_recovery_request(
             &host,
             &activation_id,
             &activation_generation,
             &generation,
             &config,
-        )
-        .unwrap();
+        )?;
         let replay = host_owned_store_recovery_request(
             &host,
             &activation_id,
             &activation_generation,
             &generation,
             &config,
-        )
-        .unwrap();
+        )?;
         assert_eq!(first.request_id, replay.request_id);
         assert_eq!(first.mutation_digest, replay.mutation_digest);
         assert_eq!(first.request_digest, replay.request_digest);
@@ -21380,45 +21252,44 @@ mod tests {
             &activation_id,
             &activation_generation,
             &generation,
-            &PlatformHandle::new("config-changed").unwrap(),
-        )
-        .unwrap();
+            &PlatformHandle::new("config-changed")?,
+        )?;
         assert_ne!(first.mutation_digest, changed_config.mutation_digest);
         let mut next_host = host.clone();
-        next_host.epoch = host.epoch.direct_child().unwrap();
+        next_host.epoch = host.epoch.direct_child()?;
         let changed_epoch = host_owned_store_recovery_request(
             &next_host,
             &activation_id,
             &activation_generation,
             &generation,
             &config,
-        )
-        .unwrap();
+        )?;
         assert_ne!(first.mutation_digest, changed_epoch.mutation_digest);
+        Ok(())
     }
 
     #[test]
-    fn pulse4_store_rebind_fence_and_pipe_substitution_fails_closed() {
+    fn pulse4_store_rebind_fence_and_pipe_substitution_fails_closed() -> TestResult {
         use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
         use eliot_kernel_service::{HostStoreBootstrapRequirement, StoreRebindHandoff};
         let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
         let req = HostStoreBootstrapRequirement {
-            route_identity: PlatformHandle::new("store_bridge").unwrap(),
-            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
+            route_identity: PlatformHandle::new("store_bridge")?,
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")?,
             store_generation: ResourceGeneration::genesis(),
             state_fence: fence,
-            launch_nonce: PlatformHandle::new("nonce-1").unwrap(),
-            connection_id: PlatformHandle::new("connection-1").unwrap(),
-            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            launch_nonce: PlatformHandle::new("nonce-1")?,
+            connection_id: PlatformHandle::new("connection-1")?,
+            expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
             expected_peer_session_id: 0,
-            approved_artifact_hash: PlatformHandle::new("a".repeat(64)).unwrap(),
-            approved_config_hash: PlatformHandle::new("b".repeat(64)).unwrap(),
+            approved_artifact_hash: PlatformHandle::new("a".repeat(64))?,
+            approved_config_hash: PlatformHandle::new("b".repeat(64))?,
             timeout_ms: 5000,
         };
         let mut bad = req.clone();
-        bad.canonical_pipe_identity = PlatformHandle::new(r"\\.\pipe\eliot\other").unwrap();
+        bad.canonical_pipe_identity = PlatformHandle::new(r"\\.\pipe\eliot\other")?;
         let handoff = StoreRebindHandoff {
-            operation_id: PlatformHandle::new("op-1").unwrap(),
+            operation_id: PlatformHandle::new("op-1")?,
             request_digest: "d".repeat(64),
             requirement: bad,
             process_binding: eliot_kernel_service::StoreProcessBinding {
@@ -21427,7 +21298,7 @@ mod tests {
                     start_time_100ns: 100,
                     image_path: r"C:\Eliot\store.exe".to_owned(),
                 },
-                job: PlatformHandle::new(r"Local\Eliot-Host-Store-test").unwrap(),
+                job: PlatformHandle::new(r"Local\Eliot-Host-Store-test")?,
             },
             candidate_binding_digest: "f".repeat(64),
             generation: ResourceGeneration::genesis(),
@@ -21439,6 +21310,7 @@ mod tests {
                 || handoff.requirement.canonical_pipe_identity.as_str()
                     != req.canonical_pipe_identity.as_str()
         );
+        Ok(())
     }
 
     #[test]
@@ -21451,7 +21323,7 @@ mod tests {
     }
 
     #[test]
-    fn store_recovery_stale_binding_rejected_production_bound() {
+    fn store_recovery_stale_binding_rejected_production_bound() -> TestResult {
         assert_eq!(
             HostComposition::production_store_rebind_discriminator(),
             HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR
@@ -21462,59 +21334,58 @@ mod tests {
         );
         let req = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RecoverStore,
-            PlatformHandle::new("store-recovery-stale").unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("store-recovery-stale")?,
+        )?;
         let mut stale = req.clone();
-        stale.request_digest = PlatformHandle::new("0".repeat(64)).unwrap();
+        stale.request_digest = PlatformHandle::new("0".repeat(64))?;
         assert!(stale.validate().is_err());
         assert!(req.validate().is_ok());
         let receipt = HostStoreRecoveryReceipt {
             external_control_mutation_digest: req.mutation_digest.clone(),
             request_digest: req.request_digest.clone(),
-            store_rebind_request_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
-            store_fence: PlatformHandle::new("a".repeat(64)).unwrap(),
-            new_store_process_id: PlatformHandle::new("pid:101:start:1001").unwrap(),
-            kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
-            activation_nonce_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
-            ready_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
-            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+            store_rebind_request_digest: PlatformHandle::new("e".repeat(64))?,
+            store_fence: PlatformHandle::new("a".repeat(64))?,
+            new_store_process_id: PlatformHandle::new("pid:101:start:1001")?,
+            kernel_generation: PlatformHandle::new("b".repeat(64))?,
+            activation_nonce_digest: PlatformHandle::new("c".repeat(64))?,
+            ready_receipt_digest: PlatformHandle::new("d".repeat(64))?,
+            receipt_digest: PlatformHandle::new("0".repeat(64))?,
         };
         let mut good = receipt.clone();
-        good.receipt_digest = good.computed_digest().unwrap();
+        good.receipt_digest = good.computed_digest()?;
         assert!(good.validate().is_ok());
         let mut bad = good.clone();
-        bad.store_fence = PlatformHandle::new("0".repeat(64)).unwrap();
+        bad.store_fence = PlatformHandle::new("0".repeat(64))?;
         assert!(bad.validate().is_err());
         let mut aliased = good;
         aliased.store_rebind_request_digest = aliased.external_control_mutation_digest.clone();
-        aliased.receipt_digest = aliased.computed_digest().unwrap();
+        aliased.receipt_digest = aliased.computed_digest()?;
         assert!(aliased.validate().is_err());
+        Ok(())
     }
 
     #[test]
-    fn store_recovery_response_loss_query_preserves_original_digest() {
+    fn store_recovery_response_loss_query_preserves_original_digest() -> TestResult {
         assert_eq!(
             HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR,
             "eliot-host::production-store-rebind:v1"
         );
         let req = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RecoverStore,
-            PlatformHandle::new("store-recovery-response-loss").unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("store-recovery-response-loss")?,
+        )?;
         let mut receipt = HostStoreRecoveryReceipt {
             external_control_mutation_digest: req.mutation_digest.clone(),
             request_digest: req.request_digest.clone(),
-            store_rebind_request_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
-            store_fence: PlatformHandle::new("a".repeat(64)).unwrap(),
-            new_store_process_id: PlatformHandle::new("pid:101:start:1001").unwrap(),
-            kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
-            activation_nonce_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
-            ready_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
-            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+            store_rebind_request_digest: PlatformHandle::new("e".repeat(64))?,
+            store_fence: PlatformHandle::new("a".repeat(64))?,
+            new_store_process_id: PlatformHandle::new("pid:101:start:1001")?,
+            kernel_generation: PlatformHandle::new("b".repeat(64))?,
+            activation_nonce_digest: PlatformHandle::new("c".repeat(64))?,
+            ready_receipt_digest: PlatformHandle::new("d".repeat(64))?,
+            receipt_digest: PlatformHandle::new("0".repeat(64))?,
         };
-        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        receipt.receipt_digest = receipt.computed_digest()?;
         let map = {
             let mut m = std::collections::HashMap::new();
             m.insert(req.mutation_digest.as_str().to_owned(), receipt.clone());
@@ -21522,7 +21393,9 @@ mod tests {
         };
         let pending_ref = super::runtime_control_unknown_ref("store-recovery-pending", &req);
         assert!(pending_ref.as_str().contains(req.request_digest.as_str()));
-        let recovered = map.get(req.mutation_digest.as_str()).unwrap();
+        let recovered = map
+            .get(req.mutation_digest.as_str())
+            .ok_or_else(|| std::io::Error::other("test option invariant"))?;
         assert_eq!(
             recovered.external_control_mutation_digest,
             req.mutation_digest
@@ -21530,16 +21403,15 @@ mod tests {
         assert_eq!(recovered.request_digest, req.request_digest);
         assert_eq!(
             recovered.store_rebind_request_digest,
-            PlatformHandle::new("e".repeat(64)).unwrap()
+            PlatformHandle::new("e".repeat(64))?
         );
         let reconcile = HostRuntimeControlRequest::new_store_reconcile(
-            PlatformHandle::new("store-recovery-response-loss-query").unwrap(),
+            PlatformHandle::new("store-recovery-response-loss-query")?,
             req.mutation_digest.clone(),
-        )
-        .unwrap();
+        )?;
         assert_eq!(reconcile.mutation_digest, req.mutation_digest);
         assert_ne!(reconcile.request_digest, req.request_digest);
-        let rebound = super::rebind_store_recovery_receipt(&receipt, &reconcile).unwrap();
+        let rebound = super::rebind_store_recovery_receipt(&receipt, &reconcile)?;
         assert_eq!(
             rebound.external_control_mutation_digest,
             req.mutation_digest
@@ -21547,39 +21419,39 @@ mod tests {
         assert_eq!(rebound.request_digest, reconcile.request_digest);
         assert_eq!(
             rebound.store_rebind_request_digest,
-            PlatformHandle::new("e".repeat(64)).unwrap()
+            PlatformHandle::new("e".repeat(64))?
         );
         assert_ne!(rebound.receipt_digest, receipt.receipt_digest);
+        Ok(())
     }
 
     #[test]
-    fn store_recovery_reconciles_only_canonical_committed_inner_rebind() {
+    fn store_recovery_reconciles_only_canonical_committed_inner_rebind() -> TestResult {
         use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
         use eliot_kernel_service::{
             HostStoreBootstrapRequirement, StoreProcessBinding, StoreRebindHandoff,
         };
 
-        let host = super::fresh_host_epoch(PlatformHandle::new("inner-rebind-test").unwrap(), None)
-            .unwrap();
-        let activation_id = super::fresh_identity("inner-rebind-activation").unwrap();
+        let host = super::fresh_host_epoch(PlatformHandle::new("inner-rebind-test")?, None)?;
+        let activation_id = super::fresh_identity("inner-rebind-activation")?;
         let activation_generation =
-            super::root_epoch(super::fresh_identity("inner-rebind-lineage").unwrap());
-        let authority_epoch = AuthorityEpoch::new(7).unwrap();
-        let generation = ResourceGeneration::new(3).unwrap();
+            super::root_epoch(super::fresh_identity("inner-rebind-lineage")?);
+        let authority_epoch = AuthorityEpoch::new(7)?;
+        let generation = ResourceGeneration::new(3)?;
         let requirement = HostStoreBootstrapRequirement {
-            route_identity: PlatformHandle::new("store_bridge").unwrap(),
-            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
+            route_identity: PlatformHandle::new("store_bridge")?,
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")?,
             store_generation: generation,
             state_fence: StateFence::new(authority_epoch, generation),
-            launch_nonce: PlatformHandle::new("inner-rebind-launch-nonce").unwrap(),
-            connection_id: PlatformHandle::new("inner-rebind-connection").unwrap(),
-            expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
+            launch_nonce: PlatformHandle::new("inner-rebind-launch-nonce")?,
+            connection_id: PlatformHandle::new("inner-rebind-connection")?,
+            expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
             expected_peer_session_id: 0,
-            approved_artifact_hash: PlatformHandle::new("a".repeat(64)).unwrap(),
-            approved_config_hash: PlatformHandle::new("b".repeat(64)).unwrap(),
+            approved_artifact_hash: PlatformHandle::new("a".repeat(64))?,
+            approved_config_hash: PlatformHandle::new("b".repeat(64))?,
             timeout_ms: 5_000,
         };
-        let operation_id = PlatformHandle::new("inner-rebind-operation").unwrap();
+        let operation_id = PlatformHandle::new("inner-rebind-operation")?;
         let candidate_digest = "c".repeat(64);
         let store_fence = "d".repeat(64);
         let process_binding = StoreProcessBinding {
@@ -21588,7 +21460,7 @@ mod tests {
                 start_time_100ns: 7_311,
                 image_path: r"C:\Eliot\store-new.exe".to_owned(),
             },
-            job: PlatformHandle::new(r"Local\Eliot-Store-new").unwrap(),
+            job: PlatformHandle::new(r"Local\Eliot-Store-new")?,
         };
         let handoff = StoreRebindHandoff {
             operation_id: operation_id.clone(),
@@ -21600,39 +21472,37 @@ mod tests {
             authority_epoch,
             store_fence: store_fence.clone(),
         };
-        let inner_digest = handoff.canonical_request_digest().unwrap();
-        let requirement_digest = super::sha256_json(&requirement).unwrap();
+        let inner_digest = handoff.canonical_request_digest()?;
+        let requirement_digest = super::sha256_json(&requirement)?;
         let record = eliot_host_state::StoreRebindRecord {
             fence: super::record_fence(&host, &activation_id, &activation_generation),
             operation: eliot_host_state::IdempotencyIdentity {
-                operation_id: PlatformHandle::new("inner-rebind-journal-operation").unwrap(),
-                idempotency_key: PlatformHandle::new("inner-rebind-journal-key").unwrap(),
+                operation_id: PlatformHandle::new("inner-rebind-journal-operation")?,
+                idempotency_key: PlatformHandle::new("inner-rebind-journal-key")?,
             },
             state: eliot_host_state::StoreRebindState::Committed,
             operation_id,
-            request_digest: PlatformHandle::new(inner_digest.clone()).unwrap(),
-            requirement: PlatformHandle::new(requirement_digest).unwrap(),
-            candidate_binding_digest: PlatformHandle::new(candidate_digest.clone()).unwrap(),
-            store_fence: PlatformHandle::new(store_fence.clone()).unwrap(),
+            request_digest: PlatformHandle::new(inner_digest.clone())?,
+            requirement: PlatformHandle::new(requirement_digest)?,
+            candidate_binding_digest: PlatformHandle::new(candidate_digest.clone())?,
+            store_fence: PlatformHandle::new(store_fence.clone())?,
             process_id: process_binding.process.process_id,
             process_start_time_100ns: process_binding.process.start_time_100ns,
-            process_image_path: PlatformHandle::new(process_binding.process.image_path.clone())
-                .unwrap(),
+            process_image_path: PlatformHandle::new(process_binding.process.image_path.clone())?,
             job_name: process_binding.job.clone(),
             generation: generation.value(),
             authority_epoch: authority_epoch.value(),
-            receipt_request_digest: Some(PlatformHandle::new(inner_digest.clone()).unwrap()),
-            receipt_store_fence: Some(PlatformHandle::new(store_fence).unwrap()),
+            receipt_request_digest: Some(PlatformHandle::new(inner_digest.clone())?),
+            receipt_store_fence: Some(PlatformHandle::new(store_fence)?),
         };
         let receipt =
-            super::committed_store_rebind_receipt(&record, &requirement, &candidate_digest)
-                .unwrap();
+            super::committed_store_rebind_receipt(&record, &requirement, &candidate_digest)?;
         assert_eq!(receipt.request_digest, inner_digest);
         assert_eq!(receipt.process_binding, process_binding);
 
         let mut substituted = record.clone();
-        substituted.request_digest = PlatformHandle::new("e".repeat(64)).unwrap();
-        substituted.receipt_request_digest = Some(PlatformHandle::new("e".repeat(64)).unwrap());
+        substituted.request_digest = PlatformHandle::new("e".repeat(64))?;
+        substituted.receipt_request_digest = Some(PlatformHandle::new("e".repeat(64))?);
         assert!(
             super::committed_store_rebind_receipt(&substituted, &requirement, &candidate_digest,)
                 .is_err()
@@ -21648,61 +21518,55 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
     }
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn store_recovery_changes_only_store_identity_kernel_fence_invariants_hold() {
-        let host = super::fresh_host_epoch(PlatformHandle::new("test-installation").unwrap(), None)
-            .unwrap();
+    fn store_recovery_changes_only_store_identity_kernel_fence_invariants_hold() -> TestResult {
+        let host = super::fresh_host_epoch(PlatformHandle::new("test-installation")?, None)?;
         let journal = eliot_host_state::HostStateJournalService::from_backend(
             eliot_host_state::MemoryBackend::default(),
             host.clone(),
-        )
-        .unwrap();
+        )?;
         let activation_generation =
-            super::root_epoch(super::fresh_identity("store-recovery-activation").unwrap());
-        let activation_id = super::fresh_identity("store-recovery-activation-id").unwrap();
+            super::root_epoch(super::fresh_identity("store-recovery-activation")?);
+        let activation_id = super::fresh_identity("store-recovery-activation-id")?;
         super::append_reconciled(
             &journal,
-            eliot_host_state::HostStateRecord::Activation(
-                super::initial_activation_record(
-                    &host,
-                    &activation_id,
-                    &activation_generation,
-                    eliot_host_state::ActivationState::Starting,
-                    "store-recovery-test-starting",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
-        let snapshot_before = journal.snapshot().unwrap();
+            eliot_host_state::HostStateRecord::Activation(super::initial_activation_record(
+                &host,
+                &activation_id,
+                &activation_generation,
+                eliot_host_state::ActivationState::Starting,
+                "store-recovery-test-starting",
+            )?),
+        )?;
+        let snapshot_before = journal.snapshot()?;
         let kernel_before = snapshot_before.kernel.clone();
         let host_epoch_before = snapshot_before.host.epoch.clone();
         let req = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RecoverStore,
-            PlatformHandle::new("store-recovery-kernel-invariant").unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("store-recovery-kernel-invariant")?,
+        )?;
         let candidate_digest = "c".repeat(64);
-        let store_fence = PlatformHandle::new("d".repeat(64)).unwrap();
+        let store_fence = PlatformHandle::new("d".repeat(64))?;
         let pending = eliot_host_state::StoreRebindRecord {
             fence: super::record_fence(&host, &activation_id, &activation_generation),
             operation: eliot_host_state::IdempotencyIdentity {
-                operation_id: PlatformHandle::new("store-recovery-op").unwrap(),
-                idempotency_key: PlatformHandle::new("store-recovery-key").unwrap(),
+                operation_id: PlatformHandle::new("store-recovery-op")?,
+                idempotency_key: PlatformHandle::new("store-recovery-key")?,
             },
             state: eliot_host_state::StoreRebindState::Pending,
-            operation_id: PlatformHandle::new("store-recovery-op").unwrap(),
+            operation_id: PlatformHandle::new("store-recovery-op")?,
             request_digest: req.mutation_digest.clone(),
-            requirement: PlatformHandle::new("b".repeat(64)).unwrap(),
-            candidate_binding_digest: PlatformHandle::new(candidate_digest).unwrap(),
+            requirement: PlatformHandle::new("b".repeat(64))?,
+            candidate_binding_digest: PlatformHandle::new(candidate_digest)?,
             store_fence: store_fence.clone(),
             process_id: 101,
             process_start_time_100ns: 1001,
-            process_image_path: PlatformHandle::new(r"C:\Eliot\store-new.exe").unwrap(),
-            job_name: PlatformHandle::new(r"Local\Eliot-Store-new").unwrap(),
+            process_image_path: PlatformHandle::new(r"C:\Eliot\store-new.exe")?,
+            job_name: PlatformHandle::new(r"Local\Eliot-Store-new")?,
             generation: 1,
             authority_epoch: 1,
             receipt_request_digest: None,
@@ -21711,24 +21575,23 @@ mod tests {
         super::append_reconciled(
             &journal,
             eliot_host_state::HostStateRecord::StoreRebind(pending),
-        )
-        .unwrap();
+        )?;
         let committed = eliot_host_state::StoreRebindRecord {
             fence: super::record_fence(&host, &activation_id, &activation_generation),
             operation: eliot_host_state::IdempotencyIdentity {
-                operation_id: PlatformHandle::new("store-recovery-op").unwrap(),
-                idempotency_key: PlatformHandle::new("store-recovery-key-committed").unwrap(),
+                operation_id: PlatformHandle::new("store-recovery-op")?,
+                idempotency_key: PlatformHandle::new("store-recovery-key-committed")?,
             },
             state: eliot_host_state::StoreRebindState::Committed,
-            operation_id: PlatformHandle::new("store-recovery-op").unwrap(),
+            operation_id: PlatformHandle::new("store-recovery-op")?,
             request_digest: req.mutation_digest.clone(),
-            requirement: PlatformHandle::new("b".repeat(64)).unwrap(),
-            candidate_binding_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
+            requirement: PlatformHandle::new("b".repeat(64))?,
+            candidate_binding_digest: PlatformHandle::new("c".repeat(64))?,
             store_fence: store_fence.clone(),
             process_id: 101,
             process_start_time_100ns: 1001,
-            process_image_path: PlatformHandle::new(r"C:\Eliot\store-new.exe").unwrap(),
-            job_name: PlatformHandle::new(r"Local\Eliot-Store-new").unwrap(),
+            process_image_path: PlatformHandle::new(r"C:\Eliot\store-new.exe")?,
+            job_name: PlatformHandle::new(r"Local\Eliot-Store-new")?,
             generation: 1,
             authority_epoch: 1,
             receipt_request_digest: Some(req.mutation_digest.clone()),
@@ -21737,9 +21600,8 @@ mod tests {
         super::append_reconciled(
             &journal,
             eliot_host_state::HostStateRecord::StoreRebind(committed),
-        )
-        .unwrap();
-        let snapshot_after = journal.snapshot().unwrap();
+        )?;
+        let snapshot_after = journal.snapshot()?;
         assert_eq!(snapshot_after.host.epoch, host_epoch_before);
         assert_eq!(snapshot_after.kernel, kernel_before);
         assert!(
@@ -21754,57 +21616,52 @@ mod tests {
                 .iter()
                 .any(|r| r.state == eliot_host_state::StoreRebindState::Committed)
         );
+        Ok(())
     }
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn store_recovery_same_host_response_loss_preserves_commit_and_idempotent_replay() {
-        let host = super::fresh_host_epoch(PlatformHandle::new("test-installation").unwrap(), None)
-            .unwrap();
+    fn store_recovery_same_host_response_loss_preserves_commit_and_idempotent_replay() -> TestResult
+    {
+        let host = super::fresh_host_epoch(PlatformHandle::new("test-installation")?, None)?;
         let journal = eliot_host_state::HostStateJournalService::from_backend(
             eliot_host_state::MemoryBackend::default(),
             host.clone(),
-        )
-        .unwrap();
+        )?;
         let activation_generation =
-            super::root_epoch(super::fresh_identity("crash-reopen-activation").unwrap());
-        let activation_id = super::fresh_identity("crash-reopen-activation-id").unwrap();
+            super::root_epoch(super::fresh_identity("crash-reopen-activation")?);
+        let activation_id = super::fresh_identity("crash-reopen-activation-id")?;
         super::append_reconciled(
             &journal,
-            eliot_host_state::HostStateRecord::Activation(
-                super::initial_activation_record(
-                    &host,
-                    &activation_id,
-                    &activation_generation,
-                    eliot_host_state::ActivationState::Starting,
-                    "crash-reopen-starting",
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
+            eliot_host_state::HostStateRecord::Activation(super::initial_activation_record(
+                &host,
+                &activation_id,
+                &activation_generation,
+                eliot_host_state::ActivationState::Starting,
+                "crash-reopen-starting",
+            )?),
+        )?;
         let req = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RecoverStore,
-            PlatformHandle::new("store-recovery-crash").unwrap(),
-        )
-        .unwrap();
-        let store_fence = PlatformHandle::new("e".repeat(64)).unwrap();
+            PlatformHandle::new("store-recovery-crash")?,
+        )?;
+        let store_fence = PlatformHandle::new("e".repeat(64))?;
         let pending = eliot_host_state::StoreRebindRecord {
             fence: super::record_fence(&host, &activation_id, &activation_generation),
             operation: eliot_host_state::IdempotencyIdentity {
-                operation_id: PlatformHandle::new("crash-op").unwrap(),
-                idempotency_key: PlatformHandle::new("crash-key").unwrap(),
+                operation_id: PlatformHandle::new("crash-op")?,
+                idempotency_key: PlatformHandle::new("crash-key")?,
             },
             state: eliot_host_state::StoreRebindState::Pending,
-            operation_id: PlatformHandle::new("crash-op").unwrap(),
+            operation_id: PlatformHandle::new("crash-op")?,
             request_digest: req.mutation_digest.clone(),
-            requirement: PlatformHandle::new("b".repeat(64)).unwrap(),
-            candidate_binding_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
+            requirement: PlatformHandle::new("b".repeat(64))?,
+            candidate_binding_digest: PlatformHandle::new("c".repeat(64))?,
             store_fence: store_fence.clone(),
             process_id: 201,
             process_start_time_100ns: 2001,
-            process_image_path: PlatformHandle::new(r"C:\Eliot\store-crash.exe").unwrap(),
-            job_name: PlatformHandle::new(r"Local\Eliot-Store-crash").unwrap(),
+            process_image_path: PlatformHandle::new(r"C:\Eliot\store-crash.exe")?,
+            job_name: PlatformHandle::new(r"Local\Eliot-Store-crash")?,
             generation: 1,
             authority_epoch: 1,
             receipt_request_digest: None,
@@ -21813,24 +21670,23 @@ mod tests {
         super::append_reconciled(
             &journal,
             eliot_host_state::HostStateRecord::StoreRebind(pending),
-        )
-        .unwrap();
+        )?;
         let committed = eliot_host_state::StoreRebindRecord {
             fence: super::record_fence(&host, &activation_id, &activation_generation),
             operation: eliot_host_state::IdempotencyIdentity {
-                operation_id: PlatformHandle::new("crash-op").unwrap(),
-                idempotency_key: PlatformHandle::new("crash-key-committed").unwrap(),
+                operation_id: PlatformHandle::new("crash-op")?,
+                idempotency_key: PlatformHandle::new("crash-key-committed")?,
             },
             state: eliot_host_state::StoreRebindState::Committed,
-            operation_id: PlatformHandle::new("crash-op").unwrap(),
+            operation_id: PlatformHandle::new("crash-op")?,
             request_digest: req.mutation_digest.clone(),
-            requirement: PlatformHandle::new("b".repeat(64)).unwrap(),
-            candidate_binding_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
+            requirement: PlatformHandle::new("b".repeat(64))?,
+            candidate_binding_digest: PlatformHandle::new("c".repeat(64))?,
             store_fence: store_fence.clone(),
             process_id: 201,
             process_start_time_100ns: 2001,
-            process_image_path: PlatformHandle::new(r"C:\Eliot\store-crash.exe").unwrap(),
-            job_name: PlatformHandle::new(r"Local\Eliot-Store-crash").unwrap(),
+            process_image_path: PlatformHandle::new(r"C:\Eliot\store-crash.exe")?,
+            job_name: PlatformHandle::new(r"Local\Eliot-Store-crash")?,
             generation: 1,
             authority_epoch: 1,
             receipt_request_digest: Some(req.mutation_digest.clone()),
@@ -21839,9 +21695,8 @@ mod tests {
         super::append_reconciled(
             &journal,
             eliot_host_state::HostStateRecord::StoreRebind(committed.clone()),
-        )
-        .unwrap();
-        let snapshot_before = journal.snapshot().unwrap();
+        )?;
+        let snapshot_before = journal.snapshot()?;
         assert!(
             snapshot_before
                 .store_rebinds
@@ -21851,13 +21706,12 @@ mod tests {
         let replay = super::append_reconciled(
             &journal,
             eliot_host_state::HostStateRecord::StoreRebind(committed),
-        )
-        .unwrap();
+        )?;
         assert_eq!(
             replay.disposition(),
             eliot_host_state::AppendDisposition::Replayed
         );
-        let snapshot_after = journal.snapshot().unwrap();
+        let snapshot_after = journal.snapshot()?;
         assert!(
             snapshot_after
                 .store_rebinds
@@ -21865,48 +21719,45 @@ mod tests {
                 .any(|r| r.state == eliot_host_state::StoreRebindState::Committed
                     && r.request_digest == req.mutation_digest)
         );
+        Ok(())
     }
 
     #[test]
-    fn store_recovery_unknown_is_mutation_keyed_not_destination() {
+    fn store_recovery_unknown_is_mutation_keyed_not_destination() -> TestResult {
         let req = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RecoverStore,
-            PlatformHandle::new("store-recovery-unknown-mutation").unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("store-recovery-unknown-mutation")?,
+        )?;
         let foreign = HostRuntimeControlRequest::new(
             HostRuntimeControlOperation::RecoverStore,
-            PlatformHandle::new("store-recovery-unknown-foreign").unwrap(),
-        )
-        .unwrap();
+            PlatformHandle::new("store-recovery-unknown-foreign")?,
+        )?;
         assert_ne!(req.mutation_digest, foreign.mutation_digest);
         let receipt = HostStoreRecoveryReceipt {
             external_control_mutation_digest: req.mutation_digest.clone(),
             request_digest: req.request_digest.clone(),
-            store_rebind_request_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
-            store_fence: PlatformHandle::new("a".repeat(64)).unwrap(),
-            new_store_process_id: PlatformHandle::new("pid:301:start:3001").unwrap(),
-            kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
-            activation_nonce_digest: PlatformHandle::new("c".repeat(64)).unwrap(),
-            ready_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
-            receipt_digest: PlatformHandle::new("0".repeat(64)).unwrap(),
+            store_rebind_request_digest: PlatformHandle::new("e".repeat(64))?,
+            store_fence: PlatformHandle::new("a".repeat(64))?,
+            new_store_process_id: PlatformHandle::new("pid:301:start:3001")?,
+            kernel_generation: PlatformHandle::new("b".repeat(64))?,
+            activation_nonce_digest: PlatformHandle::new("c".repeat(64))?,
+            ready_receipt_digest: PlatformHandle::new("d".repeat(64))?,
+            receipt_digest: PlatformHandle::new("0".repeat(64))?,
         };
         let mut good = receipt.clone();
-        good.receipt_digest = good.computed_digest().unwrap();
+        good.receipt_digest = good.computed_digest()?;
         assert!(good.validate().is_ok());
         let reconcile_foreign = HostRuntimeControlRequest::new_store_reconcile(
-            PlatformHandle::new("store-recovery-unknown-query").unwrap(),
+            PlatformHandle::new("store-recovery-unknown-query")?,
             foreign.mutation_digest.clone(),
-        )
-        .unwrap();
+        )?;
         let unknown = super::rebind_store_recovery_receipt(&good, &reconcile_foreign);
         assert!(unknown.is_err(), "foreign mutation must not match receipt");
         let reconcile_correct = HostRuntimeControlRequest::new_store_reconcile(
-            PlatformHandle::new("store-recovery-unknown-query-ok").unwrap(),
+            PlatformHandle::new("store-recovery-unknown-query-ok")?,
             req.mutation_digest.clone(),
-        )
-        .unwrap();
-        let ok = super::rebind_store_recovery_receipt(&good, &reconcile_correct).unwrap();
+        )?;
+        let ok = super::rebind_store_recovery_receipt(&good, &reconcile_correct)?;
         assert_eq!(ok.external_control_mutation_digest, req.mutation_digest);
         assert_eq!(ok.request_digest, reconcile_correct.request_digest);
 
@@ -21914,17 +21765,18 @@ mod tests {
             "eliot-host-store-recovery-receipt-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::create_dir_all(&root).unwrap();
-        super::persist_store_recovery_receipt(&root, &good).unwrap();
+        std::fs::create_dir_all(&root)?;
+        super::persist_store_recovery_receipt(&root, &good)?;
         let path = super::store_recovery_receipt_path(&root, req.mutation_digest.as_str());
-        let original = std::fs::read(&path).unwrap();
-        super::persist_store_recovery_receipt(&root, &good).unwrap();
+        let original = std::fs::read(&path)?;
+        super::persist_store_recovery_receipt(&root, &good)?;
         let mut substituted = good.clone();
-        substituted.ready_receipt_digest = PlatformHandle::new("f".repeat(64)).unwrap();
-        substituted.receipt_digest = substituted.computed_digest().unwrap();
+        substituted.ready_receipt_digest = PlatformHandle::new("f".repeat(64))?;
+        substituted.receipt_digest = substituted.computed_digest()?;
         assert!(super::persist_store_recovery_receipt(&root, &substituted).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&path)?, original);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 }
 

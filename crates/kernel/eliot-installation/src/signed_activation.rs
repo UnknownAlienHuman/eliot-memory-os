@@ -1,4 +1,3 @@
-#![allow(clippy::too_many_arguments, clippy::too_many_lines)]
 //! Production signed-activation admission.
 //!
 //! This module is intentionally a narrow boundary.  It consumes an explicit
@@ -349,6 +348,10 @@ fn bootstrap_approval(
     ))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "W3 owns the structural split; W0 keeps this authority check contiguous"
+)]
 fn verify_and_derive_projection(
     transaction: &InstallationTransaction,
     envelope: &SignedInstallationActivationApproval,
@@ -841,6 +844,10 @@ impl RedbInstallationRegistry {
     /// checksummed before verification and transitioned through the sealed
     /// transaction-store CAS before the registry CAS; any revision or
     /// full-byte checksum drift rejects the write.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "authority inputs remain explicit until the W3 installation split"
+    )]
     pub fn stage_pending_activation_signed(
         &self,
         transaction_store: &mut RedbInstallationTransactionStore,

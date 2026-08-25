@@ -1918,8 +1918,12 @@ mod tests {
             "Eliot/installations/codex-host-state-legacy-test-{}/host/host-state-journal.redb",
             std::process::id()
         );
-        let path = eliot_platform_windows::protected_program_data_path(relative)
-            .unwrap_or_else(|_| unreachable!());
+        // Build the negative fixture from the verified ProgramData root without
+        // traversing a real retained Eliot installation. Its service ACL may
+        // intentionally deny this unelevated test process metadata access.
+        let path = eliot_platform_windows::protected_program_data_root()
+            .unwrap_or_else(|error| panic!("resolve protected ProgramData root: {error:?}"))
+            .join(relative);
         assert!(RedbJournalBackend::open(&path).is_err());
         assert!(RedbJournalBackend::inspect_existing(&path).is_err());
     }
@@ -1931,8 +1935,11 @@ mod tests {
             "Eliot/installations/codex-host-state-runtime-test-{}/host/host-state-journal.redb",
             std::process::id()
         );
-        let path = eliot_platform_windows::protected_program_data_path(relative)
-            .unwrap_or_else(|_| unreachable!());
+        // This is an arbitrary retained-installation-shaped negative fixture,
+        // not a request to inspect or provision the real protected child.
+        let path = eliot_platform_windows::protected_program_data_root()
+            .unwrap_or_else(|error| panic!("resolve protected ProgramData root: {error:?}"))
+            .join(relative);
         let parent = path.parent().unwrap_or_else(|| unreachable!());
         if parent.exists() {
             // Never touch a real installation from a unit test.

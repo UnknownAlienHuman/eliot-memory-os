@@ -1284,7 +1284,7 @@ impl McpClient {
                 "method": "tools/call",
                 "params": {"name": name, "arguments": arguments}
             }),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         )
     }
 
