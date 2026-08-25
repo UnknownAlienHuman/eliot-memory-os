@@ -35,7 +35,16 @@ jobs:
       - name: Configure Cargo environment
         shell: pwsh
         run: |
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP\eliot-fast-integration-target"
+          # Windows security tests bind caller paths to OS-resolved handles.
+          # The hosted account's default TEMP may use a DOS 8.3 alias, so use
+          # the runner-owned canonical temp contour for every later process.
+          $testTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          if (-not [IO.Path]::IsPathFullyQualified($testTemp) -or -not (Test-Path -LiteralPath $testTemp -PathType Container)) {
+            throw "Runner temp is not an existing absolute directory: $testTemp"
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "TEMP=$testTemp"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "TMP=$testTemp"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$testTemp\eliot-fast-integration-target"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_INCREMENTAL=0"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_BUILD_JOBS=4"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TERM_VERBOSE=false"
