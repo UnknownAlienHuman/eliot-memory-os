@@ -1,0 +1,51 @@
+{
+  "schema_version": "eliot.bootstrap-work-result.v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "work_item_id": "W0-09",
+  "structured_result": {
+    "disposition": "completed",
+    "evidence_status": "ACCEPT_LOCAL_ONLY",
+    "product_source_baseline": "e71d385e6f89d9f1a476bfe37a249c301a0be1c3",
+    "closure_overlay": [
+      "swarm/results/W0-09.json",
+      "swarm/gates/W0.md"
+    ],
+    "local_verification": {
+      "command": "pwsh -NoProfile -File scripts/verify.ps1",
+      "profile": "eliot-verify-v3",
+      "result": "PASS",
+      "expected_steps": 11,
+      "scope": "the product baseline plus the exact two-file W0-09 closure overlay",
+      "stu_evidence": "PROVISIONAL_NON_BLOCKING"
+    },
+    "hosted_verification": {
+      "status": "HOSTED_NOT_RUN",
+      "receipt_claimed": false,
+      "reason": "The Human decision owner explicitly required local test execution only. The active hosted run was cancelled and no replacement run is authorized."
+    },
+    "recoverable_deviation": {
+      "deviation_id": "W0-09-LOCAL-ONLY",
+      "from_contract_or_default": "RECOVERY_PROGRAM_v1 DoD W0 and ROOT-DIRECTIVE-v1.4 W0-09 require a green hosted-main receipt.",
+      "scope": "Only the W0-09 hosted-main receipt criterion. The verifier profile, source contracts, normative hashes, local acceptance checks, and all Architecture hard boundaries remain unchanged.",
+      "owner": "Root / Sol Main Agent under explicit Human instruction",
+      "reason_and_evidence": "GitHub Actions quota consumption is not authorized for this recovery. The exact Windows aggregate verifier is executed locally instead; no hosted result is inferred from local evidence.",
+      "hard_boundaries_checked": [
+        "No hosted receipt, clean-host parity, release readiness, Product Proof, or VERIFIED_COMPLETE status is fabricated.",
+        "The local verifier remains fail-closed and executes the same versioned eliot-verify-v3 profile.",
+        "The deviation grants no runtime, write, launch, migration, or canonical authority."
+      ],
+      "expected_benefit": "Continue bounded recovery without consuming additional GitHub Actions minutes while retaining an exact local Windows acceptance surface.",
+      "risk": "Hosted clean-runner behavior and main-branch hosted parity remain unverified.",
+      "rollback": "Revoke this deviation, restore the hosted-green W0-09 criterion, and invalidate CLOSED_LOCAL_RECOVERABLE_DEVIATION before any claim that requires hosted proof.",
+      "review_condition": "Review when the Human decision owner explicitly reauthorizes hosted CI, before release/cutover evidence requires a hosted runner, or if local and hosted behavior diverge.",
+      "outcome_ref": "swarm/results/W0-09.json#/structured_result",
+      "outcome": "CLOSED_LOCAL_RECOVERABLE_DEVIATION",
+      "disposition": "active"
+    },
+    "uncertainty": [
+      "Local evidence proves only the exact local Windows verifier scope.",
+      "Hosted CI, clean-clone hosted execution, and hosted-main parity are not proven."
+    ],
+    "proof_ceiling": "EVIDENCE_ONLY; CLOSED_LOCAL_RECOVERABLE_DEVIATION; HOSTED_NOT_RUN; no hosted, release, Product Proof, or terminal-completion authority."
+  }
+}
