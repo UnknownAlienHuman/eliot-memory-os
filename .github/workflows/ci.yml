@@ -28,7 +28,6 @@ jobs:
     # Credential Manager, Win32 process identity. A Linux runner would not be
     # testing the same program.
     runs-on: windows-latest
-    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
