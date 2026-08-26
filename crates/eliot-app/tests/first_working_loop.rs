@@ -1646,10 +1646,34 @@ impl OwnedWorktree {
         if !add.status.success() {
             return Err(format!("git add failed: {}", String::from_utf8_lossy(&add.stderr)).into());
         }
+        let staged = Command::new("git")
+            .current_dir(&self.path)
+            .args(["diff", "--cached", "--quiet", "--"])
+            .arg(artifact_path)
+            .output()?;
+        match staged.status.code() {
+            Some(1) => {}
+            Some(0) => return Err("owned artifact has no staged diff to commit".into()),
+            _ => {
+                return Err(format!(
+                    "git staged-diff check failed (status={}): {}",
+                    staged.status,
+                    String::from_utf8_lossy(&staged.stderr)
+                )
+                .into());
+            }
+        }
         let commit = Command::new("git")
             .current_dir(&self.path)
             .args([
+                "-c",
+                "user.name=Eliot FWL Fixture",
+                "-c",
+                "user.email=fwl-fixture@invalid",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
+                "--no-verify",
                 "-m",
                 "test: first working loop reversible artifact",
             ])
