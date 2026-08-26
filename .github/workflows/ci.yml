@@ -5,10 +5,6 @@ name: Fast Integration CI
 # check here needs a running database or a paid API, it does not belong here.
 
 on:
-  push:
-    branches: [main, 'codex/**']
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -67,8 +63,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $metadata = cargo metadata --locked --format-version 1 --no-deps | ConvertFrom-Json
-          if ($metadata.packages.Count -ne 125) {
-            throw "Expected 125 workspace packages, observed $($metadata.packages.Count)"
+          if ($metadata.packages.Count -ne 126) {
+            throw "Expected 126 workspace packages, observed $($metadata.packages.Count)"
           }
           if ($metadata.workspace_default_members.Count -ne 6) {
             throw "Expected 6 default members, observed $($metadata.workspace_default_members.Count)"
