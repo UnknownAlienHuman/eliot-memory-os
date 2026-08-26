@@ -13,7 +13,7 @@ nodes and 268,208 edges; it is useful for navigation only and may lag source.
 
 ## Workspace shape
 
-`cargo metadata --no-deps --format-version 1` at this revision reports 125
+`cargo metadata --no-deps --format-version 1` at this revision reports 126
 workspace members, all version `0.1.0`, with the default runtime members
 `eliot`, `eliot-host`, `eliot-kernel`, `eliot-store-surreal`, `eliot-watchdog`,
 and `eliotd`. The workspace is Rust 2024 and MSVC; the workspace manifest
