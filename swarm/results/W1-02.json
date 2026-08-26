@@ -24,7 +24,7 @@
       "note": "UNKNOWN anchors are explicit evidence gaps: the source span contains no validated normative/work identifier; they are not inferred from the historical 1371 baseline."
     },
     "source_file_count": 581,
-    "source_digest_aggregate": "87b9b86501fb842dc2e9afab0d157fcc1708bd977a5350ff2396a15721d33a1d",
+    "source_digest_aggregate": "b7ccf3657f293e82a8e2048e4a207fa44f9f630035dd36120ddfbf35c06dd49b",
     "normative_pair_sha256": "041c9bb09db91b8bd8b8c073270c6220cf534b746fcf7faadf705094218b99b1",
     "normative_pair_paths": [
       "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -1653,7 +1653,7 @@
         },
         {
           "path": "crates/governor/eliot-authority/src/grants.rs",
-          "sha256": "bcb8ebf9fcf0e90f311ced6eb7d49176d6a627e7fc27ef9e2f260087468b31f6"
+          "sha256": "6707534513211a527c5861b26a0c6d9317c9cc5c5e8b59a1b81b6e3a02dd0c01"
         },
         {
           "path": "crates/governor/eliot-authority/src/leases.rs",
@@ -1673,7 +1673,7 @@
         },
         {
           "path": "crates/governor/eliot-canonical/src/lib.rs",
-          "sha256": "ceb8fbc5bdebd3c2fedd84529225c3645fdd02b415bebe8b628240e80fa7a9fb"
+          "sha256": "365b69d7a80eee7fa916cda6356915100d9fb1a9d1c5752abd9b959f37bf33b0"
         },
         {
           "path": "crates/governor/eliot-change-monitor/src/lib.rs",
@@ -1685,7 +1685,7 @@
         },
         {
           "path": "crates/governor/eliot-coordination/src/lib.rs",
-          "sha256": "05b007bdeb3ec17f8815ef948207afa80c8911fb32df214ebcb3b85bdd277a63"
+          "sha256": "f0f00b7e21937a0119dfb8cbe4b58d8cc079d245cc07d9227fea1f7830766743"
         },
         {
           "path": "crates/governor/eliot-finish/src/lib.rs",
@@ -1733,7 +1733,7 @@
         },
         {
           "path": "crates/governor/eliot-workscope/src/lib.rs",
-          "sha256": "b44faca38c5c82ed7f641fbc26b57b493eb480bef1080abbaa84897432dbbe6c"
+          "sha256": "9c8c4582eb509590ae0804995ad5a611044878bc30d0ccc3be308d2f4f42a628"
         },
         {
           "path": "crates/instrument/eliot-artifact/src/binding.rs",
@@ -2388,7 +2388,7 @@
           "sha256": "0b9cb7808d1a6ef940c7c095f06de336ea78beb58b9f6191235f7b0698a21eee"
         }
       ],
-      "source_manifest_sha256": "87b9b86501fb842dc2e9afab0d157fcc1708bd977a5350ff2396a15721d33a1d",
+      "source_manifest_sha256": "b7ccf3657f293e82a8e2048e4a207fa44f9f630035dd36120ddfbf35c06dd49b",
       "normative_pair": [
         {
           "path": "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -2413,7 +2413,7 @@
           "sha256": "94772e868277cc0f01d043066a3ca3422e90eaf488dacc61551c95297a1ab2d9"
         }
       ],
-      "content_digest": "7d8ce9ca7cda4a2d6047590edc6da60a29149f7cb0fc88020b6d5851a2fbe8b6"
+      "content_digest": "089585ab2ff10ea420b7507e96c5f36242eda3f0a2011008b43f7a315e71f3d4"
     },
     "disposition": "challenged",
     "artifacts": [

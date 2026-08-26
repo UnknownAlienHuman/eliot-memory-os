@@ -8,7 +8,7 @@
       {
         "path": "docs/conformance.toml",
         "role": "generated projection",
-        "sha256": "4CB33613483FC8C49D9FE587566D517862D17DF7EB095E941A2F884737DE8AFA"
+        "sha256": "62947A674ADD0D53540109AFD887AE2FE2ACCCB940B33E4E2F76F4B0A94C5819"
       },
       {
         "path": "swarm/results/W1-04-implementation.json",
@@ -17,26 +17,30 @@
       }
     ],
     "evidence": [
-      "58 A16.1 anchors are deterministically projected to 58 Appendix H rows with UNKNOWN support and empty invalidation by default."
+      "58 A16.1 anchors are projected in canonical order; 4 exact production bindings have code-derived owners and 54 owners remain UNKNOWN.",
+      "Every support value remains UNKNOWN and every invalidation list remains empty."
     ],
     "discriminator_before": {
-      "name": "anchor-bijection",
-      "value": "A16.1/Appendix H mapping and generated envelope required independent verification",
+      "name": "code-owned-anchor-bindings",
+      "value": "zero explicit production anchor-owner bindings; owner inference from Appendix H or names was forbidden",
       "status": "observed"
     },
     "discriminator_after": {
-      "name": "anchor-bijection",
-      "value": "58x58 exact ID bijection and content-bound BootstrapWorkResult wrapper",
+      "name": "code-owned-anchor-bindings",
+      "value": "4 exact code bindings and 54 UNKNOWN owners with symmetric reverse index",
       "status": "verified"
     },
     "uncertainty": [
-      "No generated support or invalidation evidence exists; UNKNOWN and [] remain honest defaults."
+      "No support or invalidation evidence is inferred from a navigation binding.",
+      "The persisted graph corroborates project provenance but source markers remain the ownership authority.",
+      "Digest and semantic evidence assumes writer quiescence; it is not an atomic snapshot proof and does not claim TOCTOU is fixed."
     ],
     "unresolved_questions": [
-      "Per-anchor owner/support/invalidation semantics remain unresolved and require a separately admitted work item."
+      "The remaining UNKNOWN owners require later exact production bindings.",
+      "Per-anchor support and invalidation semantics require separately admitted evidence."
     ],
     "proposed_effects": [
-      "Future implementation may add independently verified support/invalidation evidence; no product or authority contract is changed here."
+      "Future implementation lanes may add an exact production marker when they can preserve the one-to-one binding contract."
     ],
     "evidence_lineage": [
       {
@@ -52,10 +56,45 @@
       {
         "path": "swarm/challenges/W1-RESULT-ENVELOPE-CONTRACT.md",
         "sha256": "C8A14FCDF73CD77EE5E28875EABEBD91ADA33831B35BE2713B29700F7CA394A4",
-        "role": "resolved result-envelope program revision"
+        "role": "resolved result-envelope contract"
+      },
+      {
+        "path": "swarm/challenges/W1-04-ANCHOR-SYMBOL-INDEX.md",
+        "sha256": "67FC0C6BD597520E42ECB3BB21A34EDBABE4746A01D761DB52F30E784F5823A6",
+        "role": "Root-accepted anchor-symbol binding contract"
+      },
+      {
+        "path": "swarm/inventory/modules.json",
+        "sha256": "28AFCA6960240165D7CEE0AA4138B3177E3EF75DC285B1A45E068D23AB5158C9",
+        "role": "current module ownership inventory"
+      },
+      {
+        "path": "swarm/inventory/refusals.csv",
+        "sha256": "94772E868277CC0F01D043066A3CA3422E90EAF488DACC61551C95297A1AB2D9",
+        "role": "current refusal-site inventory"
+      },
+      {
+        "path": ".codebase-memory/artifact.json",
+        "sha256": "D12D06F32E8FD7BBC4D1300737F5A05FDADBCB793828F82E871A89A4C68EFB72",
+        "role": "code graph identity and counts"
+      },
+      {
+        "path": ".codebase-memory/graph.db.zst",
+        "sha256": "FA906F525CB78020437E09D65D33E9B874F9D25F2BD7543E28954FD3354CBDF2",
+        "role": "persisted code graph database"
+      },
+      {
+        "path": "scripts/gen-conformance.ps1",
+        "sha256": "A14A7CF7D42E28D1DD812B0DFB7238FF3E000435E1BDE3EA464566D951D3DCC6",
+        "role": "projection generator"
+      },
+      {
+        "path": "scripts/verify-conformance.ps1",
+        "sha256": "F372833365BF6DD20B01AC57BCFB62544145C488C6642908CAD3C701817A0298",
+        "role": "independent projection verifier"
       }
     ],
-    "schema_version": "eliot-w1-04-implementation-v2",
+    "schema_version": "eliot-w1-04-implementation-v3",
     "authority_status": "EVIDENCE_ONLY",
     "work_item_id": "W1-04",
     "provenance_mode": "CONTENT_BOUND",
@@ -72,33 +111,80 @@
       },
       {
         "path": "swarm/challenges/W1-RESULT-ENVELOPE-CONTRACT.md",
-        "role": "resolved result-envelope program revision",
+        "role": "resolved result-envelope contract",
         "sha256": "C8A14FCDF73CD77EE5E28875EABEBD91ADA33831B35BE2713B29700F7CA394A4"
+      },
+      {
+        "path": "swarm/challenges/W1-04-ANCHOR-SYMBOL-INDEX.md",
+        "role": "Root-accepted anchor-symbol binding contract",
+        "sha256": "67FC0C6BD597520E42ECB3BB21A34EDBABE4746A01D761DB52F30E784F5823A6"
+      },
+      {
+        "path": "swarm/inventory/modules.json",
+        "role": "current module ownership inventory",
+        "sha256": "28AFCA6960240165D7CEE0AA4138B3177E3EF75DC285B1A45E068D23AB5158C9"
+      },
+      {
+        "path": "swarm/inventory/refusals.csv",
+        "role": "current refusal-site inventory",
+        "sha256": "94772E868277CC0F01D043066A3CA3422E90EAF488DACC61551C95297A1AB2D9"
+      },
+      {
+        "path": ".codebase-memory/artifact.json",
+        "role": "code graph identity and counts",
+        "sha256": "D12D06F32E8FD7BBC4D1300737F5A05FDADBCB793828F82E871A89A4C68EFB72"
+      },
+      {
+        "path": ".codebase-memory/graph.db.zst",
+        "role": "persisted code graph database",
+        "sha256": "FA906F525CB78020437E09D65D33E9B874F9D25F2BD7543E28954FD3354CBDF2"
+      },
+      {
+        "path": "scripts/gen-conformance.ps1",
+        "role": "projection generator",
+        "sha256": "A14A7CF7D42E28D1DD812B0DFB7238FF3E000435E1BDE3EA464566D951D3DCC6"
+      },
+      {
+        "path": "scripts/verify-conformance.ps1",
+        "role": "independent projection verifier",
+        "sha256": "F372833365BF6DD20B01AC57BCFB62544145C488C6642908CAD3C701817A0298"
       }
     ],
     "normalized_pair_sha256": "D5FF4BE95EE49644CB86058202BA353BE524A2E83EF5FC61DEA1C8DC17F2686A",
     "generator_path": "scripts/gen-conformance.ps1",
-    "generator_source_sha256": "B93594C092B8860FA2CBBCC316B1340384277EA4827AD659F25DF24B5998F0CF",
+    "generator_source_sha256": "A14A7CF7D42E28D1DD812B0DFB7238FF3E000435E1BDE3EA464566D951D3DCC6",
     "verifier_path": "scripts/verify-conformance.ps1",
-    "verifier_source_sha256": "0984E99F8FC4D2860BD77456202547491DF4ACB4C363E5A1F029751D5DAD4537",
+    "verifier_source_sha256": "F372833365BF6DD20B01AC57BCFB62544145C488C6642908CAD3C701817A0298",
     "result": {
       "disposition": "EVIDENCE_ONLY",
       "anchors": 58,
+      "code_bindings": 4,
+      "unknown_owners": 54,
       "bijection": "58x58 exact ID bijection",
       "support_default": "UNKNOWN",
       "invalidation_default": [],
       "ordering": "Architecture A16.1 canonical order",
-      "authority": "generated projection only; no manual mapping source"
+      "authority": "site-local production rustdoc binding plus current module ownership; no Appendix H owner inference",
+      "graph": {
+        "schema_version": 2,
+        "project": "eliot-memory-os-v15-current",
+        "commit": "8af3984b9a3059fe1b8950337f432065cc7a85f4",
+        "nodes": 58637,
+        "edges": 278304
+      }
     },
-    "contract_challenge_path": "swarm/challenges/W1-RESULT-ENVELOPE-CONTRACT.md",
+    "result_envelope_contract_path": "swarm/challenges/W1-RESULT-ENVELOPE-CONTRACT.md",
+    "binding_contract_path": "swarm/challenges/W1-04-ANCHOR-SYMBOL-INDEX.md",
     "verification": [
       "generator self-test and deterministic generation",
-      "generator check of conformance and implementation result",
+      "generator check of conformance and both result envelopes",
       "independent verifier self-test and normal verification"
     ],
     "residuals": [
-      "No generated evidence exists; every support value remains UNKNOWN and every invalidation list remains empty.",
-      "Result remains EVIDENCE_ONLY as BootstrapWorkResult evidence; no terminal attempt is claimed."
+      "54 anchor owners remain UNKNOWN.",
+      "No generated support or invalidation evidence exists.",
+      "Result remains EVIDENCE_ONLY; no terminal attempt is claimed.",
+      "Digest and semantic evidence assumes writer quiescence; it is not an atomic snapshot proof and does not claim TOCTOU is fixed."
     ],
     "authority_ceiling": "EVIDENCE_ONLY; no terminal completion, release WIP, activation, or wave authorization."
   }

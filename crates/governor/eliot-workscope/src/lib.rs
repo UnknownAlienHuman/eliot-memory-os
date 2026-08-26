@@ -724,6 +724,7 @@ impl OnboardingResolver {
     }
 }
 
+/// ELIOT_ARCH_OWNER: ARCH-SCOPE-01
 /// Stateless mid-task scope binding guard.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScopeBindingGuard;

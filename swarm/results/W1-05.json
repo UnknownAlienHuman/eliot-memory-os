@@ -10,7 +10,7 @@
     "artifacts": {
       "inventory": {
         "path": "swarm/inventory/contour-cut.json",
-        "sha256": "3A3BCD5A07383C5D078E9B6B8F3503033C1BB0C4FA8D2D987B72CF47CCD9C7E3"
+        "sha256": "B5D1353B086BAA7BDE14BE75A452E987D9FF121B14CEFE24F6C962ADF578DED9"
       },
       "generator": {
         "path": "scripts/gen-contour-cut.ps1",
@@ -22,7 +22,7 @@
       },
       "generator_sha256": "3C240F4E0668780CD0BD8113179BEF1539BD9DCA1422B2322E0FE5DAB0ABA756",
       "verifier_sha256": "7B83C47B2FA58BD33404EBD4803B464866D854F527415764F67DC7CD2EA10587",
-      "inventory_sha256": "3A3BCD5A07383C5D078E9B6B8F3503033C1BB0C4FA8D2D987B72CF47CCD9C7E3"
+      "inventory_sha256": "B5D1353B086BAA7BDE14BE75A452E987D9FF121B14CEFE24F6C962ADF578DED9"
     },
     "evidence": [
       "content-bound path plus byte source census",
@@ -58,7 +58,7 @@
       },
       "inventory": {
         "path": "swarm/inventory/contour-cut.json",
-        "sha256": "3A3BCD5A07383C5D078E9B6B8F3503033C1BB0C4FA8D2D987B72CF47CCD9C7E3"
+        "sha256": "B5D1353B086BAA7BDE14BE75A452E987D9FF121B14CEFE24F6C962ADF578DED9"
       }
     },
     "observed_worktree_state": "CONTENT_BOUND_SOURCE_UNION; GIT_CATEGORIES_OBSERVATIONAL_ONLY",
@@ -91,7 +91,7 @@
         "eliot-kernel",
         "eliotd"
       ],
-      "rows": 4106,
+      "rows": 4110,
       "cargo_direct_edges": {
         "A_TO_B": {
           "present": 0,
@@ -105,16 +105,16 @@
       "source_scan": {
         "file_set_kind": "git_cached_plus_nonignored_untracked_rust",
         "grammar_file_set": "direct-read-source-union",
-        "cached_rust_file_count": 546,
-        "nonignored_untracked_rust_file_count": 35,
+        "cached_rust_file_count": 581,
+        "nonignored_untracked_rust_file_count": 0,
         "union_rust_file_count": 581,
         "grammar_motifs": 18,
-        "hit_count": 4072.0,
-        "row_count": 4072,
+        "hit_count": 4076.0,
+        "row_count": 4076,
         "motif_hit_counts": {
           "runtime-executable-literal": 1251,
-          "process-constructor": 262,
-          "process-literal-launch": 119,
+          "process-constructor": 264,
+          "process-literal-launch": 121,
           "process-wrapper-spawn": 5,
           "process-executor-wrapper": 364,
           "windows-process-api": 3,
@@ -133,8 +133,8 @@
         },
         "motif_row_counts": {
           "runtime-executable-literal": 1251,
-          "process-constructor": 262,
-          "process-literal-launch": 119,
+          "process-constructor": 264,
+          "process-literal-launch": 121,
           "process-wrapper-spawn": 5,
           "process-executor-wrapper": 364,
           "windows-process-api": 3,
@@ -152,14 +152,14 @@
           "canonical-write-symbol": 1
         },
         "provenance": "content_bound_path_plus_bytes",
-        "rust_files_sha256": "BD454E8E25352C4AB76ECC8462E5624E1BAF8F5D7194EBFE17900FDBC2CF1724"
+        "rust_files_sha256": "F8242E8F51D553D6E9BB234C10918A37E72BE5A34E972A06219AD395FD63510B"
       },
       "edge_class_counts": {
         "canonical_write_definition": 1,
         "cargo_dependency": 24,
         "launch_control_observation": 376,
         "negative_observation": 5,
-        "process_launch_observation": 381,
+        "process_launch_observation": 385,
         "process_wrapper_observation": 372,
         "runtime_ipc_observation": 377,
         "runtime_process_observation": 1246,
@@ -169,21 +169,21 @@
       },
       "status_counts": {
         "absent": 24,
-        "present": 2693,
+        "present": 2697,
         "unknown": 1389
       },
       "semantic_counts": {
         "negative_observation_non_join": 5,
-        "process_launch_observation": 381,
+        "process_launch_observation": 385,
         "process_wrapper_observation": 372,
         "runtime_ipc_observation": 377,
         "launch_control_observation": 376,
         "schema_observation": 640,
         "state_write_unknown": 373,
-        "unknown_process_target": 723,
+        "unknown_process_target": 727,
         "unknown_ipc_target": 377,
         "unknown_launch_target": 376,
-        "present": 2693,
+        "present": 2697,
         "absent": 24,
         "unknown": 1389
       },
@@ -268,14 +268,14 @@
         "definition": "crates/governor/eliot-governor/src/composition.rs:1292",
         "status": "VERIFIED_ONE_DEFINITION_ZERO_CALLERS"
       },
-      "inventory_summary_sha256": "92BFA10E630C961041C16D7624E0E55571348F20C612EA88A3459E6CFDB86D24",
-      "source_scan_sha256": "89566FA759227E369315632A3023C3E2F6152A60E113F7F9B108283EED9A84E0",
+      "inventory_summary_sha256": "6B28FC0B0CE8DAD6BAA06F46174132EADE21481D58E23864A30B62EC98AA25EB",
+      "source_scan_sha256": "71D95CC8F6B78FA39D096A8573023DF2BBDC9A5FE720A6C41A20BD793B2183AE",
       "canonical_write_proof_sha256": "23BF3C4D828DAA047A5EDAF143F3E96A72CD003EB396F6B6B7FD0F2871D1D36B",
       "regression_fixtures_sha256": "ACFF0865E67C01CA6CA35AFA15FBA494AFB35E5F2CCF546A69EE2EE1088E7E41",
       "cutover_decision": "PENDING_ROOT"
     },
     "findings": [
-      "The full-from-zero mechanism scans the deterministic union of 546 Git-cached and 35 non-ignored-untracked Rust files by direct file reads; it claims completeness only for the 18 declared motifs over that current file set, never semantic/runtime exhaustiveness.",
+      "The full-from-zero mechanism scans the deterministic union of 581 Git-cached and 0 non-ignored-untracked Rust files by direct file reads; it claims completeness only for the 18 declared motifs over that current file set, never semantic/runtime exhaustiveness.",
       "Dynamic and qualified process constructors are emitted with exact local target resolution when available and UNKNOWN_PROCESS_TARGET otherwise. Windows suspended-job wrappers, process-executor symbols, Windows CreateProcess APIs, Tokio/Std/qualified constructors, and named-pipe client/server/transport/authentication operations are represented.",
       "Regression rows include workspace/tools/eliot-runtime-compiler/src/lib.rs:3222, bins/eliot-mod-research/src/lib.rs:72, bins/eliot-host/src/lib.rs:2918, crates/instrument/eliot-process-executor/src/lib.rs:478, crates/eliot-app/src/runtime_bootstrap.rs:71, and the cached bins/eliot/tests/bootstrap_brief.rs fixture.",
       "The bins/eliot/src/main.rs:604 legacy eliot-governor.exe coexistence check is negative_observation/non_join, not a launch/control join. Other legacy/process-state observations are likewise non-join evidence.",
@@ -285,7 +285,7 @@
     ],
     "verification": [
       "pwsh -NoProfile -File scripts/gen-contour-cut.ps1 -SelfTest: PASS",
-      "pwsh -NoProfile -File scripts/gen-contour-cut.ps1: PASS (4106 rows; 581 Rust files)",
+      "pwsh -NoProfile -File scripts/gen-contour-cut.ps1: PASS (4110 rows; 581 Rust files)",
       "pwsh -NoProfile -File scripts/gen-contour-cut.ps1 -Check: PASS",
       "pwsh -NoProfile -File scripts/verify-contour-cut.ps1 -SelfTest: PASS (omitted edge, source-stage, source/result family envelope, duplicate, negative, and §5.1 tamper checks)",
       "pwsh -NoProfile -File scripts/verify-contour-cut.ps1: PASS (declared grammar, Cargo edges, source anchors/digests, §5.1 proof, and full result envelope independently recomputed)",

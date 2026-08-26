@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "f63675ba0539aca21e813fe9ba2c0076e1badb1f",
-    "indexed_at": "2026-08-24T05:34:25Z",
-    "project": "eliot-memory-os-f636-runtime-live-v3",
-    "nodes": 54134,
-    "edges": 268208,
-    "original_size": 111804416,
-    "compressed_size": 17542073,
+    "commit": "8af3984b9a3059fe1b8950337f432065cc7a85f4",
+    "indexed_at": "2026-08-26T08:12:59Z",
+    "project": "eliot-memory-os-v15-current",
+    "nodes": 58637,
+    "edges": 278304,
+    "original_size": 111214592,
+    "compressed_size": 18184318,
     "compression_level": 9
 }
