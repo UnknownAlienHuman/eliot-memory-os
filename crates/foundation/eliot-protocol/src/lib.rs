@@ -362,6 +362,8 @@ pub enum FrameKind {
 /// Explicitly admitted EBP lifecycle message types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum MessageType {
+    /// Kernel-issued bridge peer challenge.
+    Challenge,
     /// Module start.
     Start,
     /// Module ready.
@@ -1653,7 +1655,8 @@ impl JsonCodec {
 fn is_known_message_type(value: &str) -> bool {
     matches!(
         value,
-        "Start"
+        "Challenge"
+            | "Start"
             | "Ready"
             | "Health"
             | "Execute"
@@ -2218,6 +2221,44 @@ mod tests {
             wire.len() - 4
         );
         assert_eq!(codec.decode(&wire)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn challenge_message_type_is_admitted_without_changing_unknown_behavior()
+    -> Result<(), ProtocolError> {
+        let declaration = agent_bridge_client_declaration()?;
+        let challenge = peer_challenge(&declaration)?;
+        let source = Frame {
+            protocol_version: ProtocolVersion::CURRENT,
+            encoding_profile: EncodingProfile::JsonV1,
+            connection_id: "server-connection".to_owned(),
+            request_id: None,
+            kind: FrameKind::Control,
+            message_type: MessageType::Challenge,
+            request_identity: None,
+            payload: ProtocolPayload::Json(
+                serde_json::to_value(challenge)
+                    .map_err(|error| ProtocolError::Json(error.to_string()))?,
+            ),
+            trace_context: BTreeMap::new(),
+        };
+        let codec = JsonCodec::new();
+        let wire = codec.encode(&source)?;
+        assert_eq!(codec.decode(&wire)?, source);
+
+        let mut unknown =
+            serde_json::to_value(source).map_err(|error| ProtocolError::Json(error.to_string()))?;
+        unknown["message_type"] = Value::String("UnknownLifecycleMessage".to_owned());
+        let body =
+            serde_json::to_vec(&unknown).map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let mut unknown_wire = Vec::with_capacity(4 + body.len());
+        unknown_wire.extend_from_slice(&encoded_length(body.len())?.to_le_bytes());
+        unknown_wire.extend_from_slice(&body);
+        assert!(matches!(
+            codec.decode(&unknown_wire),
+            Err(ProtocolError::UnknownMessageType)
+        ));
         Ok(())
     }
 

@@ -9,8 +9,9 @@ use std::future::Future;
 use std::time::Duration;
 
 use eliot_protocol::{
-    ClientHello, EncodingProfile, Frame, FrameKind, JsonCodec, MessageType, ProtocolError,
-    ProtocolPayload, ProtocolRange, ProtocolVersion, ServerHello, negotiate,
+    AgentBridgeClientDeclaration, AgentBridgePeerChallenge, ClientHello, EncodingProfile, Frame,
+    FrameKind, JsonCodec, MessageType, ProtocolError, ProtocolPayload, ProtocolRange,
+    ProtocolVersion, ServerHello, negotiate,
 };
 use eliot_runtime_contracts::ModuleGeneration;
 use thiserror::Error;
@@ -480,6 +481,172 @@ pub fn decode_client_hello_frame_unbound(frame: &Frame) -> Result<ClientHello, T
         .map_err(|error| ProtocolError::Json(error.to_string()))?;
     client.validate()?;
     Ok(client)
+}
+
+/// Encodes the Kernel-issued peer challenge on the authenticated control lane.
+///
+/// The challenge is correlation-only. It does not carry or establish a
+/// semantic Session, principal, task, scope, plan, or request identity.
+pub fn peer_challenge_frame(
+    connection_id: impl Into<String>,
+    challenge: &AgentBridgePeerChallenge,
+) -> Result<Frame, TransportError> {
+    challenge.validate()?;
+    handshake_frame(
+        connection_id,
+        FrameKind::Control,
+        MessageType::Challenge,
+        serde_json::to_value(challenge).map_err(|error| ProtocolError::Json(error.to_string()))?,
+    )
+}
+
+/// Decodes the exact typed peer challenge from an authenticated control frame.
+pub fn decode_peer_challenge_frame(
+    frame: &Frame,
+    expected_connection_id: &str,
+) -> Result<AgentBridgePeerChallenge, TransportError> {
+    let payload = validate_handshake_frame(
+        frame,
+        Some(expected_connection_id),
+        FrameKind::Control,
+        MessageType::Challenge,
+    )?;
+    let challenge: AgentBridgePeerChallenge = serde_json::from_value(payload.clone())
+        .map_err(|error| ProtocolError::Json(error.to_string()))?;
+    challenge.validate()?;
+    Ok(challenge)
+}
+
+/// One-shot server-first handshake state owned by a single transport
+/// connection.
+///
+/// The server creates the connection identity and supplies the already
+/// selected challenge/declaration pair. This type deliberately does not
+/// reference [`ServerHandshakePolicy`]: it cannot mutate shared handshake
+/// policy or issue any application authority. A malformed, mismatched, or
+/// repeated `ClientHello` permanently fences this connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServerFirstState {
+    /// The challenge was sent and one exact `ClientHello` is expected.
+    Challenged,
+    /// The exact one-shot `ClientHello` was accepted.
+    Accepted,
+    /// The connection is permanently fenced after a protocol failure.
+    Fenced,
+    /// The owner explicitly aborted before acceptance.
+    Aborted,
+}
+
+/// Provider-neutral server-first challenge/hello exchange.
+///
+/// `ServerFirstConnection` is intentionally not `Clone`: copying a pending
+/// state would allow two owners to accept the same one-shot challenge.
+///
+/// ```compile_fail
+/// use eliot_ipc::ServerFirstConnection;
+///
+/// let connection: ServerFirstConnection = panic!("owned pending connection");
+/// let _duplicate = connection.clone();
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+pub struct ServerFirstConnection {
+    connection_id: String,
+    challenge: AgentBridgePeerChallenge,
+    state: ServerFirstState,
+}
+
+impl ServerFirstConnection {
+    /// Creates a server-owned one-shot exchange after validating the exact
+    /// challenge/declaration relationship.
+    pub fn new(
+        connection_id: impl Into<String>,
+        challenge: AgentBridgePeerChallenge,
+        declaration: &AgentBridgeClientDeclaration,
+    ) -> Result<Self, TransportError> {
+        let connection_id = connection_id.into();
+        validate_server_connection_id(&connection_id)?;
+        challenge.validate_declaration(declaration)?;
+        Ok(Self {
+            connection_id,
+            challenge,
+            state: ServerFirstState::Challenged,
+        })
+    }
+
+    /// Returns the server-created connection identity.
+    #[must_use]
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
+    /// Returns the validated one-shot challenge.
+    #[must_use]
+    pub const fn challenge(&self) -> &AgentBridgePeerChallenge {
+        &self.challenge
+    }
+
+    /// Returns the current exchange state.
+    #[must_use]
+    pub const fn state(&self) -> ServerFirstState {
+        self.state
+    }
+
+    /// Builds the exact Control/Challenge frame for this connection.
+    pub fn challenge_frame(&self) -> Result<Frame, TransportError> {
+        peer_challenge_frame(&self.connection_id, &self.challenge)
+    }
+
+    /// Accepts exactly one Control/Start `ClientHello` matching the supplied
+    /// static declaration and this challenge's nonce.
+    ///
+    /// The declaration is revalidated and rebound on every attempt. Any
+    /// malformed frame, identity mismatch, declaration substitution, nonce
+    /// substitution, digest mismatch, or second attempt fences the exchange.
+    pub fn accept_client_hello(
+        &mut self,
+        frame: &Frame,
+        declaration: &AgentBridgeClientDeclaration,
+    ) -> Result<ClientHello, TransportError> {
+        if self.state != ServerFirstState::Challenged {
+            self.state = ServerFirstState::Fenced;
+            return Err(TransportError::SessionFenced);
+        }
+
+        let result = (|| {
+            self.challenge.validate_declaration(declaration)?;
+            let hello = decode_client_hello_frame(frame, &self.connection_id)?;
+            let expected = declaration.client_hello(self.challenge.challenge_nonce.clone())?;
+            if hello != expected {
+                return Err(TransportError::SessionFenced);
+            }
+            Ok(hello)
+        })();
+        if let Ok(hello) = result {
+            self.state = ServerFirstState::Accepted;
+            Ok(hello)
+        } else {
+            self.state = ServerFirstState::Fenced;
+            Err(TransportError::SessionFenced)
+        }
+    }
+
+    /// Explicitly aborts this exchange for an owner-observed timeout or
+    /// disconnect. No clock is invented by this transport-neutral type.
+    pub fn abort(&mut self) {
+        self.state = ServerFirstState::Aborted;
+    }
+
+    /// Explicitly fences this exchange for an owner-observed transport fault.
+    pub fn fence(&mut self) {
+        self.state = ServerFirstState::Fenced;
+    }
+}
+
+fn validate_server_connection_id(connection_id: &str) -> Result<(), TransportError> {
+    if connection_id.trim().is_empty() || connection_id.chars().any(char::is_control) {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
 }
 
 /// Encodes the server-authoritative typed `ServerHello` on the control lane.
@@ -1683,7 +1850,12 @@ mod windows_transport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_protocol::{EncodingProfile, FrameKind, MessageType, ProtocolPayload};
+    use eliot_protocol::{
+        AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+        AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
+        AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentBridgeClientDeclaration,
+        AgentBridgePeerChallenge, EncodingProfile, FrameKind, MessageType, ProtocolPayload,
+    };
     use std::collections::BTreeMap;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1720,6 +1892,83 @@ mod tests {
             control_reserve: 1,
             operation_timeout: Duration::from_secs(1),
         }
+    }
+
+    fn bridge_declaration() -> Result<AgentBridgeClientDeclaration, ProtocolError> {
+        serde_json::from_value::<AgentBridgeClientDeclaration>(serde_json::json!({
+            "wire_id": AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID,
+            "wire_version": AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+            "module_id": AGENT_BRIDGE_MODULE_ID,
+            "profile_id": "agent-bridge-profile-1",
+            "protocol_range": {
+                "minimum": {"major": 1, "minor": 0},
+                "maximum": {"major": 1, "minor": 0}
+            },
+            "module_contract": {
+                "module_id": AGENT_BRIDGE_MODULE_ID,
+                "version": {"major": 1, "minor": 0, "patch": 0},
+                "artifact_id": "a".repeat(64),
+                "protocols": ["eliot.agent-bridge.v1"],
+                "required_capabilities": ["agent.bridge.activate"],
+                "optional_capabilities": [],
+                "advisory_capabilities": [],
+                "state_owner": "eliot-host",
+                "failure_domain": "agent-bridge",
+                "hot_replace": false
+            },
+            "module_generation": {
+                "module_id": AGENT_BRIDGE_MODULE_ID,
+                "generation": 1,
+                "artifact_id": "a".repeat(64),
+                "state": "STARTING",
+                "health": {
+                    "liveness": "HEALTHY",
+                    "readiness": "HEALTHY",
+                    "freshness": "HEALTHY",
+                    "compatibility": "HEALTHY",
+                    "integrity": "HEALTHY",
+                    "capacity": "HEALTHY"
+                },
+                "state_fence": {
+                    "authority_epoch": 7,
+                    "resource_generation": 1,
+                    "task_revision": null,
+                    "policy_revision": null,
+                    "integration_revision": null
+                }
+            },
+            "capabilities": ["agent.bridge.activate"],
+            "privacy_classes": ["PUBLIC"],
+            "max_frame": 4_194_304,
+            "expected_kernel_sid": "S-1-5-18",
+            "expected_kernel_session_id": 0,
+            "expected_kernel_principal_binding": "kernel:agent-bridge",
+            "expected_kernel_authority_epoch": 8,
+            "expected_kernel_generation": 2,
+            "expected_kernel_artifact_sha256": "b".repeat(64),
+            "expected_kernel_config_snapshot_sha256": "c".repeat(64),
+            "declaration_sha256": ""
+        }))
+        .map_err(|error| ProtocolError::Json(error.to_string()))?
+        .with_computed_digest()
+    }
+
+    fn bridge_challenge(
+        declaration: &AgentBridgeClientDeclaration,
+    ) -> Result<AgentBridgePeerChallenge, ProtocolError> {
+        AgentBridgePeerChallenge {
+            wire_id: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: declaration.profile_id.clone(),
+            descriptor_sha256: "d".repeat(64),
+            client_declaration_sha256: declaration.declaration_sha256.clone(),
+            bridge_generation: declaration.module_generation.generation,
+            state_fence: declaration.module_generation.state_fence.clone(),
+            challenge_nonce: "kernel-challenge-1".to_owned(),
+            challenge_sha256: String::new(),
+        }
+        .with_computed_digest()
     }
 
     #[test]
@@ -1786,6 +2035,153 @@ mod tests {
     fn uncertainty_never_becomes_delivery_proof() {
         assert_eq!(classify_disconnect(false), DeliveryOutcome::UnknownOutcome);
         assert_eq!(classify_disconnect(true), DeliveryOutcome::UnknownOutcome);
+    }
+
+    #[test]
+    fn server_first_challenge_codec_and_one_shot_acceptance() -> TestResult {
+        let declaration = bridge_declaration()?;
+        let challenge = bridge_challenge(&declaration)?;
+        let exchange =
+            ServerFirstConnection::new("server-connection", challenge.clone(), &declaration)?;
+        let challenge_frame = exchange.challenge_frame()?;
+        assert_eq!(
+            decode_peer_challenge_frame(&challenge_frame, "server-connection")?,
+            challenge
+        );
+        let hello = declaration.client_hello(challenge.challenge_nonce.clone())?;
+        let hello_frame = client_hello_frame("server-connection", &hello)?;
+        let mut exchange = exchange;
+        assert_eq!(
+            exchange.accept_client_hello(&hello_frame, &declaration)?,
+            hello
+        );
+        assert_eq!(exchange.state(), ServerFirstState::Accepted);
+        assert_eq!(
+            exchange.accept_client_hello(&hello_frame, &declaration),
+            Err(TransportError::SessionFenced)
+        );
+        assert_eq!(exchange.state(), ServerFirstState::Fenced);
+        Ok(())
+    }
+
+    #[test]
+    fn server_first_fences_identity_and_binding_substitutions() -> TestResult {
+        let declaration = bridge_declaration()?;
+        let challenge = bridge_challenge(&declaration)?;
+
+        let wrong_connection = peer_challenge_frame("other-connection", &challenge)?;
+        assert_eq!(
+            decode_peer_challenge_frame(&wrong_connection, "server-connection"),
+            Err(TransportError::SessionFenced)
+        );
+        let mut wrong_kind = peer_challenge_frame("server-connection", &challenge)?;
+        wrong_kind.kind = FrameKind::Event;
+        assert_eq!(
+            decode_peer_challenge_frame(&wrong_kind, "server-connection"),
+            Err(TransportError::SessionFenced)
+        );
+        let mut wrong_type = peer_challenge_frame("server-connection", &challenge)?;
+        wrong_type.message_type = MessageType::Start;
+        assert_eq!(
+            decode_peer_challenge_frame(&wrong_type, "server-connection"),
+            Err(TransportError::SessionFenced)
+        );
+
+        let mut substituted_profile = declaration.clone();
+        substituted_profile.profile_id = "other-profile".to_owned();
+        substituted_profile.declaration_sha256 = substituted_profile.compute_digest()?;
+        let mut exchange =
+            ServerFirstConnection::new("server-connection", challenge.clone(), &declaration)?;
+        let hello = declaration.client_hello(challenge.challenge_nonce.clone())?;
+        let hello_frame = client_hello_frame("server-connection", &hello)?;
+        assert_eq!(
+            exchange.accept_client_hello(&hello_frame, &substituted_profile),
+            Err(TransportError::SessionFenced)
+        );
+        assert_eq!(exchange.state(), ServerFirstState::Fenced);
+
+        let mut nonce_exchange =
+            ServerFirstConnection::new("server-connection", challenge.clone(), &declaration)?;
+        let wrong_nonce = declaration.client_hello("different-nonce")?;
+        let wrong_nonce_frame = client_hello_frame("server-connection", &wrong_nonce)?;
+        assert_eq!(
+            nonce_exchange.accept_client_hello(&wrong_nonce_frame, &declaration),
+            Err(TransportError::SessionFenced)
+        );
+
+        let mut generation_challenge = challenge.clone();
+        generation_challenge.bridge_generation = serde_json::from_value(serde_json::json!(2))?;
+        generation_challenge = generation_challenge.with_computed_digest()?;
+        assert!(
+            ServerFirstConnection::new("server-connection", generation_challenge, &declaration)
+                .is_err()
+        );
+
+        let mut digest_challenge = challenge.clone();
+        digest_challenge.client_declaration_sha256 = "e".repeat(64);
+        digest_challenge = digest_challenge.with_computed_digest()?;
+        assert!(
+            ServerFirstConnection::new("server-connection", digest_challenge, &declaration)
+                .is_err()
+        );
+
+        let mut fence_challenge = challenge.clone();
+        fence_challenge.state_fence.authority_epoch = serde_json::from_value(serde_json::json!(8))?;
+        fence_challenge = fence_challenge.with_computed_digest()?;
+        assert!(
+            ServerFirstConnection::new("server-connection", fence_challenge, &declaration).is_err()
+        );
+
+        let mut request_id_frame = client_hello_frame("server-connection", &hello)?;
+        request_id_frame.request_id = Some(serde_json::from_value(serde_json::json!("request"))?);
+        let mut identity_exchange =
+            ServerFirstConnection::new("server-connection", challenge, &declaration)?;
+        assert_eq!(
+            identity_exchange.accept_client_hello(&request_id_frame, &declaration),
+            Err(TransportError::SessionFenced)
+        );
+        assert_eq!(identity_exchange.state(), ServerFirstState::Fenced);
+
+        let mut request_identity_frame = hello_frame;
+        request_identity_frame.kind = FrameKind::Request;
+        request_identity_frame.request_id =
+            Some(serde_json::from_value(serde_json::json!("request"))?);
+        let mut identity_exchange = ServerFirstConnection::new(
+            "server-connection",
+            bridge_challenge(&declaration)?,
+            &declaration,
+        )?;
+        assert_eq!(
+            identity_exchange.accept_client_hello(&request_identity_frame, &declaration),
+            Err(TransportError::SessionFenced)
+        );
+        assert_eq!(identity_exchange.state(), ServerFirstState::Fenced);
+        Ok(())
+    }
+
+    #[test]
+    fn server_first_owner_abort_and_fence_are_explicit() -> TestResult {
+        let declaration = bridge_declaration()?;
+        let challenge = bridge_challenge(&declaration)?;
+        let mut aborted =
+            ServerFirstConnection::new("server-connection", challenge.clone(), &declaration)?;
+        aborted.abort();
+        assert_eq!(aborted.state(), ServerFirstState::Aborted);
+        let hello = declaration.client_hello(challenge.challenge_nonce.clone())?;
+        let hello_frame = client_hello_frame("server-connection", &hello)?;
+        assert_eq!(
+            aborted.accept_client_hello(&hello_frame, &declaration),
+            Err(TransportError::SessionFenced)
+        );
+
+        let mut fenced = ServerFirstConnection::new("server-connection", challenge, &declaration)?;
+        fenced.fence();
+        assert_eq!(fenced.state(), ServerFirstState::Fenced);
+        assert_eq!(
+            fenced.accept_client_hello(&hello_frame, &declaration),
+            Err(TransportError::SessionFenced)
+        );
+        Ok(())
     }
 
     fn heartbeat() -> Frame {

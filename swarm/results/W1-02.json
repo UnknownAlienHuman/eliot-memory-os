@@ -24,7 +24,7 @@
       "note": "UNKNOWN anchors are explicit evidence gaps: the source span contains no validated normative/work identifier; they are not inferred from the historical 1371 baseline."
     },
     "source_file_count": 581,
-    "source_digest_aggregate": "5fdecd19f7c9a8cbafc3c473619a3081c229474350135ff860d24dd91cea1d34",
+    "source_digest_aggregate": "25bf7ba66e958833cb5f6777267cfb358fadbd1856bac179a31b3a5817925693",
     "normative_pair_sha256": "041c9bb09db91b8bd8b8c073270c6220cf534b746fcf7faadf705094218b99b1",
     "normative_pair_paths": [
       "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -1585,7 +1585,7 @@
         },
         {
           "path": "crates/foundation/eliot-protocol/src/lib.rs",
-          "sha256": "36b22131e03135875b687b51dd07e979298761b475f2c1948b95fd45e1b5430e"
+          "sha256": "7a3d1c5a9f5b1839d71622448da3399087db26dfccf23004930b6019db84e0cb"
         },
         {
           "path": "crates/foundation/eliot-receipts/src/lib.rs",
@@ -1977,7 +1977,7 @@
         },
         {
           "path": "crates/kernel/eliot-ipc/src/lib.rs",
-          "sha256": "d1993a2c3429efbff7c2cccdee323c66816d933e3117c0b3e46bf95aafaff372"
+          "sha256": "0c025953ae655ba268133ffa56a31390e06a2f0d615b6e30935187c37745569a"
         },
         {
           "path": "crates/kernel/eliot-kernel-core/src/authority.rs",
@@ -2388,7 +2388,7 @@
           "sha256": "0b9cb7808d1a6ef940c7c095f06de336ea78beb58b9f6191235f7b0698a21eee"
         }
       ],
-      "source_manifest_sha256": "5fdecd19f7c9a8cbafc3c473619a3081c229474350135ff860d24dd91cea1d34",
+      "source_manifest_sha256": "25bf7ba66e958833cb5f6777267cfb358fadbd1856bac179a31b3a5817925693",
       "normative_pair": [
         {
           "path": "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -2410,10 +2410,10 @@
       "artifact_hashes": [
         {
           "path": "swarm/inventory/refusals.csv",
-          "sha256": "0f59dec85f60e95dc2f67f9b156c68b5a2fb5730f51d3c1fdc8ed6940bd24a41"
+          "sha256": "900c3bae0543dbd4cd129625aa1e039ed168a7db2dd57aa8c410d26dc0ac422c"
         }
       ],
-      "content_digest": "a49a6ec183ed316a516523a2fe6e634ffbd9714347ab1d892d1387e131b2f9bd"
+      "content_digest": "edae3d54086cde91e2e024094feed5c119d807dd9a16d6df93c30214f92a8382"
     },
     "disposition": "challenged",
     "artifacts": [
