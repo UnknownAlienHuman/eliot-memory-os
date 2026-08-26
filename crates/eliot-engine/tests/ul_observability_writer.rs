@@ -168,6 +168,7 @@ fn task_contract_command(
             action_lease_id: None,
             understanding_proof_hash: None,
             action_provenance: None,
+            memory_grant_redemptions: Vec::new(),
             observation_ids: Vec::new(),
             verification_ids: Vec::new(),
             verification_scopes: Vec::new(),

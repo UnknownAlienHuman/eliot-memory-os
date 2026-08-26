@@ -239,6 +239,10 @@ pub(super) async fn load_managed_finalization_authority(
     })
 }
 
+fn managed_finalization_lease_is_active(state: eliot_types::AuthorityLeaseState) -> bool {
+    state == eliot_types::AuthorityLeaseState::Active
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) async fn validate_managed_broker_authority(
     state: &McpState,
@@ -300,6 +304,7 @@ pub(super) async fn validate_managed_broker_authority(
         .find(|lease| {
             lease.task_id == managed.task_id
                 && lease.agent_session_id == controller_session_id
+                && managed_finalization_lease_is_active(lease.state)
                 && lease.expires_at > now
         })
         .context("managed finalization requires the active ControllerLease")?;
@@ -310,6 +315,7 @@ pub(super) async fn validate_managed_broker_authority(
             role.task_id == managed.task_id
                 && role.agent_session_id == controller_session_id
                 && role.role == AgentRole::Controller
+                && managed_finalization_lease_is_active(role.state)
                 && role.expires_at > now
                 && role
                     .capability_scope
@@ -331,6 +337,7 @@ pub(super) async fn validate_managed_broker_authority(
     if provider_role.role_lease_id != managed.role_lease_id
         || provider_role.task_id != managed.task_id
         || provider_role.agent_session_id != managed.agent_session_id
+        || !managed_finalization_lease_is_active(provider_role.state)
         || provider_role.expires_at <= now
         || provider_role.role == AgentRole::Controller
         || request
@@ -1295,4 +1302,19 @@ pub(super) fn validate_managed_finalization_aggregate_replay(
     }
     validate_managed_finalization_commit(&managed.worktree_path, intent, &aggregate.commit_ref)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod authority_state_tests {
+    use super::*;
+
+    #[test]
+    fn managed_finalization_accepts_only_active_authority_leases() {
+        use eliot_types::AuthorityLeaseState::{Active, Consumed, Expired, Pending, Revoked};
+
+        assert!(managed_finalization_lease_is_active(Active));
+        for state in [Pending, Consumed, Revoked, Expired] {
+            assert!(!managed_finalization_lease_is_active(state));
+        }
+    }
 }

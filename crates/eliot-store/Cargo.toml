@@ -26,5 +26,8 @@ uuid.workspace = true
 [dev-dependencies]
 time.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+eliot-windows-ipc = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

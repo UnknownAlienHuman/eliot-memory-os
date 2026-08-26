@@ -415,7 +415,9 @@ pub struct MemoryNeedService;
 impl MemoryNeedService {
     pub fn decide(frame: &TaskMeaningFrame, requested: Option<MemoryNeed>) -> MemoryNeedDecision {
         let need = requested.unwrap_or_else(|| {
-            if frame.material_unknowns.is_empty() && !frame.current_evidence.is_empty() {
+            if frame.material_unknowns.is_empty()
+                && TaskMeaningService::bridge_quality(frame).decision_sufficient
+            {
                 MemoryNeed::None
             } else if !frame.problem_or_failure_signature.trim().is_empty()
                 || !frame.control_data_state_path.is_empty()
@@ -601,6 +603,20 @@ impl ExperienceRetrievalService {
                 no_useful_memory: true,
                 reason: "NO_USEFUL_MEMORY: memory not needed or exposure policy excludes it"
                     .to_owned(),
+            };
+        }
+        if !MemoryKindCompatibilityService::compatible(request.need.need, MemoryKind::CausalCase) {
+            return ExperienceRecallResponse {
+                project_id: request.project_id,
+                decision: request.need.clone(),
+                fused_rank_traces: Vec::new(),
+                applicability: Vec::new(),
+                experience_priors: Vec::new(),
+                no_useful_memory: true,
+                reason: format!(
+                    "NO_USEFUL_MEMORY: causal case corpus is incompatible with {:?}",
+                    request.need.need
+                ),
             };
         }
         let mut ranked = cases

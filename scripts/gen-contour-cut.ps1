@@ -22,6 +22,45 @@ $UnknownProcessTarget = 'UNKNOWN_PROCESS_TARGET'
 $UnknownIpcTarget = 'UNKNOWN_IPC_TARGET'
 $UnknownLaunchTarget = 'UNKNOWN_LAUNCH_TARGET'
 $UnknownSchemaOwner = 'UNKNOWN_SCHEMA_OWNER'
+
+function Resolve-InventoryOnlyOutputSafe([string]$Candidate) {
+    if ([string]::IsNullOrWhiteSpace($Candidate)) { throw '-InventoryOnly requires a non-empty -OutputPath' }
+    $raw = $Candidate.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    if ($raw.StartsWith('\\')) { throw '-InventoryOnly output must not use a UNC or device path' }
+    if ($raw -match '[\x00-\x1F\x7F]') { throw '-InventoryOnly output must not contain control characters' }
+    $pathRoot = [IO.Path]::GetPathRoot($raw)
+    $allowedDriveColon = -not [string]::IsNullOrEmpty($pathRoot) -and
+        $pathRoot.Length -ge 2 -and $pathRoot[1] -eq ':' -and
+        $raw.IndexOf(':') -eq 1 -and $raw.LastIndexOf(':') -eq 1
+    if ($raw.Contains(':') -and -not $allowedDriveColon) { throw '-InventoryOnly output must not use an alternate data stream or control colon' }
+    foreach ($segment in @($raw -split '[\\/]')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -in @('.', '..') -or $segment -match '^[A-Za-z]:$') { continue }
+        if ($segment -match '~[0-9]' -or $segment.EndsWith('.') -or $segment.EndsWith(' ')) { throw '-InventoryOnly output must not use a Win32-normalized path alias' }
+    }
+    $fullPath = if ([IO.Path]::IsPathRooted($raw)) { [IO.Path]::GetFullPath($raw) } else { [IO.Path]::GetFullPath((Join-Path $RepoRoot $raw)) }
+    $volumeRoot = [IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrEmpty($volumeRoot)) { throw '-InventoryOnly output has no filesystem root' }
+    $cursor = $volumeRoot
+    foreach ($segment in @([IO.Path]::GetRelativePath($volumeRoot, $fullPath) -split '[\\/]')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -eq '.') { continue }
+        $cursor = [IO.Path]::Combine($cursor, $segment)
+        if (Test-Path -LiteralPath $cursor) {
+            $item = Get-Item -LiteralPath $cursor -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw '-InventoryOnly output must not traverse a reparse point' }
+        }
+    }
+    foreach ($relative in @('swarm\inventory\contour-cut.json','swarm\results\W1-05.json','scripts\gen-contour-cut.ps1','scripts\verify-contour-cut.ps1')) {
+        $ownedFull = [IO.Path]::GetFullPath((Join-Path $RepoRoot $relative))
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($fullPath, $ownedFull)) { throw '-InventoryOnly output must not target a generator-owned path' }
+    }
+    $repositoryRoot = [IO.Path]::GetFullPath($RepoRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $repositoryPrefix = $repositoryRoot + [IO.Path]::DirectorySeparatorChar
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $temporaryPrefix = $temporaryRoot + [IO.Path]::DirectorySeparatorChar
+    if ([StringComparer]::OrdinalIgnoreCase.Equals($temporaryRoot, $repositoryRoot) -or $temporaryRoot.StartsWith($repositoryPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw '-InventoryOnly process temporary directory must not overlap the repository' }
+    if (-not $fullPath.StartsWith($temporaryPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw '-InventoryOnly output must stay under the process temporary directory' }
+    return $fullPath
+}
 $UnknownCanonicalOwner = 'UNKNOWN_CANONICAL_OWNER'
 
 $RegressionFixtures = @(
@@ -586,14 +625,19 @@ if ($SelfTest) {
 if ($InventoryOnly -and $PSBoundParameters.ContainsKey('ResultPath')) { throw '-InventoryOnly cannot combine with -ResultPath' }
 $customOutput = $PSBoundParameters.ContainsKey('OutputPath')
 $customResult = $PSBoundParameters.ContainsKey('ResultPath')
-if (-not $InventoryOnly -and $customOutput -ne $customResult) { throw 'custom -OutputPath and -ResultPath must be supplied together unless -InventoryOnly is used' }
+if ($InventoryOnly -and -not $customOutput) { throw '-InventoryOnly requires explicit -OutputPath' }
+if (-not $InventoryOnly -and ($customOutput -or $customResult)) { throw 'custom output paths require explicit -InventoryOnly; normal generation owns the canonical inventory/result pair' }
+$target = if ($InventoryOnly) { Resolve-InventoryOnlyOutputSafe $OutputPath } else { $DefaultOutputPath }
 if ($Check -and ($customOutput -or $customResult)) { throw '-Check validates canonical output and result paths only' }
-$target = if ($customOutput) { [IO.Path]::GetFullPath($OutputPath) } else { $DefaultOutputPath }
-$resultTarget = if ($InventoryOnly) { $null } elseif ($customResult) { [IO.Path]::GetFullPath($ResultPath) } else { $DefaultResultPath }
+$resultTarget = if ($InventoryOnly) { $null } else { $DefaultResultPath }
 $inventory = New-Inventory
 Assert-Inventory $inventory
 $inventoryBytes = Get-JsonBytes $inventory
 $resultBytes = if ($InventoryOnly) { $null } else { Get-ResultBytes $inventory $inventoryBytes }
+if ($InventoryOnly) {
+    $revalidatedTarget = Resolve-InventoryOnlyOutputSafe $OutputPath
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($target, $revalidatedTarget)) { throw '-InventoryOnly output path identity changed during generation' }
+}
 if ($Check) {
     Assert-BytesEqual $target $inventoryBytes 'generated inventory'
     Assert-BytesEqual $resultTarget $resultBytes 'generated result envelope'

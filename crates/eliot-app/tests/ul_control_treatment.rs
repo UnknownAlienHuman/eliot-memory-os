@@ -654,6 +654,70 @@ fn u9_8_packet_startup_recovery_is_complete_isolated_and_effects_once() -> TestR
     Ok(())
 }
 
+#[test]
+fn u9_7_measurement_assignment_survives_material_frame_refinement() -> TestResult {
+    let _guard = test_guard();
+    if rerun_with_credential_gate("u9_7_measurement_assignment_survives_material_frame_refinement")?
+    {
+        return Ok(());
+    }
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let prepared = Harness::prepare("u9-assignment-stability")?;
+    let mut harness = prepared.launch()?;
+    harness.create_task(40, project_id, task_id)?;
+
+    let baseline = compile(
+        &mut harness,
+        41,
+        project_id,
+        task_id,
+        None,
+        "src/blob_store.rs",
+    )?;
+    assert_eq!(
+        baseline["ul_experiment"]["task_class"]["action_class"],
+        "read_only"
+    );
+    let baseline_assignment = harness
+        .ul_assignment(project_id, task_id)?
+        .ok_or("baseline packet did not persist its experiment assignment")?;
+
+    let refined = compile(
+        &mut harness,
+        42,
+        project_id,
+        task_id,
+        Some(material_frame(&[], &[])),
+        "src/blob_store.rs",
+    )?;
+    assert_eq!(refined["packet_admission"]["active_allowed"], true);
+    assert_eq!(
+        refined["ul_experiment"]["task_class"],
+        baseline["ul_experiment"]["task_class"]
+    );
+    assert_eq!(
+        harness.ul_assignment(project_id, task_id)?,
+        Some(baseline_assignment)
+    );
+
+    let outbox_root = harness
+        .runtime_path()
+        .join("reports")
+        .join("context-packets")
+        .join("tasks")
+        .join(task_id.to_string())
+        .join("outbox");
+    for operation in std::fs::read_dir(outbox_root)? {
+        let events = packet_event_snapshot(&operation?.path().join("events"))?;
+        let (_, terminal) = events.last().ok_or("packet outbox event missing")?;
+        let terminal: Value = serde_json::from_slice(terminal)?;
+        assert_eq!(terminal["status"], "complete");
+        assert_eq!(terminal["errors"], json!([]));
+    }
+    Ok(())
+}
+
 fn compile(
     harness: &mut Harness,
     request_id: u64,

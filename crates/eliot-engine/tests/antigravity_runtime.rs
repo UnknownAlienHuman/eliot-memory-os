@@ -904,6 +904,8 @@ fn active_worktree_lease(
         base_commit: "test-head".to_owned(),
         allowed_read_set: work_lease.scope.read_set.clone(),
         allowed_write_set: work_lease.scope.write_set.clone(),
+        kind: eliot_types::WorktreeLeaseKind::LinkedGitWorktree,
+        managed_root: None,
         state: WorktreeLeaseState::Active,
         issued_at: now,
         expires_at: now + Duration::minutes(30),

@@ -12,7 +12,7 @@
     "artifacts": [
       {
         "path": "swarm/inventory/composition-roots.json",
-        "sha256": "ce03fda3474277959415b1035a064964ff453a05f4d332179b1d147ced497a44",
+        "sha256": "7db20543f7abc6307abd6304e4d454ff6dd45421fa94976020db7c778a2cb517",
         "kind": "inventory"
       }
     ],
@@ -41,7 +41,7 @@
     "evidence_lineage": [
       {
         "path": "swarm/inventory/composition-roots.json",
-        "sha256": "ce03fda3474277959415b1035a064964ff453a05f4d332179b1d147ced497a44",
+        "sha256": "7db20543f7abc6307abd6304e4d454ff6dd45421fa94976020db7c778a2cb517",
         "role": "generated composition-root registry"
       }
     ],
@@ -52,8 +52,8 @@
       "verifier": "scripts/verify-composition-roots.ps1",
       "schema_version": "eliot-composition-root-registry-v2",
       "cargo_metadata_target_count": 22,
-      "target_set_digest": "bc000e30676905f3c8854970fc47554ca74a8acdf6c0815f069b8a333116fd59",
-      "registry_sha256": "ce03fda3474277959415b1035a064964ff453a05f4d332179b1d147ced497a44"
+      "target_set_digest": "b7779a409a5f9d10e158da2263cf8c31e866691a8cc8b51057249c295e7193bf",
+      "registry_sha256": "7db20543f7abc6307abd6304e4d454ff6dd45421fa94976020db7c778a2cb517"
     },
     "classification": {
       "useful_work": 16,

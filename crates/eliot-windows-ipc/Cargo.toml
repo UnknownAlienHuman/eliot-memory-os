@@ -4,6 +4,20 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+autobins = false
+
+[features]
+default = []
+test-support = []
+
+[[bin]]
+name = "eliot-process-guardian"
+path = "src/bin/eliot-process-guardian.rs"
+
+[[bin]]
+name = "eliot-credential-suite-guard"
+path = "src/bin/eliot-credential-suite-guard.rs"
+required-features = ["test-support"]
 
 [dependencies]
 serde_json.workspace = true

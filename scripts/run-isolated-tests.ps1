@@ -29,7 +29,7 @@ if (-not (Test-Path -LiteralPath $surrealExePath -PathType Leaf)) {
 $surrealConfigPath = $surrealExePath.Replace('\', '/')
 $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $runId = [guid]::NewGuid().ToString('N')
-$ownedRoot = [IO.Path]::GetFullPath((Join-Path $tempBase ("eliot-governor-workspace-tests-{0}-{1}" -f $PID, $runId)))
+$ownedRoot = [IO.Path]::GetFullPath((Join-Path $tempBase ("eliot-wt-{0}-{1}" -f $PID, $runId)))
 $ownedPrefix = $ownedRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
 $lower = $ownedRoot.ToLowerInvariant()
 
@@ -354,6 +354,7 @@ foreach ($name in @(
     'ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_ROOT',
     'ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_TARGET',
     'ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE',
+    'ELIOT_TEST_REGISTERED_CARGO_TARGET_ROOT',
     'ELIOT_COGNITIVE_FIELD_RESULT_PATH',
     'ELIOT_SURREAL_EXE',
     'SURREAL_USER',
@@ -460,6 +461,7 @@ migrations_dir = "$migrationsPath"
     $env:ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_ROOT = $operatorCursorCredentialRoot
     Remove-Item Env:ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_TARGET -ErrorAction SilentlyContinue
     Remove-Item Env:ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE -ErrorAction SilentlyContinue
+    $env:ELIOT_TEST_REGISTERED_CARGO_TARGET_ROOT = $ownedRoot
     $env:ELIOT_GOVERNOR_CONFIG = $configPath
     $env:ELIOT_TEST_SURREAL_BIND = "127.0.0.1:$port"
     $env:ELIOT_TEST_SURREAL_ENDPOINT = "ws://127.0.0.1:$port/rpc"
@@ -476,7 +478,7 @@ migrations_dir = "$migrationsPath"
     $env:SURREAL_PASS = $password
 
     $guardianBuildProcess = Start-Process -FilePath 'cargo.exe' -ArgumentList @(
-        'build', '--offline', '-p', 'eliot-windows-ipc', '--bins'
+        'build', '--offline', '-p', 'eliot-windows-ipc', '--bins', '--features', 'test-support'
     ) -WorkingDirectory $repo -RedirectStandardOutput $guardianBuildStdout `
         -RedirectStandardError $guardianBuildStderr -PassThru -WindowStyle Hidden
     if (-not $guardianBuildProcess.WaitForExit(300000)) {

@@ -1,0 +1,958 @@
+{
+  "schema_version": "eliot.bootstrap-work-result.v1",
+  "authority_status": "EVIDENCE_ONLY",
+  "work_item_id": "W3-03",
+  "structured_result": {
+    "disposition": "challenged",
+    "implementation_status": "PARTIAL_ENDPOINT_TWENTY_ONE_HOST_MODULES_AND_FOUR_TEST_MODULES_IMPLEMENTED",
+    "head_revision": "d5f0fdc528fa4926db8924972b3a7b3fdc21f3d2",
+    "source_state": "HEAD_PLUS_DIRTY_OVERLAY",
+    "integration_owner": "Sol Root /root",
+    "non_goals": [
+      "Do not claim the W3-03 terminal <=40k-per-crate target from a per-file <100k result.",
+      "Do not regenerate W1-owned module inventory while its generator authority and package-count discriminator are unresolved.",
+      "Do not claim Product Pulse, hosted verification, release readiness, or cutover readiness from this local source split."
+    ],
+    "evidence": [
+      {
+        "command": "cargo fmt -p eliot-host -- --check",
+        "exit_code": 0,
+        "output": ""
+      },
+      {
+        "command": "cargo metadata --format-version 1 --no-deps",
+        "exit_code": 0,
+        "output": "126 workspace packages; 126 workspace members"
+      },
+      {
+        "command": "cargo check -q -p eliot-host --all-targets --all-features",
+        "exit_code": 0,
+        "output": ""
+      },
+      {
+        "command": "cargo clippy -q -p eliot-host --all-targets --all-features -- -D warnings",
+        "exit_code": 0,
+        "output": ""
+      },
+      {
+        "command": "cargo test -q -p eliot-host --all-features --lib",
+        "exit_code": 0,
+        "output": "test result: ok. 97 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+      },
+      {
+        "command": "cargo test -q -p eliot-host --all-features --lib -- --list | normalized sorted full test lines + LF | SHA256",
+        "exit_code": 0,
+        "output": "count=97; sha256=3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38"
+      },
+      {
+        "command": "git diff --check -- bins/eliot-host/src/lib.rs swarm/results/W3-03.json",
+        "exit_code": 0,
+        "output": ""
+      }
+    ],
+    "uncertainty": [
+      "The evidence is bound to a dirty local overlay and is not a commit, release, hosted, or cutover receipt.",
+      "The W1-01 generator still requires an authority/package-count correction before modules.json can be regenerated honestly.",
+      "Product Pulse #1 has not been rerun for this split, so runtime behavior beyond the focused Host tests remains unproved.",
+      "The eliot-host crate remains above the terminal <=40k-per-crate W3-03 target even though lib.rs now passes the <100k per-file gate."
+    ],
+    "unresolved_questions": [
+      "Which next coherent Host ownership cells will reduce the crate to the terminal <=40k target without duplicating lifecycle authority?",
+      "When will the W1-01 generator owner repair the 126-package discriminator and canonical-result collision so inventory regeneration can proceed?"
+    ],
+    "proposed_effects": [
+      "Continue W3-03 with independently contracted Host cells selected from current source after each local Cargo verification.",
+      "Regenerate module inventory only after the separate W1-01 authority repair is admitted.",
+      "Run the required local Product Pulse after the Host split reaches its admitted terminal shape."
+    ],
+    "evidence_lineage": {
+      "authority_program": "C:/Users/kleym/Downloads/RECOVERY_PROGRAM_v1.md",
+      "root_corrections": "swarm/decisions/ROOT-DIRECTIVE-v1.4.md",
+      "source_revision": "d5f0fdc528fa4926db8924972b3a7b3fdc21f3d2",
+      "source_state": "HEAD_PLUS_DIRTY_OVERLAY",
+      "proof_ceiling": "LOCAL_ONLY_EVIDENCE_ONLY",
+      "independent_reviews": [
+        "luna_w3_03_next_cell_map",
+        "luna_w3_03_next_cell_falsify",
+        "luna_store_recovery_imports",
+        "luna_phase_journal_imports",
+        "luna_w3_03_evidence_audit"
+      ]
+    },
+    "artifacts": [
+      {
+        "path": "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
+        "kind": "functional_capability_cell_manifest",
+        "sha256": "9d6e08e7f4fe565ca26f57074285494a5f719ba60b1c3e02bd1621add2f06aa6",
+        "utf8_bytes": 667
+      },
+      {
+        "path": "crates/kernel/eliot-host-control-endpoint/src/lib.rs",
+        "kind": "capability_bound_runtime_control_endpoint",
+        "sha256": "f9068958e5a04c179863c9a9b1442cb73b9d10d4ffd8f26815281d4315713e53",
+        "utf8_bytes": 8470,
+        "stu": 2824
+      },
+      {
+        "path": "bins/eliot-host/src/runtime_control.rs",
+        "kind": "compatibility_facade",
+        "sha256": "0fef03c021bad76e1c66759fd8f3ecd1ef4b8684745aaecbf1445df69986a8fc",
+        "utf8_bytes": 120,
+        "stu": 40
+      },
+      {
+        "path": "bins/eliot-host/src/launch_artifact.rs",
+        "kind": "same_crate_launch_artifact_boundary",
+        "sha256": "6e553d9a384bea034108f8ce57ee170b8857db0aeded79bd505437050abe4f8c",
+        "utf8_bytes": 5708,
+        "stu": 1903
+      },
+      {
+        "path": "bins/eliot-host/src/launch_options.rs",
+        "kind": "same_crate_launch_options_parser_boundary",
+        "sha256": "6cab3ca6010f40cc7e6fae35856e15ffa6f73a42d2e08302f49f426d5d748e70",
+        "utf8_bytes": 9087,
+        "stu": 3029
+      },
+      {
+        "path": "bins/eliot-host/src/scm_launch.rs",
+        "kind": "same_crate_read_only_scm_launch_boundary",
+        "sha256": "49a12f4f04b9d84c8efeafe97b1dc8e73a34e58635030225b061f2ca1e3d9404",
+        "utf8_bytes": 3463,
+        "stu": 1155
+      },
+      {
+        "path": "bins/eliot-host/src/launch_options_tests.rs",
+        "kind": "same_crate_test_module",
+        "sha256": "c9444f75c24aaa4153c3d2d09c08c9a5b34e3db4a5253ded519095ced250c8c0",
+        "utf8_bytes": 3363,
+        "stu": 1121
+      },
+      {
+        "path": "bins/eliot-host/src/watchdog_service_tests.rs",
+        "kind": "same_crate_windows_test_module",
+        "sha256": "a83e2639f0929c594b162bb7f93088c1f23cd13d18a360e817079a095abe3893",
+        "utf8_bytes": 29125,
+        "stu": 9709
+      },
+      {
+        "path": "bins/eliot-host/src/journal_tests.rs",
+        "kind": "same_crate_test_module",
+        "sha256": "9a9ab15c95a19415c856087698eb654ff3eb6af0322187480792d01f098d021c",
+        "utf8_bytes": 139560,
+        "stu": 46520
+      },
+      {
+        "path": "bins/eliot-host/src/tests.rs",
+        "kind": "same_crate_windows_test_module",
+        "sha256": "99c395fb65ee6c46e8c99fc27caa169ca2712bb8949b82b953934485816e4b51",
+        "utf8_bytes": 50976,
+        "stu": 16992
+      },
+      {
+        "path": "bins/eliot-host/src/readiness_gate.rs",
+        "kind": "same_crate_readiness_state_machine_boundary",
+        "sha256": "0d8bc12490dea98aa68fee4245681077aadde9c0c324f305a371198dd9ccc812",
+        "utf8_bytes": 8522,
+        "stu": 2841
+      },
+      {
+        "path": "bins/eliot-host/src/watchdog_publication.rs",
+        "kind": "same_crate_watchdog_publication_boundary",
+        "sha256": "6b8bf80b8456776dc7613f738b2543b2f8c8635af25929f71566c71cf102e755",
+        "utf8_bytes": 20215,
+        "stu": 6739
+      },
+      {
+        "path": "bins/eliot-host/src/store_recovery_fence.rs",
+        "kind": "same_crate_store_recovery_fence_boundary",
+        "sha256": "1f5ec31822a2a6a249eb18d547748b4c357a0a4796a18e3223b30e90ea4ab9a7",
+        "utf8_bytes": 8141,
+        "stu": 2714
+      },
+      {
+        "path": "bins/eliot-host/src/runtime_restart_state.rs",
+        "kind": "same_crate_runtime_restart_state_boundary",
+        "sha256": "e97aee48e852f0b323b37d6c9c06a18c1284fcf04f4d359d57cdd562ec0eb8bb",
+        "utf8_bytes": 17907,
+        "stu": 5969
+      },
+      {
+        "path": "bins/eliot-host/src/watchdog_service_start.rs",
+        "kind": "same_crate_watchdog_service_start_boundary",
+        "sha256": "aa6ae6ffc392c61ecfb21bf09b2bfd1b95ce204687bc94e6dc6daf2641dbc0b6",
+        "utf8_bytes": 17279,
+        "stu": 5760
+      },
+      {
+        "path": "bins/eliot-host/src/phase_b_projection.rs",
+        "kind": "same_crate_phase_b_projection_boundary",
+        "sha256": "f786ea035a22732390ead3792a74a46f3a4a655891de8c21a8c2cbe64de0f28b",
+        "utf8_bytes": 17278,
+        "stu": 5760
+      },
+      {
+        "path": "bins/eliot-host/src/host_epoch_reopen.rs",
+        "kind": "same_crate_host_epoch_reopen_boundary",
+        "sha256": "f0bbb77292ceddf3f7fdaa3b27f76b1fa1371a7a4d5faee29dd54602b1ef4685",
+        "utf8_bytes": 12289,
+        "stu": 4097
+      },
+      {
+        "path": "bins/eliot-host/src/phase_b_previous_authority.rs",
+        "kind": "same_crate_phase_b_previous_authority_boundary",
+        "sha256": "3c275f786951eb41c0f22fd085f4bfb67426ac2438726dbab150091dc4a515b6",
+        "utf8_bytes": 9356,
+        "stu": 3119
+      },
+      {
+        "path": "bins/eliot-host/src/phase_b_previous_projection.rs",
+        "kind": "same_crate_phase_b_previous_projection_boundary",
+        "sha256": "0a5a62a9667c3c37a5380e9732fa45cb722ec69234e1a561bbe2577b6c5ec996",
+        "utf8_bytes": 14439,
+        "stu": 4813
+      },
+      {
+        "path": "bins/eliot-host/src/store_recovery_evidence.rs",
+        "kind": "same_crate_store_recovery_evidence_boundary",
+        "sha256": "20b16d5507f05b88c193974582db1e0988a7e2d54130ebb867c9ccba286f632c",
+        "utf8_bytes": 9769,
+        "stu": 3257
+      },
+      {
+        "path": "bins/eliot-host/src/kernel_activation_driver.rs",
+        "kind": "same_crate_kernel_activation_driver_boundary",
+        "sha256": "824930939b5a7ad478375289e766cac8184019a214e94100cf0053ddca63c5f7",
+        "utf8_bytes": 8739,
+        "stu": 2913
+      },
+      {
+        "path": "bins/eliot-host/src/host_composition_validation.rs",
+        "kind": "same_crate_host_composition_validation_boundary",
+        "sha256": "d4834156dc5f7e31d54ee8c5d80ffd61708832889e979de90059aa1428eb3433",
+        "utf8_bytes": 7161,
+        "stu": 2387
+      },
+      {
+        "path": "bins/eliot-host/src/host_composition_phase_b.rs",
+        "kind": "same_crate_host_composition_phase_b_boundary",
+        "sha256": "a8fab931d089c07ab2a5363085bf566ffd6d13b25923d090006ece82dc68074f",
+        "utf8_bytes": 52962,
+        "stu": 17654
+      },
+      {
+        "path": "bins/eliot-host/src/host_composition_store_recovery.rs",
+        "kind": "same_crate_host_composition_store_recovery_boundary",
+        "sha256": "b00d93adb473bd7b11a403b96260c6a788317d8669d0ffb64759bd6356c1643f",
+        "utf8_bytes": 43481,
+        "stu": 14494
+      },
+      {
+        "path": "bins/eliot-host/src/host_activation_durable.rs",
+        "kind": "same_crate_host_activation_durable_boundary",
+        "sha256": "b1b736173bbf8343b6bec9d7328dd6adcc47bcfe3c13a912b6737bd8cc9ff34c",
+        "utf8_bytes": 38331,
+        "stu": 12777
+      },
+      {
+        "path": "bins/eliot-host/src/phase_b_materialization.rs",
+        "kind": "same_crate_phase_b_materialization_boundary",
+        "sha256": "f2d897d792df81c84b66508c8a31ad498761bac5276178babe0956c16ffebc2b",
+        "utf8_bytes": 15030,
+        "stu": 5010
+      },
+      {
+        "path": "bins/eliot-host/src/journal_append.rs",
+        "kind": "same_crate_journal_append_boundary",
+        "sha256": "2f179d10dfbe1e70ab0021a9a83e251f7ab7add22036861493b23fec09f4dc38",
+        "utf8_bytes": 22905,
+        "stu": 7635
+      },
+      {
+        "path": "bins/eliot-host/src/store_recovery_persistence.rs",
+        "kind": "same_crate_store_recovery_persistence_boundary",
+        "sha256": "3beac66bfafbe6dd8e2097d2520f58e554fdcd5fb8597e70ec2faf4af1ed05cb",
+        "utf8_bytes": 43663,
+        "stu": 14555
+      }
+    ],
+    "discriminator_before": {
+      "workspace_packages": 125,
+      "workspace_members": 125,
+      "host_runtime_control_lines": 233,
+      "host_runtime_control_utf8_bytes": 8347,
+      "host_runtime_control_sha256": "8fba5e7b1f0ceaf705867abefee231e141597ac6e818573e96f41292710fae9b",
+      "module_local_tests": 3,
+      "standalone_endpoint_cell": "ABSENT"
+    },
+    "discriminator_after": {
+      "workspace_packages": 126,
+      "workspace_members": 126,
+      "endpoint_lines": 234,
+      "endpoint_stu": 2824,
+      "host_facade_lines": 3,
+      "host_lib_lines": 6928,
+      "host_lib_stu": 98413,
+      "host_lib_sha256_current": "45633fe2bd3ad9e465e28a795172616f20b3e40d612c0b3c296524a657d0aeba",
+      "endpoint_tests": 3,
+      "endpoint_test_list_sha256": "0a0f97491bfa52c1b0dd382a6d3a11f0aabcb6a2eaeed9df74cecbfa74d15a76",
+      "host_lib_tests": 97,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "aggregate_host_plus_endpoint_tests": 100,
+      "all_targets_all_features_check": "PASS",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "endpoint_module_test_capsule": "3 passed; 0 failed; 0 ignored",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "second_slice_discriminator": {
+      "kind": "same_crate_launch_artifact_boundary",
+      "before_host_lib_lines": 21805,
+      "before_host_lib_stu": 303355,
+      "before_host_lib_sha256": "ad4a0a877e3a1806567a24d02d0634149a9d6ce899f81e7ba8dd4458607a95e4",
+      "after_host_lib_lines": 21669,
+      "after_host_lib_stu": 301635,
+      "after_host_lib_sha256": "70b2944a87f0647de3dd80c78f5e100d138af2499e5d88c13c2fd3c83dd20d44",
+      "launch_artifact_lines": 151,
+      "launch_artifact_stu": 1903,
+      "launch_artifact_sha256": "6e553d9a384bea034108f8ce57ee170b8857db0aeded79bd505437050abe4f8c",
+      "visibility": "pub(super) only; no external API widening",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "third_slice_discriminator": {
+      "kind": "same_crate_launch_options_parser_boundary",
+      "before_host_lib_lines": 21669,
+      "before_host_lib_stu": 301635,
+      "before_host_lib_sha256": "70b2944a87f0647de3dd80c78f5e100d138af2499e5d88c13c2fd3c83dd20d44",
+      "after_host_lib_lines": 21439,
+      "after_host_lib_stu": 298751,
+      "after_host_lib_sha256": "e66160c58ee4c06406b6abb57ba62fd7962673962dbc11878d4ab91261fd349a",
+      "launch_options_lines": 242,
+      "launch_options_stu": 3029,
+      "launch_options_sha256": "6cab3ca6010f40cc7e6fae35856e15ffa6f73a42d2e08302f49f426d5d748e70",
+      "visibility": "private fields are pub(super) only for existing Host negative tests; public HostLaunchOptions facade is unchanged",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "fourth_slice_discriminator": {
+      "kind": "same_crate_read_only_scm_launch_boundary",
+      "before_host_lib_lines": 21439,
+      "before_host_lib_stu": 298751,
+      "before_host_lib_sha256": "e66160c58ee4c06406b6abb57ba62fd7962673962dbc11878d4ab91261fd349a",
+      "after_host_lib_lines": 21358,
+      "after_host_lib_stu": 297718,
+      "after_host_lib_sha256": "c3ffd3896ae3c00590d2075757c48aa10b549f0c05b9517d27c745c9765a21b3",
+      "scm_launch_lines": 91,
+      "scm_launch_stu": 1155,
+      "scm_launch_sha256": "49a12f4f04b9d84c8efeafe97b1dc8e73a34e58635030225b061f2ca1e3d9404",
+      "effect_boundary": "read-only SCM registration reconstruction and inspection; no register or start authority",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "fifth_slice_discriminator": {
+      "kind": "four_same_crate_test_modules",
+      "before_host_lib_lines": 21358,
+      "before_host_lib_stu": 297718,
+      "before_host_lib_sha256": "c3ffd3896ae3c00590d2075757c48aa10b549f0c05b9517d27c745c9765a21b3",
+      "after_host_lib_lines": 15449,
+      "after_host_lib_stu": 215648,
+      "after_host_lib_sha256": "fa8787e336ccd0afbe48c2879d019183b81ddafc26aa49586f608c0aac239a73",
+      "modules": [
+        "launch_options_tests",
+        "watchdog_service_tests",
+        "journal_tests",
+        "tests"
+      ],
+      "cfg_gates_preserved": [
+        "#[cfg(test)] launch_options_tests",
+        "#[cfg(all(test, windows))] watchdog_service_tests",
+        "#[cfg(test)] journal_tests",
+        "#[cfg(all(test, windows))] tests"
+      ],
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "sixth_slice_discriminator": {
+      "kind": "same_crate_readiness_state_machine_boundary",
+      "before_host_lib_lines": 15449,
+      "before_host_lib_stu": 215648,
+      "before_host_lib_sha256": "fa8787e336ccd0afbe48c2879d019183b81ddafc26aa49586f608c0aac239a73",
+      "after_host_lib_lines": 15214,
+      "after_host_lib_stu": 213055,
+      "after_host_lib_sha256": "24dd2e714cfa4b8f49312b11335f459d37808d6e0541c1cf87e02fbe71c867ac",
+      "readiness_gate_lines": 250,
+      "readiness_gate_stu": 2841,
+      "readiness_gate_sha256": "0d8bc12490dea98aa68fee4245681077aadde9c0c324f305a371198dd9ccc812",
+      "effect_boundary": "pure cadence, contour identity, retry, and readiness admission state machine; no filesystem, process, SCM, Job Object, or journal write authority",
+      "visibility": "pub(super) only for names and fields already visible to the parent and sibling test modules before relocation",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "seventh_slice_discriminator": {
+      "kind": "same_crate_watchdog_publication_boundary",
+      "before_host_lib_lines": 15214,
+      "before_host_lib_stu": 213055,
+      "before_host_lib_sha256": "24dd2e714cfa4b8f49312b11335f459d37808d6e0541c1cf87e02fbe71c867ac",
+      "after_host_lib_lines": 14752,
+      "after_host_lib_stu": 206691,
+      "after_host_lib_sha256": "9d318fcffe5042c525254f3d884be2286da2ee08611104b5e2657ddbafaf8880",
+      "watchdog_publication_lines": 482,
+      "watchdog_publication_stu": 6739,
+      "watchdog_publication_sha256": "6b8bf80b8456776dc7613f738b2543b2f8c8635af25929f71566c71cf102e755",
+      "effect_boundary": "Host-owned immutable Watchdog publication and bounded retention stay on the existing durable spool; HostComposition remains the sole orchestrator",
+      "visibility": "pub(super) only for the observation type and five parent call surfaces; no public API or Cargo edge",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "eighth_slice_discriminator": {
+      "kind": "two_bounded_same_crate_recovery_boundaries",
+      "before_host_lib_lines": 14752,
+      "before_host_lib_stu": 206691,
+      "before_host_lib_sha256": "9d318fcffe5042c525254f3d884be2286da2ee08611104b5e2657ddbafaf8880",
+      "after_host_lib_lines": 14124,
+      "after_host_lib_stu": 198525,
+      "after_host_lib_sha256": "d4d7723c8e75464edc3ac467ea5bfbc983bbac392dd0f8982c0cc7738dfcd466",
+      "store_recovery_fence_lines": 204,
+      "store_recovery_fence_stu": 2714,
+      "store_recovery_fence_sha256": "1f5ec31822a2a6a249eb18d547748b4c357a0a4796a18e3223b30e90ea4ab9a7",
+      "runtime_restart_state_lines": 461,
+      "runtime_restart_state_stu": 5969,
+      "runtime_restart_state_sha256": "e97aee48e852f0b323b37d6c9c06a18c1284fcf04f4d359d57cdd562ec0eb8bb",
+      "effect_boundary": "store recovery admission classification is pure; runtime restart keeps the existing Host-owned pending and receipt files without moving the caller or creating a second writer",
+      "visibility": "pub(super) only for existing parent and sibling-test call surfaces; no public API or Cargo edge",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "ninth_slice_discriminator": {
+      "kind": "same_crate_watchdog_service_start_boundary",
+      "before_host_lib_lines": 14124,
+      "before_host_lib_stu": 198525,
+      "before_host_lib_sha256": "d4d7723c8e75464edc3ac467ea5bfbc983bbac392dd0f8982c0cc7738dfcd466",
+      "after_host_lib_lines": 13675,
+      "after_host_lib_stu": 193155,
+      "after_host_lib_sha256": "af10ceacae79edd93f7a3d2dab66494f83fd5e5b0342dc4b39887383a85d7ab4",
+      "watchdog_service_start_lines": 476,
+      "watchdog_service_start_stu": 5760,
+      "watchdog_service_start_sha256": "aa6ae6ffc392c61ecfb21bf09b2bfd1b95ce204687bc94e6dc6daf2641dbc0b6",
+      "effect_boundary": "the existing Windows SCM inspection and one-start bounded convergence state machine moved intact; HostComposition remains the sole orchestrator and no registration mutation authority was added",
+      "visibility": "production callers import only the three required functions; test-only traits, inspection state, timeout, and clock helpers remain cfg(test) and pub(super)",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "tenth_slice_discriminator": {
+      "kind": "same_crate_phase_b_projection_boundary",
+      "before_host_lib_lines": 13675,
+      "before_host_lib_stu": 193155,
+      "before_host_lib_sha256": "af10ceacae79edd93f7a3d2dab66494f83fd5e5b0342dc4b39887383a85d7ab4",
+      "after_host_lib_lines": 13315,
+      "after_host_lib_stu": 187906,
+      "after_host_lib_sha256": "92cd8c1e9140a242686108b6875c1dcb7ecf493ea042010ffc7f0df11964c705",
+      "phase_b_projection_lines": 390,
+      "phase_b_projection_stu": 5760,
+      "phase_b_projection_sha256": "f786ea035a22732390ead3792a74a46f3a4a655891de8c21a8c2cbe64de0f28b",
+      "effect_boundary": "read-only Phase-B digest, receipt, authority-descriptor, and marker projection; no filesystem, credential, rollback, process-launch, or journal write authority moved",
+      "visibility": "pub(super) only for the existing parent, sibling Phase-B seam, and journal-test call surfaces; no public API or Cargo edge",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "eleventh_slice_discriminator": {
+      "kind": "same_crate_host_epoch_reopen_boundary",
+      "before_host_lib_lines": 13315,
+      "before_host_lib_stu": 187906,
+      "before_host_lib_sha256": "92cd8c1e9140a242686108b6875c1dcb7ecf493ea042010ffc7f0df11964c705",
+      "after_host_lib_lines": 12991,
+      "after_host_lib_stu": 184121,
+      "after_host_lib_sha256": "914f174cb49e63007c35cc9967620802bdf8aa78c8d176d17e3a588466be2882",
+      "host_epoch_reopen_lines": 342,
+      "host_epoch_reopen_stu": 4097,
+      "host_epoch_reopen_sha256": "f0bbb77292ceddf3f7fdaa3b27f76b1fa1371a7a4d5faee29dd54602b1ef4685",
+      "effect_boundary": "one existing Host startup and reopen lifecycle retains journal replay, pending recovery disposition, production epoch opening, and test-only opening; HostComposition remains the only production caller",
+      "visibility": "production root imports only open_production_epoch and persist_pending_recovery; reopen and backend/test helpers are cfg(test) imports; no public API or Cargo edge",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "twelfth_slice_discriminator": {
+      "kind": "same_crate_phase_b_previous_authority_boundary",
+      "before_host_lib_lines": 12991,
+      "before_host_lib_stu": 184121,
+      "before_host_lib_sha256": "914f174cb49e63007c35cc9967620802bdf8aa78c8d176d17e3a588466be2882",
+      "after_host_lib_lines": 12764,
+      "after_host_lib_stu": 181296,
+      "after_host_lib_sha256": "358d4d8e8655f8219b3acf94a1a572691ed1c1de17006639539208ac32a135a8",
+      "phase_b_previous_authority_lines": 252,
+      "phase_b_previous_authority_stu": 3119,
+      "phase_b_previous_authority_sha256": "3c275f786951eb41c0f22fd085f4bfb67426ac2438726dbab150091dc4a515b6",
+      "effect_boundary": "read-only lease observation, authority-marker parsing, and exact durable prior-binding validation; no file, credential, process, rollback, or journal mutation",
+      "visibility": "pub(super) only for the existing parent and sibling Phase-B seams; the marker parser stays module-private; no public API or Cargo edge",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "thirteenth_slice_discriminator": {
+      "kind": "same_crate_phase_b_previous_projection_boundary",
+      "before_host_lib_lines": 12764,
+      "before_host_lib_stu": 181296,
+      "before_host_lib_sha256": "358d4d8e8655f8219b3acf94a1a572691ed1c1de17006639539208ac32a135a8",
+      "after_host_lib_lines": 12422,
+      "after_host_lib_stu": 176863,
+      "after_host_lib_sha256": "1ed387529c3567e228cec021260de21b53e0ea8cc136a3fc9284432b9dd3822f",
+      "phase_b_previous_projection_lines": 368,
+      "phase_b_previous_projection_stu": 4813,
+      "phase_b_previous_projection_sha256": "0a5a62a9667c3c37a5380e9732fa45cb722ec69234e1a561bbe2577b6c5ec996",
+      "effect_boundary": "read-only prior launch, config, eliotd descriptor, bootstrap, and receipt reconstruction from retained leases; no materialization, rollback, credential, process, or journal mutation",
+      "visibility": "pub(super) only for existing HostComposition and sibling Phase-B calls; the test-only live epoch projection remains cfg(test); no public API or Cargo edge",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "fourteenth_slice_discriminator": {
+      "kind": "same_crate_store_recovery_evidence_boundary",
+      "before_host_lib_lines": 12422,
+      "before_host_lib_stu": 176863,
+      "before_host_lib_sha256": "1ed387529c3567e228cec021260de21b53e0ea8cc136a3fc9284432b9dd3822f",
+      "after_host_lib_lines": 12200,
+      "after_host_lib_stu": 173928,
+      "after_host_lib_sha256": "19dba5e60102336f6a69279c155e62d8b84563f203a57f06ce5cb21018ddd8b9",
+      "store_recovery_evidence_lines": 243,
+      "store_recovery_evidence_stu": 3257,
+      "store_recovery_evidence_sha256": "20b16d5507f05b88c193974582db1e0988a7e2d54130ebb867c9ccba286f632c",
+      "effect_boundary": "bounded termination and inner-binding file reads, strict deserialization, and cross-binding validation only; directory enumeration and all durable publication remain with the existing Host owner",
+      "visibility": "pub(super) fields and validators only for existing root, store_recovery_fence, and same lib-test callers; no public API or Cargo edge",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "fifteenth_slice_discriminator": {
+      "kind": "same_crate_kernel_activation_driver_boundary",
+      "before_host_lib_lines": 12200,
+      "before_host_lib_stu": 173928,
+      "before_host_lib_sha256": "19dba5e60102336f6a69279c155e62d8b84563f203a57f06ce5cb21018ddd8b9",
+      "after_host_lib_lines": 11995,
+      "after_host_lib_stu": 171287,
+      "after_host_lib_sha256": "587577486ce353b55f1caa32c93890e00eacd94c1a85d6d19c2d717355f61681",
+      "kernel_activation_driver_lines": 219,
+      "kernel_activation_driver_stu": 2913,
+      "kernel_activation_driver_sha256": "824930939b5a7ad478375289e766cac8184019a214e94100cf0053ddca63c5f7",
+      "effect_boundary": "the existing durable Kernel activation transition driver still borrows the single Host journal writer; adjacent cross-platform nonce and cleanup helpers remain in the root",
+      "visibility": "the driver and eight externally called methods are pub(super); fields and transition remain private; no public API or Cargo edge",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "sixteenth_slice_discriminator": {
+      "kind": "same_crate_host_composition_validation_boundary",
+      "before_host_lib_lines": 11995,
+      "before_host_lib_stu": 171287,
+      "before_host_lib_sha256": "587577486ce353b55f1caa32c93890e00eacd94c1a85d6d19c2d717355f61681",
+      "after_host_lib_lines": 11847,
+      "after_host_lib_stu": 169069,
+      "after_host_lib_sha256": "aa402506fbb2362270414a0d1d434d8bf61284a9d9e0697922bca1cd35829da7",
+      "host_composition_validation_lines": 163,
+      "host_composition_validation_stu": 2387,
+      "host_composition_validation_sha256": "d4834156dc5f7e31d54ee8c5d80ffd61708832889e979de90059aa1428eb3433",
+      "effect_boundary": "read-only HostComposition launch and registration approval validation plus production-boundary discriminator access; no journal, filesystem, process, SCM, Job Object, registry, or authority mutation",
+      "visibility": "three existing sibling callers use pub(super) inherent methods; registration approval remains private and public discriminator signatures are unchanged; no Cargo edge",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "seventeenth_slice_discriminator": {
+      "kind": "same_crate_host_composition_phase_b_boundary",
+      "before_host_lib_lines": 11847,
+      "before_host_lib_stu": 169069,
+      "before_host_lib_sha256": "aa402506fbb2362270414a0d1d434d8bf61284a9d9e0697922bca1cd35829da7",
+      "after_host_lib_lines": 10660,
+      "after_host_lib_stu": 151458,
+      "after_host_lib_sha256": "ba7d5fc3752531c96818898abdcf878df03a5a4bb9dbdd1402499cfa09fbbc2c",
+      "host_composition_phase_b_lines": 1192,
+      "host_composition_phase_b_stu": 17654,
+      "host_composition_phase_b_sha256": "a8fab931d089c07ab2a5363085bf566ffd6d13b25923d090006ece82dc68074f",
+      "effect_boundary": "the existing HostComposition instance remains the only Phase-B owner; four-file publication, rollback, registry CAS, and receipt ordering still call the original parent-private persistence helpers and no writer or durable object is duplicated",
+      "visibility": "materialize_phase_b retains its existing public API; four sibling-called methods are pub(super), all fields and persistence helpers remain private, and no Cargo edge is added",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "eighteenth_slice_discriminator": {
+      "kind": "same_crate_host_composition_store_recovery_boundary",
+      "before_host_lib_lines": 10660,
+      "before_host_lib_stu": 151458,
+      "before_host_lib_sha256": "ba7d5fc3752531c96818898abdcf878df03a5a4bb9dbdd1402499cfa09fbbc2c",
+      "after_host_lib_lines": 9696,
+      "after_host_lib_stu": 137002,
+      "after_host_lib_sha256": "1be86fa45a748d7d5e60da44073bcc2cd12ae39d12a8b3f27b0806fa68b31a5e",
+      "host_composition_store_recovery_lines": 969,
+      "host_composition_store_recovery_stu": 14494,
+      "host_composition_store_recovery_sha256": "b00d93adb473bd7b11a403b96260c6a788317d8669d0ffb64759bd6356c1643f",
+      "effect_boundary": "the full fail-closed Store-recovery reconciliation and effect contour moved together; the same HostComposition receiver still owns pending intent, termination evidence, relaunch, inner binding, journal append, receipt readback, and fresh readiness ordering",
+      "visibility": "two existing public request methods retain their API; the SCM request builder and effect executor are pub(super), reconciliation helpers remain private, and no persistence helper or Cargo edge moves",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "nineteenth_slice_discriminator": {
+      "kind": "same_crate_host_activation_durable_boundary",
+      "before_host_lib_lines": 9696,
+      "before_host_lib_stu": 137002,
+      "before_host_lib_sha256": "1be86fa45a748d7d5e60da44073bcc2cd12ae39d12a8b3f27b0806fa68b31a5e",
+      "after_host_lib_lines": 8841,
+      "after_host_lib_stu": 124286,
+      "after_host_lib_sha256": "dab6ef016218069e990c5c047694f367419a9733632bf2be80e60dac4f36125f",
+      "host_activation_durable_lines": 860,
+      "host_activation_durable_stu": 12777,
+      "host_activation_durable_sha256": "b1b736173bbf8343b6bec9d7328dd6adcc47bcfe3c13a912b6737bd8cc9ff34c",
+      "effect_boundary": "registry claim, Phase-B intent/prepared/receipt persistence, pending abort, commit-fence snapshot verification, and durable generation commit remain one Windows-only CAS contour; journal append, SCM start, Kernel activation, and cutover effects stay outside",
+      "visibility": "only existing sibling-called durable methods are pub(super); internal claim, abort, and fence validators remain private; no public API, writer object, or Cargo edge moves",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "twentieth_slice_discriminator": {
+      "kind": "same_crate_phase_b_materialization_boundary",
+      "before_host_lib_lines": 8841,
+      "before_host_lib_stu": 124286,
+      "before_host_lib_sha256": "dab6ef016218069e990c5c047694f367419a9733632bf2be80e60dac4f36125f",
+      "after_host_lib_lines": 8479,
+      "after_host_lib_stu": 119571,
+      "after_host_lib_sha256": "059a83163100b4d1465e01f2112ac3901823ff5365ae9ac98ac25cd050a2cad4",
+      "phase_b_materialization_lines": 389,
+      "phase_b_materialization_stu": 5010,
+      "phase_b_materialization_sha256": "f2d897d792df81c84b66508c8a31ad498761bac5276178babe0956c16ffebc2b",
+      "effect_boundary": "Phase-B file materialization, digest verification, rollback restore/remove, and template path helpers moved intact; the existing HostComposition remains the only caller that orders these primitives with durable authority and no writer or receipt owner moved",
+      "visibility": "only sibling-consumed materialization helpers are pub(super); rollback internals remain private, test-only helpers retain cfg(test), and no Cargo edge or public API is added",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "twenty_first_slice_discriminator": {
+      "kind": "same_crate_journal_append_boundary",
+      "before_host_lib_lines": 8479,
+      "before_host_lib_stu": 119571,
+      "before_host_lib_sha256": "059a83163100b4d1465e01f2112ac3901823ff5365ae9ac98ac25cd050a2cad4",
+      "after_host_lib_lines": 7975,
+      "after_host_lib_stu": 112492,
+      "after_host_lib_sha256": "734e47e3a8657dc69e1b8e417b53825c10cf21378d7fd9062eb171b02729463d",
+      "journal_append_lines": 539,
+      "journal_append_stu": 7635,
+      "journal_append_sha256": "2f179d10dfbe1e70ab0021a9a83e251f7ab7add22036861493b23fec09f4dc38",
+      "effect_boundary": "activation, termination, Store-rebind, readiness, and clean-marker journal records still converge on the same append_reconciled primitive and Host journal; record construction moved without duplicating the journal or changing append order",
+      "visibility": "only sibling-called record builders and append entry points are pub(super); append_reconciled_readiness remains private, test-only helpers retain cfg(test), and no Cargo edge or public API is added",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "twenty_second_slice_discriminator": {
+      "kind": "same_crate_store_recovery_persistence_boundary",
+      "before_host_lib_lines": 7975,
+      "before_host_lib_stu": 112492,
+      "before_host_lib_sha256": "734e47e3a8657dc69e1b8e417b53825c10cf21378d7fd9062eb171b02729463d",
+      "after_host_lib_lines": 6928,
+      "after_host_lib_stu": 98413,
+      "after_host_lib_sha256": "45633fe2bd3ad9e465e28a795172616f20b3e40d612c0b3c296524a657d0aeba",
+      "store_recovery_persistence_lines": 1073,
+      "store_recovery_persistence_stu": 14555,
+      "store_recovery_persistence_sha256": "3beac66bfafbe6dd8e2097d2520f58e554fdcd5fb8597e70ec2faf4af1ed05cb",
+      "effect_boundary": "pending intent, termination evidence, canonical inner binding, receipt publication, cleanup, and rebind readback remain one no-replace persistence adapter; evidence validation stays in the existing sibling module and is connected by parent-private aliases without a second writer",
+      "visibility": "the pending identity, its sibling-read fields and validation methods, the publication result, and externally consumed persistence functions are pub(super); record serialization and directory sync helpers remain private, and no Cargo edge or public API is added",
+      "host_test_list_identical": true,
+      "host_test_list_sha256": "3998c404b9b18f079acbc31f8530df92b09e8dedf524a1822457dea4d72e7f38",
+      "host_lib_tests_result": "97 passed; 0 failed; 0 ignored",
+      "all_targets_all_features_check": "PASS",
+      "all_targets_all_features_strict_clippy": "PASS",
+      "rustfmt": "PASS",
+      "git_diff_check": "PASS"
+    },
+    "boundary": {
+      "wire_contract_owner": "eliot-host-service::runtime_control",
+      "endpoint_owner": "eliot-host-control-endpoint",
+      "composition_owner": "eliot-host",
+      "single_normal_consumer": "eliot-host",
+      "normal_dependencies": [
+        "eliot-host-service",
+        "eliot-ipc",
+        "eliot-platform-windows",
+        "tokio"
+      ],
+      "authority_change": "The sole cross-crate constructor is public only with an opaque live HostOwnerEpochCapability; the arbitrary queue constructor was removed.",
+      "preserved_host_facade": [
+        "HOST_RUNTIME_CONTROL_PIPE",
+        "HostKernelRestartReceipt",
+        "HostRuntimeControl",
+        "HostRuntimeControlOperation",
+        "HostRuntimeControlQueue",
+        "HostRuntimeControlRequest",
+        "HostRuntimeControlResponse",
+        "HostStoreRecoveryReceipt"
+      ],
+      "retained_in_host": [
+        "runtime-control dispatch",
+        "journal and recovery state",
+        "Job Object ownership",
+        "Kernel and Store effect handlers"
+      ],
+      "same_crate_launch_artifact_boundary": [
+        "LaunchLease",
+        "approved_locator",
+        "approved_phase_b_destination_locator",
+        "open_launch_lease",
+        "verify_launch_digest"
+      ],
+      "same_crate_launch_options_boundary": [
+        "HostLaunchOptions",
+        "parse_launch_text",
+        "valid_launch_os_path",
+        "valid_sha256_text",
+        "valid_launch_identity"
+      ],
+      "same_crate_scm_launch_boundary": [
+        "ValidatedHostScmLaunch",
+        "validate_host_scm_bootstrap"
+      ],
+      "same_crate_test_modules": [
+        "launch_options_tests",
+        "watchdog_service_tests",
+        "journal_tests",
+        "tests"
+      ],
+      "same_crate_readiness_boundary": [
+        "ReadinessCadence",
+        "ReadinessContourIdentity",
+        "ReadinessFailureKind",
+        "HostReadinessGate",
+        "reconcile_authenticated_readiness"
+      ],
+      "same_crate_watchdog_publication_boundary": [
+        "observe_host_watchdog_publication",
+        "verify_exact_current_watchdog_publication",
+        "read_manifest_current_supervision_lease",
+        "supervision_publication_identity",
+        "publish_current_watchdog_supervision_bundle"
+      ],
+      "same_crate_store_recovery_fence_boundary": [
+        "StoreRecoveryReopenFence",
+        "StoreRecoveryStartupFence",
+        "ActivePhaseBRebindRecoveryKind"
+      ],
+      "same_crate_runtime_restart_state_boundary": [
+        "load_durable_runtime_restarts",
+        "persist_runtime_restart_pending",
+        "persist_runtime_restart_receipt",
+        "rebind_runtime_restart_receipt"
+      ],
+      "same_crate_watchdog_service_start_boundary": [
+        "approved_service_registration_request",
+        "select_watchdog_approval_for_inspection",
+        "require_running_watchdog",
+        "start_installed_watchdog",
+        "start_installed_watchdog_with_clock"
+      ],
+      "same_crate_phase_b_projection_boundary": [
+        "phase_b_manifest_digest",
+        "phase_b_public_receipt",
+        "phase_b_build_authority_descriptor",
+        "phase_b_build_authority_descriptor_for_rebind",
+        "phase_b_authority_marker"
+      ],
+      "same_crate_host_epoch_reopen_boundary": [
+        "reopen_existing_epoch",
+        "persist_pending_recovery",
+        "open_production_epoch",
+        "open_production_epoch_from_backend",
+        "open_test_support_epoch"
+      ],
+      "same_crate_phase_b_previous_authority_boundary": [
+        "PhaseBPreviousBinding",
+        "phase_b_observe_previous_binding",
+        "phase_b_validate_durable_previous_binding",
+        "phase_b_validate_authority",
+        "phase_b_open_existing",
+        "phase_b_authority_is_observable"
+      ],
+      "same_crate_phase_b_previous_projection_boundary": [
+        "phase_b_previous_live_launch",
+        "phase_b_previous_config_digest",
+        "phase_b_previous_eliotd_digest",
+        "phase_b_previous_bootstrap_digest",
+        "phase_b_live_launch",
+        "phase_b_activation_binding",
+        "phase_b_receipt_digest"
+      ],
+      "same_crate_store_recovery_evidence_boundary": [
+        "StoreRecoveryTerminationEvidence",
+        "read_store_recovery_termination_evidence",
+        "StoreRecoveryInnerBinding",
+        "read_store_recovery_inner_binding"
+      ],
+      "same_crate_kernel_activation_driver_boundary": [
+        "DurableKernelActivationDriver::resume",
+        "DurableKernelActivationDriver::bind_candidate",
+        "DurableKernelActivationDriver::issue_nonce",
+        "DurableKernelActivationDriver::active",
+        "DurableKernelActivationDriver::fail"
+      ],
+      "same_crate_host_composition_validation_boundary": [
+        "HostComposition::active_phase_b_rebind_binding",
+        "HostComposition::production_store_rebind_discriminator",
+        "HostComposition::production_runtime_control_discriminator",
+        "HostComposition::validate_launch_options_for_manifest",
+        "HostComposition::validate_launch_options_for_registry"
+      ],
+      "same_crate_host_composition_phase_b_boundary": [
+        "HostComposition::materialize_phase_b",
+        "HostComposition::rebind_active_phase_b",
+        "HostComposition::rehydrate_phase_b_from_prepared",
+        "HostComposition::rollback_uncommitted_phase_b",
+        "HostComposition::reconcile_phase_b_for_manifest"
+      ],
+      "same_crate_host_composition_store_recovery_boundary": [
+        "HostComposition::handle_store_recovery_request",
+        "HostComposition::scm_store_recovery_request",
+        "HostComposition::reconcile_committed_store_recovery",
+        "HostComposition::store_recovery_receipt_matches_current_contour",
+        "HostComposition::reconcile_store_recovery_request",
+        "HostComposition::execute_store_recovery"
+      ],
+      "same_crate_host_activation_durable_boundary": [
+        "HostComposition::reconcile_pending_activation",
+        "HostComposition::claim_pending_durable",
+        "HostComposition::persist_pending_phase_b_intent",
+        "HostComposition::persist_pending_phase_b_prepared",
+        "HostComposition::persist_pending_phase_b_receipt",
+        "HostComposition::persist_active_phase_b_rebind_intent",
+        "HostComposition::persist_active_phase_b_rebind_recovery_and_intent",
+        "HostComposition::persist_active_phase_b_rebind_prepared",
+        "HostComposition::persist_active_phase_b_rebind_receipt",
+        "HostComposition::abort_pending_durable",
+        "HostComposition::fresh_pending_commit_fence",
+        "HostComposition::verify_pending_commit_journal_fence",
+        "HostComposition::commit_pending_durable"
+      ],
+      "same_crate_phase_b_materialization_boundary": [
+        "phase_b_lease_identity",
+        "phase_b_lease_bytes",
+        "phase_b_bytes_digest",
+        "phase_b_materialize_file",
+        "phase_b_materialize_file_with_rollback",
+        "phase_b_restore_or_remove",
+        "phase_b_remove_rollback_backup",
+        "phase_b_template_path",
+        "phase_b_template_bytes"
+      ],
+      "same_crate_journal_append_boundary": [
+        "exact_termination_binding_matches",
+        "terminated_prior_kernel",
+        "initial_activation_record",
+        "transition_activation_record",
+        "append_reconciled",
+        "append_store_rebind_terminal",
+        "persist_store_rebind_disposition",
+        "append_authenticated_kernel_readiness",
+        "clean_marker_record",
+        "append_clean_marker",
+        "pending_activation_binding"
+      ],
+      "same_crate_store_recovery_persistence_boundary": [
+        "StoreRecoveryPendingIdentity",
+        "StoreRecoveryPendingPublication",
+        "load_durable_store_recoveries",
+        "read_store_recovery_pending_identity",
+        "persist_store_recovery_pending",
+        "persist_store_recovery_termination_evidence",
+        "persist_store_recovery_inner_binding",
+        "read_store_recovery_receipt",
+        "persist_store_recovery_receipt",
+        "cleanup_store_recovery_supporting_evidence_for",
+        "cleanup_completed_store_recovery_supporting_evidence",
+        "rebind_store_recovery_receipt",
+        "committed_store_rebind_receipt"
+      ]
+    },
+    "shared_dirty_files": [
+      "Cargo.toml also contains the pre-existing W2 Surreal dependency cleanup",
+      "bins/eliot-host/Cargo.toml and bins/eliot-host/src/lib.rs contain the pre-existing W0-07 test-support containment changes",
+      "Cargo.lock records only the new local package and host dependency for this cell in addition to prior overlay state"
+    ],
+    "terminal_status": {
+      "w3_03": "NOT_PROVEN",
+      "reasons": [
+        "The 98413-STU host lib.rs now passes the per-file 100k gate but the eliot-host crate remains above the terminal 40k-per-crate target.",
+        "This is one dependency-light crate plus twenty-one production same-crate boundaries and four direct test modules, not the complete Host decomposition.",
+        "The three endpoint tests moved to a new crate-qualified identity; all 97 eliot-host qualified test identities remain byte-for-byte identical as a normalized list.",
+        "swarm/inventory/modules.json was not regenerated while W1-01 generator authority remains dirty.",
+        "Product Pulse #1 was not rerun under the explicit no-rerun constraint."
+      ]
+    }
+  }
+}

@@ -7,6 +7,7 @@ RETURN SELECT
   action_lease_id,
   understanding_proof_hash,
   action_provenance,
+  memory_grant_redemptions,
   observation_ids,
   verification_ids,
   verification_scopes,

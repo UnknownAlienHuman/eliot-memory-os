@@ -6293,13 +6293,7 @@ impl KernelComposition {
                 .daemon_health()
                 .await
                 .map_err(|_| TransportError::SessionFenced)
-                .map(|value| {
-                    serde_json::json!({
-                        "status": "known",
-                        "value": value,
-                        "recovery": null,
-                    })
-                }),
+                .map(|health| Self::daemon_health_response(&health)),
             "daemon_degraded" => {
                 let reason = payload
                     .get("reason")
@@ -6343,6 +6337,17 @@ impl KernelComposition {
         serde_json::json!({
             "status": "known",
             "value": { "accepted": true },
+            "recovery": null,
+        })
+    }
+
+    fn daemon_health_response(health: &StoreHealth) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": "health",
+                "value": health,
+            },
             "recovery": null,
         })
     }
@@ -8373,6 +8378,35 @@ mod tests {
         SupervisionSealedKeyFileIdentity,
     };
     use eliot_store_api::{RevisionHead, RevisionKey};
+
+    #[test]
+    fn daemon_health_response_matches_the_eliotd_typed_value_contract() {
+        for status in [
+            StoreHealthStatus::Ready,
+            StoreHealthStatus::Degraded,
+            StoreHealthStatus::Unavailable,
+        ] {
+            let health = StoreHealth {
+                status,
+                contract_version: eliot_store_api::CONTRACT_VERSION,
+                manifest_digest: eliot_store_api::OperationManifestDigest::new("a".repeat(64))
+                    .expect("manifest digest"),
+            };
+            let health_value = serde_json::to_value(&health).expect("health JSON");
+
+            assert_eq!(
+                KernelComposition::daemon_health_response(&health),
+                serde_json::json!({
+                    "status": "known",
+                    "value": {
+                        "kind": "health",
+                        "value": health_value,
+                    },
+                    "recovery": null,
+                })
+            );
+        }
+    }
 
     fn supervision_incarnation() -> SupervisionLeaseIncarnationBinding {
         SupervisionLeaseIncarnationBinding {

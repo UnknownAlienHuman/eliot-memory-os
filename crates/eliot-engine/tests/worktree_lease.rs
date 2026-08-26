@@ -4,8 +4,9 @@ use eliot_engine::{
     AgentSessionService, CandidateCompletionContext, CandidateDiffCaptureInput,
     CandidateDiffService, CandidatePatchRequestInput, CandidateReviewInput, CandidateReviewService,
     CompletionGate, PatchRunner, PatchRunnerInput, VerifierHarness, WorkClaimRequest,
-    WorkCreateRequest, WorkLeaseService, WorkQueueService, WorkState, WorktreeCleanupService,
-    WorktreeCreateInput, WorktreeLeaseService, codecortex_report_ref, default_work_scope,
+    WorkCreateRequest, WorkLeaseService, WorkQueueService, WorkState, WorktreeAdoptInput,
+    WorktreeCleanupService, WorktreeCreateInput, WorktreeLeaseService, codecortex_report_ref,
+    default_work_scope,
 };
 use eliot_types::{
     ActionLease, ActionScope, AgentRole, AgentSessionId, CandidateDiffId, CandidateDiffStatus,
@@ -67,6 +68,149 @@ async fn worktree_created_outside_controller_tree() -> TestResult {
 
     assert_ne!(repo_root, worktree_path);
     assert!(!worktree_path.starts_with(&repo_root));
+    Ok(())
+}
+
+#[tokio::test]
+async fn linked_worktree_still_rejects_dirty_controller_repo() -> TestResult {
+    let mut bundle = Bundle::new("linked-dirty-controller", &["src/lib.rs"])?;
+    fs::write(
+        bundle.repo_root.join("src/lib.rs"),
+        "pub fn value() -> u32 { 9 }\n",
+    )?;
+    let request = bundle.worktree_request();
+    let input = bundle.create_input(request);
+    let result = WorktreeLeaseService.create(&mut bundle.state, input).await;
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("controller_repo_dirty")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn worktree_adopts_clean_independent_clone() -> TestResult {
+    let mut bundle = Bundle::new("adopt-independent", &["src/lib.rs"])?;
+    let adopted = bundle.independent_clone("dogfood/adopt-independent")?;
+    let request = bundle.worktree_request();
+    let managed_root = bundle.worktree_root.clone();
+    let lease = WorktreeLeaseService
+        .adopt_independent(
+            &mut bundle.state,
+            WorktreeAdoptInput {
+                request,
+                worktree_path: adopted.clone(),
+                managed_root,
+                ttl_minutes: WorktreeLeaseService::default_ttl_minutes(),
+            },
+        )
+        .await?;
+
+    assert_eq!(
+        fs::canonicalize(lease.worktree_path)?,
+        fs::canonicalize(adopted)?
+    );
+    assert_eq!(lease.base_commit, git_head(&bundle.repo_root)?);
+    assert_eq!(lease.state, WorktreeLeaseState::Active);
+    Ok(())
+}
+
+#[tokio::test]
+async fn worktree_adopts_clean_independent_clone_from_dirty_controller_repo() -> TestResult {
+    let mut bundle = Bundle::new("adopt-independent-dirty-controller", &["src/lib.rs"])?;
+    let adopted = bundle.independent_clone("dogfood/adopt-independent-dirty-controller")?;
+    fs::write(
+        bundle.repo_root.join("src/lib.rs"),
+        "pub fn value() -> u32 { 9 }\n",
+    )?;
+    let request = bundle.worktree_request();
+    let managed_root = bundle.worktree_root.clone();
+    let lease = WorktreeLeaseService
+        .adopt_independent(
+            &mut bundle.state,
+            WorktreeAdoptInput {
+                request,
+                worktree_path: adopted.clone(),
+                managed_root,
+                ttl_minutes: WorktreeLeaseService::default_ttl_minutes(),
+            },
+        )
+        .await?;
+
+    assert_eq!(
+        fs::canonicalize(lease.worktree_path)?,
+        fs::canonicalize(adopted)?
+    );
+    assert_eq!(lease.base_commit, git_head(&bundle.repo_root)?);
+    assert_eq!(lease.state, WorktreeLeaseState::Active);
+    Ok(())
+}
+
+#[tokio::test]
+async fn worktree_rejects_dirty_independent_clone_adoption() -> TestResult {
+    let mut bundle = Bundle::new("adopt-dirty", &["src/lib.rs"])?;
+    let adopted = bundle.independent_clone("dogfood/adopt-dirty")?;
+    fs::write(adopted.join("src/lib.rs"), "pub fn value() -> u32 { 9 }\n")?;
+    let request = bundle.worktree_request();
+    let managed_root = bundle.worktree_root.clone();
+    let result = WorktreeLeaseService
+        .adopt_independent(
+            &mut bundle.state,
+            WorktreeAdoptInput {
+                request,
+                worktree_path: adopted,
+                managed_root,
+                ttl_minutes: WorktreeLeaseService::default_ttl_minutes(),
+            },
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("adopted_worktree_dirty")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn worktree_cleanup_removes_only_adopted_independent_clone() -> TestResult {
+    let mut bundle = Bundle::new("adopt-cleanup", &["src/lib.rs"])?;
+    let adopted = bundle.independent_clone("dogfood/adopt-cleanup")?;
+    let request = bundle.worktree_request();
+    let managed_root = bundle.worktree_root.clone();
+    let lease = WorktreeLeaseService
+        .adopt_independent(
+            &mut bundle.state,
+            WorktreeAdoptInput {
+                request,
+                worktree_path: adopted.clone(),
+                managed_root,
+                ttl_minutes: WorktreeLeaseService::default_ttl_minutes(),
+            },
+        )
+        .await?;
+    bundle
+        .state
+        .worktree_leases
+        .iter_mut()
+        .find(|candidate| candidate.worktree_lease_id == lease.worktree_lease_id)
+        .expect("adopted lease")
+        .state = WorktreeLeaseState::Captured;
+
+    let cleaned = WorktreeCleanupService
+        .cleanup(&mut bundle.state, lease.worktree_lease_id)
+        .await?;
+
+    assert_eq!(cleaned.state, WorktreeLeaseState::Cleaned);
+    assert!(!adopted.exists());
+    assert!(bundle.repo_root.exists());
     Ok(())
 }
 
@@ -886,6 +1030,30 @@ impl Bundle {
             worktree_root: self.worktree_root.clone(),
             ttl_minutes: WorktreeLeaseService::default_ttl_minutes(),
         }
+    }
+
+    fn independent_clone(&self, branch: &str) -> TestResult<PathBuf> {
+        fs::create_dir_all(&self.worktree_root)?;
+        let destination = self.worktree_root.join("independent");
+        let source_arg = self.repo_root.display().to_string();
+        let destination_arg = destination.display().to_string();
+        run_process(
+            &self.worktree_root,
+            "git",
+            &[
+                "clone",
+                "--local",
+                "--no-hardlinks",
+                "--no-checkout",
+                "--",
+                &source_arg,
+                &destination_arg,
+            ],
+        )?;
+        let head = git_head(&self.repo_root)?;
+        run_process(&destination, "git", &["checkout", "-b", branch, &head])?;
+        run_process(&destination, "git", &["remote", "remove", "origin"])?;
+        Ok(destination)
     }
 
     async fn create_worktree(&mut self) -> TestResult<eliot_types::WorktreeLease> {

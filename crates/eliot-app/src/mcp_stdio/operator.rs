@@ -7,6 +7,7 @@
 
 use super::*;
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn read_operator_cursor_signing_key(
     path: &Path,
 ) -> Result<[u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES]> {
@@ -19,12 +20,14 @@ pub(super) fn read_operator_cursor_signing_key(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn load_or_create_operator_cursor_signing_key_file(
     instance: &RuntimeInstance,
 ) -> Result<[u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES]> {
     load_or_create_operator_cursor_signing_key_file_at(&instance.runtime_dir().join("secrets"))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn load_or_create_operator_cursor_signing_key_file_at(
     secret_dir: &Path,
 ) -> Result<[u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES]> {
@@ -100,7 +103,9 @@ fn load_or_create_operator_cursor_signing_key_credential(
 pub(super) fn load_or_create_operator_cursor_signing_key(
     instance: &RuntimeInstance,
 ) -> Result<[u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES]> {
-    if let Some(backend) =
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if let Some(backend) =
         eliot_windows_ipc::test_support::IsolatedTestCredentialBackend::from_process_environment()?
     {
         return match backend {
@@ -112,8 +117,9 @@ pub(super) fn load_or_create_operator_cursor_signing_key(
             } => load_or_create_operator_cursor_signing_key_credential(&target),
         };
     }
-    if cfg!(test) || std::env::var(LEGACY_OPERATOR_CURSOR_TEST_OVERRIDE).as_deref() == Ok("1") {
-        return load_or_create_operator_cursor_signing_key_file(instance);
+        if cfg!(test) || std::env::var(LEGACY_OPERATOR_CURSOR_TEST_OVERRIDE).as_deref() == Ok("1") {
+            return load_or_create_operator_cursor_signing_key_file(instance);
+        }
     }
 
     load_or_create_operator_cursor_signing_key_credential(
@@ -718,7 +724,11 @@ pub(super) async fn dispatch_operator_snapshot(
     .map_err(Into::into)
 }
 
-pub(super) async fn dispatch_operator_query(state: &McpState, arguments: Value) -> Result<Value> {
+pub(super) async fn dispatch_operator_query(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    arguments: Value,
+) -> Result<Value> {
     let request: OperatorQueryRequest = serde_json::from_value(arguments)?;
     if request.page_size == 0 || request.page_size > 100 {
         anyhow::bail!("operator page_size must be between 1 and 100");
@@ -758,7 +768,7 @@ pub(super) async fn dispatch_operator_query(state: &McpState, arguments: Value) 
     };
     let snapshot: OperatorSnapshot =
         serde_json::from_value(dispatch_operator_snapshot(state, snapshot_arguments).await?)?;
-    let mut prepared = prepare_operator_query_records(&request, &snapshot)?;
+    let mut prepared = prepare_operator_query_records(&request, &snapshot, context)?;
     if let Some(records) = operator_typed_memory_query_records(state, &request).await? {
         prepared.records = records;
     }
@@ -779,9 +789,17 @@ pub(super) async fn dispatch_operator_query(state: &McpState, arguments: Value) 
     prepared
         .records
         .retain(|record| operator_record_matches(record, &request.filter));
-    let page =
+    let mut page =
         paginate_operator_query_records(state, &request, &cursor_scope, cursor_state, prepared)
             .await?;
+    memory_grant::attach_memory_grant_offers(
+        state,
+        context,
+        &request,
+        &snapshot,
+        &mut page.records,
+    )
+    .await?;
     let task_revision = snapshot
         .task_cognition
         .first()
@@ -1428,6 +1446,7 @@ pub(super) fn operator_l2_handle_record(
 pub(super) fn prepare_operator_query_records(
     request: &OperatorQueryRequest,
     snapshot: &OperatorSnapshot,
+    context: AuthenticatedRequestContext,
 ) -> Result<PreparedOperatorQuery> {
     let projection = match request.query_operation {
         Some(OperatorQueryOperation::CurrentState) => OperatorProjectionKind::TaskCognition,
@@ -1452,7 +1471,7 @@ pub(super) fn prepare_operator_query_records(
                 .context("exact_evidence requires query_parameters.record_ref")
         })
         .transpose()?;
-    let mut records = operator_projection_records(snapshot, projection);
+    let mut records = operator_projection_records(snapshot, projection, context);
     records.retain(|record| {
         operator_query_specific_match(record, projection, exact_evidence_target.as_deref())
     });
@@ -1783,6 +1802,7 @@ pub(super) fn operator_canonical_record_kind(receipt_kind: &str) -> &str {
 pub(super) fn operator_projection_records(
     snapshot: &OperatorSnapshot,
     projection: OperatorProjectionKind,
+    context: AuthenticatedRequestContext,
 ) -> Vec<OperatorRecordView> {
     let mut records = Vec::new();
     match projection {
@@ -2030,6 +2050,15 @@ pub(super) fn operator_projection_records(
                     ));
                 }
                 if let Some(decision) = &view.active_decision_state {
+                    let worktree = scoped_action_worktree(snapshot, context, view);
+                    let mut fields = vec![
+                        operator_field("packet_id", &decision.packet_id, true),
+                        operator_field("expected_observable", &decision.expected_observable, false),
+                        operator_field("verifier", &decision.verifier, false),
+                        operator_field("stop_condition", &decision.stop_condition, false),
+                        operator_field("open_unknowns", decision.open_unknowns.len(), false),
+                    ];
+                    fields.extend(action_request_context_fields(view, decision, worktree));
                     records.push(operator_record(
                         &format!("decision:{}", decision.packet_id),
                         "active_decision_state",
@@ -2037,17 +2066,7 @@ pub(super) fn operator_projection_records(
                         &decision.next_allowed_action,
                         "active",
                         "governor",
-                        vec![
-                            operator_field("packet_id", &decision.packet_id, true),
-                            operator_field(
-                                "expected_observable",
-                                &decision.expected_observable,
-                                false,
-                            ),
-                            operator_field("verifier", &decision.verifier, true),
-                            operator_field("stop_condition", &decision.stop_condition, false),
-                            operator_field("open_unknowns", decision.open_unknowns.len(), false),
-                        ],
+                        fields,
                     ));
                 }
                 records.extend(view.current_truth.iter().map(|claim| {
@@ -2088,7 +2107,7 @@ pub(super) fn operator_projection_records(
                         .enumerate()
                         .map(|(index, prior)| {
                             operator_record(
-                                &format!("experience-prior:{index}:{}", prior.essence),
+                                &memory_grant::experience_prior_record_ref(index, prior),
                                 "experience_brief",
                                 &prior.essence,
                                 &prior.why_it_may_apply.join("; "),
@@ -2479,6 +2498,82 @@ pub(super) fn operator_projection_records(
         }
     }
     records
+}
+
+pub(super) fn action_request_context_fields(
+    view: &TaskCognitionView,
+    decision: &eliot_types::ActiveDecisionState,
+    worktree: Option<&eliot_types::WorktreeLease>,
+) -> Vec<OperatorFieldView> {
+    let task_contract_ref = format!(
+        "eliot/task/{}@{}",
+        view.task_contract.task_id,
+        view.task_contract.memory_revision.value()
+    );
+    let mut fields = vec![
+        operator_field(
+            "packet_revision_fence",
+            decision.revision_fence.value(),
+            true,
+        ),
+        operator_field("task_contract_ref", &task_contract_ref, true),
+        operator_field("current_truth_ref", &task_contract_ref, true),
+        operator_field(
+            "negative_memory_check_ref",
+            format!("eliot/negative-memory/{}", decision.packet_id),
+            true,
+        ),
+        operator_field(
+            "provenance_handles",
+            serde_json::to_string(&[view.task_contract.write_id.to_string()])
+                .unwrap_or_else(|_| "[]".to_owned()),
+            true,
+        ),
+    ];
+    if let Some(verifier) = RegisteredTaskVerifier::from_id(&decision.verifier) {
+        fields.push(operator_field(
+            "planned_verifier_ref",
+            verifier.reference(),
+            true,
+        ));
+        if let Some(worktree) = worktree
+            && matches!(
+                verifier,
+                RegisteredTaskVerifier::DogfoodBlobIntegrity
+                    | RegisteredTaskVerifier::CargoWorkspaceCheck
+            )
+        {
+            fields.push(operator_field(
+                "worktree_ref",
+                &worktree.worktree_path,
+                true,
+            ));
+            fields.push(operator_field(
+                "artifact_paths",
+                serde_json::to_string(&worktree.allowed_write_set)
+                    .unwrap_or_else(|_| "[]".to_owned()),
+                true,
+            ));
+        }
+    }
+    fields
+}
+
+fn scoped_action_worktree<'a>(
+    snapshot: &'a OperatorSnapshot,
+    context: AuthenticatedRequestContext,
+    view: &TaskCognitionView,
+) -> Option<&'a eliot_types::WorktreeLease> {
+    let now = time::OffsetDateTime::now_utc();
+    let mut matches = snapshot.routing.worktree_leases.iter().filter(|lease| {
+        lease.project_id == view.task_contract.project_id
+            && lease.task_id == view.task_contract.task_id
+            && lease.holder_session_id.as_uuid() == context.session_id.as_uuid()
+            && lease.state == eliot_types::WorktreeLeaseState::Active
+            && lease.expires_at > now
+    });
+    let worktree = matches.next()?;
+    matches.next().is_none().then_some(worktree)
 }
 
 pub(super) fn operator_run_record(run: &eliot_types::AutonomyRunView) -> OperatorRecordView {

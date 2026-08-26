@@ -16,16 +16,16 @@ use eliot_types::{
     CurrentStateRequest, CurrentStateResponse, EpistemicStatus, ExperimentalMetaPolicyCandidate,
     FetchAtomsL2Request, FetchAtomsL2Response, GraphHealthResponse, HarnessExperimentRecord,
     InjectionReceipt, L0CollapsedDuplicateTrace, L0FeatureScore, L0RankTrace, L0SuppressionTrace,
-    LifecycleStatus, MemoryConfidence, MemoryHandlePreview, MemoryInfluenceTrace, MemoryRevision,
-    MemoryStateTransition, MemoryTrajectoryCorrectness, MemoryWriteEnvelope,
-    MetaIsolationRejectionRecord, MetaPolicyExecutionAction, MetaPolicyExecutionReceipt,
-    MinorityPressureRecord, ObservabilityKind, ObservabilityWriteEnvelope,
-    ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId, ProjectSequence,
-    RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun, SealedReplayCaseRecord,
-    SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SleepCandidateArtifact,
-    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaintClass, TaskContract,
-    TaskId, ToolObservation, TruncationInfo, VerificationId, VerificationRun, Visibility, WriteId,
-    WriteReceipt, WriteStatus, cue_binding_page_id,
+    LifecycleStatus, MemoryConfidence, MemoryGrantOfferRecord, MemoryHandlePreview,
+    MemoryInfluenceTrace, MemoryRevision, MemoryStateTransition, MemoryTrajectoryCorrectness,
+    MemoryWriteEnvelope, MetaIsolationRejectionRecord, MetaPolicyExecutionAction,
+    MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
+    ObservabilityWriteEnvelope, ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId,
+    ProjectSequence, RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun,
+    SealedReplayCaseRecord, SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SessionId,
+    SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
+    TaintClass, TaskContract, TaskId, ToolObservation, TruncationInfo, VerificationId,
+    VerificationRun, Visibility, WriteId, WriteReceipt, WriteStatus, cue_binding_page_id,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -2351,6 +2351,8 @@ impl CanonicalStore {
                     "envelope": envelope,
                     "canonical_payloads": canonical_payloads,
                     "relation_payloads": relation_payloads,
+                    "memory_grant_ref_schema_version": eliot_types::ACTION_MEMORY_GRANT_REF_SCHEMA_VERSION,
+                    "memory_grant_redemption_schema_version": eliot_types::ACTION_MEMORY_GRANT_REDEMPTION_SCHEMA_VERSION,
                     "fail_before_projection_outbox": fail_before_projection_outbox,
                     "now": now,
                 }),
@@ -3036,6 +3038,23 @@ impl CanonicalStore {
         &self,
         envelope: &ObservabilityWriteEnvelope,
     ) -> Result<ObservabilityWriteReceipt, StoreError> {
+        if envelope.kind == ObservabilityKind::MemoryGrantOffer {
+            let offer: MemoryGrantOfferRecord = serde_json::from_value(envelope.payload.clone())
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+            if offer.schema_version != eliot_types::MEMORY_DELIVERY_GRANT_SCHEMA_VERSION
+                || offer.grant_id != envelope.record_id
+                || offer.offer_write_id != envelope.write_id
+                || offer.project_id != envelope.project_id
+                || Some(offer.task_id) != envelope.task_id
+                || Some(offer.session_id) != envelope.session_id
+                || offer.offered_at != envelope.created_at
+            {
+                return Err(StoreError::PolicyViolation(
+                    "memory grant offer identity does not match its observability envelope"
+                        .to_owned(),
+                ));
+            }
+        }
         let injection_payload = if envelope.kind == ObservabilityKind::InjectionReceipt {
             let receipt: InjectionReceipt = serde_json::from_value(envelope.payload.clone())
                 .map_err(|error| StoreError::Decode(error.to_string()))?;
@@ -3146,6 +3165,30 @@ impl CanonicalStore {
             )
             .await?;
         decode_value(NamedSurqlOp::ObservabilityRecordsByKind, value)
+    }
+
+    pub async fn memory_grant_offer_by_id(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+        session_id: SessionId,
+        grant_id: &str,
+    ) -> Result<Option<MemoryGrantOfferRecord>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::MemoryGrantOfferById,
+                json!({
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "grant_id": grant_id,
+                }),
+            )
+            .await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        decode_value(NamedSurqlOp::MemoryGrantOfferById, value).map(Some)
     }
 
     pub async fn replace_cue_rows(

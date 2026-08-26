@@ -316,13 +316,40 @@ fn kind_compatibility_rejects_weak_claim_as_procedure() {
 fn memory_need_can_return_no_useful_memory() {
     let frame = TaskMeaningFrame {
         task_id: "sufficient".to_owned(),
+        normalized_goal: "verify the complete decision path".to_owned(),
+        task_or_action_type: "governed task".to_owned(),
+        project_module_boundary: vec!["eliot-engine".to_owned()],
+        files_symbols_config: vec!["semantic_memory.rs".to_owned()],
+        control_data_state_path: vec!["task -> packet -> verifier".to_owned()],
         current_evidence: vec!["current source and verifier are present".to_owned()],
+        predicted_observable: "the registered verifier passes".to_owned(),
+        verifier_need: "semantic-memory-test".to_owned(),
         ..TaskMeaningFrame::default()
     };
     assert_eq!(
         MemoryNeedService::decide(&frame, None).need,
         MemoryNeed::None
     );
+}
+
+#[test]
+fn memory_need_does_not_stop_at_partial_current_evidence() {
+    let frame = TaskMeaningFrame {
+        task_id: "incomplete-bridge".to_owned(),
+        normalized_goal: "verify the incomplete decision path".to_owned(),
+        task_or_action_type: "governed task".to_owned(),
+        project_module_boundary: vec!["eliot-engine".to_owned()],
+        files_symbols_config: vec!["semantic_memory.rs".to_owned()],
+        current_evidence: vec!["one current source handle".to_owned()],
+        predicted_observable: "the registered verifier passes".to_owned(),
+        verifier_need: "semantic-memory-test".to_owned(),
+        ..TaskMeaningFrame::default()
+    };
+
+    let decision = MemoryNeedService::decide(&frame, None);
+
+    assert_eq!(decision.need, MemoryNeed::CurrentFact);
+    assert_ne!(decision.expected_decision_delta, "none");
 }
 
 #[test]
@@ -468,6 +495,45 @@ fn exposure_policy_partitions_control_and_candidate_conditions() {
         &[case],
     );
     assert!(!candidate.fused_rank_traces.is_empty());
+}
+
+#[test]
+fn current_fact_need_cannot_leak_a_causal_case() {
+    let project_id = ProjectId::new_v7();
+    let case = formed(episode(
+        project_id,
+        "kind-gate",
+        "staged writeback is not a canonical receipt",
+        "staged writeback",
+        "canonical receipt absent",
+        "canonical receipt present",
+        "write receipt missing",
+        "staged is not persisted",
+    ));
+    let frame = TaskMeaningFrame {
+        task_id: "kind-gate".to_owned(),
+        normalized_goal: "write receipt missing".to_owned(),
+        problem_or_failure_signature: "canonical receipt absent".to_owned(),
+        current_evidence: vec!["canonical receipt absent".to_owned()],
+        ..TaskMeaningFrame::default()
+    };
+    let response = ExperienceRetrievalService::recall(
+        &ExperienceRecallRequest {
+            project_id,
+            task_frame: frame.clone(),
+            need: MemoryNeedService::decide(&frame, Some(MemoryNeed::CurrentFact)),
+            exposure_policy: MemoryExposurePolicy {
+                mode: MemoryExposureMode::IncludeCaseCandidates,
+                ..MemoryExposurePolicy::default()
+            },
+        },
+        &[case],
+    );
+
+    assert!(response.no_useful_memory);
+    assert!(response.fused_rank_traces.is_empty());
+    assert!(response.experience_priors.is_empty());
+    assert!(response.reason.contains("incompatible with CurrentFact"));
 }
 
 #[test]

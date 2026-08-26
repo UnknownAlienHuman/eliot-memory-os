@@ -112,6 +112,124 @@ fn governor_bound_scope_defaults_ids_and_rejects_scope_spoofing() -> Result<()> 
 }
 
 #[test]
+fn scoped_request_authority_refresh_rejects_revocation_and_stale_fences() -> Result<()> {
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let agent_session_id = AgentSessionId::new_v7();
+    let session_id = SessionId::from_uuid(agent_session_id.as_uuid());
+    let mut broker_state = eliot_types::DelegationState::default();
+    HostBrokerService.register_session(
+        &mut broker_state,
+        agent_session_id,
+        AgentHostId::Codex,
+        "Codex".to_owned(),
+        "scoped-request-authority-refresh".to_owned(),
+        AgentCapabilityEnvelope::default(),
+    )?;
+    HostBrokerService.bind_session_scope(
+        &mut broker_state,
+        agent_session_id,
+        project_id,
+        task_id,
+    )?;
+    let (role, controller) = HostBrokerService.grant_role(
+        &mut broker_state,
+        task_id,
+        agent_session_id,
+        AgentRole::Controller,
+        vec!["review".to_owned(), "verify".to_owned()],
+        30,
+    )?;
+    assert!(
+        controller.is_some(),
+        "a Controller role must mint its lease"
+    );
+
+    let validated = validate_presented_scoped_host_authority_state(
+        &broker_state,
+        McpAccessProfile::CodexController,
+        session_id,
+        &role.role_lease_id,
+        project_id,
+        task_id,
+        role.epoch,
+        role.generation,
+    )?;
+    assert_eq!(validated.role_lease_id, role.role_lease_id);
+
+    let mut revoked_role = broker_state.clone();
+    revoked_role
+        .task_role_leases
+        .iter_mut()
+        .find(|candidate| candidate.role_lease_id == role.role_lease_id)
+        .context("test Controller TaskRoleLease is absent")?
+        .state = eliot_types::AuthorityLeaseState::Revoked;
+    let role_error = validate_presented_scoped_host_authority_state(
+        &revoked_role,
+        McpAccessProfile::CodexController,
+        session_id,
+        &role.role_lease_id,
+        project_id,
+        task_id,
+        role.epoch,
+        role.generation,
+    )
+    .err()
+    .context("a revoked TaskRoleLease must fail request-time refresh")?;
+    assert!(
+        role_error
+            .to_string()
+            .contains("no active matching TaskRoleLease")
+    );
+
+    let mut revoked_controller = broker_state.clone();
+    revoked_controller
+        .controller_leases
+        .iter_mut()
+        .find(|candidate| {
+            candidate.task_id == task_id && candidate.agent_session_id == agent_session_id
+        })
+        .context("test ControllerLease is absent")?
+        .state = eliot_types::AuthorityLeaseState::Revoked;
+    let controller_error = validate_presented_scoped_host_authority_state(
+        &revoked_controller,
+        McpAccessProfile::CodexController,
+        session_id,
+        &role.role_lease_id,
+        project_id,
+        task_id,
+        role.epoch,
+        role.generation,
+    )
+    .err()
+    .context("a revoked ControllerLease must fail request-time refresh")?;
+    assert!(
+        controller_error
+            .to_string()
+            .contains("active matching ControllerLease required")
+    );
+
+    let stale_fence_error = validate_presented_scoped_host_authority_state(
+        &broker_state,
+        McpAccessProfile::CodexController,
+        session_id,
+        &role.role_lease_id,
+        project_id,
+        task_id,
+        role.epoch + 1,
+        role.generation,
+    )
+    .err()
+    .context("a stale presented epoch must fail request-time refresh")?;
+    assert!(
+        stale_fence_error
+            .to_string()
+            .contains("stale TaskRoleLease epoch or generation")
+    );
+    Ok(())
+}
+
+#[test]
 fn cold_observe_candidate_is_fetchable_but_not_cue_indexed() {
     let mut payload = json!({
         "record_kind": "observation_candidate",
@@ -320,6 +438,7 @@ async fn managed_host_observation_uses_the_daemon_owned_writer() -> Result<()> {
             SessionId::new_v7(),
             None,
             None,
+            None,
             &serde_json::to_string(&json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -347,6 +466,7 @@ async fn managed_host_observation_uses_the_daemon_owned_writer() -> Result<()> {
         .handle_line(
             "host_governor",
             SessionId::new_v7(),
+            None,
             None,
             None,
             &serde_json::to_string(&json!({
@@ -866,6 +986,8 @@ fn completion_task_fixture() -> TaskContract {
             task_contract_ref: format!("eliot/task/{task_id}@1"),
             current_truth_refs: vec![format!("eliot/task/{task_id}@1")],
             exact_evidence_refs: vec!["receipt:test".to_owned()],
+            memory_delivery_refs: vec![],
+            memory_grant_refs: vec![],
             negative_memory_check_ref: "eliot/negative-memory/test".to_owned(),
             planned_verifier_ref: RegisteredTaskVerifier::CargoWorkspaceCheck.reference(),
             source_scope: ActionSourceScope {
@@ -880,6 +1002,7 @@ fn completion_task_fixture() -> TaskContract {
             resolver_version: ACTION_PROVENANCE_RESOLVER_VERSION.to_owned(),
             hash: "provenance-hash".to_owned(),
         }),
+        memory_grant_redemptions: vec![],
         observation_ids: vec!["observation".to_owned()],
         verification_ids: vec![verification_id],
         verification_scopes: vec![VerifierArtifactScope {
@@ -909,6 +1032,18 @@ fn completion_task_fixture() -> TaskContract {
         project_sequence: eliot_types::ProjectSequence::new(2),
         write_id: WriteId::from_uuid(lease_id.as_uuid()),
     }
+}
+
+#[test]
+fn empty_action_memory_delivery_refs_preserve_v1_wire_shape() {
+    let task = completion_task_fixture();
+    let provenance = task
+        .action_provenance
+        .as_ref()
+        .expect("fixture has action provenance");
+    let wire = serde_json::to_value(provenance).expect("serialize action provenance");
+    assert!(wire.get("memory_delivery_refs").is_none());
+    assert!(wire.get("memory_grant_refs").is_none());
 }
 
 fn bound_completion_proof_fixture() -> (TaskContract, CompletionProof) {
@@ -997,6 +1132,88 @@ fn canonical_task_completion_proof_rejects_goal_mismatch() {
     assert!(
         task_completion_proof_gaps(&task, &proof)
             .contains(&"completion_proof:goal_mismatch".to_owned())
+    );
+}
+
+#[test]
+fn canonical_task_completion_proof_binds_exact_server_delivered_memory_refs() {
+    let (mut task, mut proof) = bound_completion_proof_fixture();
+    let memory_handle = "experience:bounded-retry".to_owned();
+    let project_id = task.project_id;
+    let task_id = task.task_id;
+    task.action_provenance
+        .as_mut()
+        .expect("fixture has action provenance")
+        .memory_delivery_refs
+        .push(ActionMemoryDeliveryRef {
+            schema_version: ACTION_MEMORY_DELIVERY_REF_SCHEMA_VERSION.to_owned(),
+            project_id,
+            task_id,
+            session_id: SessionId::from_uuid(uuid::Uuid::from_u128(6)),
+            delivery_kind: ActionMemoryDeliveryKind::ContextPacketExperiencePrior,
+            delivery_id: "eliot/packet/test".to_owned(),
+            memory_handle: memory_handle.clone(),
+            delivery_surface: "mcp_response_piggyback".to_owned(),
+            source_fingerprint: "fingerprint".to_owned(),
+            delivery_receipt_resolved_at: time::OffsetDateTime::UNIX_EPOCH,
+            evidence_class: ActionMemoryEvidenceClass::AgentDeclaredUseAfterServerDelivery,
+        });
+    proof.memory_refs_used.push(memory_handle);
+    assert!(task_completion_proof_gaps(&task, &proof).is_empty());
+
+    proof.memory_refs_used.clear();
+    assert!(
+        task_completion_proof_gaps(&task, &proof)
+            .contains(&"completion_proof:memory_delivery_refs_not_exact".to_owned())
+    );
+}
+
+#[test]
+fn canonical_task_completion_proof_binds_exact_opaque_memory_grants() {
+    let (mut task, mut proof) = bound_completion_proof_fixture();
+    let project_id = task.project_id;
+    let task_id = task.task_id;
+    let grant_uuid = uuid::Uuid::from_u128(7);
+    let grant_id = grant_uuid.to_string();
+    task.action_provenance
+        .as_mut()
+        .expect("fixture has action provenance")
+        .memory_grant_refs
+        .push(ActionMemoryGrantRef {
+            schema_version: ACTION_MEMORY_GRANT_REF_SCHEMA_VERSION.to_owned(),
+            project_id,
+            task_id,
+            session_id: SessionId::from_uuid(uuid::Uuid::from_u128(6)),
+            grant_id: grant_id.clone(),
+            offer_write_id: WriteId::from_uuid(grant_uuid),
+            packet_id: "eliot/packet/opaque-grant".to_owned(),
+            packet_revision_fence: MemoryRevision::new(2),
+            task_memory_revision: task.memory_revision,
+            task_contract_ref: "eliot/task/opaque-grant@2".to_owned(),
+            prior_fingerprint: "private-prior-fingerprint".to_owned(),
+            guidance_hash: "private-guidance-hash".to_owned(),
+            expires_at: time::OffsetDateTime::from_unix_timestamp(2_000_000_000)
+                .expect("fixed expiry is valid"),
+            redeemed_at: time::OffsetDateTime::from_unix_timestamp(1_999_999_000)
+                .expect("fixed redemption time is valid"),
+            evidence_class:
+                ActionMemoryGrantEvidenceClass::AgentReturnedOpaqueGrantAfterServerOffer,
+        });
+    proof.memory_refs_used.push(format!("grant:{grant_id}"));
+    assert!(task_completion_proof_gaps(&task, &proof).is_empty());
+
+    proof.memory_refs_used.clear();
+    assert!(
+        task_completion_proof_gaps(&task, &proof)
+            .contains(&"completion_proof:memory_delivery_refs_not_exact".to_owned())
+    );
+
+    proof
+        .memory_refs_used
+        .push(format!("grant:{}", uuid::Uuid::from_u128(8)));
+    assert!(
+        task_completion_proof_gaps(&task, &proof)
+            .contains(&"completion_proof:memory_delivery_refs_not_exact".to_owned())
     );
 }
 
@@ -1229,6 +1446,10 @@ fn cargo_workspace_check_registry_contract_is_static() {
     assert_eq!(verifier.id(), "cargo-workspace-check");
     assert_eq!(verifier.source_kind(), "git_worktree");
     assert_eq!(
+        RegisteredTaskVerifier::from_id(verifier.id()),
+        Some(verifier)
+    );
+    assert_eq!(
         RegisteredTaskVerifier::from_reference(&verifier.reference()),
         Some(verifier)
     );
@@ -1241,11 +1462,216 @@ fn cargo_workspace_check_registry_contract_is_static() {
     );
 }
 
+#[test]
+fn task_cognition_exposes_exact_action_request_context() {
+    let task = completion_task_fixture();
+    let decision = eliot_types::ActiveDecisionState {
+        task_id: task.task_id,
+        packet_id: "eliot/packet/action-context".to_owned(),
+        revision_fence: MemoryRevision::new(14),
+        selected_owner_or_module: None,
+        next_allowed_action: "make the bounded change".to_owned(),
+        expected_observable: "verifier passes".to_owned(),
+        verifier: RegisteredTaskVerifier::CargoWorkspaceCheck.id().to_owned(),
+        stop_condition: "stop on verifier failure".to_owned(),
+        killed_paths: Vec::new(),
+        open_unknowns: Vec::new(),
+    };
+    let view = TaskCognitionView {
+        task_contract: task.clone(),
+        task_meaning: None,
+        active_decision_state: Some(decision.clone()),
+        current_truth: Vec::new(),
+        epistemic_state: eliot_types::EpistemicPacketState::default(),
+        causal_bridge: Vec::new(),
+        experience_priors: Vec::new(),
+        negative_memory: Vec::new(),
+        selected_memory: Vec::new(),
+        suppressed_memory: Vec::new(),
+        procedural_skills: eliot_types::ProceduralSkillPacketView::default(),
+        packet_quality: None,
+        understanding_outcomes: Vec::new(),
+        completion_proof: None,
+    };
+
+    let fields = operator::action_request_context_fields(&view, &decision, None);
+    let write_id = task.write_id.to_string();
+    let verifier_ref = RegisteredTaskVerifier::CargoWorkspaceCheck.reference();
+    let value = |label: &str| {
+        fields
+            .iter()
+            .find(|field| field.label == label)
+            .map(|field| (field.value.as_str(), field.copyable))
+    };
+    let task_ref = format!(
+        "eliot/task/{}@{}",
+        task.task_id,
+        task.memory_revision.value()
+    );
+    let provenance_handles = format!("[\"{write_id}\"]");
+
+    assert_eq!(value("packet_revision_fence"), Some(("14", true)));
+    assert_eq!(value("task_contract_ref"), Some((task_ref.as_str(), true)));
+    assert_eq!(value("current_truth_ref"), Some((task_ref.as_str(), true)));
+    assert_eq!(
+        value("negative_memory_check_ref"),
+        Some(("eliot/negative-memory/eliot/packet/action-context", true,))
+    );
+    assert_eq!(
+        value("provenance_handles"),
+        Some((provenance_handles.as_str(), true))
+    );
+    assert_eq!(
+        value("planned_verifier_ref"),
+        Some((verifier_ref.as_str(), true))
+    );
+}
+
+#[test]
+fn task_cognition_exposes_session_bound_worktree_context() {
+    let task = completion_task_fixture();
+    let decision = eliot_types::ActiveDecisionState {
+        task_id: task.task_id,
+        packet_id: "eliot/packet/worktree-context".to_owned(),
+        revision_fence: MemoryRevision::new(14),
+        selected_owner_or_module: None,
+        next_allowed_action: "make the bounded change".to_owned(),
+        expected_observable: "verifier passes".to_owned(),
+        verifier: RegisteredTaskVerifier::CargoWorkspaceCheck.id().to_owned(),
+        stop_condition: "stop on verifier failure".to_owned(),
+        killed_paths: Vec::new(),
+        open_unknowns: Vec::new(),
+    };
+    let view = TaskCognitionView {
+        task_contract: task.clone(),
+        task_meaning: None,
+        active_decision_state: Some(decision.clone()),
+        current_truth: Vec::new(),
+        epistemic_state: eliot_types::EpistemicPacketState::default(),
+        causal_bridge: Vec::new(),
+        experience_priors: Vec::new(),
+        negative_memory: Vec::new(),
+        selected_memory: Vec::new(),
+        suppressed_memory: Vec::new(),
+        procedural_skills: eliot_types::ProceduralSkillPacketView::default(),
+        packet_quality: None,
+        understanding_outcomes: Vec::new(),
+        completion_proof: None,
+    };
+    let worktree = eliot_types::WorktreeLease {
+        worktree_lease_id: WorktreeLeaseId::new_v7(),
+        project_id: task.project_id,
+        task_id: task.task_id,
+        work_item_id: WorkItemId::new_v7(),
+        work_lease_id: WorkLeaseId::new_v7(),
+        holder_session_id: AgentSessionId::new_v7(),
+        repo_root: r"C:\repo".to_owned(),
+        worktree_path: r"C:\dogfood\worktree".to_owned(),
+        branch_name: "codex/bounded".to_owned(),
+        base_commit: "a".repeat(40),
+        allowed_read_set: vec![DOGFOOD_BLOB_ARTIFACT.to_owned()],
+        allowed_write_set: vec![DOGFOOD_BLOB_ARTIFACT.to_owned()],
+        kind: eliot_types::WorktreeLeaseKind::IndependentClone,
+        managed_root: Some(r"C:\dogfood".to_owned()),
+        state: eliot_types::WorktreeLeaseState::Active,
+        issued_at: time::OffsetDateTime::UNIX_EPOCH,
+        expires_at: time::OffsetDateTime::from_unix_timestamp(2_000_000_000)
+            .expect("fixed expiry is valid"),
+        cleaned_at: None,
+        write_receipt: None,
+    };
+
+    let fields = operator::action_request_context_fields(&view, &decision, Some(&worktree));
+    let value = |label: &str| {
+        fields
+            .iter()
+            .find(|field| field.label == label)
+            .map(|field| (field.value.as_str(), field.copyable))
+    };
+    assert_eq!(value("worktree_ref"), Some((r"C:\dogfood\worktree", true)));
+    assert_eq!(
+        value("artifact_paths"),
+        Some((r#"["crates/eliot-store/src/blob_store.rs"]"#, true))
+    );
+}
+
+#[test]
+fn codecortex_selects_exactly_one_active_session_worktree_lease() -> Result<()> {
+    let now = time::OffsetDateTime::now_utc();
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let session_id = AgentSessionId::new_v7();
+    let mut state = WorkState::default();
+    let lease = WorktreeLease {
+        worktree_lease_id: WorktreeLeaseId::new_v7(),
+        project_id,
+        task_id,
+        work_item_id: WorkItemId::new_v7(),
+        work_lease_id: WorkLeaseId::new_v7(),
+        holder_session_id: session_id,
+        repo_root: r"C:\repo".to_owned(),
+        worktree_path: r"C:\managed\worktree".to_owned(),
+        branch_name: "codex/bounded".to_owned(),
+        base_commit: "a".repeat(40),
+        allowed_read_set: vec![DOGFOOD_BLOB_ARTIFACT.to_owned()],
+        allowed_write_set: vec![DOGFOOD_BLOB_ARTIFACT.to_owned()],
+        kind: eliot_types::WorktreeLeaseKind::IndependentClone,
+        managed_root: Some(r"C:\managed".to_owned()),
+        state: WorktreeLeaseState::Active,
+        issued_at: now,
+        expires_at: now + time::Duration::minutes(5),
+        cleaned_at: None,
+        write_receipt: None,
+    };
+    state.worktree_leases.push(lease.clone());
+
+    assert_eq!(
+        unique_active_worktree_lease_id(&state, session_id, project_id, task_id, now)?,
+        lease.worktree_lease_id
+    );
+    assert!(
+        unique_active_worktree_lease_id(&state, AgentSessionId::new_v7(), project_id, task_id, now)
+            .is_err()
+    );
+
+    let mut duplicate = lease;
+    duplicate.worktree_lease_id = WorktreeLeaseId::new_v7();
+    state.worktree_leases.push(duplicate);
+    let error = unique_active_worktree_lease_id(&state, session_id, project_id, task_id, now)
+        .expect_err("multiple active session-bound worktrees must fail closed");
+    assert!(error.to_string().contains("ambiguous"));
+    Ok(())
+}
+
+#[test]
+fn codecortex_live_scan_is_grounding_only() {
+    assert!(!live_codecortex_diagnostics_mode(None).unwrap());
+    assert!(!live_codecortex_diagnostics_mode(Some(false)).unwrap());
+    let error = live_codecortex_diagnostics_mode(Some(true))
+        .expect_err("live MCP must reject an inline Cargo diagnostic run");
+    assert!(error.to_string().contains("grounding-only"));
+
+    let schema = codecortex_scan_schema();
+    assert_eq!(
+        schema.pointer("/properties/include_diagnostics/const"),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        schema.pointer("/properties/include_diagnostics/default"),
+        Some(&Value::Bool(false))
+    );
+}
+
 #[tokio::test]
 async fn cargo_workspace_check_registry_runs_fixed_offline_command() -> Result<()> {
     let root =
         std::env::temp_dir().join(format!("eliot-l4-workspace-check-{}", uuid::Uuid::now_v7()));
+    let runtime_root = std::env::temp_dir().join(format!(
+        "eliot-l4-workspace-check-runtime-{}",
+        uuid::Uuid::now_v7()
+    ));
     std::fs::create_dir_all(root.join("src"))?;
+    std::fs::create_dir_all(&runtime_root)?;
     std::fs::write(
         root.join("Cargo.toml"),
         "[package]\nname = \"eliot-l4-verifier-probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
@@ -1255,9 +1681,37 @@ async fn cargo_workspace_check_registry_runs_fixed_offline_command() -> Result<(
         "pub fn verified() -> bool { true }\n",
     )?;
 
-    let result = run_cargo_workspace_check_verifier(&root).await;
-    let cleanup = std::fs::remove_dir_all(&root);
+    let cargo_target = prepare_registered_cargo_target(&root, &runtime_root)?;
+    let result = run_cargo_workspace_check_verifier(&root, &runtime_root).await;
+    assert!(
+        !root.join("target").exists(),
+        "registered verifier must not write build output into the leased worktree"
+    );
+    assert!(cargo_target.is_dir());
+    let cleanup_root = std::fs::remove_dir_all(&root);
+    let cleanup_runtime = std::fs::remove_dir_all(&runtime_root);
     result?;
+    cleanup_root?;
+    cleanup_runtime?;
+    Ok(())
+}
+
+#[test]
+fn registered_cargo_target_rejects_worktree_overlap() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-l4-overlapping-cargo-target-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let runtime_root = root.join("runtime");
+    std::fs::create_dir_all(&runtime_root)?;
+    let result = prepare_registered_cargo_target(&root, &runtime_root);
+    let cleanup = std::fs::remove_dir_all(&root);
+    assert!(
+        result
+            .expect_err("overlapping target must fail closed")
+            .to_string()
+            .contains("must not overlap")
+    );
     cleanup?;
     Ok(())
 }
@@ -1629,6 +2083,7 @@ fn human_operator_profile_exposes_only_typed_control_plane() -> Result<()> {
         .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
         .collect::<Vec<_>>();
     assert_eq!(names.len(), OPERATOR_TOOLS.len());
+    assert!(names.contains(&"eliot_task_contract_create".to_owned()));
     assert!(names.contains(&"eliot_operator_snapshot".to_owned()));
     assert!(names.contains(&"eliot_operator_query".to_owned()));
     assert!(names.contains(&"eliot_autonomy_run_status".to_owned()));
@@ -2118,6 +2573,7 @@ fn canonical_trace_schema_requires_receiptable_sources_and_derives_ten_parts() -
 #[test]
 fn canonical_mutation_authority_is_controller_or_operator_only() {
     for tool in [
+        "eliot_task_contract_create",
         "eliot_trace_completeness",
         "eliot_replay_run",
         "eliot_sleep_run",
@@ -2128,6 +2584,7 @@ fn canonical_mutation_authority_is_controller_or_operator_only() {
         assert!(McpAccessProfile::HumanOperator.allows(tool));
         assert!(!McpAccessProfile::CodexWorker.allows(tool));
         assert!(!McpAccessProfile::DynamicAgent.allows(tool));
+        assert!(!McpAccessProfile::ExternalAuditor.allows(tool));
         assert!(!McpAccessProfile::HumanReadonly.allows(tool));
     }
     assert!(!McpAccessProfile::CodexWorker.allows("eliot_canonical_status"));
@@ -2886,6 +3343,8 @@ fn append_m3_host_chain(
         base_commit: "base".to_owned(),
         allowed_read_set: vec![path.to_owned()],
         allowed_write_set: vec![path.to_owned()],
+        kind: eliot_types::WorktreeLeaseKind::LinkedGitWorktree,
+        managed_root: None,
         state: eliot_types::WorktreeLeaseState::Captured,
         issued_at: now,
         expires_at: now + time::Duration::hours(1),
@@ -3557,5 +4016,63 @@ fn c4_distillation_projection_preserves_exact_and_near_miss_boundaries() -> Resu
             .iter()
             .any(|evidence| evidence.starts_with("receipt:"))
     }));
+    Ok(())
+}
+#[test]
+fn opaque_codex_scope_capability_rejects_tamper_expiry_and_substitution() -> Result<()> {
+    let token = format!("cs1.{}.{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let key = [0x5a_u8; 32];
+    let now = 1_800_000_000_i64;
+    let claims = CodexScopeCapabilityClaims {
+        schema_version: CODEX_SCOPE_CAPABILITY_SCHEMA_VERSION.to_owned(),
+        instance_name: "isolated-test".to_owned(),
+        token_hash: blake3::hash(token.as_bytes()).to_hex().to_string(),
+        project_id: ProjectId::new_v7(),
+        task_id: TaskId::new_v7(),
+        session_id: SessionId::new_v7(),
+        role_lease_id: "role-lease-test".to_owned(),
+        role_lease_epoch: 7,
+        role_lease_generation: 11,
+        work_item_id: WorkItemId::new_v7(),
+        work_lease_id: WorkLeaseId::new_v7(),
+        worktree_lease_id: WorktreeLeaseId::new_v7(),
+        worktree_path: PathBuf::from(r"C:\dogfood-worktree"),
+        branch_name: "codex/w2-local".to_owned(),
+        baseline_commit: "a".repeat(40),
+        preflight_contract_sha256: "ab".repeat(32),
+        issued_at_unix: now,
+        expires_at_unix: now + 60,
+    };
+    let file = CodexScopeCapabilityFile {
+        mac: codex_scope_capability_mac(&claims, &key)?,
+        claims,
+    };
+    assert!(
+        validate_codex_scope_capability_file(&file, &token, "isolated-test", &key, now).is_ok()
+    );
+
+    let mut tampered = file.clone();
+    tampered.claims.role_lease_id = "substituted-role-lease".to_owned();
+    assert!(
+        validate_codex_scope_capability_file(&tampered, &token, "isolated-test", &key, now)
+            .is_err()
+    );
+    assert!(
+        validate_codex_scope_capability_file(
+            &file,
+            "cs1.substituted.token",
+            "isolated-test",
+            &key,
+            now,
+        )
+        .is_err()
+    );
+
+    let mut expired = file.clone();
+    expired.claims.expires_at_unix = now;
+    expired.mac = codex_scope_capability_mac(&expired.claims, &key)?;
+    assert!(
+        validate_codex_scope_capability_file(&expired, &token, "isolated-test", &key, now).is_err()
+    );
     Ok(())
 }

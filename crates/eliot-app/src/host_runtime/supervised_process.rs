@@ -10,7 +10,7 @@ use eliot_types::{
     OperationReconciliationState, OperationRuntimeCheckpoint, ProcessReapReceipt,
     ProviderDispatchState, ProviderTimeoutClass, ProviderTimeoutProfile,
 };
-use eliot_windows_ipc::SuspendedJobChild;
+use eliot_windows_ipc::{RecoverableJobObject, SuspendedJobChild};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -27,6 +27,11 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
 const SUPERVISED_TERMINATION_CODE: u32 = 0xE110_7001;
+// `connect_global_client` can spend one 10s window waiting for publication and
+// a second 10s window opening a busy pipe.  Preserve those healthy transport
+// budgets, the 2s handshake, and a bounded local response margin while still
+// rejecting a peer that accepts the request and never replies.
+const DAEMON_OPERATION_RUNTIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(
@@ -180,10 +185,13 @@ impl eliot_engine::OperationRuntimeProxy for DaemonOperationRuntimeProxy {
                     "encode daemon operation-runtime request: {error}"
                 ))
             })?;
-            let response = crate::named_pipe_ipc::host_governor_request(
-                &instance,
-                "runtime/operation",
-                params,
+            let response = bounded_operation_runtime_request(
+                DAEMON_OPERATION_RUNTIME_REQUEST_TIMEOUT,
+                crate::named_pipe_ipc::host_governor_request(
+                    &instance,
+                    "runtime/operation",
+                    params,
+                ),
             )
             .await
             .map_err(|error| {
@@ -198,6 +206,15 @@ impl eliot_engine::OperationRuntimeProxy for DaemonOperationRuntimeProxy {
             })
         })
     }
+}
+
+async fn bounded_operation_runtime_request<F, T>(timeout: Duration, request: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    tokio::time::timeout(timeout, request)
+        .await
+        .context("daemon operation-runtime request timed out")?
 }
 
 pub fn daemon_operation_runtime_handle(
@@ -221,10 +238,7 @@ pub fn daemon_operation_runtime_handle_for_instance(
 fn default_daemon_runtime_instance(
     config_path: &Path,
 ) -> Result<crate::runtime_instance::RuntimeInstance> {
-    crate::runtime_instance::RuntimeInstance::select(
-        config_path,
-        Some(crate::runtime_instance::DEFAULT_INSTANCE_NAME),
-    )
+    super::host_governor_instance(config_path)
 }
 
 fn daemon_operation_runtime_handle_for_runtime_instance(
@@ -495,6 +509,7 @@ where
 
     loop {
         tokio::select! {
+            biased;
             outcome = &mut worker => {
                 let mut outcome = outcome.context("supervised process worker panicked")??;
                 while let Ok(progress) = progress_rx.try_recv() {
@@ -602,7 +617,8 @@ pub async fn recover_stale_job_objects(
             recover_checkpoint_process_tree(&recovery_checkpoint, Duration::from_secs(5))
         })
         .await
-        .context("startup process recovery worker panicked")??;
+        .context("startup process recovery worker panicked")?;
+        let recovery = recovery_or_identity_unproven(recovery);
         match recovery {
             StartupProcessRecovery::JobReaped {
                 job_name,
@@ -776,6 +792,14 @@ enum StartupProcessRecovery {
     IdentityUnproven(String),
 }
 
+fn recovery_or_identity_unproven(
+    recovery: Result<StartupProcessRecovery>,
+) -> StartupProcessRecovery {
+    recovery.unwrap_or_else(|error| {
+        StartupProcessRecovery::IdentityUnproven(format!("process_recovery_failed:{error:#}"))
+    })
+}
+
 fn recover_checkpoint_process_tree(
     checkpoint: &OperationRuntimeCheckpoint,
     cleanup_grace: Duration,
@@ -787,13 +811,20 @@ fn recover_checkpoint_process_tree(
     };
     match eliot_windows_ipc::RecoverableJobObject::open(&job_name) {
         Ok(job) => {
-            let process_count_before = job.active_process_count()?;
+            let process_count_before = job
+                .active_process_count()
+                .context("query reopened Job Object before recovery")?;
             let forced_termination = process_count_before > 0;
             if forced_termination {
-                job.terminate(SUPERVISED_TERMINATION_CODE)?;
+                job.terminate(SUPERVISED_TERMINATION_CODE)
+                    .context("terminate reopened Job Object during recovery")?;
             }
-            let empty = job.wait_for_empty(cleanup_grace)?;
-            let process_count_after = job.active_process_count()?;
+            let empty = job
+                .wait_for_empty(cleanup_grace)
+                .context("wait for reopened Job Object recovery")?;
+            let process_count_after = job
+                .active_process_count()
+                .context("query reopened Job Object after recovery")?;
             Ok(StartupProcessRecovery::JobReaped {
                 job_name,
                 process_count_before,
@@ -894,15 +925,17 @@ fn validate_spec(spec: &SupervisedProcessSpec) -> Result<()> {
 
 fn operation_checkpoint(spec: &SupervisedProcessSpec) -> OperationRuntimeCheckpoint {
     let now = OffsetDateTime::now_utc();
-    let phase_deadline_at = now
-        + time::Duration::milliseconds(
-            i64::try_from(spec.timeout_profile.spawn_deadline_ms().unwrap_or(5_000))
-                .unwrap_or(i64::MAX),
-        );
     let absolute_deadline_at = now
         + time::Duration::milliseconds(
             i64::try_from(spec.timeout_profile.absolute_runtime_deadline_ms()).unwrap_or(i64::MAX),
         );
+    // The checkpoint is persisted through the daemon before the worker owns a
+    // PID and named Job Object.  That IPC latency must not consume the local
+    // spawn-admission budget: a daemon watchdog cannot safely recover a
+    // pre-spawn checkpoint which has no process identity.  The worker enforces
+    // `spawn_deadline_ms` after the process is created; durable progress moves
+    // this checkpoint to `Running` and keeps the absolute deadline.
+    let phase_deadline_at = absolute_deadline_at;
     OperationRuntimeCheckpoint {
         schema_version: OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION.to_owned(),
         operation_id: spec.operation_id.clone(),
@@ -1185,17 +1218,33 @@ fn run_worker(
     let mut cancellation_seen_at = None;
     let mut exit_code = None;
     let mut process_exit_at = None;
+    let mut root_exit_seen_at = None;
+    let mut root_descendant_grace_deadline = None;
+    let mut root_wait_failure_detail = None;
     let mut descendants_at_root_exit: Option<DescendantsAtRootExit> = None;
+    let mut descendant_capture_task: Option<WorkerThread<DescendantsAtRootExit>> = None;
 
     loop {
-        if descendants_at_root_exit.is_none() {
+        if root_exit_seen_at.is_none() {
             match child.try_wait() {
                 Ok(Some(code)) => {
                     let elapsed_ms =
                         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let snapshot =
-                        capture_descendants_at_root_exit(&child, root_pid, Some(code), elapsed_ms);
-                    descendants_at_root_exit = Some(snapshot);
+                    let root_exit_at = Instant::now();
+                    root_exit_seen_at = Some(root_exit_at);
+                    root_descendant_grace_deadline = Some(
+                        root_exit_at
+                            .checked_add(cleanup_grace)
+                            .unwrap_or(root_exit_at),
+                    );
+                    send_progress(progress_tx, ProcessProgress::Exited);
+                    descendant_capture_task = Some(spawn_descendant_capture(
+                        child.job_name().to_owned(),
+                        root_pid,
+                        Some(code),
+                        elapsed_ms,
+                        descendant_capture_delay(&spec.operation_id),
+                    ));
                     if process_exit_at.is_none() {
                         process_exit_at = Some(OffsetDateTime::now_utc());
                     }
@@ -1205,35 +1254,11 @@ fn run_worker(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    let elapsed_ms =
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let detail = format!("root wait failed: {error}");
-                    let truncated = if detail.chars().count() > 512 {
-                        detail.chars().take(512).collect::<String>()
-                    } else {
-                        detail
-                    };
-                    let snapshot = DescendantsAtRootExit::failed(
-                        Some(root_pid),
-                        None,
-                        elapsed_ms,
-                        DescendantsCaptureErrorKind::EnumerationFailed,
-                        truncated,
-                    )
-                    .unwrap_or(DescendantsAtRootExit::Failed(
-                        DescendantsAtRootExitFailed {
-                            schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
-                            root_pid: Some(root_pid),
-                            root_exit_code: None,
-                            capture_elapsed_ms: elapsed_ms,
-                            error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
-                            detail: "root wait failed".to_owned(),
-                        },
-                    ));
-                    descendants_at_root_exit = Some(snapshot);
-                    record_worker_error(
+                    record_root_wait_failure(
+                        cancellation,
                         &mut worker_error,
-                        format!("query supervised root process exit: {error}"),
+                        &mut root_wait_failure_detail,
+                        &error,
                     );
                 }
             }
@@ -1246,7 +1271,15 @@ fn run_worker(
                     send_progress(progress_tx, ProcessProgress::ProcessCount(count));
                 }
                 if count == 0 {
-                    exit_code = child.try_wait().unwrap_or(None);
+                    match child.try_wait() {
+                        Ok(code) => exit_code = code,
+                        Err(error) => record_root_wait_failure(
+                            cancellation,
+                            &mut worker_error,
+                            &mut root_wait_failure_detail,
+                            &error,
+                        ),
+                    }
                     process_exit_at = Some(OffsetDateTime::now_utc());
                     send_progress(progress_tx, ProcessProgress::Exited);
                     break;
@@ -1259,6 +1292,18 @@ fn run_worker(
                 );
                 cancellation.cancel();
             }
+        }
+
+        if root_descendant_grace_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            send_progress(progress_tx, ProcessProgress::Reaping);
+            if let Err(error) = child.terminate(SUPERVISED_TERMINATION_CODE) {
+                record_worker_error(
+                    &mut worker_error,
+                    format!("terminate descendants after supervised root exit: {error}"),
+                );
+            }
+            forced_termination = true;
+            break;
         }
 
         let now = Instant::now();
@@ -1337,7 +1382,35 @@ fn run_worker(
     let exit_waiter_terminal = exit_code.is_some();
     if descendants_at_root_exit.is_none() {
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let snapshot = capture_descendants_at_root_exit(&child, root_pid, exit_code, elapsed_ms);
+        let fallback = root_wait_failure_detail.as_deref().map_or_else(
+            || {
+                failed_descendant_capture(
+                    Some(root_pid),
+                    exit_code,
+                    elapsed_ms,
+                    DescendantsCaptureErrorKind::Ambiguous,
+                    if descendant_capture_task.is_some() {
+                        "descendant capture did not complete before bounded cleanup"
+                    } else {
+                        "root exit was not observed before bounded cleanup"
+                    },
+                )
+            },
+            |detail| {
+                failed_descendant_capture(
+                    Some(root_pid),
+                    exit_code,
+                    elapsed_ms,
+                    DescendantsCaptureErrorKind::EnumerationFailed,
+                    detail,
+                )
+            },
+        );
+        let snapshot = if descendant_capture_task.is_some() {
+            receive_worker_thread(descendant_capture_task.take(), cleanup_deadline, fallback).0
+        } else {
+            fallback
+        };
         descendants_at_root_exit = Some(snapshot);
     }
     let descendants_at_root_exit = descendants_at_root_exit.unwrap_or_else(|| {
@@ -1464,14 +1537,82 @@ fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn spawn_descendant_capture(
+    job_name: String,
+    root_pid: u32,
+    root_exit_code: Option<i32>,
+    capture_elapsed_ms: u64,
+    delay: Duration,
+) -> WorkerThread<DescendantsAtRootExit> {
+    let (result_tx, result_rx) = std_mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        let snapshot = RecoverableJobObject::open(&job_name).map_or_else(
+            |error| {
+                failed_descendant_capture(
+                    Some(root_pid),
+                    root_exit_code,
+                    capture_elapsed_ms,
+                    DescendantsCaptureErrorKind::EnumerationFailed,
+                    format!("open Job Object for descendant capture: {error}"),
+                )
+            },
+            |job| {
+                capture_descendants_at_root_exit(&job, root_pid, root_exit_code, capture_elapsed_ms)
+            },
+        );
+        let _ = result_tx.send(snapshot);
+    });
+    WorkerThread {
+        result_rx,
+        thread: Some(thread),
+    }
+}
+
+fn descendant_capture_delay(operation_id: &str) -> Duration {
+    #[cfg(test)]
+    if operation_id.contains("delayed-descendant-capture") {
+        return Duration::from_secs(5);
+    }
+    let _ = operation_id;
+    Duration::ZERO
+}
+
+fn failed_descendant_capture(
+    root_pid: Option<u32>,
+    root_exit_code: Option<i32>,
+    capture_elapsed_ms: u64,
+    error_kind: DescendantsCaptureErrorKind,
+    detail: impl Into<String>,
+) -> DescendantsAtRootExit {
+    let detail = detail.into();
+    DescendantsAtRootExit::failed(
+        root_pid,
+        root_exit_code,
+        capture_elapsed_ms,
+        error_kind,
+        detail.clone(),
+    )
+    .unwrap_or(DescendantsAtRootExit::Failed(DescendantsAtRootExitFailed {
+        schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
+        root_pid,
+        root_exit_code,
+        capture_elapsed_ms,
+        error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
+        detail,
+    }))
+}
+
 #[allow(clippy::too_many_lines)]
 fn capture_descendants_at_root_exit(
-    child: &SuspendedJobChild,
+    job: &RecoverableJobObject,
     root_pid: u32,
     root_exit_code: Option<i32>,
     capture_elapsed_ms: u64,
 ) -> DescendantsAtRootExit {
-    match child.current_job_processes() {
+    match job.current_job_processes() {
         Ok(snapshots) => {
             let mut descendants = Vec::new();
             for snapshot in snapshots {
@@ -1750,6 +1891,26 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
+fn record_root_wait_failure(
+    cancellation: &CancellationToken,
+    worker_error: &mut Option<String>,
+    root_wait_failure_detail: &mut Option<String>,
+    error: &std::io::Error,
+) {
+    let detail = format!("root wait failed: {error}");
+    let detail = if detail.chars().count() > 512 {
+        detail.chars().take(512).collect::<String>()
+    } else {
+        detail
+    };
+    root_wait_failure_detail.get_or_insert_with(|| detail.clone());
+    record_worker_error(
+        worker_error,
+        format!("query supervised root process exit: {error}"),
+    );
+    cancellation.cancel();
+}
+
 fn record_worker_error(error: &mut Option<String>, detail: impl Into<String>) {
     let detail = detail.into();
     if let Some(error) = error {
@@ -1775,20 +1936,31 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::{
         ChildCriticality, ProcessRestartPolicy, RestartStrategy, ScriptedProviderProcessRunner,
-        SupervisedChildKind, SupervisedProcessSpec, SupervisedWindowsProcessRunner,
+        StartupProcessRecovery, SupervisedChildKind, SupervisedProcessSpec,
+        SupervisedWindowsProcessRunner, bounded_operation_runtime_request,
         checkpoint_requests_process_cancellation, checkpoint_requires_process_recovery,
-        default_daemon_runtime_instance, operation_checkpoint, run_supervised_process,
+        default_daemon_runtime_instance, operation_checkpoint, record_root_wait_failure,
+        recovery_or_identity_unproven, run_supervised_process,
     };
     use anyhow::{Result, anyhow, bail};
     use eliot_engine::{
-        OperationRuntimeHandle, ProviderProcessRunner, ProviderProcessSpec,
+        EngineError, OperationRuntimeHandle, OperationRuntimeProxy, OperationRuntimeRequest,
+        OperationRuntimeResponse, ProviderProcessRunner, ProviderProcessSpec,
         runtime_supervision::{AdapterExecutionContext, CancellationToken},
     };
-    use eliot_types::{OperationCancellationState, ProcessReapReceipt};
+    use eliot_types::{
+        DescendantsAtRootExit, DescendantsCaptureErrorKind, OperationCancellationState,
+        ProcessReapReceipt,
+    };
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::path::Path;
+    use std::pin::Pin;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -1799,18 +1971,151 @@ mod tests {
     const TEST_IDLE_CONTEXT_TIMEOUT_MS: u64 = 60_000;
 
     #[test]
-    fn production_operation_runtime_routes_to_default_daemon_instance() -> Result<()> {
-        let instance = default_daemon_runtime_instance(Path::new("ignored/governor.toml"))?;
+    fn production_operation_runtime_falls_back_to_config_bound_daemon_instance() -> Result<()> {
+        let config_path = Path::new("ignored/supervised-process-isolated-governor.toml");
+        let instance = default_daemon_runtime_instance(config_path)?;
+        let expected = crate::runtime_instance::RuntimeInstance::select(config_path, None)?;
 
-        assert_eq!(
+        assert_eq!(instance.name(), expected.name());
+        assert_eq!(instance.publication_path(), expected.publication_path());
+        assert_ne!(
             instance.name(),
             crate::runtime_instance::DEFAULT_INSTANCE_NAME
         );
-        assert!(instance.standalone());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_query_error_is_fail_closed_not_fatal() {
+        let recovery = recovery_or_identity_unproven(Err(anyhow!(
+            "The parameter is incorrect. (os error 87)"
+        )));
+
+        let StartupProcessRecovery::IdentityUnproven(reason) = recovery else {
+            panic!("recovery error must remain identity-unproven");
+        };
+        assert_eq!(
+            reason,
+            "process_recovery_failed:The parameter is incorrect. (os error 87)"
+        );
+    }
+
+    #[test]
+    fn root_wait_error_retries_observation_and_cancels_fail_closed() {
+        let cancellation = CancellationToken::new();
+        let mut worker_error = None;
+        let mut root_wait_failure_detail = None;
+
+        record_root_wait_failure(
+            &cancellation,
+            &mut worker_error,
+            &mut root_wait_failure_detail,
+            &std::io::Error::from_raw_os_error(6),
+        );
+
+        assert!(cancellation.is_cancelled());
         assert!(
-            instance
-                .publication_path()
-                .ends_with(Path::new("instances/default/runtime/publication.json"))
+            worker_error
+                .as_deref()
+                .is_some_and(|detail| detail.contains("query supervised root process exit"))
+        );
+        assert!(
+            root_wait_failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("root wait failed:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_operation_runtime_timeout_unblocks_never_replying_proxy_request() {
+        let started = Instant::now();
+        let result = bounded_operation_runtime_request(
+            Duration::from_millis(10),
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+
+        let error = result.expect_err("never-replying runtime request must time out");
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[derive(Default)]
+    struct NeverReplyingAfterPrepareProxy {
+        calls: AtomicUsize,
+    }
+
+    impl OperationRuntimeProxy for NeverReplyingAfterPrepareProxy {
+        fn request(
+            &self,
+            request: OperationRuntimeRequest,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<OperationRuntimeResponse, EngineError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                match (call, request) {
+                    (0, OperationRuntimeRequest::GetCheckpoint(_)) => {
+                        Ok(OperationRuntimeResponse::Checkpoint(None))
+                    }
+                    (1, OperationRuntimeRequest::PutCheckpoint(_)) => {
+                        Ok(OperationRuntimeResponse::Unit)
+                    }
+                    _ => bounded_operation_runtime_request(
+                        Duration::from_millis(25),
+                        std::future::pending::<Result<OperationRuntimeResponse>>(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        EngineError::RuntimeSupervision(format!(
+                            "never-replying operation-runtime proxy: {error:#}"
+                        ))
+                    }),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn never_replying_operation_runtime_cancels_and_reaps_ready_worker() -> Result<()> {
+        let proxy = Arc::new(NeverReplyingAfterPrepareProxy::default());
+        let mut run_context = context(3_000);
+        run_context.runtime_store = OperationRuntimeHandle::from_proxy(proxy.clone());
+        let mut spec = fixture_spec("ignore-shutdown", 5_000)?;
+        spec.stdin_payload = Some(Vec::new());
+        spec.timeout_profile = eliot_types::ProviderRoutePolicy::for_route(
+            eliot_types::AgentHostId::Codex,
+            "never-replying-operation-runtime-fixture",
+            eliot_types::ProviderDeclaredBudget::new(5_000, 32 * 1024)
+                .with_spawn_deadline_ms(Some(1_000))
+                .with_first_output_deadline_ms(None)
+                .with_cancellation_grace_ms(20)
+                .with_cleanup_grace_ms(250)
+                .with_reconciliation_window_ms(0),
+        )
+        .timeout_profile()
+        .clone();
+
+        let started = Instant::now();
+        let output = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_supervised_process(spec, run_context),
+        )
+        .await
+        .expect("bounded operation-runtime failure must not strand the runner")?;
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(proxy.calls.load(Ordering::SeqCst) >= 3);
+        assert!(output.reap_receipt.proves_complete_reap());
+        assert!(
+            output
+                .worker_error
+                .as_deref()
+                .is_some_and(|detail| detail.contains("runtime checkpoint persistence failed"))
         );
         Ok(())
     }
@@ -1978,6 +2283,23 @@ mod tests {
             false
         ));
         assert!(checkpoint_requests_process_cancellation(&checkpoint));
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_checkpoint_does_not_spend_spawn_budget_on_daemon_persistence() -> Result<()> {
+        let spec = fixture_spec("pipe-pressure", 60_000)?;
+        let checkpoint = operation_checkpoint(&spec);
+
+        assert_eq!(checkpoint.phase, eliot_types::OperationPhase::Prepared);
+        assert_eq!(
+            checkpoint.phase_deadline_at,
+            checkpoint.absolute_deadline_at
+        );
+        assert!(
+            checkpoint.phase_deadline_at - checkpoint.phase_started_at
+                >= time::Duration::seconds(59)
+        );
         Ok(())
     }
 
@@ -2252,6 +2574,49 @@ mod tests {
                 .any(|window| window == b"{\"status\":\"complete\"}")
         );
         assert!(output.reap_receipt.proves_complete_reap());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn delayed_descendant_capture_cannot_block_bounded_reaping() -> Result<()> {
+        let mut spec = fixture_spec("descendant-handles", 5_000)?;
+        spec.operation_id = format!(
+            "delayed-descendant-capture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        spec.stdin_payload = Some(Vec::new());
+        spec.timeout_profile = eliot_types::ProviderRoutePolicy::for_route(
+            eliot_types::AgentHostId::Codex,
+            "delayed-descendant-capture-fixture",
+            eliot_types::ProviderDeclaredBudget::new(5_000, 32 * 1024)
+                .with_spawn_deadline_ms(Some(1_000))
+                .with_first_output_deadline_ms(None)
+                .with_cancellation_grace_ms(20)
+                .with_cleanup_grace_ms(150)
+                .with_reconciliation_window_ms(0),
+        )
+        .timeout_profile()
+        .clone();
+        let started = Instant::now();
+        let output = run_supervised_process(spec, context(3_000)).await?;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(output.reap_receipt.forced_termination);
+        assert_eq!(output.reap_receipt.process_count_after, 0);
+        assert!(output.reap_receipt.proves_complete_reap());
+        match &output.reap_receipt.descendants_at_root_exit {
+            DescendantsAtRootExit::Failed(failed) => {
+                assert_eq!(failed.error_kind, DescendantsCaptureErrorKind::Ambiguous);
+                assert!(failed.detail.contains("bounded cleanup"));
+            }
+            DescendantsAtRootExit::Captured(captured) => {
+                panic!("delayed capture became authoritative: {captured:?}");
+            }
+        }
         Ok(())
     }
 

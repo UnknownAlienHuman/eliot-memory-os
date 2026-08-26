@@ -225,6 +225,110 @@ pub struct ActionSourceScope {
     pub artifact_paths: Vec<PathRef>,
 }
 
+/// A server-resolved memory delivery that the acting agent cited when asking
+/// for an `ActionLease`.
+///
+/// This is deliberately weaker than a causal influence claim. It proves that
+/// the named memory was durably delivered to the authenticated session before
+/// the action request and that the agent cited it for that action. It does not
+/// by itself prove that the memory changed the agent's decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionMemoryDeliveryRef {
+    pub schema_version: String,
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub session_id: SessionId,
+    pub delivery_kind: ActionMemoryDeliveryKind,
+    pub delivery_id: String,
+    pub memory_handle: String,
+    pub delivery_surface: String,
+    pub source_fingerprint: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub delivery_receipt_resolved_at: OffsetDateTime,
+    pub evidence_class: ActionMemoryEvidenceClass,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionMemoryDeliveryKind {
+    ContextPacketExperiencePrior,
+    InjectionReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionMemoryEvidenceClass {
+    AgentDeclaredUseAfterServerDelivery,
+}
+
+pub const ACTION_MEMORY_GRANT_REF_SCHEMA_VERSION: &str = "eliot.action-memory-grant-ref.v1";
+pub const ACTION_MEMORY_GRANT_REDEMPTION_SCHEMA_VERSION: &str =
+    "eliot.action-memory-grant-redemption.v1";
+
+/// A server-resolved opaque memory offer returned by the same authenticated
+/// task session in its `ActionRequest`.
+///
+/// This is a transport acknowledgement plus an agent-declared use binding. It
+/// does not reveal an exact memory handle and does not claim that the offered
+/// guidance causally changed the action.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionMemoryGrantRef {
+    pub schema_version: String,
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub session_id: SessionId,
+    pub grant_id: String,
+    pub offer_write_id: WriteId,
+    pub packet_id: String,
+    pub packet_revision_fence: MemoryRevision,
+    pub task_memory_revision: MemoryRevision,
+    pub task_contract_ref: String,
+    pub prior_fingerprint: String,
+    pub guidance_hash: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub redeemed_at: OffsetDateTime,
+    pub evidence_class: ActionMemoryGrantEvidenceClass,
+}
+
+/// The append-only task-local consumption record for an opaque memory grant.
+///
+/// This record is committed in the same `TaskContract` transaction as the
+/// `ActionRequest` that consumed the grant. It therefore proves a durable
+/// offer-return-to-action binding without claiming that the memory changed the
+/// agent's decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionMemoryGrantRedemption {
+    pub schema_version: String,
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub session_id: SessionId,
+    pub grant_id: String,
+    pub offer_write_id: WriteId,
+    pub action_write_id: WriteId,
+    pub action_request_hash: String,
+    pub provenance_set_id: String,
+    pub provenance_set_hash: String,
+    pub packet_id: String,
+    pub packet_revision_fence: MemoryRevision,
+    pub task_memory_revision: MemoryRevision,
+    pub task_contract_ref: String,
+    pub prior_fingerprint: String,
+    pub guidance_hash: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub redeemed_at: OffsetDateTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionMemoryGrantEvidenceClass {
+    AgentReturnedOpaqueGrantAfterServerOffer,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActionProvenanceSet {
     pub provenance_set_id: String,
@@ -234,6 +338,10 @@ pub struct ActionProvenanceSet {
     pub task_contract_ref: String,
     pub current_truth_refs: Vec<String>,
     pub exact_evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_delivery_refs: Vec<ActionMemoryDeliveryRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_grant_refs: Vec<ActionMemoryGrantRef>,
     pub negative_memory_check_ref: String,
     pub planned_verifier_ref: String,
     pub source_scope: ActionSourceScope,
@@ -281,6 +389,8 @@ pub struct TaskContractInput {
     pub understanding_proof_hash: Option<String>,
     #[serde(default)]
     pub action_provenance: Option<ActionProvenanceSet>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_grant_redemptions: Vec<ActionMemoryGrantRedemption>,
     pub observation_ids: Vec<String>,
     pub verification_ids: Vec<VerificationId>,
     #[serde(default)]
@@ -309,6 +419,8 @@ pub struct TaskContract {
     pub understanding_proof_hash: Option<String>,
     #[serde(default)]
     pub action_provenance: Option<ActionProvenanceSet>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_grant_redemptions: Vec<ActionMemoryGrantRedemption>,
     pub observation_ids: Vec<String>,
     pub verification_ids: Vec<VerificationId>,
     #[serde(default)]
@@ -2048,6 +2160,21 @@ pub enum WorktreeLeaseState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeLeaseKind {
+    #[default]
+    LinkedGitWorktree,
+    IndependentClone,
+}
+
+impl WorktreeLeaseKind {
+    #[must_use]
+    pub const fn is_linked_git_worktree(&self) -> bool {
+        matches!(self, Self::LinkedGitWorktree)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorktreeLease {
     pub worktree_lease_id: WorktreeLeaseId,
@@ -2062,6 +2189,13 @@ pub struct WorktreeLease {
     pub base_commit: String,
     pub allowed_read_set: Vec<PathRef>,
     pub allowed_write_set: Vec<PathRef>,
+    #[serde(
+        default,
+        skip_serializing_if = "WorktreeLeaseKind::is_linked_git_worktree"
+    )]
+    pub kind: WorktreeLeaseKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_root: Option<PathRef>,
     pub state: WorktreeLeaseState,
     #[serde(with = "time::serde::rfc3339")]
     pub issued_at: OffsetDateTime,

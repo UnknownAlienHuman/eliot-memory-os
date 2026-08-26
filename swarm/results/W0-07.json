@@ -32,6 +32,8 @@
       }
     },
     "proof_ceiling": "EVIDENCE_ONLY; focused dependency, Clippy, and test evidence; no hosted or terminal completion authority is claimed.",
-    "uncertainty": []
+    "uncertainty": [
+      "This result is limited to the exact watchdog normal-dependency edge named by ROOT-DIRECTIVE-v1.4 W0-07; it does not certify every test-only environment hook or explicitly feature-enabled test surface elsewhere in the workspace."
+    ]
   }
 }

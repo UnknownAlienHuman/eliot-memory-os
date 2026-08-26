@@ -963,7 +963,9 @@ pub(super) async fn dispatch_tool(
         }
         "eliot_operator_contract" => dispatch_operator_contract()?,
         "eliot_operator_snapshot" => Box::pin(dispatch_operator_snapshot(state, arguments)).await?,
-        "eliot_operator_query" => Box::pin(dispatch_operator_query(state, arguments)).await?,
+        "eliot_operator_query" => {
+            Box::pin(dispatch_operator_query(state, context, arguments)).await?
+        }
         "eliot_autonomy_run_status" => {
             Box::pin(dispatch_autonomy_run_status(state, arguments)).await?
         }
@@ -1037,7 +1039,9 @@ pub(super) async fn dispatch_tool(
                 serde_json::to_value(decision)?
             }
         }
-        "eliot_codecortex_scan" => Box::pin(dispatch_codecortex_scan(state, arguments)).await?,
+        "eliot_codecortex_scan" => {
+            Box::pin(dispatch_codecortex_scan(state, context, arguments)).await?
+        }
         "eliot_codecortex_latest" => dispatch_codecortex_latest(state)?,
         "eliot_external_review_providers" => dispatch_external_review_providers(state)?,
         "eliot_external_review_request" => {

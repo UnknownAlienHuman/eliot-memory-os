@@ -3864,6 +3864,129 @@ fn managed_finalization_restarts_every_stage_and_converges_without_provider_disp
 
 #[test]
 #[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
+#[allow(clippy::too_many_lines)]
+fn managed_finalization_rejects_non_active_authority_leases() -> TestResult {
+    let _guard = TestLock::acquire()?;
+    for (case, expected_error) in [
+        (
+            "controller-lease",
+            "authenticated session authority is no longer active",
+        ),
+        (
+            "controller-role",
+            "authenticated session authority is no longer active",
+        ),
+        (
+            "provider-role",
+            "managed provider TaskRoleLease is stale or scope-mismatched",
+        ),
+    ] {
+        let fixture = prepare_managed_finalization_fixture(&format!("non-active-{case}"))?;
+        let mut controller = McpClient::start_scoped_in_workspace(
+            &fixture.workspace,
+            "codex",
+            &fixture.controller_session_id,
+            &fixture.controller_role_lease_id,
+            &fixture.task_id,
+        )?;
+        let active_scope = controller.tool_call(948, "eliot_host_session_status", &json!({}))?;
+        assert_eq!(
+            active_scope["scope_status"], "governor_bound_scope_active",
+            "the same connection must be admitted before {case} is revoked"
+        );
+        let broker_path = test_runtime_root().join("reports/delegation-state/latest.json");
+        let mut broker: eliot_types::DelegationState =
+            serde_json::from_reader(fs::File::open(&broker_path)?)?;
+        let provider_role_lease_id = broker
+            .agent_invocations
+            .iter()
+            .find(|request| request.invocation_id == fixture.invocation_id)
+            .map(|request| request.role_lease_id.clone())
+            .ok_or_else(|| std::io::Error::other("fixture provider role lease is absent"))?;
+        let task_id = fixture.task_id.parse::<TaskId>()?;
+        let controller_session_id = fixture.controller_session_id.parse::<AgentSessionId>()?;
+        let future_expiry = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        match case {
+            "controller-lease" => {
+                let lease = broker
+                    .controller_leases
+                    .iter_mut()
+                    .find(|lease| {
+                        lease.task_id == task_id && lease.agent_session_id == controller_session_id
+                    })
+                    .ok_or_else(|| std::io::Error::other("fixture ControllerLease is absent"))?;
+                lease.state = eliot_types::AuthorityLeaseState::Revoked;
+                lease.expires_at = future_expiry;
+            }
+            "controller-role" => {
+                let role = broker
+                    .task_role_leases
+                    .iter_mut()
+                    .find(|role| role.role_lease_id == fixture.controller_role_lease_id)
+                    .ok_or_else(|| {
+                        std::io::Error::other("fixture controller TaskRoleLease is absent")
+                    })?;
+                role.state = eliot_types::AuthorityLeaseState::Revoked;
+                role.expires_at = future_expiry;
+            }
+            "provider-role" => {
+                let role = broker
+                    .task_role_leases
+                    .iter_mut()
+                    .find(|role| role.role_lease_id == provider_role_lease_id)
+                    .ok_or_else(|| {
+                        std::io::Error::other("fixture provider TaskRoleLease is absent")
+                    })?;
+                role.state = eliot_types::AuthorityLeaseState::Revoked;
+                role.expires_at = future_expiry;
+            }
+            _ => unreachable!("the authority-state matrix is static"),
+        }
+        fs::write(&broker_path, serde_json::to_vec_pretty(&broker)?)?;
+
+        let error = match controller.tool_call(
+            949,
+            "eliot_agent_result_finalize",
+            &json!({
+                "invocation_id": fixture.invocation_id,
+                "expected_provider_output_hash": fixture.provider_output_hash,
+                "idempotency_key": format!("reject-non-active-{case}"),
+                "verifier_refs": [fixture.verifier_ref],
+            }),
+        ) {
+            Ok(value) => {
+                return Err(std::io::Error::other(format!(
+                    "non-active {case} authorized managed finalization: {value}"
+                ))
+                .into());
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected_error),
+            "non-active {case} returned an unrelated denial: {error}"
+        );
+        assert_eq!(
+            managed_finalization_record_count(
+                &fixture,
+                &[
+                    "managed_finalization_intent",
+                    "managed_finalization_aggregate"
+                ]
+            )?,
+            0
+        );
+        assert_eq!(
+            m3_git(&fixture.worktree, &["rev-parse", "HEAD"])?,
+            fixture.baseline_commit
+        );
+        drop(controller);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn managed_finalization_rejects_local_only_invocation_authority() -> TestResult {
     let _guard = TestLock::acquire()?;
     let fixture = prepare_managed_finalization_fixture_with_invocation_authority(

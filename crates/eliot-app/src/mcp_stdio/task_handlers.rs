@@ -117,6 +117,26 @@ struct PreparedPacketMeasurement {
     effective_injection_mode: Option<eliot_types::UlInjectionMode>,
 }
 
+fn stabilize_packet_measurement_assignment(
+    requested: eliot_types::UlTaskExperimentAssignment,
+    existing: Option<eliot_types::UlTaskExperimentAssignment>,
+) -> Result<eliot_types::UlTaskExperimentAssignment> {
+    let Some(existing) = existing else {
+        return Ok(requested);
+    };
+    anyhow::ensure!(
+        existing.project_id == requested.project_id
+            && existing.task_id == requested.task_id
+            && existing.arm == requested.arm,
+        "UL_EXPERIMENT_ASSIGNMENT_CONFLICT: existing per-task assignment is incompatible with the requested certification arm"
+    );
+    // The experiment assignment is unique per task, not per packet. Freeze the
+    // class selected by the first admitted certification packet so a later
+    // material-frame refinement cannot poison the post-commit outbox by trying
+    // to rewrite the task into a different measurement cohort.
+    Ok(existing)
+}
+
 async fn prepare_packet_measurement(
     state: &McpState,
     project_id: ProjectId,
@@ -130,7 +150,7 @@ async fn prepare_packet_measurement(
     } else {
         eliot_types::UlExperimentArm::Treatment
     };
-    let assignment = eliot_types::UlTaskExperimentAssignment {
+    let requested_assignment = eliot_types::UlTaskExperimentAssignment {
         project_id,
         task_id,
         task_class: task_class.clone(),
@@ -141,6 +161,13 @@ async fn prepare_packet_measurement(
         injection_mode: eliot_types::UlInjectionMode::Payload,
         config_hash: config_hash.clone(),
     };
+    let assignment = stabilize_packet_measurement_assignment(
+        requested_assignment,
+        state
+            .store
+            .load_ul_experiment_assignment(project_id, task_id)
+            .await?,
+    )?;
     let effective_injection_mode = if memory_free_control {
         None
     } else {
@@ -213,8 +240,13 @@ async fn dispatch_compile_packet_l3(
             .transpose()?
             .flatten()
     };
-    let codecortex_batch =
-        fresh_codecortex_reports(state, &request, material_frame.as_ref(), packet_task.as_ref())?;
+    let codecortex_batch = fresh_codecortex_reports(
+        state,
+        &request,
+        material_frame.as_ref(),
+        packet_task.as_ref(),
+    )
+    .await?;
     let codecortex_reports = &codecortex_batch.reports;
     let current_git_scope =
         resolve_governed_packet_git_scope(&request, packet_task.as_ref(), codecortex_reports)
@@ -1078,7 +1110,7 @@ struct CodeCortexCompileBatch {
     pending_persistence: Option<CodeCortexReport>,
 }
 
-fn fresh_codecortex_reports(
+async fn fresh_codecortex_reports(
     state: &McpState,
     request: &CompilePacketL3Request,
     frame: Option<&MaterialPacketFrame>,
@@ -1108,24 +1140,27 @@ fn fresh_codecortex_reports(
         max_matches_per_pattern: 24,
         include_diagnostics: false,
     };
-    let project_root = resolve_codecortex_repo_root(
-        &state.root,
-        task,
-    )?;
-    let service = CodeCortexService::new(project_root);
-    if let Some(report) = latest_codecortex_report(&state.root)?
-        && service.report_is_fresh(&report, &codecortex_request)?
-    {
-        return Ok(CodeCortexCompileBatch {
-            reports: vec![report],
-            pending_persistence: None,
-        });
-    }
-    let report = service.scan(&codecortex_request)?;
-    Ok(CodeCortexCompileBatch {
-        reports: vec![report.clone()],
-        pending_persistence: Some(report),
+    let runtime_root = state.root.clone();
+    let task = task.cloned();
+    tokio::task::spawn_blocking(move || {
+        let project_root = resolve_codecortex_repo_root(&runtime_root, task.as_ref())?;
+        let service = CodeCortexService::new(project_root);
+        if let Some(report) = latest_codecortex_report(&runtime_root)?
+            && service.report_is_fresh(&report, &codecortex_request)?
+        {
+            return Ok(CodeCortexCompileBatch {
+                reports: vec![report],
+                pending_persistence: None,
+            });
+        }
+        let report = service.scan(&codecortex_request)?;
+        Ok(CodeCortexCompileBatch {
+            reports: vec![report.clone()],
+            pending_persistence: Some(report),
+        })
     })
+    .await
+    .context("join packet CodeCortex grounding worker")?
 }
 
 fn persist_pending_codecortex_projection(
@@ -2271,6 +2306,43 @@ mod packet_commit_unit_tests {
             arm: eliot_types::UlExperimentArm::Treatment,
             injection_mode: eliot_types::UlInjectionMode::Payload,
             config_hash: "config-hash".to_owned(),
+        }
+    }
+
+    #[test]
+    fn packet_measurement_reuses_the_first_admitted_assignment() {
+        let intent = outbox_intent(SessionId::new_v7(), json!({}));
+        let mut existing = measurement(&intent.material);
+        existing.ordinal = 7;
+        existing.injection_mode = eliot_types::UlInjectionMode::HandlesOnly;
+        existing.config_hash = "original-config".to_owned();
+        let mut requested = existing.clone();
+        requested.task_class.action_class = "single_file".to_owned();
+        requested.ordinal = 0;
+        requested.injection_mode = eliot_types::UlInjectionMode::Payload;
+        requested.config_hash = "new-config".to_owned();
+
+        let stabilized = stabilize_packet_measurement_assignment(requested, Some(existing.clone()))
+            .expect("same per-task arm must reuse the entire first assignment");
+
+        assert_eq!(stabilized, existing);
+    }
+
+    #[test]
+    fn packet_measurement_rejects_arm_and_identity_drift() {
+        let intent = outbox_intent(SessionId::new_v7(), json!({}));
+        let existing = measurement(&intent.material);
+        let mut changed_arm = existing.clone();
+        changed_arm.arm = eliot_types::UlExperimentArm::Control;
+        let mut changed_task = existing.clone();
+        changed_task.task_id = TaskId::new_v7();
+
+        for requested in [changed_arm, changed_task] {
+            let error = stabilize_packet_measurement_assignment(requested, Some(existing.clone()))
+                .expect_err("per-task assignment semantics must remain immutable");
+            assert!(error
+                .to_string()
+                .contains("UL_EXPERIMENT_ASSIGNMENT_CONFLICT"));
         }
     }
 

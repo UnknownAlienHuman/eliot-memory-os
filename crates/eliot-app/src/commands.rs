@@ -51,12 +51,12 @@ use eliot_engine::{
     VerificationDoctorIntegration, VerificationPlannerService, VerificationProfileService,
     VerificationRunnerService, VerificationVerdictService, VerifierHarness, WindowsServiceManager,
     WorkClaimRequest, WorkCreateRequest, WorkLeaseService, WorkMemoryWriter, WorkQueueService,
-    WorkState, WorktreeCleanupService, WorktreeCreateInput, WorktreeLeaseService,
-    WorktreeMemoryWriter, WriteAdmissionService, WriterActor, WriterConfig, WriterReportService,
-    antigravity_real_report, antigravity_report, antigravity_review_request, builtin_manifests,
-    codecortex_report_ref, default_lease_ttl_minutes, default_runtime_services, default_work_scope,
-    external_review_request, family_slug, h1_protocol_version, harness_experiment_record,
-    hash_secret, shutdown_deadline_after, test_request,
+    WorkState, WorktreeAdoptInput, WorktreeCleanupService, WorktreeCreateInput,
+    WorktreeLeaseService, WorktreeMemoryWriter, WriteAdmissionService, WriterActor, WriterConfig,
+    WriterReportService, antigravity_real_report, antigravity_report, antigravity_review_request,
+    builtin_manifests, codecortex_report_ref, default_lease_ttl_minutes, default_runtime_services,
+    default_work_scope, external_review_request, family_slug, h1_protocol_version,
+    harness_experiment_record, hash_secret, shutdown_deadline_after, test_request,
 };
 use eliot_store::{
     BlobStore, CanonicalRecord, CanonicalStore, ControlWal, DbClientSet, NamedSurqlOp,

@@ -48,6 +48,7 @@ pub enum NamedSurqlOp {
     ApplyObservability,
     ObservabilityReceiptById,
     ObservabilityRecordsByKind,
+    MemoryGrantOfferById,
     CurrentState,
     LoadRecallCandidates,
     UpsertMemorySearchProjection,
@@ -148,6 +149,7 @@ impl NamedSurqlOp {
             | Self::LoadUlReadiness
             | Self::ObservabilityReceiptById
             | Self::ObservabilityRecordsByKind
+            | Self::MemoryGrantOfferById
             | Self::CurrentState
             | Self::LoadRecallCandidates
             | Self::LoadMemorySearchFtsCandidates
@@ -224,6 +226,7 @@ impl NamedSurqlOp {
             Self::ApplyObservability => "apply_observability",
             Self::ObservabilityReceiptById => "observability_receipt_by_id",
             Self::ObservabilityRecordsByKind => "observability_records_by_kind",
+            Self::MemoryGrantOfferById => "memory_grant_offer_by_id",
             Self::CurrentState => "current_state",
             Self::LoadRecallCandidates => "load_recall_candidates",
             Self::UpsertMemorySearchProjection => "upsert_memory_search_projection",
@@ -346,6 +349,7 @@ impl NamedSurqlOp {
             Self::ObservabilityRecordsByKind => {
                 include_str!("surql/observability_records_by_kind.surql")
             }
+            Self::MemoryGrantOfferById => include_str!("surql/memory_grant_offer_by_id.surql"),
             Self::CurrentState => include_str!("surql/current_state.surql"),
             Self::LoadRecallCandidates => include_str!("surql/load_recall_candidates.surql"),
             Self::UpsertMemorySearchProjection => {
@@ -477,7 +481,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 61] {
+fn foundational_templates() -> [SurqlTemplate; 62] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -712,6 +716,12 @@ fn foundational_templates() -> [SurqlTemplate; 61] {
             "ObservabilityRecordsByKindInput",
             "ObservabilityRecordsByKindOutput",
             512 * 1024,
+        ),
+        template(
+            NamedSurqlOp::MemoryGrantOfferById,
+            "MemoryGrantOfferByIdInput",
+            "MemoryGrantOfferByIdOutput",
+            64 * 1024,
         ),
         template(
             NamedSurqlOp::CurrentState,

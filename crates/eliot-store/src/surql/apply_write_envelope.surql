@@ -125,6 +125,110 @@ UPSERT type::record('scope_head', $envelope.project_id) CONTENT {
 
 FOR $task IN $envelope.task_contracts {
   LET $existing_task = SELECT * FROM ONLY type::record('task_contract', $task.task_id);
+  LET $existing_grant_redemptions = IF $existing_task = NONE
+    OR $existing_task.memory_grant_redemptions = NONE
+    OR $existing_task.memory_grant_redemptions = NULL {
+    []
+  } ELSE {
+    $existing_task.memory_grant_redemptions
+  };
+  LET $incoming_grant_redemptions = IF $task.memory_grant_redemptions = NONE
+    OR $task.memory_grant_redemptions = NULL {
+    []
+  } ELSE {
+    $task.memory_grant_redemptions
+  };
+  LET $existing_grant_ids = $existing_grant_redemptions.map(|$redemption| {
+    RETURN <string> $redemption.grant_id;
+  });
+  LET $incoming_grant_ids = $incoming_grant_redemptions.map(|$redemption| {
+    RETURN <string> $redemption.grant_id;
+  });
+  IF array::len($incoming_grant_redemptions) > 64
+    OR array::len(array::distinct($existing_grant_ids)) != array::len($existing_grant_ids)
+    OR array::len(array::distinct($incoming_grant_ids)) != array::len($incoming_grant_ids) {
+    THROW string::concat('invalid_memory_grant_redemption_history:', <string> $task.task_id);
+  };
+  FOR $existing_redemption IN $existing_grant_redemptions {
+    LET $preserved = $incoming_grant_redemptions.filter(|$candidate| {
+      <string> $candidate.grant_id = <string> $existing_redemption.grant_id
+    });
+    IF array::len($preserved) != 1 OR $preserved[0] != $existing_redemption {
+      THROW string::concat('memory_grant_redemption_history_rewrite:', <string> $task.task_id);
+    };
+  };
+  LET $new_grant_redemptions = $incoming_grant_redemptions.filter(|$candidate| {
+    !(<string> $candidate.grant_id IN $existing_grant_ids)
+  });
+  IF array::len($new_grant_redemptions) > 8 {
+    THROW string::concat('too_many_memory_grant_redemptions:', <string> $task.task_id);
+  };
+  FOR $redemption IN $new_grant_redemptions {
+    LET $grant_refs = IF $task.action_provenance = NONE
+      OR $task.action_provenance = NULL
+      OR $task.action_provenance.memory_grant_refs = NONE
+      OR $task.action_provenance.memory_grant_refs = NULL {
+      []
+    } ELSE {
+      $task.action_provenance.memory_grant_refs
+    };
+    LET $matching_grants = $grant_refs.filter(|$grant| {
+      <string> $grant.grant_id = <string> $redemption.grant_id
+    });
+    LET $redemption_grant_id = $redemption.grant_id;
+    LET $offer = SELECT *
+      FROM ONLY type::record('memory_grant_offer', $redemption_grant_id);
+    IF array::len($matching_grants) != 1 {
+      THROW string::concat('memory_grant_redemption_ref_cardinality:', <string> $redemption.grant_id);
+    };
+    IF $offer = NONE {
+      THROW string::concat('memory_grant_redemption_offer_missing:', <string> $redemption.grant_id);
+    };
+    IF <string> $redemption.schema_version != <string> $memory_grant_redemption_schema_version {
+      THROW string::concat('memory_grant_redemption_schema_mismatch:', <string> $redemption.grant_id);
+    };
+    IF <string> $redemption.project_id != <string> $envelope.project_id
+      OR <string> $redemption.task_id != <string> $task.task_id
+      OR <string> $redemption.session_id != <string> $envelope.session_id {
+      THROW string::concat('memory_grant_redemption_scope_mismatch:', <string> $redemption.grant_id);
+    };
+    IF <string> $redemption.action_write_id != <string> $envelope.write_id
+      OR <string> $redemption.provenance_set_id != <string> $task.action_provenance.provenance_set_id
+      OR <string> $redemption.provenance_set_hash != <string> $task.action_provenance.hash
+      OR <string> $redemption.action_request_hash = '' {
+      THROW string::concat('memory_grant_redemption_action_mismatch:', <string> $redemption.grant_id);
+    };
+    IF <string> $offer.project_id != <string> $redemption.project_id
+      OR <string> $offer.task_id != <string> $redemption.task_id
+      OR <string> $offer.session_id != <string> $redemption.session_id
+      OR <string> $offer.payload.grant_id != <string> $redemption.grant_id
+      OR <string> $offer.payload.offer_write_id != <string> $redemption.offer_write_id {
+      THROW string::concat('memory_grant_redemption_offer_mismatch:', <string> $redemption.grant_id);
+    };
+    LET $grant = $matching_grants[0];
+    IF <string> $grant.schema_version != <string> $memory_grant_ref_schema_version
+      OR <string> $grant.project_id != <string> $redemption.project_id
+      OR <string> $grant.task_id != <string> $redemption.task_id
+      OR <string> $grant.session_id != <string> $redemption.session_id
+      OR <string> $grant.offer_write_id != <string> $redemption.offer_write_id
+      OR <string> $grant.packet_id != <string> $redemption.packet_id
+      OR <string> $grant.packet_revision_fence != <string> $redemption.packet_revision_fence
+      OR <string> $grant.task_memory_revision != <string> $redemption.task_memory_revision
+      OR <string> $grant.task_contract_ref != <string> $redemption.task_contract_ref
+      OR <string> $grant.prior_fingerprint != <string> $redemption.prior_fingerprint
+      OR <string> $grant.guidance_hash != <string> $redemption.guidance_hash
+      OR <string> $grant.redeemed_at != <string> $redemption.redeemed_at
+      OR <string> $grant.evidence_class != 'agent_returned_opaque_grant_after_server_offer'
+      OR <string> $offer.payload.packet_id != <string> $redemption.packet_id
+      OR <string> $offer.payload.packet_revision_fence != <string> $redemption.packet_revision_fence
+      OR <string> $offer.payload.task_memory_revision != <string> $redemption.task_memory_revision
+      OR <string> $offer.payload.task_contract_ref != <string> $redemption.task_contract_ref
+      OR <string> $offer.payload.prior_fingerprint != <string> $redemption.prior_fingerprint
+      OR <string> $offer.payload.guidance_hash != <string> $redemption.guidance_hash
+      OR <datetime> $redemption.redeemed_at > <datetime> $offer.payload.expires_at {
+      THROW string::concat('memory_grant_redemption_binding_mismatch:', <string> $redemption.grant_id);
+    };
+  };
   IF $task.expected_revision != NONE AND $task.expected_revision != NULL AND (
     $existing_task == NONE OR $existing_task.memory_revision != $task.expected_revision
   ) {
@@ -139,6 +243,7 @@ FOR $task IN $envelope.task_contracts {
     action_lease_id: $task.action_lease_id,
     understanding_proof_hash: $task.understanding_proof_hash,
     action_provenance: $task.action_provenance,
+    memory_grant_redemptions: $incoming_grant_redemptions,
     observation_ids: $task.observation_ids,
     verification_ids: $task.verification_ids,
     verification_scopes: $task.verification_scopes,

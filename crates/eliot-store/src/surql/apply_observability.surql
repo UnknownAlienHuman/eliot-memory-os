@@ -64,6 +64,11 @@ LET $stored_payload = IF $envelope.kind = 'injection_receipt' {
 };
 LET $existing_receipt =
   SELECT * FROM ONLY type::record('observability_receipt', $receipt_id);
+LET $existing_immutable_record = IF $envelope.kind = 'memory_grant_offer' {
+  SELECT * FROM ONLY type::record($target_table, $envelope.record_id)
+} ELSE {
+  NONE
+};
 LET $result = IF $existing_receipt != NONE {
   IF $existing_receipt.input_hash == $envelope.input_hash {
     {
@@ -89,6 +94,18 @@ LET $result = IF $existing_receipt != NONE {
       rejected_reason: 'observability_write_id_conflict',
       created_at: $existing_receipt.created_at
     }
+  }
+} ELSE IF $existing_immutable_record != NONE {
+  {
+    write_id: $envelope.write_id,
+    record_id: $envelope.record_id,
+    project_id: $envelope.project_id,
+    task_id: $envelope.task_id,
+    kind: $envelope.kind,
+    input_hash: $envelope.input_hash,
+    status: 'rejected',
+    rejected_reason: 'immutable_observability_record_conflict',
+    created_at: $envelope.created_at
   }
 } ELSE {
   UPSERT type::record($target_table, $envelope.record_id) CONTENT {

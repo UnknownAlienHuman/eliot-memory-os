@@ -480,6 +480,8 @@ impl Fixture {
             base_commit: "collective-work-fixture".to_owned(),
             allowed_read_set: vec!["crates/eliot-engine/src/collective.rs".to_owned()],
             allowed_write_set: vec!["crates/eliot-engine/src/collective.rs".to_owned()],
+            kind: eliot_types::WorktreeLeaseKind::LinkedGitWorktree,
+            managed_root: None,
             state: WorktreeLeaseState::Active,
             issued_at: now,
             expires_at: now + Duration::hours(1),

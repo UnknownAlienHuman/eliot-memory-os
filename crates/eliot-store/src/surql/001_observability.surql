@@ -1,6 +1,7 @@
 DEFINE TABLE IF NOT EXISTS observability_receipt SCHEMALESS;
 DEFINE TABLE IF NOT EXISTS memory_influence_trace SCHEMALESS;
 DEFINE TABLE IF NOT EXISTS injection_receipt SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS memory_grant_offer SCHEMALESS;
 DEFINE TABLE IF NOT EXISTS activation_trace SCHEMALESS;
 DEFINE TABLE IF NOT EXISTS prediction_record SCHEMALESS;
 DEFINE TABLE IF NOT EXISTS exam_record SCHEMALESS;
@@ -15,5 +16,11 @@ DEFINE INDEX OVERWRITE idx_influence_task
   ON TABLE memory_influence_trace FIELDS project_id, task_id, created_at;
 DEFINE INDEX OVERWRITE idx_injection_write
   ON TABLE injection_receipt FIELDS write_id UNIQUE;
+DEFINE INDEX OVERWRITE idx_memory_grant_offer_write
+  ON TABLE memory_grant_offer FIELDS write_id UNIQUE;
+DEFINE INDEX OVERWRITE idx_memory_grant_offer_id
+  ON TABLE memory_grant_offer FIELDS payload.grant_id UNIQUE;
+DEFINE INDEX OVERWRITE idx_memory_grant_offer_scope
+  ON TABLE memory_grant_offer FIELDS project_id, task_id, session_id, created_at;
 DEFINE INDEX OVERWRITE idx_prediction_write
   ON TABLE prediction_record FIELDS write_id UNIQUE;

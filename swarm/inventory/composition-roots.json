@@ -5,7 +5,7 @@
     "command": "cargo metadata --no-deps --format-version 1",
     "target_kind": "bin",
     "target_count": 22,
-    "target_set_digest": "bc000e30676905f3c8854970fc47554ca74a8acdf6c0815f069b8a333116fd59"
+    "target_set_digest": "b7779a409a5f9d10e158da2263cf8c31e866691a8cc8b51057249c295e7193bf"
   },
   "summary": {
     "useful_work": 16,
@@ -294,7 +294,7 @@
           "text": "name = \"eliot-windows-ipc\"",
           "line_sha256": "c42a0718de656c37c7f5fb7a8f4e15647d98069be84d9262e6b583a9f5ec19e4"
         },
-        "digest": "e89784a033a26c269cab73219af1f5f44e63ae9c5b9960b77b439fc6a704a50d"
+        "digest": "a7ba7f2711d8e9a933bf74cc9ec5b3bf2e93fac3a6f1e8fbc5f8379a9c0c9077"
       },
       "main": {
         "path": "crates/eliot-windows-ipc/src/bin/eliot-credential-suite-guard.rs",
@@ -503,11 +503,11 @@
           "text": "name = \"eliot-app\"",
           "line_sha256": "53bf1a186dcfd73f6df4b3665b31c2ebd47caa951c31e35689289b141cda22b0"
         },
-        "digest": "874cd54c9ef7bbea57ad75a01e1ad3beec7b48cbae25f2ae55ab879f0e004a28"
+        "digest": "a847d9e217a5913f39dac53f0464dda93808a70650a07c27cac03f43e55a877b"
       },
       "main": {
         "path": "crates/eliot-app/src/main.rs",
-        "line": 2001,
+        "line": 2027,
         "symbol": "main",
         "text": "fn main() -> Result<()> {",
         "line_sha256": "70809f3aec2f7aaf5d863c69927041d60278ef28812f606deb6abc3e325817bd"
@@ -518,14 +518,14 @@
         "call_chain": [
           {
             "path": "crates/eliot-app/src/main.rs",
-            "line": 2010,
+            "line": 2036,
             "symbol": "main",
             "text": "            let cli = Cli::parse();",
             "line_sha256": "0387df2ba23bee9dee128ac36bb7d543d0e0ff03dc6061ea35840c6d190fb02d"
           },
           {
             "path": "crates/eliot-app/src/main.rs",
-            "line": 2021,
+            "line": 2047,
             "symbol": "dispatch_command",
             "text": "            runtime.block_on(Box::pin(dispatch_command(",
             "line_sha256": "ff386d0d2e7d6b9022ffe97772f5b2d8a64c4a91c74f95dd29b85f5708776e49"
@@ -543,8 +543,8 @@
           "refusal_scope": null,
           "witness": {
             "ordered_anchor_lines": [
-              "crates/eliot-app/src/main.rs:2010",
-              "crates/eliot-app/src/main.rs:2021"
+              "crates/eliot-app/src/main.rs:2036",
+              "crates/eliot-app/src/main.rs:2047"
             ],
             "ordered_anchor_symbols": [
               "main",
@@ -558,7 +558,7 @@
       },
       "witness": {
         "catalogue": "W1-07-v1",
-        "source_digest": "d72a6feaef3c11b8552d170ab78574ba11d23d24917cab9f8abf374d622992e7",
+        "source_digest": "487e28ba8cdc98ff5eb6d83921c1a1b41c4335b50a6afbbb54f211704c9d33ed",
         "anchor_digest": "f4fc02076400a47d36ce31c7f2af26c012640c945ab9c5366d6101acd9d9564a"
       }
     },
@@ -575,7 +575,7 @@
           "text": "name = \"eliot-host\"",
           "line_sha256": "a59b59718cb421803aaacc300da74f5dfeb35169dd94f8bbcd98cdf815519a37"
         },
-        "digest": "62e9e195bdffe0845101f15bca9c7b4e33c5b84102dc0dd6a8dc7ffc718fbe7b"
+        "digest": "70d9a5ee6fb6a87920ba5076bbc7da76d0a16d5713cc880d5b9cb1aa23c014b9"
       },
       "main": {
         "path": "bins/eliot-host/src/main.rs",
@@ -1104,7 +1104,7 @@
           "text": "name = \"eliot-windows-ipc\"",
           "line_sha256": "c42a0718de656c37c7f5fb7a8f4e15647d98069be84d9262e6b583a9f5ec19e4"
         },
-        "digest": "e89784a033a26c269cab73219af1f5f44e63ae9c5b9960b77b439fc6a704a50d"
+        "digest": "a7ba7f2711d8e9a933bf74cc9ec5b3bf2e93fac3a6f1e8fbc5f8379a9c0c9077"
       },
       "main": {
         "path": "crates/eliot-windows-ipc/src/bin/eliot-process-guardian.rs",

@@ -18,6 +18,44 @@ function Rel([string]$Path) { ([IO.Path]::GetRelativePath($root, $Path)).Replace
 function Sha([byte[]]$Bytes) { ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes))).ToLowerInvariant() }
 function ShaText([string]$Text) { Sha $Utf8.GetBytes($Text) }
 function ReadText([string]$Path) { try { $Utf8.GetString([IO.File]::ReadAllBytes($Path)) } catch { Fail "invalid UTF-8: $Path" } }
+function Resolve-InventoryOnlyOutputSafe([string]$Candidate) {
+    if ([string]::IsNullOrWhiteSpace($Candidate)) { Fail '-InventoryOnly requires a non-empty -OutputPath' }
+    $raw = $Candidate.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    if ($raw.StartsWith('\\')) { Fail '-InventoryOnly output must not use a UNC or device path' }
+    if ($raw -match '[\x00-\x1F\x7F]') { Fail '-InventoryOnly output must not contain control characters' }
+    $pathRoot = [IO.Path]::GetPathRoot($raw)
+    $allowedDriveColon = -not [string]::IsNullOrEmpty($pathRoot) -and
+        $pathRoot.Length -ge 2 -and $pathRoot[1] -eq ':' -and
+        $raw.IndexOf(':') -eq 1 -and $raw.LastIndexOf(':') -eq 1
+    if ($raw.Contains(':') -and -not $allowedDriveColon) { Fail '-InventoryOnly output must not use an alternate data stream or control colon' }
+    foreach ($segment in @($raw -split '[\\/]')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -in @('.', '..') -or $segment -match '^[A-Za-z]:$') { continue }
+        if ($segment -match '~[0-9]' -or $segment.EndsWith('.') -or $segment.EndsWith(' ')) { Fail '-InventoryOnly output must not use a Win32-normalized path alias' }
+    }
+    $fullPath = if ([IO.Path]::IsPathRooted($raw)) { [IO.Path]::GetFullPath($raw) } else { [IO.Path]::GetFullPath((Join-Path $root $raw)) }
+    $volumeRoot = [IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrEmpty($volumeRoot)) { Fail '-InventoryOnly output has no filesystem root' }
+    $cursor = $volumeRoot
+    foreach ($segment in @([IO.Path]::GetRelativePath($volumeRoot, $fullPath) -split '[\\/]')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -eq '.') { continue }
+        $cursor = [IO.Path]::Combine($cursor, $segment)
+        if (Test-Path -LiteralPath $cursor) {
+            $item = Get-Item -LiteralPath $cursor -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail '-InventoryOnly output must not traverse a reparse point' }
+        }
+    }
+    foreach ($relative in @('swarm\inventory\w1-06-premises.json','swarm\results\W1-06-revised.json','scripts\gen-w1-06-premises.ps1','scripts\verify-w1-06-premises.ps1')) {
+        $ownedFull = [IO.Path]::GetFullPath((Join-Path $root $relative))
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($fullPath, $ownedFull)) { Fail '-InventoryOnly output must not target a generator-owned path' }
+    }
+    $repositoryRoot = [IO.Path]::GetFullPath($root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $repositoryPrefix = $repositoryRoot + [IO.Path]::DirectorySeparatorChar
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $temporaryPrefix = $temporaryRoot + [IO.Path]::DirectorySeparatorChar
+    if ([StringComparer]::OrdinalIgnoreCase.Equals($temporaryRoot, $repositoryRoot) -or $temporaryRoot.StartsWith($repositoryPrefix, [StringComparison]::OrdinalIgnoreCase)) { Fail '-InventoryOnly process temporary directory must not overlap the repository' }
+    if (-not $fullPath.StartsWith($temporaryPrefix, [StringComparison]::OrdinalIgnoreCase)) { Fail '-InventoryOnly output must stay under the process temporary directory' }
+    return $fullPath
+}
 function FileDigest([string]$Path) {
     AssertRelative $Path 'linked file'
     $full = Join-Path $root ($Path.Replace('/', [IO.Path]::DirectorySeparatorChar))
@@ -162,13 +200,11 @@ try {
     if ($InventoryOnly -and $PSBoundParameters.ContainsKey('ResultPath')) { Fail '-InventoryOnly cannot combine with -ResultPath' }
     $customOutput = $PSBoundParameters.ContainsKey('OutputPath')
     $customResult = $PSBoundParameters.ContainsKey('ResultPath')
-    if (-not $InventoryOnly -and $customOutput -ne $customResult) { Fail 'custom -OutputPath and -ResultPath must be supplied together unless -InventoryOnly is used' }
-    $outCandidate=$OutputPath.Replace('/',[IO.Path]::DirectorySeparatorChar)
-    $outFull=if([IO.Path]::IsPathRooted($outCandidate)){[IO.Path]::GetFullPath($outCandidate)}else{[IO.Path]::GetFullPath((Join-Path $root $outCandidate))}
-    $resultFull = if ($InventoryOnly) { $null } else {
-        $resultCandidate = $ResultPath.Replace('/',[IO.Path]::DirectorySeparatorChar)
-        if([IO.Path]::IsPathRooted($resultCandidate)){[IO.Path]::GetFullPath($resultCandidate)}else{[IO.Path]::GetFullPath((Join-Path $root $resultCandidate))}
-    }
+    if ($InventoryOnly -and -not $customOutput) { Fail '-InventoryOnly requires explicit -OutputPath' }
+    if (-not $InventoryOnly -and ($customOutput -or $customResult)) { Fail 'custom output paths require explicit -InventoryOnly; normal generation owns the canonical inventory/result pair' }
+    $outFull = if ($InventoryOnly) { Resolve-InventoryOnlyOutputSafe $OutputPath } else { [IO.Path]::GetFullPath((Join-Path $root 'swarm\inventory\w1-06-premises.json')) }
+    if ($Check -and ($customOutput -or $customResult)) { Fail '-Check validates canonical output and result paths only' }
+    $resultFull = if ($InventoryOnly) { $null } else { [IO.Path]::GetFullPath((Join-Path $root 'swarm\results\W1-06-revised.json')) }
     $meta=CargoMeta; $gitFiles=@(GitPaths); $sourcePaths=@(SourceUniverse $gitFiles); $signed=ParseSignedRoles; $material=ParseMaterialRoles
     $wC1=@(Witness 'scripts/finalize-eliot-windows-x64-release.ps1' 'function Get-AuthenticodeRoleDefinitions' 'finalizer Authenticode role definition'; Witness 'scripts/finalize-eliot-windows-x64-release.ps1' 'Governor, Operator UI, and other payload remain outside' 'Governor excluded from exact signing scope')
     $wC2=@(Witness 'bins/eliot/src/source_bundle_materializer.rs' 'pub const REQUIRED_ROLES' 'materializer ordered Phase-A role set'; Witness 'bins/eliot/src/source_bundle_materializer.rs' 'validate_role_inventory\(&REQUIRED_ROLES\)' 'materializer validates exact role inventory'; Witness 'scripts/build-eliot-windows-x64-release.ps1' '\$runtimeArtifactPlan = Get-RuntimeArtifactPlan' 'release builder runtime artifact plan')
@@ -195,6 +231,7 @@ try {
     $doc.document_digest=ShaText $canonical
     $inventoryBytes=$Utf8.GetBytes((SerializeJson $doc))
     $resultBytes=if($InventoryOnly){$null}else{$Utf8.GetBytes((SerializeJson (ExpectedResult $doc $inventoryBytes)))}
+    if($InventoryOnly){$revalidatedOutFull=Resolve-InventoryOnlyOutputSafe $OutputPath;if(-not [StringComparer]::OrdinalIgnoreCase.Equals($outFull,$revalidatedOutFull)){Fail '-InventoryOnly output path identity changed during generation'}}
     if($Check){
         AssertBytes $outFull $inventoryBytes 'inventory'
         if(-not $InventoryOnly){AssertBytes $resultFull $resultBytes 'result envelope'}

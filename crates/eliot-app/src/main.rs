@@ -483,6 +483,8 @@ enum DogfoodCommand {
         root: PathBuf,
         #[arg(long)]
         project: PathBuf,
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        surreal_exe: PathBuf,
     },
     Start {
         #[arg(long)]
@@ -509,6 +511,20 @@ enum DogfoodCommand {
     RunCodex {
         #[arg(long)]
         root: PathBuf,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        agent_session: String,
+        #[arg(long)]
+        role_lease: String,
+        #[arg(long)]
+        work_item: String,
+        #[arg(long)]
+        work_lease: String,
+        #[arg(long)]
+        worktree_lease: String,
     },
     Stop {
         #[arg(long)]
@@ -1223,6 +1239,8 @@ enum WorkCommand {
         read: Vec<String>,
         #[arg(long = "write")]
         write: Vec<String>,
+        #[arg(long = "agent-session")]
+        agent_session: Option<String>,
     },
     Claim {
         #[arg(long)]
@@ -1231,6 +1249,8 @@ enum WorkCommand {
         task: String,
         #[arg(long, default_value = "implementer")]
         role: String,
+        #[arg(long = "agent-session")]
+        agent_session: Option<String>,
     },
     Status {
         #[arg(long)]
@@ -1263,6 +1283,12 @@ enum WorktreeCommand {
     Create {
         #[arg(long = "work-lease")]
         work_lease: String,
+    },
+    Adopt {
+        #[arg(long = "work-lease")]
+        work_lease: String,
+        #[arg(long = "dogfood-root")]
+        dogfood_root: PathBuf,
     },
     Status {
         #[arg(long = "worktree-lease")]
@@ -2037,7 +2063,11 @@ async fn dispatch_command(
 ) -> Result<()> {
     match command {
         Command::Dogfood { command } => match command {
-            DogfoodCommand::Init { root, project } => dogfood::init(&root, &project),
+            DogfoodCommand::Init {
+                root,
+                project,
+                surreal_exe,
+            } => dogfood::init(&root, &project, &surreal_exe),
             DogfoodCommand::Start { root } => dogfood::start(&root).await,
             DogfoodCommand::Doctor { root } => dogfood::doctor(&root).await,
             DogfoodCommand::Status { root } => dogfood::status(&root).await,
@@ -2047,7 +2077,28 @@ async fn dispatch_command(
                 branch,
                 commit,
             } => dogfood::prepare_worktree(&root, &destination, &branch, &commit),
-            DogfoodCommand::RunCodex { root } => dogfood::run_codex(&root).await,
+            DogfoodCommand::RunCodex {
+                root,
+                project,
+                task,
+                agent_session,
+                role_lease,
+                work_item,
+                work_lease,
+                worktree_lease,
+            } => {
+                dogfood::run_codex(
+                    &root,
+                    &project,
+                    &task,
+                    &agent_session,
+                    &role_lease,
+                    &work_item,
+                    &work_lease,
+                    &worktree_lease,
+                )
+                .await
+            }
             DogfoodCommand::Stop { root } => dogfood::stop(&root).await,
         },
         Command::Doctor { command } => {
@@ -3178,12 +3229,27 @@ async fn dispatch_work_command(config: &Path, command: WorkCommand) -> Result<()
             goal,
             read,
             write,
-        } => commands::run_work_create(config, &project, &task, &goal, &read, &write).await,
+            agent_session,
+        } => {
+            commands::run_work_create(
+                config,
+                &project,
+                &task,
+                &goal,
+                &read,
+                &write,
+                agent_session.as_deref(),
+            )
+            .await
+        }
         WorkCommand::Claim {
             project,
             task,
             role,
-        } => commands::run_work_claim(config, &project, &task, &role).await,
+            agent_session,
+        } => {
+            commands::run_work_claim(config, &project, &task, &role, agent_session.as_deref()).await
+        }
         WorkCommand::Status { project, task } => commands::run_work_status(config, &project, &task),
         WorkCommand::Renew { lease } => commands::run_work_renew(config, &lease).await,
         WorkCommand::Release { lease } => commands::run_work_release(config, &lease).await,
@@ -3199,6 +3265,10 @@ async fn dispatch_worktree_command(config: &Path, command: WorktreeCommand) -> R
         WorktreeCommand::Create { work_lease } => {
             commands::run_worktree_create(config, &work_lease).await
         }
+        WorktreeCommand::Adopt {
+            work_lease,
+            dogfood_root,
+        } => commands::run_worktree_adopt(config, &work_lease, &dogfood_root).await,
         WorktreeCommand::Status { worktree_lease } => {
             commands::run_worktree_status(config, &worktree_lease)
         }

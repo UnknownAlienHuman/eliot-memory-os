@@ -267,7 +267,7 @@ pub use work::{
 };
 pub use worktree::{
     CandidateCompletionContext, CandidateDiffCaptureInput, CandidateDiffService,
-    CandidatePatchRequestInput, CandidateReviewInput, CandidateReviewService,
+    CandidatePatchRequestInput, CandidateReviewInput, CandidateReviewService, WorktreeAdoptInput,
     WorktreeCleanupService, WorktreeCreateInput, WorktreeLeaseService, WorktreeMemoryWriter,
 };
 pub use writer::{

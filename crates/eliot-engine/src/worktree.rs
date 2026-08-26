@@ -7,8 +7,8 @@ use eliot_types::{
     CandidateReview, CandidateReviewDecision, CommandContext, CompletionGateDecision,
     CompletionProof, CompletionStatus, LifecycleStatus, PatchRequest, SemanticCommand, TaintClass,
     ToolObservationRecordCommand, UnifiedDiff, VerifierRun, VerifierStatus, Visibility, WorkLease,
-    WorkScope, WorktreeLease, WorktreeLeaseId, WorktreeLeaseRequest, WorktreeLeaseState, WriteId,
-    WriteReceiptRef,
+    WorkScope, WorktreeLease, WorktreeLeaseId, WorktreeLeaseKind, WorktreeLeaseRequest,
+    WorktreeLeaseState, WriteId, WriteReceiptRef,
 };
 #[cfg(windows)]
 use std::fs;
@@ -30,6 +30,14 @@ const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
 pub struct WorktreeCreateInput {
     pub request: WorktreeLeaseRequest,
     pub worktree_root: PathBuf,
+    pub ttl_minutes: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorktreeAdoptInput {
+    pub request: WorktreeLeaseRequest,
+    pub worktree_path: PathBuf,
+    pub managed_root: PathBuf,
     pub ttl_minutes: i64,
 }
 
@@ -152,6 +160,110 @@ impl WorktreeLeaseService {
             base_commit: head,
             allowed_read_set: input.request.requested_scope.read_set,
             allowed_write_set: input.request.requested_scope.write_set,
+            kind: WorktreeLeaseKind::LinkedGitWorktree,
+            managed_root: None,
+            state: WorktreeLeaseState::Active,
+            issued_at: now,
+            expires_at: now + Duration::minutes(input.ttl_minutes.max(1)),
+            cleaned_at: None,
+            write_receipt: None,
+        };
+        state.worktree_leases.push(lease.clone());
+        Ok(lease)
+    }
+
+    pub async fn adopt_independent(
+        &self,
+        state: &mut WorkState,
+        input: WorktreeAdoptInput,
+    ) -> Result<WorktreeLease, EngineError> {
+        let repo_root = canonical_non_reparse_directory(&input.request.repo_root)?;
+        let worktree_path = canonical_non_reparse_directory(&input.worktree_path)?;
+        let managed_root = canonical_non_reparse_directory(&input.managed_root)?;
+        if worktree_path == repo_root
+            || worktree_path.starts_with(&repo_root)
+            || repo_root.starts_with(&worktree_path)
+            || worktree_path.parent() != Some(managed_root.as_path())
+        {
+            return Err(rejected("adopted_worktree_not_independent"));
+        }
+
+        let work_lease = active_matching_work_lease(state, &input.request)?.clone();
+        validate_requested_scope(&input.request.requested_scope, &work_lease.scope)?;
+        if state.worktree_leases.iter().any(|lease| {
+            lease.work_lease_id == work_lease.work_lease_id
+                && matches!(
+                    lease.state,
+                    WorktreeLeaseState::Created | WorktreeLeaseState::Active
+                )
+        }) {
+            return Err(rejected("active_worktree_lease_exists_for_work_lease"));
+        }
+
+        let repo_head = git_stdout(&repo_root, &["rev-parse", "HEAD"]).await?;
+        if input
+            .request
+            .base_commit
+            .as_deref()
+            .is_some_and(|base| !base.eq_ignore_ascii_case(&repo_head))
+        {
+            return Err(rejected("requested_base_commit_is_not_repo_head"));
+        }
+        let reported_top = git_stdout(&worktree_path, &["rev-parse", "--show-toplevel"]).await?;
+        let reported_top = canonical_existing_path(reported_top.trim())?;
+        if reported_top != worktree_path {
+            return Err(rejected("adopted_worktree_root_mismatch"));
+        }
+        let git_dir = canonical_non_reparse_directory(worktree_path.join(".git"))?;
+        if !git_dir.is_dir()
+            || !git_dir.starts_with(&worktree_path)
+            || git_dir.join("objects/info/alternates").exists()
+        {
+            return Err(rejected("adopted_worktree_git_metadata_not_independent"));
+        }
+        let common_dir = git_stdout(&worktree_path, &["rev-parse", "--git-common-dir"]).await?;
+        let common_dir = if Path::new(&common_dir).is_absolute() {
+            PathBuf::from(common_dir)
+        } else {
+            worktree_path.join(common_dir)
+        };
+        if canonical_non_reparse_directory(common_dir)? != git_dir {
+            return Err(rejected("adopted_worktree_git_common_dir_is_external"));
+        }
+        if !git_status_clean(&worktree_path).await? {
+            return Err(rejected("adopted_worktree_dirty"));
+        }
+        let adopted_head = git_stdout(&worktree_path, &["rev-parse", "HEAD"]).await?;
+        if !adopted_head.eq_ignore_ascii_case(&repo_head) {
+            return Err(rejected("adopted_worktree_base_commit_mismatch"));
+        }
+        let branch_name = git_stdout(&worktree_path, &["branch", "--show-current"]).await?;
+        validate_requested_branch(Some(&branch_name))?;
+        if input
+            .request
+            .requested_branch_name
+            .as_deref()
+            .is_some_and(|requested| requested != branch_name)
+        {
+            return Err(rejected("adopted_worktree_branch_mismatch"));
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let lease = WorktreeLease {
+            worktree_lease_id: WorktreeLeaseId::new_v7(),
+            project_id: input.request.project_id,
+            task_id: input.request.task_id,
+            work_item_id: input.request.work_item_id,
+            work_lease_id: input.request.work_lease_id,
+            holder_session_id: input.request.agent_session_id,
+            repo_root: path_for_record(&repo_root),
+            worktree_path: path_for_record(&worktree_path),
+            branch_name,
+            base_commit: repo_head,
+            allowed_read_set: input.request.requested_scope.read_set,
+            allowed_write_set: input.request.requested_scope.write_set,
+            kind: WorktreeLeaseKind::IndependentClone,
+            managed_root: Some(path_for_record(&managed_root)),
             state: WorktreeLeaseState::Active,
             issued_at: now,
             expires_at: now + Duration::minutes(input.ttl_minutes.max(1)),
@@ -390,6 +502,17 @@ impl WorktreeCleanupService {
         }
         let repo_root = canonical_existing_path(&lease.repo_root)?;
         let worktree_path = PathBuf::from(&lease.worktree_path);
+        if lease.kind == WorktreeLeaseKind::IndependentClone {
+            let managed_root = lease
+                .managed_root
+                .as_deref()
+                .map(PathBuf::from)
+                .ok_or_else(|| rejected("independent_worktree_missing_managed_root"))?;
+            remove_independent_clone(&repo_root, &managed_root, &worktree_path)?;
+            state.worktree_leases[lease_index].state = WorktreeLeaseState::Cleaned;
+            state.worktree_leases[lease_index].cleaned_at = Some(OffsetDateTime::now_utc());
+            return Ok(state.worktree_leases[lease_index].clone());
+        }
         validate_worktree_cleanup_path(&worktree_path, worktree_lease_id)?;
         #[cfg(windows)]
         clear_worktree_metadata_readonly(&repo_root, worktree_lease_id)?;
@@ -457,6 +580,41 @@ impl WorktreeCleanupService {
         lease.state = WorktreeLeaseState::Revoked;
         Ok(lease.clone())
     }
+}
+
+fn remove_independent_clone(
+    repo_root: &Path,
+    managed_root: &Path,
+    worktree_path: &Path,
+) -> Result<(), EngineError> {
+    let managed_root = canonical_non_reparse_directory(managed_root)?;
+    let worktree_parent = worktree_path
+        .parent()
+        .ok_or_else(|| rejected("invalid_independent_worktree_cleanup_path"))?;
+    if !worktree_path.is_absolute()
+        || canonical_non_reparse_directory(worktree_parent)? != managed_root
+    {
+        return Err(rejected("invalid_independent_worktree_cleanup_path"));
+    }
+    if !worktree_directory_exists(worktree_path)? {
+        return Ok(());
+    }
+    let worktree_path = canonical_non_reparse_directory(worktree_path)?;
+    if worktree_path.parent() != Some(managed_root.as_path())
+        || worktree_path == repo_root
+        || worktree_path.starts_with(repo_root)
+        || repo_root.starts_with(&worktree_path)
+    {
+        return Err(rejected(
+            "refuse_independent_worktree_cleanup_outside_managed_root",
+        ));
+    }
+    let git_dir = canonical_non_reparse_directory(worktree_path.join(".git"))?;
+    if !git_dir.starts_with(&worktree_path) {
+        return Err(rejected("independent_worktree_git_metadata_is_external"));
+    }
+    std::fs::remove_dir_all(&worktree_path)?;
+    Ok(())
 }
 
 fn validate_worktree_cleanup_path(
@@ -793,6 +951,11 @@ fn active_matching_work_lease<'a>(
     state: &'a WorkState,
     request: &WorktreeLeaseRequest,
 ) -> Result<&'a WorkLease, EngineError> {
+    let item = state
+        .work_items
+        .iter()
+        .find(|item| item.work_item_id == request.work_item_id)
+        .ok_or_else(|| rejected("missing_work_item"))?;
     let lease = state
         .leases
         .iter()
@@ -807,6 +970,13 @@ fn active_matching_work_lease<'a>(
         || lease.agent_session_id != request.agent_session_id
     {
         return Err(rejected("work_lease_request_mismatch"));
+    }
+    if item.project_id != request.project_id
+        || item.task_id != request.task_id
+        || item.active_lease_id != Some(lease.work_lease_id)
+        || !item.lease_refs.contains(&lease.work_lease_id)
+    {
+        return Err(rejected("work_item_active_lease_mismatch"));
     }
     Ok(lease)
 }
@@ -866,6 +1036,38 @@ fn validate_requested_branch(branch: Option<&str>) -> Result<(), EngineError> {
 
 fn canonical_existing_path(path: impl AsRef<Path>) -> Result<PathBuf, EngineError> {
     Ok(PathBuf::from(path.as_ref()).canonicalize()?)
+}
+
+fn canonical_non_reparse_directory(path: impl AsRef<Path>) -> Result<PathBuf, EngineError> {
+    let path = path.as_ref();
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if let Ok(metadata) = std::fs::symlink_metadata(&current)
+            && (metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata))
+        {
+            return Err(rejected("adopted_worktree_path_contains_reparse_point"));
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err(rejected("adopted_worktree_path_is_not_plain_directory"));
+    }
+    Ok(path.canonicalize()?)
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+#[cfg(not(windows))]
+const fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 fn prepare_worktree_root(repo_root: &Path, worktree_root: &Path) -> Result<PathBuf, EngineError> {

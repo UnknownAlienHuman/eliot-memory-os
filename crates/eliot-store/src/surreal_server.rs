@@ -373,8 +373,8 @@ impl SurrealServerSupervisor {
             .trim()
             .parse::<u32>()
             .map_err(|error| StoreError::Process(error.to_string()))?;
-        stop_pid(pid).await?;
-        fs::remove_file(pid_path)?;
+        self.stop_owned_process(pid).await?;
+        self.remove_pid_file_if_matches(pid)?;
         Ok(true)
     }
 
@@ -1620,13 +1620,16 @@ mod lifecycle_tests {
     /// removed, this test kills its own process instead of failing politely.
     #[cfg(windows)]
     #[tokio::test]
-    async fn a_pid_whose_image_is_not_surreal_is_never_stopped()
+    async fn public_stop_refuses_a_pid_whose_image_is_not_surreal()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = test_root("identity")?;
         let supervisor = supervisor_for("cmd", &root);
         let self_pid = std::process::id();
+        let pid_path = supervisor.pid_path();
+        fs::create_dir_all(pid_path.parent().ok_or("pid path has no parent")?)?;
+        fs::write(&pid_path, self_pid.to_string())?;
 
-        let refusal = supervisor.stop_owned_process(self_pid).await;
+        let refusal = supervisor.stop().await;
 
         assert!(
             refusal.is_err(),
@@ -1635,6 +1638,10 @@ mod lifecycle_tests {
         assert!(
             process_is_alive(self_pid)?,
             "the refused process must still be running"
+        );
+        assert!(
+            pid_path.is_file(),
+            "a refused foreign pid receipt must remain available for operator diagnosis"
         );
         fs::remove_dir_all(&root)?;
         Ok(())

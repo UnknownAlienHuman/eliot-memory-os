@@ -177,6 +177,22 @@ function AssertInventory([string]$Path) {
 function FileDigest([string]$Path) {
     AssertRelative $Path 'linked file'; $full = Join-Path $root ($Path.Replace('/', [IO.Path]::DirectorySeparatorChar)); if (-not (Test-Path $full -PathType Leaf)) { Fail "missing linked file $Path" }; Sha ([IO.File]::ReadAllBytes($full))
 }
+function Assert-GeneratorCliRejected([string[]]$Arguments,[string]$ExpectedPattern) {
+    $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName=(Get-Command pwsh -ErrorAction Stop).Source;$psi.WorkingDirectory=$root;$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true
+    foreach($argument in @('-NoProfile','-File',(Join-Path $root 'scripts/gen-w1-06-premises.ps1'),'-RepoRoot',$root)+$Arguments){[void]$psi.ArgumentList.Add($argument)}
+    $process=[Diagnostics.Process]::new();$process.StartInfo=$psi;if(-not $process.Start()){Fail 'could not start W1-06 generator CLI negative fixture'};$stdout=$process.StandardOutput.ReadToEnd();$stderr=$process.StandardError.ReadToEnd();$process.WaitForExit()
+    if($process.ExitCode-eq 0){Fail "W1-06 generator CLI negative fixture unexpectedly passed: $($Arguments -join ' ')"}
+    $combined=[regex]::Replace(($stdout+"`n"+$stderr),'\x1B\[[0-?]*[ -/]*[@-~]','')
+    if($combined-notmatch $ExpectedPattern){Fail "W1-06 generator CLI negative fixture returned wrong refusal: $combined"}
+}
+function Assert-VerifierCliRejected([string]$RejectedResultPath,[string]$ExpectedPattern) {
+    $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName=(Get-Command pwsh -ErrorAction Stop).Source;$psi.WorkingDirectory=$root;$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true
+    foreach($argument in @('-NoProfile','-File',(Join-Path $root 'scripts/verify-w1-06-premises.ps1'),'-RepoRoot',$root,'-InventoryPath',$InventoryPath,'-ResultPath',$RejectedResultPath)){[void]$psi.ArgumentList.Add($argument)}
+    $process=[Diagnostics.Process]::new();$process.StartInfo=$psi;if(-not $process.Start()){Fail 'could not start W1-06 verifier CLI negative fixture'};$stdout=$process.StandardOutput.ReadToEnd();$stderr=$process.StandardError.ReadToEnd();$process.WaitForExit()
+    if($process.ExitCode-eq 0){Fail 'W1-06 verifier CLI negative fixture unexpectedly passed'}
+    $combined=[regex]::Replace(($stdout+"`n"+$stderr),'\x1B\[[0-?]*[ -/]*[@-~]','')
+    if($combined-notmatch $ExpectedPattern){Fail "W1-06 verifier CLI negative fixture returned wrong refusal: $combined"}
+}
 function SerializeJson($Value) { return (($Value | ConvertTo-Json -Depth 50 -Compress) + "`n") }
 function ExpectedResult($Inventory) {
     $programPath = 'swarm/decisions/W1-RESULT-ENVELOPE-PROGRAM-REVISION-v1.3.md'; $challengePath = 'swarm/challenges/W1-06-FALSIFICATION.md'
@@ -218,12 +234,25 @@ function AssertRegeneratedInventory([string]$Path) {
 }
 try {
     $root = (Resolve-Path $RepoRoot).Path
+    if ($PSBoundParameters.ContainsKey('ResultPath') -and [string]::IsNullOrWhiteSpace($ResultPath)) { Fail '-ResultPath must be non-empty when supplied' }
     $invCandidate = $InventoryPath.Replace('/', [IO.Path]::DirectorySeparatorChar); $invPath = if ([IO.Path]::IsPathRooted($invCandidate)) { [IO.Path]::GetFullPath($invCandidate) } else { [IO.Path]::GetFullPath((Join-Path $root $invCandidate)) }
     $resCandidate = $ResultPath.Replace('/', [IO.Path]::DirectorySeparatorChar); $resPath = if ([IO.Path]::IsPathRooted($resCandidate)) { [IO.Path]::GetFullPath($resCandidate) } else { [IO.Path]::GetFullPath((Join-Path $root $resCandidate)) }
     $inventory = AssertInventory $invPath; AssertRegeneratedInventory $invPath; $null = AssertResult $resPath $inventory
     if ($SelfTest) {
-        $canonicalResultBefore = [IO.File]::ReadAllBytes($resPath)
-        $tmp = [IO.Path]::GetTempFileName(); try {
+        $ownedPaths=@($invPath,$resPath,(Join-Path $root 'scripts/gen-w1-06-premises.ps1'),(Join-Path $root 'scripts/verify-w1-06-premises.ps1'))
+        $ownedBytesBefore=@{};$ownedStampsBefore=@{};foreach($ownedPath in $ownedPaths){$ownedFull=[IO.Path]::GetFullPath($ownedPath);$ownedBytesBefore[$ownedFull]=[IO.File]::ReadAllBytes($ownedFull);$ownedStampsBefore[$ownedFull]=(Get-Item -LiteralPath $ownedFull).LastWriteTimeUtc.Ticks}
+        Assert-GeneratorCliRejected @('-InventoryOnly') '-InventoryOnly requires explicit -OutputPath'
+        foreach($ownedPath in $ownedPaths){Assert-GeneratorCliRejected @('-Check','-InventoryOnly','-OutputPath',$ownedPath) '-InventoryOnly output must not target a generator-owned path'}
+        $tmp = [IO.Path]::GetTempFileName(); $customResult=$null; try {
+            $customResult=[IO.Path]::GetTempFileName()
+            Assert-GeneratorCliRejected @('-Check','-InventoryOnly','-OutputPath',($tmp+':w1-selftest')) '-InventoryOnly output must not use an alternate data stream or control colon'
+            Assert-GeneratorCliRejected @('-Check','-InventoryOnly','-OutputPath',(Join-Path (Split-Path $tmp -Parent) 'W1SAFE~1.tmp')) '-InventoryOnly output must not use a Win32-normalized path alias'
+            Assert-GeneratorCliRejected @('-Check','-InventoryOnly','-OutputPath',('\\localhost\'+$root.Substring(0,1)+'$'+$root.Substring(2)+'\swarm\inventory\w1-06-premises.json')) '-InventoryOnly output must not use a UNC or device path'
+            Assert-GeneratorCliRejected @('-Check','-InventoryOnly','-OutputPath',(Join-Path $root 'Cargo.toml')) '-InventoryOnly output must stay under the process temporary directory'
+            Assert-GeneratorCliRejected @('-OutputPath',$tmp,'-ResultPath',$customResult) 'custom output paths require explicit -InventoryOnly'
+            Assert-GeneratorCliRejected @('-InventoryOnly','-ResultPath',$customResult) '-InventoryOnly cannot combine with -ResultPath'
+            Assert-VerifierCliRejected '' '-ResultPath must be non-empty when supplied'
+            Assert-VerifierCliRejected '   ' '-ResultPath must be non-empty when supplied'
             $gen = Join-Path $root 'scripts/gen-w1-06-premises.ps1'; & pwsh -NoLogo -NoProfile -File $gen -RepoRoot $root -OutputPath $tmp -InventoryOnly | Out-Null; $a = [IO.File]::ReadAllBytes($tmp); & pwsh -NoLogo -NoProfile -File $gen -RepoRoot $root -OutputPath $tmp -InventoryOnly | Out-Null; $b = [IO.File]::ReadAllBytes($tmp); if (-not [Linq.Enumerable]::SequenceEqual($a, $b)) { Fail 'generator byte determinism failed' }
             $inventoryCases = @('top-level-add','top-level-remove','e2e-field','e2e-path','witness-field','provenance-field','provenance-path','universe-file','digest-field')
             foreach ($case in $inventoryCases) {
@@ -264,8 +293,8 @@ try {
                 }
                 $bad = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($bad, ($j | ConvertTo-Json -Depth 50 -Compress), $Utf8); $failed = $false; try { $null = AssertResult $bad $inventory } catch { $failed = $true }; Remove-Item -LiteralPath $bad -Force -ErrorAction SilentlyContinue; if (-not $failed) { Fail "result tamper accepted: $case" }
             }
-        } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-        if (-not [Linq.Enumerable]::SequenceEqual($canonicalResultBefore, [IO.File]::ReadAllBytes($resPath))) { Fail 'inventory-only self-test mutated canonical result' }
+        } finally { @($tmp,$customResult)|Where-Object{-not [string]::IsNullOrWhiteSpace($_)}|ForEach-Object{Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue} }
+        foreach($ownedPath in $ownedPaths){$ownedFull=[IO.Path]::GetFullPath($ownedPath);if(-not [Linq.Enumerable]::SequenceEqual([byte[]]$ownedBytesBefore[$ownedFull],[byte[]][IO.File]::ReadAllBytes($ownedFull)) -or (Get-Item -LiteralPath $ownedFull).LastWriteTimeUtc.Ticks -ne $ownedStampsBefore[$ownedFull]){Fail 'rejected CLI calls mutated a W1-06 generator-owned path'}}
     }
     Write-Output $(if ($SelfTest) { 'verified: content-bound cached+nonignored-untracked source universe, full inventory/result exact oracle, challenge/reference content binding, path safety, byte determinism, and broad inventory/result tamper matrix' } else { 'verified: content-bound source universe, full inventory/result deterministic oracle, challenge/reference content binding, path safety, and proof ceilings' }); exit 0
 } catch { Write-Error $_.Exception.Message; exit 1 }

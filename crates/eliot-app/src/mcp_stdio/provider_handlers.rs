@@ -9,25 +9,57 @@ async fn dispatch_understanding_proof(state: &McpState, arguments: Value) -> Res
     serde_json::to_value(receipt).map_err(Into::into)
 }
 
-async fn dispatch_codecortex_scan(state: &McpState, arguments: Value) -> Result<Value> {
+async fn dispatch_codecortex_scan(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    arguments: Value,
+) -> Result<Value> {
     let input: CodeCortexScanToolInput = serde_json::from_value(arguments)?;
+    let requested_project_id = ProjectId::from_str(&input.project)
+        .context("CodeCortex project must be the authenticated project UUID")?;
+    let requested_task_id = TaskId::from_str(&input.task)
+        .context("CodeCortex task must be the authenticated task UUID")?;
+    let bound_project_id = context
+        .bound_project_id
+        .context("CodeCortex scan requires a project-bound authenticated session")?;
+    let bound_task_id = context
+        .bound_task_id
+        .context("CodeCortex scan requires a task-bound authenticated session")?;
+    if requested_project_id != bound_project_id || requested_task_id != bound_task_id {
+        anyhow::bail!("CodeCortex project/task must match the authenticated session scope");
+    }
     let request = CodeCortexRequest {
-        project: input.project,
-        task: input.task,
+        project: requested_project_id.to_string(),
+        task: requested_task_id.to_string(),
         goal: input.goal,
         exact_patterns: input.exact_patterns.unwrap_or_default(),
         max_files: input.max_files.unwrap_or(160),
         max_matches_per_pattern: input.max_matches_per_pattern.unwrap_or(24),
-        include_diagnostics: input.include_diagnostics.unwrap_or(true),
+        include_diagnostics: live_codecortex_diagnostics_mode(input.include_diagnostics)?,
     };
-    let project_root = resolve_codecortex_repo_root(
+    let project_root = validate_unique_active_worktree_lease(
         &state.root,
-        None,
-    )?;
-    let mut report = CodeCortexService::new(project_root).scan(&request)?;
-    write_codecortex_report_to_memory(state, &mut report).await?;
+        context.session_id,
+        bound_project_id,
+        bound_task_id,
+    )?
+    .worktree_path;
+    let mut report = tokio::task::spawn_blocking(move || {
+        CodeCortexService::new(project_root).scan(&request)
+    })
+    .await
+    .context("join live CodeCortex grounding worker")??;
+    write_codecortex_report_to_memory(state, context, &mut report).await?;
     write_json_report(&codecortex_latest_path(&state.root), &report)?;
     serde_json::to_value(report).map_err(Into::into)
+}
+
+fn live_codecortex_diagnostics_mode(requested: Option<bool>) -> Result<bool> {
+    anyhow::ensure!(
+        !requested.unwrap_or(false),
+        "live CodeCortex MCP scans are grounding-only; run the registered verifier separately"
+    );
+    Ok(false)
 }
 
 const GOVERNOR_REPO_ROOT_ENV: &str = "ELIOT_GOVERNOR_REPO_ROOT";

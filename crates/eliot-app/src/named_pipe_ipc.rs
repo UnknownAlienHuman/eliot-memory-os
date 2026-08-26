@@ -1,4 +1,4 @@
-use crate::mcp_stdio::{CognitiveCapabilityFile, McpDaemon};
+use crate::mcp_stdio::{AuthenticatedRoleAuthority, CognitiveCapabilityFile, McpDaemon};
 use crate::runtime_instance::{
     RuntimeDiscoveryErrorCode, RuntimeInstance, RuntimePublication, RuntimePublicationState,
     atomic_write_json,
@@ -39,12 +39,15 @@ const FORBIDDEN_FACADE_DB_ENV: &[&str] = &[
     "ELIOT_TEST_SURREAL_STORAGE",
 ];
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 #[allow(clippy::struct_field_names)]
 pub(crate) struct RequestedSessionScope {
     pub session_id: Option<SessionId>,
     pub project_id: ProjectId,
     pub task_id: Option<TaskId>,
+    pub role_lease_id: String,
+    pub role_lease_epoch: u64,
+    pub role_lease_generation: u64,
 }
 
 pub(crate) fn pipe_name(config_path: &Path) -> String {
@@ -239,9 +242,13 @@ async fn serve_connection(
         }
     }
     let Ok((bound_project_id, bound_task_id)) = daemon.authoritative_host_scope(
+        &principal.profile,
         principal.session_id,
         principal.bound_project_id,
         principal.bound_task_id,
+        principal.role_lease_id.as_deref(),
+        principal.role_lease_epoch,
+        principal.role_lease_generation,
     ) else {
         reject_handshake(&mut writer, "invalid_session_scope").await?;
         return Ok(());
@@ -251,12 +258,14 @@ async fn serve_connection(
     let session_id = principal.session_id.to_string();
     write_authentication_result(&mut writer, true, Some(&session_id), None).await?;
     while let Some(line) = read_bounded_async_line(&mut reader).await? {
+        let role_authority = retained_role_authority(&principal)?;
         if let Some(response) = daemon
             .handle_line(
                 &principal.profile,
                 principal.session_id,
                 principal.bound_project_id,
                 principal.bound_task_id,
+                role_authority,
                 &line,
             )
             .await?
@@ -285,7 +294,7 @@ pub(crate) async fn run_stdio_client(
     requested_scope: Option<RequestedSessionScope>,
 ) -> Result<()> {
     reject_database_environment()?;
-    let mut connection = connect_client(instance, profile, requested_scope).await?;
+    let mut connection = connect_client(instance, profile, requested_scope.clone()).await?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut stdin = stdin.lock();
@@ -298,7 +307,7 @@ pub(crate) async fn run_stdio_client(
         let expects_response = request.get("id").is_some();
         let latest = wait_for_ready_publication(instance, CONNECT_TIMEOUT).await?;
         if !same_runtime_generation(&latest, &connection.publication) {
-            connection = connect_client(instance, profile, requested_scope).await?;
+            connection = connect_client(instance, profile, requested_scope.clone()).await?;
         }
         let response = match relay_request(&mut connection, &request, expects_response).await {
             Ok(response) => response,
@@ -311,7 +320,7 @@ pub(crate) async fn run_stdio_client(
                         "daemon connection failed and runtime publication did not rotate",
                     );
                 }
-                connection = connect_client(instance, profile, requested_scope).await?;
+                connection = connect_client(instance, profile, requested_scope.clone()).await?;
                 relay_request(&mut connection, &request, expects_response)
                     .await
                     .context("retry MCP request after one runtime publication refresh")?
@@ -416,12 +425,23 @@ async fn connect_global_client(
         client_nonce: Uuid::new_v4().to_string(),
         profile: profile.to_owned(),
         requested_session_id: requested_scope
+            .as_ref()
             .and_then(|scope| scope.session_id)
             .map(|session_id| session_id.to_string()),
-        requested_project_id: requested_scope.map(|scope| scope.project_id.to_string()),
+        requested_project_id: requested_scope
+            .as_ref()
+            .map(|scope| scope.project_id.to_string()),
         requested_task_id: requested_scope
+            .as_ref()
             .and_then(|scope| scope.task_id)
             .map(|task_id| task_id.to_string()),
+        requested_role_lease_id: requested_scope
+            .as_ref()
+            .map(|scope| scope.role_lease_id.clone()),
+        requested_role_lease_epoch: requested_scope.as_ref().map(|scope| scope.role_lease_epoch),
+        requested_role_lease_generation: requested_scope
+            .as_ref()
+            .map(|scope| scope.role_lease_generation),
         capability_file: None,
         capability_token: None,
     };
@@ -602,6 +622,9 @@ async fn connect_cognitive_child(capability_path: &Path) -> Result<IpcClientConn
         requested_session_id: None,
         requested_project_id: None,
         requested_task_id: None,
+        requested_role_lease_id: None,
+        requested_role_lease_epoch: None,
+        requested_role_lease_generation: None,
         capability_file: Some(capability_path.to_string_lossy().into_owned()),
         capability_token: Some(file.capability_token),
     };
@@ -784,6 +807,12 @@ struct IpcClientHandshake {
     #[serde(default)]
     requested_task_id: Option<String>,
     #[serde(default)]
+    requested_role_lease_id: Option<String>,
+    #[serde(default)]
+    requested_role_lease_epoch: Option<u64>,
+    #[serde(default)]
+    requested_role_lease_generation: Option<u64>,
+    #[serde(default)]
     capability_file: Option<String>,
     #[serde(default)]
     capability_token: Option<String>,
@@ -802,8 +831,38 @@ struct IpcPrincipal {
     session_id: SessionId,
     bound_project_id: Option<ProjectId>,
     bound_task_id: Option<TaskId>,
+    role_lease_id: Option<String>,
+    role_lease_epoch: Option<u64>,
+    role_lease_generation: Option<u64>,
     capability_file: Option<String>,
     capability_token: Option<String>,
+}
+
+fn retained_role_authority(
+    principal: &IpcPrincipal,
+) -> Result<Option<AuthenticatedRoleAuthority<'_>>> {
+    match (
+        principal.role_lease_id.as_deref(),
+        principal.role_lease_epoch,
+        principal.role_lease_generation,
+    ) {
+        (Some(role_lease_id), Some(epoch), Some(generation)) => {
+            Ok(Some(AuthenticatedRoleAuthority {
+                role_lease_id,
+                epoch,
+                generation,
+            }))
+        }
+        (None, None, None) => Ok(None),
+        _ => {
+            tracing::warn!(
+                profile = principal.profile.as_str(),
+                session_id = %principal.session_id,
+                "denied named-pipe request with incomplete retained role authority"
+            );
+            anyhow::bail!("authenticated named-pipe principal retained incomplete role authority")
+        }
+    }
 }
 
 /// Bounded window of recently seen handshake nonces.
@@ -980,6 +1039,9 @@ impl IpcAuthenticationState {
                     handshake.requested_session_id.is_some(),
                     handshake.requested_project_id.is_some(),
                     handshake.requested_task_id.is_some(),
+                    handshake.requested_role_lease_id.is_some(),
+                    handshake.requested_role_lease_epoch.is_some(),
+                    handshake.requested_role_lease_generation.is_some(),
                 ) {
                     return Err("invalid_session_scope");
                 }
@@ -1005,6 +1067,9 @@ impl IpcAuthenticationState {
                     || handshake.requested_session_id.is_some()
                     || handshake.requested_project_id.is_some()
                     || handshake.requested_task_id.is_some()
+                    || handshake.requested_role_lease_id.is_some()
+                    || handshake.requested_role_lease_epoch.is_some()
+                    || handshake.requested_role_lease_generation.is_some()
                     || handshake
                         .capability_file
                         .as_deref()
@@ -1051,6 +1116,9 @@ impl IpcAuthenticationState {
             session_id,
             bound_project_id,
             bound_task_id,
+            role_lease_id: handshake.requested_role_lease_id,
+            role_lease_epoch: handshake.requested_role_lease_epoch,
+            role_lease_generation: handshake.requested_role_lease_generation,
             capability_file: handshake.capability_file,
             capability_token: handshake.capability_token,
         })
@@ -1066,6 +1134,9 @@ impl IpcAuthenticationState {
             || handshake.requested_session_id.is_some()
             || handshake.requested_project_id.is_some()
             || handshake.requested_task_id.is_some()
+            || handshake.requested_role_lease_id.is_some()
+            || handshake.requested_role_lease_epoch.is_some()
+            || handshake.requested_role_lease_generation.is_some()
             || handshake.capability_file.is_some()
             || handshake.capability_token.is_some()
         {
@@ -1125,10 +1196,24 @@ fn allowed_ipc_profile(profile: &str) -> bool {
     )
 }
 
-fn valid_normal_scope_shape(has_session: bool, has_project: bool, has_task: bool) -> bool {
+fn valid_normal_scope_shape(
+    has_session: bool,
+    has_project: bool,
+    has_task: bool,
+    has_role_lease: bool,
+    has_role_epoch: bool,
+    has_role_generation: bool,
+) -> bool {
     matches!(
-        (has_session, has_project, has_task),
-        (false, _, false) | (true, true, true)
+        (
+            has_session,
+            has_project,
+            has_task,
+            has_role_lease,
+            has_role_epoch,
+            has_role_generation,
+        ),
+        (false, _, false, false, false, false) | (true, true, true, true, true, true)
     )
 }
 
@@ -1321,11 +1406,12 @@ pub(crate) async fn run_stdio_client(
 mod tests {
     use super::{
         ClientProcessAttestation, IPC_PROTOCOL_VERSION, IpcAuthenticationState, IpcClientHandshake,
-        MAX_REPLAY_NONCES, ReplayWindow, allowed_ipc_profile, decode_bounded_line,
-        handshake_requires_process_attestation, private_host_governor_method_allowed, sha256_file,
-        valid_normal_scope_shape,
+        IpcPrincipal, MAX_REPLAY_NONCES, ReplayWindow, allowed_ipc_profile, decode_bounded_line,
+        handshake_requires_process_attestation, private_host_governor_method_allowed,
+        retained_role_authority, sha256_file, valid_normal_scope_shape,
     };
     use anyhow::{Context as _, Result};
+    use eliot_types::SessionId;
     use tokio::sync::Mutex;
     use uuid::Uuid;
 
@@ -1337,14 +1423,57 @@ mod tests {
 
     #[test]
     fn normal_ipc_scope_accepts_project_only_without_task_authority() {
-        assert!(valid_normal_scope_shape(false, false, false));
-        assert!(valid_normal_scope_shape(false, true, false));
-        assert!(valid_normal_scope_shape(true, true, true));
+        assert!(valid_normal_scope_shape(
+            false, false, false, false, false, false
+        ));
+        assert!(valid_normal_scope_shape(
+            false, true, false, false, false, false
+        ));
+        assert!(valid_normal_scope_shape(true, true, true, true, true, true));
 
-        assert!(!valid_normal_scope_shape(true, false, false));
-        assert!(!valid_normal_scope_shape(true, true, false));
-        assert!(!valid_normal_scope_shape(false, false, true));
-        assert!(!valid_normal_scope_shape(false, true, true));
+        assert!(!valid_normal_scope_shape(
+            true, false, false, true, true, true
+        ));
+        assert!(!valid_normal_scope_shape(
+            true, true, false, true, true, true
+        ));
+        assert!(!valid_normal_scope_shape(
+            false, false, true, false, false, false
+        ));
+        assert!(!valid_normal_scope_shape(
+            false, true, true, false, false, false
+        ));
+        assert!(!valid_normal_scope_shape(
+            true, true, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn retained_role_authority_is_all_or_nothing() -> Result<()> {
+        let mut principal = IpcPrincipal {
+            profile: "codex_controller".to_owned(),
+            session_id: SessionId::new_v7(),
+            bound_project_id: None,
+            bound_task_id: None,
+            role_lease_id: None,
+            role_lease_epoch: None,
+            role_lease_generation: None,
+            capability_file: None,
+            capability_token: None,
+        };
+
+        assert!(retained_role_authority(&principal)?.is_none());
+
+        principal.role_lease_id = Some("role-lease".to_owned());
+        assert!(retained_role_authority(&principal).is_err());
+
+        principal.role_lease_epoch = Some(7);
+        principal.role_lease_generation = Some(11);
+        let retained = retained_role_authority(&principal)?.context("retained role authority")?;
+        assert_eq!(retained.role_lease_id, "role-lease");
+        assert_eq!(retained.epoch, 7);
+        assert_eq!(retained.generation, 11);
+        Ok(())
     }
 
     #[test]
@@ -1362,6 +1491,9 @@ mod tests {
                 requested_session_id: None,
                 requested_project_id: None,
                 requested_task_id: None,
+                requested_role_lease_id: None,
+                requested_role_lease_epoch: None,
+                requested_role_lease_generation: None,
                 capability_file: None,
                 capability_token: None,
             })
@@ -1529,6 +1661,9 @@ mod tests {
             requested_session_id: None,
             requested_project_id: None,
             requested_task_id: None,
+            requested_role_lease_id: None,
+            requested_role_lease_epoch: None,
+            requested_role_lease_generation: None,
             capability_file: None,
             capability_token: None,
         })?)

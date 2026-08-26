@@ -152,7 +152,7 @@ fn understanding_proof_schema() -> Value {
 }
 
 fn codecortex_scan_schema() -> Value {
-    json_schema(
+    let mut schema = json_schema(
         &[
             ("project", "string"),
             ("task", "string"),
@@ -163,7 +163,14 @@ fn codecortex_scan_schema() -> Value {
             ("include_diagnostics", "boolean"),
         ],
         &["project", "task", "goal"],
-    )
+    );
+    schema["properties"]["include_diagnostics"] = json!({
+        "type": "boolean",
+        "const": false,
+        "default": false,
+        "description": "Live MCP scans are grounding-only; run Cargo diagnostics through a registered verifier."
+    });
+    schema
 }
 
 fn action_plan_schema() -> Value {
@@ -441,11 +448,26 @@ fn write_json_report<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> 
 
 async fn write_codecortex_report_to_memory(
     state: &McpState,
+    context: AuthenticatedRequestContext,
     report: &mut CodeCortexReport,
 ) -> Result<()> {
     let handle = state.writer.clone();
     let admission = WriteAdmissionService;
-    CodeCortexMemoryWriter::write_report(&handle, &admission, report).await?;
+    let project_id = context
+        .bound_project_id
+        .context("CodeCortex memory write requires a project-bound session")?;
+    let task_id = context
+        .bound_task_id
+        .context("CodeCortex memory write requires a task-bound session")?;
+    CodeCortexMemoryWriter::write_report_scoped(
+        &handle,
+        &admission,
+        report,
+        context.session_id,
+        project_id,
+        task_id,
+    )
+    .await?;
     Ok(())
 }
 

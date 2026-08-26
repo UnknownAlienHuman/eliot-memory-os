@@ -1,0 +1,25 @@
+   Compiling eliot-app v0.1.0 (C:\Development\Rust\projects\eliot-memory-os\crates\eliot-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.42s
+────────────
+ Nextest run ID 24e0d5bd-4290-4f87-ac5c-955f0dcc34e7 with nextest profile: default
+    Starting 1 test across 1 binary (5 tests skipped)
+        FAIL [  26.612s] (1/1) eliot-app::first_working_loop first_working_loop_end_to_end
+  stdout ───
+
+    running 1 test
+    test first_working_loop_end_to_end ... FAILED
+
+    failures:
+
+    failures:
+        first_working_loop_end_to_end
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 26.60s
+
+  stderr ───
+    Error: "git commit failed (status=exit code: 1): stdout=On branch work/first-working-loop-01a0385e-8a94-77a0-8011-fb9bcd30038a\nnothing to commit, working tree clean\n stderr="
+
+────────────
+     Summary [  26.613s] 1 test run: 0 passed, 1 failed, 5 skipped
+        FAIL [  26.612s] (1/1) eliot-app::first_working_loop first_working_loop_end_to_end
+error: test run failed

@@ -1181,6 +1181,17 @@ impl RecoverableJobObject {
         })
     }
 
+    /// Enumerates and verifies the exact current members of the reopened Job Object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Windows cannot query the Job, open a member process, or
+    /// verify its image identity. Membership changes during capture are returned as
+    /// `WouldBlock` instead of an authoritative empty snapshot.
+    pub fn current_job_processes(&self) -> io::Result<Vec<CurrentJobProcessSnapshot>> {
+        current_job_processes(self.job.0)
+    }
+
     /// Terminates every process in the reopened Job Object.
     ///
     /// # Errors
@@ -1418,62 +1429,7 @@ impl SuspendedJobChild {
     /// verify its image identity. Callers must surface this error as explicit typed
     /// capture failure rather than an empty snapshot.
     pub fn current_job_processes(&self) -> io::Result<Vec<CurrentJobProcessSnapshot>> {
-        let pids = job_process_ids(self.job.0)?;
-        if pids.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Job Object returned PID 0",
-            ));
-        }
-        let mut snapshots = Vec::with_capacity(pids.len());
-        for pid in pids {
-            let snapshot = Self::open_current_process_snapshot(pid)?;
-            if snapshots
-                .iter()
-                .any(|existing: &CurrentJobProcessSnapshot| existing.pid == snapshot.pid)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("duplicate PID {pid} in Job Object enumeration"),
-                ));
-            }
-            snapshots.push(snapshot);
-        }
-        snapshots.sort_by_key(|entry| entry.pid);
-        let current_ids = job_process_ids(self.job.0)?;
-        if current_ids.len() != snapshots.len()
-            || !current_ids
-                .iter()
-                .all(|pid| snapshots.iter().any(|entry| &entry.pid == pid))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Job Object membership changed between enumeration and identity capture",
-            ));
-        }
-        Ok(snapshots)
-    }
-
-    fn open_current_process_snapshot(pid: u32) -> io::Result<CurrentJobProcessSnapshot> {
-        if pid == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "PID must be non-zero",
-            ));
-        }
-        // SAFETY: numeric PID is used only to resolve a process handle.
-        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        let process = OwnedHandle::new(process)?;
-        let image = query_process_image(process.0)?;
-        let start_ticks = process_start_ticks(process.0)?;
-        let image_file = PinnedFile::open(&image)?;
-        let file_identity = image_file.identity();
-        Ok(CurrentJobProcessSnapshot {
-            pid,
-            start_ticks,
-            image,
-            file_identity,
-        })
+        current_job_processes(self.job.0)
     }
 
     /// Returns the number of processes currently assigned to the Job Object.
@@ -1527,15 +1483,8 @@ impl SuspendedJobChild {
     pub fn try_wait(&self) -> io::Result<Option<i32>> {
         // SAFETY: process handle remains live for the call.
         match unsafe { WaitForSingleObject(self.process.0, 0) } {
-            WAIT_TIMEOUT => Ok(None),
-            WAIT_OBJECT_0 => {
-                let mut code = 0_u32;
-                // SAFETY: process is signaled and code is a valid out pointer.
-                if unsafe { GetExitCodeProcess(self.process.0, &raw mut code) } == 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(Some(i32::from_ne_bytes(code.to_ne_bytes())))
-            }
+            WAIT_TIMEOUT => query_process_exit_code(self.process.0, false),
+            WAIT_OBJECT_0 => query_process_exit_code(self.process.0, true),
             _ => Err(io::Error::last_os_error()),
         }
     }
@@ -1555,7 +1504,7 @@ impl SuspendedJobChild {
         })?;
         // SAFETY: process handle remains live for the call.
         match unsafe { WaitForSingleObject(self.process.0, millis) } {
-            WAIT_TIMEOUT => Ok(None),
+            WAIT_TIMEOUT => query_process_exit_code(self.process.0, false),
             WAIT_OBJECT_0 => self.try_wait(),
             _ => Err(io::Error::last_os_error()),
         }
@@ -1595,6 +1544,83 @@ fn process_start_ticks(process: HANDLE) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+fn query_process_exit_code(process: HANDLE, signaled: bool) -> io::Result<Option<i32>> {
+    let mut code = 0_u32;
+    // SAFETY: `process` is a retained live handle and `code` is a valid out pointer.
+    if unsafe { GetExitCodeProcess(process, &raw mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let still_active = u32::try_from(STILL_ACTIVE).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows STILL_ACTIVE value does not fit u32",
+        )
+    })?;
+    if !signaled && code == still_active {
+        return Ok(None);
+    }
+    Ok(Some(i32::from_ne_bytes(code.to_ne_bytes())))
+}
+
+fn current_job_processes(job: HANDLE) -> io::Result<Vec<CurrentJobProcessSnapshot>> {
+    let pids = job_process_ids(job)?;
+    if pids.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Job Object returned PID 0",
+        ));
+    }
+    let mut snapshots = Vec::with_capacity(pids.len());
+    for pid in pids {
+        let snapshot = open_current_process_snapshot(pid)?;
+        if snapshots
+            .iter()
+            .any(|existing: &CurrentJobProcessSnapshot| existing.pid == snapshot.pid)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate PID {pid} in Job Object enumeration"),
+            ));
+        }
+        snapshots.push(snapshot);
+    }
+    snapshots.sort_by_key(|entry| entry.pid);
+    let current_ids = job_process_ids(job)?;
+    if current_ids.len() != snapshots.len()
+        || !current_ids
+            .iter()
+            .all(|pid| snapshots.iter().any(|entry| &entry.pid == pid))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "Job Object membership changed between enumeration and identity capture",
+        ));
+    }
+    Ok(snapshots)
+}
+
+fn open_current_process_snapshot(pid: u32) -> io::Result<CurrentJobProcessSnapshot> {
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PID must be non-zero",
+        ));
+    }
+    // SAFETY: numeric PID is used only to resolve a process handle.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    let process = OwnedHandle::new(process)?;
+    let image = query_process_image(process.0)?;
+    let start_ticks = process_start_ticks(process.0)?;
+    let image_file = PinnedFile::open(&image)?;
+    let file_identity = image_file.identity();
+    Ok(CurrentJobProcessSnapshot {
+        pid,
+        start_ticks,
+        image,
+        file_identity,
+    })
 }
 
 fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
@@ -1988,6 +2014,7 @@ pub fn credential_ids_current_user_with_prefix(prefix: &str) -> io::Result<Vec<S
 }
 
 /// Shared command configuration for disposable Governor integration fixtures.
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::{credential_ids_current_user_with_prefix, credential_target};
     use std::ffi::OsStr;

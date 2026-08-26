@@ -235,13 +235,16 @@ pub use mcp_contract::{
     observe_input_schema,
 };
 pub use memory::{
-    ActionKind, ActionLease, ActionLeaseRecord, ActionProvenanceSet, ActionRequest, ActionScope,
-    ActionSourceScope, ActiveDecisionTransitionCommand, AgentContributionTrace,
-    AgentResultRecordCommand, AgentRole, AgentRun, AgentRunStatus, AgentSession,
-    AgentSessionStatus, AgentTransport, AuthorityPermission, AuthorityProfile, BlackboardItem,
-    BlackboardItemKind, BlackboardItemStatus, BlackboardScope, BlastRadiusView, CandidateDiff,
-    CandidateDiffStatus, CandidateReview, CandidateReviewDecision, ChangePlan, ClaimCard,
-    ClaimCardInput, ClaimProposeCommand, ClaimSummary, ClaimSupportCommand, ClaimVerifyCommand,
+    ACTION_MEMORY_GRANT_REDEMPTION_SCHEMA_VERSION, ACTION_MEMORY_GRANT_REF_SCHEMA_VERSION,
+    ActionKind, ActionLease, ActionLeaseRecord, ActionMemoryDeliveryKind, ActionMemoryDeliveryRef,
+    ActionMemoryEvidenceClass, ActionMemoryGrantEvidenceClass, ActionMemoryGrantRedemption,
+    ActionMemoryGrantRef, ActionProvenanceSet, ActionRequest, ActionScope, ActionSourceScope,
+    ActiveDecisionTransitionCommand, AgentContributionTrace, AgentResultRecordCommand, AgentRole,
+    AgentRun, AgentRunStatus, AgentSession, AgentSessionStatus, AgentTransport,
+    AuthorityPermission, AuthorityProfile, BlackboardItem, BlackboardItemKind,
+    BlackboardItemStatus, BlackboardScope, BlastRadiusView, CandidateDiff, CandidateDiffStatus,
+    CandidateReview, CandidateReviewDecision, ChangePlan, ClaimCard, ClaimCardInput,
+    ClaimProposeCommand, ClaimSummary, ClaimSupportCommand, ClaimVerifyCommand,
     CodeCortexPacketView, CodeCortexReport, CodeCortexRequest, CodeCortexScopeBinding,
     CodeEvidenceSource, CognitiveGateDecision, CognitiveGateOutcome, CognitiveGateReason,
     CognitiveGateRequest, CognitiveProjectionReadState, CollectiveTrace, CommandContext,
@@ -273,8 +276,8 @@ pub use memory::{
     VerifierRunRef, VerifierStatus, Visibility, WorkConflict, WorkConflictKind,
     WorkConflictResolution, WorkItem, WorkItemStatus, WorkLease, WorkLeaseDecision,
     WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseState, WorkScope, WorktreeLease,
-    WorktreeLeaseRequest, WorktreeLeaseState, WriteReceipt, WriteReceiptRef, WriteRejectReason,
-    WriteStatus, WriterStatusResponse,
+    WorktreeLeaseKind, WorktreeLeaseRequest, WorktreeLeaseState, WriteReceipt, WriteReceiptRef,
+    WriteRejectReason, WriteStatus, WriterStatusResponse,
 };
 pub use metrics::{
     CostLedger, CostLedgerEntry, DashboardHealthStatus, DashboardHealthSummary, DashboardReport,
@@ -285,9 +288,10 @@ pub use metrics::{
     SloEvaluation, SloObjective, TelemetryEvent, TelemetryEventKind, TelemetryRollup,
 };
 pub use observability::{
-    MemoryInfluenceToolInput, MemoryInfluenceTraceWriteInput, MemoryInfluenceTraceWriteResult,
-    OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
-    ObservabilityWriteReceipt, ObservabilityWriteStatus, memory_influence_trace_write_input_schema,
+    MEMORY_DELIVERY_GRANT_SCHEMA_VERSION, MemoryGrantOfferRecord, MemoryInfluenceToolInput,
+    MemoryInfluenceTraceWriteInput, MemoryInfluenceTraceWriteResult, OBSERVABILITY_SCHEMA_VERSION,
+    ObservabilityKind, ObservabilityWriteEnvelope, ObservabilityWriteReceipt,
+    ObservabilityWriteStatus, memory_influence_trace_write_input_schema,
 };
 pub use project_understanding::{
     CausalHopKind, CausalHopStatus, ContinuityAcceptanceState, ContinuityGitState,

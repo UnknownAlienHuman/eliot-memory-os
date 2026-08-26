@@ -500,6 +500,8 @@ fn fixture_work(
         base_commit: base_commit.to_owned(),
         allowed_read_set: vec!["scripts".to_owned()],
         allowed_write_set: write_set.to_vec(),
+        kind: eliot_types::WorktreeLeaseKind::LinkedGitWorktree,
+        managed_root: None,
         state: WorktreeLeaseState::Active,
         issued_at: now,
         expires_at: now + time::Duration::minutes(30),

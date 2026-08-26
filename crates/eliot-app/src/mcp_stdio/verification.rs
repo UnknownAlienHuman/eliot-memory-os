@@ -824,14 +824,17 @@ pub(super) fn verifier_scope_hash_is_valid(scope: &VerifierArtifactScope) -> Res
 
 pub(super) async fn run_registered_cargo_verifier(
     worktree: &Path,
+    runtime_root: &Path,
     args: &[&str],
     timeout_seconds: u64,
     verifier_name: &str,
 ) -> Result<()> {
+    let cargo_target_dir = prepare_registered_cargo_target(worktree, runtime_root)?;
     let mut command = tokio::process::Command::new("cargo");
     command
         .current_dir(worktree)
         .args(args)
+        .env("CARGO_TARGET_DIR", cargo_target_dir)
         .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
         .env_remove("SURREAL_USER")
         .env_remove("SURREAL_PASS")
@@ -844,14 +847,75 @@ pub(super) async fn run_registered_cargo_verifier(
     .await
     .with_context(|| format!("registered {verifier_name} verifier timed out"))??;
     if !output.status.success() {
-        anyhow::bail!("registered {verifier_name} verifier failed");
+        let stdout = bounded_verifier_output(&output.stdout);
+        let stderr = bounded_verifier_output(&output.stderr);
+        anyhow::bail!(
+            "registered {verifier_name} verifier failed (status={}): stdout_tail={stdout:?}; stderr_tail={stderr:?}",
+            output.status
+        );
     }
     Ok(())
 }
 
-pub(super) async fn run_dogfood_blob_verifier(worktree: &Path) -> Result<()> {
+fn bounded_verifier_output(bytes: &[u8]) -> String {
+    const MAX_BYTES: usize = 4_096;
+    let start = bytes.len().saturating_sub(MAX_BYTES);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+pub(super) fn prepare_registered_cargo_target(
+    worktree: &Path,
+    runtime_root: &Path,
+) -> Result<PathBuf> {
+    let worktree = worktree
+        .canonicalize()
+        .context("canonicalize registered verifier worktree")?;
+    let runtime_root = runtime_root
+        .canonicalize()
+        .context("canonicalize registered verifier runtime root")?;
+    let test_owner = std::env::var_os("ELIOT_TEST_REGISTERED_CARGO_TARGET_ROOT").map(PathBuf::from);
+    let (owner, target) = if let Some(test_owner) = test_owner {
+        anyhow::ensure!(
+            std::env::var("ELIOT_DISABLE_REAL_PROVIDER").as_deref() == Ok("1"),
+            "test-owned registered Cargo target requires the real-provider kill switch"
+        );
+        anyhow::ensure!(
+            test_owner.is_absolute(),
+            "test-owned registered Cargo target root must be absolute"
+        );
+        let owner = test_owner
+            .canonicalize()
+            .context("canonicalize test-owned registered Cargo target root")?;
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .context("canonicalize TEMP for registered Cargo target")?;
+        anyhow::ensure!(
+            owner.starts_with(&temp_root),
+            "test-owned registered Cargo target root escaped TEMP"
+        );
+        let target = owner.join("cargo");
+        (owner, target)
+    } else {
+        let target = runtime_root.join("tmp").join("registered-cargo-target");
+        (runtime_root, target)
+    };
+    fs::create_dir_all(&target).context("create runtime-owned registered Cargo target")?;
+    let target = target
+        .canonicalize()
+        .context("canonicalize runtime-owned registered Cargo target")?;
+    if !target.starts_with(&owner) {
+        anyhow::bail!("registered Cargo target escaped its owned root");
+    }
+    if target.starts_with(&worktree) || worktree.starts_with(&target) {
+        anyhow::bail!("registered Cargo target must not overlap the leased worktree");
+    }
+    Ok(target)
+}
+
+pub(super) async fn run_dogfood_blob_verifier(worktree: &Path, runtime_root: &Path) -> Result<()> {
     run_registered_cargo_verifier(
         worktree,
+        runtime_root,
         &[
             "test",
             "--offline",
@@ -868,9 +932,13 @@ pub(super) async fn run_dogfood_blob_verifier(worktree: &Path) -> Result<()> {
     .await
 }
 
-pub(super) async fn run_cargo_workspace_check_verifier(worktree: &Path) -> Result<()> {
+pub(super) async fn run_cargo_workspace_check_verifier(
+    worktree: &Path,
+    runtime_root: &Path,
+) -> Result<()> {
     run_registered_cargo_verifier(
         worktree,
+        runtime_root,
         &[
             "check",
             "--workspace",
@@ -886,6 +954,7 @@ pub(super) async fn run_cargo_workspace_check_verifier(worktree: &Path) -> Resul
 
 #[allow(clippy::too_many_lines)]
 pub(super) async fn resolve_verifier_artifact_scope(
+    runtime_root: &Path,
     project_id: ProjectId,
     task: &TaskContract,
     verification_id: VerificationId,
@@ -1015,10 +1084,10 @@ pub(super) async fn resolve_verifier_artifact_scope(
             }
             match verifier {
                 RegisteredTaskVerifier::DogfoodBlobIntegrity => {
-                    run_dogfood_blob_verifier(&before.root).await?;
+                    run_dogfood_blob_verifier(&before.root, runtime_root).await?;
                 }
                 RegisteredTaskVerifier::CargoWorkspaceCheck => {
-                    run_cargo_workspace_check_verifier(&before.root).await?;
+                    run_cargo_workspace_check_verifier(&before.root, runtime_root).await?;
                 }
                 RegisteredTaskVerifier::ReceiptResolution => unreachable!(),
             }
@@ -1142,6 +1211,7 @@ pub(super) async fn dispatch_task_verification_run(
         anyhow::bail!("verifier requires a satisfied candidate observation in this task");
     }
     let scope = match resolve_verifier_artifact_scope(
+        &state.root,
         project_id,
         &task,
         verification_id,

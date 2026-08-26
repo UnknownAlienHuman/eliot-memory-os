@@ -21,13 +21,13 @@ use eliot_types::{
     CurrentTruthSnapshot, DecisionLocalitySuffix, EpistemicPacketState, EpistemicStatus,
     ExperienceCase, ExperienceRecallRequest, FetchAtomsL2Request, FetchAtomsL2Response,
     MaterialPacketFrame, MemoryAdmissionDecision, MemoryDecisionReceipt, MemoryExposureMode,
-    MemoryExposurePolicy, MemoryLifecyclePacketView, MemoryRevision, PacketQualityReport,
-    PacketQualityResult, PredictionConfidence, ProjectId, ProjectUnderstandingEvidence,
-    ProjectUnderstandingModel, ReadConsistencyMode, RecallL0Request, RecallL0Response, SessionId,
-    SkillCardV2, TaskContract, TaskId, TaskMeaningFrame, TokenBudgetReport, TruncationInfo,
-    UlExperimentArm, UlInjectionMode, UlMetacognitionView, UlPrediction, UlTaskClass,
-    UnderstandingProof, UnderstandingProofReceipt, VerifierArtifactRef, VerifierStatus, WorkItem,
-    WorkItemStatus, WorkLease, WorkLeaseState,
+    MemoryExposurePolicy, MemoryLifecyclePacketView, MemoryNeed, MemoryRevision,
+    PacketQualityReport, PacketQualityResult, PredictionConfidence, ProjectId,
+    ProjectUnderstandingEvidence, ProjectUnderstandingModel, ReadConsistencyMode, RecallL0Request,
+    RecallL0Response, SessionId, SkillCardV2, TaskContract, TaskId, TaskMeaningFrame,
+    TokenBudgetReport, TruncationInfo, UlExperimentArm, UlInjectionMode, UlMetacognitionView,
+    UlPrediction, UlTaskClass, UnderstandingProof, UnderstandingProofReceipt, VerifierArtifactRef,
+    VerifierStatus, WorkItem, WorkItemStatus, WorkLease, WorkLeaseState,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -832,7 +832,9 @@ fn attach_packet_plan_sources<'a>(
             unreachable!("non-control experience source is validated before compilation")
         };
         let task_frame = packet_task_meaning_frame(plan, packet);
-        let memory_need = MemoryNeedService::decide(&task_frame, None);
+        let requested_need = (plan.memory_exposure == MemoryExposureMode::IncludeCaseCandidates)
+            .then_some(MemoryNeed::CausalCase);
+        let memory_need = MemoryNeedService::decide(&task_frame, requested_need);
         let exposure_policy = MemoryExposurePolicy {
             mode: plan.memory_exposure,
             packet_cache_partition: format!("{:?}:{}", plan.memory_exposure, plan.request.task_id)
@@ -2302,7 +2304,7 @@ fn attach_codecortex_reports(packet: &mut ContextPacketL3, reports: &[CodeCortex
     });
 }
 
-fn codecortex_unknowns(report: &CodeCortexReport) -> Vec<String> {
+pub(crate) fn codecortex_unknowns(report: &CodeCortexReport) -> Vec<String> {
     let mut unknowns = report.adapter_notes.clone();
     if report.dirty {
         unknowns.push("git working tree was dirty when CodeCortex report was generated".to_owned());
@@ -3884,8 +3886,10 @@ mod current_git_scope_tests {
     use super::*;
     use eliot_types::{
         BlastRadiusView, CausalBridgeHop, ClaimId, ClaimSummary, CodeCortexScopeBinding,
-        CodeEvidenceSource, FileEvidence, GovernorConfig, OperationStatus, ReceiptId, WriteId,
-        WriteReceiptRef,
+        CodeEvidenceSource, ExperienceAuthority, ExperienceCausalModel,
+        ExperienceInterventionOutcome, ExperienceMaturity, ExperienceMaturityState,
+        ExperienceProblemFrame, ExperienceTransferBoundary, FileEvidence, GovernorConfig,
+        OperationStatus, ReceiptId, SourceBranchCommitEnvironment, WriteId, WriteReceiptRef,
     };
     use serde_json::json;
 
@@ -4030,6 +4034,51 @@ mod current_git_scope_tests {
             adapter_notes: Vec::new(),
             memory_receipt: None,
             operation_status: OperationStatus::OperationCompleted,
+        }
+    }
+
+    fn blob_integrity_case(project_id: ProjectId) -> ExperienceCase {
+        ExperienceCase {
+            case_id: "experience-case-natural-blob-integrity".to_owned(),
+            project_id,
+            source_episode_refs: vec!["episode:blob-integrity".to_owned()],
+            source_task_refs: vec!["task:prior-blob-integrity".to_owned()],
+            source_agent_sessions: Vec::new(),
+            source_branch_commit_environment: SourceBranchCommitEnvironment::default(),
+            problem_frame: ExperienceProblemFrame {
+                goal_pattern: "harden content addressed blob integrity".to_owned(),
+                task_or_action_type: "governed_task".to_owned(),
+                trigger_or_symptom: "corrupt blob bytes pass a path-only lookup".to_owned(),
+                desired_state_transition: "reject corrupt blob bytes fail closed".to_owned(),
+                ..ExperienceProblemFrame::default()
+            },
+            causal_model: ExperienceCausalModel {
+                mechanism: "a content-addressed path does not prove current byte identity"
+                    .to_owned(),
+                ..ExperienceCausalModel::default()
+            },
+            intervention_and_outcome: ExperienceInterventionOutcome {
+                decisive_action_or_non_action: "recompute the digest before returning bytes"
+                    .to_owned(),
+                observed_outcome: "corrupt existing blob is rejected".to_owned(),
+                ..ExperienceInterventionOutcome::default()
+            },
+            transfer_boundary: ExperienceTransferBoundary {
+                retrieval_cues: vec!["blob integrity".to_owned()],
+                applies_when: vec!["blob".to_owned()],
+                required_local_checks: vec!["blob".to_owned()],
+                recommended_first_probe: "inspect the current blob read path".to_owned(),
+                ..ExperienceTransferBoundary::default()
+            },
+            maturity: ExperienceMaturity {
+                state: ExperienceMaturityState::ReconstructedCase,
+                support_count: 1,
+                contrast_count: 0,
+                cross_host_transfer_count: 0,
+                negative_transfer_count: 0,
+            },
+            authority: ExperienceAuthority::default(),
+            formed_at: OffsetDateTime::UNIX_EPOCH,
         }
     }
 
@@ -4180,6 +4229,84 @@ mod current_git_scope_tests {
         assert_eq!(
             result.response_supplement["ul_experiment"]["packet_disposition"],
             "admitted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn treatment_mode_attaches_natural_case_without_candidate_handle()
+    -> Result<(), PacketCompilePlanInvalid> {
+        let project_id = ProjectId::new_v7();
+        let task_id = TaskId::new_v7().to_string();
+        let request = CompilePacketL3Request {
+            project_id,
+            task_id: task_id.clone(),
+            goal: "harden fail-closed integrity for content-addressed blob reads".to_owned(),
+            candidate_handles: Vec::new(),
+            max_tokens: 1_800,
+        };
+        let claim = verified_claim(project_id, BRANCH);
+        let mut packet = packet(project_id, &claim);
+        packet.task_id.clone_from(&task_id);
+        packet.goal.clone_from(&request.goal);
+        packet.causal_bridge = vec![CausalBridgeHop {
+            from: "blob task intent".to_owned(),
+            relation: "owned_by".to_owned(),
+            to: "crates/eliot-store/src/blob_store.rs".to_owned(),
+            evidence_ref: Some("task-write-receipt".to_owned()),
+        }];
+        let mut report = codecortex_identity_report();
+        report.file_evidence.clone_from(&report.tracked_files);
+        attach_codecortex_reports(&mut packet, std::slice::from_ref(&report));
+        let plan = PacketCompilePlan {
+            request,
+            session_id: SessionId::new_v7(),
+            compile_mode: PacketCompileMode::CertificationTreatment,
+            memory_exposure: MemoryExposureMode::IncludeCaseCandidates,
+            task_contract: None,
+            task_receipt_metadata: None,
+            previous_packet: None,
+            material_frame: Some(MaterialPacketFrame {
+                causal_bridge: packet.causal_bridge.clone(),
+                expected_observable: "corrupt blob bytes are rejected".to_owned(),
+                verifier: "blob-integrity-verifier".to_owned(),
+                next_allowed_action: "inspect the current blob read path".to_owned(),
+                stop_condition: "stop on verifier failure".to_owned(),
+                ..MaterialPacketFrame::default()
+            }),
+            codecortex_reports: vec![report],
+            current_git_scope: None,
+            touched_paths: vec!["crates/eliot-store/src/blob_store.rs".to_owned()],
+            resolved_cues: PacketResolvedCues::default(),
+            pyramid_source: PacketPyramidSource::Unavailable {
+                reason: "not needed by this focused experience-selection test".to_owned(),
+            },
+            experience_source: PacketExperienceSource::Cases(vec![blob_integrity_case(project_id)]),
+            budget_policy: PacketBudgetPolicy::governor_default(1_800),
+            measurement_view: None,
+        };
+
+        assert_eq!(
+            MemoryNeedService::decide(&packet_task_meaning_frame(&plan, &packet), None).need,
+            MemoryNeed::None,
+            "the complete current frame must exercise the explicit treatment override"
+        );
+        attach_packet_plan_sources(&plan, &mut packet, false)?;
+
+        assert!(plan.request.candidate_handles.is_empty());
+        assert_eq!(
+            packet
+                .memory_need_decision
+                .as_ref()
+                .map(|decision| decision.need),
+            Some(MemoryNeed::CausalCase)
+        );
+        assert_eq!(packet.experience_priors.len(), 1);
+        assert!(
+            packet
+                .exact_handles
+                .iter()
+                .all(|handle| !handle.contains("experience-case-natural-blob-integrity"))
         );
         Ok(())
     }

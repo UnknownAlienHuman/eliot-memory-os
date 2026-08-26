@@ -1,11 +1,12 @@
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_types::{
-    AgentId, BlastRadiusView, CodeCortexReport, CodeCortexRequest, CodeCortexScopeBinding,
-    CodeEvidenceSource, CommandContext, DiagnosticEvidence, FileEvidence, InvariantCard,
-    LifecycleStatus, OperationStatus, ProjectId, SemanticCommand, SymbolEvidence, TaintClass,
-    TaskId, ToolObservationRecordCommand, VerifierEvidence, Visibility, WriteId, WriteReceiptRef,
+    AgentId, BlastRadiusView, CodeCortexPacketView, CodeCortexReport, CodeCortexRequest,
+    CodeCortexScopeBinding, CodeEvidenceSource, CommandContext, DiagnosticEvidence, FileEvidence,
+    InvariantCard, LifecycleStatus, OperationStatus, ProjectId, SemanticCommand, SessionId,
+    SymbolEvidence, TaintClass, TaskId, ToolObservationRecordCommand, VerifierEvidence, Visibility,
+    WriteId, WriteReceiptRef,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
@@ -15,6 +16,11 @@ use time::OffsetDateTime;
 
 const DEFAULT_MAX_FILES: usize = 160;
 const DEFAULT_MAX_MATCHES_PER_PATTERN: usize = 24;
+const CODECORTEX_MEMORY_PAYLOAD_SCHEMA_VERSION: &str = "codecortex-memory-projection-v1";
+const CODECORTEX_MEMORY_PAYLOAD_MAX_BYTES: usize = 96 * 1024;
+const CODECORTEX_MEMORY_EVIDENCE_LIMIT: usize = 12;
+const CODECORTEX_MEMORY_TEXT_MAX_BYTES: usize = 512;
+const CODECORTEX_MEMORY_LIST_TEXT_MAX_BYTES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct CodeCortexService {
@@ -296,23 +302,34 @@ impl CodeCortexMemoryWriter {
         admission: &WriteAdmissionService,
         report: &mut CodeCortexReport,
     ) -> Result<WriteReceiptRef, EngineError> {
-        let command = SemanticCommand::ToolObservationRecord(ToolObservationRecordCommand {
-            context: CommandContext {
-                write_id: WriteId::new_v7(),
-                agent_id: AgentId::new_v7(),
-                session_id: None,
-                project_id: ProjectId::new_v7(),
-                task_id: Some(TaskId::new_v7()),
-                scope: "codecortex-d1".to_owned(),
-                authority: "local-codecortex".to_owned(),
-                visibility: Visibility::Internal,
-                taint: TaintClass::LocalVerified,
-                lifecycle_status: LifecycleStatus::Active,
-            },
-            tool_name: "codecortex_internal_report".to_owned(),
-            observation: format!("CodeCortex internal report for task {}", report.task),
-            payload: serde_json::to_value(&*report)?,
-        });
+        Self::write_report_with_scope(handle, admission, report, None).await
+    }
+
+    pub async fn write_report_scoped(
+        handle: &WriterHandle,
+        admission: &WriteAdmissionService,
+        report: &mut CodeCortexReport,
+        session_id: SessionId,
+        project_id: ProjectId,
+        task_id: TaskId,
+    ) -> Result<WriteReceiptRef, EngineError> {
+        Self::write_report_with_scope(
+            handle,
+            admission,
+            report,
+            Some((session_id, project_id, task_id)),
+        )
+        .await
+    }
+
+    async fn write_report_with_scope(
+        handle: &WriterHandle,
+        admission: &WriteAdmissionService,
+        report: &mut CodeCortexReport,
+        scope: Option<(SessionId, ProjectId, TaskId)>,
+    ) -> Result<WriteReceiptRef, EngineError> {
+        let payload = bounded_codecortex_memory_payload(report)?;
+        let command = codecortex_observation_command(report, payload, scope);
         let envelope = admission.admit(&command)?;
         let receipt = handle.submit(envelope).await?;
         let receipt_ref = WriteReceiptRef {
@@ -322,6 +339,250 @@ impl CodeCortexMemoryWriter {
         report.memory_receipt = Some(receipt_ref.clone());
         Ok(receipt_ref)
     }
+}
+
+fn codecortex_observation_command(
+    report: &CodeCortexReport,
+    payload: Value,
+    scope: Option<(SessionId, ProjectId, TaskId)>,
+) -> SemanticCommand {
+    let (session_id, project_id, task_id) = scope.map_or_else(
+        || (None, ProjectId::new_v7(), TaskId::new_v7()),
+        |(session_id, project_id, task_id)| (Some(session_id), project_id, task_id),
+    );
+    SemanticCommand::ToolObservationRecord(ToolObservationRecordCommand {
+        context: CommandContext {
+            write_id: WriteId::new_v7(),
+            agent_id: AgentId::new_v7(),
+            session_id,
+            project_id,
+            task_id: Some(task_id),
+            scope: "codecortex-d1".to_owned(),
+            authority: "local-codecortex".to_owned(),
+            visibility: Visibility::Internal,
+            taint: TaintClass::LocalVerified,
+            lifecycle_status: LifecycleStatus::Active,
+        },
+        tool_name: "codecortex_internal_report".to_owned(),
+        observation: format!(
+            "CodeCortex internal report for task {}",
+            truncate_text(&report.task, CODECORTEX_MEMORY_LIST_TEXT_MAX_BYTES)
+        ),
+        payload,
+    })
+}
+
+fn bounded_codecortex_memory_payload(report: &CodeCortexReport) -> Result<Value, EngineError> {
+    let mut canonical_report = report.clone();
+    canonical_report.memory_receipt = None;
+    let full_report_bytes = serde_json::to_vec(&canonical_report)?;
+    let full_report_digest = format!("blake3:{}", blake3::hash(&full_report_bytes).to_hex());
+
+    let mut evidence_limit = CODECORTEX_MEMORY_EVIDENCE_LIMIT;
+    loop {
+        let payload = codecortex_memory_payload_at_limit(
+            &canonical_report,
+            &full_report_digest,
+            full_report_bytes.len(),
+            evidence_limit,
+        );
+        if serde_json::to_vec(&payload)?.len() <= CODECORTEX_MEMORY_PAYLOAD_MAX_BYTES {
+            return Ok(payload);
+        }
+        if evidence_limit == 0 {
+            return Err(EngineError::WriteRejected(
+                "CodeCortex memory projection exceeds its bounded payload".to_owned(),
+            ));
+        }
+        evidence_limit /= 2;
+    }
+}
+
+fn codecortex_memory_payload_at_limit(
+    report: &CodeCortexReport,
+    full_report_digest: &str,
+    full_report_bytes: usize,
+    evidence_limit: usize,
+) -> Value {
+    let report_ref = crate::context::codecortex_report_ref(report);
+    let packet_view = CodeCortexPacketView {
+        report_refs: vec![report_ref.clone()],
+        git_head: report.git_head.clone(),
+        scope_binding: bounded_scope_binding(&report.scope_binding),
+        file_evidence: report
+            .file_evidence
+            .iter()
+            .take(evidence_limit)
+            .map(bounded_file_evidence)
+            .collect(),
+        symbol_evidence: report
+            .symbol_evidence
+            .iter()
+            .take(evidence_limit)
+            .map(bounded_symbol_evidence)
+            .collect(),
+        diagnostic_evidence: report
+            .diagnostic_evidence
+            .iter()
+            .take(evidence_limit)
+            .map(bounded_diagnostic_evidence)
+            .collect(),
+        verifier_map: report
+            .verifier_evidence
+            .iter()
+            .take(evidence_limit)
+            .map(bounded_verifier_evidence)
+            .collect(),
+        blast_radius: bounded_blast_radius(&report.blast_radius),
+        unknowns: crate::context::codecortex_unknowns(report)
+            .iter()
+            .take(CODECORTEX_MEMORY_EVIDENCE_LIMIT)
+            .map(|value| truncate_text(value, CODECORTEX_MEMORY_TEXT_MAX_BYTES))
+            .collect(),
+    };
+    let included = json!({
+        "file_evidence": packet_view.file_evidence.len(),
+        "symbol_evidence": packet_view.symbol_evidence.len(),
+        "diagnostic_evidence": packet_view.diagnostic_evidence.len(),
+        "verifier_evidence": packet_view.verifier_map.len(),
+        "blast_radius_files": packet_view.blast_radius.files.len(),
+        "blast_radius_crates": packet_view.blast_radius.crates.len(),
+        "blast_radius_reasons": packet_view.blast_radius.reasons.len(),
+        "unknowns": packet_view.unknowns.len(),
+    });
+    let counts = json!({
+        "tracked_files": report.tracked_files.len(),
+        "workspace_members": report.workspace_members.len(),
+        "crates": report.crates.len(),
+        "targets": report.targets.len(),
+        "file_evidence": report.file_evidence.len(),
+        "symbol_evidence": report.symbol_evidence.len(),
+        "diagnostic_evidence": report.diagnostic_evidence.len(),
+        "verifier_evidence": report.verifier_evidence.len(),
+        "invariant_cards": report.invariant_cards.len(),
+        "evidence_sources": report.evidence_sources.len(),
+        "adapter_notes": report.adapter_notes.len(),
+    });
+    let projection_truncated = report.file_evidence.len() > packet_view.file_evidence.len()
+        || report.symbol_evidence.len() > packet_view.symbol_evidence.len()
+        || report.diagnostic_evidence.len() > packet_view.diagnostic_evidence.len()
+        || report.verifier_evidence.len() > packet_view.verifier_map.len()
+        || report.blast_radius.files.len() > packet_view.blast_radius.files.len()
+        || report.blast_radius.crates.len() > packet_view.blast_radius.crates.len()
+        || report.blast_radius.reasons.len() > packet_view.blast_radius.reasons.len()
+        || crate::context::codecortex_unknowns(report).len() > packet_view.unknowns.len()
+        || !report.tracked_files.is_empty()
+        || !report.workspace_members.is_empty()
+        || !report.crates.is_empty()
+        || !report.targets.is_empty()
+        || !report.invariant_cards.is_empty()
+        || !report.evidence_sources.is_empty()
+        || !report.adapter_notes.is_empty();
+
+    json!({
+        "schema_version": CODECORTEX_MEMORY_PAYLOAD_SCHEMA_VERSION,
+        "report_ref": report_ref,
+        "project": truncate_text(&report.project, CODECORTEX_MEMORY_TEXT_MAX_BYTES),
+        "task": truncate_text(&report.task, CODECORTEX_MEMORY_TEXT_MAX_BYTES),
+        "goal": truncate_text(&report.goal, CODECORTEX_MEMORY_TEXT_MAX_BYTES),
+        "generated_at": report.generated_at,
+        "final_status": report.operation_status,
+        "dirty": report.dirty,
+        "full_report_digest": full_report_digest,
+        "full_report_bytes": full_report_bytes,
+        "counts": counts,
+        "included": included,
+        "projection_truncated": projection_truncated,
+        "packet_view": packet_view,
+    })
+}
+
+fn bounded_scope_binding(binding: &CodeCortexScopeBinding) -> CodeCortexScopeBinding {
+    CodeCortexScopeBinding {
+        branch: binding.branch.clone(),
+        commit: binding.commit.clone(),
+        dirty_state_hash: binding.dirty_state_hash.clone(),
+        adapter_versions: binding.adapter_versions.clone(),
+        verifier_config_hash: binding.verifier_config_hash.clone(),
+    }
+}
+
+fn bounded_file_evidence(evidence: &FileEvidence) -> FileEvidence {
+    FileEvidence {
+        path: truncate_text(&evidence.path, CODECORTEX_MEMORY_TEXT_MAX_BYTES),
+        content_hash: evidence
+            .content_hash
+            .as_deref()
+            .map(|value| truncate_text(value, CODECORTEX_MEMORY_LIST_TEXT_MAX_BYTES)),
+        line_start: evidence.line_start,
+        line_end: evidence.line_end,
+        excerpt: truncate_text(&evidence.excerpt, CODECORTEX_MEMORY_TEXT_MAX_BYTES),
+        source: evidence.source,
+    }
+}
+
+fn bounded_symbol_evidence(evidence: &SymbolEvidence) -> SymbolEvidence {
+    SymbolEvidence {
+        name: truncate_text(&evidence.name, CODECORTEX_MEMORY_LIST_TEXT_MAX_BYTES),
+        kind: truncate_text(&evidence.kind, CODECORTEX_MEMORY_LIST_TEXT_MAX_BYTES),
+        path: truncate_text(&evidence.path, CODECORTEX_MEMORY_TEXT_MAX_BYTES),
+        line: evidence.line,
+        source: evidence.source,
+    }
+}
+
+fn bounded_diagnostic_evidence(evidence: &DiagnosticEvidence) -> DiagnosticEvidence {
+    DiagnosticEvidence {
+        source: evidence.source,
+        status: truncate_text(&evidence.status, CODECORTEX_MEMORY_LIST_TEXT_MAX_BYTES),
+        path: evidence
+            .path
+            .as_deref()
+            .map(|value| truncate_text(value, CODECORTEX_MEMORY_TEXT_MAX_BYTES)),
+        line: evidence.line,
+        severity: truncate_text(&evidence.severity, CODECORTEX_MEMORY_LIST_TEXT_MAX_BYTES),
+        message: truncate_text(&evidence.message, CODECORTEX_MEMORY_TEXT_MAX_BYTES),
+    }
+}
+
+fn bounded_verifier_evidence(evidence: &VerifierEvidence) -> VerifierEvidence {
+    VerifierEvidence {
+        name: truncate_text(&evidence.name, CODECORTEX_MEMORY_LIST_TEXT_MAX_BYTES),
+        command: truncate_text(&evidence.command, CODECORTEX_MEMORY_TEXT_MAX_BYTES),
+        status: truncate_text(&evidence.status, CODECORTEX_MEMORY_LIST_TEXT_MAX_BYTES),
+        summary: truncate_text(&evidence.summary, CODECORTEX_MEMORY_TEXT_MAX_BYTES),
+        source: evidence.source,
+    }
+}
+
+fn bounded_blast_radius(blast_radius: &BlastRadiusView) -> BlastRadiusView {
+    BlastRadiusView {
+        files: bounded_text_list(&blast_radius.files),
+        crates: bounded_text_list(&blast_radius.crates),
+        reasons: bounded_text_list(&blast_radius.reasons),
+    }
+}
+
+fn bounded_text_list(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .take(CODECORTEX_MEMORY_EVIDENCE_LIMIT)
+        .map(|value| truncate_text(value, CODECORTEX_MEMORY_TEXT_MAX_BYTES))
+        .collect()
+}
+
+fn truncate_text(value: &str, max_bytes: usize) -> String {
+    const SUFFIX: &str = "...[truncated]";
+
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let target = max_bytes.saturating_sub(SUFFIX.len());
+    let mut end = target.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &value[..end], SUFFIX)
 }
 
 pub(crate) struct ProcessOutput {
@@ -967,4 +1228,198 @@ fn sanitize_name(value: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_codecortex_report_uses_bounded_memory_projection() -> Result<(), EngineError> {
+        let report = large_report();
+        let full_payload = serde_json::to_value(&report)?;
+        let full_command = codecortex_observation_command(&report, full_payload, None);
+        let full_command_bytes = serde_json::to_vec(&full_command)?.len();
+        assert!(
+            full_command_bytes > 128 * 1024,
+            "fixture must exercise the generic semantic-command size guard"
+        );
+        assert!(matches!(
+            WriteAdmissionService.admit(&full_command),
+            Err(EngineError::WriteRejected(reason))
+                if reason == "semantic command payload is too large"
+        ));
+
+        let payload = bounded_codecortex_memory_payload(&report)?;
+        let payload_bytes = serde_json::to_vec(&payload)?.len();
+        assert!(payload_bytes <= CODECORTEX_MEMORY_PAYLOAD_MAX_BYTES);
+        assert_eq!(
+            payload.get("schema_version").and_then(Value::as_str),
+            Some(CODECORTEX_MEMORY_PAYLOAD_SCHEMA_VERSION)
+        );
+        assert_eq!(payload["counts"]["tracked_files"], json!(1_080));
+        assert_eq!(payload["counts"]["workspace_members"], json!(2));
+        assert_eq!(payload["projection_truncated"], json!(true));
+        assert!(payload.get("tracked_files").is_none());
+        assert!(payload.get("workspace_members").is_none());
+        assert!(payload.get("repo_root").is_none());
+        assert!(
+            payload["packet_view"]["file_evidence"]
+                .as_array()
+                .is_some_and(|items| items.len() <= CODECORTEX_MEMORY_EVIDENCE_LIMIT)
+        );
+        assert!(
+            payload["full_report_digest"]
+                .as_str()
+                .is_some_and(|digest| digest.starts_with("blake3:"))
+        );
+        assert_eq!(
+            payload["report_ref"],
+            json!(crate::context::codecortex_report_ref(&report))
+        );
+
+        let bounded_command = codecortex_observation_command(&report, payload, None);
+        WriteAdmissionService.admit(&bounded_command)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_memory_text_preserves_utf8_boundaries() {
+        let value = "current-truth-🙂".repeat(100);
+        let truncated = truncate_text(&value, 128);
+        assert!(truncated.len() <= 128);
+        assert!(truncated.ends_with("...[truncated]"));
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn long_task_identity_does_not_escape_the_command_bound() -> Result<(), EngineError> {
+        let mut report = large_report();
+        report.task = "task-segment".repeat(1_500);
+
+        let payload = bounded_codecortex_memory_payload(&report)?;
+        assert_eq!(
+            payload["report_ref"],
+            json!(crate::context::codecortex_report_ref(&report))
+        );
+        let command = codecortex_observation_command(&report, payload, None);
+        let observation = match &command {
+            SemanticCommand::ToolObservationRecord(body) => &body.observation,
+            _ => unreachable!("helper must build a ToolObservationRecord"),
+        };
+        assert!(observation.len() < 512);
+        WriteAdmissionService.admit(&command)?;
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_command_uses_authenticated_project_task_and_session() {
+        let report = large_report();
+        let session_id = SessionId::new_v7();
+        let project_id = ProjectId::new_v7();
+        let task_id = TaskId::new_v7();
+        let command = codecortex_observation_command(
+            &report,
+            json!({ "bounded": true }),
+            Some((session_id, project_id, task_id)),
+        );
+        let context = command.context();
+        assert_eq!(context.session_id, Some(session_id));
+        assert_eq!(context.project_id, project_id);
+        assert_eq!(context.task_id, Some(task_id));
+    }
+
+    #[test]
+    fn pathological_task_identity_is_rejected_fail_closed() {
+        let mut report = large_report();
+        report.task = "task-segment".repeat(10_000);
+        assert!(matches!(
+            bounded_codecortex_memory_payload(&report),
+            Err(EngineError::WriteRejected(reason))
+                if reason == "CodeCortex memory projection exceeds its bounded payload"
+        ));
+    }
+
+    fn large_report() -> CodeCortexReport {
+        let tracked_files = (0..1_080)
+            .map(|index| FileEvidence {
+                path: format!(
+                    "crates/fixture-{index:04}/src/{}.rs",
+                    "large-inventory-segment".repeat(6)
+                ),
+                content_hash: Some(format!("blake3:{index:064x}")),
+                line_start: None,
+                line_end: None,
+                excerpt: String::new(),
+                source: CodeEvidenceSource::Git,
+            })
+            .collect();
+        let file_evidence = (0..24)
+            .map(|index| FileEvidence {
+                path: format!("crates/eliot-engine/src/fixture_{index}.rs"),
+                content_hash: Some(format!("blake3:{index:064x}")),
+                line_start: Some(index + 1),
+                line_end: Some(index + 1),
+                excerpt: format!("pub fn fixture_{index}() {{}}"),
+                source: CodeEvidenceSource::Rg,
+            })
+            .collect();
+        let mut adapter_versions = BTreeMap::new();
+        adapter_versions.insert("git".to_owned(), "2.51.0".to_owned());
+        adapter_versions.insert("rg".to_owned(), "14.1.1".to_owned());
+        CodeCortexReport {
+            project: "eliot-memory-os".to_owned(),
+            task: "codecortex-bounded-persistence".to_owned(),
+            goal: "Persist an authority-bound CodeCortex summary without bypassing admission"
+                .to_owned(),
+            generated_at: OffsetDateTime::UNIX_EPOCH,
+            repo_root: r"C:\Development\Rust\projects\eliot-memory-os".to_owned(),
+            git_head: Some("d5f0fdc".to_owned()),
+            dirty: true,
+            scope_binding: CodeCortexScopeBinding {
+                branch: "main".to_owned(),
+                commit: "d5f0fdc".to_owned(),
+                dirty_state_hash: "dirty-state-hash".to_owned(),
+                adapter_versions,
+                verifier_config_hash: "verifier-config-hash".to_owned(),
+            },
+            tracked_files,
+            workspace_members: vec!["eliot-engine".to_owned(), "eliot-types".to_owned()],
+            crates: vec!["eliot-engine".to_owned(), "eliot-types".to_owned()],
+            targets: vec!["eliot_engine".to_owned()],
+            file_evidence,
+            symbol_evidence: vec![SymbolEvidence {
+                name: "CodeCortexMemoryWriter".to_owned(),
+                kind: "struct".to_owned(),
+                path: "crates/eliot-engine/src/codecortex.rs".to_owned(),
+                line: Some(297),
+                source: CodeEvidenceSource::Rg,
+            }],
+            diagnostic_evidence: vec![DiagnosticEvidence {
+                source: CodeEvidenceSource::Diagnostics,
+                status: "clean".to_owned(),
+                path: None,
+                line: None,
+                severity: "info".to_owned(),
+                message: "focused diagnostics passed".to_owned(),
+            }],
+            verifier_evidence: vec![VerifierEvidence {
+                name: "bounded_projection".to_owned(),
+                command: "cargo test -p eliot-engine oversized_codecortex_report".to_owned(),
+                status: "pass".to_owned(),
+                summary: "bounded projection accepted while full payload was rejected".to_owned(),
+                source: CodeEvidenceSource::Diagnostics,
+            }],
+            blast_radius: BlastRadiusView {
+                files: vec!["crates/eliot-engine/src/codecortex.rs".to_owned()],
+                crates: vec!["eliot-engine".to_owned()],
+                reasons: vec!["memory persistence payload only".to_owned()],
+            },
+            invariant_cards: invariant_cards(),
+            evidence_sources: vec![CodeEvidenceSource::Git, CodeEvidenceSource::Diagnostics],
+            adapter_notes: vec!["full report remains the local artifact".to_owned()],
+            memory_receipt: None,
+            operation_status: OperationStatus::OperationCompleted,
+        }
+    }
 }

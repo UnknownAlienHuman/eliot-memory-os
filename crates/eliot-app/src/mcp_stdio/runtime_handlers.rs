@@ -387,6 +387,12 @@ async fn dispatch_task_contract_create(
     context: AuthenticatedRequestContext,
     arguments: Value,
 ) -> Result<Value> {
+    require_canonical_controller_authority(state)?;
+    let transition_authority = match state.profile {
+        McpAccessProfile::CodexController => "controller-task-contract",
+        McpAccessProfile::HumanOperator => "human-operator-task-contract",
+        _ => unreachable!("canonical task-contract authority was checked above"),
+    };
     let input: TaskContractCreateToolInput = serde_json::from_value(arguments)?;
     if input.acceptance_items.len() != 2 {
         anyhow::bail!("First Working Loop TaskContract requires exactly two acceptance items");
@@ -445,6 +451,7 @@ async fn dispatch_task_contract_create(
         action_lease_id: None,
         understanding_proof_hash: None,
         action_provenance: None,
+        memory_grant_redemptions: Vec::new(),
         observation_ids: Vec::new(),
         verification_ids: Vec::new(),
         verification_scopes: Vec::new(),
@@ -457,7 +464,7 @@ async fn dispatch_task_contract_create(
         project_id,
         write_id,
         contract,
-        "controller-task-contract",
+        transition_authority,
         TaintClass::LocalTool,
         TaskTransitionEvidence::default(),
     )
@@ -540,7 +547,8 @@ impl RegisteredTaskVerifier {
                 ],
                 "artifact_paths": [DOGFOOD_BLOB_ARTIFACT],
                 "timeout_seconds": 120,
-                "provider_kill_switch": true
+                "provider_kill_switch": true,
+                "cargo_target_policy": "runtime_owned_or_isolated_harness_owned_single_writer"
             }),
             Self::CargoWorkspaceCheck => json!({
                 "id": self.id(),
@@ -551,7 +559,8 @@ impl RegisteredTaskVerifier {
                 ],
                 "artifact_scope": "action_leased_exact_changed_paths",
                 "timeout_seconds": 300,
-                "provider_kill_switch": true
+                "provider_kill_switch": true,
+                "cargo_target_policy": "runtime_owned_or_isolated_harness_owned_single_writer"
             }),
         };
         let bytes =
@@ -574,6 +583,10 @@ impl RegisteredTaskVerifier {
             .find(|profile| profile.reference() == reference)
     }
 
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|profile| profile.id() == id)
+    }
+
     fn descriptor(self) -> Value {
         json!({
             "verifier_id": self.id(),
@@ -593,6 +606,8 @@ struct CanonicalPacketRefs {
     task_contract_ref: String,
     current_truth_refs: Vec<String>,
     negative_memory_check_ref: String,
+    experience_prior_handles: BTreeMap<String, String>,
+    experience_prior_guidance: BTreeMap<String, String>,
 }
 
 fn canonical_packet_refs(state: &McpState, task: &TaskContract) -> Result<CanonicalPacketRefs> {
@@ -643,6 +658,41 @@ fn canonical_packet_refs(state: &McpState, task: &TaskContract) -> Result<Canoni
             .clone(),
     )
     .context("active packet authority task_contract is invalid")?;
+    let mut experience_prior_handles = BTreeMap::new();
+    let mut experience_prior_guidance = BTreeMap::new();
+    for prior_value in response
+        .get("experience_priors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let prior: ExperienceBrief = serde_json::from_value(prior_value.clone())
+            .context("active packet experience prior is invalid")?;
+        let fingerprint = memory_grant::memory_grant_prior_fingerprint(&prior)?;
+        let guidance_hash = memory_grant::memory_grant_guidance_hash(&prior)?;
+        if let Some(existing) =
+            experience_prior_guidance.insert(fingerprint.clone(), guidance_hash.clone())
+        {
+            anyhow::ensure!(
+                existing == guidance_hash,
+                "active packet contains an ambiguous experience-prior fingerprint"
+            );
+        }
+        for handle in &prior.exact_source_handles {
+            anyhow::ensure!(
+                !handle.trim().is_empty() && handle == handle.trim(),
+                "experience prior contains a non-normalized memory handle"
+            );
+            if let Some(existing) =
+                experience_prior_handles.insert(handle.to_owned(), fingerprint.clone())
+            {
+                anyhow::ensure!(
+                    existing == fingerprint,
+                    "active packet contains an ambiguous experience-prior handle"
+                );
+            }
+        }
+    }
 
     let expected_task_contract_ref = format!(
         "eliot/task/{}@{}",
@@ -673,6 +723,8 @@ fn canonical_packet_refs(state: &McpState, task: &TaskContract) -> Result<Canoni
         task_contract_ref,
         current_truth_refs,
         negative_memory_check_ref,
+        experience_prior_handles,
+        experience_prior_guidance,
     })
 }
 
@@ -919,10 +971,107 @@ async fn resolve_action_source_scope(
     }
 }
 
+const ACTION_MEMORY_DELIVERY_REF_SCHEMA_VERSION: &str = "eliot.action-memory-delivery-ref.v1";
+
+fn bind_action_memory_deliveries(
+    project_id: ProjectId,
+    task_id: TaskId,
+    session_id: SessionId,
+    requested_handles: &[String],
+    receipts: &[InjectionReceipt],
+    packet_id: Option<&str>,
+    packet_experience_prior_handles: &BTreeMap<String, String>,
+    resolved_at: time::OffsetDateTime,
+) -> Result<Vec<ActionMemoryDeliveryRef>> {
+    let mut requested = BTreeSet::new();
+    for handle in requested_handles {
+        anyhow::ensure!(
+            !handle.trim().is_empty() && handle == handle.trim(),
+            "memory handle used by an action must be non-empty and normalized"
+        );
+        anyhow::ensure!(
+            requested.insert(handle.as_str()),
+            "memory handle used by an action must not be duplicated"
+        );
+    }
+
+    let mut bound = Vec::with_capacity(requested.len());
+    for handle in requested {
+        if let (Some(packet_id), Some(fingerprint)) =
+            (packet_id, packet_experience_prior_handles.get(handle))
+        {
+            bound.push(ActionMemoryDeliveryRef {
+                schema_version: ACTION_MEMORY_DELIVERY_REF_SCHEMA_VERSION.to_owned(),
+                project_id,
+                task_id,
+                session_id,
+                delivery_kind: ActionMemoryDeliveryKind::ContextPacketExperiencePrior,
+                delivery_id: packet_id.to_owned(),
+                memory_handle: handle.to_owned(),
+                delivery_surface: "context_packet_experience_prior".to_owned(),
+                source_fingerprint: fingerprint.clone(),
+                delivery_receipt_resolved_at: resolved_at,
+                evidence_class: ActionMemoryEvidenceClass::AgentDeclaredUseAfterServerDelivery,
+            });
+            continue;
+        }
+        let matching = receipts
+            .iter()
+            .filter(|receipt| {
+                receipt.session_id == session_id
+                    && receipt.task_id == Some(task_id)
+                    && receipt.item_ref == handle
+                    && receipt.outcome == "delivered"
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            matching.len() == 1,
+            "memory handle used by an action must resolve to exactly one delivered InjectionReceipt in the authenticated task session"
+        );
+        let receipt = matching[0];
+        anyhow::ensure!(
+            !receipt.surface.trim().is_empty()
+                && !receipt.source_fingerprint.trim().is_empty()
+                && matches!(receipt.render_form.as_str(), "handle" | "payload"),
+            "memory delivery receipt is incomplete or has an unsupported render form"
+        );
+        uuid::Uuid::parse_str(&receipt.injection_id)
+            .context("memory delivery receipt has a non-canonical injection id")?;
+        bound.push(ActionMemoryDeliveryRef {
+            schema_version: ACTION_MEMORY_DELIVERY_REF_SCHEMA_VERSION.to_owned(),
+            project_id,
+            task_id,
+            session_id,
+            delivery_kind: ActionMemoryDeliveryKind::InjectionReceipt,
+            delivery_id: receipt.injection_id.clone(),
+            memory_handle: receipt.item_ref.clone(),
+            delivery_surface: receipt.surface.clone(),
+            source_fingerprint: receipt.source_fingerprint.clone(),
+            delivery_receipt_resolved_at: resolved_at,
+            evidence_class: ActionMemoryEvidenceClass::AgentDeclaredUseAfterServerDelivery,
+        });
+    }
+    Ok(bound)
+}
+
+fn action_provenance_resolver_version(
+    memory_delivery_refs: &[ActionMemoryDeliveryRef],
+    memory_grant_refs: &[ActionMemoryGrantRef],
+) -> &'static str {
+    if !memory_grant_refs.is_empty() {
+        ACTION_PROVENANCE_RESOLVER_VERSION_V3
+    } else if memory_delivery_refs.is_empty() {
+        ACTION_PROVENANCE_RESOLVER_VERSION
+    } else {
+        ACTION_PROVENANCE_RESOLVER_VERSION_V2
+    }
+}
+
 async fn resolve_action_provenance(
     state: &McpState,
     project_id: ProjectId,
     task: &TaskContract,
+    session_id: SessionId,
     action_write_id: WriteId,
     input: &TaskActionToolInput,
 ) -> Result<(ActionProvenanceSet, RegisteredTaskVerifier)> {
@@ -970,6 +1119,64 @@ async fn resolve_action_provenance(
         anyhow::bail!("provenance must resolve the current TaskContract write");
     }
 
+    let resolved_at = time::OffsetDateTime::now_utc();
+    anyhow::ensure!(
+        input.memory_handles_used.is_empty() || input.memory_grant_tokens.is_empty(),
+        "legacy exact-handle evidence and opaque memory grants cannot be mixed in one action"
+    );
+    let memory_delivery_refs = if input.memory_handles_used.is_empty() {
+        Vec::new()
+    } else {
+        let (session_packet_id, _) = state.ul.touched.packet_context(project_id, session_id);
+        let same_session_packet_id = session_packet_id
+            .as_deref()
+            .filter(|packet_id| *packet_id == packet.packet_id);
+        let receipts = state
+            .store
+            .load_injection_receipts(project_id, session_id)
+            .await?;
+        bind_action_memory_deliveries(
+            project_id,
+            task.task_id,
+            session_id,
+            &input.memory_handles_used,
+            &receipts,
+            same_session_packet_id,
+            &packet.experience_prior_handles,
+            resolved_at,
+        )?
+    };
+
+    anyhow::ensure!(
+        input.memory_grant_tokens.len() <= 8,
+        "an action may redeem at most eight opaque memory grants"
+    );
+    let mut unique_grants = BTreeSet::new();
+    let mut memory_grant_refs = Vec::with_capacity(input.memory_grant_tokens.len());
+    for token in &input.memory_grant_tokens {
+        anyhow::ensure!(
+            !token.trim().is_empty()
+                && token == token.trim()
+                && unique_grants.insert(token.as_str()),
+            "opaque memory grant tokens must be non-empty, normalized, and unique"
+        );
+        memory_grant_refs.push(
+            memory_grant::resolve_memory_grant_ref(
+                state,
+                project_id,
+                task,
+                session_id,
+                token,
+                &packet,
+                resolved_at,
+            )
+            .await?,
+        );
+    }
+    memory_grant_refs.sort_by(|left, right| left.grant_id.cmp(&right.grant_id));
+
+    let resolver_version =
+        action_provenance_resolver_version(&memory_delivery_refs, &memory_grant_refs);
     let mut provenance = ActionProvenanceSet {
         provenance_set_id: format!("eliot/provenance-set/{action_write_id}"),
         task_id: task.task_id,
@@ -978,13 +1185,221 @@ async fn resolve_action_provenance(
         task_contract_ref: packet.task_contract_ref.clone(),
         current_truth_refs: packet.current_truth_refs,
         exact_evidence_refs,
+        memory_delivery_refs,
+        memory_grant_refs,
         negative_memory_check_ref: packet.negative_memory_check_ref,
         planned_verifier_ref: verifier.reference(),
         source_scope,
-        resolved_at: time::OffsetDateTime::now_utc(),
-        resolver_version: ACTION_PROVENANCE_RESOLVER_VERSION.to_owned(),
+        resolved_at,
+        resolver_version: resolver_version.to_owned(),
         hash: String::new(),
     };
     provenance.hash = canonical_struct_hash(&provenance)?;
     Ok((provenance, verifier))
+}
+
+#[cfg(test)]
+mod action_memory_delivery_tests {
+    use super::*;
+
+    fn receipt(
+        injection: u128,
+        session_id: SessionId,
+        task_id: TaskId,
+        handle: &str,
+    ) -> InjectionReceipt {
+        InjectionReceipt {
+            injection_id: uuid::Uuid::from_u128(injection).to_string(),
+            session_id,
+            task_id: Some(task_id),
+            surface: "mcp_response_piggyback".to_owned(),
+            item_ref: handle.to_owned(),
+            render_form: "payload".to_owned(),
+            fired_cues: Vec::new(),
+            token_cost: 4,
+            source_fingerprint: format!("fingerprint-{injection}"),
+            outcome: "delivered".to_owned(),
+            policy_reason: None,
+        }
+    }
+
+    #[test]
+    fn action_memory_delivery_binding_is_exact_and_explicitly_noncausal() {
+        let project_id = ProjectId::from_uuid(uuid::Uuid::from_u128(1));
+        let task_id = TaskId::from_uuid(uuid::Uuid::from_u128(2));
+        let session_id = SessionId::from_uuid(uuid::Uuid::from_u128(3));
+        let receipts = vec![receipt(4, session_id, task_id, "experience:bounded-retry")];
+
+        let bound = bind_action_memory_deliveries(
+            project_id,
+            task_id,
+            session_id,
+            &["experience:bounded-retry".to_owned()],
+            &receipts,
+            None,
+            &BTreeMap::new(),
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("same-session delivered memory must bind");
+
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].project_id, project_id);
+        assert_eq!(bound[0].task_id, task_id);
+        assert_eq!(bound[0].session_id, session_id);
+        assert_eq!(bound[0].delivery_id, receipts[0].injection_id);
+        assert_eq!(
+            bound[0].delivery_kind,
+            ActionMemoryDeliveryKind::InjectionReceipt
+        );
+        assert_eq!(bound[0].memory_handle, "experience:bounded-retry");
+        assert_eq!(
+            bound[0].evidence_class,
+            ActionMemoryEvidenceClass::AgentDeclaredUseAfterServerDelivery
+        );
+        assert_eq!(
+            action_provenance_resolver_version(&[], &[]),
+            ACTION_PROVENANCE_RESOLVER_VERSION,
+            "legacy empty provenance must preserve the v1 resolver/hash domain"
+        );
+        assert_eq!(
+            action_provenance_resolver_version(&bound, &[]),
+            ACTION_PROVENANCE_RESOLVER_VERSION_V2,
+            "memory-bound provenance must opt into the v2 resolver/hash domain"
+        );
+        let grant_uuid = uuid::Uuid::from_u128(44);
+        let grants = vec![ActionMemoryGrantRef {
+            schema_version: ACTION_MEMORY_GRANT_REF_SCHEMA_VERSION.to_owned(),
+            project_id,
+            task_id,
+            session_id,
+            grant_id: grant_uuid.to_string(),
+            offer_write_id: WriteId::from_uuid(grant_uuid),
+            packet_id: "packet:opaque-grant".to_owned(),
+            packet_revision_fence: MemoryRevision::new(7),
+            task_memory_revision: MemoryRevision::new(8),
+            task_contract_ref: "eliot/task/opaque-grant@8".to_owned(),
+            prior_fingerprint: "private-prior-fingerprint".to_owned(),
+            guidance_hash: "private-guidance-hash".to_owned(),
+            expires_at: time::OffsetDateTime::from_unix_timestamp(2_000_000_000)
+                .expect("fixed expiry is valid"),
+            redeemed_at: time::OffsetDateTime::UNIX_EPOCH,
+            evidence_class:
+                ActionMemoryGrantEvidenceClass::AgentReturnedOpaqueGrantAfterServerOffer,
+        }];
+        assert_eq!(
+            action_provenance_resolver_version(&[], &grants),
+            ACTION_PROVENANCE_RESOLVER_VERSION_V3,
+            "opaque grant provenance must opt into the v3 resolver/hash domain"
+        );
+    }
+
+    #[test]
+    fn action_memory_delivery_binding_accepts_only_same_session_packet_prior() {
+        let project_id = ProjectId::from_uuid(uuid::Uuid::from_u128(31));
+        let task_id = TaskId::from_uuid(uuid::Uuid::from_u128(32));
+        let session_id = SessionId::from_uuid(uuid::Uuid::from_u128(33));
+        let handle = "experience:naturally-ranked-prior";
+        let mut packet_priors = BTreeMap::new();
+        packet_priors.insert(handle.to_owned(), "prior-fingerprint".to_owned());
+
+        let bound = bind_action_memory_deliveries(
+            project_id,
+            task_id,
+            session_id,
+            &[handle.to_owned()],
+            &[],
+            Some("packet:same-session"),
+            &packet_priors,
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("same-session context-packet experience prior must bind");
+
+        assert_eq!(bound.len(), 1);
+        assert_eq!(
+            bound[0].delivery_kind,
+            ActionMemoryDeliveryKind::ContextPacketExperiencePrior
+        );
+        assert_eq!(bound[0].delivery_id, "packet:same-session");
+        assert_eq!(bound[0].memory_handle, handle);
+        assert_eq!(bound[0].source_fingerprint, "prior-fingerprint");
+
+        assert!(
+            bind_action_memory_deliveries(
+                project_id,
+                task_id,
+                session_id,
+                &[handle.to_owned()],
+                &[],
+                None,
+                &packet_priors,
+                time::OffsetDateTime::UNIX_EPOCH,
+            )
+            .is_err(),
+            "packet prior without authenticated same-session packet context must be rejected"
+        );
+    }
+
+    #[test]
+    fn action_memory_delivery_binding_rejects_fabricated_foreign_and_ambiguous_refs() {
+        let project_id = ProjectId::from_uuid(uuid::Uuid::from_u128(11));
+        let task_id = TaskId::from_uuid(uuid::Uuid::from_u128(12));
+        let other_task = TaskId::from_uuid(uuid::Uuid::from_u128(13));
+        let session_id = SessionId::from_uuid(uuid::Uuid::from_u128(14));
+        let other_session = SessionId::from_uuid(uuid::Uuid::from_u128(15));
+        let handle = "experience:server-owned";
+
+        let cases = [
+            (
+                vec![receipt(16, session_id, other_task, handle)],
+                vec![handle.to_owned()],
+            ),
+            (
+                vec![receipt(17, other_session, task_id, handle)],
+                vec![handle.to_owned()],
+            ),
+            (
+                vec![receipt(18, session_id, task_id, handle)],
+                vec![handle.to_owned(), handle.to_owned()],
+            ),
+            (
+                vec![
+                    receipt(19, session_id, task_id, handle),
+                    receipt(20, session_id, task_id, handle),
+                ],
+                vec![handle.to_owned()],
+            ),
+        ];
+
+        for (receipts, requested) in cases {
+            assert!(
+                bind_action_memory_deliveries(
+                    project_id,
+                    task_id,
+                    session_id,
+                    &requested,
+                    &receipts,
+                    None,
+                    &BTreeMap::new(),
+                    time::OffsetDateTime::UNIX_EPOCH,
+                )
+                .is_err()
+            );
+        }
+
+        let mut undelivered = receipt(21, session_id, task_id, handle);
+        undelivered.outcome = "suppressed".to_owned();
+        assert!(
+            bind_action_memory_deliveries(
+                project_id,
+                task_id,
+                session_id,
+                &[handle.to_owned()],
+                &[undelivered],
+                None,
+                &BTreeMap::new(),
+                time::OffsetDateTime::UNIX_EPOCH,
+            )
+            .is_err()
+        );
+    }
 }

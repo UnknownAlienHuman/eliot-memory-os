@@ -1103,8 +1103,59 @@ pub(super) fn task_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_task_action_request",
             "Eliot Task Action Request",
-            "Deny incomplete understanding or issue one bounded task ActionLease with a receipt.",
-            &json!({ "type": "object" }),
+            "Deny incomplete understanding or issue one bounded task ActionLease with a receipt. Read the task_cognition projection first and pass its copyable provenance_handles array unchanged. memory_grant_tokens lets the same bound task session acknowledge an opaque server offer without receiving an exact memory handle. This proves offer-and-return, not causal benefit.",
+            &json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "task_id": {"type": "string"},
+                    "write_id": {"type": "string"},
+                    "expected_revision": {"type": "integer", "minimum": 0},
+                    "packet_id": {"type": "string"},
+                    "packet_revision_fence": {"type": "integer", "minimum": 1},
+                    "task_contract_ref": {"type": "string"},
+                    "current_truth_refs": {"type": "array", "items": {"type": "string"}},
+                    "provenance_handles": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string"},
+                        "description": "Exact copyable provenance_handles array from the active task_cognition projection. Each item is a canonical WriteReceipt id; do not substitute a task ref or leave the array empty."
+                    },
+                    "memory_handles_used": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional handles the agent cites for this action. The daemon resolves them to persisted same-session InjectionReceipts."
+                    },
+                    "memory_grant_tokens": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {"type": "string", "pattern": "^mg1:"},
+                        "description": "Optional opaque offers returned by this same Governor-bound task session. Tokens reveal no exact memory handle or source URI."
+                    },
+                    "negative_memory_checked": {"type": "boolean"},
+                    "negative_memory_check_ref": {"type": "string"},
+                    "planned_action": {"type": "string"},
+                    "planned_verifier_ref": {"type": "string"},
+                    "worktree_ref": {"type": "string"},
+                    "artifact_paths": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": [
+                    "project_id",
+                    "task_id",
+                    "write_id",
+                    "expected_revision",
+                    "packet_id",
+                    "packet_revision_fence",
+                    "task_contract_ref",
+                    "current_truth_refs",
+                    "provenance_handles",
+                    "negative_memory_checked",
+                    "negative_memory_check_ref",
+                    "planned_action",
+                    "planned_verifier_ref"
+                ]
+            }),
         ),
         tool(
             "eliot_task_observation_record",
@@ -1388,7 +1439,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_codecortex_scan",
             "Eliot CodeCortex Scan",
-            "Run a governed internal CodeCortex grounding scan and write its report through WriterActor.",
+            "Run a governed grounding-only CodeCortex scan and write its report through WriterActor. Cargo diagnostics must run through a registered verifier.",
             &codecortex_scan_schema(),
         ),
         tool(

@@ -18,5 +18,8 @@ time.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+eliot-windows-ipc = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

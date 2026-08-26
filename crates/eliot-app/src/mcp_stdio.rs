@@ -2,9 +2,12 @@
 use crate::config::load_config;
 use crate::{
     action_plan, calibration_runtime, delegation_runtime, named_pipe_ipc,
-    runtime_instance::{RuntimeInstance, RuntimePublication, atomic_write_json},
+    runtime_instance::{
+        RuntimeInstance, RuntimePublication, atomic_write_bytes, atomic_write_json,
+    },
 };
 use anyhow::{Context, Result};
+use eliot_engine::host::ActiveRoleAuthorityCheck;
 use eliot_engine::{
     AdapterMemoryWriter, AdapterObservationBridge, AdapterObservationReport, AdapterRegistry,
     AdapterSupervisor, AgentSessionService, AntigravityAuthCheckService, AntigravityBinaryResolver,
@@ -67,73 +70,79 @@ use eliot_engine::{
 };
 use eliot_store::{BlobStore, CanonicalClaimCard, CanonicalRecord, CanonicalStore, ControlWal};
 use eliot_types::{
-    ActionKind, ActionLease, ActionLeaseId, ActionProvenanceSet, ActionSourceScope,
-    AdapterCapability, AgentCandidateCurationInput, AgentCandidateSubmitInput,
-    AgentCapabilityEnvelope, AgentHostId, AgentId, AgentInvocationRequest, AgentResultDisposition,
-    AgentResultDispositionKind, AgentResultEnvelope, AgentResultRecordCommand, AgentResultStatus,
-    AgentRole, AgentRoutingView, AgentSessionId, AntigravityAuthCheck, AntigravityBinaryResolution,
-    AntigravityCapabilityProbe, AntigravityCommandContract, AntigravityDisableReceipt,
-    AntigravityEnablementReceipt, AntigravityLiveSmokeResult, AntigravityMcpInvocationReceipt,
-    AntigravityReviewMode, AntigravityRun, ApprovalView, AutonomyRunContract, AutonomyRunState,
-    BenchmarkIntegrityReceipt, BlackboardItemId, BlackboardItemKind, BlackboardScope,
-    BlobStoreConfig, COGNITIVE_RUN_EXACT_CALLS, COGNITIVE_RUN_RAW_VERIFIER_CALLS,
-    COGNITIVE_RUN_SCHEMA_VERSION, CandidateDiff, CandidateDiffId, CandidateDiffStatus,
-    CandidateReview, CandidateReviewDecision, CanonicalCaseDisposition, CanonicalReplayAuthority,
-    CanonicalReplayExecutionRecord, CanonicalReplayObservationEvidence,
-    CanonicalTraceCompletenessContract, CanonicalTraceEvidence, CanonicalTraceEvidenceKind,
-    CanonicalTraceEvidenceSource, CanonicalTraceReceiptBinding, ChangePlan, ClaimCardInput,
-    ClaimId, CodeCortexReport, CodeCortexRequest, CognitiveCandidateCapability, CognitiveCaseSpec,
-    CognitiveExecutionSeal, CognitiveFailureLocalizationReport, CognitiveGateRequest,
-    CognitiveHostObservation, CognitiveInvocationRole, CognitiveRawVerifierEvidence,
-    CognitiveReaderAnswer, CognitiveRunAttempt, CognitiveRunCallPlan, CognitiveRunCallStatus,
-    CognitiveRunContract, CognitiveRunTerminal, CognitiveSharedGateBinding,
-    CognitiveToolObservation, CommandContext, CompilePacketL3Request, CompletionDecisionMemory,
-    CompletionMemoryAdmission, CompletionMemoryRequest, CompletionProof, CompletionStatus,
-    ConfidenceLevel, ContextPacketL3, ContrastiveAbstractionResult, ControlWalConfig,
-    ControllerCommitHandoff, CostLedger, CredentialPurpose, CurrentStateRequest, DashboardReport,
-    DataRootMode, EpistemicStatus, EvalBaseline, EvalCase, EvalDatasetManifest, EvalFailureCluster,
-    EvalFamily, EvalRun, EvalRunId, EvalRunProfile, EvalSuite, EvalVerdict, EvalVerdictStatus,
-    EvidenceAtomInput, EvidenceId, ExperienceCase, ExperienceFormationResult, ExperiencePattern,
+    ACTION_MEMORY_GRANT_REDEMPTION_SCHEMA_VERSION, ACTION_MEMORY_GRANT_REF_SCHEMA_VERSION,
+    ActionKind, ActionLease, ActionLeaseId, ActionMemoryDeliveryKind, ActionMemoryDeliveryRef,
+    ActionMemoryEvidenceClass, ActionMemoryGrantEvidenceClass, ActionMemoryGrantRedemption,
+    ActionMemoryGrantRef, ActionProvenanceSet, ActionSourceScope, AdapterCapability,
+    AgentCandidateCurationInput, AgentCandidateSubmitInput, AgentCapabilityEnvelope, AgentHostId,
+    AgentId, AgentInvocationRequest, AgentResultDisposition, AgentResultDispositionKind,
+    AgentResultEnvelope, AgentResultRecordCommand, AgentResultStatus, AgentRole, AgentRoutingView,
+    AgentSessionId, AntigravityAuthCheck, AntigravityBinaryResolution, AntigravityCapabilityProbe,
+    AntigravityCommandContract, AntigravityDisableReceipt, AntigravityEnablementReceipt,
+    AntigravityLiveSmokeResult, AntigravityMcpInvocationReceipt, AntigravityReviewMode,
+    AntigravityRun, ApprovalView, AutonomyRunContract, AutonomyRunState, BenchmarkIntegrityReceipt,
+    BlackboardItemId, BlackboardItemKind, BlackboardScope, BlobStoreConfig,
+    COGNITIVE_RUN_EXACT_CALLS, COGNITIVE_RUN_RAW_VERIFIER_CALLS, COGNITIVE_RUN_SCHEMA_VERSION,
+    CandidateDiff, CandidateDiffId, CandidateDiffStatus, CandidateReview, CandidateReviewDecision,
+    CanonicalCaseDisposition, CanonicalReplayAuthority, CanonicalReplayExecutionRecord,
+    CanonicalReplayObservationEvidence, CanonicalTraceCompletenessContract, CanonicalTraceEvidence,
+    CanonicalTraceEvidenceKind, CanonicalTraceEvidenceSource, CanonicalTraceReceiptBinding,
+    ChangePlan, ClaimCardInput, ClaimId, CodeCortexReport, CodeCortexRequest,
+    CognitiveCandidateCapability, CognitiveCaseSpec, CognitiveExecutionSeal,
+    CognitiveFailureLocalizationReport, CognitiveGateRequest, CognitiveHostObservation,
+    CognitiveInvocationRole, CognitiveRawVerifierEvidence, CognitiveReaderAnswer,
+    CognitiveRunAttempt, CognitiveRunCallPlan, CognitiveRunCallStatus, CognitiveRunContract,
+    CognitiveRunTerminal, CognitiveSharedGateBinding, CognitiveToolObservation, CommandContext,
+    CompilePacketL3Request, CompletionDecisionMemory, CompletionMemoryAdmission,
+    CompletionMemoryRequest, CompletionProof, CompletionStatus, ConfidenceLevel, ContextPacketL3,
+    ContrastiveAbstractionResult, ControlWalConfig, ControllerCommitHandoff, CostLedger,
+    CredentialPurpose, CurrentStateRequest, DashboardReport, DataRootMode, EpistemicStatus,
+    EvalBaseline, EvalCase, EvalDatasetManifest, EvalFailureCluster, EvalFamily, EvalRun,
+    EvalRunId, EvalRunProfile, EvalSuite, EvalVerdict, EvalVerdictStatus, EvidenceAtomInput,
+    EvidenceId, ExperienceBrief, ExperienceCase, ExperienceFormationResult, ExperiencePattern,
     ExperienceRecallRequest, ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState,
     ExternalOutputSchemaKind, ExternalProviderProfile, ExternalReviewBudget,
     ExternalReviewGateDecisionKind, ExternalReviewPacket, ExternalReviewRequest,
     ExternalReviewRole, FetchAtomsL2Request, FetchAtomsL2Response, ForgettingOperator,
-    ForgettingReason, LatencyHistogram, LifecycleStatus, MailboxMessageId, MailboxMessageKind,
-    MailboxRecipient, MaintenanceJobKind, MaterialPacketFrame, MemoryAdmissionDecision,
-    MemoryCurationCandidate, MemoryCurationCorpusProfile, MemoryCurationFindingKind,
-    MemoryCurationPreviewRequest, MemoryCurationPreviewResponse, MemoryDistillationCorpusItem,
-    MemoryDistillationFinding, MemoryDistillationInput, MemoryDistillationScheduleRequest,
-    MemoryExposureMode, MemoryExposurePolicy, MemoryInfluenceClass, MemoryInfluenceReport,
+    ForgettingReason, InjectionReceipt, LatencyHistogram, LifecycleStatus,
+    MEMORY_DELIVERY_GRANT_SCHEMA_VERSION, MailboxMessageId, MailboxMessageKind, MailboxRecipient,
+    MaintenanceJobKind, MaterialPacketFrame, MemoryAdmissionDecision, MemoryCurationCandidate,
+    MemoryCurationCorpusProfile, MemoryCurationFindingKind, MemoryCurationPreviewRequest,
+    MemoryCurationPreviewResponse, MemoryDistillationCorpusItem, MemoryDistillationFinding,
+    MemoryDistillationInput, MemoryDistillationScheduleRequest, MemoryExposureMode,
+    MemoryExposurePolicy, MemoryGrantOfferRecord, MemoryInfluenceClass, MemoryInfluenceReport,
     MemoryInfluenceToolInput, MemoryInfluenceTrace, MemoryInfluenceTraceWriteResult,
     MemoryInspectorView, MemoryLifecyclePacketView, MemoryLifecycleState, MemoryNeed,
     MemoryRevision, MemoryStateTransition, MemoryUtilitySourceRecord, MemoryWriteEnvelope,
     MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence, MetaPolicyAuthorization,
     MetaPolicyExecutionAction, MetricDefinition, MetricSample, MetricWindow,
     MinorityPressureRecord, MinorityPressureStatus, NegativeTransferHarm,
-    OPERATOR_CONTRACT_MANIFEST, OPERATOR_IPC_PROTOCOL_VERSION, OPERATOR_SCHEMA_VERSION,
-    OperationJob, OperationJobState, OperationStatus, OperatorActionView, OperatorCommand,
-    OperatorCommandReceipt, OperatorControlRequest, OperatorFieldView, OperatorProjectionFilter,
-    OperatorProjectionKind, OperatorProjectionPage, OperatorQueryOperation, OperatorQueryRequest,
-    OperatorRecordView, OperatorRelationshipView, OperatorSnapshot, PatchRequest, PatchRequestId,
-    ProcedurePromotionOutcome, ProfileVerificationRun, ProjectId, QualitySignal,
-    ReactivationCondition, ReadConsistencyMode, RecallL0Request, RecallL0Response, ReceiptId,
-    ReplayCaseKind, ReplayInputSnapshot, ReplaySetRole, ReplayThresholdPolicyV1, RuntimeMode,
-    SealedReplaySetRecord, SemanticCommand, SemanticCommandKind, ServiceHealthState,
-    ServiceRuntimeStatus, SessionId, SkillCardV2, SkillCurationAction, SkillCurationGateDecision,
-    SkillCurationProposal, SkillCuratorRun, SkillExecutionOutcome, SkillFailureMode, SkillId,
-    SkillInputRequirement, SkillInputSource, SkillLifecycleRecord, SkillLifecycleState,
-    SkillOutputSpec, SkillScopeRule, SkillStep, SkillToolRequirement, SleepCandidateArtifactKind,
-    SleepConsolidationBundle, SleepTrigger, SloDefinition, SloEvaluation, SourceSnapshotInput,
-    TaintClass, TaskAcceptanceEvidenceKind, TaskAcceptanceItem, TaskCognitionView, TaskContract,
-    TaskContractInput, TaskContractStatus, TaskContractWriteCommand, TaskId, TaskMeaningFrame,
-    TelemetryRollup, TestInventory, ToolObservationInput, ToolObservationRecordCommand,
-    TraceTimelineView, UnderstandingOutcomeRecord, UnderstandingProof, UnifiedDiff, VerificationId,
-    VerificationPlan, VerificationResult, VerificationRun, VerificationRunInput,
-    VerificationVerdict, VerifiedEpisodeProjection, VerifierArtifactRef, VerifierArtifactScope,
-    VerifierCommandKind, VerifierPlan, VerifierRequirement, VerifierRun, Visibility, WorkItem,
-    WorkItemId, WorkItemStatus, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind,
-    WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState, WorktreeLease, WorktreeLeaseId,
-    WorktreeLeaseRequest, WorktreeLeaseRequestId, WorktreeLeaseState, WriteId, WriteReceiptRef,
+    OBSERVABILITY_SCHEMA_VERSION, OPERATOR_CONTRACT_MANIFEST, OPERATOR_IPC_PROTOCOL_VERSION,
+    OPERATOR_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
+    ObservabilityWriteStatus, OperationJob, OperationJobState, OperationStatus, OperatorActionView,
+    OperatorCommand, OperatorCommandReceipt, OperatorControlRequest, OperatorFieldView,
+    OperatorProjectionFilter, OperatorProjectionKind, OperatorProjectionPage,
+    OperatorQueryOperation, OperatorQueryRequest, OperatorRecordView, OperatorRelationshipView,
+    OperatorSnapshot, PatchRequest, PatchRequestId, ProcedurePromotionOutcome,
+    ProfileVerificationRun, ProjectId, QualitySignal, ReactivationCondition, ReadConsistencyMode,
+    RecallL0Request, RecallL0Response, ReceiptId, ReplayCaseKind, ReplayInputSnapshot,
+    ReplaySetRole, ReplayThresholdPolicyV1, RuntimeMode, SealedReplaySetRecord, SemanticCommand,
+    SemanticCommandKind, ServiceHealthState, ServiceRuntimeStatus, SessionId, SkillCardV2,
+    SkillCurationAction, SkillCurationGateDecision, SkillCurationProposal, SkillCuratorRun,
+    SkillExecutionOutcome, SkillFailureMode, SkillId, SkillInputRequirement, SkillInputSource,
+    SkillLifecycleRecord, SkillLifecycleState, SkillOutputSpec, SkillScopeRule, SkillStep,
+    SkillToolRequirement, SleepCandidateArtifactKind, SleepConsolidationBundle, SleepTrigger,
+    SloDefinition, SloEvaluation, SourceSnapshotInput, TaintClass, TaskAcceptanceEvidenceKind,
+    TaskAcceptanceItem, TaskCognitionView, TaskContract, TaskContractInput, TaskContractStatus,
+    TaskContractWriteCommand, TaskId, TaskMeaningFrame, TelemetryRollup, TestInventory,
+    ToolObservationInput, ToolObservationRecordCommand, TraceTimelineView,
+    UnderstandingOutcomeRecord, UnderstandingProof, UnifiedDiff, VerificationId, VerificationPlan,
+    VerificationResult, VerificationRun, VerificationRunInput, VerificationVerdict,
+    VerifiedEpisodeProjection, VerifierArtifactRef, VerifierArtifactScope, VerifierCommandKind,
+    VerifierPlan, VerifierRequirement, VerifierRun, Visibility, WorkItem, WorkItemId,
+    WorkItemStatus, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason,
+    WorkLeaseId, WorkLeaseState, WorktreeLease, WorktreeLeaseId, WorktreeLeaseRequest,
+    WorktreeLeaseRequestId, WorktreeLeaseState, WriteId, WriteReceipt, WriteReceiptRef,
     WriteStatus, operator_contract_hash,
 };
 use serde_json::{Value, json};
@@ -143,6 +152,7 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock as StdOnceLock};
 use tokio::sync::{Mutex, OnceCell};
@@ -153,6 +163,8 @@ const COGNITIVE_RUN_RAW_VERIFIER_CALLS_U8: u8 = 16;
 const COGNITIVE_TOOL_OBSERVATION_MAX: usize = 64;
 const COGNITIVE_TOOL_OBSERVATION_QUERY_LIMIT: u16 = 128;
 const ACTION_PROVENANCE_RESOLVER_VERSION: &str = "eliot-l3-provenance-v1";
+const ACTION_PROVENANCE_RESOLVER_VERSION_V2: &str = "eliot-l3-provenance-v2";
+const ACTION_PROVENANCE_RESOLVER_VERSION_V3: &str = "eliot-l3-provenance-v3";
 const RECEIPT_VERIFIER_ID: &str = "daemon-receipt-resolution";
 const DOGFOOD_BLOB_VERIFIER_ID: &str = "cargo-eliot-store-blob-integrity";
 const CARGO_WORKSPACE_CHECK_VERIFIER_ID: &str = "cargo-workspace-check";
@@ -161,9 +173,16 @@ const DOGFOOD_BLOB_ARTIFACT: &str = "crates/eliot-store/src/blob_store.rs";
 const DOGFOOD_BLOB_TEST: &str =
     "blob_store::tests::rejects_corrupt_existing_content_addressed_blob";
 const OPERATOR_CURSOR_SIGNING_KEY_BYTES: usize = 32;
+#[cfg(any(test, feature = "test-support"))]
 const OPERATOR_CURSOR_SIGNING_KEY_FILE: &str = "operator-cursor-signing.key";
+#[cfg(any(test, feature = "test-support"))]
 const LEGACY_OPERATOR_CURSOR_TEST_OVERRIDE: &str =
     "ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE";
+const CODEX_SCOPE_TOKEN_ENV: &str = "ELIOT_CODEX_SCOPE_TOKEN";
+const CODEX_SCOPE_CAPABILITY_SCHEMA_VERSION: &str = "eliot-codex-scope-capability-v2";
+const CODEX_SCOPE_CAPABILITY_TTL_SECONDS: i64 = 5 * 60;
+const REQUEST_AUTHORITY_INACTIVE_MESSAGE: &str =
+    "authenticated session authority is no longer active";
 const BUILD_SOURCE_COMMIT: &str = env!("ELIOT_BUILD_SOURCE_COMMIT");
 
 #[derive(Clone, Copy)]
@@ -172,6 +191,13 @@ struct AuthenticatedRequestContext {
     session_id: SessionId,
     bound_project_id: Option<ProjectId>,
     bound_task_id: Option<TaskId>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AuthenticatedRoleAuthority<'a> {
+    pub(crate) role_lease_id: &'a str,
+    pub(crate) epoch: u64,
+    pub(crate) generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +228,7 @@ mod experiment;
 mod finalization;
 mod input_validation;
 mod memory;
+mod memory_grant;
 mod operator;
 mod replay;
 mod skill;
@@ -306,6 +333,7 @@ const GOVERNED_TOOLS: &[&str] = &[
     "eliot_experience_abstract",
     "eliot_experience_maturity_transition",
     "eliot_negative_transfer_record",
+    "eliot_operator_query",
     "eliot_cognitive_lab_evaluate",
     "eliot_cognitive_failure_localization_record",
     "eliot_submit_understanding_proof",
@@ -491,6 +519,7 @@ const BOUND_PROJECT_DEFAULT_TOOLS: &[&str] = &[
     "eliot_experience_reinstate",
     "eliot_agent_candidate_submit",
     "eliot_write_cognitive_observation",
+    "eliot_operator_query",
 ];
 
 const BOUND_TASK_DEFAULT_TOOLS: &[&str] = &[
@@ -498,6 +527,7 @@ const BOUND_TASK_DEFAULT_TOOLS: &[&str] = &[
     "eliot_compile_packet_l3",
     "eliot_agent_candidate_submit",
     "eliot_write_cognitive_observation",
+    "eliot_operator_query",
 ];
 
 const BOUND_PROJECT_ALIAS_DEFAULT_TOOLS: &[&str] = &["eliot_skill_list"];
@@ -521,6 +551,7 @@ pub(crate) const EXTERNAL_AUDITOR_TOOLS: &[&str] = &[
 ];
 
 const OPERATOR_TOOLS: &[&str] = &[
+    "eliot_task_contract_create",
     "eliot_operator_contract",
     "eliot_operator_snapshot",
     "eliot_operator_query",
@@ -674,6 +705,7 @@ fn resolve_effective_profile(
             Ok(McpAccessProfile::UnderstandingReader)
         }
         (Some("codex"), "default" | "codex_worker") => Ok(McpAccessProfile::CodexWorker),
+        (Some("codex"), "codex_controller") => Ok(McpAccessProfile::CodexController),
         (Some("antigravity" | "opencode"), "default")
         | (Some("antigravity"), "dynamic_agent" | "agent_host") => {
             Ok(McpAccessProfile::DynamicAgent)
@@ -739,7 +771,8 @@ pub async fn run(
         host,
         std::env::var("ELIOT_MCP_ACCESS_PROFILE").ok().as_deref(),
         std::env::var_os("ELIOT_AGENT_SESSION_ID").is_some(),
-        std::env::var_os("ELIOT_ROLE_LEASE_ID").is_some(),
+        std::env::var_os("ELIOT_ROLE_LEASE_ID").is_some()
+            || std::env::var_os(CODEX_SCOPE_TOKEN_ENV).is_some(),
     )?;
     let profile = resolve_effective_profile(
         &requested_profile,
@@ -757,6 +790,14 @@ pub async fn run(
         );
     }
     let requested_scope = scoped_host_session_from_env(config_path, host, profile)?;
+    if host == Some("codex")
+        && profile == McpAccessProfile::CodexController
+        && requested_scope.is_none()
+    {
+        anyhow::bail!(
+            "Codex controller MCP requires an active Governor-bound Session and TaskRoleLease"
+        );
+    }
     let instance = RuntimeInstance::select(config_path, instance)?;
     if instance.standalone() {
         let governor = std::env::current_exe().context("resolve Eliot MCP facade executable")?;
@@ -795,6 +836,18 @@ fn scoped_host_session_from_env(
     host: Option<&str>,
     profile: McpAccessProfile,
 ) -> Result<Option<named_pipe_ipc::RequestedSessionScope>> {
+    if let Some(token) = std::env::var_os(CODEX_SCOPE_TOKEN_ENV) {
+        if host != Some("codex") || profile != McpAccessProfile::CodexController {
+            anyhow::bail!(
+                "opaque Codex scope capability requires --host codex --profile codex_controller"
+            );
+        }
+        if std::env::var_os("ELIOT_ROLE_LEASE_ID").is_some() {
+            anyhow::bail!("opaque Codex scope capability cannot be mixed with a raw role lease");
+        }
+        return consume_codex_scope_capability(config_path, &token.to_string_lossy())
+            .map(|validated| Some(validated.requested_scope));
+    }
     let Some(raw_session_id) = std::env::var_os("ELIOT_AGENT_SESSION_ID") else {
         return Ok(None);
     };
@@ -822,14 +875,501 @@ fn scoped_host_session_from_env(
         .ok()
         .map(|value| ProjectId::from_str(&value).context("parse ELIOT_PROJECT_ID"))
         .transpose()?;
+    let validated = validate_scoped_host_authority(
+        config_path,
+        session_id,
+        &role_lease_id,
+        presented_project_id,
+        task_id,
+        host_id,
+        profile,
+    )?;
+    debug_assert_eq!(validated.agent_session_id, agent_session_id);
+    Ok(Some(validated.requested_scope))
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedCodexControllerScope {
+    pub(crate) requested_scope: named_pipe_ipc::RequestedSessionScope,
+    pub(crate) agent_session_id: AgentSessionId,
+    pub(crate) role_lease_id: String,
+    pub(crate) role_lease_epoch: u64,
+    pub(crate) role_lease_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedCodexWorkScope {
+    pub(crate) work_item_id: WorkItemId,
+    pub(crate) work_lease_id: WorkLeaseId,
+    pub(crate) worktree_lease_id: WorktreeLeaseId,
+    pub(crate) worktree_path: PathBuf,
+    pub(crate) branch_name: String,
+    pub(crate) baseline_commit: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CodexScopeCapabilityClaims {
+    schema_version: String,
+    instance_name: String,
+    token_hash: String,
+    project_id: ProjectId,
+    task_id: TaskId,
+    session_id: SessionId,
+    role_lease_id: String,
+    role_lease_epoch: u64,
+    role_lease_generation: u64,
+    work_item_id: WorkItemId,
+    work_lease_id: WorkLeaseId,
+    worktree_lease_id: WorktreeLeaseId,
+    worktree_path: PathBuf,
+    branch_name: String,
+    baseline_commit: String,
+    preflight_contract_sha256: String,
+    issued_at_unix: i64,
+    expires_at_unix: i64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CodexScopeCapabilityFile {
+    claims: CodexScopeCapabilityClaims,
+    mac: String,
+}
+
+fn codex_scope_capability_key(instance: &RuntimeInstance) -> Result<[u8; 32]> {
+    let cursor_key = load_or_create_operator_cursor_signing_key(instance)?;
+    Ok(blake3::derive_key(
+        "eliot-codex-scope-capability-signing-key-v1",
+        &cursor_key,
+    ))
+}
+
+fn codex_scope_capability_path(instance: &RuntimeInstance, token: &str) -> Result<PathBuf> {
+    if token.len() > 128 || !token.starts_with("cs1.") {
+        anyhow::bail!("invalid opaque Codex scope token shape");
+    }
+    let digest = blake3::hash(token.as_bytes()).to_hex().to_string();
+    Ok(instance
+        .runtime_dir()
+        .join("codex-scope-capabilities")
+        .join(format!("{digest}.json")))
+}
+
+fn codex_scope_capability_mac(
+    claims: &CodexScopeCapabilityClaims,
+    key: &[u8; 32],
+) -> Result<String> {
+    Ok(blake3::keyed_hash(key, &serde_json::to_vec(claims)?)
+        .to_hex()
+        .to_string())
+}
+
+fn validate_codex_scope_capability_file<'a>(
+    file: &'a CodexScopeCapabilityFile,
+    token: &str,
+    instance_name: &str,
+    key: &[u8; 32],
+    now_unix: i64,
+) -> Result<&'a CodexScopeCapabilityClaims> {
+    let expected_mac = codex_scope_capability_mac(&file.claims, key)?;
+    if file.claims.schema_version != CODEX_SCOPE_CAPABILITY_SCHEMA_VERSION
+        || file.claims.instance_name != instance_name
+        || file.claims.token_hash != blake3::hash(token.as_bytes()).to_hex().to_string()
+        || file.mac != expected_mac
+        || file.claims.preflight_contract_sha256.len() != 64
+        || !file
+            .claims
+            .preflight_contract_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || file.claims.issued_at_unix > now_unix + 30
+        || file.claims.expires_at_unix <= now_unix
+        || file.claims.expires_at_unix - file.claims.issued_at_unix
+            > CODEX_SCOPE_CAPABILITY_TTL_SECONDS
+    {
+        anyhow::bail!("opaque Codex scope capability is invalid, stale, or tampered");
+    }
+    Ok(&file.claims)
+}
+
+pub(crate) fn issue_codex_scope_capability(
+    config_path: &Path,
+    scope: &ValidatedCodexControllerScope,
+    work_scope: &ValidatedCodexWorkScope,
+    preflight_contract_sha256: &str,
+) -> Result<String> {
+    if preflight_contract_sha256.len() != 64
+        || !preflight_contract_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("Codex preflight contract must be a SHA-256 hex digest");
+    }
+    let instance = RuntimeInstance::select(config_path, None)?;
+    let directory = instance.runtime_dir().join("codex-scope-capabilities");
+    fs::create_dir_all(&directory).context("create Codex scope capability directory")?;
+    named_pipe_ipc::restrict_owned_directory_to_current_user(&directory)?;
+    let token = format!("cs1.{}.{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let path = codex_scope_capability_path(&instance, &token)?;
+    if path.exists() {
+        anyhow::bail!("opaque Codex scope capability collision");
+    }
+    let task_id = scope
+        .requested_scope
+        .task_id
+        .context("validated Codex scope is missing task id")?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let claims = CodexScopeCapabilityClaims {
+        schema_version: CODEX_SCOPE_CAPABILITY_SCHEMA_VERSION.to_owned(),
+        instance_name: instance.name().to_owned(),
+        token_hash: blake3::hash(token.as_bytes()).to_hex().to_string(),
+        project_id: scope.requested_scope.project_id,
+        task_id,
+        session_id: SessionId::from_uuid(scope.agent_session_id.as_uuid()),
+        role_lease_id: scope.role_lease_id.clone(),
+        role_lease_epoch: scope.role_lease_epoch,
+        role_lease_generation: scope.role_lease_generation,
+        work_item_id: work_scope.work_item_id,
+        work_lease_id: work_scope.work_lease_id,
+        worktree_lease_id: work_scope.worktree_lease_id,
+        worktree_path: work_scope.worktree_path.clone(),
+        branch_name: work_scope.branch_name.clone(),
+        baseline_commit: work_scope.baseline_commit.clone(),
+        preflight_contract_sha256: preflight_contract_sha256.to_owned(),
+        issued_at_unix: now,
+        expires_at_unix: now + CODEX_SCOPE_CAPABILITY_TTL_SECONDS,
+    };
+    let file = CodexScopeCapabilityFile {
+        mac: codex_scope_capability_mac(&claims, &codex_scope_capability_key(&instance)?)?,
+        claims,
+    };
+    atomic_write_bytes(&path, &serde_json::to_vec(&file)?)?;
+    Ok(token)
+}
+
+pub(crate) fn revoke_codex_scope_capability(config_path: &Path, token: &str) -> Result<()> {
+    let instance = RuntimeInstance::select(config_path, None)?;
+    let path = codex_scope_capability_path(&instance, token)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("revoke opaque Codex scope capability"),
+    }
+}
+
+fn consume_codex_scope_capability(
+    config_path: &Path,
+    token: &str,
+) -> Result<ValidatedCodexControllerScope> {
+    let instance = RuntimeInstance::select(config_path, None)?;
+    let path = codex_scope_capability_path(&instance, token)?;
+    let bytes = fs::read(&path).context("read opaque Codex scope capability")?;
+    fs::remove_file(&path).context("consume opaque Codex scope capability")?;
+    let file: CodexScopeCapabilityFile =
+        serde_json::from_slice(&bytes).context("decode opaque Codex scope capability")?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let key = codex_scope_capability_key(&instance)?;
+    let claims = validate_codex_scope_capability_file(&file, token, instance.name(), &key, now)?;
+    let validated = validate_codex_controller_scope(
+        config_path,
+        claims.session_id,
+        &claims.role_lease_id,
+        claims.project_id,
+        claims.task_id,
+    )?;
+    if validated.role_lease_epoch != claims.role_lease_epoch
+        || validated.role_lease_generation != claims.role_lease_generation
+    {
+        anyhow::bail!("opaque Codex scope capability carries stale role authority");
+    }
+    validate_codex_work_scope(
+        config_path,
+        &validated,
+        claims.work_item_id,
+        claims.work_lease_id,
+        claims.worktree_lease_id,
+        &claims.worktree_path,
+        &claims.branch_name,
+        &claims.baseline_commit,
+    )?;
+    Ok(validated)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_codex_work_scope(
+    config_path: &Path,
+    role_scope: &ValidatedCodexControllerScope,
+    work_item_id: WorkItemId,
+    work_lease_id: WorkLeaseId,
+    worktree_lease_id: WorktreeLeaseId,
+    expected_worktree: &Path,
+    expected_branch: &str,
+    expected_baseline: &str,
+) -> Result<ValidatedCodexWorkScope> {
+    let project_id = role_scope.requested_scope.project_id;
+    let task_id = role_scope
+        .requested_scope
+        .task_id
+        .context("validated Codex role scope is missing task id")?;
+    let validated = validate_bound_worktree_lease(
+        &delegation_runtime::root_from_config(config_path),
+        role_scope.agent_session_id,
+        project_id,
+        task_id,
+        worktree_lease_id,
+    )?;
+    let expected_worktree = canonicalize_codex_worktree_directory(expected_worktree)?;
+    if validated.work_item_id != work_item_id
+        || validated.work_lease_id != work_lease_id
+        || validated.worktree_path != expected_worktree
+        || validated.branch_name != expected_branch
+        || validated.baseline_commit != expected_baseline
+    {
+        anyhow::bail!("Codex WorktreeLease differs from the launch contract");
+    }
+    Ok(validated)
+}
+
+fn validate_bound_worktree_lease(
+    root: &Path,
+    agent_session_id: AgentSessionId,
+    project_id: ProjectId,
+    task_id: TaskId,
+    worktree_lease_id: WorktreeLeaseId,
+) -> Result<ValidatedCodexWorkScope> {
+    let state = delegation_runtime::load_work_state(root)?;
+    let worktree = state
+        .worktree_leases
+        .iter()
+        .find(|lease| lease.worktree_lease_id == worktree_lease_id)
+        .context("Codex scope references a missing WorktreeLease")?;
+    let work_item_id = worktree.work_item_id;
+    let work_lease_id = worktree.work_lease_id;
+    let item = state
+        .work_items
+        .iter()
+        .find(|item| {
+            item.work_item_id == work_item_id
+                && item.project_id == project_id
+                && item.task_id == task_id
+        })
+        .context("Codex scope references a missing WorkItem")?;
+    if item.active_lease_id != Some(work_lease_id)
+        || !item.lease_refs.contains(&work_lease_id)
+        || item.scope.write_set.is_empty()
+    {
+        anyhow::bail!("Codex WorkItem has no active bounded write lease");
+    }
+    let lease = state
+        .leases
+        .iter()
+        .find(|lease| lease.work_lease_id == work_lease_id)
+        .context("Codex scope references a missing WorkLease")?;
+    if !eliot_engine::work_lease_is_active(lease)
+        || lease.work_item_id != work_item_id
+        || lease.project_id != project_id
+        || lease.task_id != task_id
+        || lease.agent_session_id != agent_session_id
+        || lease.role != AgentRole::Controller
+    {
+        anyhow::bail!("Codex WorkLease is inactive or scope-mismatched");
+    }
+    let now = time::OffsetDateTime::now_utc();
+    if worktree.state != WorktreeLeaseState::Active
+        || worktree.expires_at <= now
+        || worktree.project_id != project_id
+        || worktree.task_id != task_id
+        || worktree.work_item_id != work_item_id
+        || worktree.work_lease_id != work_lease_id
+        || worktree.holder_session_id != agent_session_id
+        || worktree.allowed_write_set.is_empty()
+        || worktree.kind != eliot_types::WorktreeLeaseKind::IndependentClone
+        || worktree.repo_root != lease.scope.repo_root
+        || worktree.managed_root.is_none()
+    {
+        anyhow::bail!("Codex WorktreeLease is inactive or scope-mismatched");
+    }
+    if worktree
+        .allowed_write_set
+        .iter()
+        .any(|path| !eliot_engine::path_in_scope(path, &item.scope.write_set))
+    {
+        anyhow::bail!("Codex WorktreeLease write set escapes the WorkItem scope");
+    }
+    let leased_worktree =
+        canonicalize_codex_worktree_directory(Path::new(&worktree.worktree_path))?;
+    let managed_root = canonicalize_codex_worktree_directory(Path::new(
+        worktree
+            .managed_root
+            .as_deref()
+            .context("independent Codex WorktreeLease is missing its managed root")?,
+    ))?;
+    if leased_worktree.parent() != Some(managed_root.as_path()) {
+        anyhow::bail!("Codex WorktreeLease escaped its managed dogfood root");
+    }
+    let head = Command::new("git.exe")
+        .arg("-C")
+        .arg(&leased_worktree)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("read Codex worktree HEAD")?;
+    if !head.status.success()
+        || String::from_utf8(head.stdout)?.trim() != worktree.base_commit
+        || worktree.base_commit.trim().is_empty()
+    {
+        anyhow::bail!("Codex worktree HEAD differs from the leased baseline");
+    }
+    Ok(ValidatedCodexWorkScope {
+        work_item_id,
+        work_lease_id,
+        worktree_lease_id,
+        worktree_path: leased_worktree,
+        branch_name: worktree.branch_name.clone(),
+        baseline_commit: worktree.base_commit.clone(),
+    })
+}
+
+fn validate_unique_active_worktree_lease(
+    root: &Path,
+    session_id: SessionId,
+    project_id: ProjectId,
+    task_id: TaskId,
+) -> Result<ValidatedCodexWorkScope> {
+    let agent_session_id = AgentSessionId::from_uuid(session_id.as_uuid());
+    let state = delegation_runtime::load_work_state(root)?;
+    let worktree_lease_id = unique_active_worktree_lease_id(
+        &state,
+        agent_session_id,
+        project_id,
+        task_id,
+        time::OffsetDateTime::now_utc(),
+    )?;
+    validate_bound_worktree_lease(
+        root,
+        agent_session_id,
+        project_id,
+        task_id,
+        worktree_lease_id,
+    )
+}
+
+fn unique_active_worktree_lease_id(
+    state: &WorkState,
+    agent_session_id: AgentSessionId,
+    project_id: ProjectId,
+    task_id: TaskId,
+    now: time::OffsetDateTime,
+) -> Result<WorktreeLeaseId> {
+    let mut matches = state.worktree_leases.iter().filter(|lease| {
+        lease.holder_session_id == agent_session_id
+            && lease.project_id == project_id
+            && lease.task_id == task_id
+            && lease.state == WorktreeLeaseState::Active
+            && lease.expires_at > now
+    });
+    let worktree_lease_id = matches
+        .next()
+        .map(|lease| lease.worktree_lease_id)
+        .context("CodeCortex requires one active session-bound WorktreeLease")?;
+    if matches.next().is_some() {
+        anyhow::bail!("CodeCortex session has ambiguous active WorktreeLease authority");
+    }
+    Ok(worktree_lease_id)
+}
+
+fn canonicalize_codex_worktree_directory(path: &Path) -> Result<PathBuf> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if let Ok(metadata) = fs::symlink_metadata(&current)
+            && (metadata.file_type().is_symlink()
+                || codex_worktree_metadata_is_reparse_point(&metadata))
+        {
+            anyhow::bail!("Codex worktree path contains a reparse point");
+        }
+    }
+    let metadata = fs::symlink_metadata(path).context("inspect Codex worktree directory")?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || codex_worktree_metadata_is_reparse_point(&metadata)
+    {
+        anyhow::bail!("Codex worktree path is not a plain directory");
+    }
+    path.canonicalize()
+        .context("canonicalize Codex worktree directory")
+}
+
+#[cfg(windows)]
+fn codex_worktree_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+#[cfg(not(windows))]
+const fn codex_worktree_metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+pub(crate) fn validate_codex_controller_scope(
+    config_path: &Path,
+    session_id: SessionId,
+    role_lease_id: &str,
+    project_id: ProjectId,
+    task_id: TaskId,
+) -> Result<ValidatedCodexControllerScope> {
+    validate_scoped_host_authority(
+        config_path,
+        session_id,
+        role_lease_id,
+        Some(project_id),
+        task_id,
+        Some(AgentHostId::Codex),
+        McpAccessProfile::CodexController,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_scoped_host_authority(
+    config_path: &Path,
+    session_id: SessionId,
+    role_lease_id: &str,
+    presented_project_id: Option<ProjectId>,
+    task_id: TaskId,
+    expected_host_id: Option<AgentHostId>,
+    profile: McpAccessProfile,
+) -> Result<ValidatedCodexControllerScope> {
     let broker_state =
         delegation_runtime::load_state(&delegation_runtime::root_from_config(config_path))?;
+    validate_scoped_host_authority_state(
+        &broker_state,
+        session_id,
+        role_lease_id,
+        presented_project_id,
+        task_id,
+        expected_host_id,
+        profile,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_scoped_host_authority_state(
+    broker_state: &eliot_types::DelegationState,
+    session_id: SessionId,
+    role_lease_id: &str,
+    presented_project_id: Option<ProjectId>,
+    task_id: TaskId,
+    expected_host_id: Option<AgentHostId>,
+    profile: McpAccessProfile,
+) -> Result<ValidatedCodexControllerScope> {
+    let agent_session_id = AgentSessionId::from_uuid(session_id.as_uuid());
     let binding = broker_state
         .agent_host_sessions
         .iter()
         .find(|binding| binding.agent_session_id == agent_session_id)
         .context("ELIOT_AGENT_SESSION_ID has no registered host binding")?;
-    if host_id.is_some_and(|host_id| binding.host_identity.host_id != host_id) {
+    let required_host_id = expected_host_id.unwrap_or(binding.host_identity.host_id);
+    if binding.host_identity.host_id != required_host_id {
         anyhow::bail!("ELIOT_AGENT_SESSION_ID is bound to a different host");
     }
     let project_id = binding
@@ -841,23 +1381,105 @@ fn scoped_host_session_from_env(
     if binding.bound_task_id != Some(task_id) {
         anyhow::bail!("TASK_SCOPE_MISMATCH: host session is not bound to ELIOT_TASK_ID");
     }
-    let now = time::OffsetDateTime::now_utc();
-    let role_is_active = broker_state.task_role_leases.iter().any(|lease| {
-        lease.role_lease_id == role_lease_id
-            && lease.agent_session_id == agent_session_id
-            && lease.task_id == task_id
-            && lease.expires_at > now
-    });
-    if !role_is_active {
-        anyhow::bail!("ELIOT scoped MCP session has no active matching TaskRoleLease");
+    let role = broker_state
+        .task_role_leases
+        .iter()
+        .find(|lease| {
+            lease.role_lease_id == role_lease_id
+                && lease.agent_session_id == agent_session_id
+                && lease.task_id == task_id
+        })
+        .context("ELIOT scoped MCP session has no matching TaskRoleLease")?;
+    let operation_id = role
+        .owner_operation_id
+        .as_deref()
+        .unwrap_or("scoped-mcp-session");
+    let authority = HostBrokerService
+        .validate_active_role_authority(
+            broker_state,
+            &ActiveRoleAuthorityCheck {
+                operation_id,
+                task_id,
+                role_lease_id,
+                expected_epoch: role.epoch,
+                generation: role.generation,
+                host_id: required_host_id,
+                requested_capabilities: &[],
+            },
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if profile == McpAccessProfile::CodexController {
+        if required_host_id != AgentHostId::Codex
+            || authority.role_lease.role != AgentRole::Controller
+        {
+            anyhow::bail!(
+                "CODEX_CONTROLLER_SCOPE_MISMATCH: active Codex Controller TaskRoleLease required"
+            );
+        }
+        let now = time::OffsetDateTime::now_utc();
+        let controller_is_active = broker_state.controller_leases.iter().any(|lease| {
+            lease.task_id == task_id
+                && lease.agent_session_id == agent_session_id
+                && lease.epoch == authority.role_lease.epoch
+                && lease.generation == authority.role_lease.generation
+                && lease.state == eliot_types::AuthorityLeaseState::Active
+                && lease.expires_at > now
+        });
+        if !controller_is_active {
+            anyhow::bail!(
+                "CODEX_CONTROLLER_SCOPE_MISMATCH: active matching ControllerLease required"
+            );
+        }
     }
-    Ok(Some(named_pipe_ipc::RequestedSessionScope {
-        session_id: Some(session_id),
-        project_id,
-        task_id: Some(task_id),
-    }))
+    Ok(ValidatedCodexControllerScope {
+        requested_scope: named_pipe_ipc::RequestedSessionScope {
+            session_id: Some(session_id),
+            project_id,
+            task_id: Some(task_id),
+            role_lease_id: authority.role_lease.role_lease_id.clone(),
+            role_lease_epoch: authority.role_lease.epoch,
+            role_lease_generation: authority.role_lease.generation,
+        },
+        agent_session_id,
+        role_lease_id: authority.role_lease.role_lease_id,
+        role_lease_epoch: authority.role_lease.epoch,
+        role_lease_generation: authority.role_lease.generation,
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_presented_scoped_host_authority_state(
+    broker_state: &eliot_types::DelegationState,
+    profile: McpAccessProfile,
+    session_id: SessionId,
+    role_lease_id: &str,
+    project_id: ProjectId,
+    task_id: TaskId,
+    presented_epoch: u64,
+    presented_generation: u64,
+) -> Result<ValidatedCodexControllerScope> {
+    let expected_host_id =
+        (profile == McpAccessProfile::CodexController).then_some(AgentHostId::Codex);
+    let validated = validate_scoped_host_authority_state(
+        broker_state,
+        session_id,
+        role_lease_id,
+        Some(project_id),
+        task_id,
+        expected_host_id,
+        profile,
+    )?;
+    if validated.role_lease_epoch != presented_epoch
+        || validated.role_lease_generation != presented_generation
+    {
+        anyhow::bail!(
+            "Governor-bound host scope carries a stale TaskRoleLease epoch or generation"
+        );
+    }
+    Ok(validated)
+}
+
+#[cfg(test)]
 fn validate_canonical_host_scope(
     broker_state: &eliot_types::DelegationState,
     session_id: SessionId,
@@ -1089,6 +1711,8 @@ impl McpDaemon {
             projection.clone(),
         ));
         let cursor_signing_key = load_or_create_operator_cursor_signing_key(instance)?;
+        let memory_grant_signing_key =
+            blake3::derive_key("eliot-memory-grant-signing-key-v1", &cursor_signing_key);
         let cognitive_runtime = Arc::new(CognitiveRuntimePaths {
             runtime_dir: instance.runtime_dir(),
             publication_path: instance.publication_path(),
@@ -1120,6 +1744,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1138,6 +1763,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1156,6 +1782,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1174,6 +1801,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1192,6 +1820,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1210,6 +1839,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1228,6 +1858,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1246,6 +1877,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1264,6 +1896,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1282,6 +1915,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1300,6 +1934,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1318,6 +1953,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime: Arc::clone(&cognitive_runtime),
                 cognitive_principals: Arc::clone(&cognitive_principals),
             },
@@ -1336,6 +1972,7 @@ impl McpDaemon {
                 runtime_id: publication.runtime_id.clone(),
                 auth_generation: publication.auth_generation.clone(),
                 cursor_signing_key,
+                memory_grant_signing_key,
                 cognitive_runtime,
                 cognitive_principals,
             },
@@ -1344,13 +1981,48 @@ impl McpDaemon {
 
     pub(crate) async fn handle_line(
         &self,
-        profile: &str,
+        profile_name: &str,
         session_id: SessionId,
         bound_project_id: Option<ProjectId>,
         bound_task_id: Option<TaskId>,
+        role_authority: Option<AuthenticatedRoleAuthority<'_>>,
         line: &str,
     ) -> Result<Option<String>> {
-        let profile = McpAccessProfile::parse(profile)?;
+        let profile = McpAccessProfile::parse(profile_name)?;
+        let request: Value =
+            serde_json::from_str(line).with_context(|| "parse authenticated named-pipe request")?;
+        let refreshed_scope = self.authoritative_host_scope(
+            profile_name,
+            session_id,
+            bound_project_id,
+            bound_task_id,
+            role_authority.map(|authority| authority.role_lease_id),
+            role_authority.map(|authority| authority.epoch),
+            role_authority.map(|authority| authority.generation),
+        );
+        let authority_error = match refreshed_scope {
+            Ok(scope) if scope == (bound_project_id, bound_task_id) => None,
+            Ok(_) => Some("canonical host scope changed after authentication".to_owned()),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(error) = authority_error {
+            tracing::warn!(
+                profile = profile_name,
+                session_id = %session_id,
+                error,
+                "denied named-pipe request after live authority revalidation"
+            );
+            return Ok(request
+                .get("id")
+                .map(|id| {
+                    serde_json::to_string(&error_response(
+                        id,
+                        -32603,
+                        REQUEST_AUTHORITY_INACTIVE_MESSAGE,
+                    ))
+                })
+                .transpose()?);
+        }
         let _host_governor_authority = if profile == McpAccessProfile::HostGovernor {
             Some(self.host_governor_authority.lock().await)
         } else {
@@ -1371,8 +2043,6 @@ impl McpDaemon {
             McpAccessProfile::HumanOperator => &self.human_operator,
             McpAccessProfile::HumanReadonly => &self.human_readonly,
         };
-        let request: Value =
-            serde_json::from_str(line).with_context(|| "parse authenticated named-pipe request")?;
         Ok(handle_message(
             state,
             AuthenticatedRequestContext {
@@ -1389,15 +2059,43 @@ impl McpDaemon {
 
     pub(crate) fn authoritative_host_scope(
         &self,
+        profile: &str,
         session_id: SessionId,
         requested_project_id: Option<ProjectId>,
         requested_task_id: Option<TaskId>,
+        requested_role_lease_id: Option<&str>,
+        requested_role_lease_epoch: Option<u64>,
+        requested_role_lease_generation: Option<u64>,
     ) -> Result<(Option<ProjectId>, Option<TaskId>)> {
         match (requested_project_id, requested_task_id) {
-            (None, None) => Ok((None, None)),
+            (None, None) => {
+                if requested_role_lease_id.is_some()
+                    || requested_role_lease_epoch.is_some()
+                    || requested_role_lease_generation.is_some()
+                {
+                    anyhow::bail!("unscoped host request cannot carry TaskRoleLease authority");
+                }
+                Ok((None, None))
+            }
             (Some(project_id), Some(task_id)) => {
                 let broker_state = delegation_runtime::load_state(&self.dynamic_agent.root)?;
-                validate_canonical_host_scope(&broker_state, session_id, project_id, task_id)?;
+                let role_lease_id = requested_role_lease_id
+                    .context("Governor-bound host scope is missing TaskRoleLease id")?;
+                let role_lease_epoch = requested_role_lease_epoch
+                    .context("Governor-bound host scope is missing TaskRoleLease epoch")?;
+                let role_lease_generation = requested_role_lease_generation
+                    .context("Governor-bound host scope is missing TaskRoleLease generation")?;
+                let profile = McpAccessProfile::parse(profile)?;
+                validate_presented_scoped_host_authority_state(
+                    &broker_state,
+                    profile,
+                    session_id,
+                    role_lease_id,
+                    project_id,
+                    task_id,
+                    role_lease_epoch,
+                    role_lease_generation,
+                )?;
                 Ok((Some(project_id), Some(task_id)))
             }
             _ => {
@@ -2690,6 +3388,7 @@ struct TaskStateToolInput {
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct TaskActionToolInput {
     project_id: String,
     task_id: String,
@@ -2705,6 +3404,10 @@ struct TaskActionToolInput {
     current_truth_refs: Vec<String>,
     #[serde(default)]
     provenance_handles: Vec<String>,
+    #[serde(default)]
+    memory_handles_used: Vec<String>,
+    #[serde(default)]
+    memory_grant_tokens: Vec<String>,
     #[serde(default)]
     negative_memory_checked: bool,
     #[serde(default)]
@@ -2810,6 +3513,7 @@ struct McpState {
     runtime_id: String,
     auth_generation: String,
     cursor_signing_key: [u8; 32],
+    memory_grant_signing_key: [u8; 32],
     cognitive_runtime: Arc<CognitiveRuntimePaths>,
     cognitive_principals: Arc<Mutex<HashMap<SessionId, CognitivePrincipalClaims>>>,
 }

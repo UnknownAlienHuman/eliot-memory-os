@@ -11,7 +11,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $SchemaVersion = 'eliot.effective-micro-module-manifest.v2'
-$GeneratorVersion = 'gen-module-manifests.ps1/2.2.0'
+$GeneratorVersion = 'gen-module-manifests.ps1/2.3.0'
+$ExpectedWorkspacePackageCount = 126
 $Utf8Strict = [System.Text.UTF8Encoding]::new($false, $true)
 
 function Fail([string] $Message) { throw "MODULE_MANIFEST_GENERATE_FAIL: $Message" }
@@ -50,6 +51,73 @@ function Resolve-UnderRoot([string] $Root, [string] $Path) {
     $prefix = $Root.TrimEnd([char]0x5c, [char]0x2f) + [IO.Path]::DirectorySeparatorChar
     if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { Fail "path escapes repository: $Path" }
     return $full
+}
+function Resolve-InventoryOnlyOutputSafe([string] $Root, [string] $Candidate) {
+    if ([string]::IsNullOrWhiteSpace($Candidate)) {
+        Fail '-InventoryOnly requires a non-empty -OutputPath'
+    }
+    $raw = $Candidate.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    if ($raw.StartsWith('\\')) {
+        Fail '-InventoryOnly output must not use a UNC or device path'
+    }
+    if ($raw -match '[\x00-\x1F\x7F]') {
+        Fail '-InventoryOnly output must not contain control characters'
+    }
+    $pathRoot = [IO.Path]::GetPathRoot($raw)
+    $allowedDriveColon = -not [string]::IsNullOrEmpty($pathRoot) -and
+        $pathRoot.Length -ge 2 -and $pathRoot[1] -eq ':' -and
+        $raw.IndexOf(':') -eq 1 -and $raw.LastIndexOf(':') -eq 1
+    if ($raw.Contains(':') -and -not $allowedDriveColon) {
+        Fail '-InventoryOnly output must not use an alternate data stream or control colon'
+    }
+    foreach ($segment in @($raw -split '[\\/]')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -in @('.', '..') -or $segment -match '^[A-Za-z]:$') { continue }
+        if ($segment -match '~[0-9]' -or $segment.EndsWith('.') -or $segment.EndsWith(' ')) {
+            Fail '-InventoryOnly output must not use a Win32-normalized path alias'
+        }
+    }
+    $fullPath = if ([IO.Path]::IsPathRooted($raw)) {
+        [IO.Path]::GetFullPath($raw)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $Root $raw))
+    }
+    $volumeRoot = [IO.Path]::GetPathRoot($FullPath)
+    if ([string]::IsNullOrEmpty($volumeRoot)) { Fail '-InventoryOnly output has no filesystem root' }
+    $cursor = $volumeRoot
+    foreach ($segment in @([IO.Path]::GetRelativePath($volumeRoot, $FullPath) -split '[\\/]')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -eq '.') { continue }
+        $cursor = [IO.Path]::Combine($cursor, $segment)
+        if (Test-Path -LiteralPath $cursor) {
+            $item = Get-Item -LiteralPath $cursor -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail '-InventoryOnly output must not traverse a reparse point'
+            }
+        }
+    }
+    $ownedTargets = @(
+        'swarm\inventory\modules.json',
+        'swarm\results\W1-01.json',
+        'scripts\gen-module-manifests.ps1',
+        'scripts\verify-module-manifests.ps1'
+    )
+    foreach ($relative in $ownedTargets) {
+        $ownedFull = [IO.Path]::GetFullPath((Join-Path $Root $relative))
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($FullPath, $ownedFull)) {
+            Fail '-InventoryOnly output must not target a generator-owned path'
+        }
+    }
+    $repositoryRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $repositoryPrefix = $repositoryRoot + [IO.Path]::DirectorySeparatorChar
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $temporaryPrefix = $temporaryRoot + [IO.Path]::DirectorySeparatorChar
+    if ([StringComparer]::OrdinalIgnoreCase.Equals($temporaryRoot, $repositoryRoot) -or
+        $temporaryRoot.StartsWith($repositoryPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        Fail '-InventoryOnly process temporary directory must not overlap the repository'
+    }
+    if (-not $FullPath.StartsWith($temporaryPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        Fail '-InventoryOnly output must stay under the process temporary directory'
+    }
+    return $FullPath
 }
 function Invoke-CargoMetadata([string] $Root) {
     $psi = [Diagnostics.ProcessStartInfo]::new()
@@ -159,8 +227,8 @@ function Get-ResultBytes(
     $programRevision = 'swarm/decisions/W1-RESULT-ENVELOPE-PROGRAM-REVISION-v1.3.md'
     $inventoryHash = Sha256-Bytes $InventoryBytes
     $executedEvidence = @(
-        'cargo metadata --locked --format-version 1 -> 125 workspace packages',
-        'pwsh scripts/gen-module-manifests.ps1 -> generated 125 packages',
+        "cargo metadata --locked --format-version 1 -> $ExpectedWorkspacePackageCount workspace packages",
+        "pwsh scripts/gen-module-manifests.ps1 -> generated $ExpectedWorkspacePackageCount packages",
         'generator run twice -> SHA-256 byte-identical with no HEAD/worktree state in generated bytes',
         'pwsh scripts/verify-module-manifests.ps1 -SelfTest -> PASS: v2 schema, source union, complete projection oracle, result envelope, determinism, and broad tamper matrix',
         'bootstrap_draft.rs and bootstrap_brief.rs are present in the nonignored-untracked source union and affect STU/digest/test projection'
@@ -177,7 +245,7 @@ function Get-ResultBytes(
             discriminator_after = 'The result is an exact v1.3 evidence-only wrapper generated from code, with content-bound non-self artifact and witness hashes plus independent add/remove/tamper checks.'
             implemented = @(
                 'native PowerShell generator uses cargo metadata --locked as the workspace and dependency source of truth',
-                'deterministic 125-package EffectiveMicroModuleManifest inventory with cached plus nonignored-untracked UTF-8 Rust source/test STU',
+                "deterministic $ExpectedWorkspacePackageCount-package EffectiveMicroModuleManifest inventory with cached plus nonignored-untracked UTF-8 Rust source/test STU",
                 'clone/OS-portable content-bound identity and revision fields with no HEAD or worktree-clean marker',
                 'exact declared intra-workspace providers, consumers, direct reverse fan-out and transitive normal/build closure',
                 'binary reachability from metadata bin roots and explicit static ModuleTestCapsule/test-count proxy',
@@ -249,11 +317,20 @@ try {
     }
     $customOutput = $PSBoundParameters.ContainsKey('OutputPath')
     $customResult = $PSBoundParameters.ContainsKey('ResultPath')
+    if ($InventoryOnly -and -not $customOutput) {
+        Fail '-InventoryOnly requires explicit -OutputPath'
+    }
     if (-not $InventoryOnly -and ($customOutput -or $customResult)) {
         Fail 'custom output paths require explicit -InventoryOnly; normal generation owns the canonical inventory/result pair'
     }
     $outputCandidate = $OutputPath.Replace('/', [IO.Path]::DirectorySeparatorChar)
-    $outputFull = if ([IO.Path]::IsPathRooted($outputCandidate)) { [IO.Path]::GetFullPath($outputCandidate) } else { [IO.Path]::GetFullPath((Join-Path $root $outputCandidate)) }
+    $outputFull = if ($InventoryOnly) {
+        Resolve-InventoryOnlyOutputSafe $root $OutputPath
+    } elseif ([IO.Path]::IsPathRooted($outputCandidate)) {
+        [IO.Path]::GetFullPath($outputCandidate)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $root $outputCandidate))
+    }
     $resultFull = if ($InventoryOnly) {
         $null
     } else {
@@ -265,7 +342,7 @@ try {
     $workspaceIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($id in @($doc.workspace_members)) { [void]$workspaceIds.Add([string]$id) }
     $packages = @($doc.packages | Where-Object { $workspaceIds.Contains([string]$_.id) } | Sort-Object name -Culture '')
-    if ($packages.Count -ne 125) { Fail "expected 125 workspace packages, got $($packages.Count)" }
+    if ($packages.Count -ne $ExpectedWorkspacePackageCount) { Fail "expected $ExpectedWorkspacePackageCount workspace packages, got $($packages.Count)" }
     $names = @{}; $manifestByPath = @{}
     foreach ($pkg in $packages) {
         if ($names.ContainsKey($pkg.name)) { Fail "duplicate package name: $($pkg.name)" }
@@ -307,6 +384,12 @@ try {
     $canonical=$docNoDigest|ConvertTo-Json -Depth 40 -Compress;$docNoDigest['document_digest']=Sha256-Text $canonical;$json=$docNoDigest|ConvertTo-Json -Depth 40 -Compress
     $inventoryBytes = $Utf8Strict.GetBytes($json + "`n")
     $resultBytes = if ($InventoryOnly) { $null } else { Get-ResultBytes $root $docNoDigest $inventoryBytes }
+    if ($InventoryOnly) {
+        $revalidatedOutputFull = Resolve-InventoryOnlyOutputSafe $root $OutputPath
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals($outputFull, $revalidatedOutputFull)) {
+            Fail '-InventoryOnly output path identity changed during generation'
+        }
+    }
     if ($Check) {
         Assert-BytesEqual $outputFull $inventoryBytes 'inventory'
         if (-not $InventoryOnly) { Assert-BytesEqual $resultFull $resultBytes 'result envelope' }

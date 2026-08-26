@@ -79,6 +79,7 @@ async fn real_surreal_store_backup_restore_to_new_root() -> TestResult {
             action_lease_id: None,
             understanding_proof_hash: Some("m5-understanding-proof".to_owned()),
             action_provenance: None,
+            memory_grant_redemptions: Vec::new(),
             observation_ids: Vec::new(),
             verification_ids: Vec::new(),
             verification_scopes: Vec::new(),

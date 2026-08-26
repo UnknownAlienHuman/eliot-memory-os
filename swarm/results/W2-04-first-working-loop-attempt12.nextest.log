@@ -1,0 +1,47 @@
+   Compiling eliot-app v0.1.0 (C:\Development\Rust\projects\eliot-memory-os\crates\eliot-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 47.47s
+────────────
+ Nextest run ID 63175464-1624-4a85-8e98-27299c189c56 with nextest profile: default
+    Starting 1 test across 1 binary (5 tests skipped)
+        FAIL [  43.731s] (1/1) eliot-app::first_working_loop first_working_loop_end_to_end
+  stdout ───
+
+    running 1 test
+    test first_working_loop_end_to_end ... FAILED
+
+    failures:
+
+    failures:
+        first_working_loop_end_to_end
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 43.72s
+
+  stderr ───
+
+    thread 'first_working_loop_end_to_end' (54484) panicked at crates\eliot-app\tests\first_working_loop.rs:1111:5:
+    assertion `left == right` failed: unexpected verifier result: {"reason":"registered dogfood blob integrity verifier failed","status":"denied_invalid_verifier_scope","write_receipt":null}
+      left: Some("denied_invalid_verifier_scope")
+     right: Some("passed")
+    stack backtrace:
+       0: std::panicking::panic_handler
+                 at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library\std\src\panicking.rs:689
+       1: core::panicking::panic_fmt
+                 at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library\core\src\panicking.rs:80
+       2: core::panicking::assert_failed_inner
+                 at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library\core\src\panicking.rs:434
+       3: core::panicking::assert_failed<enum2$<core::option::Option<ref$<str$> > >,enum2$<core::option::Option<ref$<str$> > > >
+                 at C:\Users\kleym\.rustup\toolchains\1.97.1-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\core\src\panicking.rs:394
+       4: first_working_loop::first_working_loop_end_to_end
+                 at .\tests\first_working_loop.rs:1111
+       5: first_working_loop::first_working_loop_end_to_end::closure$0
+                 at .\tests\first_working_loop.rs:626
+       6: core::ops::function::FnOnce::call_once<first_working_loop::first_working_loop_end_to_end::closure_env$0,tuple$<> >
+                 at C:\Users\kleym\.rustup\toolchains\1.97.1-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\core\src\ops\function.rs:250
+       7: core::ops::function::FnOnce::call_once
+                 at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library\core\src\ops\function.rs:250
+    note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+────────────
+     Summary [  43.732s] 1 test run: 0 passed, 1 failed, 5 skipped
+        FAIL [  43.731s] (1/1) eliot-app::first_working_loop first_working_loop_end_to_end
+error: test run failed

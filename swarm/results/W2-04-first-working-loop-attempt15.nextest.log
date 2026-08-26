@@ -1,0 +1,7 @@
+   Compiling eliot-app v0.1.0 (C:\Development\Rust\projects\eliot-memory-os\crates\eliot-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 46.06s
+────────────
+ Nextest run ID f1ed3d0f-2bbd-41c9-8093-38042a172a91 with nextest profile: default
+    Starting 1 test across 1 binary (5 tests skipped)
+────────────
+     Summary [ 108.079s] 1 test run: 1 passed (1 slow), 5 skipped

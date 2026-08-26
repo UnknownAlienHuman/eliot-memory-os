@@ -1,0 +1,28 @@
+   Compiling eliot-app v0.1.0 (C:\Development\Rust\projects\eliot-memory-os\crates\eliot-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.22s
+────────────
+ Nextest run ID ba45149d-232a-4de5-980d-df3b92749915 with nextest profile: default
+    Starting 1 test across 1 binary (5 tests skipped)
+        FAIL [ 104.739s] (1/1) eliot-app::first_working_loop first_working_loop_end_to_end
+  stdout ───
+
+    running 1 test
+    test first_working_loop_end_to_end has been running for over 60 seconds
+    PHASE_L2_EVIDENCE={"final_status":"DONE_VERIFIED","host_safety":{"owned_processes_stopped":true,"temp_root":"C:\\Users\\kleym\\AppData\\Local\\Temp\\eliot-fwl-47300-1787655075658589000"},"negative_assertions":{"candidate_observation_cannot_satisfy_verifier":true,"candidate_verification_denied":true,"incomplete_finish_denied":true,"insufficient_action_denied":true,"stale_revision_denied":true,"verificationless_finish_denied":true},"project_id":"4b751723-9cf1-84a1-8611-7e1f2a090dd7","provider":{"kill_switch":true,"run_owned_artifacts":0},"receipts":{"action":"01a0388b-f38e-77f1-8a80-b910a1d7a46b","completion":"01a0388b-f38e-77f1-8a80-b9884becb648","create":"01a0388b-f38e-77f1-8a80-b8f3bef221a2","observation":"01a0388b-f38e-77f1-8a80-b92ccd7ad576","verification":"01a0388b-f38e-77f1-8a80-b962c795ea7b"},"restart":{"auth_generation_rotated":true,"idempotent_replay":true,"pid_rotated":true,"runtime_id_rotated":true,"same_revision":true,"same_task":true,"stale_token_rejected":true,"token_rotated":true},"revisions":{"action":2,"created":1,"final":5,"observation":3,"verification":4},"scenario_id":"first_working_loop","task_id":"01a0388b-f38e-77f1-8a80-b8e59fd5676c","w2_03_follow_on":{"missing_edges":["authenticated Codex Session attach/resume with a server-delivered lesson InjectionReceipt","canonical next ActionRequest route that can consume discovered lesson evidence"],"negative_oracle":{"memory_handles_used":false,"prompt_handle_or_prescribed_recall_query":false,"used_and_changed_action_claim":false},"status":"CONTRACT_CHALLENGE"}}
+    test first_working_loop_end_to_end ... FAILED
+
+    failures:
+
+    failures:
+        first_working_loop_end_to_end
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 104.73s
+
+  stderr ───
+    2026-08-25T10:52:52.709957Z  WARN IPC authentication rejected reason="stale_token_generation"
+    Error: Os { code: 32, kind: Uncategorized, message: "The process cannot access the file because it is being used by another process." }
+
+────────────
+     Summary [ 104.740s] 1 test run: 0 passed, 1 failed, 5 skipped
+        FAIL [ 104.739s] (1/1) eliot-app::first_working_loop first_working_loop_end_to_end
+error: test run failed

@@ -2524,6 +2524,39 @@ fn deterministic_host_write_id(key: &str) -> WriteId {
     WriteId::from_uuid(Uuid::from_bytes(bytes))
 }
 
+fn host_binding_observation_key(
+    agent_session_id: AgentSessionId,
+    task_id: TaskId,
+    role_lease_id: &str,
+) -> String {
+    format!("host-binding:{agent_session_id}:{task_id}:role-lease:{role_lease_id}")
+}
+
+#[cfg(test)]
+mod host_binding_observation_key_tests {
+    use super::*;
+
+    #[test]
+    fn exact_role_replay_is_stable_but_regrant_gets_a_new_write_id() -> Result<()> {
+        let task_id = TaskId::from_str("e22f3736-d012-4734-ba74-50e0c1050b8d")?;
+        let agent_session_id =
+            AgentSessionId::from_str("f7a7b998-48d6-44c3-94b0-b9cae15e0cd8")?;
+        let first_key =
+            host_binding_observation_key(agent_session_id, task_id, "task-role-lease:old");
+        let replay_key =
+            host_binding_observation_key(agent_session_id, task_id, "task-role-lease:old");
+        let regrant_key =
+            host_binding_observation_key(agent_session_id, task_id, "task-role-lease:new");
+        let first_id = deterministic_host_write_id(&first_key);
+        let replay_id = deterministic_host_write_id(&replay_key);
+        let regrant_id = deterministic_host_write_id(&regrant_key);
+
+        assert_eq!(first_id, replay_id);
+        assert_ne!(first_id, regrant_id);
+        Ok(())
+    }
+}
+
 fn role_authority_path(config_path: &Path, role_lease_id: &str) -> PathBuf {
     role_authority_path_from_root(&runtime_root(config_path), role_lease_id)
 }
@@ -2944,7 +2977,11 @@ async fn open_operation_scope_with_writer(
         input.project_id,
         input.task_id,
         input.agent_session_id,
-        &format!("host-binding:{}:{}", input.agent_session_id, input.task_id),
+        &host_binding_observation_key(
+            input.agent_session_id,
+            input.task_id,
+            &role_lease_id,
+        ),
         "host_binding_authority",
         &binding_value,
     )
@@ -3587,7 +3624,11 @@ async fn grant_role_with_writer(
         task_contract.project_id,
         task_id,
         agent_session_id,
-        &format!("host-binding:{}:{task_id}", host_binding.agent_session_id),
+        &host_binding_observation_key(
+            host_binding.agent_session_id,
+            task_id,
+            &role_lease.role_lease_id,
+        ),
         "host_binding_authority",
         &host_binding_value,
     )

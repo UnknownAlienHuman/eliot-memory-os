@@ -39,6 +39,7 @@ members = [
   "crates/instrument/eliot-instrument-api",
   "crates/instrument/eliot-process-executor",
   "crates/kernel/eliot-host-state",
+  "crates/kernel/eliot-host-control-endpoint",
   "crates/kernel/eliot-ipc",
   "crates/kernel/eliot-kernel-core",
   "crates/kernel/eliot-ors",
@@ -184,6 +185,7 @@ eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
 eliot-process-executor = { path = "crates/instrument/eliot-process-executor", version = "0.1.0" }
 eliot-host-state = { path = "crates/kernel/eliot-host-state", version = "0.1.0" }
+eliot-host-control-endpoint = { path = "crates/kernel/eliot-host-control-endpoint", version = "0.1.0" }
 eliot-ipc = { path = "crates/kernel/eliot-ipc", version = "0.1.0" }
 eliot-kernel-core = { path = "crates/kernel/eliot-kernel-core", version = "0.1.0" }
 eliot-ors = { path = "crates/kernel/eliot-ors", version = "0.1.0" }
@@ -266,7 +268,6 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 sha2 = "0.10.9"
-surrealdb = { version = "=3.2.3", default-features = false, features = ["protocol-ws", "rustls"] }
 thiserror = "2.0.18"
 time = { version = "0.3.51", features = ["local-offset", "serde", "serde-well-known"] }
 tokio = { version = "1.52.3", features = [

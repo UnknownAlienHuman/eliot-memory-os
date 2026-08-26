@@ -22,7 +22,7 @@ use thiserror::Error;
 /// Stable wire name for the C0-13 surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.evaluation-contracts";
 /// Current wire revision for the C0-13 surface.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
 
 /// Structural validation failures.  These errors never imply a product or
 /// release verdict.
@@ -336,7 +336,68 @@ impl RecoveryAcceptanceProfile {
     }
 }
 
-/// Exact verifier reference used by a proof brief.
+/// Observable that a planned verifier is expected to establish.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedObservableSpec {
+    pub property: String,
+    pub matcher: String,
+    pub artifact_selector: String,
+}
+
+impl ExpectedObservableSpec {
+    /// Validates that the property, matcher, and artifact selector are all
+    /// explicit before execution begins.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        text(&self.property, "expected_observable.property")?;
+        text(&self.matcher, "expected_observable.matcher")?;
+        text(
+            &self.artifact_selector,
+            "expected_observable.artifact_selector",
+        )?;
+        Ok(())
+    }
+}
+
+/// Planned verifier configuration used by a proof brief.
+///
+/// This is intentionally not executable evidence: admission of the declared
+/// configuration and revision to a run remains the consumer's responsibility.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedVerifierRef {
+    pub verifier_id: ContractId,
+    pub scope: String,
+    pub verifier_config_hash: String,
+    pub expected_observable: ExpectedObservableSpec,
+    pub environment_binding: String,
+    pub verifier_authority_ref: String,
+    pub contract_revision: ContractVersion,
+    pub proof_ceiling: ProofCeiling,
+}
+
+impl PlannedVerifierRef {
+    /// Validates the non-empty, non-executable verifier plan fields.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        text(&self.scope, "planned_verifier.scope")?;
+        text(
+            &self.verifier_config_hash,
+            "planned_verifier.verifier_config_hash",
+        )?;
+        self.expected_observable.validate()?;
+        text(
+            &self.environment_binding,
+            "planned_verifier.environment_binding",
+        )?;
+        text(
+            &self.verifier_authority_ref,
+            "planned_verifier.verifier_authority_ref",
+        )?;
+        Ok(())
+    }
+}
+
+/// Exact terminal verifier evidence reference used by a proof brief.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifierEvidenceRef {
@@ -363,6 +424,53 @@ impl VerifierEvidenceRef {
                 field: "verifier.execution",
                 reason: "proof reference requires a terminal execution status",
             });
+        }
+        if self.outcome.is_pass() && self.execution != ExecutionStatus::Succeeded {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "verifier.outcome",
+                reason: "PASS requires a succeeded verifier execution",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Binding between a planned verifier and its terminal evidence.
+///
+/// This binds the verifier identity, scope, and proof ceiling. Admission of
+/// the planned configuration hash and contract revision to the executed run
+/// remains the consumer's responsibility because terminal evidence does not
+/// carry those planned-only fields.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalVerifierBinding {
+    pub planned: PlannedVerifierRef,
+    pub evidence: VerifierEvidenceRef,
+}
+
+impl TerminalVerifierBinding {
+    /// Validates exact verifier identity/scope binding without admitting a run.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        self.planned.validate()?;
+        self.evidence.validate()?;
+        if self.planned.verifier_id != self.evidence.verifier_id {
+            return Err(EvaluationContractError::InvalidDependency {
+                field: "terminal_verifier_binding.evidence.verifier_id",
+                reason: "terminal evidence verifier must match the planned verifier",
+            });
+        }
+        if self.planned.scope != self.evidence.scope {
+            return Err(EvaluationContractError::InvalidDependency {
+                field: "terminal_verifier_binding.evidence.scope",
+                reason: "terminal evidence scope must match the planned verifier scope",
+            });
+        }
+        if !self
+            .evidence
+            .proof_ceiling
+            .is_at_most(self.planned.proof_ceiling)
+        {
+            return Err(EvaluationContractError::ProofOverclaim);
         }
         Ok(())
     }
@@ -398,7 +506,7 @@ pub struct OperationalSpineProofBrief {
     pub task_and_environment: String,
     pub comparison_basis: ComparisonBasis,
     pub comparison_reason: Option<String>,
-    pub expected_observable_and_exact_verifier: VerifierEvidenceRef,
+    pub expected_observable_and_exact_verifier: PlannedVerifierRef,
     pub counter_metrics_and_known_confounders: Vec<String>,
     pub budget_and_time_envelope: BudgetTimeEnvelope,
     pub stop_kill_rollback_and_claim_boundary: String,
@@ -425,6 +533,20 @@ impl OperationalSpineProofBrief {
             "brief.counter_metrics_and_known_confounders",
         )?;
         self.expected_observable_and_exact_verifier.validate()?;
+        if !self
+            .exact_product_identity_and_contract_revisions
+            .contract_revisions
+            .contains(
+                &self
+                    .expected_observable_and_exact_verifier
+                    .contract_revision,
+            )
+        {
+            return Err(EvaluationContractError::InvalidDependency {
+                field: "brief.expected_observable_and_exact_verifier.contract_revision",
+                reason: "planned verifier revision must be listed in product identity contract revisions",
+            });
+        }
         self.budget_and_time_envelope.validate()?;
         if self.comparison_basis == ComparisonBasis::NotApplicableWithReason {
             match &self.comparison_reason {
@@ -947,12 +1069,12 @@ pub mod surface_types {
     pub use super::{
         BudgetEquivalence, BudgetEquivalenceLedger, BudgetEvidence, BudgetTimeEnvelope,
         CensoringRecord, ClaimKind, ComparisonBasis, DelayedOutcomeWindow, EvaluationReportInput,
-        EvidenceScope, GraphEvidenceRef, ObjectiveStatus, ObservationWindowSpec,
-        ObservationWindowStatus, OperationalSpineProofBrief, OutcomeObservation,
-        ProductEvaluationPlan, ProductEvidenceStatus, ProductIdentityRef,
-        ProductOutcomeObservationWindow, RecoveryAcceptanceProfile, RecoveryGap,
-        RecoveryProfileStatus, ReportInput, Trial, TrialOutcome, TrialRecord, TrialStatus,
-        UserOutcomeObjectiveState, VerifierEvidenceRef,
+        EvidenceScope, ExpectedObservableSpec, GraphEvidenceRef, ObjectiveStatus,
+        ObservationWindowSpec, ObservationWindowStatus, OperationalSpineProofBrief,
+        OutcomeObservation, PlannedVerifierRef, ProductEvaluationPlan, ProductEvidenceStatus,
+        ProductIdentityRef, ProductOutcomeObservationWindow, RecoveryAcceptanceProfile,
+        RecoveryGap, RecoveryProfileStatus, ReportInput, TerminalVerifierBinding, Trial,
+        TrialOutcome, TrialRecord, TrialStatus, UserOutcomeObjectiveState, VerifierEvidenceRef,
     };
 }
 
@@ -984,6 +1106,46 @@ pub mod negative_consumer_fixtures {
     /// JSON for a censoring record without its required reason.
     pub fn censored_without_reason() -> Value {
         json!({"reason": "", "exposure": "partial"})
+    }
+
+    /// Planned verifier JSON with terminal-only fields; rejected fail-closed.
+    pub fn planned_as_terminal() -> Value {
+        json!({
+            "verifier_id": "verifier-1",
+            "scope": "one task",
+            "verifier_config_hash": "config-1",
+            "expected_observable": {
+                "property": "one property",
+                "matcher": "equals expected",
+                "artifact_selector": "artifact.json"
+            },
+            "environment_binding": "local fixture",
+            "verifier_authority_ref": "authority:test",
+            "contract_revision": {"major": 2, "minor": 0, "patch": 0},
+            "proof_ceiling": "SCOPED_VERIFICATION",
+            "run_id": "run-1",
+            "execution": "SUCCEEDED",
+            "outcome": {"kind": "PASS"},
+            "evidence_refs": ["artifact-1"]
+        })
+    }
+
+    /// Planned verifier JSON with empty required text fields.
+    pub fn empty_planned_fields() -> Value {
+        json!({
+            "verifier_id": "verifier-1",
+            "scope": " ",
+            "verifier_config_hash": "",
+            "expected_observable": {
+                "property": "",
+                "matcher": " ",
+                "artifact_selector": ""
+            },
+            "environment_binding": "",
+            "verifier_authority_ref": "",
+            "contract_revision": {"major": 2, "minor": 0, "patch": 0},
+            "proof_ceiling": "OBSERVATION"
+        })
     }
 }
 
@@ -1028,6 +1190,35 @@ mod tests {
             product_id: valid!(ProductId, "product-1"),
             source_revision: "source-1".to_owned(),
             contract_revisions: vec![CONTRACT_VERSION],
+        }
+    }
+
+    fn planned_verifier() -> PlannedVerifierRef {
+        PlannedVerifierRef {
+            verifier_id: valid!(ContractId, "verifier-1"),
+            scope: "one task".to_owned(),
+            verifier_config_hash: "config-1".to_owned(),
+            expected_observable: ExpectedObservableSpec {
+                property: "one property".to_owned(),
+                matcher: "equals expected".to_owned(),
+                artifact_selector: "artifact.json".to_owned(),
+            },
+            environment_binding: "local fixture".to_owned(),
+            verifier_authority_ref: "authority:test".to_owned(),
+            contract_revision: CONTRACT_VERSION,
+            proof_ceiling: ProofCeiling::ScopedVerification,
+        }
+    }
+
+    fn verifier_evidence() -> VerifierEvidenceRef {
+        VerifierEvidenceRef {
+            run_id: valid!(RequestId, "run-1"),
+            verifier_id: valid!(ContractId, "verifier-1"),
+            scope: "one task".to_owned(),
+            execution: ExecutionStatus::Succeeded,
+            outcome: VerificationOutcome::Pass,
+            proof_ceiling: ProofCeiling::ScopedVerification,
+            evidence_refs: vec![valid!(ArtifactId, "artifact-1")],
         }
     }
 
@@ -1087,22 +1278,13 @@ mod tests {
 
     #[test]
     fn proof_ceiling_cannot_be_overclaimed() {
-        let verifier = VerifierEvidenceRef {
-            run_id: valid!(RequestId, "run-1"),
-            verifier_id: valid!(ContractId, "verifier-1"),
-            scope: "one task".to_owned(),
-            execution: ExecutionStatus::Succeeded,
-            outcome: VerificationOutcome::Pass,
-            proof_ceiling: ProofCeiling::ScopedVerification,
-            evidence_refs: vec![valid!(ArtifactId, "artifact-1")],
-        };
         let brief = OperationalSpineProofBrief {
             exact_product_identity_and_contract_revisions: product_identity(),
             user_outcome_and_one_causal_property: "recovery".to_owned(),
             task_and_environment: "fixture".to_owned(),
             comparison_basis: ComparisonBasis::ExactPrechangeBehavior,
             comparison_reason: None,
-            expected_observable_and_exact_verifier: verifier,
+            expected_observable_and_exact_verifier: planned_verifier(),
             counter_metrics_and_known_confounders: vec!["latency".to_owned()],
             budget_and_time_envelope: BudgetTimeEnvelope {
                 max_wall_time_ms: 1,
@@ -1118,6 +1300,141 @@ mod tests {
             brief.validate(),
             Err(EvaluationContractError::ProofOverclaim)
         );
+    }
+
+    #[test]
+    fn planned_verifier_rejects_terminal_fields_during_serde() {
+        assert!(
+            serde_json::from_value::<PlannedVerifierRef>(
+                negative_consumer_fixtures::planned_as_terminal()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn planned_verifier_rejects_empty_required_fields() {
+        let planned = match serde_json::from_value::<PlannedVerifierRef>(
+            negative_consumer_fixtures::empty_planned_fields(),
+        ) {
+            Ok(planned) => planned,
+            Err(error) => panic!("fixture must retain the planned verifier shape: {error}"),
+        };
+        assert!(planned.validate().is_err());
+    }
+
+    #[test]
+    fn brief_rejects_unlisted_planned_contract_revision() {
+        let mut brief = OperationalSpineProofBrief {
+            exact_product_identity_and_contract_revisions: product_identity(),
+            user_outcome_and_one_causal_property: "recovery".to_owned(),
+            task_and_environment: "fixture".to_owned(),
+            comparison_basis: ComparisonBasis::ExactPrechangeBehavior,
+            comparison_reason: None,
+            expected_observable_and_exact_verifier: planned_verifier(),
+            counter_metrics_and_known_confounders: vec!["latency".to_owned()],
+            budget_and_time_envelope: BudgetTimeEnvelope {
+                max_wall_time_ms: 1,
+                max_model_calls: 0,
+                max_tool_calls: 0,
+                max_human_attention_ms: 0,
+            },
+            stop_kill_rollback_and_claim_boundary: "no release claim".to_owned(),
+            delayed_observation_or_recurrence_window: None,
+            proof_ceiling: ProofCeiling::ScopedVerification,
+        };
+        brief
+            .expected_observable_and_exact_verifier
+            .contract_revision = ContractVersion::new(1, 0, 0);
+        assert!(matches!(
+            brief.validate(),
+            Err(EvaluationContractError::InvalidDependency { .. })
+        ));
+    }
+
+    #[test]
+    fn terminal_binding_rejects_scope_and_verifier_substitution() {
+        let mut binding = TerminalVerifierBinding {
+            planned: planned_verifier(),
+            evidence: verifier_evidence(),
+        };
+        binding.evidence.scope = "other task".to_owned();
+        assert!(binding.validate().is_err());
+
+        binding.evidence.scope = binding.planned.scope.clone();
+        binding.evidence.verifier_id = valid!(ContractId, "other-verifier");
+        assert!(binding.validate().is_err());
+    }
+
+    #[test]
+    fn terminal_binding_rejects_evidence_above_planned_ceiling() {
+        let mut binding = TerminalVerifierBinding {
+            planned: planned_verifier(),
+            evidence: verifier_evidence(),
+        };
+        binding.planned.proof_ceiling = ProofCeiling::Observation;
+        assert_eq!(
+            binding.validate(),
+            Err(EvaluationContractError::ProofOverclaim)
+        );
+    }
+
+    #[test]
+    fn terminal_evidence_requires_terminal_status_and_artifacts() {
+        let mut evidence = verifier_evidence();
+        evidence.execution = ExecutionStatus::Running;
+        assert!(evidence.validate().is_err());
+
+        evidence.execution = ExecutionStatus::Succeeded;
+        evidence.evidence_refs.clear();
+        assert!(evidence.validate().is_err());
+    }
+
+    #[test]
+    fn terminal_pass_requires_succeeded_execution() {
+        for execution in [
+            ExecutionStatus::Failed,
+            ExecutionStatus::Partial,
+            ExecutionStatus::Unknown,
+            ExecutionStatus::Blocked,
+            ExecutionStatus::Cancelled,
+        ] {
+            let mut evidence = verifier_evidence();
+            evidence.execution = execution;
+            assert!(matches!(
+                evidence.validate(),
+                Err(EvaluationContractError::EvidenceState {
+                    field: "verifier.outcome",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn tracked_w2_01_brief_matches_and_validates_contract_schema() {
+        let brief = match serde_json::from_str::<OperationalSpineProofBrief>(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../swarm/briefs/W2-01.json"
+        ))) {
+            Ok(brief) => brief,
+            Err(error) => panic!("tracked W2-01 brief must match the contract shape: {error}"),
+        };
+        assert_eq!(
+            brief
+                .exact_product_identity_and_contract_revisions
+                .source_revision,
+            format!(
+                "sha256:{}",
+                eliot_contracts::sha256_hex(include_bytes!("lib.rs"))
+            )
+        );
+        assert_eq!(
+            brief.comparison_basis,
+            ComparisonBasis::NotApplicableWithReason
+        );
+        assert_eq!(brief.proof_ceiling, ProofCeiling::CandidateArtifact);
+        assert!(brief.validate().is_ok());
     }
 
     #[test]

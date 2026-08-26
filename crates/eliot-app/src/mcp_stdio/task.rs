@@ -15,12 +15,37 @@ pub(super) async fn dispatch_task_action_request(
     arguments: Value,
 ) -> Result<Value> {
     let input: TaskActionToolInput = serde_json::from_value(arguments)?;
+    let action_request_hash = canonical_struct_hash(&input)?;
     let project_id = parse_project_id(&input.project_id)?;
     let task_id = TaskId::from_str(&input.task_id).context("parse task id")?;
     let _task_guard = task_commit_serializer().lock().await;
     let _task_process_guard = acquire_task_transition_process_lock(&state.root, task_id).await?;
     let write_id = WriteId::from_str(&input.write_id).context("parse write id")?;
     let mut task = require_task(state, project_id, task_id).await?;
+    if let Some(receipt) = state.store.write_receipt_by_id(&write_id).await?
+        && task
+            .memory_grant_redemptions
+            .iter()
+            .any(|redemption| redemption.action_write_id == write_id)
+    {
+        return match replay_memory_grant_action(
+            context,
+            project_id,
+            &task,
+            write_id,
+            &action_request_hash,
+            &input,
+            receipt,
+        ) {
+            Ok(response) => Ok(response),
+            Err(error) => Ok(json!({
+                "status": "denied_idempotency_conflict",
+                "decision": "deny",
+                "reason": error.to_string(),
+                "write_receipt": Value::Null
+            })),
+        };
+    }
     ensure_expected_revision_or_replay(state, &task, input.expected_revision, write_id).await?;
 
     let mut missing = Vec::new();
@@ -60,18 +85,26 @@ pub(super) async fn dispatch_task_action_request(
         }));
     }
 
-    let (provenance, verifier) =
-        match resolve_action_provenance(state, project_id, &task, write_id, &input).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                return Ok(json!({
-                    "status": "denied_invalid_provenance",
-                    "decision": "deny",
-                    "reason": error.to_string(),
-                    "write_receipt": Value::Null
-                }));
-            }
-        };
+    let (provenance, verifier) = match resolve_action_provenance(
+        state,
+        project_id,
+        &task,
+        context.session_id,
+        write_id,
+        &input,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return Ok(json!({
+                "status": "denied_invalid_provenance",
+                "decision": "deny",
+                "reason": error.to_string(),
+                "write_receipt": Value::Null
+            }));
+        }
+    };
     let proof_hash = canonical_struct_hash(&json!({
         "planned_action": input.planned_action,
         "provenance_set_hash": provenance.hash
@@ -80,6 +113,12 @@ pub(super) async fn dispatch_task_action_request(
     task.status = TaskContractStatus::Active;
     task.action_lease_id = Some(lease_id);
     task.understanding_proof_hash = Some(proof_hash.clone());
+    memory_grant::append_memory_grant_redemptions(
+        &mut task,
+        write_id,
+        &action_request_hash,
+        &provenance,
+    )?;
     task.action_provenance = Some(provenance.clone());
     let contract = task_input(&task, Some(MemoryRevision::new(input.expected_revision)));
     let (receipt, task) = submit_task_transition(
@@ -105,6 +144,106 @@ pub(super) async fn dispatch_task_action_request(
             "planned_verifier_ref": provenance.planned_verifier_ref,
             "verifier_config_hash": verifier.config_hash(),
             "understanding_proof_hash": proof_hash,
+            "memory_delivery_refs": provenance.memory_delivery_refs,
+            "memory_grant_refs": provenance.memory_grant_refs,
+            "provenance_set_hash": provenance.hash
+        },
+        "task_contract": task,
+        "write_receipt": receipt
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_memory_grant_action(
+    context: AuthenticatedRequestContext,
+    project_id: ProjectId,
+    task: &TaskContract,
+    action_write_id: WriteId,
+    action_request_hash: &str,
+    input: &TaskActionToolInput,
+    mut receipt: WriteReceipt,
+) -> Result<Value> {
+    anyhow::ensure!(
+        receipt.write_id == action_write_id
+            && receipt.project_id == project_id
+            && receipt.task_id == Some(task.task_id)
+            && receipt.command_kind == SemanticCommandKind::TaskContractWrite
+            && matches!(
+                receipt.status,
+                WriteStatus::Committed | WriteStatus::IdempotentReplay
+            ),
+        "existing write receipt is not the committed TaskContract action"
+    );
+    let redemptions = task
+        .memory_grant_redemptions
+        .iter()
+        .filter(|redemption| redemption.action_write_id == action_write_id)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !redemptions.is_empty()
+            && redemptions.iter().all(|redemption| {
+                redemption.schema_version == ACTION_MEMORY_GRANT_REDEMPTION_SCHEMA_VERSION
+                    && redemption.project_id == project_id
+                    && redemption.task_id == task.task_id
+                    && redemption.session_id == context.session_id
+                    && redemption.action_request_hash == action_request_hash
+            }),
+        "same write id was retried with a different action request or session"
+    );
+    let requested_grants = memory_grant::memory_grant_ids_from_tokens(&input.memory_grant_tokens)?;
+    let persisted_grants = redemptions
+        .iter()
+        .map(|redemption| redemption.grant_id.clone())
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        requested_grants == persisted_grants && requested_grants.len() == redemptions.len(),
+        "same write id was retried with a substituted opaque memory grant set"
+    );
+
+    let provenance = task
+        .action_provenance
+        .as_ref()
+        .context("persisted action provenance is unavailable for replay")?;
+    anyhow::ensure!(
+        task.write_id == action_write_id
+            && provenance.provenance_set_id == format!("eliot/provenance-set/{action_write_id}")
+            && redemptions.iter().all(|redemption| {
+                redemption.provenance_set_id == provenance.provenance_set_id
+                    && redemption.provenance_set_hash == provenance.hash
+            }),
+        "persisted action result is no longer the exact replay target"
+    );
+    let verifier = RegisteredTaskVerifier::from_reference(&provenance.planned_verifier_ref)
+        .context("persisted planned verifier is not registered")?;
+    let proof_hash = canonical_struct_hash(&json!({
+        "planned_action": input.planned_action,
+        "provenance_set_hash": provenance.hash
+    }))?;
+    anyhow::ensure!(
+        task.understanding_proof_hash.as_deref() == Some(proof_hash.as_str()),
+        "same write id was retried with a different planned action"
+    );
+    let lease_id = ActionLeaseId::from_uuid(action_write_id.as_uuid());
+    anyhow::ensure!(
+        task.action_lease_id == Some(lease_id),
+        "persisted ActionLease identity does not match the replayed write"
+    );
+    receipt.status = WriteStatus::IdempotentReplay;
+    Ok(json!({
+        "status": "allowed_bounded",
+        "decision": "allow",
+        "idempotent_replay": true,
+        "action_lease": {
+            "lease_id": lease_id,
+            "task_id": task.task_id,
+            "at_revision": input.expected_revision,
+            "scope": provenance.source_scope,
+            "planned_action": input.planned_action,
+            "planned_verifier_ref": provenance.planned_verifier_ref,
+            "verifier_config_hash": verifier.config_hash(),
+            "understanding_proof_hash": proof_hash,
+            "memory_delivery_refs": provenance.memory_delivery_refs,
+            "memory_grant_refs": provenance.memory_grant_refs,
             "provenance_set_hash": provenance.hash
         },
         "task_contract": task,
@@ -1005,6 +1144,30 @@ fn append_completion_proof_header_gaps(
         if proof_files != provenance_files || proof_files.len() != proof.changed_files.len() {
             gaps.push("completion_proof:changed_files_not_exact".to_owned());
         }
+
+        let proof_memory = proof
+            .memory_refs_used
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let delivered_memory = provenance
+            .memory_delivery_refs
+            .iter()
+            .map(|reference| reference.memory_handle.clone())
+            .chain(
+                provenance
+                    .memory_grant_refs
+                    .iter()
+                    .map(|reference| format!("grant:{}", reference.grant_id)),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        if proof_memory != delivered_memory
+            || proof_memory.len() != proof.memory_refs_used.len()
+            || delivered_memory.len()
+                != provenance.memory_delivery_refs.len() + provenance.memory_grant_refs.len()
+        {
+            gaps.push("completion_proof:memory_delivery_refs_not_exact".to_owned());
+        }
     }
 }
 
@@ -1096,10 +1259,186 @@ pub(super) fn task_input(
         action_lease_id: task.action_lease_id,
         understanding_proof_hash: task.understanding_proof_hash.clone(),
         action_provenance: task.action_provenance.clone(),
+        memory_grant_redemptions: task.memory_grant_redemptions.clone(),
         observation_ids: task.observation_ids.clone(),
         verification_ids: task.verification_ids.clone(),
         verification_scopes: task.verification_scopes.clone(),
         completion_proof: task.completion_proof.clone(),
         completion_write_id: task.completion_write_id,
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    #[test]
+    fn exact_memory_grant_action_replay_is_idempotent_and_substitution_fails() -> Result<()> {
+        let project_id = ProjectId::from_uuid(uuid::Uuid::from_u128(1));
+        let task_id = TaskId::from_uuid(uuid::Uuid::from_u128(2));
+        let session_id = SessionId::from_uuid(uuid::Uuid::from_u128(3));
+        let grant_id = uuid::Uuid::from_u128(4).to_string();
+        let offer_write_id = WriteId::from_uuid(uuid::Uuid::from_u128(4));
+        let action_write_id = WriteId::from_uuid(uuid::Uuid::from_u128(5));
+        let redeemed_at = time::OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+        let token = format!("mg1:{grant_id}:1800000900:{}", "c".repeat(64));
+        let input = TaskActionToolInput {
+            project_id: project_id.to_string(),
+            task_id: task_id.to_string(),
+            write_id: action_write_id.to_string(),
+            expected_revision: 7,
+            packet_id: "eliot/packet/replay".to_owned(),
+            packet_revision_fence: 7,
+            task_contract_ref: format!("eliot/task/{task_id}@7"),
+            current_truth_refs: vec![format!("eliot/task/{task_id}@7")],
+            provenance_handles: vec!["receipt:task".to_owned()],
+            memory_handles_used: Vec::new(),
+            memory_grant_tokens: vec![token],
+            negative_memory_checked: true,
+            negative_memory_check_ref: "negative-memory:replay".to_owned(),
+            planned_action: "edit one bounded file".to_owned(),
+            planned_verifier_ref: RegisteredTaskVerifier::ReceiptResolution.reference(),
+            worktree_ref: None,
+            artifact_paths: Vec::new(),
+        };
+        let action_request_hash = canonical_struct_hash(&input)?;
+        let grant_ref = ActionMemoryGrantRef {
+            schema_version: ACTION_MEMORY_GRANT_REF_SCHEMA_VERSION.to_owned(),
+            project_id,
+            task_id,
+            session_id,
+            grant_id: grant_id.clone(),
+            offer_write_id,
+            packet_id: input.packet_id.clone(),
+            packet_revision_fence: MemoryRevision::new(input.packet_revision_fence),
+            task_memory_revision: MemoryRevision::new(input.expected_revision),
+            task_contract_ref: input.task_contract_ref.clone(),
+            prior_fingerprint: "prior-fingerprint".to_owned(),
+            guidance_hash: "guidance-hash".to_owned(),
+            expires_at: redeemed_at + time::Duration::minutes(15),
+            redeemed_at,
+            evidence_class:
+                ActionMemoryGrantEvidenceClass::AgentReturnedOpaqueGrantAfterServerOffer,
+        };
+        let provenance = ActionProvenanceSet {
+            provenance_set_id: format!("eliot/provenance-set/{action_write_id}"),
+            task_id,
+            packet_id: input.packet_id.clone(),
+            packet_revision_fence: MemoryRevision::new(input.packet_revision_fence),
+            task_contract_ref: input.task_contract_ref.clone(),
+            current_truth_refs: input.current_truth_refs.clone(),
+            exact_evidence_refs: input.provenance_handles.clone(),
+            memory_delivery_refs: Vec::new(),
+            memory_grant_refs: vec![grant_ref],
+            negative_memory_check_ref: input.negative_memory_check_ref.clone(),
+            planned_verifier_ref: input.planned_verifier_ref.clone(),
+            source_scope: ActionSourceScope {
+                kind: "read_only".to_owned(),
+                worktree_ref: None,
+                branch: None,
+                baseline_commit: None,
+                baseline_dirty_state_hash: None,
+                artifact_paths: Vec::new(),
+            },
+            resolved_at: redeemed_at,
+            resolver_version: ACTION_PROVENANCE_RESOLVER_VERSION_V3.to_owned(),
+            hash: "b".repeat(64),
+        };
+        let redemption = ActionMemoryGrantRedemption {
+            schema_version: ACTION_MEMORY_GRANT_REDEMPTION_SCHEMA_VERSION.to_owned(),
+            project_id,
+            task_id,
+            session_id,
+            grant_id,
+            offer_write_id,
+            action_write_id,
+            action_request_hash: action_request_hash.clone(),
+            provenance_set_id: provenance.provenance_set_id.clone(),
+            provenance_set_hash: provenance.hash.clone(),
+            packet_id: provenance.packet_id.clone(),
+            packet_revision_fence: provenance.packet_revision_fence,
+            task_memory_revision: MemoryRevision::new(input.expected_revision),
+            task_contract_ref: provenance.task_contract_ref.clone(),
+            prior_fingerprint: "prior-fingerprint".to_owned(),
+            guidance_hash: "guidance-hash".to_owned(),
+            redeemed_at,
+        };
+        let proof_hash = canonical_struct_hash(&json!({
+            "planned_action": input.planned_action,
+            "provenance_set_hash": provenance.hash
+        }))?;
+        let task = TaskContract {
+            task_id,
+            project_id,
+            title: "memory grant replay".to_owned(),
+            status: TaskContractStatus::Active,
+            acceptance_items: Vec::new(),
+            action_lease_id: Some(ActionLeaseId::from_uuid(action_write_id.as_uuid())),
+            understanding_proof_hash: Some(proof_hash),
+            action_provenance: Some(provenance),
+            memory_grant_redemptions: vec![redemption],
+            observation_ids: Vec::new(),
+            verification_ids: Vec::new(),
+            verification_scopes: Vec::new(),
+            completion_proof: None,
+            completion_write_id: None,
+            memory_revision: MemoryRevision::new(8),
+            project_sequence: eliot_types::ProjectSequence::new(8),
+            write_id: action_write_id,
+        };
+        let receipt = WriteReceipt {
+            receipt_id: ReceiptId::from_uuid(action_write_id.as_uuid()),
+            write_id: action_write_id,
+            input_hash: "input-hash".to_owned(),
+            project_id,
+            task_id: Some(task_id),
+            command_kind: SemanticCommandKind::TaskContractWrite,
+            status: WriteStatus::Committed,
+            memory_revision: Some(MemoryRevision::new(8)),
+            project_sequence: Some(eliot_types::ProjectSequence::new(8)),
+            created_records: vec![task_id.to_string()],
+            created_relations: Vec::new(),
+            weak_records: Vec::new(),
+            rejected_reason: None,
+            db_operation_id: None,
+            created_at: redeemed_at,
+        };
+        let context = AuthenticatedRequestContext {
+            session_id,
+            bound_project_id: Some(project_id),
+            bound_task_id: Some(task_id),
+        };
+
+        let replay = replay_memory_grant_action(
+            context,
+            project_id,
+            &task,
+            action_write_id,
+            &action_request_hash,
+            &input,
+            receipt.clone(),
+        )?;
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["write_receipt"]["status"], "idempotent_replay");
+
+        let mut substituted = input;
+        substituted.memory_grant_tokens = vec![format!(
+            "mg1:{}:1800000900:{}",
+            uuid::Uuid::from_u128(6),
+            "d".repeat(64)
+        )];
+        assert!(
+            replay_memory_grant_action(
+                context,
+                project_id,
+                &task,
+                action_write_id,
+                &action_request_hash,
+                &substituted,
+                receipt,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }

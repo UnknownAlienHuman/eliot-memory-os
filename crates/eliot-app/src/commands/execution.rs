@@ -373,12 +373,22 @@ pub async fn run_work_create(
     goal: &str,
     read: &[String],
     write: &[String],
+    agent_session: Option<&str>,
 ) -> Result<()> {
     let root = runtime_root(config_path);
     let mut state = load_work_state(&root)?;
     let project_id = project_id_from_label(project);
     let task_id = task_id_from_label(task);
-    let session = AgentSessionService.create_controller(&mut state, project_id);
+    let session = if let Some(agent_session) = agent_session {
+        AgentSessionService.bind_for_role(
+            &mut state,
+            AgentSessionId::from_str(agent_session).context("parse --agent-session")?,
+            project_id,
+            AgentRole::Controller,
+        )?
+    } else {
+        AgentSessionService.create_controller(&mut state, project_id)
+    };
     if read.is_empty() && write.is_empty() {
         bail!("work create requires an explicit --read or --write scope");
     }
@@ -434,6 +444,7 @@ pub async fn run_work_claim(
     project: &str,
     task: &str,
     role: &str,
+    agent_session: Option<&str>,
 ) -> Result<()> {
     let root = runtime_root(config_path);
     let mut state = load_work_state(&root)?;
@@ -444,7 +455,16 @@ pub async fn run_work_claim(
     let project_id = find_work_item(&state, project, task)
         .map(|item| item.project_id)
         .context("no matching work item found; run work create first")?;
-    let session = AgentSessionService.create_for_role(&mut state, project_id, role);
+    let session = if let Some(agent_session) = agent_session {
+        AgentSessionService.bind_for_role(
+            &mut state,
+            AgentSessionId::from_str(agent_session).context("parse --agent-session")?,
+            project_id,
+            role,
+        )?
+    } else {
+        AgentSessionService.create_for_role(&mut state, project_id, role)
+    };
     let decision = WorkLeaseService.claim(
         &mut state,
         WorkClaimRequest {
@@ -835,6 +855,55 @@ pub async fn run_worktree_create(config_path: &Path, work_lease_id: &str) -> Res
     save_worktree_state_and_reports(&root, &state)?;
     write_json(&serde_json::json!({
         "component": "worktree_create",
+        "worktree_lease": lease,
+        "operation_status": OperationStatus::OperationCompleted
+    }))
+}
+
+pub async fn run_worktree_adopt(
+    config_path: &Path,
+    work_lease_id: &str,
+    dogfood_root: &Path,
+) -> Result<()> {
+    let root = runtime_root(config_path);
+    let prepared = crate::dogfood::prepared_worktree_adoption(dogfood_root, config_path)?;
+    let mut state = load_work_state(&root)?;
+    let work_lease_id = WorkLeaseId::from_str(work_lease_id).context("parse work lease id")?;
+    let work_lease = state
+        .leases
+        .iter()
+        .find(|lease| lease.work_lease_id == work_lease_id)
+        .cloned()
+        .context("work lease not found")?;
+    let request = WorktreeLeaseRequest {
+        request_id: WorktreeLeaseRequestId::new_v7(),
+        project_id: work_lease.project_id,
+        task_id: work_lease.task_id,
+        work_item_id: work_lease.work_item_id,
+        work_lease_id: work_lease.work_lease_id,
+        agent_session_id: work_lease.agent_session_id,
+        repo_root: work_lease.scope.repo_root.clone(),
+        requested_branch_name: Some(prepared.branch),
+        requested_scope: work_lease.scope.clone(),
+        base_commit: Some(prepared.commit),
+        created_at: time::OffsetDateTime::now_utc(),
+    };
+    let mut lease = WorktreeLeaseService
+        .adopt_independent(
+            &mut state,
+            WorktreeAdoptInput {
+                request,
+                worktree_path: prepared.worktree,
+                managed_root: prepared.managed_root,
+                ttl_minutes: WorktreeLeaseService::default_ttl_minutes(),
+            },
+        )
+        .await?;
+    write_worktree_records(config_path, Some(&mut lease), None, None, None).await?;
+    replace_worktree_lease(&mut state, lease.clone());
+    save_worktree_state_and_reports(&root, &state)?;
+    write_json(&serde_json::json!({
+        "component": "worktree_adopt",
         "worktree_lease": lease,
         "operation_status": OperationStatus::OperationCompleted
     }))

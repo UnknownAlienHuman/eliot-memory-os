@@ -1,0 +1,27 @@
+   Compiling eliot-app v0.1.0 (C:\Development\Rust\projects\eliot-memory-os\crates\eliot-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.58s
+────────────
+ Nextest run ID bb2295e1-3a4a-4296-89aa-a9ee2ec0eb72 with nextest profile: default
+    Starting 1 test across 1 binary (5 tests skipped)
+        FAIL [ 116.012s] (1/1) eliot-app::first_working_loop first_working_loop_end_to_end
+  stdout ───
+
+    running 1 test
+    test first_working_loop_end_to_end has been running for over 60 seconds
+    test first_working_loop_end_to_end ... FAILED
+
+    failures:
+
+    failures:
+        first_working_loop_end_to_end
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 116.01s
+
+  stderr ───
+    2026-08-25T10:24:45.165497Z  WARN IPC authentication rejected reason="stale_token_generation"
+    Error: "git worktree remove failed: error: failed to delete 'C:/Users/kleym/AppData/Local/Temp/eliot-fwl-wt-01a03872-0749-7d31-9d8c-38bdec8af12d': Invalid argument\n"
+
+────────────
+     Summary [ 116.013s] 1 test run: 0 passed, 1 failed, 5 skipped
+        FAIL [ 116.012s] (1/1) eliot-app::first_working_loop first_working_loop_end_to_end
+error: test run failed

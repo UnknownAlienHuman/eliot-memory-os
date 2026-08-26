@@ -152,6 +152,50 @@ impl AgentSessionService {
         session
     }
 
+    pub fn bind_for_role(
+        &self,
+        state: &mut WorkState,
+        agent_session_id: AgentSessionId,
+        project_id: ProjectId,
+        role: AgentRole,
+    ) -> Result<AgentSession, EngineError> {
+        if let Some(session) = state
+            .sessions
+            .iter()
+            .find(|session| session.agent_session_id == agent_session_id)
+        {
+            if session.project_id != project_id
+                || session.role != role
+                || session.status != AgentSessionStatus::Active
+            {
+                return Err(EngineError::WriteRejected(
+                    "agent session binding does not match the requested active project role"
+                        .to_owned(),
+                ));
+            }
+            return Ok(session.clone());
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let session = AgentSession {
+            agent_session_id,
+            agent_id: AgentId::new_v7(),
+            project_id,
+            role,
+            transport: AgentTransport::LocalCli,
+            status: AgentSessionStatus::Active,
+            parent_session_id: None,
+            current_work_item_id: None,
+            started_at: now,
+            last_heartbeat_at: now,
+            stopped_at: None,
+            unavailable_reason: None,
+            write_receipt: None,
+        };
+        state.sessions.push(session.clone());
+        Ok(session)
+    }
+
     #[must_use]
     pub fn create_subagent_unavailable(
         &self,

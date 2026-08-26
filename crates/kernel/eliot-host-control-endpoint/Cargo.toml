@@ -1,0 +1,27 @@
+[package]
+name = "eliot-host-control-endpoint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Capability-bound Host runtime-control named-pipe endpoint"
+
+[package.metadata.eliot]
+work_id = "P-05"
+functional_cell = "host-control-endpoint"
+lifecycle_owner = "P-05"
+source_layer = "C1"
+proof_entrypoint = "cargo test -p eliot-host-control-endpoint"
+
+[dependencies]
+eliot-host-service.workspace = true
+eliot-ipc.workspace = true
+eliot-platform-windows.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+eliot-platform.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

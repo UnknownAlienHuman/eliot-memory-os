@@ -1,7 +1,14 @@
 use eliot_store::{CanonicalStore, StoreError};
 use eliot_types::{
-    CredentialProviderKind, GovernorConfig, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind,
-    ObservabilityWriteEnvelope, ObservabilityWriteStatus, ProjectId, SessionId, TaskId, WriteId,
+    ACTION_MEMORY_GRANT_REDEMPTION_SCHEMA_VERSION, ACTION_MEMORY_GRANT_REF_SCHEMA_VERSION,
+    ActionMemoryGrantEvidenceClass, ActionMemoryGrantRedemption, ActionMemoryGrantRef,
+    ActionProvenanceSet, ActionSourceScope, AgentId, CredentialProviderKind, GovernorConfig,
+    IdempotencyOptions, LifecycleStatus, LifecycleWriteOptions,
+    MEMORY_DELIVERY_GRANT_SCHEMA_VERSION, MemoryGrantOfferRecord, MemoryRevision,
+    MemoryWriteEnvelope, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind,
+    ObservabilityWriteEnvelope, ObservabilityWriteStatus, OperationId, ProjectId, ProjectSequence,
+    SemanticCommandKind, SessionId, TaintClass, TaskContractInput, TaskContractStatus, TaskId,
+    Visibility, WriteId, WriteStatus,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -80,6 +87,299 @@ async fn t02_store_conflict_preserves_original() -> TestResult {
     assert_eq!(records, vec![original.payload]);
     assert_eq!(receipt.input_hash, original.input_hash);
     assert_eq!(receipt.status, ObservabilityWriteStatus::Committed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t02_memory_grant_offer_is_scoped_and_immutable() -> TestResult {
+    if rerun_with_isolated_credential_backend("t02_memory_grant_offer_is_scoped_and_immutable")? {
+        return Ok(());
+    }
+    let harness = Harness::start("memory-grant").await?;
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let session_id = SessionId::new_v7();
+    let grant_uuid = uuid::Uuid::now_v7();
+    let grant_id = grant_uuid.to_string();
+    let write_id = WriteId::from_uuid(grant_uuid);
+    let offered_at = time::OffsetDateTime::now_utc();
+    let offer = MemoryGrantOfferRecord {
+        schema_version: MEMORY_DELIVERY_GRANT_SCHEMA_VERSION.to_owned(),
+        grant_id: grant_id.clone(),
+        project_id,
+        task_id,
+        session_id,
+        packet_id: "packet-memory-grant".to_owned(),
+        packet_revision_fence: MemoryRevision::new(7),
+        task_memory_revision: MemoryRevision::new(11),
+        task_contract_ref: "eliot/task/memory-grant@7".to_owned(),
+        auth_generation: uuid::Uuid::now_v7().to_string(),
+        prior_fingerprint: "private-prior-fingerprint".to_owned(),
+        guidance_hash: "private-guidance-hash".to_owned(),
+        offer_write_id: write_id,
+        token_hash: "opaque-token-hash".to_owned(),
+        expires_at: offered_at + time::Duration::minutes(15),
+        offered_at,
+    };
+    let payload = serde_json::to_value(&offer)?;
+    let envelope = ObservabilityWriteEnvelope {
+        schema_version: OBSERVABILITY_SCHEMA_VERSION.to_owned(),
+        write_id,
+        project_id,
+        task_id: Some(task_id),
+        session_id: Some(session_id),
+        kind: ObservabilityKind::MemoryGrantOffer,
+        record_id: grant_id.clone(),
+        input_hash: payload_hash(&payload),
+        payload,
+        created_at: offered_at,
+    };
+
+    let receipt = harness.store.apply_observability(&envelope).await?;
+    assert_eq!(receipt.status, ObservabilityWriteStatus::Committed);
+    assert_eq!(
+        harness
+            .store
+            .memory_grant_offer_by_id(project_id, task_id, session_id, &grant_id)
+            .await?,
+        Some(offer.clone())
+    );
+    assert_eq!(
+        harness
+            .store
+            .memory_grant_offer_by_id(project_id, task_id, SessionId::new_v7(), &grant_id)
+            .await?,
+        None
+    );
+
+    let replacement_write_id = WriteId::new_v7();
+    let mut replacement_offer = offer.clone();
+    replacement_offer.offer_write_id = replacement_write_id;
+    replacement_offer.guidance_hash = "substituted-guidance-hash".to_owned();
+    let replacement_payload = serde_json::to_value(&replacement_offer)?;
+    let replacement = ObservabilityWriteEnvelope {
+        write_id: replacement_write_id,
+        input_hash: payload_hash(&replacement_payload),
+        payload: replacement_payload,
+        ..envelope
+    };
+    assert!(matches!(
+        harness.store.apply_observability(&replacement).await,
+        Err(StoreError::ObservabilityConflict)
+    ));
+    assert_eq!(
+        harness
+            .store
+            .memory_grant_offer_by_id(project_id, task_id, session_id, &grant_id)
+            .await?,
+        Some(offer)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t02_memory_grant_redemption_is_atomic_durable_and_single_use() -> TestResult {
+    if rerun_with_isolated_credential_backend(
+        "t02_memory_grant_redemption_is_atomic_durable_and_single_use",
+    )? {
+        return Ok(());
+    }
+    let harness = Harness::start("grant-redemption").await?;
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let session_id = SessionId::new_v7();
+    let grant_uuid = uuid::Uuid::now_v7();
+    let grant_id = grant_uuid.to_string();
+    let offer_write_id = WriteId::from_uuid(grant_uuid);
+    let action_write_id = WriteId::new_v7();
+    let offered_at = time::OffsetDateTime::now_utc();
+    let redeemed_at = offered_at + time::Duration::seconds(1);
+    let offer = MemoryGrantOfferRecord {
+        schema_version: MEMORY_DELIVERY_GRANT_SCHEMA_VERSION.to_owned(),
+        grant_id: grant_id.clone(),
+        project_id,
+        task_id,
+        session_id,
+        packet_id: "eliot/packet/grant-redemption".to_owned(),
+        packet_revision_fence: MemoryRevision::new(1),
+        task_memory_revision: MemoryRevision::new(1),
+        task_contract_ref: format!("eliot/task/{task_id}@1"),
+        auth_generation: uuid::Uuid::now_v7().to_string(),
+        prior_fingerprint: "private-prior-fingerprint".to_owned(),
+        guidance_hash: "private-guidance-hash".to_owned(),
+        offer_write_id,
+        token_hash: "opaque-token-hash".to_owned(),
+        expires_at: offered_at + time::Duration::minutes(15),
+        offered_at,
+    };
+    let offer_payload = serde_json::to_value(&offer)?;
+    harness
+        .store
+        .apply_observability(&ObservabilityWriteEnvelope {
+            schema_version: OBSERVABILITY_SCHEMA_VERSION.to_owned(),
+            write_id: offer_write_id,
+            project_id,
+            task_id: Some(task_id),
+            session_id: Some(session_id),
+            kind: ObservabilityKind::MemoryGrantOffer,
+            record_id: grant_id.clone(),
+            input_hash: payload_hash(&offer_payload),
+            payload: offer_payload,
+            created_at: offered_at,
+        })
+        .await?;
+    assert_eq!(
+        harness
+            .store
+            .memory_grant_offer_by_id(project_id, task_id, session_id, &grant_id)
+            .await?,
+        Some(offer.clone())
+    );
+
+    let grant_ref = ActionMemoryGrantRef {
+        schema_version: ACTION_MEMORY_GRANT_REF_SCHEMA_VERSION.to_owned(),
+        project_id,
+        task_id,
+        session_id,
+        grant_id: grant_id.clone(),
+        offer_write_id,
+        packet_id: offer.packet_id.clone(),
+        packet_revision_fence: offer.packet_revision_fence,
+        task_memory_revision: offer.task_memory_revision,
+        task_contract_ref: offer.task_contract_ref.clone(),
+        prior_fingerprint: offer.prior_fingerprint.clone(),
+        guidance_hash: offer.guidance_hash.clone(),
+        expires_at: offer.expires_at,
+        redeemed_at,
+        evidence_class: ActionMemoryGrantEvidenceClass::AgentReturnedOpaqueGrantAfterServerOffer,
+    };
+    let provenance = ActionProvenanceSet {
+        provenance_set_id: format!("eliot/provenance-set/{action_write_id}"),
+        task_id,
+        packet_id: offer.packet_id.clone(),
+        packet_revision_fence: offer.packet_revision_fence,
+        task_contract_ref: offer.task_contract_ref.clone(),
+        current_truth_refs: vec![offer.task_contract_ref.clone()],
+        exact_evidence_refs: vec!["receipt:task".to_owned()],
+        memory_delivery_refs: Vec::new(),
+        memory_grant_refs: vec![grant_ref],
+        negative_memory_check_ref: "negative-memory:grant-redemption".to_owned(),
+        planned_verifier_ref: "verifier:test".to_owned(),
+        source_scope: ActionSourceScope {
+            kind: "read_only".to_owned(),
+            worktree_ref: None,
+            branch: None,
+            baseline_commit: None,
+            baseline_dirty_state_hash: None,
+            artifact_paths: Vec::new(),
+        },
+        resolved_at: redeemed_at,
+        resolver_version: "eliot.action-provenance-resolver.v3".to_owned(),
+        hash: "b".repeat(64),
+    };
+    let redemption = ActionMemoryGrantRedemption {
+        schema_version: ACTION_MEMORY_GRANT_REDEMPTION_SCHEMA_VERSION.to_owned(),
+        project_id,
+        task_id,
+        session_id,
+        grant_id,
+        offer_write_id,
+        action_write_id,
+        action_request_hash: "a".repeat(64),
+        provenance_set_id: provenance.provenance_set_id.clone(),
+        provenance_set_hash: provenance.hash.clone(),
+        packet_id: offer.packet_id,
+        packet_revision_fence: offer.packet_revision_fence,
+        task_memory_revision: offer.task_memory_revision,
+        task_contract_ref: offer.task_contract_ref,
+        prior_fingerprint: offer.prior_fingerprint,
+        guidance_hash: offer.guidance_hash,
+        redeemed_at,
+    };
+    let task = TaskContractInput {
+        task_id,
+        title: "atomic memory grant redemption".to_owned(),
+        status: TaskContractStatus::Active,
+        acceptance_items: Vec::new(),
+        expected_revision: None,
+        action_lease_id: None,
+        understanding_proof_hash: Some("understanding".to_owned()),
+        action_provenance: Some(provenance),
+        memory_grant_redemptions: vec![redemption.clone()],
+        observation_ids: Vec::new(),
+        verification_ids: Vec::new(),
+        verification_scopes: Vec::new(),
+        completion_proof: None,
+        completion_write_id: None,
+    };
+    let action = MemoryWriteEnvelope {
+        write_id: action_write_id,
+        operation_id: OperationId::new_v7(),
+        agent_id: AgentId::new_v7(),
+        session_id: Some(session_id),
+        project_id,
+        task_id: Some(task_id),
+        command_kind: SemanticCommandKind::TaskContractWrite,
+        input_hash: "action-input-hash".to_owned(),
+        policy_snapshot_id: None,
+        project_sequence_hint: Some(ProjectSequence::new(1)),
+        created_at: redeemed_at,
+        scope: format!("task:{task_id}"),
+        authority: "test-memory-grant-redemption".to_owned(),
+        task_contracts: vec![task],
+        source_snapshots: Vec::new(),
+        evidence_atoms: Vec::new(),
+        tool_observations: Vec::new(),
+        failures: Vec::new(),
+        claims: Vec::new(),
+        verification_runs: Vec::new(),
+        relations: Vec::new(),
+        lifecycle: LifecycleWriteOptions {
+            status: LifecycleStatus::Active,
+            visibility: Visibility::Project,
+            taint: TaintClass::LocalTool,
+        },
+        idempotency: IdempotencyOptions { allow_replay: true },
+    };
+
+    assert_eq!(
+        harness.store.apply_write_envelope(&action).await?.status,
+        WriteStatus::Committed
+    );
+    assert_eq!(
+        harness.store.apply_write_envelope(&action).await?.status,
+        WriteStatus::IdempotentReplay
+    );
+    let stored = harness
+        .store
+        .task_contract_by_id(task_id)
+        .await?
+        .ok_or("task contract missing after grant redemption")?;
+    assert_eq!(stored.memory_grant_redemptions, vec![redemption.clone()]);
+
+    let mut substituted = action;
+    substituted.write_id = WriteId::new_v7();
+    substituted.operation_id = OperationId::new_v7();
+    substituted.input_hash = "substituted-action-input-hash".to_owned();
+    substituted.project_sequence_hint = Some(ProjectSequence::new(2));
+    substituted.task_contracts[0].expected_revision = Some(MemoryRevision::new(1));
+    substituted.task_contracts[0].memory_grant_redemptions[0].action_write_id =
+        substituted.write_id;
+    assert!(
+        harness
+            .store
+            .apply_write_envelope(&substituted)
+            .await
+            .is_err(),
+        "a different action write must not rewrite a committed grant redemption"
+    );
+    let unchanged = harness
+        .store
+        .task_contract_by_id(task_id)
+        .await?
+        .ok_or("task contract missing after rejected grant reuse")?;
+    assert_eq!(unchanged.memory_revision, MemoryRevision::new(1));
+    assert_eq!(unchanged.memory_grant_redemptions, vec![redemption]);
     Ok(())
 }
 
@@ -246,6 +546,8 @@ fn test_port(name: &str) -> TestResult<u16> {
     let port = match name {
         "replay" => 8601,
         "conflict" => 8602,
+        "memory-grant" => 8603,
+        "grant-redemption" => 8604,
         other => return Err(format!("unknown UL-02 store test {other}").into()),
     };
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))

@@ -48,6 +48,68 @@ fn agent_session_create_for_role_persists_requested_role() {
 }
 
 #[test]
+fn agent_session_bind_for_role_reuses_exact_active_session() {
+    let mut state = WorkState::default();
+    let project_id = ProjectId::new_v7();
+    let agent_session_id = AgentSessionId::new_v7();
+
+    let created = eliot_engine::AgentSessionService
+        .bind_for_role(
+            &mut state,
+            agent_session_id,
+            project_id,
+            AgentRole::Controller,
+        )
+        .expect("bind external controller session");
+    let reused = eliot_engine::AgentSessionService
+        .bind_for_role(
+            &mut state,
+            agent_session_id,
+            project_id,
+            AgentRole::Controller,
+        )
+        .expect("reuse exact controller session");
+
+    assert_eq!(created.agent_session_id, agent_session_id);
+    assert_eq!(reused.agent_session_id, created.agent_session_id);
+    assert_eq!(reused.project_id, created.project_id);
+    assert_eq!(reused.role, created.role);
+    assert_eq!(state.sessions.len(), 1);
+}
+
+#[test]
+fn agent_session_bind_for_role_rejects_authority_substitution() {
+    let mut state = WorkState::default();
+    let project_id = ProjectId::new_v7();
+    let agent_session_id = AgentSessionId::new_v7();
+    eliot_engine::AgentSessionService
+        .bind_for_role(
+            &mut state,
+            agent_session_id,
+            project_id,
+            AgentRole::Controller,
+        )
+        .expect("bind external controller session");
+
+    let wrong_project = eliot_engine::AgentSessionService.bind_for_role(
+        &mut state,
+        agent_session_id,
+        ProjectId::new_v7(),
+        AgentRole::Controller,
+    );
+    let wrong_role = eliot_engine::AgentSessionService.bind_for_role(
+        &mut state,
+        agent_session_id,
+        project_id,
+        AgentRole::Implementer,
+    );
+
+    assert!(wrong_project.is_err());
+    assert!(wrong_role.is_err());
+    assert_eq!(state.sessions.len(), 1);
+}
+
+#[test]
 fn agent_session_subagent_hook_smoke_or_unavailable_honestly() {
     let mut state = WorkState::default();
     let controller =

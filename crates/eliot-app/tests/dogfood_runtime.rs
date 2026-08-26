@@ -37,6 +37,7 @@ fn dogfood_runtime_starts_doctors_stops_and_restarts_persistent_state() -> TestR
     let root_arg = owned.0.to_string_lossy().into_owned();
     let project = repo_root();
     let project_arg = project.to_string_lossy().into_owned();
+    let surreal_exe_arg = surreal_exe_arg()?;
 
     let initialized = run(&[
         "dogfood",
@@ -45,6 +46,8 @@ fn dogfood_runtime_starts_doctors_stops_and_restarts_persistent_state() -> TestR
         &root_arg,
         "--project",
         &project_arg,
+        "--surreal-exe",
+        &surreal_exe_arg,
     ])?;
     assert_eq!(initialized["status"], "initialized");
     assert_eq!(initialized["runtime_root_safe"], true);
@@ -75,6 +78,14 @@ fn dogfood_runtime_starts_doctors_stops_and_restarts_persistent_state() -> TestR
             "a detached clean worktree has no controller-local historical provider report"
         );
         assert!(doctor["codex_cli_version"].as_str().is_some());
+        assert!(doctor["surrealdb_identity"]["path"].as_str().is_some());
+        assert!(doctor["surrealdb_identity"]["version"].as_str().is_some());
+        assert!(doctor["surrealdb_identity"]["sha256"].as_str().is_some());
+        assert!(
+            doctor["surrealdb_identity"]["pe_machine"]
+                .as_str()
+                .is_some()
+        );
         assert_eq!(doctor["blockers"].as_array().map(Vec::len), Some(0));
 
         let status = run(&["dogfood", "status", "--root", &root_arg])?;
@@ -99,6 +110,10 @@ fn dogfood_runtime_starts_doctors_stops_and_restarts_persistent_state() -> TestR
         assert!(!owned.0.join("runtime").join("daemon.pid").exists());
         assert!(!owned.0.join("runtime").join("ipc-auth.json").exists());
         assert!(owned.0.join("surrealdb-rocks").is_dir());
+        let doctor_after_stop = run_failure(&["dogfood", "doctor", "--root", &root_arg])?;
+        assert!(doctor_after_stop.contains("\"status\": \"BLOCKED\""));
+        assert!(doctor_after_stop.contains("db_not_ready"));
+        assert!(doctor_after_stop.contains("daemon_not_ready"));
     }
 
     let manifest_path = owned.0.join("dogfood-manifest.json");
@@ -144,13 +159,31 @@ fn dogfood_prepares_independent_codex_worktree_with_enabled_hooks_contract() -> 
         &["config", "user.email", "eliot-test@example.invalid"],
     )?;
     fs::write(source.join("README.md"), "isolated dogfood source\n")?;
-    git(&source, &["add", "README.md"])?;
+    let lock_source = repo_root()
+        .join("docs")
+        .join("release")
+        .join("SURREALDB_WINDOWS_X64.lock.json");
+    let lock_destination = source
+        .join("docs")
+        .join("release")
+        .join("SURREALDB_WINDOWS_X64.lock.json");
+    fs::create_dir_all(lock_destination.parent().ok_or("lock parent missing")?)?;
+    fs::copy(lock_source, &lock_destination)?;
+    git(
+        &source,
+        &[
+            "add",
+            "README.md",
+            "docs/release/SURREALDB_WINDOWS_X64.lock.json",
+        ],
+    )?;
     git(&source, &["commit", "-m", "seed"])?;
     let head = git_stdout(&source, &["rev-parse", "HEAD"])?;
 
     let runtime_arg = runtime.to_string_lossy().into_owned();
     let source_arg = source.to_string_lossy().into_owned();
     let destination_arg = destination.to_string_lossy().into_owned();
+    let surreal_exe_arg = surreal_exe_arg()?;
     run(&[
         "dogfood",
         "init",
@@ -158,7 +191,18 @@ fn dogfood_prepares_independent_codex_worktree_with_enabled_hooks_contract() -> 
         &runtime_arg,
         "--project",
         &source_arg,
+        "--surreal-exe",
+        &surreal_exe_arg,
     ])?;
+    let config = fs::read_to_string(runtime.join("config").join("governor.toml"))?;
+    assert!(config.contains("runtime/bin/surreal.exe"));
+    assert!(
+        runtime
+            .join("runtime")
+            .join("bin")
+            .join("surreal.exe")
+            .is_file()
+    );
     let report = run(&[
         "dogfood",
         "prepare-worktree",
@@ -240,6 +284,7 @@ fn dogfood_run_codex_is_exposed_and_preflight_fails_before_spawn() -> TestResult
     let root_arg = owned.0.to_string_lossy().into_owned();
     let project = repo_root();
     let project_arg = project.to_string_lossy().into_owned();
+    let surreal_exe_arg = surreal_exe_arg()?;
     run(&[
         "dogfood",
         "init",
@@ -247,12 +292,63 @@ fn dogfood_run_codex_is_exposed_and_preflight_fails_before_spawn() -> TestResult
         &root_arg,
         "--project",
         &project_arg,
+        "--surreal-exe",
+        &surreal_exe_arg,
     ])?;
 
-    let failure = run_failure(&["dogfood", "run-codex", "--root", &root_arg])?;
+    let doctor = run_failure(&["dogfood", "doctor", "--root", &root_arg])?;
+    assert!(doctor.contains("\"status\": \"BLOCKED\""));
+    assert!(doctor.contains("db_not_ready"));
+    assert!(doctor.contains("daemon_not_ready"));
+    assert!(doctor.contains("schema_not_ready_before_daemon_ready"));
+    assert!(doctor.contains("\"surrealdb_identity\": {"));
+
+    let failure = run_failure(&[
+        "dogfood",
+        "run-codex",
+        "--root",
+        &root_arg,
+        "--project",
+        "00000000-0000-0000-0000-000000000001",
+        "--task",
+        "00000000-0000-0000-0000-000000000002",
+        "--agent-session",
+        "00000000-0000-0000-0000-000000000003",
+        "--role-lease",
+        "dogfood-test-role-lease",
+        "--work-item",
+        "00000000-0000-0000-0000-000000000004",
+        "--work-lease",
+        "00000000-0000-0000-0000-000000000005",
+        "--worktree-lease",
+        "00000000-0000-0000-0000-000000000006",
+    ])?;
     assert!(failure.contains("requires a running owned runtime"));
     assert!(!owned.0.join("reports/live-codex/events.jsonl").exists());
     assert!(!owned.0.join("reports/live-codex/latest.json").exists());
+    Ok(())
+}
+
+#[test]
+fn dogfood_init_rejects_relative_surreal_preseed_path() -> TestResult {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "eliot-dogfood-relative-surreal-test-{}-{nonce}",
+        std::process::id()
+    ));
+    let root_arg = root.to_string_lossy().into_owned();
+    let project_arg = repo_root().to_string_lossy().into_owned();
+    let failure = run_failure(&[
+        "dogfood",
+        "init",
+        "--root",
+        &root_arg,
+        "--project",
+        &project_arg,
+        "--surreal-exe",
+        "surreal.exe",
+    ])?;
+    assert!(failure.contains("must be absolute"));
     Ok(())
 }
 
@@ -263,8 +359,10 @@ fn assert_codex_launch_contract(report: &Value) -> TestResult {
     for required in [
         "features.hooks=true",
         "approval_policy=\"never\"",
-        "sandbox_mode=\"workspace-write\"",
-        "sandbox_workspace_write.network_access=false",
+        "default_permissions=\":workspace\"",
+        "permissions={}",
+        "windows.sandbox=\"elevated\"",
+        "shell_environment_policy.inherit=\"core\"",
         "web_search=\"disabled\"",
     ] {
         assert!(
@@ -298,10 +396,16 @@ fn assert_codex_launch_contract(report: &Value) -> TestResult {
         "args =",
         "cwd =",
         "env =",
+        "env_vars =",
         "enabled = true",
         "required = true",
         "enabled_tools =",
         "default_tools_approval_mode = \"approve\"",
+        "--profile",
+        "codex_controller",
+        "--host",
+        "codex",
+        "ELIOT_CODEX_SCOPE_TOKEN",
     ] {
         assert!(
             mcp_servers.contains(key),
@@ -314,12 +418,18 @@ fn assert_codex_launch_contract(report: &Value) -> TestResult {
             "atomic dogfood MCP table retained unrelated server {excluded}"
         );
     }
+    assert!(
+        !mcp_servers.contains("ELIOT_ROLE_LEASE_ID"),
+        "raw role lease must not cross the Codex process environment boundary"
+    );
     for tool in [
+        "eliot_host_session_status",
+        "eliot_project_identity",
         "eliot_task_state",
+        "eliot_operator_query",
         "eliot_task_action_request",
         "eliot_task_observation_record",
         "eliot_task_verification_run",
-        "eliot_compile_packet_l3",
         "eliot_submit_understanding_proof",
         "eliot_submit_completion_proof",
         "eliot_codecortex_scan",
@@ -330,6 +440,9 @@ fn assert_codex_launch_contract(report: &Value) -> TestResult {
         "\"eliot_external_review",
         "\"eliot_delegate",
         "\"eliot_antigravity",
+        "\"eliot_compile_packet_l3\"",
+        "\"eliot_recall_l0\"",
+        "\"eliot_fetch_atoms_l2\"",
         "\"raw",
     ] {
         assert!(
@@ -344,11 +457,18 @@ fn assert_codex_launch_contract(report: &Value) -> TestResult {
     assert_eq!(report["codex_project_config_loaded"], false);
     assert_eq!(report["codex_home_relocation_required"], false);
     assert_eq!(report["codex_hook_trust_bypass_required"], true);
+    assert_eq!(report["codex_scope_environment_only"], true);
+    assert_eq!(report["codex_role_lease_in_argv"], false);
+    assert!(!overrides.iter().any(|item| {
+        item.as_str().is_some_and(|item| {
+            item.starts_with("sandbox_mode=") || item.starts_with("sandbox_workspace_write.")
+        })
+    }));
     Ok(())
 }
 
 fn assert_codex_exec_plan(report: &Value, destination: &Path, runtime: &Path) -> TestResult {
-    let argv = report["codex_exec_argv_before_prompt"]
+    let argv = report["codex_exec_argv_without_prompt"]
         .as_array()
         .ok_or("missing exact Codex exec argv")?;
     let argv = argv
@@ -360,17 +480,14 @@ fn assert_codex_exec_plan(report: &Value, destination: &Path, runtime: &Path) ->
     let output_schema = format!("{runtime}/reports/live-codex/output-schema.json");
     let last_message = format!("{runtime}/reports/live-codex/last-message.json");
     assert_eq!(
-        &argv[..15],
+        &argv[..12],
         &[
             "--strict-config",
-            "--ask-for-approval",
-            "never",
             "exec",
             "--cd",
             destination.as_str(),
-            "--sandbox",
-            "workspace-write",
             "--ignore-user-config",
+            "--ignore-rules",
             "--dangerously-bypass-hook-trust",
             "--json",
             "--output-schema",
@@ -379,12 +496,22 @@ fn assert_codex_exec_plan(report: &Value, destination: &Path, runtime: &Path) ->
             last_message.as_str(),
         ]
     );
-    let config_argv = &argv[15..];
-    assert_eq!(config_argv.len(), 22);
+    let config_argv = &argv[12..];
+    assert_eq!(config_argv.len(), 28);
     assert!(config_argv.chunks_exact(2).all(|pair| pair[0] == "-c"));
     assert_eq!(report["codex_exec_command"], "codex");
-    assert_eq!(report["codex_prompt_must_be_final_argument"], true);
-    assert_eq!(report["codex_output_schema_must_exist_before_launch"], true);
+    assert_eq!(report["codex_prompt_via_stdin_required"], true);
+    assert_eq!(report["codex_prompt_generated_from_task_contract"], true);
+    assert_eq!(
+        report["codex_output_schema_generated_from_task_contract"],
+        true
+    );
+    assert!(
+        !argv
+            .iter()
+            .any(|argument| *argument == "--ask-for-approval")
+    );
+    assert!(!argv.iter().any(|argument| *argument == "--sandbox"));
     assert_eq!(report["codex_jsonl_stdout_redirection_required"], true);
     assert_eq!(report["codex_home_relocation_required"], false);
     Ok(())
@@ -453,6 +580,20 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
+}
+
+fn surreal_exe_arg() -> TestResult<String> {
+    let path = std::env::var_os("ELIOT_DOGFOOD_SURREAL_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Tools\SurrealDB\surreal.exe"));
+    if !path.is_absolute() || !path.is_file() {
+        return Err(format!(
+            "focused dogfood test requires an operator-preseeded absolute surreal.exe; set ELIOT_DOGFOOD_SURREAL_EXE (resolved {})",
+            path.display()
+        )
+        .into());
+    }
+    Ok(path.to_string_lossy().into_owned())
 }
 
 fn git(cwd: &std::path::Path, args: &[&str]) -> TestResult {

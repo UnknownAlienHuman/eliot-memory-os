@@ -10,16 +10,9 @@ description = "ELIOT Host lifecycle and durable operational-state entrypoint"
 name = "eliot-host"
 path = "src/main.rs"
 
-[features]
-default = []
-test-support = [
-    "eliot-installation/test-support",
-    "eliot-host-state/test-support",
-    "eliot-platform-windows/test-support",
-]
-
 [dependencies]
 eliot-contracts.workspace = true
+eliot-host-control-endpoint.workspace = true
 eliot-host-service.workspace = true
 eliot-kernel-core.workspace = true
 eliot-installation.workspace = true
@@ -41,6 +34,10 @@ thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Services"] }
+
+[dev-dependencies]
+eliot-host-state = { workspace = true, features = ["test-support"] }
+eliot-installation = { workspace = true, features = ["test-support"] }
 
 [lints.rust]
 unsafe_code = "allow"

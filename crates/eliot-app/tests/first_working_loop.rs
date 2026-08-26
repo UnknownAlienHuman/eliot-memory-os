@@ -624,6 +624,7 @@ fn l3_free_text_verifier_scope_cannot_satisfy_acceptance() -> TestResult {
 #[allow(clippy::print_stdout, clippy::too_many_lines)]
 #[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn first_working_loop_end_to_end() -> TestResult {
+    let daemon_readiness_timeout = Duration::from_secs(30);
     assert_eq!(
         std::env::var("ELIOT_DISABLE_REAL_PROVIDER").as_deref(),
         Ok("1")
@@ -641,11 +642,29 @@ fn first_working_loop_end_to_end() -> TestResult {
         .join("reports")
         .join("runtime")
         .join("latest.json");
+    let auth_path = runtime.path().join("runtime").join("ipc-auth.json");
     let mut daemon = start_daemon(&config_path)?;
-    wait_for_runtime_pid(&runtime_report, daemon.id(), Duration::from_secs(10))?;
+    let first_pid = daemon.id();
+    let first_runtime_report =
+        wait_for_runtime_pid(&runtime_report, first_pid, daemon_readiness_timeout)?;
+    let first_auth = wait_for_json(&auth_path, daemon_readiness_timeout)?;
+    let first_runtime_id = required_string(&first_auth, "/runtime_id")?;
+    let first_token = required_string(&first_auth, "/token")?;
+    let first_generation = required_string(&first_auth, "/token_generation_id")?;
     let daemon_runtime_report = fs::read(&runtime_report)?;
     let mut facade = McpClient::start(&config_path)?;
     facade.initialize()?;
+    let project_key = repository_root()?.display().to_string();
+    let identity = facade.tool_call(
+        100,
+        "eliot_project_identity",
+        &serde_json::json!({"project_key": project_key}),
+    )?;
+    assert_eq!(
+        identity.get("scope_authority").and_then(Value::as_str),
+        Some("canonical_project_key")
+    );
+    let project_id = required_string(&identity, "/project_id")?;
     let runtime_status = facade.tool_call(90, "eliot_runtime_status", &serde_json::json!({}))?;
     assert_eq!(
         runtime_status.get("mode").and_then(Value::as_str),
@@ -682,8 +701,13 @@ fn first_working_loop_end_to_end() -> TestResult {
         daemon_runtime_report,
         "status tools must not overwrite the daemon readiness report"
     );
+    assert_eq!(
+        first_runtime_report
+            .pointer("/status/pid")
+            .and_then(Value::as_u64),
+        Some(u64::from(first_pid))
+    );
 
-    let project_id = ProjectId::new_v7().to_string();
     let task_id = TaskId::new_v7().to_string();
     let create_write = WriteId::new_v7().to_string();
     let denied_action_write = WriteId::new_v7().to_string();
@@ -695,6 +719,14 @@ fn first_working_loop_end_to_end() -> TestResult {
     let verification_write = WriteId::new_v7().to_string();
     let stale_write = WriteId::new_v7().to_string();
     let completion_write = WriteId::new_v7().to_string();
+    let original_goal = "prove the canonical First Working Loop";
+    let artifact_path = "crates/eliot-store/src/blob_store.rs".to_owned();
+    let worktree_branch = format!("work/first-working-loop-{task_id}");
+    let worktree = OwnedWorktree::create(
+        repository_root()?.as_path(),
+        std::env::temp_dir().join(format!("eliot-fwl-wt-{task_id}")),
+        &worktree_branch,
+    )?;
     let acceptance_ids = vec![
         "observation-recorded".to_owned(),
         "verification-passed".to_owned(),
@@ -707,7 +739,7 @@ fn first_working_loop_end_to_end() -> TestResult {
             "project_id": project_id,
             "task_id": task_id,
             "write_id": create_write,
-            "title": "deterministic First Working Loop",
+            "title": original_goal,
             "acceptance_items": [
                 {"item_id": acceptance_ids[0], "description": "one scoped observation is receipted", "required_evidence": "observation"},
                 {"item_id": acceptance_ids[1], "description": "one trusted verifier result is receipted", "required_evidence": "verification"}
@@ -732,7 +764,7 @@ fn first_working_loop_end_to_end() -> TestResult {
         &serde_json::json!({
             "project_id": project_id,
             "task_id": task_id,
-            "goal": "prove the canonical First Working Loop",
+            "goal": original_goal,
             "candidate_handles": [],
             "max_tokens": 2000
         }),
@@ -745,13 +777,16 @@ fn first_working_loop_end_to_end() -> TestResult {
         packet.get("task_revision_fence").and_then(Value::as_u64),
         Some(create_revision)
     );
-    let (receipt_verifier_ref, receipt_verifier_config_hash) =
-        registered_verifier(&packet, "daemon-receipt-resolution")?;
-    let (dogfood_verifier_ref, _) =
+    let (receipt_verifier_ref, _) = registered_verifier(&packet, "daemon-receipt-resolution")?;
+    let (dogfood_verifier_ref, dogfood_verifier_config_hash) =
         registered_verifier(&packet, "cargo-eliot-store-blob-integrity")?;
     let (workspace_check_verifier_ref, workspace_check_config_hash) =
         registered_verifier(&packet, "cargo-workspace-check")?;
     assert!(workspace_check_verifier_ref.contains(&workspace_check_config_hash));
+    assert_eq!(
+        registered_verifier_command(&packet, "cargo-eliot-store-blob-integrity")?,
+        "cargo test --offline -p eliot-store blob_store::tests::rejects_corrupt_existing_content_addressed_blob -- --exact --test-threads=1"
+    );
 
     let denied_action = facade.tool_call(
         4,
@@ -793,8 +828,10 @@ fn first_working_loop_end_to_end() -> TestResult {
             "provenance_handles": [create_receipt],
             "negative_memory_checked": true,
             "negative_memory_check_ref": required_string(&packet, "/negative_memory_check_ref")?,
-            "planned_action": "record one deterministic observation",
-            "planned_verifier_ref": receipt_verifier_ref
+            "planned_action": "commit one reversible test-owned artifact edit",
+            "planned_verifier_ref": dogfood_verifier_ref,
+            "worktree_ref": worktree.path().display().to_string(),
+            "artifact_paths": [artifact_path.clone()]
         }),
     )?;
     assert_eq!(
@@ -809,6 +846,22 @@ fn first_working_loop_end_to_end() -> TestResult {
         .to_owned();
     let provenance_set_hash =
         required_string(&allowed_action, "/action_lease/provenance_set_hash")?;
+    let leased_worktree_ref = required_string(&allowed_action, "/action_lease/scope/worktree_ref")?;
+    assert_eq!(
+        allowed_action
+            .pointer("/action_lease/scope/artifact_paths/0")
+            .and_then(Value::as_str),
+        Some(artifact_path.as_str()),
+        "ActionLease must bind the exact test-owned artifact"
+    );
+    assert!(
+        allowed_action
+            .pointer("/action_lease/memory_delivery_refs")
+            .and_then(Value::as_array)
+            .is_some_and(|refs| refs.is_empty()),
+        "the bounded core loop must not claim an undelivered memory influence"
+    );
+    worktree.append_and_commit(&artifact_path)?;
 
     let stale_packet = facade.tool_call(
         51,
@@ -874,7 +927,10 @@ fn first_working_loop_end_to_end() -> TestResult {
             "status": "passed",
             "scope": format!("eliot/task/{task_id}/acceptance/{}", acceptance_ids[0]),
             "provenance_handles": [receipt_id(&allowed_action)?],
-            "provenance_set_hash": provenance_set_hash
+            "provenance_set_hash": provenance_set_hash,
+            "changed_paths": [artifact_path.clone()],
+            "diagnostic_before": ["artifact edit not yet committed"],
+            "diagnostic_after": ["artifact edit committed on owned branch"]
         }),
     )?;
     assert_eq!(
@@ -887,19 +943,37 @@ fn first_working_loop_end_to_end() -> TestResult {
         .and_then(Value::as_str)
         .ok_or("observation id missing")?
         .to_owned();
+    let provisional_completion_proof = serde_json::json!({
+        "task_id": task_id,
+        "project_id": project_id,
+        "goal": original_goal,
+        "changed_files": [artifact_path.clone()],
+        "memory_refs_used": [],
+        "checks_run": ["cargo-eliot-store-blob-integrity", "cargo test --offline -p eliot-store blob_store::tests::rejects_corrupt_existing_content_addressed_blob -- --exact --test-threads=1"],
+        "checks_not_run": [],
+        "acceptance_items": [
+            {"item": acceptance_ids[0], "status": "verified", "evidence": observation_id, "verifier": "daemon-receipt-resolution", "residual_uncertainty": ""},
+            {"item": acceptance_ids[1], "status": "verified", "evidence": "verification:not-yet-run", "verifier": "cargo-eliot-store-blob-integrity", "residual_uncertainty": ""}
+        ],
+        "evidence": [observation_id, "verification:not-yet-run"],
+        "skill_refs": [],
+        "skill_execution_proof_refs": [],
+        "residual_uncertainty": "verification not yet run",
+        "known_risks": []
+    });
 
     for (id, verifier_ref, config_hash, worktree_ref, artifact_paths, label) in [
         (
             52,
-            dogfood_verifier_ref.clone(),
-            receipt_verifier_config_hash.clone(),
+            workspace_check_verifier_ref.clone(),
+            workspace_check_config_hash.clone(),
             None,
             Vec::<String>::new(),
             "verifier changed after lease",
         ),
         (
             53,
-            receipt_verifier_ref.clone(),
+            dogfood_verifier_ref.clone(),
             "stale-config-hash".to_owned(),
             None,
             Vec::<String>::new(),
@@ -907,8 +981,8 @@ fn first_working_loop_end_to_end() -> TestResult {
         ),
         (
             54,
-            receipt_verifier_ref.clone(),
-            receipt_verifier_config_hash.clone(),
+            dogfood_verifier_ref.clone(),
+            dogfood_verifier_config_hash.clone(),
             Some(runtime.path().display().to_string()),
             vec!["wrong-artifact".to_owned()],
             "caller-authored worktree scope",
@@ -973,6 +1047,7 @@ fn first_working_loop_end_to_end() -> TestResult {
             "task_id": task_id,
             "write_id": verificationless_completion_write,
             "expected_revision": observation_revision,
+            "completion_proof": provisional_completion_proof,
             "acceptance_item_ids": acceptance_ids,
             "observation_ids": [observation_id],
             "verification_ids": []
@@ -1025,11 +1100,12 @@ fn first_working_loop_end_to_end() -> TestResult {
             "item_id": acceptance_ids[1],
             "observation_id": observation_id,
             "mode": "registered",
-            "verifier_ref": receipt_verifier_ref,
-            "verifier_config_hash": receipt_verifier_config_hash,
+            "verifier_ref": dogfood_verifier_ref,
+            "verifier_config_hash": dogfood_verifier_config_hash,
             "provenance_set_hash": provenance_set_hash,
             "acceptance_item_ids": [acceptance_ids[1]],
-            "artifact_paths": []
+            "worktree_ref": leased_worktree_ref.clone(),
+            "artifact_paths": [artifact_path.clone()]
         }),
     )?;
     assert_eq!(
@@ -1043,6 +1119,30 @@ fn first_working_loop_end_to_end() -> TestResult {
         .and_then(Value::as_str)
         .ok_or("verification id missing")?
         .to_owned();
+    let verification_scope_hash =
+        required_string(&verified, "/artifact_scope/canonical_scope_hash")?;
+    let completion_proof = serde_json::json!({
+        "task_id": task_id,
+        "project_id": project_id,
+        "goal": original_goal,
+        "changed_files": [artifact_path.clone()],
+        "memory_refs_used": [],
+        "checks_run": ["cargo-eliot-store-blob-integrity", "cargo test --offline -p eliot-store blob_store::tests::rejects_corrupt_existing_content_addressed_blob -- --exact --test-threads=1"],
+        "checks_not_run": [],
+        "acceptance_items": [
+            {"item": acceptance_ids[0], "status": "verified", "evidence": observation_id, "verifier": "daemon-receipt-resolution", "residual_uncertainty": ""},
+            {"item": acceptance_ids[1], "status": "verified", "evidence": format!("verification:{verification_id}"), "verifier": "cargo-eliot-store-blob-integrity", "residual_uncertainty": ""}
+        ],
+        "evidence": [
+            observation_id,
+            format!("verification:{verification_id}"),
+            verification_scope_hash
+        ],
+        "skill_refs": [],
+        "skill_execution_proof_refs": [],
+        "residual_uncertainty": "",
+        "known_risks": []
+    });
 
     let stale_response = facade.tool_call_response(
         9,
@@ -1074,6 +1174,7 @@ fn first_working_loop_end_to_end() -> TestResult {
             "task_id": task_id,
             "write_id": WriteId::new_v7().to_string(),
             "expected_revision": verification_revision,
+            "completion_proof": completion_proof.clone(),
             "acceptance_item_ids": [acceptance_ids[0]],
             "observation_ids": [observation_id],
             "verification_ids": [verification_id]
@@ -1095,6 +1196,7 @@ fn first_working_loop_end_to_end() -> TestResult {
         "task_id": task_id,
         "write_id": completion_write,
         "expected_revision": verification_revision,
+        "completion_proof": completion_proof,
         "acceptance_item_ids": acceptance_ids,
         "observation_ids": [observation_id],
         "verification_ids": [verification_id]
@@ -1102,7 +1204,8 @@ fn first_working_loop_end_to_end() -> TestResult {
     let completed = facade.tool_call(11, "eliot_submit_completion_proof", &completion_arguments)?;
     assert_eq!(
         completed.get("decision").and_then(Value::as_str),
-        Some("DONE_VERIFIED")
+        Some("DONE_VERIFIED"),
+        "canonical completion must accept the exact task goal and evidence: {completed}"
     );
     let final_revision = task_revision(&completed)?;
     let completion_receipt = receipt_id(&completed)?;
@@ -1113,11 +1216,40 @@ fn first_working_loop_end_to_end() -> TestResult {
 
     fs::remove_file(&runtime_report)?;
     let mut restarted_daemon = start_daemon(&config_path)?;
-    wait_for_runtime_pid(
+    let second_runtime_report = wait_for_runtime_pid(
         &runtime_report,
         restarted_daemon.id(),
-        Duration::from_secs(10),
+        daemon_readiness_timeout,
     )?;
+    let second_auth = wait_for_changed_json_string(
+        &auth_path,
+        "/token_generation_id",
+        &first_generation,
+        daemon_readiness_timeout,
+    )?;
+    let second_runtime_id = required_string(&second_auth, "/runtime_id")?;
+    let second_token = required_string(&second_auth, "/token")?;
+    let second_generation = required_string(&second_auth, "/token_generation_id")?;
+    assert_ne!(
+        second_runtime_report
+            .pointer("/status/pid")
+            .and_then(Value::as_u64),
+        Some(u64::from(first_pid)),
+        "daemon restart must rotate the live PID"
+    );
+    assert_ne!(second_runtime_id, first_runtime_id);
+    assert_ne!(second_generation, first_generation);
+    assert_ne!(second_token, first_token);
+    #[cfg(windows)]
+    {
+        let pipe_name = required_string(&second_auth, "/pipe_name")?;
+        let mut stale = authenticated_handshake(&first_auth, &first_token, "stale-after-restart")?;
+        stale["runtime_id"] = Value::String(second_runtime_id.clone());
+        assert_handshake_rejected(
+            &raw_pipe_exchange(&pipe_name, &stale, None)?,
+            "stale_token_generation",
+        )?;
+    }
     let mut restarted_facade = McpClient::start(&config_path)?;
     restarted_facade.initialize()?;
     let resumed = restarted_facade.tool_call(
@@ -1132,9 +1264,38 @@ fn first_working_loop_end_to_end() -> TestResult {
         Some("done_verified")
     );
     assert_eq!(task_revision(&resumed)?, final_revision);
+    assert_eq!(
+        resumed
+            .pointer("/task_contract/title")
+            .and_then(Value::as_str),
+        Some(original_goal)
+    );
+    assert_eq!(
+        resumed
+            .pointer("/task_contract/completion_proof/goal")
+            .and_then(Value::as_str),
+        Some(original_goal)
+    );
+    assert_eq!(
+        resumed
+            .pointer("/task_contract/completion_proof/changed_files/0")
+            .and_then(Value::as_str),
+        Some(artifact_path.as_str())
+    );
+    assert_eq!(
+        resumed
+            .pointer("/task_contract/verification_scopes/0/worktree_ref")
+            .and_then(Value::as_str),
+        Some(leased_worktree_ref.as_str())
+    );
 
+    let mut replay_arguments = completion_arguments.clone();
+    replay_arguments["completion_proof"] = resumed
+        .pointer("/task_contract/completion_proof")
+        .cloned()
+        .ok_or("resumed task is missing its canonical CompletionProof")?;
     let replay =
-        restarted_facade.tool_call(13, "eliot_submit_completion_proof", &completion_arguments)?;
+        restarted_facade.tool_call(13, "eliot_submit_completion_proof", &replay_arguments)?;
     assert_eq!(receipt_id(&replay)?, completion_receipt);
     assert_eq!(task_revision(&replay)?, final_revision);
 
@@ -1142,6 +1303,11 @@ fn first_working_loop_end_to_end() -> TestResult {
     request_daemon_stop(&config_path)?;
     restarted_daemon.wait_for_exit(Duration::from_secs(10))?;
     database.stop()?;
+    assert!(
+        !worktree.path().join("target").exists(),
+        "registered verifier must keep Cargo build output outside the leased worktree"
+    );
+    worktree.cleanup()?;
 
     assert_no_provider_activity(runtime.path())?;
     let evidence = serde_json::json!({
@@ -1171,7 +1337,28 @@ fn first_working_loop_end_to_end() -> TestResult {
             "stale_revision_denied": true,
             "incomplete_finish_denied": true
         },
-        "restart": {"same_task": true, "same_revision": true, "idempotent_replay": true},
+        "restart": {
+            "same_task": true,
+            "same_revision": true,
+            "idempotent_replay": true,
+            "pid_rotated": true,
+            "runtime_id_rotated": true,
+            "auth_generation_rotated": true,
+            "token_rotated": true,
+            "stale_token_rejected": cfg!(windows)
+        },
+        "w2_03_follow_on": {
+            "status": "CONTRACT_CHALLENGE",
+            "missing_edges": [
+                "authenticated Codex Session attach/resume with a server-delivered lesson InjectionReceipt",
+                "canonical next ActionRequest route that can consume discovered lesson evidence"
+            ],
+            "negative_oracle": {
+                "memory_handles_used": false,
+                "used_and_changed_action_claim": false,
+                "prompt_handle_or_prescribed_recall_query": false
+            }
+        },
         "provider": {"kill_switch": true, "run_owned_artifacts": 0},
         "host_safety": {"temp_root": runtime.path(), "owned_processes_stopped": true}
     });
@@ -1380,13 +1567,10 @@ struct OwnedRuntime {
 }
 
 impl OwnedRuntime {
-    fn new(label: &str) -> TestResult<Self> {
+    fn new(_label: &str) -> TestResult<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let temp = std::env::temp_dir();
-        let path = temp.join(format!(
-            "eliot-governor-first-working-loop-{label}-{}-{nonce}",
-            std::process::id()
-        ));
+        let path = temp.join(format!("eliot-fwl-{}-{nonce}", std::process::id()));
         let lower = path.to_string_lossy().to_ascii_lowercase();
         assert!(path.starts_with(&temp), "runtime must descend from TEMP");
         assert!(!lower.contains("onedrive"), "runtime must not use OneDrive");
@@ -1415,6 +1599,141 @@ impl Drop for OwnedRuntime {
         if self.path.starts_with(std::env::temp_dir()) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+struct OwnedWorktree {
+    repo: PathBuf,
+    path: PathBuf,
+    branch: String,
+}
+
+impl OwnedWorktree {
+    fn create(repo: &Path, path: PathBuf, branch: &str) -> TestResult<Self> {
+        assert!(path.starts_with(std::env::temp_dir()));
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(["worktree", "add", "-b", branch])
+            .arg(&path)
+            .arg("HEAD")
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            path,
+            branch: branch.to_owned(),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn append_and_commit(&self, artifact_path: &str) -> TestResult {
+        let artifact = self.path.join(artifact_path);
+        let mut file = fs::OpenOptions::new().append(true).open(&artifact)?;
+        writeln!(
+            file,
+            "\n// FWL test-owned reversible artifact marker; remove with the owned worktree."
+        )?;
+        file.sync_all()?;
+        drop(file);
+        let add = Command::new("git")
+            .current_dir(&self.path)
+            .args(["add", "--", artifact_path])
+            .output()?;
+        if !add.status.success() {
+            return Err(format!("git add failed: {}", String::from_utf8_lossy(&add.stderr)).into());
+        }
+        let commit = Command::new("git")
+            .current_dir(&self.path)
+            .args([
+                "commit",
+                "-m",
+                "test: first working loop reversible artifact",
+            ])
+            .output()?;
+        if !commit.status.success() {
+            return Err(format!(
+                "git commit failed (status={}): stdout={} stderr={}",
+                commit.status,
+                String::from_utf8_lossy(&commit.stdout),
+                String::from_utf8_lossy(&commit.stderr)
+            )
+            .into());
+        }
+        let status = Command::new("git")
+            .current_dir(&self.path)
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .output()?;
+        if !status.status.success() || !status.stdout.is_empty() {
+            return Err("owned worktree must be clean after its committed artifact edit".into());
+        }
+        Ok(())
+    }
+
+    fn cleanup(&self) -> TestResult {
+        if self.path.exists() {
+            if !self.path.starts_with(std::env::temp_dir()) {
+                return Err("owned worktree cleanup escaped the temp root".into());
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut last_error = String::new();
+            while self.path.exists() {
+                let remove = Command::new("git")
+                    .current_dir(&self.repo)
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&self.path)
+                    .output()?;
+                if remove.status.success() || !self.path.exists() {
+                    break;
+                }
+                last_error = String::from_utf8_lossy(&remove.stderr).into_owned();
+                match fs::remove_dir_all(&self.path) {
+                    Ok(()) => break,
+                    Err(error) if Instant::now() < deadline => {
+                        last_error = format!("{last_error}; fallback: {error}");
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "owned worktree cleanup timed out: git={last_error}; fallback={error}"
+                        )
+                        .into());
+                    }
+                }
+            }
+            if self.path.exists() {
+                return Err(format!("owned worktree cleanup left its path: {last_error}").into());
+            }
+        }
+        let branch = Command::new("git")
+            .current_dir(&self.repo)
+            .args(["branch", "-D"])
+            .arg(&self.branch)
+            .output()?;
+        if !branch.status.success()
+            && !String::from_utf8_lossy(&branch.stderr).contains("not found")
+        {
+            return Err(format!(
+                "git branch cleanup failed: {}",
+                String::from_utf8_lossy(&branch.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OwnedWorktree {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
     }
 }
 
@@ -1487,6 +1806,21 @@ fn registered_verifier(packet: &Value, verifier_id: &str) -> TestResult<(String,
         required_string(descriptor, "/verifier_ref")?,
         required_string(descriptor, "/config_hash")?,
     ))
+}
+
+fn registered_verifier_command(packet: &Value, verifier_id: &str) -> TestResult<String> {
+    let descriptor = packet
+        .get("registered_verifiers")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("verifier_id").and_then(Value::as_str) == Some(verifier_id))
+        })
+        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("registered verifier {verifier_id} missing from packet").into()
+        })?;
+    required_string(descriptor, "/command")
 }
 
 #[cfg(windows)]
