@@ -47,6 +47,15 @@ pub const AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-client-declaration";
 /// Current protected agent-bridge client declaration version.
 pub const AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION: u16 = 2;
+/// Stable wire identity for a Kernel-issued bridge peer challenge.
+pub const AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID: &str = "eliot.protocol.agent-bridge-peer-challenge";
+/// Current bridge peer challenge wire version.
+pub const AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION: u16 = 1;
+/// Stable wire identity for a Kernel-produced bridge peer admission receipt.
+pub const AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_ID: &str =
+    "eliot.protocol.agent-bridge-peer-admission-receipt";
+/// Current bridge peer admission receipt wire version.
+pub const AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_VERSION: u16 = 1;
 const FRAME_PREFIX_BYTES: usize = 4;
 
 /// A protocol contract validation or compatibility failure.
@@ -175,13 +184,58 @@ fn windows_sid(value: &str, field: &'static str) -> Result<(), ProtocolError> {
     if !value.strip_prefix("S-1-").is_some_and(|tail| {
         !tail.is_empty()
             && tail.len() <= 180
-            && tail
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b'-')
+            && tail.split('-').all(|component| {
+                !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+            })
     }) {
         return Err(ProtocolError::InvalidField {
             field,
             reason: "must be canonical Windows SID text",
+        });
+    }
+    Ok(())
+}
+
+fn bounded_text(
+    value: &str,
+    field: &'static str,
+    maximum_bytes: usize,
+) -> Result<(), ProtocolError> {
+    text(value, field)?;
+    if value.len() > maximum_bytes {
+        return Err(ProtocolError::InvalidField {
+            field,
+            reason: "exceeds the bounded wire length",
+        });
+    }
+    Ok(())
+}
+
+fn absolute_windows_path(value: &str, field: &'static str) -> Result<(), ProtocolError> {
+    bounded_text(value, field, 32_768)?;
+    let bytes = value.as_bytes();
+    let device_namespace = bytes.get(..4).is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case(b"\\\\.\\") || prefix.eq_ignore_ascii_case(b"\\\\?\\")
+    });
+    if device_namespace {
+        return Err(ProtocolError::InvalidField {
+            field,
+            reason: "device namespace paths are not admitted",
+        });
+    }
+    let drive_path = bytes.len() >= 3
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+        && bytes[0].is_ascii_alphabetic();
+    let unc_path = value.strip_prefix(r"\\").is_some_and(|rest| {
+        let mut parts = rest.split(['\\', '/']);
+        parts.next().is_some_and(|server| !server.is_empty())
+            && parts.next().is_some_and(|share| !share.is_empty())
+    });
+    if !drive_path && !unc_path {
+        return Err(ProtocolError::InvalidField {
+            field,
+            reason: "must be an absolute Windows path",
         });
     }
     Ok(())
@@ -1062,6 +1116,340 @@ impl AgentBridgeClientDeclaration {
     }
 }
 
+/// Kernel-issued, one-shot correlation challenge for one bridge connection.
+///
+/// This is a transport-neutral packet. `challenge_nonce` is correlation-only:
+/// it is not a Session, request identity, semantic principal, task, scope,
+/// plan, or other authority. A Kernel implementation must retain the
+/// one-shot challenge state and bind it to the live connection before using a
+/// receipt. This pure contract does not perform that retention or observation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgePeerChallenge {
+    /// Challenge wire identity.
+    pub wire_id: String,
+    /// Challenge wire version.
+    pub wire_version: u16,
+    /// Exact bridge module identity.
+    pub module_id: String,
+    /// Static bridge profile identity.
+    pub profile_id: String,
+    /// Digest of the immutable admission descriptor.
+    pub descriptor_sha256: String,
+    /// Digest of the immutable client declaration template.
+    pub client_declaration_sha256: String,
+    /// Bridge generation selected by the static profile.
+    pub bridge_generation: ResourceGeneration,
+    /// Generation/authority fence selected by the static profile.
+    pub state_fence: StateFence,
+    /// Fresh per-connection Kernel challenge nonce.
+    pub challenge_nonce: String,
+    /// Lowercase SHA-256 over every challenge field except this field.
+    pub challenge_sha256: String,
+}
+
+impl AgentBridgePeerChallenge {
+    /// Current challenge contract version.
+    pub const CONTRACT_VERSION: u16 = AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION;
+
+    /// Returns canonical bytes covered by `challenge_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.challenge_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical challenge digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical challenge digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.challenge_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the static bindings and canonical self digest.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_peer_challenge.wire",
+                reason: "unsupported bridge peer challenge",
+            });
+        }
+        validate_peer_bindings(
+            &self.module_id,
+            &self.profile_id,
+            &self.descriptor_sha256,
+            &self.client_declaration_sha256,
+            self.bridge_generation,
+            &self.state_fence,
+            &self.challenge_nonce,
+        )?;
+        lowercase_sha256(
+            &self.challenge_sha256,
+            "agent_bridge_peer_challenge.challenge_sha256",
+        )?;
+        if self.challenge_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_peer_challenge.challenge_sha256",
+                reason: "challenge digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that this challenge names the exact protected declaration.
+    pub fn validate_declaration(
+        &self,
+        declaration: &AgentBridgeClientDeclaration,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        declaration.validate()?;
+        if declaration.module_id != self.module_id
+            || declaration.profile_id != self.profile_id
+            || declaration.module_generation.generation != self.bridge_generation
+            || declaration.module_generation.state_fence != self.state_fence
+            || declaration.compute_digest()? != self.client_declaration_sha256
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_peer_challenge.client_declaration_sha256",
+                reason: "must bind the exact protected client declaration",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Kernel-produced observation of one challenged bridge peer.
+///
+/// The receipt is inert output until a Kernel validates it against its
+/// retained one-shot challenge and trusted platform evidence. A caller-held
+/// or caller-produced receipt grants no authority and does not establish a
+/// semantic Session, task, `WorkScope`, plan, or request identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgePeerAdmissionReceipt {
+    /// Receipt wire identity.
+    pub wire_id: String,
+    /// Receipt wire version.
+    pub wire_version: u16,
+    /// Exact bridge module identity.
+    pub module_id: String,
+    /// Static bridge profile identity.
+    pub profile_id: String,
+    /// Digest of the immutable admission descriptor.
+    pub descriptor_sha256: String,
+    /// Digest of the immutable client declaration template.
+    pub client_declaration_sha256: String,
+    /// Bridge generation selected by the static profile.
+    pub bridge_generation: ResourceGeneration,
+    /// Generation/authority fence selected by the static profile.
+    pub state_fence: StateFence,
+    /// Exact challenge nonce observed by Kernel.
+    pub challenge_nonce: String,
+    /// Digest of the exact challenge packet.
+    pub challenge_sha256: String,
+    /// Digest of the exact dynamic `ClientHello`.
+    pub client_hello_sha256: String,
+    /// Windows SID observed from the connected peer token.
+    pub observed_sid: String,
+    /// Interactive Windows session observed from the connected peer.
+    pub observed_session_id: u32,
+    /// Process ID observed for the connected peer.
+    pub observed_process_id: u32,
+    /// Process start identity observed for the connected peer.
+    pub observed_process_start_time_100ns: u64,
+    /// Absolute image path observed for the connected peer.
+    pub observed_image_path: String,
+    /// Volume serial number of the observed image file.
+    pub observed_image_volume_serial: u32,
+    /// File index of the observed image file.
+    pub observed_image_file_index: u64,
+    /// Lowercase SHA-256 over every receipt field except this field.
+    pub receipt_sha256: String,
+}
+
+impl AgentBridgePeerAdmissionReceipt {
+    /// Current receipt contract version.
+    pub const CONTRACT_VERSION: u16 = AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_VERSION;
+
+    /// Returns canonical bytes covered by `receipt_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.receipt_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical receipt digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical receipt digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.receipt_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates that the receipt names the exact one-shot challenge.
+    pub fn validate_challenge(
+        &self,
+        challenge: &AgentBridgePeerChallenge,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        challenge.validate()?;
+        if self.module_id != challenge.module_id
+            || self.profile_id != challenge.profile_id
+            || self.descriptor_sha256 != challenge.descriptor_sha256
+            || self.client_declaration_sha256 != challenge.client_declaration_sha256
+            || self.bridge_generation != challenge.bridge_generation
+            || self.state_fence != challenge.state_fence
+            || self.challenge_nonce != challenge.challenge_nonce
+            || self.challenge_sha256 != challenge.challenge_sha256
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_peer_admission_receipt.challenge",
+                reason: "must bind the exact one-shot challenge",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that the receipt names the exact dynamic `ClientHello`.
+    pub fn validate_client_hello(
+        &self,
+        declaration: &AgentBridgeClientDeclaration,
+        hello: &ClientHello,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        declaration.validate()?;
+        hello.validate()?;
+        if self.module_id != declaration.module_id
+            || self.profile_id != declaration.profile_id
+            || self.client_declaration_sha256 != declaration.declaration_sha256
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_peer_admission_receipt.client_declaration_sha256",
+                reason: "must bind the exact client declaration profile",
+            });
+        }
+        let expected_hello = declaration.client_hello(self.challenge_nonce.clone())?;
+        let hello_digest = eliot_contracts::sha256_hex(
+            &canonical_json_bytes(hello).map_err(|error| ProtocolError::Json(error.to_string()))?,
+        );
+        if self.client_hello_sha256 != hello_digest || *hello != expected_hello {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_peer_admission_receipt.client_hello_sha256",
+                reason: "must bind the exact dynamic ClientHello",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the receipt shape without authenticating the peer.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_peer_admission_receipt.wire",
+                reason: "unsupported bridge peer admission receipt",
+            });
+        }
+        validate_peer_bindings(
+            &self.module_id,
+            &self.profile_id,
+            &self.descriptor_sha256,
+            &self.client_declaration_sha256,
+            self.bridge_generation,
+            &self.state_fence,
+            &self.challenge_nonce,
+        )?;
+        for (digest, field) in [
+            (
+                self.challenge_sha256.as_str(),
+                "agent_bridge_peer_admission_receipt.challenge_sha256",
+            ),
+            (
+                self.client_hello_sha256.as_str(),
+                "agent_bridge_peer_admission_receipt.client_hello_sha256",
+            ),
+            (
+                self.receipt_sha256.as_str(),
+                "agent_bridge_peer_admission_receipt.receipt_sha256",
+            ),
+        ] {
+            lowercase_sha256(digest, field)?;
+        }
+        windows_sid(
+            &self.observed_sid,
+            "agent_bridge_peer_admission_receipt.observed_sid",
+        )?;
+        if self.observed_session_id == 0
+            || self.observed_process_id == 0
+            || self.observed_process_start_time_100ns == 0
+            || self.observed_image_volume_serial == 0
+            || self.observed_image_file_index == 0
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_peer_admission_receipt.observed_identity",
+                reason: "interactive process and file identities must be nonzero",
+            });
+        }
+        absolute_windows_path(
+            &self.observed_image_path,
+            "agent_bridge_peer_admission_receipt.observed_image_path",
+        )?;
+        if self.receipt_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_peer_admission_receipt.receipt_sha256",
+                reason: "receipt digest mismatch",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_peer_bindings(
+    module_id: &str,
+    profile_id: &str,
+    descriptor_sha256: &str,
+    client_declaration_sha256: &str,
+    bridge_generation: ResourceGeneration,
+    state_fence: &StateFence,
+    challenge_nonce: &str,
+) -> Result<(), ProtocolError> {
+    if module_id != AGENT_BRIDGE_MODULE_ID {
+        return Err(ProtocolError::InvalidField {
+            field: "agent_bridge_peer.module_id",
+            reason: "must match the exact agent-bridge module",
+        });
+    }
+    bounded_text(profile_id, "agent_bridge_peer.profile_id", 256)?;
+    lowercase_sha256(descriptor_sha256, "agent_bridge_peer.descriptor_sha256")?;
+    lowercase_sha256(
+        client_declaration_sha256,
+        "agent_bridge_peer.client_declaration_sha256",
+    )?;
+    state_fence.validate().map_err(ProtocolError::Foundation)?;
+    if bridge_generation.value() == 0 || bridge_generation != state_fence.resource_generation {
+        return Err(ProtocolError::InvalidField {
+            field: "agent_bridge_peer.bridge_generation",
+            reason: "must match the state fence resource generation",
+        });
+    }
+    bounded_text(challenge_nonce, "agent_bridge_peer.challenge_nonce", 512)?;
+    Ok(())
+}
+
 /// Server-side EBP handshake selection and capability declaration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1457,6 +1845,300 @@ mod tests {
         let mut wrong_self_digest = declaration;
         wrong_self_digest.declaration_sha256 = "f".repeat(64);
         assert!(wrong_self_digest.validate().is_err());
+        Ok(())
+    }
+
+    fn peer_challenge(
+        declaration: &AgentBridgeClientDeclaration,
+    ) -> Result<AgentBridgePeerChallenge, ProtocolError> {
+        AgentBridgePeerChallenge {
+            wire_id: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: declaration.profile_id.clone(),
+            descriptor_sha256: "d".repeat(64),
+            client_declaration_sha256: declaration.declaration_sha256.clone(),
+            bridge_generation: declaration.module_generation.generation,
+            state_fence: declaration.module_generation.state_fence.clone(),
+            challenge_nonce: "kernel-challenge-1".to_owned(),
+            challenge_sha256: String::new(),
+        }
+        .with_computed_digest()
+    }
+
+    fn peer_receipt(
+        challenge: &AgentBridgePeerChallenge,
+        hello: &ClientHello,
+    ) -> Result<AgentBridgePeerAdmissionReceipt, ProtocolError> {
+        let client_hello_sha256 = eliot_contracts::sha256_hex(
+            &canonical_json_bytes(hello).map_err(|error| ProtocolError::Json(error.to_string()))?,
+        );
+        AgentBridgePeerAdmissionReceipt {
+            wire_id: AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_VERSION,
+            module_id: challenge.module_id.clone(),
+            profile_id: challenge.profile_id.clone(),
+            descriptor_sha256: challenge.descriptor_sha256.clone(),
+            client_declaration_sha256: challenge.client_declaration_sha256.clone(),
+            bridge_generation: challenge.bridge_generation,
+            state_fence: challenge.state_fence.clone(),
+            challenge_nonce: challenge.challenge_nonce.clone(),
+            challenge_sha256: challenge.challenge_sha256.clone(),
+            client_hello_sha256,
+            observed_sid: "S-1-5-21-100-200-300-1001".to_owned(),
+            observed_session_id: 7,
+            observed_process_id: 1234,
+            observed_process_start_time_100ns: 55,
+            observed_image_path: r"C:\Program Files\ELIOT\eliot-agent-bridge.exe".to_owned(),
+            observed_image_volume_serial: 77,
+            observed_image_file_index: 88,
+            receipt_sha256: String::new(),
+        }
+        .with_computed_digest()
+    }
+
+    #[test]
+    fn bridge_peer_challenge_and_receipt_bind_dynamic_connection_data() -> Result<(), ProtocolError>
+    {
+        let declaration = agent_bridge_client_declaration()?;
+        let challenge = peer_challenge(&declaration)?;
+        let hello_one = declaration.client_hello(&challenge.challenge_nonce)?;
+        let receipt = peer_receipt(&challenge, &hello_one)?;
+        challenge.validate()?;
+        challenge.validate_declaration(&declaration)?;
+        receipt.validate()?;
+        receipt.validate_challenge(&challenge)?;
+        receipt.validate_client_hello(&declaration, &hello_one)?;
+        assert_eq!(receipt.observed_session_id, 7);
+
+        let second_challenge = AgentBridgePeerChallenge {
+            challenge_nonce: "kernel-challenge-2".to_owned(),
+            ..challenge.clone()
+        }
+        .with_computed_digest()?;
+        let hello_two = declaration.client_hello(&second_challenge.challenge_nonce)?;
+        let second_receipt = peer_receipt(&second_challenge, &hello_two)?;
+        assert_ne!(challenge.challenge_nonce, second_challenge.challenge_nonce);
+        assert_ne!(
+            challenge.challenge_sha256,
+            second_challenge.challenge_sha256
+        );
+        assert_ne!(hello_one, hello_two);
+        assert_ne!(receipt.receipt_sha256, second_receipt.receipt_sha256);
+        assert_eq!(
+            declaration.declaration_sha256,
+            declaration.compute_digest()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_peer_relational_bindings_reject_recomputed_substitutions() -> Result<(), ProtocolError>
+    {
+        let declaration = agent_bridge_client_declaration()?;
+        let challenge = peer_challenge(&declaration)?;
+        let hello = declaration.client_hello(&challenge.challenge_nonce)?;
+        let receipt = peer_receipt(&challenge, &hello)?;
+
+        let mut substituted_profile = challenge.clone();
+        substituted_profile.profile_id = "other-profile".to_owned();
+        substituted_profile = substituted_profile.with_computed_digest()?;
+        assert!(substituted_profile.validate().is_ok());
+        assert!(
+            substituted_profile
+                .validate_declaration(&declaration)
+                .is_err()
+        );
+
+        let mut substituted_challenge = challenge.clone();
+        substituted_challenge.descriptor_sha256 = "e".repeat(64);
+        substituted_challenge = substituted_challenge.with_computed_digest()?;
+        assert!(substituted_challenge.validate().is_ok());
+        assert!(receipt.validate_challenge(&substituted_challenge).is_err());
+
+        let mut substituted_declaration = challenge.clone();
+        substituted_declaration.client_declaration_sha256 = "f".repeat(64);
+        substituted_declaration = substituted_declaration.with_computed_digest()?;
+        assert!(substituted_declaration.validate().is_ok());
+        assert!(
+            receipt
+                .validate_challenge(&substituted_declaration)
+                .is_err()
+        );
+
+        let mut substituted_nonce = challenge.clone();
+        substituted_nonce.challenge_nonce = "kernel-challenge-other".to_owned();
+        substituted_nonce = substituted_nonce.with_computed_digest()?;
+        assert!(substituted_nonce.validate().is_ok());
+        assert!(receipt.validate_challenge(&substituted_nonce).is_err());
+
+        let mut substituted_hash = receipt.clone();
+        substituted_hash.challenge_sha256 = "a".repeat(64);
+        substituted_hash = substituted_hash.with_computed_digest()?;
+        assert!(substituted_hash.validate().is_ok());
+        assert!(substituted_hash.validate_challenge(&challenge).is_err());
+
+        let mut substituted_generation = challenge.clone();
+        substituted_generation.bridge_generation = ResourceGeneration::new(2)?;
+        substituted_generation.state_fence.resource_generation = ResourceGeneration::new(2)?;
+        substituted_generation = substituted_generation.with_computed_digest()?;
+        assert!(substituted_generation.validate().is_ok());
+        assert!(receipt.validate_challenge(&substituted_generation).is_err());
+
+        let mut substituted_fence = challenge.clone();
+        substituted_fence.state_fence.authority_epoch = AuthorityEpoch::new(2)?;
+        substituted_fence = substituted_fence.with_computed_digest()?;
+        assert!(substituted_fence.validate().is_ok());
+        assert!(receipt.validate_challenge(&substituted_fence).is_err());
+
+        let hello_other = declaration.client_hello("kernel-challenge-other")?;
+        let mut receipt_other_hello = receipt.clone();
+        receipt_other_hello.client_hello_sha256 = eliot_contracts::sha256_hex(
+            &canonical_json_bytes(&hello_other)
+                .map_err(|error| ProtocolError::Json(error.to_string()))?,
+        );
+        receipt_other_hello = receipt_other_hello.with_computed_digest()?;
+        assert!(receipt_other_hello.validate().is_ok());
+        assert!(
+            receipt_other_hello
+                .validate_client_hello(&declaration, &hello_other)
+                .is_err()
+        );
+
+        let mut forged_hello = hello.clone();
+        forged_hello
+            .capabilities
+            .push("forged.capability".to_owned());
+        forged_hello.validate()?;
+        let mut forged_receipt = receipt.clone();
+        forged_receipt.client_hello_sha256 = eliot_contracts::sha256_hex(
+            &canonical_json_bytes(&forged_hello)
+                .map_err(|error| ProtocolError::Json(error.to_string()))?,
+        );
+        forged_receipt = forged_receipt.with_computed_digest()?;
+        assert!(forged_receipt.validate().is_ok());
+        assert!(
+            forged_receipt
+                .validate_client_hello(&declaration, &forged_hello)
+                .is_err()
+        );
+
+        let mut receipt_other_nonce = receipt.clone();
+        receipt_other_nonce.challenge_nonce = "kernel-challenge-other".to_owned();
+        receipt_other_nonce = receipt_other_nonce.with_computed_digest()?;
+        assert!(receipt_other_nonce.validate().is_ok());
+        assert!(
+            receipt_other_nonce
+                .validate_client_hello(&declaration, &hello)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_peer_contracts_reject_legacy_semantic_and_malformed_values()
+    -> Result<(), ProtocolError> {
+        let declaration = agent_bridge_client_declaration()?;
+        let challenge = peer_challenge(&declaration)?;
+        let hello = declaration.client_hello(&challenge.challenge_nonce)?;
+        let receipt = peer_receipt(&challenge, &hello)?;
+
+        let mut unknown = serde_json::to_value(&challenge)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        unknown["session_id"] = Value::String("semantic-session".to_owned());
+        assert!(serde_json::from_value::<AgentBridgePeerChallenge>(unknown).is_err());
+
+        let mut legacy = serde_json::to_value(&receipt)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        legacy["connection_id"] = Value::String("legacy".to_owned());
+        assert!(serde_json::from_value::<AgentBridgePeerAdmissionReceipt>(legacy).is_err());
+
+        let mut bad_challenge = challenge.clone();
+        bad_challenge.wire_version = 0;
+        assert!(bad_challenge.validate().is_err());
+        for (mut bad, field) in [
+            (challenge.clone(), "module_id"),
+            (challenge.clone(), "profile_id"),
+            (challenge.clone(), "descriptor_sha256"),
+            (challenge.clone(), "client_declaration_sha256"),
+            (challenge.clone(), "challenge_nonce"),
+        ] {
+            match field {
+                "module_id" => bad.module_id = "other-module".to_owned(),
+                "profile_id" => bad.profile_id.clear(),
+                "descriptor_sha256" => bad.descriptor_sha256 = "bad".to_owned(),
+                "client_declaration_sha256" => bad.client_declaration_sha256 = "bad".to_owned(),
+                _ => bad.challenge_nonce = "\u{7f}".to_owned(),
+            }
+            assert!(bad.validate().is_err(), "bad challenge field {field}");
+        }
+
+        for mut bad in [receipt.clone()] {
+            bad.challenge_sha256 = "e".repeat(64);
+            assert!(bad.validate().is_err());
+            let mut bad_hello = receipt.clone();
+            bad_hello.client_hello_sha256 = "A".repeat(64);
+            assert!(bad_hello.validate().is_err());
+            let mut bad_generation = receipt.clone();
+            bad_generation.bridge_generation = ResourceGeneration::new(2)?;
+            assert!(bad_generation.validate().is_err());
+            let mut bad_fence = receipt.clone();
+            bad_fence.state_fence.resource_generation = ResourceGeneration::new(2)?;
+            assert!(bad_fence.validate().is_err());
+            for mut zero in [
+                receipt.clone(),
+                AgentBridgePeerAdmissionReceipt {
+                    observed_session_id: 0,
+                    ..receipt.clone()
+                },
+                AgentBridgePeerAdmissionReceipt {
+                    observed_process_id: 0,
+                    ..receipt.clone()
+                },
+                AgentBridgePeerAdmissionReceipt {
+                    observed_process_start_time_100ns: 0,
+                    ..receipt.clone()
+                },
+                AgentBridgePeerAdmissionReceipt {
+                    observed_image_volume_serial: 0,
+                    ..receipt.clone()
+                },
+                AgentBridgePeerAdmissionReceipt {
+                    observed_image_file_index: 0,
+                    ..receipt.clone()
+                },
+            ] {
+                zero.receipt_sha256 = receipt.receipt_sha256.clone();
+                if zero != receipt {
+                    assert!(zero.validate().is_err());
+                }
+            }
+            let mut bad_path = receipt.clone();
+            bad_path.observed_image_path = "relative.exe".to_owned();
+            assert!(bad_path.validate().is_err());
+            for device_path in [
+                r"\\.\pipe\eliot-agent-bridge",
+                r"\\?\C:\Program Files\ELIOT\eliot-agent-bridge.exe",
+                r"\\server",
+                r"\\server\",
+                r"\\\share\eliot-agent-bridge.exe",
+            ] {
+                let mut malformed_path = receipt.clone();
+                malformed_path.observed_image_path = device_path.to_owned();
+                assert!(malformed_path.validate().is_err(), "bad path {device_path}");
+            }
+            let mut bad_sid = receipt.clone();
+            bad_sid.observed_sid = "not-a-sid".to_owned();
+            assert!(bad_sid.validate().is_err());
+            for malformed_sid in ["S-1--5", "S-1-5-"] {
+                let mut malformed = receipt.clone();
+                malformed.observed_sid = malformed_sid.to_owned();
+                assert!(malformed.validate().is_err(), "bad SID {malformed_sid}");
+            }
+            let mut bad_digest = receipt.clone();
+            bad_digest.receipt_sha256 = "f".repeat(64);
+            assert!(bad_digest.validate().is_err());
+        }
         Ok(())
     }
 

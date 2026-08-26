@@ -8,7 +8,7 @@
       {
         "path": "docs/conformance.toml",
         "role": "generated projection",
-        "sha256": "2304517EAAD119F926893EAA8FD946FFE3AAA306A75D1C4DD9E0A8E38DE9BF7F"
+        "sha256": "1F60BF4C680CF81BE2E75ED3266201EC07310A8CC0ABBC534664FD61A9AD3233"
       },
       {
         "path": "swarm/results/W1-04-implementation.json",
@@ -65,7 +65,7 @@
       },
       {
         "path": "swarm/inventory/modules.json",
-        "sha256": "672125F6FB595945C7CA11E997B80FE90458A33E35F39D932DB78025F40F9E9E",
+        "sha256": "E2254C15BA6B7ABBD56FEF2F35829E162691F8075FF67F832306E4EB7871C5E3",
         "role": "current module ownership inventory"
       },
       {
@@ -122,7 +122,7 @@
       {
         "path": "swarm/inventory/modules.json",
         "role": "current module ownership inventory",
-        "sha256": "672125F6FB595945C7CA11E997B80FE90458A33E35F39D932DB78025F40F9E9E"
+        "sha256": "E2254C15BA6B7ABBD56FEF2F35829E162691F8075FF67F832306E4EB7871C5E3"
       },
       {
         "path": "swarm/inventory/refusals.csv",
