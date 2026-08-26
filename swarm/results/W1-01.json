@@ -4,7 +4,7 @@
   "work_item_id": "W1-01",
   "structured_result": {
     "schema_version": "eliot-work-result-v2",
-    "source_revision": "content:88a9beeef1d4e1725dc898282cf48ff0f1835df0096ad43db0c1ede169a9f04b",
+    "source_revision": "content:fceabdfa789f46f6e049a4f93479e3d72fb6318352e07501630d4c50b8a1253c",
     "disposition": "challenged",
     "discriminator_before": "Prior W1-01 evidence used a result envelope that was not source-compatible and accepted incomplete nested metadata.",
     "discriminator_after": "The result is an exact v1.3 evidence-only wrapper generated from code, with content-bound non-self artifact and witness hashes plus independent add/remove/tamper checks.",
@@ -36,17 +36,17 @@
       },
       {
         "path": "swarm/inventory/modules.json",
-        "sha256": "50a6f964c3b3382aa8f57a39440baee66c125df473fd3a3b98ab032ccd95b52e"
+        "sha256": "a70f874bc49471a4ea9ebaa715370594e5b1444f8509757c5d5fc5f252515755"
       }
     ],
     "inventory_summary": {
       "members_total": 126,
-      "total_source_stu": 7443184,
-      "total_test_count": 3352,
+      "total_source_stu": 7448715,
+      "total_test_count": 3355,
       "zero_test_packages": 43,
       "unreachable_from_bins": 41,
-      "document_digest": "e624cdf8cdbeb56612f6f0c332435e0b3008ec64ccc35c1c29099484252e7606",
-      "inputs_digest": "88a9beeef1d4e1725dc898282cf48ff0f1835df0096ad43db0c1ede169a9f04b"
+      "document_digest": "cde489f7c0853d90d59694d2d03b0df307cc3b3f94720861e9abaf149f20cc5d",
+      "inputs_digest": "fceabdfa789f46f6e049a4f93479e3d72fb6318352e07501630d4c50b8a1253c"
     },
     "evidence": [
       "cargo metadata --locked --format-version 1 -> 126 workspace packages",
@@ -82,7 +82,7 @@
       },
       "inventory": {
         "path": "swarm/inventory/modules.json",
-        "sha256": "50a6f964c3b3382aa8f57a39440baee66c125df473fd3a3b98ab032ccd95b52e"
+        "sha256": "a70f874bc49471a4ea9ebaa715370594e5b1444f8509757c5d5fc5f252515755"
       }
     },
     "external_review": {

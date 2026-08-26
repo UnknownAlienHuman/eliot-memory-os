@@ -25,6 +25,8 @@ pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
 pub use protocol::{
+    AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID, AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
+    AGENT_BRIDGE_MODULE_ID, AgentBridgeAdmissionDescriptor, AgentBridgeProcessPolicy,
     ContainmentAction, EliotdLaunchDescriptor, HostFileIdentity, HostJobBinding, HostJobIdentity,
     HostJobRoot, HostKernelCandidateBinding, HostProcessBinding, HostStoreBootstrapRequirement,
     KERNEL_CONTROL_PIPE, KERNEL_CONTROL_WIRE_ID, KERNEL_CONTROL_WIRE_VERSION,

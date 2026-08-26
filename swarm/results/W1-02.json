@@ -24,7 +24,7 @@
       "note": "UNKNOWN anchors are explicit evidence gaps: the source span contains no validated normative/work identifier; they are not inferred from the historical 1371 baseline."
     },
     "source_file_count": 581,
-    "source_digest_aggregate": "9f8b307e89b94456456a42c30c51bb2fc8d4c12af3659d77cae1e9a27d4f392a",
+    "source_digest_aggregate": "f800cfe25a33308dba24058579de5d4d8b1995f75d1701024a996d9eeac1b748",
     "normative_pair_sha256": "041c9bb09db91b8bd8b8c073270c6220cf534b746fcf7faadf705094218b99b1",
     "normative_pair_paths": [
       "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -2017,7 +2017,7 @@
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/lib.rs",
-          "sha256": "96cae89d4016398b37bcaf9213716d4fbcd7cead5c7e188cd5162e1cd0229ca7"
+          "sha256": "c65d92691f85d8f0c30e1d98c6ac2d4a26a61f2b1f17ee8ac573a55d183e65cd"
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/lifecycle.rs",
@@ -2025,7 +2025,7 @@
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/protocol.rs",
-          "sha256": "b31a5057583ce91ec94b3fd84ebcd7fe69d44ebb8195759bbc505d2a2c74cfe2"
+          "sha256": "2ea54361e96574311445dc03ca6aba055a3e80f0d4c71f7f6d428e70130a5352"
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/store_client.rs",
@@ -2388,7 +2388,7 @@
           "sha256": "0b9cb7808d1a6ef940c7c095f06de336ea78beb58b9f6191235f7b0698a21eee"
         }
       ],
-      "source_manifest_sha256": "9f8b307e89b94456456a42c30c51bb2fc8d4c12af3659d77cae1e9a27d4f392a",
+      "source_manifest_sha256": "f800cfe25a33308dba24058579de5d4d8b1995f75d1701024a996d9eeac1b748",
       "normative_pair": [
         {
           "path": "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -2413,7 +2413,7 @@
           "sha256": "d416e0ba46ded5b5a64fd3b3f3f739961d502ba71e744db65da8cb104f54b325"
         }
       ],
-      "content_digest": "e2ad08c8975652b9e4447199626774d120808310947642073b416bcfb6520140"
+      "content_digest": "3e1c5fa03a1e3b1bc39293c050887dea41f8dadc56ccb37d2a529463262738b1"
     },
     "disposition": "challenged",
     "artifacts": [

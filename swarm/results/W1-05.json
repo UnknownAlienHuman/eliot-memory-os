@@ -10,7 +10,7 @@
     "artifacts": {
       "inventory": {
         "path": "swarm/inventory/contour-cut.json",
-        "sha256": "DC4AFA74E241BE8ACE4646038151F43A3F1E18DC4A1B29CB4758FAE973F1576F"
+        "sha256": "9FCC1363725A5401457A76EFD374A67D60790C3239BDF6CF12FF7B29544A1B16"
       },
       "generator": {
         "path": "scripts/gen-contour-cut.ps1",
@@ -22,7 +22,7 @@
       },
       "generator_sha256": "3C240F4E0668780CD0BD8113179BEF1539BD9DCA1422B2322E0FE5DAB0ABA756",
       "verifier_sha256": "7B83C47B2FA58BD33404EBD4803B464866D854F527415764F67DC7CD2EA10587",
-      "inventory_sha256": "DC4AFA74E241BE8ACE4646038151F43A3F1E18DC4A1B29CB4758FAE973F1576F"
+      "inventory_sha256": "9FCC1363725A5401457A76EFD374A67D60790C3239BDF6CF12FF7B29544A1B16"
     },
     "evidence": [
       "content-bound path plus byte source census",
@@ -58,7 +58,7 @@
       },
       "inventory": {
         "path": "swarm/inventory/contour-cut.json",
-        "sha256": "DC4AFA74E241BE8ACE4646038151F43A3F1E18DC4A1B29CB4758FAE973F1576F"
+        "sha256": "9FCC1363725A5401457A76EFD374A67D60790C3239BDF6CF12FF7B29544A1B16"
       }
     },
     "observed_worktree_state": "CONTENT_BOUND_SOURCE_UNION; GIT_CATEGORIES_OBSERVATIONAL_ONLY",
@@ -91,7 +91,7 @@
         "eliot-kernel",
         "eliotd"
       ],
-      "rows": 4110,
+      "rows": 4116,
       "cargo_direct_edges": {
         "A_TO_B": {
           "present": 0,
@@ -109,8 +109,8 @@
         "nonignored_untracked_rust_file_count": 0,
         "union_rust_file_count": 581,
         "grammar_motifs": 18,
-        "hit_count": 4076.0,
-        "row_count": 4076,
+        "hit_count": 4082.0,
+        "row_count": 4082,
         "motif_hit_counts": {
           "runtime-executable-literal": 1251,
           "process-constructor": 264,
@@ -118,7 +118,7 @@
           "process-wrapper-spawn": 5,
           "process-executor-wrapper": 364,
           "windows-process-api": 3,
-          "runtime-launch-contract": 376,
+          "runtime-launch-contract": 382,
           "ipc-named-pipe-operation": 42,
           "ipc-qualified-named-pipe-api": 9,
           "ipc-peer-auth": 67,
@@ -138,7 +138,7 @@
           "process-wrapper-spawn": 5,
           "process-executor-wrapper": 364,
           "windows-process-api": 3,
-          "runtime-launch-contract": 376,
+          "runtime-launch-contract": 382,
           "ipc-named-pipe-operation": 42,
           "ipc-qualified-named-pipe-api": 9,
           "ipc-peer-auth": 67,
@@ -152,12 +152,12 @@
           "canonical-write-symbol": 1
         },
         "provenance": "content_bound_path_plus_bytes",
-        "rust_files_sha256": "AD1940CA29DE1E04AF475106520ED9ECF7744C8739C919234CE27A6DB7BBE170"
+        "rust_files_sha256": "8527E6ADC04C7A69CF44FC9ACB7B7CDFE77B98A340E41966F1685999AD071A5C"
       },
       "edge_class_counts": {
         "canonical_write_definition": 1,
         "cargo_dependency": 24,
-        "launch_control_observation": 376,
+        "launch_control_observation": 382,
         "negative_observation": 5,
         "process_launch_observation": 385,
         "process_wrapper_observation": 372,
@@ -170,22 +170,22 @@
       "status_counts": {
         "absent": 24,
         "present": 2697,
-        "unknown": 1389
+        "unknown": 1395
       },
       "semantic_counts": {
         "negative_observation_non_join": 5,
         "process_launch_observation": 385,
         "process_wrapper_observation": 372,
         "runtime_ipc_observation": 377,
-        "launch_control_observation": 376,
+        "launch_control_observation": 382,
         "schema_observation": 640,
         "state_write_unknown": 373,
         "unknown_process_target": 727,
         "unknown_ipc_target": 377,
-        "unknown_launch_target": 376,
+        "unknown_launch_target": 382,
         "present": 2697,
         "absent": 24,
-        "unknown": 1389
+        "unknown": 1395
       },
       "regression_fixtures": [
         {
@@ -268,8 +268,8 @@
         "definition": "crates/governor/eliot-governor/src/composition.rs:1292",
         "status": "VERIFIED_ONE_DEFINITION_ZERO_CALLERS"
       },
-      "inventory_summary_sha256": "6B28FC0B0CE8DAD6BAA06F46174132EADE21481D58E23864A30B62EC98AA25EB",
-      "source_scan_sha256": "33D99A0125FEC07E84853D4CA7552D931E9648F36E2D69BB004084F38D335054",
+      "inventory_summary_sha256": "9B4FE88DA50E3D9E704A51B9F4EFE07A581F985A66DAC0A090D94E5DDE18AC91",
+      "source_scan_sha256": "60C55C91BD6C371347B2F3DB520B84868DF6EF1897B616D088CCEDDE7510C286",
       "canonical_write_proof_sha256": "23BF3C4D828DAA047A5EDAF143F3E96A72CD003EB396F6B6B7FD0F2871D1D36B",
       "regression_fixtures_sha256": "ACFF0865E67C01CA6CA35AFA15FBA494AFB35E5F2CCF546A69EE2EE1088E7E41",
       "cutover_decision": "PENDING_ROOT"
@@ -285,7 +285,7 @@
     ],
     "verification": [
       "pwsh -NoProfile -File scripts/gen-contour-cut.ps1 -SelfTest: PASS",
-      "pwsh -NoProfile -File scripts/gen-contour-cut.ps1: PASS (4110 rows; 581 Rust files)",
+      "pwsh -NoProfile -File scripts/gen-contour-cut.ps1: PASS (4116 rows; 581 Rust files)",
       "pwsh -NoProfile -File scripts/gen-contour-cut.ps1 -Check: PASS",
       "pwsh -NoProfile -File scripts/verify-contour-cut.ps1 -SelfTest: PASS (omitted edge, source-stage, source/result family envelope, duplicate, negative, and §5.1 tamper checks)",
       "pwsh -NoProfile -File scripts/verify-contour-cut.ps1: PASS (declared grammar, Cargo edges, source anchors/digests, §5.1 proof, and full result envelope independently recomputed)",
