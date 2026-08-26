@@ -11,6 +11,7 @@ eliot-bootstrap.workspace = true
 eliot-contracts.workspace = true
 eliot-observation-contracts.workspace = true
 eliot-ipc.workspace = true
+eliot-mcp.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
 eliot-receipts.workspace = true

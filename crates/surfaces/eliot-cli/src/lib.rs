@@ -21,6 +21,8 @@ pub const CATALOGUE_NAME: &str = "eliot.cli.commands";
 pub const CATALOGUE_REVISION: &str = "a11-plan-v2";
 /// Schema projection identity.
 pub const SCHEMA_VERSION: &str = "eliot-cli-schema-v1";
+/// MCP surface revision consumed by the CLI catalogue edge.
+pub const MCP_SURFACE_CONTRACT_REVISION: &str = eliot_mcp::CONTRACT_REVISION;
 
 /// Canonical command identifiers from the first-line command projection.
 #[derive(
@@ -1078,7 +1080,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1120,7 +1122,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1134,7 +1136,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1148,7 +1150,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1162,7 +1164,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1176,7 +1178,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1190,7 +1192,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1204,7 +1206,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1218,7 +1220,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1232,7 +1234,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1246,7 +1248,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1260,7 +1262,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1274,7 +1276,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1288,7 +1290,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1302,7 +1304,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1316,7 +1318,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1330,7 +1332,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1344,7 +1346,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1358,7 +1360,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1372,7 +1374,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1386,7 +1388,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-06",
-            dependency: "eliot-mcp",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
 ];
@@ -2060,6 +2062,7 @@ mod tests {
 
     #[test]
     fn provider_identity_comes_from_actual_contract_shapes() -> Result<(), CatalogueError> {
+        assert_eq!(MCP_SURFACE_CONTRACT_REVISION, "1.0.0");
         let providers = CommandCatalogue::current().providers()?;
         assert_eq!(providers.len(), 4);
         assert!(

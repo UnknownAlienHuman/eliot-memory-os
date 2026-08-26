@@ -873,6 +873,7 @@ dependencies = [
  "eliot-bootstrap",
  "eliot-contracts",
  "eliot-ipc",
+ "eliot-mcp",
  "eliot-observation-contracts",
  "eliot-platform-windows",
  "eliot-protocol",
