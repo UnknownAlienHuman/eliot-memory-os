@@ -721,11 +721,11 @@ fn first_working_loop_end_to_end() -> TestResult {
     let completion_write = WriteId::new_v7().to_string();
     let original_goal = "prove the canonical First Working Loop";
     let artifact_path = "crates/eliot-store/src/blob_store.rs".to_owned();
-    let worktree_branch = format!("work/first-working-loop-{task_id}");
+    let fixture_branch = format!("work/first-working-loop-{task_id}");
     let worktree = OwnedWorktree::create(
         repository_root()?.as_path(),
         std::env::temp_dir().join(format!("eliot-fwl-wt-{task_id}")),
-        &worktree_branch,
+        &fixture_branch,
     )?;
     let acceptance_ids = vec![
         "observation-recorded".to_owned(),
@@ -930,7 +930,7 @@ fn first_working_loop_end_to_end() -> TestResult {
             "provenance_set_hash": provenance_set_hash,
             "changed_paths": [artifact_path.clone()],
             "diagnostic_before": ["artifact edit not yet committed"],
-            "diagnostic_after": ["artifact edit committed on owned branch"]
+            "diagnostic_after": ["artifact edit committed in an independent fixture repository"]
         }),
     )?;
     assert_eq!(
@@ -1597,33 +1597,110 @@ impl Drop for OwnedRuntime {
     }
 }
 
+fn git_stdout(repo: &Path, args: &[&str]) -> TestResult<String> {
+    let output = Command::new("git").current_dir(repo).args(args).output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let value = String::from_utf8(output.stdout)?.trim().to_owned();
+    if value.is_empty() {
+        return Err(format!("git {} returned an empty value", args.join(" ")).into());
+    }
+    Ok(value)
+}
+
 struct OwnedWorktree {
-    repo: PathBuf,
     path: PathBuf,
-    branch: String,
 }
 
 impl OwnedWorktree {
     fn create(repo: &Path, path: PathBuf, branch: &str) -> TestResult<Self> {
-        assert!(path.starts_with(std::env::temp_dir()));
-        let output = Command::new("git")
-            .current_dir(repo)
-            .args(["worktree", "add", "-b", branch])
-            .arg(&path)
-            .arg("HEAD")
-            .output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "git worktree add failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
+        let temp_root = std::env::temp_dir();
+        if !path.starts_with(&temp_root) || path.starts_with(repo) || path.exists() {
+            return Err(
+                "fixture repository path must be a new child of TEMP outside the source repository"
+                    .into(),
+            );
         }
-        Ok(Self {
-            repo: repo.to_path_buf(),
-            path,
-            branch: branch.to_owned(),
-        })
+        let source_head = git_stdout(repo, &["rev-parse", "--verify", "HEAD"])?;
+        let result = (|| -> TestResult {
+            let clone = Command::new("git")
+                .args([
+                    "clone",
+                    "--local",
+                    "--no-hardlinks",
+                    "--no-checkout",
+                    "--no-tags",
+                    "--",
+                ])
+                .arg(repo)
+                .arg(&path)
+                .output()?;
+            if !clone.status.success() {
+                return Err(format!(
+                    "git fixture clone failed: {}",
+                    String::from_utf8_lossy(&clone.stderr)
+                )
+                .into());
+            }
+            let remove_origin = Command::new("git")
+                .current_dir(&path)
+                .args(["remote", "remove", "origin"])
+                .output()?;
+            if !remove_origin.status.success() {
+                return Err(format!(
+                    "git fixture origin removal failed: {}",
+                    String::from_utf8_lossy(&remove_origin.stderr)
+                )
+                .into());
+            }
+            if path.join(".git/objects/info/alternates").exists() {
+                return Err("fixture repository must not borrow the source object database".into());
+            }
+            let checkout = Command::new("git")
+                .current_dir(&path)
+                .args(["checkout", "-b", branch])
+                .arg(&source_head)
+                .output()?;
+            if !checkout.status.success() {
+                return Err(format!(
+                    "git fixture checkout failed: {}",
+                    String::from_utf8_lossy(&checkout.stderr)
+                )
+                .into());
+            }
+            if git_stdout(&path, &["rev-parse", "--verify", "HEAD"])? != source_head {
+                return Err("fixture repository HEAD does not match the source revision".into());
+            }
+            if git_stdout(&path, &["symbolic-ref", "--quiet", "--short", "HEAD"])? != branch {
+                return Err("fixture repository branch does not match the owned branch".into());
+            }
+            let canonical_fixture = fs::canonicalize(&path)?;
+            let canonical_temp = fs::canonicalize(&temp_root)?;
+            let canonical_source = fs::canonicalize(repo)?;
+            if !canonical_fixture.starts_with(&canonical_temp)
+                || canonical_fixture.starts_with(&canonical_source)
+            {
+                return Err(
+                    "fixture repository escaped TEMP or entered the source repository".into(),
+                );
+            }
+            let git_dir = PathBuf::from(git_stdout(&path, &["rev-parse", "--absolute-git-dir"])?);
+            if !fs::canonicalize(git_dir)?.starts_with(&canonical_fixture) {
+                return Err("fixture Git directory escaped the independent repository".into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&path);
+            return Err(error);
+        }
+        Ok(Self { path })
     }
 
     fn path(&self) -> &Path {
@@ -1700,51 +1777,9 @@ impl OwnedWorktree {
     fn cleanup(&self) -> TestResult {
         if self.path.exists() {
             if !self.path.starts_with(std::env::temp_dir()) {
-                return Err("owned worktree cleanup escaped the temp root".into());
+                return Err("fixture repository cleanup escaped the temp root".into());
             }
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut last_error = String::new();
-            while self.path.exists() {
-                let remove = Command::new("git")
-                    .current_dir(&self.repo)
-                    .args(["worktree", "remove", "--force"])
-                    .arg(&self.path)
-                    .output()?;
-                if remove.status.success() || !self.path.exists() {
-                    break;
-                }
-                last_error = String::from_utf8_lossy(&remove.stderr).into_owned();
-                match fs::remove_dir_all(&self.path) {
-                    Ok(()) => break,
-                    Err(error) if Instant::now() < deadline => {
-                        last_error = format!("{last_error}; fallback: {error}");
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "owned worktree cleanup timed out: git={last_error}; fallback={error}"
-                        )
-                        .into());
-                    }
-                }
-            }
-            if self.path.exists() {
-                return Err(format!("owned worktree cleanup left its path: {last_error}").into());
-            }
-        }
-        let branch = Command::new("git")
-            .current_dir(&self.repo)
-            .args(["branch", "-D"])
-            .arg(&self.branch)
-            .output()?;
-        if !branch.status.success()
-            && !String::from_utf8_lossy(&branch.stderr).contains("not found")
-        {
-            return Err(format!(
-                "git branch cleanup failed: {}",
-                String::from_utf8_lossy(&branch.stderr)
-            )
-            .into());
+            fs::remove_dir_all(&self.path)?;
         }
         Ok(())
     }
