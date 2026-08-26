@@ -1688,7 +1688,7 @@
       },
       {
         "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
-        "sha256": "B738C25B9DF64A123A040F2F13FAE885FFB6DDF8B35A5C838B6F3DF159EBCCD8"
+        "sha256": "E9EAAC94F241874A1BC22119838D65AAFF72A98C98185D0B0A811A9C054DEE00"
       },
       {
         "path": "crates/kernel/eliot-platform-windows/src/supervision_authority_key.rs",
@@ -2947,7 +2947,7 @@
         "sha256": "0B9CB7808D1A6EF940C7C095F06DE336EA78BEB58B9F6191235F7B0698A21EEE"
       }
     ],
-    "rust_files_sha256": "380333B327BAF26B8682A2F57D5CFA5F98CCF5BA056F3AB312B02DBBD75A643E",
+    "rust_files_sha256": "46CB339FABF853A31102F2412BE15DD3BD7A6D73E8E508FBBBB51E38F0989844",
     "grammar_file_set": "direct-read-source-union",
     "grammar": [
       {
@@ -21956,7 +21956,7 @@
       "falsifier": "Resolve the dynamic process target and show authenticated protocol completion; constructor evidence alone is not runtime success."
     },
     {
-      "id": "CENSUS-process-constructor-eliot-platform-windows-UNKNOWN_PROCESS_TARGET-crates_kernel_eliot-platform-windows_src_package_staging_rs-L4999-21",
+      "id": "CENSUS-process-constructor-eliot-platform-windows-UNKNOWN_PROCESS_TARGET-crates_kernel_eliot-platform-windows_src_package_staging_rs-L5004-21",
       "from": "eliot-platform-windows",
       "to": "UNKNOWN_PROCESS_TARGET",
       "edge_class": "process_launch_observation",
@@ -21964,12 +21964,12 @@
       "direction": "EXTERNAL_OR_UNKNOWN",
       "motif_id": "process-constructor",
       "source_path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
-      "source_line": 4999,
+      "source_line": 5004,
       "source_symbol": "junction_is_rejected_by_no_follow_directory_open_and_enumeration",
       "source_symbol_text": "fn junction_is_rejected_by_no_follow_directory_open_and_enumeration() -> TestResult {",
       "source_pattern": "(?i)(?<constructor>(?:(?:std|tokio)::process::)?(?:Command|StdCommand|ProcessCommand|TokioCommand|TokioProcessCommand|AsyncCommand))\\s*::\\s*new\\s*\\(",
       "source_match_text": "let output = std::process::Command::new(\"cmd.exe\")",
-      "source_file_sha256": "B738C25B9DF64A123A040F2F13FAE885FFB6DDF8B35A5C838B6F3DF159EBCCD8",
+      "source_file_sha256": "E9EAAC94F241874A1BC22119838D65AAFF72A98C98185D0B0A811A9C054DEE00",
       "source_symbol_sha256": "771B37165CCC7F43F4AD0923ABCEF36EC433AD2796E26A305B698C48DEDDFC1E",
       "source_match_sha256": "70BEB339590847BE420B3D51D365C6F84BFD8C39EC84125BF4A2B737A9E884A6",
       "source_file_set": "cached",
@@ -22076,7 +22076,7 @@
       "falsifier": "Resolve the dynamic process target and show authenticated protocol completion; constructor evidence alone is not runtime success."
     },
     {
-      "id": "CENSUS-process-literal-launch-eliot-platform-windows-UNKNOWN_PROCESS_TARGET-crates_kernel_eliot-platform-windows_src_package_staging_rs-L4999-21",
+      "id": "CENSUS-process-literal-launch-eliot-platform-windows-UNKNOWN_PROCESS_TARGET-crates_kernel_eliot-platform-windows_src_package_staging_rs-L5004-21",
       "from": "eliot-platform-windows",
       "to": "UNKNOWN_PROCESS_TARGET",
       "edge_class": "process_launch_observation",
@@ -22084,12 +22084,12 @@
       "direction": "EXTERNAL_OR_UNKNOWN",
       "motif_id": "process-literal-launch",
       "source_path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
-      "source_line": 4999,
+      "source_line": 5004,
       "source_symbol": "junction_is_rejected_by_no_follow_directory_open_and_enumeration",
       "source_symbol_text": "fn junction_is_rejected_by_no_follow_directory_open_and_enumeration() -> TestResult {",
       "source_pattern": "(?i)(?:(?:std|tokio)::process::)?(?:Command|StdCommand|ProcessCommand|TokioCommand|TokioProcessCommand|AsyncCommand)\\s*::\\s*new\\s*\\(\\s*\"(?<target>[^\"]+)\"",
       "source_match_text": "let output = std::process::Command::new(\"cmd.exe\")",
-      "source_file_sha256": "B738C25B9DF64A123A040F2F13FAE885FFB6DDF8B35A5C838B6F3DF159EBCCD8",
+      "source_file_sha256": "E9EAAC94F241874A1BC22119838D65AAFF72A98C98185D0B0A811A9C054DEE00",
       "source_symbol_sha256": "771B37165CCC7F43F4AD0923ABCEF36EC433AD2796E26A305B698C48DEDDFC1E",
       "source_match_sha256": "70BEB339590847BE420B3D51D365C6F84BFD8C39EC84125BF4A2B737A9E884A6",
       "source_file_set": "cached",

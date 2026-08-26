@@ -3880,13 +3880,18 @@ fn create_generation_root(_path: &Path) -> Result<std::fs::File, PackageStagingE
 }
 
 #[cfg(windows)]
+fn is_create_new_collision(code: u32) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+
+    code == ERROR_FILE_EXISTS || code == ERROR_ALREADY_EXISTS
+}
+
+#[cfg(windows)]
 fn create_destination_file(
     path: &Path,
 ) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
     use std::os::windows::io::FromRawHandle as _;
-    use windows_sys::Win32::Foundation::{
-        ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE,
-    };
+    use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -3920,7 +3925,7 @@ fn create_destination_file(
     drop(parent_file);
     if handle == INVALID_HANDLE_VALUE {
         let code = unsafe { GetLastError() };
-        return if code == ERROR_ALREADY_EXISTS {
+        return if is_create_new_collision(code) {
             Err(PackageStagingError::GenerationExists)
         } else {
             Err(PackageStagingError::Win32 {
@@ -5456,6 +5461,16 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn create_new_collision_codes_are_typed_as_generation_exists() {
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+
+        assert!(is_create_new_collision(ERROR_FILE_EXISTS));
+        assert!(is_create_new_collision(ERROR_ALREADY_EXISTS));
+        assert!(!is_create_new_collision(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn create_new_file_collision_never_overwrites_existing_bytes() -> TestResult {
         use std::io::Write as _;
 
@@ -5563,7 +5578,15 @@ mod tests {
             }
             Err(error) => panic!("nested directory fixture failed: {error}"),
         };
-        let (second, second_identity, _) = create_destination_directory(&second_path)?;
+        let (second, second_identity, _) = match create_destination_directory(&second_path) {
+            Ok(directory) => directory,
+            Err(error) if security_fixture_unavailable(&error) => {
+                delete_open_handle(first, first_identity)?;
+                std::fs::remove_dir(&parent)?;
+                return Ok(());
+            }
+            Err(error) => panic!("nested child directory fixture failed: {error}"),
+        };
         assert!(second_path.is_dir());
         let substituted = parent.join("bin-substituted");
         assert!(
@@ -5685,13 +5708,21 @@ mod tests {
             }
             Err(error) => panic!("rollback fixture failed: {error}"),
         };
+        let root_identity = file_identity_from_open_handle(&root_file)?;
         let owned_path = generation.join("owned.bin");
-        let (mut owned_file, owned_identity) = create_destination_file(&owned_path)?;
+        let (mut owned_file, owned_identity) = match create_destination_file(&owned_path) {
+            Ok(file) => file,
+            Err(error) if security_fixture_unavailable(&error) => {
+                delete_open_handle(root_file, root_identity)?;
+                std::fs::remove_dir(&parent)?;
+                return Ok(());
+            }
+            Err(error) => panic!("rollback child file fixture failed: {error}"),
+        };
         owned_file.write_all(b"owned")?;
         flush_file_buffers(&owned_file)?;
         let foreign_path = generation.join("foreign.bin");
         std::fs::write(&foreign_path, b"foreign")?;
-        let root_identity = file_identity_from_open_handle(&root_file)?;
         let created = CreatedTree {
             root_path: generation.clone(),
             root_identity,
