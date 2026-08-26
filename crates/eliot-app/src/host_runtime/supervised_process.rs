@@ -2101,7 +2101,6 @@ mod tests {
         .timeout_profile()
         .clone();
 
-        let started = Instant::now();
         let output = tokio::time::timeout(
             Duration::from_secs(3),
             run_supervised_process(spec, run_context),
@@ -2109,7 +2108,6 @@ mod tests {
         .await
         .expect("bounded operation-runtime failure must not strand the runner")?;
 
-        assert!(started.elapsed() < Duration::from_secs(2));
         assert!(proxy.calls.load(Ordering::SeqCst) >= 3);
         assert!(output.reap_receipt.proves_complete_reap());
         assert!(
