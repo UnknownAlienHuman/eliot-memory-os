@@ -24,7 +24,7 @@
       "note": "UNKNOWN anchors are explicit evidence gaps: the source span contains no validated normative/work identifier; they are not inferred from the historical 1371 baseline."
     },
     "source_file_count": 581,
-    "source_digest_aggregate": "d23434d51c19863d5e2c03abae5e8d9216ade92c118b7688ccc8fa73c89d1d66",
+    "source_digest_aggregate": "71247634c5b402be3ae08da8a8cfb09f458c10368ed2d49aaf1f45d333d20b1a",
     "normative_pair_sha256": "041c9bb09db91b8bd8b8c073270c6220cf534b746fcf7faadf705094218b99b1",
     "normative_pair_paths": [
       "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -1585,7 +1585,7 @@
         },
         {
           "path": "crates/foundation/eliot-protocol/src/lib.rs",
-          "sha256": "aaa31f046db2f51452ee590f9f1ed1ff13b924614e7e46fa92a3c169140e3603"
+          "sha256": "695eb55cc6f6858549e3321b406fb462899c73738b79b0751db96621afb68052"
         },
         {
           "path": "crates/foundation/eliot-receipts/src/lib.rs",
@@ -2017,7 +2017,7 @@
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/lib.rs",
-          "sha256": "44c469a62c6c5df30af236b3ac7b0e3d6b69778650936c3dfddc500053a8a92f"
+          "sha256": "531ff41bb95c6cf5612903ad6a7e26f7c67cdf07c9f33910177d81c57a5cfd41"
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/lifecycle.rs",
@@ -2025,7 +2025,7 @@
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/protocol.rs",
-          "sha256": "3acd3dfd9c998969c8e35c79cbf59d116f44cc3b376f9610dd2f9bdd8754f85c"
+          "sha256": "57f6362cd2add8aa0686ed3c1ef8376dfd07ef84ac8afa62d51336e910ce1266"
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/store_client.rs",
@@ -2388,7 +2388,7 @@
           "sha256": "0b9cb7808d1a6ef940c7c095f06de336ea78beb58b9f6191235f7b0698a21eee"
         }
       ],
-      "source_manifest_sha256": "d23434d51c19863d5e2c03abae5e8d9216ade92c118b7688ccc8fa73c89d1d66",
+      "source_manifest_sha256": "71247634c5b402be3ae08da8a8cfb09f458c10368ed2d49aaf1f45d333d20b1a",
       "normative_pair": [
         {
           "path": "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -2413,7 +2413,7 @@
           "sha256": "0f59dec85f60e95dc2f67f9b156c68b5a2fb5730f51d3c1fdc8ed6940bd24a41"
         }
       ],
-      "content_digest": "2e2f87cc65c5551394576388a8795447460d52a702c7eb9c0833666d10053a3f"
+      "content_digest": "858f04faf444c2c2eca915b8c32717ae0742a0a335c31f0efb8accaea316743f"
     },
     "disposition": "challenged",
     "artifacts": [

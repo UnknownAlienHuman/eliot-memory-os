@@ -11,7 +11,8 @@ use eliot_process::{
 };
 pub use eliot_protocol::AGENT_BRIDGE_MODULE_ID;
 use eliot_protocol::{
-    EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
+    AgentBridgeClientDeclaration, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
+    ProtocolVersion,
 };
 use eliot_runtime_contracts::{
     HealthVector, ProvisionedSupervisionAuthority, ServiceProcessState,
@@ -41,7 +42,7 @@ pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION: u16 = 1;
 /// Stable identity for the Host-owned agent-bridge admission descriptor.
 pub const AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.agent-bridge-admission";
 /// Version of the immutable agent-bridge admission contract.
-pub const AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION: u16 = 1;
+pub const AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION: u16 = 2;
 /// Adapter-only hashed selector for a Phase-A pending runtime authority.
 /// Runtime artifact/config/descriptor/bootstrap fields must never admit it.
 const PHASE_B_PENDING_SCM_DIGEST: &str =
@@ -57,17 +58,23 @@ const PROBE_BINDING_PREFIXES: [&str; 5] = [
     "kernel-probe-artifact:",
 ];
 
-/// Process admission mode selected by the Host-owned bridge descriptor.
+/// Caller-session policy selected by the Host-owned bridge profile.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentBridgeCallerSessionPolicy {
+    /// Accept any interactive logon session for the approved stable user SID.
+    AnyInteractiveSessionForApprovedSid,
+}
+
+/// Process admission mode selected by the Host-owned bridge profile.
 ///
-/// The descriptor never accepts a caller-supplied PID. Kernel must observe the
-/// connected process through the pipe handle and seal its PID/start/image for
-/// the descriptor generation before creating a Session.
+/// The profile never accepts a caller-supplied PID. Kernel observes and binds
+/// the connected process independently for each connection.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentBridgeProcessPolicy {
-    /// Seal the first exact process observed through the authenticated OS pipe
-    /// boundary and reject every sibling or replacement for that generation.
-    SealFirstObservedExactProcess,
+    /// Require an exact OS-observed process identity for each connection.
+    ExactProcessPerConnection,
 }
 
 /// Immutable Host-owned policy for admitting one agent-bridge generation.
@@ -95,13 +102,11 @@ pub struct AgentBridgeAdmissionDescriptor {
     pub authority_epoch: AuthorityEpoch,
     /// Exact immutable fence paired with the approved generation and epoch.
     pub state_fence: StateFence,
-    /// Host-issued public launch-correlation nonce. This is not a credential.
-    pub launch_nonce: PlatformHandle,
-    /// Exact Windows SID allowed to present the bridge profile.
-    pub approved_caller_sid: String,
-    /// Exact Windows logon session allowed to present the bridge profile.
-    pub approved_caller_session_id: u32,
-    /// Required OS-observation/sealing policy.
+    /// Stable Windows user SID allowed to present the bridge profile.
+    pub approved_user_sid: String,
+    /// Interactive-session policy for the approved stable user SID.
+    pub caller_session_policy: AgentBridgeCallerSessionPolicy,
+    /// Required per-connection OS-observation policy.
     pub process_policy: AgentBridgeProcessPolicy,
     /// Capabilities the bridge may request during handshake.
     pub allowed_capabilities: Vec<String>,
@@ -117,8 +122,6 @@ pub struct AgentBridgeAdmissionDescriptor {
     pub client_declaration_path: PlatformHandle,
     /// Digest of the exact protected client declaration bytes.
     pub client_declaration_sha256: String,
-    /// Digest of the exact `ClientHello` bytes inside that declaration.
-    pub client_hello_sha256: String,
     /// Lowercase SHA-256 over every descriptor field except this field.
     pub descriptor_sha256: String,
 }
@@ -150,6 +153,92 @@ impl AgentBridgeAdmissionDescriptor {
         Ok(self)
     }
 
+    /// Validates the static v2 client declaration bound to this profile.
+    ///
+    /// Kernel artifact/generation/authority values in the declaration remain
+    /// a separate Kernel-owned authority domain and are intentionally not
+    /// compared with the bridge artifact/generation/authority here.
+    pub fn validate_client_declaration(
+        &self,
+        declaration: &AgentBridgeClientDeclaration,
+    ) -> Result<(), KernelServiceError> {
+        self.validate()?;
+        declaration
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "agent_bridge.client_declaration",
+                reason: "invalid client declaration",
+            })?;
+        if declaration
+            .compute_digest()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "agent_bridge.client_declaration",
+                reason: "cannot canonicalize client declaration",
+            })?
+            != self.client_declaration_sha256
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.client_declaration_sha256",
+            });
+        }
+        if declaration.module_id != self.module_id
+            || declaration.module_contract.module_id.as_str() != self.module_id
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.module_id",
+            });
+        }
+        if declaration.module_contract.artifact_id.as_str() != self.executable_sha256
+            || declaration.module_generation.artifact_id.as_str() != self.executable_sha256
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.executable_sha256",
+            });
+        }
+        if declaration.module_generation.generation != self.generation
+            || declaration.module_generation.state_fence != self.state_fence
+            || declaration.module_generation.state_fence.authority_epoch != self.authority_epoch
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.generation",
+            });
+        }
+        if declaration.capabilities != self.allowed_capabilities {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.allowed_capabilities",
+            });
+        }
+        if !declaration
+            .module_contract
+            .required_capabilities
+            .iter()
+            .all(|required| {
+                declaration
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == required)
+            })
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.module_contract.required_capabilities",
+            });
+        }
+        if declaration.privacy_classes != self.allowed_privacy_classes {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.allowed_privacy_classes",
+            });
+        }
+        if declaration.expected_kernel_principal_binding != self.expected_kernel_principal_binding
+            || declaration.expected_kernel_config_snapshot_sha256
+                != self.expected_kernel_config_snapshot_sha256
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.expected_kernel",
+            });
+        }
+        Ok(())
+    }
+
     /// Validates the closed descriptor shape without treating it as authority.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
         if self.wire_id != AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID
@@ -176,14 +265,7 @@ impl AgentBridgeAdmissionDescriptor {
                 });
             }
         }
-        validate_agent_bridge_launch_nonce(&self.launch_nonce)?;
-        validate_windows_sid_text(&self.approved_caller_sid)?;
-        if self.approved_caller_session_id == 0 {
-            return Err(KernelServiceError::InvalidField {
-                field: "agent_bridge.approved_caller_session_id",
-                reason: "must be non-zero",
-            });
-        }
+        validate_windows_sid_text(&self.approved_user_sid)?;
         self.state_fence
             .validate()
             .map_err(|_| KernelServiceError::HandshakeMismatch {
@@ -225,10 +307,6 @@ impl AgentBridgeAdmissionDescriptor {
                 "agent_bridge.client_declaration_sha256",
             ),
             (
-                self.client_hello_sha256.as_str(),
-                "agent_bridge.client_hello_sha256",
-            ),
-            (
                 self.descriptor_sha256.as_str(),
                 "agent_bridge.descriptor_sha256",
             ),
@@ -245,30 +323,6 @@ impl AgentBridgeAdmissionDescriptor {
     }
 }
 
-fn validate_agent_bridge_launch_nonce(value: &PlatformHandle) -> Result<(), KernelServiceError> {
-    handle(value, "agent_bridge.launch_nonce")?;
-    let suffix =
-        value
-            .as_str()
-            .strip_prefix("agent-bridge:")
-            .ok_or(KernelServiceError::InvalidField {
-                field: "agent_bridge.launch_nonce",
-                reason: "must use the opaque agent-bridge launch-correlation format",
-            })?;
-    if suffix.len() < 32
-        || suffix.len() > 120
-        || suffix
-            .bytes()
-            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')))
-    {
-        return Err(KernelServiceError::InvalidField {
-            field: "agent_bridge.launch_nonce",
-            reason: "must be bounded opaque text with at least 32 safe bytes",
-        });
-    }
-    Ok(())
-}
-
 fn validate_windows_sid_text(value: &str) -> Result<(), KernelServiceError> {
     if !value.strip_prefix("S-1-").is_some_and(|tail| {
         !tail.is_empty()
@@ -278,7 +332,7 @@ fn validate_windows_sid_text(value: &str) -> Result<(), KernelServiceError> {
                 .all(|character| character.is_ascii_digit() || character == '-')
     }) {
         return Err(KernelServiceError::InvalidField {
-            field: "agent_bridge.approved_caller_sid",
+            field: "agent_bridge.approved_user_sid",
             reason: "must be canonical Windows SID text",
         });
     }
@@ -2733,11 +2787,8 @@ mod tests {
     )]
 
     use super::*;
-    use eliot_contracts::{ArtifactId, ContractId, ContractVersion, canonical_json_bytes};
-    use eliot_protocol::{
-        AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
-        AgentBridgeClientDeclaration, ClientHello, ProtocolRange,
-    };
+    use eliot_contracts::{ArtifactId, ContractId, ContractVersion};
+    use eliot_protocol::{AgentBridgeClientDeclaration, ProtocolRange};
     use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 
     fn handle_value(value: &str) -> PlatformHandle {
@@ -2823,10 +2874,10 @@ mod tests {
             generation,
             authority_epoch,
             state_fence: StateFence::new(authority_epoch, generation),
-            launch_nonce: handle_value("agent-bridge:0123456789abcdef0123456789abcdef"),
-            approved_caller_sid: "S-1-5-21-1000".to_owned(),
-            approved_caller_session_id: 4,
-            process_policy: AgentBridgeProcessPolicy::SealFirstObservedExactProcess,
+            approved_user_sid: "S-1-5-21-1000".to_owned(),
+            caller_session_policy:
+                AgentBridgeCallerSessionPolicy::AnyInteractiveSessionForApprovedSid,
+            process_policy: AgentBridgeProcessPolicy::ExactProcessPerConnection,
             allowed_capabilities: vec!["agent.attach".to_owned()],
             allowed_privacy_classes: vec!["project_code".to_owned()],
             allowed_effects: vec!["tool.call".to_owned()],
@@ -2836,7 +2887,6 @@ mod tests {
                 r"C:\ProgramData\Eliot\kernel\agent-bridge-client.json",
             ),
             client_declaration_sha256: "c".repeat(64),
-            client_hello_sha256: "d".repeat(64),
             descriptor_sha256: String::new(),
         }
         .with_computed_digest()
@@ -2847,15 +2897,16 @@ mod tests {
         descriptor: &AgentBridgeAdmissionDescriptor,
     ) -> AgentBridgeClientDeclaration {
         let module_id = ContractId::new(AGENT_BRIDGE_MODULE_ID).expect("module id");
-        let artifact_id =
-            ArtifactId::new(descriptor.executable_sha256.clone()).expect("artifact id");
-        let client_hello = ClientHello {
+        let artifact_id = ArtifactId::new(descriptor.executable_sha256.clone()).expect("artifact");
+        AgentBridgeClientDeclaration {
+            wire_id: eliot_protocol::AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: "agent-bridge-profile-1".to_owned(),
             protocol_range: ProtocolRange {
                 minimum: ProtocolVersion::CURRENT,
                 maximum: ProtocolVersion::CURRENT,
             },
-            module_bridge_identity: AGENT_BRIDGE_MODULE_ID.to_owned(),
-            artifact_hash: artifact_id.clone(),
             module_contract: ModuleContract {
                 module_id: module_id.clone(),
                 version: ContractVersion::new(1, 0, 0),
@@ -2876,23 +2927,11 @@ mod tests {
                 health: HealthVector::healthy(),
                 state_fence: descriptor.state_fence.clone(),
             },
-            launch_nonce: descriptor.launch_nonce.as_str().to_owned(),
             capabilities: descriptor.allowed_capabilities.clone(),
             privacy_classes: descriptor.allowed_privacy_classes.clone(),
             max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES).expect("frame limit"),
-            authority_epoch: descriptor.authority_epoch,
-        };
-        let client_hello_sha256 =
-            sha256_hex(&canonical_json_bytes(&client_hello).expect("canonical client hello"));
-        AgentBridgeClientDeclaration {
-            wire_id: AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID.to_owned(),
-            wire_version: AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
-            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
-            connection_id: "agent-bridge-connection-1".to_owned(),
             expected_kernel_sid: "S-1-5-18".to_owned(),
             expected_kernel_session_id: 0,
-            client_hello,
-            client_hello_sha256,
             expected_kernel_principal_binding: descriptor.expected_kernel_principal_binding.clone(),
             expected_kernel_authority_epoch: AuthorityEpoch::new(19).expect("kernel epoch"),
             expected_kernel_generation: ResourceGeneration::new(23).expect("kernel generation"),
@@ -2907,75 +2946,159 @@ mod tests {
     }
 
     #[test]
-    fn agent_bridge_descriptor_binds_client_declaration_without_digest_cycle() {
+    fn agent_bridge_static_descriptor_digest_excludes_dynamic_session_material() {
+        let descriptor = agent_bridge_admission_descriptor();
+        descriptor.validate().expect("valid bridge descriptor");
+
+        let mut candidate_a = candidate_binding();
+        candidate_a.agent_bridge_admission = Some(descriptor.clone());
+        let mut candidate_b = candidate_binding();
+        candidate_b.agent_bridge_admission = Some(descriptor);
+        let profile_json = serde_json::to_value(
+            candidate_a
+                .agent_bridge_admission
+                .as_ref()
+                .expect("profile"),
+        )
+        .expect("profile json");
+        for dynamic_field in [
+            "launch_nonce",
+            "approved_caller_session_id",
+            "client_hello_sha256",
+        ] {
+            assert!(
+                profile_json.get(dynamic_field).is_none(),
+                "static profile must not carry {dynamic_field}"
+            );
+        }
+        assert_eq!(
+            candidate_a.compute_digest().expect("candidate digest"),
+            candidate_b.compute_digest().expect("candidate digest"),
+            "dynamic session and nonce values are not carried by the profile or candidate"
+        );
+    }
+
+    fn assert_bridge_declaration_alignment(
+        descriptor: &AgentBridgeAdmissionDescriptor,
+        declaration: &AgentBridgeClientDeclaration,
+    ) {
+        declaration.validate().expect("valid static declaration");
+        assert_eq!(declaration.module_id, descriptor.module_id);
+        assert_eq!(
+            declaration.module_contract.artifact_id.as_str(),
+            descriptor.executable_sha256
+        );
+        assert_eq!(
+            declaration.module_generation.generation,
+            descriptor.generation
+        );
+        assert_eq!(
+            declaration.module_generation.state_fence,
+            descriptor.state_fence
+        );
+        assert_eq!(declaration.capabilities, descriptor.allowed_capabilities);
+        assert_eq!(
+            declaration.privacy_classes,
+            descriptor.allowed_privacy_classes
+        );
+        assert_eq!(
+            declaration.expected_kernel_principal_binding,
+            descriptor.expected_kernel_principal_binding
+        );
+        assert_eq!(
+            declaration.expected_kernel_config_snapshot_sha256,
+            descriptor.expected_kernel_config_snapshot_sha256
+        );
+        assert_ne!(
+            declaration.expected_kernel_artifact_sha256, descriptor.executable_sha256,
+            "Kernel artifact authority must remain distinct from bridge artifact authority"
+        );
+        assert_ne!(
+            declaration.expected_kernel_authority_epoch, descriptor.authority_epoch,
+            "Kernel authority epoch must remain distinct from bridge authority epoch"
+        );
+        assert_ne!(
+            declaration.expected_kernel_generation, descriptor.generation,
+            "Kernel generation must remain distinct from bridge generation"
+        );
+    }
+
+    fn assert_bridge_declaration_rejections(
+        descriptor: &AgentBridgeAdmissionDescriptor,
+        declaration: &AgentBridgeClientDeclaration,
+    ) {
+        let mut changed_digest = declaration.clone();
+        changed_digest.declaration_sha256 = "f".repeat(64);
+        assert!(
+            descriptor
+                .validate_client_declaration(&changed_digest)
+                .is_err()
+        );
+
+        let mut changed_policy = declaration.clone();
+        changed_policy
+            .capabilities
+            .push("agent.attach.extra".to_owned());
+        changed_policy.declaration_sha256 = changed_policy
+            .compute_digest()
+            .expect("changed policy declaration digest");
+        assert!(
+            descriptor
+                .validate_client_declaration(&changed_policy)
+                .is_err()
+        );
+
+        let mut changed_kernel_expectation = declaration.clone();
+        changed_kernel_expectation
+            .expected_kernel_principal_binding
+            .push_str("-replacement");
+        changed_kernel_expectation.declaration_sha256 = changed_kernel_expectation
+            .compute_digest()
+            .expect("changed Kernel expectation digest");
+        assert!(
+            descriptor
+                .validate_client_declaration(&changed_kernel_expectation)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_bridge_static_profile_binds_v2_declaration_and_dynamic_hellos() {
         let mut descriptor = agent_bridge_admission_descriptor();
         let declaration = agent_bridge_client_declaration(&descriptor);
-        declaration.validate().expect("valid client declaration");
-        descriptor.client_declaration_sha256 = declaration
-            .compute_digest()
-            .expect("client declaration digest");
-        descriptor.client_hello_sha256 = declaration
-            .client_hello_digest()
-            .expect("client hello digest");
-        assert_eq!(
-            descriptor.expected_kernel_principal_binding,
-            declaration.expected_kernel_principal_binding
-        );
-        assert_eq!(
-            descriptor.expected_kernel_config_snapshot_sha256,
-            declaration.expected_kernel_config_snapshot_sha256
-        );
-        assert_eq!(
-            descriptor.generation,
-            declaration.client_hello.module_generation.generation
-        );
-        assert_eq!(
-            descriptor.authority_epoch,
-            declaration.client_hello.authority_epoch
-        );
+        assert_bridge_declaration_alignment(&descriptor, &declaration);
+
+        descriptor.client_declaration_sha256 =
+            declaration.compute_digest().expect("declaration digest");
         descriptor.descriptor_sha256 = descriptor.compute_digest().expect("descriptor digest");
-        descriptor.validate().expect("bound descriptor");
-        let original_descriptor_digest = descriptor.descriptor_sha256.clone();
+        descriptor.validate().expect("bound static profile");
+        descriptor
+            .validate_client_declaration(&declaration)
+            .expect("cross-contract declaration binding");
+        let descriptor_digest = descriptor.descriptor_sha256.clone();
+        assert_bridge_declaration_rejections(&descriptor, &declaration);
 
-        let mut changed_declaration = declaration.clone();
-        changed_declaration.connection_id.push_str("-replacement");
-        changed_declaration.declaration_sha256 = changed_declaration
-            .compute_digest()
-            .expect("changed declaration digest");
-        changed_declaration
-            .validate()
-            .expect("changed declaration remains internally valid");
-        descriptor.client_declaration_sha256 = changed_declaration.declaration_sha256.clone();
-        descriptor.descriptor_sha256 = descriptor.compute_digest().expect("outer digest");
-        assert_ne!(descriptor.descriptor_sha256, original_descriptor_digest);
-        let declaration_only_descriptor_digest = descriptor.descriptor_sha256.clone();
+        let first_hello = declaration
+            .client_hello("agent-bridge:nonce-one")
+            .expect("first dynamic hello");
+        let second_hello = declaration
+            .client_hello("agent-bridge:nonce-two")
+            .expect("second dynamic hello");
+        assert_ne!(first_hello.launch_nonce, second_hello.launch_nonce);
+        assert_ne!(first_hello, second_hello);
+        assert_eq!(descriptor.descriptor_sha256, descriptor_digest);
 
-        let mut changed_hello = declaration.clone();
-        changed_hello.client_hello.max_frame -= 1;
-        changed_hello.client_hello_sha256 = changed_hello
-            .client_hello_digest()
-            .expect("changed client hello digest");
-        changed_hello.declaration_sha256 = changed_hello
-            .compute_digest()
-            .expect("changed declaration digest");
-        changed_hello
-            .validate()
-            .expect("changed hello remains internally valid");
-        descriptor.client_declaration_sha256 = changed_hello.declaration_sha256.clone();
-        descriptor.client_hello_sha256 = changed_hello.client_hello_sha256.clone();
-        descriptor.descriptor_sha256 = descriptor.compute_digest().expect("outer digest");
-        assert_ne!(
-            descriptor.descriptor_sha256,
-            declaration_only_descriptor_digest
-        );
-
-        let declaration_json = serde_json::to_value(changed_declaration)
-            .expect("encode declaration without descriptor digest");
-        assert!(
-            !declaration_json
-                .as_object()
-                .expect("declaration object")
-                .contains_key("descriptor_sha256")
+        let mut first_candidate = candidate_binding();
+        first_candidate.agent_bridge_admission = Some(descriptor.clone());
+        let mut second_candidate = candidate_binding();
+        second_candidate.agent_bridge_admission = Some(descriptor);
+        assert_eq!(
+            first_candidate
+                .compute_digest()
+                .expect("first candidate digest"),
+            second_candidate
+                .compute_digest()
+                .expect("second candidate digest")
         );
     }
 
@@ -3048,6 +3171,14 @@ mod tests {
     fn agent_bridge_descriptor_rejects_malformed_policy_and_digest_inputs() {
         let descriptor = agent_bridge_admission_descriptor();
 
+        let mut old_wire = descriptor.clone();
+        old_wire.wire_version = 1;
+        old_wire.descriptor_sha256 = old_wire.compute_digest().expect("legacy digest");
+        assert!(
+            old_wire.validate().is_err(),
+            "descriptor wire v1 must be rejected after the v2 bump"
+        );
+
         let mut duplicate = descriptor.clone();
         duplicate
             .allowed_capabilities
@@ -3056,14 +3187,40 @@ mod tests {
         assert!(duplicate.validate().is_err());
 
         let mut wrong_sid = descriptor.clone();
-        wrong_sid.approved_caller_sid = "current-user".to_owned();
+        wrong_sid.approved_user_sid = "current-user".to_owned();
         wrong_sid.descriptor_sha256 = wrong_sid.compute_digest().expect("digest");
         assert!(wrong_sid.validate().is_err());
 
-        let mut zero_session = descriptor.clone();
-        zero_session.approved_caller_session_id = 0;
-        zero_session.descriptor_sha256 = zero_session.compute_digest().expect("digest");
-        assert!(zero_session.validate().is_err());
+        for old_dynamic_field in [
+            "launch_nonce",
+            "approved_caller_session_id",
+            "client_hello_sha256",
+        ] {
+            let mut legacy = serde_json::to_value(&descriptor).expect("encode descriptor");
+            legacy[old_dynamic_field] = serde_json::json!("legacy-dynamic-value");
+            assert!(
+                serde_json::from_value::<AgentBridgeAdmissionDescriptor>(legacy).is_err(),
+                "legacy dynamic field {old_dynamic_field} must be rejected"
+            );
+        }
+
+        for (field, value) in [
+            (
+                "caller_session_policy",
+                serde_json::json!("UNSUPPORTED_SESSION_POLICY"),
+            ),
+            (
+                "process_policy",
+                serde_json::json!("SEAL_FIRST_OBSERVED_EXACT_PROCESS"),
+            ),
+        ] {
+            let mut unsupported = serde_json::to_value(&descriptor).expect("encode descriptor");
+            unsupported[field] = value;
+            assert!(
+                serde_json::from_value::<AgentBridgeAdmissionDescriptor>(unsupported).is_err(),
+                "unsupported {field} must be rejected"
+            );
+        }
 
         let mut oversized = descriptor.clone();
         oversized.allowed_effects = (0..=AgentBridgeAdmissionDescriptor::MAX_POLICY_ENTRIES)

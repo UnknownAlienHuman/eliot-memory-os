@@ -2,7 +2,7 @@
 
 Status: `ACCEPTED_SOL_BOUNDARY`
 
-Implementation state: `BLOCKED_AS_SINGLE_CELL`
+Implementation state: `R13_1A_STATIC_CONTRACTS_COMPLETE_DYNAMIC_ADMISSION_BLOCKED`
 
 Authority: Root / Sol under `ROOT-DIRECTIVE-v1.5.md` §2, §7 and §9,
 Recovery Program §5.1 rule R13, and normative Implementation “Session attach”.
@@ -11,6 +11,14 @@ Accepted on 2026-08-26 against:
 - source revision `f39d9cfbc084444775ce4802462fbe5b9a0e7ff6`;
 - `ROOT-DIRECTIVE-v1.5.md` SHA-256
   `C12C3B15229286B887483BAE4B2B1CD8023F243897E84F77855D891EBE1E7BB4`.
+
+Lifecycle amendment accepted on 2026-08-26 against source revision
+`73f916fed1a615ede011b3808c73cebf3e68b731`: the candidate-carried value is a
+static, generation-scoped admission **profile**, not a per-logon or
+per-process ticket. Interactive session id, connection challenge/nonce and
+live PID/start/image evidence belong to a later Kernel-owned connection seal.
+Changing any of those values must not require a new Kernel candidate digest or
+activation permit.
 
 This record selects ownership and packet order. It does not claim that the
 provider, an authenticated agent Session, D1 ingress, Product Pulse, or the
@@ -37,10 +45,11 @@ agent bridge
 The implementation is therefore split into causal prerequisites inside R13
 provider #1. This does not reorder any consumer after R13:
 
-1. **Transport admission.** Host/installation owns a protected, versioned
-   `AgentBridgeAdmissionDescriptor`. Kernel consumes it and selects a
-   bridge-specific handshake/peer policy. The existing `eliotd` policy remains
-   exact and unchanged.
+1. **Transport admission.** Host/installation owns a protected, versioned,
+   generation-scoped `AgentBridgeAdmissionDescriptor` (a static profile).
+   Kernel combines that profile with a fresh per-connection challenge and
+   handle-bound OS peer observation, then seals a connection-scoped admission
+   receipt. The existing `eliotd` policy remains exact and unchanged.
 2. **Reachable server operation.** A neutral wire contract and Kernel selector
    admit `eliot.agent-bridge.activate` only for that bridge profile and a valid
    pre-activation `RequestIdentity`. Kernel rejects malformed,
@@ -66,8 +75,9 @@ consumer blocker, or close R13 step 2. The current unconditional
 
 | Boundary | Owner | Required source of truth |
 |---|---|---|
-| Bridge admission declaration | Host/installation | Protected descriptor bound to the approved installation/generation and exact observed process/image evidence |
-| Pipe ACL and peer authentication | Kernel IPC + Windows platform adapter | Host-approved sealed peer set and OS-observed SID/session/PID/start/image/Job evidence for each admitted process |
+| Static bridge admission profile | Host/installation | Protected descriptor bound to the approved installation/generation, stable approved user SID, artifact and policy ceiling; no live session/process fields |
+| Dynamic bridge connection admission | Kernel IPC + Windows platform adapter | Fresh Kernel challenge plus OS-observed SID/session/PID/start/image/file evidence, sealed and revoked per connection/session |
+| Pipe ACL and peer authentication | Kernel IPC + Windows platform adapter | Host-approved peer profiles and OS-observed SID/session/PID/start/image/Job evidence for each admitted process |
 | Activation request/reply wire | `eliot-protocol` | Closed, versioned request, `Authenticated` and `Denied` records shared without a Kernel→surface dependency |
 | Semantic principal/session | `eliotd` resolver over Governor owners | Active `CoordinationOwner::AgentSession`, cross-checked with `SessionLifecycleOwner` epoch/fence/lifecycle |
 | Task/work unit | `eliotd` resolver over Governor owners | Active coordination work item/lease joined to the canonical `TaskLifecycleOwner::TaskRecord` revision |
@@ -79,11 +89,15 @@ The resolver is an authority **boundary**, not a new state owner. Until the
 missing WorkScope receipt owner and current active-plan read path exist,
 `Authenticated` remains forbidden and the resolver must return a typed denial.
 
-Host/installation owns the protected admission policy and allowed peer
-profiles. Kernel owns the live OS peer observation and the current operational
-generation/epoch/fence comparison. A descriptor is an immutable admitted input;
-it never replaces Kernel's live evidence or becomes a mutable-current-fence
-oracle. `ClientHello` remains a claim checked against both sources.
+Host/installation owns the protected admission policy, stable approved user SID
+and allowed peer profiles. Kernel owns the fresh connection challenge, live OS
+peer observation, current operational generation/epoch/fence comparison and
+connection seal/revocation. UserBroker is not a prerequisite authority for
+bridge admission: making it one would be circular because the bridge is an
+approved bootstrap path for UserBroker. A descriptor is an immutable admitted
+input; it never replaces Kernel's live evidence or becomes a
+mutable-current-fence oracle. `ClientHello` remains a per-connection claim
+checked against both sources.
 
 ## Admission descriptor contract
 
@@ -93,24 +107,35 @@ external bridge to `REQUIRED_PACKAGE_ROLES` or `RuntimeLaunchDescriptor` would
 change the installed-child schema and requires a separate migration decision;
 this decision does not authorize that shortcut.
 
-The protected descriptor must bind at least:
+The protected static descriptor must bind at least:
 
 - descriptor wire id/version and canonical digest;
 - module id `eliot-agent-bridge` and exact executable path/SHA-256;
 - approved resource generation, authority epoch and state fence;
-- Host-issued launch nonce or exact Host process/Job receipt;
-- approved caller SID/session plus process/image policy;
+- stable approved caller SID plus an explicit policy requiring a live
+  interactive session for that SID;
+- a per-connection process/image sealing policy; the descriptor carries no PID,
+  start time, session id or process nonce;
 - allowed capability, privacy and effect sets;
 - expected Kernel principal/config snapshot digest;
-- immutable inputs for the module-specific protected client declaration used
-  to form `ClientHello`.
+- immutable inputs for the module-specific protected client template used to
+  form a fresh `ClientHello` for each connection.
 
-The descriptor must not store a reusable `RequestIdentity`, semantic
-principal, Session, task, WorkScope, plan, mutable clock, or mutable current
-fence. The bridge derives a fresh pre-activation identity per request from the
-authenticated transport snapshot and server-provided bounded clock. Its semantic
-session/task fields remain `None`; the activation payload carries correlation
-and attach intent, not caller-selected semantic identities.
+The descriptor must not store a connection id, interactive session id,
+per-connection challenge/launch nonce, PID/start/image observation, reusable
+`RequestIdentity`, semantic principal, Session, task, WorkScope, plan, mutable
+clock, or mutable current fence. Kernel issues a fresh challenge and seals the
+OS-observed connection evidence. The bridge derives a fresh pre-activation
+identity per request from that authenticated transport snapshot and the
+server-provided bounded clock. Its semantic session/task fields remain `None`;
+the activation payload carries correlation and attach intent, not
+caller-selected semantic identities.
+
+The protected client declaration is likewise a static generation template. It
+must not embed a reusable `ClientHello`, connection id or launch nonce. The
+bridge forms a dynamic `ClientHello` from the protected module/generation/policy
+fields plus the fresh connection challenge; that challenge is correlation, not
+authority.
 
 The generic `Eliot/kernel/application-client.json` declaration has no
 repository writer and is shared by unrelated application clients. It is not an
@@ -135,6 +160,11 @@ artifact or clock authority locally.
   activation selector.
 - the installation package planner contains no bridge artifact or protected
   bridge declaration writer.
+- source revision `73f916f` carried an interactive session id and launch nonce
+  in the candidate descriptor and sealed only the first process for the whole
+  Kernel generation. The version-2 static descriptor/client-template contract
+  accepted with this amendment removes those fields. A non-empty production
+  profile producer and the Kernel-owned challenge/seal route remain absent.
 - `GovernorComposition` retains coordination, session, task, scope and
   observation projections, but `DaemonComposition` exposes no activation
   resolver. Existing validated coordination session/lease helpers are private;
@@ -149,24 +179,31 @@ laundering. A handler-only or test-only packet is rejected.
 
 Required effects:
 
-- add the protected descriptor contract to the existing Host↔Kernel carrier
-  `eliot-kernel-service::protocol`;
+- correct the protected descriptor/client-declaration contracts to static
+  generation profiles: no interactive session, connection id or launch nonce
+  is candidate-bound;
 - materialize and read it through the Host/installation contour with exact
-  path/digest/process evidence;
+  path/digest evidence and a stable approved user SID;
+- add a Kernel-authored per-connection challenge and admission receipt; compare
+  the approved SID with a live interactive session and seal PID/start/image/file
+  evidence without mutating the candidate or shared handshake policy;
 - extend the Windows peer expectation and named-pipe server to a bounded
   sealed peer set containing the Host control client, the exact Kernel-launched
-  `eliotd` process receipt, and a bridge admission profile whose first valid
-  OS-observed PID/start/image is sealed for that generation; a caller-supplied
-  PID or a synthetic Host-child receipt is never accepted;
+  `eliotd` process receipt, and a bridge admission profile whose valid
+  OS-observed PID/start/image/file evidence is sealed for that connection;
+  replacements require a fresh challenge/seal, while a caller-supplied PID or a
+  synthetic Host-child receipt is never accepted;
 - select handshake policy by admitted module identity while preserving the
   existing exact `eliotd` path;
 - load a module-specific bridge client declaration.
 
 Exit proof: the exact Host control client and exact Kernel-launched `eliotd`
 remain admitted on separate instances, and one real sibling bridge process
-completes the authenticated handshake. An unapproved sibling, PID reuse or
-process/start/image/SID substitution, stale generation/fence and descriptor
-digest mismatch fail before Session creation.
+completes the authenticated handshake. The same approved user may reconnect in
+a new interactive session without a Kernel restart or candidate/permit digest
+change. An unapproved sibling, PID reuse or process/start/image/file/SID
+substitution, challenge replay, stale generation/fence and descriptor digest
+mismatch fail before Session creation.
 
 ### R13.1b — reachable activation selector
 
@@ -201,7 +238,8 @@ unblock the bridge consumer.
 
 - descriptor missing, malformed, digest-mismatched or outside the approved
   installation generation;
-- foreign SID/session/PID/start/image/Job, stale launch nonce, generation,
+- foreign SID/session/PID/start/image/file/Job, replayed connection challenge,
+  stale generation,
   authority epoch or state fence;
 - unknown capability/privacy/effect or wrong client module;
 - missing/reused pre-activation identity, or a client-supplied semantic
@@ -213,6 +251,8 @@ unblock the bridge consumer.
   revision, missing/stale active plan;
 - resolver decision fence differing from the admitted transport fence;
 - replay after Kernel/eliotd restart or generation change;
+- logoff/session rotation revokes the old connection seal while leaving the
+  Kernel candidate and activation permit digest unchanged;
 - missing, extra or substituted field in the ten-field `Authenticated` reply;
 - resolver unavailable: exact typed `Denied`, never local success and never a
   fabricated partial binding.
