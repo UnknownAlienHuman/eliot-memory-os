@@ -1939,8 +1939,8 @@ mod tests {
         StartupProcessRecovery, SupervisedChildKind, SupervisedProcessSpec,
         SupervisedWindowsProcessRunner, bounded_operation_runtime_request,
         checkpoint_requests_process_cancellation, checkpoint_requires_process_recovery,
-        default_daemon_runtime_instance, operation_checkpoint, record_root_wait_failure,
-        recovery_or_identity_unproven, run_supervised_process,
+        default_daemon_runtime_instance, job_object_name, operation_checkpoint,
+        record_root_wait_failure, recovery_or_identity_unproven, run_supervised_process,
     };
     use anyhow::{Result, anyhow, bail};
     use eliot_engine::{
@@ -1969,6 +1969,7 @@ mod tests {
     const TEST_SUCCESS_CONTEXT_TIMEOUT_MS: u64 = 60_000;
     const TEST_IDLE_RUNTIME_MS: u64 = 30_000;
     const TEST_IDLE_CONTEXT_TIMEOUT_MS: u64 = 60_000;
+    static FIXTURE_OPERATION_NONCE: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn production_operation_runtime_falls_back_to_config_bound_daemon_instance() -> Result<()> {
@@ -2199,8 +2200,12 @@ mod tests {
         let cwd = std::env::current_dir()?;
         let mut environment = BTreeMap::new();
         environment.insert(OsString::from(FIXTURE_ENV), OsString::from(mode));
+        let operation_nonce = FIXTURE_OPERATION_NONCE.fetch_add(1, Ordering::SeqCst);
         Ok(SupervisedProcessSpec {
-            operation_id: format!("supervised-process-{mode}-{}", std::process::id()),
+            operation_id: format!(
+                "supervised-process-{mode}-{}-{operation_nonce}",
+                std::process::id()
+            ),
             invocation_id: None,
             generation: 1,
             child_kind: SupervisedChildKind::Verifier,
@@ -2241,6 +2246,19 @@ mod tests {
             role_lease_id: None,
             role_lease_epoch: None,
         })
+    }
+
+    #[test]
+    fn supervised_process_fixtures_never_share_a_named_job() -> Result<()> {
+        let first = fixture_spec("ignore-shutdown", 100)?;
+        let second = fixture_spec("ignore-shutdown", 100)?;
+
+        assert_ne!(first.operation_id, second.operation_id);
+        assert_ne!(
+            job_object_name(&first.operation_id, first.generation),
+            job_object_name(&second.operation_id, second.generation)
+        );
+        Ok(())
     }
 
     fn context(timeout_ms: u64) -> AdapterExecutionContext {
