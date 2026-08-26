@@ -91,7 +91,7 @@ function CfgAttributes([string]$Masked,[string]$Source) {
         if($cursor-ge$Masked.Length-or$Masked[$cursor]-ne']'){throw 'malformed cfg attribute'}
         $body=$Source.Substring($open+1,$close-$open-1);$presence=$null;$nestedBuiltIn=$null
         if($match.Groups['kind'].Value-eq'cfg'){$presence=$body}else{
-            $args=@(CfgArgs $body);if($args.Count-lt1){throw 'malformed cfg_attr attribute'}
+            $args=@(CfgArgs $body);if($args.Count-lt1){throw 'malformed cfg_attr attribute'};[void](CfgPossibility $args[0])
             $gates=[Collections.Generic.List[string]]::new()
             for($argIndex=1;$argIndex-lt$args.Count;$argIndex++){
                 $nested=[regex]::Match($args[$argIndex],'(?s)^cfg\s*\((.*)\)$')
@@ -240,6 +240,7 @@ function SelfTest {
         & $assertFailure 'nested-test-lifetimes' 'src/lib.rs' "#[cfg(test)]`nmod hidden {`n    fn f<'a>() { let _: &'a str = `"`"; }`n    /// ELIOT_ARCH_OWNER: ARCH-TEST-01`n    pub struct Bad;`n}`n" 'lexical top level'
         & $assertFailure 'inner-cfg-test' 'src/lib.rs' "#![cfg(test)]`n/// ELIOT_ARCH_OWNER: ARCH-TEST-01`npub struct Bad;`n" 'test-only'
         & $assertFailure 'cfg-attr-test-gate' 'src/lib.rs' "/// ELIOT_ARCH_OWNER: ARCH-TEST-01`n#[cfg_attr(not(test), cfg(test))]`npub struct Bad;`n" 'test-only'
+        & $assertFailure 'cfg-attr-unsupported-base' 'src/lib.rs' "/// ELIOT_ARCH_OWNER: ARCH-TEST-01`n#[cfg_attr(unix, derive(Clone))]`npub struct Bad;`n" 'unsupported cfg atom in conservative subset'
         & $assertFailure 'correlated-test-only-cfg' 'src/lib.rs' "/// ELIOT_ARCH_OWNER: ARCH-TEST-01`n#[cfg(any(test, all(feature = `"x`", not(feature = `"x`"))))]`npub struct Bad;`n" 'unsupported cfg atom in conservative subset'
         & $assertFailure 'unsupported-target-os-correlation' 'src/lib.rs' "/// ELIOT_ARCH_OWNER: ARCH-TEST-01`n#[cfg(any(test, all(target_os = `"windows`", target_os = `"linux`")))]`npub struct Bad;`n" 'unsupported cfg atom in conservative subset'
         & $assertFailure 'unsupported-platform-correlation' 'src/lib.rs' "/// ELIOT_ARCH_OWNER: ARCH-TEST-01`n#[cfg(any(test, all(unix, windows)))]`npub struct Bad;`n" 'unsupported cfg atom in conservative subset'

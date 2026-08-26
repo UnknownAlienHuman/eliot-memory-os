@@ -460,6 +460,7 @@ function CfgAttributes([string]$MaskedText, [string]$OriginalText = $MaskedText)
         } else {
             $arguments = @(CfgArgs $body)
             if ($arguments.Count -lt 1) { throw 'malformed cfg_attr attribute' }
+            [void](CfgPossibility $arguments[0])
             $gates = [Collections.Generic.List[string]]::new()
             $nestedTestAttribute = $false
             for ($argumentIndex = 1; $argumentIndex -lt $arguments.Count; $argumentIndex++) {
@@ -1241,6 +1242,13 @@ pub struct CfgAttr;
 pub struct CfgAttrGate;
 "@
         ExpectFailure 'cfg_attr(not(test), cfg(test))' { CodeBindings $cfgAttrGateRoot @($anchor) $inventory } 'test-only'
+
+        $cfgAttrUnsupportedBaseRoot = NewFixture $tempRoot 'cfg-attr-unsupported-base' 'src/lib.rs' @"
+/// ELIOT_ARCH_OWNER: ARCH-TEST-01
+#[cfg_attr(unix, derive(Clone))]
+pub struct CfgAttrUnsupportedBase;
+"@
+        ExpectFailure 'cfg_attr(unix, derive(Clone))' { CodeBindings $cfgAttrUnsupportedBaseRoot @($anchor) $inventory } 'unsupported cfg atom'
 
         $cfgAttrNestedRoot = NewFixture $tempRoot 'cfg-attr-nested-cfg-attr' 'src/lib.rs' @"
 /// ELIOT_ARCH_OWNER: ARCH-TEST-01
