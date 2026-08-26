@@ -4,7 +4,7 @@
   "work_item_id": "W1-01",
   "structured_result": {
     "schema_version": "eliot-work-result-v2",
-    "source_revision": "content:6db817a04ddaa08eb74688c01982c204eb151a269d2522c095f567288c8bbad7",
+    "source_revision": "content:88a9beeef1d4e1725dc898282cf48ff0f1835df0096ad43db0c1ede169a9f04b",
     "disposition": "challenged",
     "discriminator_before": "Prior W1-01 evidence used a result envelope that was not source-compatible and accepted incomplete nested metadata.",
     "discriminator_after": "The result is an exact v1.3 evidence-only wrapper generated from code, with content-bound non-self artifact and witness hashes plus independent add/remove/tamper checks.",
@@ -36,17 +36,17 @@
       },
       {
         "path": "swarm/inventory/modules.json",
-        "sha256": "28afca6960240165d7cee0aa4138b3177e3ef75dc285b1a45e068d23ab5158c9"
+        "sha256": "50a6f964c3b3382aa8f57a39440baee66c125df473fd3a3b98ab032ccd95b52e"
       }
     ],
     "inventory_summary": {
       "members_total": 126,
-      "total_source_stu": 7442969,
-      "total_test_count": 3351,
+      "total_source_stu": 7443184,
+      "total_test_count": 3352,
       "zero_test_packages": 43,
-      "unreachable_from_bins": 43,
-      "document_digest": "1c814911cdd5c1de3e439afd12cdf232cffb275a35a4435a8e59d57c3aa02f1d",
-      "inputs_digest": "6db817a04ddaa08eb74688c01982c204eb151a269d2522c095f567288c8bbad7"
+      "unreachable_from_bins": 41,
+      "document_digest": "e624cdf8cdbeb56612f6f0c332435e0b3008ec64ccc35c1c29099484252e7606",
+      "inputs_digest": "88a9beeef1d4e1725dc898282cf48ff0f1835df0096ad43db0c1ede169a9f04b"
     },
     "evidence": [
       "cargo metadata --locked --format-version 1 -> 126 workspace packages",
@@ -82,7 +82,7 @@
       },
       "inventory": {
         "path": "swarm/inventory/modules.json",
-        "sha256": "28afca6960240165d7cee0aa4138b3177e3ef75dc285b1a45e068d23ab5158c9"
+        "sha256": "50a6f964c3b3382aa8f57a39440baee66c125df473fd3a3b98ab032ccd95b52e"
       }
     },
     "external_review": {

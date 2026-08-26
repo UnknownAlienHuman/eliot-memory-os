@@ -872,6 +872,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-bootstrap",
  "eliot-contracts",
+ "eliot-controlboard",
  "eliot-ipc",
  "eliot-mcp",
  "eliot-observation-contracts",

@@ -229,7 +229,10 @@ fn missing_a06_and_a08_operations_are_typed_unavailable() {
                 },
         } => {
             assert_eq!(missing_work_id, "A-08");
-            assert_eq!(dependency, "eliot-controlboard");
+            assert_eq!(
+                dependency,
+                "no admitted Kernel/Governor provider is injected"
+            );
         }
         result => panic!("unexpected UI result: {result:?}"),
     }
@@ -245,7 +248,10 @@ fn missing_a06_and_a08_operations_are_typed_unavailable() {
                 },
         } => {
             assert_eq!(missing_work_id, "A-08");
-            assert_eq!(dependency, "eliot-controlboard");
+            assert_eq!(
+                dependency,
+                "no admitted Kernel/Governor provider is injected"
+            );
         }
         result => panic!("unexpected dashboard result: {result:?}"),
     }
@@ -369,7 +375,7 @@ fn public_wire_envelopes_reject_unknown_fields() {
     let reason = json!({
         "code": "PLAN_GAP",
         "missing_work_id": "A-08",
-        "dependency": "eliot-controlboard",
+        "dependency": "no admitted Kernel/Governor provider is injected",
         "unexpected": true
     });
     assert!(serde_json::from_value::<UnavailableReason>(reason).is_err());
@@ -379,7 +385,7 @@ fn public_wire_envelopes_reject_unknown_fields() {
         "reason": {
             "code": "PLAN_GAP",
             "missing_work_id": "A-08",
-            "dependency": "eliot-controlboard"
+            "dependency": "no admitted Kernel/Governor provider is injected"
         },
         "unexpected": true
     });

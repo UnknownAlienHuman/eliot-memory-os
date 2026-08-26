@@ -10,7 +10,7 @@
     "artifacts": {
       "inventory": {
         "path": "swarm/inventory/contour-cut.json",
-        "sha256": "B5D1353B086BAA7BDE14BE75A452E987D9FF121B14CEFE24F6C962ADF578DED9"
+        "sha256": "DC4AFA74E241BE8ACE4646038151F43A3F1E18DC4A1B29CB4758FAE973F1576F"
       },
       "generator": {
         "path": "scripts/gen-contour-cut.ps1",
@@ -22,7 +22,7 @@
       },
       "generator_sha256": "3C240F4E0668780CD0BD8113179BEF1539BD9DCA1422B2322E0FE5DAB0ABA756",
       "verifier_sha256": "7B83C47B2FA58BD33404EBD4803B464866D854F527415764F67DC7CD2EA10587",
-      "inventory_sha256": "B5D1353B086BAA7BDE14BE75A452E987D9FF121B14CEFE24F6C962ADF578DED9"
+      "inventory_sha256": "DC4AFA74E241BE8ACE4646038151F43A3F1E18DC4A1B29CB4758FAE973F1576F"
     },
     "evidence": [
       "content-bound path plus byte source census",
@@ -58,7 +58,7 @@
       },
       "inventory": {
         "path": "swarm/inventory/contour-cut.json",
-        "sha256": "B5D1353B086BAA7BDE14BE75A452E987D9FF121B14CEFE24F6C962ADF578DED9"
+        "sha256": "DC4AFA74E241BE8ACE4646038151F43A3F1E18DC4A1B29CB4758FAE973F1576F"
       }
     },
     "observed_worktree_state": "CONTENT_BOUND_SOURCE_UNION; GIT_CATEGORIES_OBSERVATIONAL_ONLY",
@@ -152,7 +152,7 @@
           "canonical-write-symbol": 1
         },
         "provenance": "content_bound_path_plus_bytes",
-        "rust_files_sha256": "F8242E8F51D553D6E9BB234C10918A37E72BE5A34E972A06219AD395FD63510B"
+        "rust_files_sha256": "AD1940CA29DE1E04AF475106520ED9ECF7744C8739C919234CE27A6DB7BBE170"
       },
       "edge_class_counts": {
         "canonical_write_definition": 1,
@@ -269,7 +269,7 @@
         "status": "VERIFIED_ONE_DEFINITION_ZERO_CALLERS"
       },
       "inventory_summary_sha256": "6B28FC0B0CE8DAD6BAA06F46174132EADE21481D58E23864A30B62EC98AA25EB",
-      "source_scan_sha256": "71D95CC8F6B78FA39D096A8573023DF2BBDC9A5FE720A6C41A20BD793B2183AE",
+      "source_scan_sha256": "33D99A0125FEC07E84853D4CA7552D931E9648F36E2D69BB004084F38D335054",
       "canonical_write_proof_sha256": "23BF3C4D828DAA047A5EDAF143F3E96A72CD003EB396F6B6B7FD0F2871D1D36B",
       "regression_fixtures_sha256": "ACFF0865E67C01CA6CA35AFA15FBA494AFB35E5F2CCF546A69EE2EE1088E7E41",
       "cutover_decision": "PENDING_ROOT"

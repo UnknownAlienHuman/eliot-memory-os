@@ -23,6 +23,10 @@ pub const CATALOGUE_REVISION: &str = "a11-plan-v2";
 pub const SCHEMA_VERSION: &str = "eliot-cli-schema-v1";
 /// MCP surface revision consumed by the CLI catalogue edge.
 pub const MCP_SURFACE_CONTRACT_REVISION: &str = eliot_mcp::CONTRACT_REVISION;
+/// Stable A-08 [`eliot_controlboard::PLAN_GAP`] marker bound into this
+/// catalogue edge while its admitted providers remain uninjected by
+/// composition.
+pub const CONTROLBOARD_PLAN_GAP: &str = eliot_controlboard::PLAN_GAP;
 
 /// Canonical command identifiers from the first-line command projection.
 #[derive(
@@ -1094,7 +1098,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-08",
-            dependency: "eliot-controlboard",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1108,7 +1112,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "A-08",
-            dependency: "eliot-controlboard",
+            dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
     CommandSpec {
@@ -1946,7 +1950,7 @@ fn schema_command(spec: &CommandSpec) -> SchemaCommand {
             missing_work_id,
             dependency,
         } => SchemaAvailability {
-            code: "PLAN_GAP",
+            code: CONTROLBOARD_PLAN_GAP,
             dependency,
             missing_work_id: Some(missing_work_id),
             architecture_anchor: None,
@@ -1990,7 +1994,7 @@ fn schema_command(spec: &CommandSpec) -> SchemaCommand {
 const fn availability_code(availability: CommandAvailability) -> &'static str {
     match availability {
         CommandAvailability::Admitted => "ADMITTED",
-        CommandAvailability::PlanGap { .. } => "PLAN_GAP",
+        CommandAvailability::PlanGap { .. } => CONTROLBOARD_PLAN_GAP,
         CommandAvailability::Unsupported { .. } => "UNSUPPORTED",
         CommandAvailability::Unimplemented { .. } => "UNIMPLEMENTED",
     }
@@ -2076,6 +2080,11 @@ mod tests {
                 .all(|provider| provider.shape_sha256.len() == 64)
         );
         Ok(())
+    }
+
+    #[test]
+    fn controlboard_plan_gap_marker_is_pinned() {
+        assert_eq!(CONTROLBOARD_PLAN_GAP, "PLAN_GAP");
     }
 
     #[test]
