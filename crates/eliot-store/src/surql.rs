@@ -1033,8 +1033,8 @@ mod tests {
             }
         }
 
-        assert_eq!(registry.templates.len(), 82);
-        assert_eq!(counts, [45, 21, 16]);
+        assert_eq!(registry.templates.len(), 83);
+        assert_eq!(counts, [46, 21, 16]);
     }
 
     #[test]
