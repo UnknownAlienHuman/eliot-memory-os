@@ -9,6 +9,7 @@ use eliot_process::{
     CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
     ProcessExecutionError, ProcessExecutionView, ProcessStartReceipt,
 };
+pub use eliot_protocol::AGENT_BRIDGE_MODULE_ID;
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
 };
@@ -41,8 +42,6 @@ pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION: u16 = 1;
 pub const AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.agent-bridge-admission";
 /// Version of the immutable agent-bridge admission contract.
 pub const AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION: u16 = 1;
-/// Exact module identity admitted by the agent-bridge descriptor.
-pub const AGENT_BRIDGE_MODULE_ID: &str = "eliot-agent-bridge";
 /// Adapter-only hashed selector for a Phase-A pending runtime authority.
 /// Runtime artifact/config/descriptor/bootstrap fields must never admit it.
 const PHASE_B_PENDING_SCM_DIGEST: &str =
@@ -2724,6 +2723,12 @@ mod tests {
     )]
 
     use super::*;
+    use eliot_contracts::{ArtifactId, ContractId, ContractVersion, canonical_json_bytes};
+    use eliot_protocol::{
+        AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+        AgentBridgeClientDeclaration, ClientHello, ProtocolRange,
+    };
+    use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 
     fn handle_value(value: &str) -> PlatformHandle {
         PlatformHandle::new(value).expect("test handle")
@@ -2826,6 +2831,142 @@ mod tests {
         }
         .with_computed_digest()
         .expect("bridge descriptor digest")
+    }
+
+    fn agent_bridge_client_declaration(
+        descriptor: &AgentBridgeAdmissionDescriptor,
+    ) -> AgentBridgeClientDeclaration {
+        let module_id = ContractId::new(AGENT_BRIDGE_MODULE_ID).expect("module id");
+        let artifact_id =
+            ArtifactId::new(descriptor.executable_sha256.clone()).expect("artifact id");
+        let client_hello = ClientHello {
+            protocol_range: ProtocolRange {
+                minimum: ProtocolVersion::CURRENT,
+                maximum: ProtocolVersion::CURRENT,
+            },
+            module_bridge_identity: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            artifact_hash: artifact_id.clone(),
+            module_contract: ModuleContract {
+                module_id: module_id.clone(),
+                version: ContractVersion::new(1, 0, 0),
+                artifact_id: artifact_id.clone(),
+                protocols: vec!["eliot.agent-bridge.v1".to_owned()],
+                required_capabilities: descriptor.allowed_capabilities.clone(),
+                optional_capabilities: Vec::new(),
+                advisory_capabilities: Vec::new(),
+                state_owner: "eliot-host".to_owned(),
+                failure_domain: "agent-bridge".to_owned(),
+                hot_replace: false,
+            },
+            module_generation: ModuleGeneration {
+                module_id,
+                generation: descriptor.generation,
+                artifact_id,
+                state: ModuleGenerationState::Starting,
+                health: HealthVector::healthy(),
+                state_fence: descriptor.state_fence.clone(),
+            },
+            launch_nonce: descriptor.launch_nonce.as_str().to_owned(),
+            capabilities: descriptor.allowed_capabilities.clone(),
+            privacy_classes: descriptor.allowed_privacy_classes.clone(),
+            max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES).expect("frame limit"),
+            authority_epoch: descriptor.authority_epoch,
+        };
+        let client_hello_sha256 =
+            sha256_hex(&canonical_json_bytes(&client_hello).expect("canonical client hello"));
+        AgentBridgeClientDeclaration {
+            wire_id: AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            connection_id: "agent-bridge-connection-1".to_owned(),
+            expected_kernel_sid: "S-1-5-18".to_owned(),
+            expected_kernel_session_id: 0,
+            client_hello,
+            client_hello_sha256,
+            expected_kernel_principal_binding: descriptor.expected_kernel_principal_binding.clone(),
+            expected_kernel_authority_epoch: AuthorityEpoch::new(19).expect("kernel epoch"),
+            expected_kernel_generation: ResourceGeneration::new(23).expect("kernel generation"),
+            expected_kernel_artifact_sha256: "e".repeat(64),
+            expected_kernel_config_snapshot_sha256: descriptor
+                .expected_kernel_config_snapshot_sha256
+                .clone(),
+            declaration_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("client declaration digest")
+    }
+
+    #[test]
+    fn agent_bridge_descriptor_binds_client_declaration_without_digest_cycle() {
+        let mut descriptor = agent_bridge_admission_descriptor();
+        let declaration = agent_bridge_client_declaration(&descriptor);
+        declaration.validate().expect("valid client declaration");
+        descriptor.client_declaration_sha256 = declaration
+            .compute_digest()
+            .expect("client declaration digest");
+        descriptor.client_hello_sha256 = declaration
+            .client_hello_digest()
+            .expect("client hello digest");
+        assert_eq!(
+            descriptor.expected_kernel_principal_binding,
+            declaration.expected_kernel_principal_binding
+        );
+        assert_eq!(
+            descriptor.expected_kernel_config_snapshot_sha256,
+            declaration.expected_kernel_config_snapshot_sha256
+        );
+        assert_eq!(
+            descriptor.generation,
+            declaration.client_hello.module_generation.generation
+        );
+        assert_eq!(
+            descriptor.authority_epoch,
+            declaration.client_hello.authority_epoch
+        );
+        descriptor.descriptor_sha256 = descriptor.compute_digest().expect("descriptor digest");
+        descriptor.validate().expect("bound descriptor");
+        let original_descriptor_digest = descriptor.descriptor_sha256.clone();
+
+        let mut changed_declaration = declaration.clone();
+        changed_declaration.connection_id.push_str("-replacement");
+        changed_declaration.declaration_sha256 = changed_declaration
+            .compute_digest()
+            .expect("changed declaration digest");
+        changed_declaration
+            .validate()
+            .expect("changed declaration remains internally valid");
+        descriptor.client_declaration_sha256 = changed_declaration.declaration_sha256.clone();
+        descriptor.descriptor_sha256 = descriptor.compute_digest().expect("outer digest");
+        assert_ne!(descriptor.descriptor_sha256, original_descriptor_digest);
+        let declaration_only_descriptor_digest = descriptor.descriptor_sha256.clone();
+
+        let mut changed_hello = declaration.clone();
+        changed_hello.client_hello.max_frame -= 1;
+        changed_hello.client_hello_sha256 = changed_hello
+            .client_hello_digest()
+            .expect("changed client hello digest");
+        changed_hello.declaration_sha256 = changed_hello
+            .compute_digest()
+            .expect("changed declaration digest");
+        changed_hello
+            .validate()
+            .expect("changed hello remains internally valid");
+        descriptor.client_declaration_sha256 = changed_hello.declaration_sha256.clone();
+        descriptor.client_hello_sha256 = changed_hello.client_hello_sha256.clone();
+        descriptor.descriptor_sha256 = descriptor.compute_digest().expect("outer digest");
+        assert_ne!(
+            descriptor.descriptor_sha256,
+            declaration_only_descriptor_digest
+        );
+
+        let declaration_json = serde_json::to_value(changed_declaration)
+            .expect("encode declaration without descriptor digest");
+        assert!(
+            !declaration_json
+                .as_object()
+                .expect("declaration object")
+                .contains_key("descriptor_sha256")
+        );
     }
 
     #[test]

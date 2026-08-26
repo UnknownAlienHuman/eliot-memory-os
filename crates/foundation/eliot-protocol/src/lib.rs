@@ -40,6 +40,13 @@ const MAX_FRAME_BYTES_U32: u32 = 4 * 1024 * 1024;
 pub const HOT_RESPONSE_BYTES: usize = 64 * 1024;
 /// Hard maximum for structured MCP response bodies.
 pub const HARD_STRUCTURED_RESPONSE_BYTES: usize = 256 * 1024;
+/// Stable module identity for the external agent bridge.
+pub const AGENT_BRIDGE_MODULE_ID: &str = "eliot-agent-bridge";
+/// Stable identity of the protected agent-bridge client declaration.
+pub const AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID: &str =
+    "eliot.protocol.agent-bridge-client-declaration";
+/// Current protected agent-bridge client declaration version.
+pub const AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION: u16 = 1;
 const FRAME_PREFIX_BYTES: usize = 4;
 
 /// A protocol contract validation or compatibility failure.
@@ -146,6 +153,36 @@ fn unique_texts(values: &[String], field: &'static str) -> Result<(), ProtocolEr
                 reason: "must not contain duplicate values",
             });
         }
+    }
+    Ok(())
+}
+
+fn lowercase_sha256(value: &str, field: &'static str) -> Result<(), ProtocolError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ProtocolError::InvalidField {
+            field,
+            reason: "must be a lowercase SHA-256 digest",
+        });
+    }
+    Ok(())
+}
+
+fn windows_sid(value: &str, field: &'static str) -> Result<(), ProtocolError> {
+    if !value.strip_prefix("S-1-").is_some_and(|tail| {
+        !tail.is_empty()
+            && tail.len() <= 180
+            && tail
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'-')
+    }) {
+        return Err(ProtocolError::InvalidField {
+            field,
+            reason: "must be canonical Windows SID text",
+        });
     }
     Ok(())
 }
@@ -846,6 +883,154 @@ impl ClientHello {
     }
 }
 
+/// Immutable protected client declaration for one admitted agent-bridge generation.
+///
+/// This value is configuration, not authority. It contains no reusable request
+/// identity, semantic principal, Session, task, `WorkScope`, plan, clock, current
+/// fence, or admission-descriptor digest. Its Kernel principal/configuration
+/// fields describe the expected transport handshake, not an `AgentSession`. Its
+/// `ClientHello` is an immutable Host-materialized claim; Kernel must still
+/// compare it with the separate admission descriptor and live evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeClientDeclaration {
+    /// Declaration wire identity.
+    pub wire_id: String,
+    /// Declaration wire version.
+    pub wire_version: u16,
+    /// Exact module identity (`eliot-agent-bridge`).
+    pub module_id: String,
+    /// Stable connection identity assigned by the Kernel owner.
+    pub connection_id: String,
+    /// SID of the Kernel service process expected at the pipe peer.
+    pub expected_kernel_sid: String,
+    /// Session id of the Kernel service process expected at the pipe peer.
+    /// Session zero is valid for a service process.
+    pub expected_kernel_session_id: u32,
+    /// Exact client handshake declaration approved for this installation.
+    pub client_hello: ClientHello,
+    /// Lowercase SHA-256 of canonical serialized `client_hello` bytes.
+    pub client_hello_sha256: String,
+    /// Protected Kernel handshake principal binding. This is not an `AgentSession` principal.
+    pub expected_kernel_principal_binding: String,
+    /// Protected authority epoch expected from the Kernel server.
+    pub expected_kernel_authority_epoch: AuthorityEpoch,
+    /// Protected immutable generation expected from the Kernel server.
+    pub expected_kernel_generation: ResourceGeneration,
+    /// Lowercase SHA-256 of the expected Kernel artifact.
+    pub expected_kernel_artifact_sha256: String,
+    /// Lowercase SHA-256 of the canonical Kernel `ServerHello.config_snapshot`.
+    pub expected_kernel_config_snapshot_sha256: String,
+    /// Lowercase SHA-256 over every declaration field except this field.
+    pub declaration_sha256: String,
+}
+
+impl AgentBridgeClientDeclaration {
+    /// Current declaration contract version.
+    pub const CONTRACT_VERSION: u16 = AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION;
+
+    /// Returns deterministic bytes covered by `declaration_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.declaration_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical declaration digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Computes the canonical `ClientHello` digest bound by the admission descriptor.
+    pub fn client_hello_digest(&self) -> Result<String, ProtocolError> {
+        let bytes = canonical_json_bytes(&self.client_hello)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        Ok(eliot_contracts::sha256_hex(&bytes))
+    }
+
+    /// Populates the canonical declaration digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.declaration_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the protected declaration without opening a transport or issuing authority.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+            || self.module_id != AGENT_BRIDGE_MODULE_ID
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_client.wire",
+                reason: "unsupported agent-bridge client declaration",
+            });
+        }
+        text(&self.connection_id, "agent_bridge_client.connection_id")?;
+        windows_sid(
+            &self.expected_kernel_sid,
+            "agent_bridge_client.expected_kernel_sid",
+        )?;
+        self.client_hello.validate()?;
+        if self.client_hello.module_bridge_identity != AGENT_BRIDGE_MODULE_ID {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_client.client_hello",
+                reason: "must declare the exact agent-bridge module",
+            });
+        }
+        if self.client_hello.module_generation.generation
+            != self
+                .client_hello
+                .module_generation
+                .state_fence
+                .resource_generation
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_client.client_hello",
+                reason: "generation must match the immutable ClientHello fence",
+            });
+        }
+        for (value, field) in [
+            (
+                self.client_hello_sha256.as_str(),
+                "agent_bridge_client.client_hello_sha256",
+            ),
+            (
+                self.expected_kernel_artifact_sha256.as_str(),
+                "agent_bridge_client.expected_kernel_artifact_sha256",
+            ),
+            (
+                self.expected_kernel_config_snapshot_sha256.as_str(),
+                "agent_bridge_client.expected_kernel_config_snapshot_sha256",
+            ),
+            (
+                self.declaration_sha256.as_str(),
+                "agent_bridge_client.declaration_sha256",
+            ),
+        ] {
+            lowercase_sha256(value, field)?;
+        }
+        if self.client_hello_sha256 != self.client_hello_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_client.client_hello_sha256",
+                reason: "must match the exact canonical ClientHello bytes",
+            });
+        }
+        text(
+            &self.expected_kernel_principal_binding,
+            "agent_bridge_client.expected_kernel_principal_binding",
+        )?;
+        if self.declaration_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_client.declaration_sha256",
+                reason: "declaration digest mismatch",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Server-side EBP handshake selection and capability declaration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1078,11 +1263,163 @@ pub fn negotiate(
 mod tests {
     use super::*;
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ProductId, RequestMetadata, ResourceGeneration, SourceId,
+        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, ProductId,
+        RequestMetadata, ResourceGeneration, SourceId,
     };
+    use eliot_runtime_contracts::{HealthVector, ModuleGenerationState};
 
     fn fence() -> StateFence {
         StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    }
+
+    fn agent_bridge_client_declaration() -> Result<AgentBridgeClientDeclaration, ProtocolError> {
+        let module_id = ContractId::new(AGENT_BRIDGE_MODULE_ID)?;
+        let artifact_id = ArtifactId::new("a".repeat(64))?;
+        let client_hello = ClientHello {
+            protocol_range: ProtocolRange {
+                minimum: ProtocolVersion::CURRENT,
+                maximum: ProtocolVersion::CURRENT,
+            },
+            module_bridge_identity: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            artifact_hash: artifact_id.clone(),
+            module_contract: ModuleContract {
+                module_id: module_id.clone(),
+                version: ContractVersion::new(1, 0, 0),
+                artifact_id: artifact_id.clone(),
+                protocols: vec!["eliot.agent-bridge.v1".to_owned()],
+                required_capabilities: vec!["agent.bridge.activate".to_owned()],
+                optional_capabilities: Vec::new(),
+                advisory_capabilities: Vec::new(),
+                state_owner: "eliot-host".to_owned(),
+                failure_domain: "agent-bridge".to_owned(),
+                hot_replace: false,
+            },
+            module_generation: ModuleGeneration {
+                module_id,
+                generation: ResourceGeneration::genesis(),
+                artifact_id,
+                state: ModuleGenerationState::Starting,
+                health: HealthVector::healthy(),
+                state_fence: fence(),
+            },
+            launch_nonce: "agent-bridge:0123456789abcdef0123456789abcdef".to_owned(),
+            capabilities: vec!["agent.bridge.activate".to_owned()],
+            privacy_classes: vec!["PUBLIC".to_owned()],
+            max_frame: MAX_FRAME_BYTES_U32,
+            authority_epoch: AuthorityEpoch::genesis(),
+        };
+        let client_hello_sha256 = eliot_contracts::sha256_hex(
+            &canonical_json_bytes(&client_hello)
+                .map_err(|error| ProtocolError::Json(error.to_string()))?,
+        );
+        AgentBridgeClientDeclaration {
+            wire_id: AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            connection_id: "agent-bridge-connection-1".to_owned(),
+            expected_kernel_sid: "S-1-5-18".to_owned(),
+            expected_kernel_session_id: 0,
+            client_hello,
+            client_hello_sha256,
+            expected_kernel_principal_binding: "kernel:agent-bridge".to_owned(),
+            expected_kernel_authority_epoch: AuthorityEpoch::new(7)?,
+            expected_kernel_generation: ResourceGeneration::new(11)?,
+            expected_kernel_artifact_sha256: "b".repeat(64),
+            expected_kernel_config_snapshot_sha256: "c".repeat(64),
+            declaration_sha256: String::new(),
+        }
+        .with_computed_digest()
+    }
+
+    #[test]
+    fn agent_bridge_client_declaration_roundtrips_and_admits_kernel_session_zero()
+    -> Result<(), ProtocolError> {
+        let declaration = agent_bridge_client_declaration()?;
+        declaration.validate()?;
+        assert_eq!(declaration.expected_kernel_session_id, 0);
+        assert_ne!(
+            declaration.expected_kernel_authority_epoch,
+            declaration.client_hello.authority_epoch
+        );
+        assert_ne!(
+            declaration.expected_kernel_generation,
+            declaration.client_hello.module_generation.generation
+        );
+        assert_eq!(
+            declaration.declaration_sha256,
+            declaration.compute_digest()?
+        );
+        assert_eq!(
+            declaration.client_hello_digest()?,
+            eliot_contracts::sha256_hex(
+                &canonical_json_bytes(&declaration.client_hello)
+                    .map_err(|error| ProtocolError::Json(error.to_string()))?
+            )
+        );
+
+        let encoded = serde_json::to_vec(&declaration)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let decoded: AgentBridgeClientDeclaration = serde_json::from_slice(&encoded)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        assert_eq!(decoded, declaration);
+
+        let mut forbidden = serde_json::to_value(&declaration)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let object = forbidden
+            .as_object_mut()
+            .ok_or(ProtocolError::InvalidField {
+                field: "agent_bridge_client",
+                reason: "test declaration must serialize as an object",
+            })?;
+        for forbidden_field in [
+            "descriptor_sha256",
+            "request_identity",
+            "principal_id",
+            "session_id",
+            "task_id",
+            "work_scope_id",
+            "plan_id",
+            "current_fence",
+        ] {
+            assert!(!object.contains_key(forbidden_field));
+        }
+        object.insert(
+            "descriptor_sha256".to_owned(),
+            Value::String("d".repeat(64)),
+        );
+        assert!(serde_json::from_value::<AgentBridgeClientDeclaration>(forbidden).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_bridge_client_declaration_rejects_digest_and_authority_mismatches()
+    -> Result<(), ProtocolError> {
+        let declaration = agent_bridge_client_declaration()?;
+
+        let mut stale_generation = declaration.clone();
+        stale_generation.client_hello.module_generation.generation = ResourceGeneration::new(2)?;
+        stale_generation.declaration_sha256 = stale_generation.compute_digest()?;
+        assert!(stale_generation.validate().is_err());
+
+        let mut wrong_hello = declaration.clone();
+        wrong_hello.client_hello_sha256 = "0".repeat(64);
+        wrong_hello.declaration_sha256 = wrong_hello.compute_digest()?;
+        assert!(wrong_hello.validate().is_err());
+
+        let mut uppercase_digest = declaration.clone();
+        uppercase_digest.expected_kernel_artifact_sha256 = "A".repeat(64);
+        uppercase_digest.declaration_sha256 = uppercase_digest.compute_digest()?;
+        assert!(uppercase_digest.validate().is_err());
+
+        let mut wrong_module = declaration.clone();
+        wrong_module.module_id = "other-bridge".to_owned();
+        wrong_module.declaration_sha256 = wrong_module.compute_digest()?;
+        assert!(wrong_module.validate().is_err());
+
+        let mut wrong_self_digest = declaration;
+        wrong_self_digest.declaration_sha256 = "f".repeat(64);
+        assert!(wrong_self_digest.validate().is_err());
+        Ok(())
     }
 
     fn encoded_length(length: usize) -> Result<u32, ProtocolError> {

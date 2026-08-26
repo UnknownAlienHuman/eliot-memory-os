@@ -21,6 +21,10 @@ mod protocol;
 mod store_client;
 
 pub use eliot_process::ProcessExecutionAdmissionRequest;
+pub use eliot_protocol::{
+    AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+    AgentBridgeClientDeclaration,
+};
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
