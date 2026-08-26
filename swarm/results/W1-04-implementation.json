@@ -8,7 +8,7 @@
       {
         "path": "docs/conformance.toml",
         "role": "generated projection",
-        "sha256": "4DABD0685C980AC33154E64FF9CD7D1970D55B0441503C46414910D77AA6262B"
+        "sha256": "06A18EB7D61C6F245C37D922BF4ED5855CBE032CEA824DFD3946BC3210A423FD"
       },
       {
         "path": "swarm/results/W1-04-implementation.json",
@@ -65,12 +65,12 @@
       },
       {
         "path": "swarm/inventory/modules.json",
-        "sha256": "E54F4579352DF6DCF0EE04A89697514FCE9219620CBF0AF36D818AD690F9294F",
+        "sha256": "E1CE9B587E4CD21CD2CB89C2340359E37729D24DF011D3678BB1E2412EA6B421",
         "role": "current module ownership inventory"
       },
       {
         "path": "swarm/inventory/refusals.csv",
-        "sha256": "D416E0BA46DED5B5A64FD3B3F3F739961D502BA71E744DB65DA8CB104F54B325",
+        "sha256": "0F59DEC85F60E95DC2F67F9B156C68B5A2FB5730F51D3C1FDC8ED6940BD24A41",
         "role": "current refusal-site inventory"
       },
       {
@@ -122,12 +122,12 @@
       {
         "path": "swarm/inventory/modules.json",
         "role": "current module ownership inventory",
-        "sha256": "E54F4579352DF6DCF0EE04A89697514FCE9219620CBF0AF36D818AD690F9294F"
+        "sha256": "E1CE9B587E4CD21CD2CB89C2340359E37729D24DF011D3678BB1E2412EA6B421"
       },
       {
         "path": "swarm/inventory/refusals.csv",
         "role": "current refusal-site inventory",
-        "sha256": "D416E0BA46DED5B5A64FD3B3F3F739961D502BA71E744DB65DA8CB104F54B325"
+        "sha256": "0F59DEC85F60E95DC2F67F9B156C68B5A2FB5730F51D3C1FDC8ED6940BD24A41"
       },
       {
         "path": ".codebase-memory/artifact.json",

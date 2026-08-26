@@ -368,6 +368,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
             "readiness-kernel-lineage",
         ),
         restart_budget: RestartBudget::new(1, 1)?,
+        agent_bridge_admission: None,
         containment_action: None,
     };
     let durable_job = KernelJobBinding {
@@ -2433,6 +2434,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
             "reconcile-kernel-lineage",
         ),
         restart_budget: RestartBudget::new(1, 1)?,
+        agent_bridge_admission: None,
         containment_action: None,
     };
     let durable_job = KernelJobBinding {

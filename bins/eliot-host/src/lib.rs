@@ -1523,6 +1523,7 @@ impl HostJobBranches {
             supervision_incarnation,
             restart_budget: RestartBudget::new(3, 3)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            agent_bridge_admission: None,
             containment_action: None,
         };
         candidate

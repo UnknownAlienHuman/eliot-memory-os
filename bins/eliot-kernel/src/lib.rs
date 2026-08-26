@@ -12471,6 +12471,7 @@ mod tests {
                 },
                 supervision_incarnation: supervision_incarnation(),
                 restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
+                agent_bridge_admission: None,
                 containment_action: None,
             };
             svc.reconcile(cand.clone()).unwrap();
@@ -12679,6 +12680,7 @@ mod tests {
                 },
                 supervision_incarnation: supervision_incarnation(),
                 restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
+                agent_bridge_admission: None,
                 containment_action: None,
             };
             svc.reconcile(cand.clone()).unwrap();
@@ -12882,6 +12884,7 @@ mod tests {
                 },
                 supervision_incarnation: supervision_incarnation(),
                 restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
+                agent_bridge_admission: None,
                 containment_action: None,
             };
             svc.reconcile(cand.clone()).unwrap();
@@ -13092,6 +13095,7 @@ mod tests {
             },
             supervision_incarnation: supervision_incarnation(),
             restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
+            agent_bridge_admission: None,
             containment_action: None,
         };
         let peer = eliot_ipc::PeerIdentity::authenticated_for_test(
@@ -13191,6 +13195,7 @@ mod tests {
                 },
                 supervision_incarnation: supervision_incarnation(),
                 restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
+                agent_bridge_admission: None,
                 containment_action: None,
             };
             svc.reconcile(cand.clone()).unwrap();
@@ -13386,6 +13391,7 @@ mod tests {
                 },
                 supervision_incarnation: supervision_incarnation(),
                 restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
+                agent_bridge_admission: None,
                 containment_action: None,
             };
             svc.reconcile(cand.clone()).unwrap();

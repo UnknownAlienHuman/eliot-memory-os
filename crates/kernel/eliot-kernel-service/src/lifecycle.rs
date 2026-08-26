@@ -1031,6 +1031,7 @@ mod tests {
             },
             supervision_incarnation: supervision_incarnation(),
             restart_budget: RestartBudget::new(1, 1).unwrap_or_else(|_| unreachable!()),
+            agent_bridge_admission: None,
             containment_action: None,
         }
     }

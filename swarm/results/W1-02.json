@@ -24,7 +24,7 @@
       "note": "UNKNOWN anchors are explicit evidence gaps: the source span contains no validated normative/work identifier; they are not inferred from the historical 1371 baseline."
     },
     "source_file_count": 581,
-    "source_digest_aggregate": "4b265cfc46bc8a95648bcff0d11d0fd60154de4c1f184eceaa42cb30d2942350",
+    "source_digest_aggregate": "d23434d51c19863d5e2c03abae5e8d9216ade92c118b7688ccc8fa73c89d1d66",
     "normative_pair_sha256": "041c9bb09db91b8bd8b8c073270c6220cf534b746fcf7faadf705094218b99b1",
     "normative_pair_paths": [
       "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -117,7 +117,7 @@
         },
         {
           "path": "bins/eliot-host/src/journal_tests.rs",
-          "sha256": "9a9ab15c95a19415c856087698eb654ff3eb6af0322187480792d01f098d021c"
+          "sha256": "f6edd3bd90e3fee75ccb0dbdeb69061d81517feacc00a8ca795dcd074e5b85cb"
         },
         {
           "path": "bins/eliot-host/src/kernel_activation_driver.rs",
@@ -137,7 +137,7 @@
         },
         {
           "path": "bins/eliot-host/src/lib.rs",
-          "sha256": "45633fe2bd3ad9e465e28a795172616f20b3e40d612c0b3c296524a657d0aeba"
+          "sha256": "cbbf0858c4d2290b46eb7478e96645ed8f160a68ee49ae5958b760a0609223f4"
         },
         {
           "path": "bins/eliot-host/src/main.rs",
@@ -205,7 +205,7 @@
         },
         {
           "path": "bins/eliot-kernel/src/lib.rs",
-          "sha256": "b574fc43d94deece2616b9313c1f10b117493845c2e9a0c92378dd92707b0e49"
+          "sha256": "e6b0bb892234da44818184824a12c2404a5712791dea0d86b93914c6162656cd"
         },
         {
           "path": "bins/eliot-kernel/src/main.rs",
@@ -2021,11 +2021,11 @@
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/lifecycle.rs",
-          "sha256": "269acd510335809db77f43e9a4e0188163d5a91d3302cd2677f042e035d1352d"
+          "sha256": "140e28c7f350ef7b73614786699b39f9b0829b51f74e16441b95af717a8999e7"
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/protocol.rs",
-          "sha256": "ba3441c621a05562573b3d753d7e3c6f7fb0b5eabbdafcb50a0886058c7e3eb3"
+          "sha256": "3acd3dfd9c998969c8e35c79cbf59d116f44cc3b376f9610dd2f9bdd8754f85c"
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/store_client.rs",
@@ -2033,7 +2033,7 @@
         },
         {
           "path": "crates/kernel/eliot-kernel-service/tests/pulse4_store_rebind.rs",
-          "sha256": "7a9eaa487f363670e47c9dcbb4e2b20e5c2815c212a561d8c982eb64f20809a7"
+          "sha256": "9c9dd82c67eedbe80b77ec429c488fb3ca774a0e60b6a4ef4c0ac2fb0a06729f"
         },
         {
           "path": "crates/kernel/eliot-ors/src/lib.rs",
@@ -2388,7 +2388,7 @@
           "sha256": "0b9cb7808d1a6ef940c7c095f06de336ea78beb58b9f6191235f7b0698a21eee"
         }
       ],
-      "source_manifest_sha256": "4b265cfc46bc8a95648bcff0d11d0fd60154de4c1f184eceaa42cb30d2942350",
+      "source_manifest_sha256": "d23434d51c19863d5e2c03abae5e8d9216ade92c118b7688ccc8fa73c89d1d66",
       "normative_pair": [
         {
           "path": "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -2410,10 +2410,10 @@
       "artifact_hashes": [
         {
           "path": "swarm/inventory/refusals.csv",
-          "sha256": "d416e0ba46ded5b5a64fd3b3f3f739961d502ba71e744db65da8cb104f54b325"
+          "sha256": "0f59dec85f60e95dc2f67f9b156c68b5a2fb5730f51d3c1fdc8ed6940bd24a41"
         }
       ],
-      "content_digest": "b5b1b3ced060eb62f76c329fe6d09a50bca56943a7090379c911757a715d5549"
+      "content_digest": "2e2f87cc65c5551394576388a8795447460d52a702c7eb9c0833666d10053a3f"
     },
     "disposition": "challenged",
     "artifacts": [

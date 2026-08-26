@@ -2303,6 +2303,13 @@ pub struct HostKernelCandidateBinding {
     pub supervision_incarnation: SupervisionLeaseIncarnationBinding,
     /// Restart budget for this lineage.
     pub restart_budget: RestartBudget,
+    /// Optional Host-owned agent-bridge admission input carried to Kernel.
+    ///
+    /// Absence preserves the pre-R13 candidate wire and digest exactly. A
+    /// present descriptor is inert until Kernel compares it with live OS peer
+    /// evidence; this carrier alone does not admit a bridge process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_bridge_admission: Option<AgentBridgeAdmissionDescriptor>,
     /// Containment action required if the previous lineage is suspect.
     pub containment_action: Option<ContainmentAction>,
 }
@@ -2357,6 +2364,9 @@ impl HostKernelCandidateBinding {
                 field: "handshake.kernel_epoch",
                 reason: "must not precede host epoch",
             });
+        }
+        if let Some(descriptor) = &self.agent_bridge_admission {
+            descriptor.validate()?;
         }
         if let Some(containment) = &self.containment_action {
             containment.validate()?;
@@ -3372,6 +3382,7 @@ mod tests {
             },
             supervision_incarnation: supervision_incarnation(),
             restart_budget: RestartBudget::new(1, 1).expect("budget"),
+            agent_bridge_admission: None,
             containment_action: None,
         }
     }
@@ -3469,7 +3480,21 @@ mod tests {
     #[test]
     fn candidate_is_nonce_free_and_old_handshake_authority_shape_is_rejected() {
         let candidate = candidate_binding();
+        let legacy_bytes = serde_json::to_vec(&candidate).expect("legacy candidate bytes");
+        assert!(
+            !String::from_utf8_lossy(&legacy_bytes).contains("agent_bridge_admission"),
+            "an absent bridge descriptor must not alter the legacy candidate wire"
+        );
+        assert_eq!(
+            candidate.compute_digest().expect("candidate digest"),
+            sha256_hex(&legacy_bytes),
+            "the candidate digest must cover the exact legacy wire bytes"
+        );
         let value = serde_json::to_value(&candidate).expect("candidate json");
+        assert!(value.get("agent_bridge_admission").is_none());
+        let legacy: HostKernelCandidateBinding =
+            serde_json::from_value(value.clone()).expect("legacy candidate");
+        assert!(legacy.agent_bridge_admission.is_none());
         assert!(value.get("activation_nonce").is_none());
         let mut old = value;
         old["activation_nonce"] = serde_json::Value::String("legacy-authority".to_owned());
@@ -3484,6 +3509,29 @@ mod tests {
             serde_json::from_value::<HostKernelCandidateBinding>(old_v3).is_err(),
             "v3 candidate without the mandatory incarnation must require migration"
         );
+    }
+
+    #[test]
+    fn candidate_bridge_admission_is_validated_and_digest_bound() {
+        let candidate = candidate_binding();
+        let legacy_digest = candidate.compute_digest().expect("legacy digest");
+
+        let mut admitted = candidate.clone();
+        admitted.agent_bridge_admission = Some(agent_bridge_admission_descriptor());
+        admitted.validate().expect("valid bridge admission carrier");
+        assert_ne!(
+            admitted.compute_digest().expect("admitted digest"),
+            legacy_digest,
+            "a present bridge descriptor must be part of the candidate digest"
+        );
+
+        let mut tampered = admitted;
+        tampered
+            .agent_bridge_admission
+            .as_mut()
+            .expect("descriptor")
+            .module_id = "unapproved-bridge".to_owned();
+        assert!(tampered.validate().is_err());
     }
 
     #[test]

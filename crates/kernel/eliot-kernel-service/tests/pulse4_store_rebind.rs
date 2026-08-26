@@ -98,6 +98,7 @@ fn candidate_binding() -> eliot_kernel_service::HostKernelCandidateBinding {
         .with_derived_ids()
         .unwrap(),
         restart_budget: RestartBudget::new(1, 1).unwrap(),
+        agent_bridge_admission: None,
         containment_action: None,
     }
 }
