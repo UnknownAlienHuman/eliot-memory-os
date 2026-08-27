@@ -18,7 +18,8 @@ use eliot_authority::{EffectAuthorizer, GrantGraph};
 use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_contracts::{
-    AuthorityEpoch, OperationId, RequestMetadata, ResourceGeneration, StateFence, sha256_hex,
+    AuthorityEpoch, OperationId, RequestMetadata, ResourceGeneration, SessionId, StateFence,
+    TaskId, canonical_json_bytes, sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
 use eliot_finish::{FinishDecisionReceipt, FinishService};
@@ -28,14 +29,14 @@ use eliot_maintenance::{
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
-use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot};
+use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
     OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, ScopeRevisionView,
     StoreHealth, WriteReceipt,
 };
-use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot};
-use eliot_workscope::ScopeBindingGuard;
+use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
+use eliot_workscope::{WorkScopeBindingOwner, WorkScopeBindingSnapshot};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -84,8 +85,8 @@ pub enum KernelPortError {
 ///
 /// The route is deliberately split into closed operations so a production
 /// adapter must perform the owner named reads, canonical head read, receipt
-/// replay read, durable-job read, and service-observation read.  A digest in
-/// launch.json cannot substitute for any one of these operations.
+/// replay read, and durable-job read.  A digest in launch.json cannot
+/// substitute for any one of these operations.
 pub trait KernelRecoveryPort: Send + Sync {
     /// Reads one fixed owner projection under the exact fence and handoff.
     fn named_read(
@@ -122,8 +123,15 @@ pub trait KernelRecoveryPort: Send + Sync {
         state_fence: &StateFence,
         protected_snapshot_digest: &str,
     ) -> Result<Vec<MaintenanceJob>, KernelPortError>;
+}
 
-    /// Reads the ordered Governor service observations.
+/// Explicit Kernel-owned service observation route used after owner recovery.
+///
+/// Service observations are runtime admission evidence, not durable Governor
+/// owner state. Keeping this route separate prevents them from being folded
+/// into the owner recovery snapshot or its diagnostic digest.
+pub trait KernelServiceObservationPort: Send + Sync {
+    /// Reads the ordered Governor service observations under the exact fence.
     fn services(
         &self,
         state_fence: &StateFence,
@@ -498,8 +506,6 @@ pub struct GovernorRecoverySnapshot {
     pub receipts: Vec<WriteReceipt>,
     /// Durable application jobs recovered by the Kernel-owned job route.
     pub durable_jobs: Vec<MaintenanceJob>,
-    /// Existing service observations used for ordered Governor admission.
-    pub services: Vec<KernelServiceRecovery>,
 }
 
 impl GovernorRecoverySnapshot {
@@ -586,29 +592,6 @@ impl GovernorRecoverySnapshot {
             }
         }
 
-        let mut services = BTreeSet::new();
-        for recovered in &self.services {
-            if !services.insert(recovered.service)
-                || recovered.observation.generation != expected_fence.resource_generation
-                || recovered.observation.authority_epoch != expected_fence.authority_epoch
-                || recovered.observation.state
-                    != eliot_runtime_contracts::ServiceProcessState::Ready
-                || !recovered.observation.health.is_fully_healthy()
-            {
-                return Err(CompositionError::Recovery(
-                    "service recovery is incomplete, stale, or unhealthy".to_owned(),
-                ));
-            }
-        }
-        if services.len() != STARTUP_ORDER.len()
-            || STARTUP_ORDER
-                .iter()
-                .any(|service| !services.contains(service))
-        {
-            return Err(CompositionError::Recovery(
-                "Kernel recovery did not return every ordered Governor service".to_owned(),
-            ));
-        }
         Ok(())
     }
 }
@@ -728,11 +711,139 @@ pub enum CompositionError {
     Kernel(#[from] KernelPortError),
 }
 
+/// Exact current Canonical plan identity retained by the Governor owner.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalPlanBinding {
+    pub plan_id: String,
+    pub plan_revision: String,
+    pub task_id: TaskId,
+    pub work_scope_id: String,
+}
+
+impl CanonicalPlanBinding {
+    /// Constructs a bounded current-plan identity.
+    pub fn new(
+        plan_id: impl Into<String>,
+        plan_revision: impl Into<String>,
+        task_id: TaskId,
+        work_scope_id: impl Into<String>,
+    ) -> Result<Self, CompositionError> {
+        let binding = Self {
+            plan_id: plan_id.into(),
+            plan_revision: plan_revision.into(),
+            task_id,
+            work_scope_id: work_scope_id.into(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    /// Validates the bounded plan identity without consulting evidence.
+    pub fn validate(&self) -> Result<(), CompositionError> {
+        if self.plan_id.trim().is_empty() || self.plan_id.chars().any(char::is_control) {
+            return Err(CompositionError::Recovery(
+                "canonical plan id is blank or contains control characters".to_owned(),
+            ));
+        }
+        if self.plan_revision.trim().is_empty() || self.plan_revision.chars().any(char::is_control)
+        {
+            return Err(CompositionError::Recovery(
+                "canonical plan revision is blank or contains control characters".to_owned(),
+            ));
+        }
+        if self.work_scope_id.trim().is_empty() || self.work_scope_id.chars().any(char::is_control)
+        {
+            return Err(CompositionError::Recovery(
+                "canonical work scope id is blank or contains control characters".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Persisted current-plan authority for one exact Governor fence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalAdmissionSnapshot {
+    pub state_fence: StateFence,
+    pub owner_revision: u64,
+    pub current_plan: Option<CanonicalPlanBinding>,
+}
+
+impl CanonicalAdmissionSnapshot {
+    /// Constructs a snapshot only after validating its complete bounded shape.
+    pub fn new(
+        state_fence: StateFence,
+        owner_revision: u64,
+        current_plan: Option<CanonicalPlanBinding>,
+    ) -> Result<Self, CompositionError> {
+        let snapshot = Self {
+            state_fence,
+            owner_revision,
+            current_plan,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Validates snapshot identity and counters without choosing a plan.
+    pub fn validate(&self) -> Result<(), CompositionError> {
+        self.state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.owner_revision == 0 {
+            return Err(CompositionError::Recovery(
+                "canonical owner revision is zero".to_owned(),
+            ));
+        }
+        if let Some(current_plan) = &self.current_plan {
+            current_plan.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalAdmissionSnapshotWire {
+    state_fence: StateFence,
+    owner_revision: u64,
+    current_plan: Option<CanonicalPlanBinding>,
+}
+
+impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = CanonicalAdmissionSnapshotWire::deserialize(deserializer)?;
+        Self::new(wire.state_fence, wire.owner_revision, wire.current_plan)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Canonical owner with no store or provider field.
 #[derive(Clone, Debug)]
 pub struct CanonicalAdmissionOwner {
     state_fence: StateFence,
     scope: ScopeRevisionView,
+    snapshot: CanonicalAdmissionSnapshot,
+}
+
+/// One coherent semantic activation projection assembled from owner reads.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernorActivationSnapshot {
+    pub state_fence: StateFence,
+    pub principal_id: String,
+    pub session_id: String,
+    pub task_id: TaskId,
+    pub work_unit_id: String,
+    pub work_scope_id: String,
+    pub task_revision: u64,
+    pub plan_id: String,
+    pub plan_revision: String,
 }
 
 impl CanonicalAdmissionOwner {
@@ -740,6 +851,7 @@ impl CanonicalAdmissionOwner {
     pub fn new(
         state_fence: StateFence,
         scope: ScopeRevisionView,
+        snapshot: CanonicalAdmissionSnapshot,
     ) -> Result<Self, CompositionError> {
         state_fence
             .validate()
@@ -752,7 +864,17 @@ impl CanonicalAdmissionOwner {
                 "canonical scope snapshot fence does not match owner fence".to_owned(),
             ));
         }
-        Ok(Self { state_fence, scope })
+        snapshot.validate()?;
+        if snapshot.state_fence != state_fence {
+            return Err(CompositionError::Recovery(
+                "canonical admission snapshot fence does not match owner fence".to_owned(),
+            ));
+        }
+        Ok(Self {
+            state_fence,
+            scope,
+            snapshot,
+        })
     }
 
     /// Produces the immutable transition; no transport is touched here.
@@ -798,6 +920,30 @@ impl CanonicalAdmissionOwner {
     #[must_use]
     pub const fn scope(&self) -> &ScopeRevisionView {
         &self.scope
+    }
+
+    /// Reads the exact current plan only under its retained state fence.
+    pub fn read_current_plan(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalPlanBinding, CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.state_fence != *state_fence
+            || self.scope.state_fence != *state_fence
+            || self.snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "canonical plan read used a stale state fence".to_owned(),
+            ));
+        }
+        self.snapshot.validate()?;
+        self.snapshot.current_plan.clone().ok_or_else(|| {
+            CompositionError::Recovery(
+                "canonical current plan is absent; semantic activation is unavailable".to_owned(),
+            )
+        })
     }
 }
 
@@ -971,7 +1117,7 @@ impl AuthorityOwner {
 /// All N4 owners, each represented by one field and one mutable projection.
 pub struct GovernorOwners<P: ?Sized> {
     /// `WorkScope` identity/binding owner.
-    pub work_scope: ScopeBindingGuard,
+    pub work_scope: Option<WorkScopeBindingOwner>,
     /// Durable task lifecycle owner.
     pub task: TaskLifecycleOwner,
     /// Durable session lifecycle owner.
@@ -1118,19 +1264,36 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             decode_owner_snapshot(recovery, RecoveryOwner::ChangeMonitor)?;
         let change_monitor = eliot_change_monitor::ChangeMonitor::from_snapshot(change_snapshot)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        for owner in [
-            RecoveryOwner::WorkScope,
-            RecoveryOwner::Canonical,
-            RecoveryOwner::Maintenance,
-        ] {
+        let work_scope = if let Ok(snapshot) =
+            decode_owner_snapshot::<WorkScopeBindingSnapshot>(recovery, RecoveryOwner::WorkScope)
+        {
+            let owner = WorkScopeBindingOwner::from_snapshot(snapshot)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            owner
+                .read_current(state_fence)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            Some(owner)
+        } else {
+            let empty: EmptyOwnerSnapshot =
+                decode_owner_snapshot(recovery, RecoveryOwner::WorkScope)?;
+            empty.validate(state_fence)?;
+            None
+        };
+        let owner = RecoveryOwner::Maintenance;
+        {
             let empty: EmptyOwnerSnapshot = decode_owner_snapshot(recovery, owner)?;
             empty.validate(state_fence)?;
         }
-        let canonical =
-            CanonicalAdmissionOwner::new(state_fence.clone(), recovery.canonical_scope.clone())?;
+        let canonical_snapshot: CanonicalAdmissionSnapshot =
+            decode_owner_snapshot(recovery, RecoveryOwner::Canonical)?;
+        let canonical = CanonicalAdmissionOwner::new(
+            state_fence.clone(),
+            recovery.canonical_scope.clone(),
+            canonical_snapshot,
+        )?;
         let read = ReadOwner::new(state_fence.clone(), recovery.canonical_scope.clone())?;
         Ok(Self {
-            work_scope: ScopeBindingGuard,
+            work_scope,
             task,
             session,
             canonical,
@@ -1187,6 +1350,7 @@ pub struct GovernorComposition<P: ?Sized> {
     owners: GovernorOwners<P>,
     snapshot: KernelGenerationSnapshot,
     recovery: GovernorRecoverySnapshot,
+    service_observations: Vec<KernelServiceRecovery>,
     readiness: CompositionReadiness,
 }
 
@@ -1208,6 +1372,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &snapshot.protected_snapshot_digest,
         )?;
         recovery.validate(&state_fence, &snapshot.protected_snapshot_digest)?;
+        let service_observations = kernel
+            .services(&state_fence, &snapshot.protected_snapshot_digest)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        validate_service_observations(&service_observations, &state_fence)?;
         let mut governor = Governor::new(GovernorConfig {
             authority_epoch: snapshot.authority_epoch,
             resource_generation: snapshot.generation,
@@ -1222,8 +1390,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 observed: error.to_string(),
             })?;
         for service in STARTUP_ORDER {
-            let recovered = recovery
-                .services
+            let recovered = service_observations
                 .iter()
                 .find(|candidate| candidate.service == service)
                 .ok_or_else(|| {
@@ -1251,6 +1418,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             owners,
             snapshot,
             recovery,
+            service_observations,
             readiness: CompositionReadiness::Ready,
         })
     }
@@ -1272,6 +1440,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn recovery(&self) -> &GovernorRecoverySnapshot {
         &self.recovery
+    }
+
+    /// Returns the separate Kernel-owned service observations used for ordered
+    /// Governor admission; these are not part of owner recovery.
+    #[must_use]
+    pub fn service_observations(&self) -> &[KernelServiceRecovery] {
+        &self.service_observations
     }
 
     /// Returns current readiness; construction never returns a partially ready value.
@@ -1302,6 +1477,112 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
+    /// Reads one coherent semantic activation from all required owner records.
+    ///
+    /// No semantic identity is accepted from the caller: coordination first
+    /// proves one unique live work lease, then task, `WorkScope` and Canonical
+    /// owners must agree on its exact fence and linked identities.
+    pub fn read_unique_agent_activation(
+        &self,
+        now: u64,
+    ) -> Result<GovernorActivationSnapshot, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let state_fence = self.snapshot.state_fence();
+        let work = self
+            .owners
+            .coordination
+            .read_unique_active_work_lease(now, state_fence.authority_epoch, &state_fence)
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "unique coordination activation read failed: {error}"
+                ))
+            })?;
+        let task_id = TaskId::new(work.work_item.task_id.clone())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let lifecycle_session_id = SessionId::new(work.session.session_id.clone())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let lifecycle_session = self
+            .owners
+            .session
+            .session(&lifecycle_session_id)
+            .ok_or_else(|| {
+                CompositionError::Recovery(format!(
+                    "missing session lifecycle record for {lifecycle_session_id}"
+                ))
+            })?;
+        if lifecycle_session.session_id != lifecycle_session_id
+            || lifecycle_session.status != SessionState::Active
+            || lifecycle_session.authority_epoch != state_fence.authority_epoch
+            || lifecycle_session.state_fence != state_fence
+            || lifecycle_session.started_at == 0
+            || lifecycle_session.heartbeat_at < lifecycle_session.started_at
+            || lifecycle_session.expires_at == 0
+            || lifecycle_session.expires_at < lifecycle_session.heartbeat_at
+            || lifecycle_session.heartbeat_at > now
+            || now > lifecycle_session.expires_at
+        {
+            return Err(CompositionError::Recovery(
+                "session lifecycle record is not an exact active activation match".to_owned(),
+            ));
+        }
+        if let Some(scoped_task_id) = &lifecycle_session.task_scope
+            && scoped_task_id != task_id.as_str()
+        {
+            return Err(CompositionError::Recovery(
+                "session lifecycle task scope disagrees with the selected task".to_owned(),
+            ));
+        }
+        let task = self.owners.task.task(&task_id).ok_or_else(|| {
+            CompositionError::Recovery(format!("missing task owner record for {task_id}"))
+        })?;
+        if task.task_id != task_id
+            || task.state_fence != state_fence
+            || task.revision == 0
+            || !matches!(
+                task.state,
+                TaskState::ActionAuthorized | TaskState::Executing | TaskState::Verifying
+            )
+        {
+            return Err(CompositionError::Recovery(
+                "task owner record is not an exact actionable activation match".to_owned(),
+            ));
+        }
+        if let Some(expected_revision) = state_fence.task_revision
+            && expected_revision.value() != task.revision
+        {
+            return Err(CompositionError::Recovery(
+                "task revision does not match the activation fence".to_owned(),
+            ));
+        }
+        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; semantic activation is unavailable".to_owned(),
+            )
+        })?;
+        let scope = scope_owner
+            .read_current(&state_fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let plan = self.owners.canonical.read_current_plan(&state_fence)?;
+        if plan.task_id != task_id || plan.work_scope_id != scope.binding.scope.scope_ref {
+            return Err(CompositionError::Recovery(
+                "canonical active plan does not match the selected task and WorkScope".to_owned(),
+            ));
+        }
+        Ok(GovernorActivationSnapshot {
+            state_fence,
+            principal_id: work.session.principal_id,
+            session_id: work.session.session_id,
+            task_id,
+            work_unit_id: work.work_item.work_item_id,
+            work_scope_id: scope.binding.scope.scope_ref,
+            task_revision: task.revision,
+            plan_id: plan.plan_id,
+            plan_revision: plan.plan_revision,
+        })
+    }
+
     /// Stops this composition without creating a second shutdown authority.
     pub fn stop(&mut self) {
         self.readiness = CompositionReadiness::Stopped;
@@ -1320,7 +1601,11 @@ pub trait KernelGenerationSnapshotProvider {
 /// type must expose both the neutral transition port and the immutable
 /// authenticated snapshot.
 pub trait KernelGenerationPort:
-    KernelTransitionPort + KernelGenerationSnapshotProvider + KernelRecoveryPort + KernelDurableJobPort
+    KernelTransitionPort
+    + KernelGenerationSnapshotProvider
+    + KernelRecoveryPort
+    + KernelServiceObservationPort
+    + KernelDurableJobPort
 {
 }
 
@@ -1328,6 +1613,7 @@ impl<T> KernelGenerationPort for T where
     T: KernelTransitionPort
         + KernelGenerationSnapshotProvider
         + KernelRecoveryPort
+        + KernelServiceObservationPort
         + KernelDurableJobPort
 {
 }
@@ -1402,9 +1688,6 @@ fn recover_from_kernel<P: KernelRecoveryPort + ?Sized>(
     let durable_jobs = kernel
         .durable_jobs(state_fence, protected_snapshot_digest)
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-    let services = kernel
-        .services(state_fence, protected_snapshot_digest)
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
     Ok(GovernorRecoverySnapshot {
         state_fence: state_fence.clone(),
         protected_snapshot_digest: protected_snapshot_digest.to_owned(),
@@ -1412,21 +1695,62 @@ fn recover_from_kernel<P: KernelRecoveryPort + ?Sized>(
         canonical_scope,
         receipts,
         durable_jobs,
-        services,
     })
 }
 
-fn decode_owner_snapshot<T: DeserializeOwned>(
+fn validate_service_observations(
+    observations: &[KernelServiceRecovery],
+    expected_fence: &StateFence,
+) -> Result<(), CompositionError> {
+    let mut services = BTreeSet::new();
+    for recovered in observations {
+        if !services.insert(recovered.service)
+            || recovered.observation.generation != expected_fence.resource_generation
+            || recovered.observation.authority_epoch != expected_fence.authority_epoch
+            || recovered.observation.state != eliot_runtime_contracts::ServiceProcessState::Ready
+            || !recovered.observation.health.is_fully_healthy()
+        {
+            return Err(CompositionError::Recovery(
+                "service observation is incomplete, stale, or unhealthy".to_owned(),
+            ));
+        }
+    }
+    if services.len() != STARTUP_ORDER.len()
+        || STARTUP_ORDER
+            .iter()
+            .any(|service| !services.contains(service))
+    {
+        return Err(CompositionError::Recovery(
+            "Kernel service observation did not return every ordered Governor service".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_owner_snapshot<T: DeserializeOwned + Serialize>(
     recovery: &GovernorRecoverySnapshot,
     owner: RecoveryOwner,
 ) -> Result<T, CompositionError> {
     let read = recovery.owner_read(owner)?;
-    serde_json::from_slice(&read.payload).map_err(|error| {
+    let decoded: T = serde_json::from_slice(&read.payload).map_err(|error| {
         CompositionError::Recovery(format!(
             "owner {} payload schema rejected: {error}",
             owner.as_str()
         ))
-    })
+    })?;
+    let canonical = canonical_json_bytes(&decoded).map_err(|error| {
+        CompositionError::Recovery(format!(
+            "owner {} payload could not be canonicalized: {error}",
+            owner.as_str()
+        ))
+    })?;
+    if canonical != read.payload {
+        return Err(CompositionError::Recovery(format!(
+            "owner {} payload is not canonical JSON",
+            owner.as_str()
+        )));
+    }
+    Ok(decoded)
 }
 
 /// Explicit Host-approved config projection used by the daemon loader.
@@ -1482,10 +1806,13 @@ mod tests {
     use super::*;
     use crate::{STARTUP_ORDER, ServiceId};
     use eliot_contracts::{ClockReading, SessionId, TaskId};
+    use eliot_coordination::{
+        RegisterSession as CoordinationRegisterSession, WorkItem, WorkLeaseRequest, WorkState,
+    };
     use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
-    use eliot_session::RegisterSession;
+    use eliot_session::{RegisterSession, SessionCommand, SessionCommandContext};
     use eliot_store_api::ScopeId;
-    use eliot_task::{TaskCommandContext, TaskProposal};
+    use eliot_task::{TaskCommandContext, TaskLifecycleEvent, TaskProposal, TaskRecord};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct FakeKernel {
@@ -1494,6 +1821,8 @@ mod tests {
         missing: Option<RecoveryOwner>,
         genesis_all_absent: bool,
         genesis_seeded: Arc<AtomicBool>,
+        service_observations: Option<Vec<KernelServiceRecovery>>,
+        service_failure: bool,
     }
 
     impl KernelGenerationSnapshotProvider for FakeKernel {
@@ -1593,24 +1922,23 @@ mod tests {
         ) -> Result<Vec<MaintenanceJob>, KernelPortError> {
             Ok(Vec::new())
         }
+    }
 
+    impl KernelServiceObservationPort for FakeKernel {
         fn services(
             &self,
             state_fence: &StateFence,
             _protected_snapshot_digest: &str,
         ) -> Result<Vec<KernelServiceRecovery>, KernelPortError> {
-            Ok(STARTUP_ORDER
-                .into_iter()
-                .map(|service| KernelServiceRecovery {
-                    service,
-                    observation: ServiceObservation {
-                        state: ServiceProcessState::Ready,
-                        health: HealthVector::healthy(),
-                        generation: state_fence.resource_generation,
-                        authority_epoch: state_fence.authority_epoch,
-                    },
-                })
-                .collect())
+            if self.service_failure {
+                return Err(KernelPortError::Unknown(
+                    "test service observation failure".to_owned(),
+                ));
+            }
+            Ok(self
+                .service_observations
+                .clone()
+                .unwrap_or_else(|| service_observations(state_fence)))
         }
     }
 
@@ -1647,6 +1975,32 @@ mod tests {
             missing: None,
             genesis_all_absent: false,
             genesis_seeded: Arc::new(AtomicBool::new(false)),
+            service_observations: None,
+            service_failure: false,
+        }
+    }
+
+    fn service_observations(state_fence: &StateFence) -> Vec<KernelServiceRecovery> {
+        STARTUP_ORDER
+            .into_iter()
+            .map(|service| KernelServiceRecovery {
+                service,
+                observation: ServiceObservation {
+                    state: ServiceProcessState::Ready,
+                    health: HealthVector::healthy(),
+                    generation: state_fence.resource_generation,
+                    authority_epoch: state_fence.authority_epoch,
+                },
+            })
+            .collect()
+    }
+
+    fn canonical_scope(state_fence: &StateFence) -> ScopeRevisionView {
+        ScopeRevisionView {
+            scope_id: ScopeId::new("governor").expect("scope"),
+            revision_heads: Vec::new(),
+            ordering_heads: Vec::new(),
+            state_fence: state_fence.clone(),
         }
     }
 
@@ -1656,12 +2010,17 @@ mod tests {
         protected_snapshot_digest: &str,
     ) -> Vec<u8> {
         let value = match owner {
-            RecoveryOwner::WorkScope | RecoveryOwner::Canonical | RecoveryOwner::Maintenance => {
+            RecoveryOwner::WorkScope | RecoveryOwner::Maintenance => {
                 serde_json::to_value(EmptyOwnerSnapshot {
                     state_fence: state_fence.clone(),
                     revision: 1,
                 })
             }
+            RecoveryOwner::Canonical => serde_json::to_value(CanonicalAdmissionSnapshot {
+                state_fence: state_fence.clone(),
+                owner_revision: 1,
+                current_plan: None,
+            }),
             RecoveryOwner::Task => serde_json::to_value(TaskLifecycleSnapshot {
                 next_sequence: 1,
                 tasks: BTreeMap::new(),
@@ -1713,7 +2072,250 @@ mod tests {
             }
         }
         .expect("owner payload");
-        serde_json::to_vec(&value).expect("owner payload bytes")
+        canonical_json_bytes(&value).expect("owner payload bytes")
+    }
+
+    fn activation_canonical_snapshot(fence: &StateFence) -> CanonicalAdmissionSnapshot {
+        CanonicalAdmissionSnapshot {
+            state_fence: fence.clone(),
+            owner_revision: 1,
+            current_plan: Some(CanonicalPlanBinding {
+                plan_id: "plan:current".to_owned(),
+                plan_revision: "1".to_owned(),
+                task_id: TaskId::new("task-1").expect("task id"),
+                work_scope_id: "scope:work".to_owned(),
+            }),
+        }
+    }
+
+    fn activation_task_snapshot(fence: &StateFence) -> TaskLifecycleSnapshot {
+        let task_id = TaskId::new("task-1").expect("task id");
+        TaskLifecycleSnapshot {
+            next_sequence: 2,
+            tasks: BTreeMap::from([(
+                task_id.clone(),
+                TaskRecord {
+                    task_id: task_id.clone(),
+                    project_ref: "project-1".to_owned(),
+                    goal: "activate me".to_owned(),
+                    state: TaskState::ActionAuthorized,
+                    revision: 1,
+                    last_sequence: 1,
+                    last_event_id: "task-event-1".to_owned(),
+                    state_fence: fence.clone(),
+                },
+            )]),
+            events: vec![TaskLifecycleEvent {
+                sequence: 1,
+                event_id: "task-event-1".to_owned(),
+                request_id: "task-request-1".to_owned(),
+                task_id,
+                actor_ref: "agent-1".to_owned(),
+                from: None,
+                to: TaskState::ActionAuthorized,
+                command: None,
+                state_fence: fence.clone(),
+                authority_epoch: fence.authority_epoch,
+                observed_at: ClockReading::default(),
+            }],
+        }
+    }
+
+    fn activation_coordination_snapshot(
+        fence: &StateFence,
+    ) -> eliot_coordination::CoordinationOwner {
+        let mut owner = eliot_coordination::CoordinationOwner::new();
+        owner
+            .register_session(CoordinationRegisterSession {
+                request_id: "coord-session-request".to_owned(),
+                session_id: "session-1".to_owned(),
+                principal_id: "principal-1".to_owned(),
+                route_ref: "route-1".to_owned(),
+                authority_epoch: fence.authority_epoch,
+                state_fence: fence.clone(),
+                now: 1,
+                heartbeat_deadline: 100,
+            })
+            .expect("coordination session");
+        owner
+            .register_work(
+                WorkItem {
+                    work_item_id: "work-1".to_owned(),
+                    task_id: "task-1".to_owned(),
+                    state: WorkState::Ready,
+                    state_fence: fence.clone(),
+                    owner_session_id: None,
+                    lease_id: None,
+                    attempt: 0,
+                    checkpoint_ref: None,
+                    result_ref: None,
+                },
+                "coord-work-request",
+                "principal-1",
+                ClockReading::default(),
+            )
+            .expect("coordination work");
+        owner
+            .acquire_work(WorkLeaseRequest {
+                request_id: "coord-lease-request".to_owned(),
+                lease_id: "lease-1".to_owned(),
+                work_item_id: "work-1".to_owned(),
+                session_id: "session-1".to_owned(),
+                authority_epoch: fence.authority_epoch,
+                state_fence: fence.clone(),
+                now: 2,
+                lease_duration: 40,
+            })
+            .expect("coordination lease");
+        owner
+    }
+
+    fn activation_ambiguous_coordination_snapshot(
+        fence: &StateFence,
+    ) -> eliot_coordination::CoordinationOwner {
+        let mut owner = activation_coordination_snapshot(fence);
+        owner
+            .register_session(CoordinationRegisterSession {
+                request_id: "coord-session-request-2".to_owned(),
+                session_id: "session-2".to_owned(),
+                principal_id: "principal-2".to_owned(),
+                route_ref: "route-2".to_owned(),
+                authority_epoch: fence.authority_epoch,
+                state_fence: fence.clone(),
+                now: 1,
+                heartbeat_deadline: 100,
+            })
+            .expect("second coordination session");
+        owner
+            .register_work(
+                WorkItem {
+                    work_item_id: "work-2".to_owned(),
+                    task_id: "task-2".to_owned(),
+                    state: WorkState::Ready,
+                    state_fence: fence.clone(),
+                    owner_session_id: None,
+                    lease_id: None,
+                    attempt: 0,
+                    checkpoint_ref: None,
+                    result_ref: None,
+                },
+                "coord-work-request-2",
+                "principal-2",
+                ClockReading::default(),
+            )
+            .expect("second coordination work");
+        owner
+            .acquire_work(WorkLeaseRequest {
+                request_id: "coord-lease-request-2".to_owned(),
+                lease_id: "lease-2".to_owned(),
+                work_item_id: "work-2".to_owned(),
+                session_id: "session-2".to_owned(),
+                authority_epoch: fence.authority_epoch,
+                state_fence: fence.clone(),
+                now: 2,
+                lease_duration: 40,
+            })
+            .expect("second coordination lease");
+        owner
+    }
+
+    fn activation_session_snapshot(fence: &StateFence) -> SessionLifecycleSnapshot {
+        let mut owner = SessionLifecycleOwner::new(fence.authority_epoch, fence.clone())
+            .expect("session owner");
+        let session_id = SessionId::new("session-1").expect("session id");
+        owner
+            .register(RegisterSession {
+                request_id: "session-request-1".to_owned(),
+                event_id: "session-event-1".to_owned(),
+                session_id: session_id.clone(),
+                agent_id: "agent-1".to_owned(),
+                model_route: "route-1".to_owned(),
+                harness: "harness-1".to_owned(),
+                role: "worker".to_owned(),
+                project_scope: "scope-1".to_owned(),
+                task_scope: Some("task-1".to_owned()),
+                capability_profile_id: "profile-1".to_owned(),
+                parent_session_id: None,
+                policy_snapshot_id: "policy-1".to_owned(),
+                authority_epoch: fence.authority_epoch,
+                state_fence: fence.clone(),
+                now: 1,
+                expires_at: 100,
+            })
+            .expect("session register");
+        owner
+            .apply(
+                session_id,
+                SessionCommandContext {
+                    request_id: "session-activate-request".to_owned(),
+                    event_id: "session-activate-event".to_owned(),
+                    actor_ref: "agent-1".to_owned(),
+                    state_fence: fence.clone(),
+                    authority_epoch: fence.authority_epoch,
+                    observed_at: ClockReading::default(),
+                    now: 2,
+                },
+                SessionCommand::Activate,
+            )
+            .expect("session activate");
+        owner.snapshot()
+    }
+
+    fn activation_scope_snapshot(fence: &StateFence) -> eliot_workscope::WorkScopeBindingSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "state_fence": fence,
+            "owner_revision": 1,
+            "binding": {
+                "scope": {
+                    "scope_ref": "scope:work",
+                    "kind": "git_repo",
+                    "lineage_ref": "lineage:work",
+                    "instance_ref": "instance:work",
+                    "root_identity": "root:work",
+                    "generation": 1
+                },
+                "privacy_class": "INTERNAL",
+                "governing_source_generation": 1
+            },
+            "guard_receipt": {
+                "expected_scope_ref": "scope:work",
+                "observed_scope_ref": "scope:work",
+                "expected_lineage_ref": "lineage:work",
+                "observed_lineage_ref": "lineage:work",
+                "expected_instance_ref": "instance:work",
+                "observed_instance_ref": "instance:work",
+                "disposition": "MATCHED",
+                "source_generation": 1
+            }
+        }))
+        .expect("work scope binding")
+    }
+
+    fn activation_fake(observed: &KernelGenerationSnapshot) -> FakeKernel {
+        let fence = observed.state_fence();
+        let mut fake = fake_kernel(observed.clone());
+        fake.payloads.insert(
+            RecoveryOwner::Coordination,
+            canonical_json_bytes(&activation_coordination_snapshot(&fence))
+                .expect("coordination bytes"),
+        );
+        fake.payloads.insert(
+            RecoveryOwner::Session,
+            canonical_json_bytes(&activation_session_snapshot(&fence)).expect("session bytes"),
+        );
+        fake.payloads.insert(
+            RecoveryOwner::Task,
+            canonical_json_bytes(&activation_task_snapshot(&fence)).expect("task bytes"),
+        );
+        fake.payloads.insert(
+            RecoveryOwner::WorkScope,
+            canonical_json_bytes(&activation_scope_snapshot(&fence)).expect("scope bytes"),
+        );
+        fake.payloads.insert(
+            RecoveryOwner::Canonical,
+            canonical_json_bytes(&activation_canonical_snapshot(&fence)).expect("canonical bytes"),
+        );
+        fake
     }
 
     #[test]
@@ -1739,12 +2341,230 @@ mod tests {
     fn kernel_recovery_is_ready_and_start_order_is_fixed() {
         let observed = snapshot();
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
-        let provider = Arc::new(fake_kernel(observed.clone()));
+        let mut fake = fake_kernel(observed.clone());
+        fake.payloads.insert(
+            RecoveryOwner::Canonical,
+            canonical_json_bytes(&activation_canonical_snapshot(&observed.state_fence()))
+                .expect("canonical bytes"),
+        );
+        let provider = Arc::new(fake);
         let composition = GovernorComposition::new(provider, &expected, QueueLimits::default())
             .expect("composition");
         assert_eq!(composition.readiness(), CompositionReadiness::Ready);
         assert_eq!(STARTUP_ORDER[0], ServiceId::Config);
         assert_eq!(STARTUP_ORDER[15], ServiceId::Maintenance);
+        let mut plan = composition
+            .owners()
+            .canonical
+            .read_current_plan(&observed.state_fence())
+            .expect("current canonical plan");
+        assert_eq!(plan.plan_id, "plan:current");
+        plan.plan_revision = "2".to_owned();
+        assert_eq!(
+            composition
+                .owners()
+                .canonical
+                .read_current_plan(&observed.state_fence())
+                .expect("current canonical plan")
+                .plan_revision,
+            "1"
+        );
+    }
+
+    #[test]
+    fn owner_recovery_snapshot_and_digest_exclude_service_observations() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let first = GovernorComposition::new(
+            Arc::new(fake_kernel(observed.clone())),
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("first composition");
+
+        let mut second_fake = fake_kernel(observed.clone());
+        let mut reversed = service_observations(&observed.state_fence());
+        reversed.reverse();
+        second_fake.service_observations = Some(reversed);
+        let second =
+            GovernorComposition::new(Arc::new(second_fake), &expected, QueueLimits::default())
+                .expect("second composition");
+
+        assert_ne!(first.service_observations(), second.service_observations());
+        assert_eq!(first.recovery(), second.recovery());
+        let first_digest = sha256_hex(&serde_json::to_vec(first.recovery()).expect("recovery"));
+        let second_digest = sha256_hex(&serde_json::to_vec(second.recovery()).expect("recovery"));
+        assert_eq!(first_digest, second_digest);
+        let encoded = serde_json::to_value(first.recovery()).expect("recovery JSON");
+        assert!(encoded.get("services").is_none());
+    }
+
+    #[test]
+    fn service_observation_failure_blocks_readiness() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let mut fake = fake_kernel(observed);
+        fake.service_failure = true;
+        let result = GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+        assert!(matches!(result, Err(CompositionError::Recovery(_))));
+    }
+
+    #[test]
+    fn canonical_owner_rejects_invalid_plan_and_fence_bindings() {
+        let observed = snapshot();
+        let active_fence = observed.state_fence();
+        let scope = canonical_scope(&active_fence);
+        let valid_plan = CanonicalPlanBinding::new(
+            "plan:current",
+            "1",
+            TaskId::new("task-1").expect("task id"),
+            "scope:work",
+        )
+        .expect("plan");
+        let valid_snapshot =
+            CanonicalAdmissionSnapshot::new(active_fence.clone(), 1, Some(valid_plan.clone()))
+                .expect("snapshot");
+        let owner = CanonicalAdmissionOwner::new(
+            active_fence.clone(),
+            scope.clone(),
+            valid_snapshot.clone(),
+        )
+        .expect("owner");
+
+        let stale_fence = StateFence::new(
+            AuthorityEpoch::genesis(),
+            ResourceGeneration::new(2).expect("resource generation"),
+        );
+        assert!(owner.read_current_plan(&stale_fence).is_err());
+        let stale_snapshot =
+            CanonicalAdmissionSnapshot::new(stale_fence.clone(), 1, Some(valid_plan.clone()))
+                .expect("stale snapshot");
+        assert!(
+            CanonicalAdmissionOwner::new(active_fence.clone(), scope.clone(), stale_snapshot)
+                .is_err()
+        );
+        assert!(
+            CanonicalAdmissionOwner::new(stale_fence, scope.clone(), valid_snapshot.clone())
+                .is_err()
+        );
+
+        let mut stale_scope = scope;
+        stale_scope.state_fence = StateFence::new(
+            AuthorityEpoch::genesis(),
+            ResourceGeneration::new(2).expect("resource generation"),
+        );
+        assert!(
+            CanonicalAdmissionOwner::new(active_fence.clone(), stale_scope, valid_snapshot)
+                .is_err()
+        );
+
+        assert!(
+            CanonicalPlanBinding::new(
+                "",
+                "1",
+                TaskId::new("task-1").expect("task id"),
+                "scope:work"
+            )
+            .is_err()
+        );
+        assert!(
+            CanonicalPlanBinding::new(
+                "plan:current\n",
+                "1",
+                TaskId::new("task-1").expect("task id"),
+                "scope:work"
+            )
+            .is_err()
+        );
+        assert!(
+            CanonicalPlanBinding::new(
+                "plan:current",
+                "",
+                TaskId::new("task-1").expect("task id"),
+                "scope:work"
+            )
+            .is_err()
+        );
+        assert!(
+            CanonicalPlanBinding::new(
+                "plan:current",
+                "revision\n1",
+                TaskId::new("task-1").expect("task id"),
+                "scope:work"
+            )
+            .is_err()
+        );
+        assert!(
+            CanonicalPlanBinding::new(
+                "plan:current",
+                "1",
+                TaskId::new("task-1").expect("task id"),
+                ""
+            )
+            .is_err()
+        );
+        assert!(CanonicalAdmissionSnapshot::new(active_fence, 0, Some(valid_plan),).is_err());
+    }
+
+    #[test]
+    fn canonical_genesis_null_deserializes_validates_and_denies_activation() {
+        let observed = snapshot();
+        let payload = owner_payload(
+            RecoveryOwner::Canonical,
+            &observed.state_fence(),
+            &observed.protected_snapshot_digest,
+        );
+        let decoded: CanonicalAdmissionSnapshot =
+            serde_json::from_slice(&payload).expect("genesis canonical payload");
+        assert_eq!(decoded.current_plan, None);
+        decoded.validate().expect("genesis null snapshot");
+        assert_eq!(
+            payload,
+            canonical_json_bytes(&decoded).expect("canonical genesis payload bytes")
+        );
+
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let mut fake = activation_fake(&observed);
+        fake.payloads.insert(RecoveryOwner::Canonical, payload);
+        let composition =
+            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+                .expect("genesis null is recoverable");
+        assert!(matches!(
+            composition.read_unique_agent_activation(20),
+            Err(CompositionError::Recovery(message))
+                if message.contains("canonical current plan is absent")
+        ));
+    }
+
+    #[test]
+    fn canonical_recovery_rejects_the_old_empty_owner_snapshot() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let mut fake = fake_kernel(observed.clone());
+        let payload = canonical_json_bytes(&EmptyOwnerSnapshot {
+            state_fence: observed.state_fence().clone(),
+            revision: 1,
+        })
+        .expect("old canonical payload");
+        fake.payloads.insert(RecoveryOwner::Canonical, payload);
+        let result = GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+        assert!(matches!(result, Err(CompositionError::Recovery(_))));
+
+        let mut legacy = fake_kernel(observed.clone());
+        let legacy_unscoped = serde_json::json!({
+            "state_fence": observed.state_fence(),
+            "owner_revision": 1,
+            "current_plan": {
+                "plan_id": "plan:current",
+                "plan_revision": "1"
+            }
+        });
+        legacy.payloads.insert(
+            RecoveryOwner::Canonical,
+            serde_json::to_vec(&legacy_unscoped).expect("legacy canonical payload"),
+        );
+        let result = GovernorComposition::new(Arc::new(legacy), &expected, QueueLimits::default());
+        assert!(matches!(result, Err(CompositionError::Recovery(_))));
     }
 
     #[test]
@@ -1815,11 +2635,11 @@ mod tests {
         let mut fake = fake_kernel(observed.clone());
         fake.payloads.insert(
             RecoveryOwner::Task,
-            serde_json::to_vec(&task_snapshot).expect("task bytes"),
+            canonical_json_bytes(&task_snapshot).expect("task bytes"),
         );
         fake.payloads.insert(
             RecoveryOwner::Session,
-            serde_json::to_vec(&session_snapshot).expect("session bytes"),
+            canonical_json_bytes(&session_snapshot).expect("session bytes"),
         );
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let composition =
@@ -1827,6 +2647,218 @@ mod tests {
                 .expect("composition");
         assert_eq!(composition.owners().task.snapshot(), task_snapshot);
         assert_eq!(composition.owners().session.snapshot(), session_snapshot);
+    }
+
+    #[test]
+    fn unique_agent_activation_requires_and_returns_one_coherent_clone() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let composition = GovernorComposition::new(
+            Arc::new(activation_fake(&observed)),
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("coherent composition");
+
+        let first = composition
+            .read_unique_agent_activation(20)
+            .expect("activation");
+        assert_eq!(first.principal_id, "principal-1");
+        assert_eq!(first.session_id, "session-1");
+        assert_eq!(first.task_id, TaskId::new("task-1").expect("task id"));
+        assert_eq!(first.work_unit_id, "work-1");
+        assert_eq!(first.work_scope_id, "scope:work");
+        assert_eq!(first.plan_id, "plan:current");
+        assert_eq!(first.plan_revision, "1");
+        assert_eq!(
+            first,
+            composition.read_unique_agent_activation(20).expect("clone")
+        );
+    }
+
+    #[test]
+    fn activation_rejects_missing_or_invalid_lifecycle_session() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+
+        let mut missing = activation_fake(&observed);
+        missing.payloads.remove(&RecoveryOwner::Session);
+        let composition =
+            GovernorComposition::new(Arc::new(missing), &expected, QueueLimits::default())
+                .expect("composition");
+        assert!(composition.read_unique_agent_activation(20).is_err());
+
+        let mut inactive_snapshot = activation_session_snapshot(&observed.state_fence());
+        inactive_snapshot
+            .sessions
+            .get_mut(&SessionId::new("session-1").expect("session id"))
+            .expect("session")
+            .status = eliot_session::SessionState::Idle;
+        let mut inactive = activation_fake(&observed);
+        inactive.payloads.insert(
+            RecoveryOwner::Session,
+            canonical_json_bytes(&inactive_snapshot).expect("inactive session bytes"),
+        );
+        let composition =
+            GovernorComposition::new(Arc::new(inactive), &expected, QueueLimits::default())
+                .expect("composition");
+        assert!(composition.read_unique_agent_activation(20).is_err());
+
+        let mut expired_snapshot = activation_session_snapshot(&observed.state_fence());
+        expired_snapshot
+            .sessions
+            .get_mut(&SessionId::new("session-1").expect("session id"))
+            .expect("session")
+            .expires_at = 10;
+        let mut expired = activation_fake(&observed);
+        expired.payloads.insert(
+            RecoveryOwner::Session,
+            canonical_json_bytes(&expired_snapshot).expect("expired session bytes"),
+        );
+        let composition =
+            GovernorComposition::new(Arc::new(expired), &expected, QueueLimits::default())
+                .expect("composition");
+        assert!(composition.read_unique_agent_activation(20).is_err());
+    }
+
+    #[test]
+    fn activation_rejects_session_scope_and_fence_disagreement() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+
+        let mut scoped_snapshot = activation_session_snapshot(&observed.state_fence());
+        scoped_snapshot
+            .sessions
+            .get_mut(&SessionId::new("session-1").expect("session id"))
+            .expect("session")
+            .task_scope = Some("task-other".to_owned());
+        let mut scoped = activation_fake(&observed);
+        scoped.payloads.insert(
+            RecoveryOwner::Session,
+            canonical_json_bytes(&scoped_snapshot).expect("scoped session bytes"),
+        );
+        let composition =
+            GovernorComposition::new(Arc::new(scoped), &expected, QueueLimits::default())
+                .expect("composition");
+        assert!(composition.read_unique_agent_activation(20).is_err());
+
+        let stale_fence = StateFence::new(
+            AuthorityEpoch::genesis(),
+            ResourceGeneration::new(2).expect("generation"),
+        );
+        let mut stale_scope = activation_scope_snapshot(&stale_fence);
+        stale_scope.state_fence = stale_fence;
+        let mut stale = activation_fake(&observed);
+        stale.payloads.insert(
+            RecoveryOwner::WorkScope,
+            canonical_json_bytes(&stale_scope).expect("stale scope bytes"),
+        );
+        assert!(
+            GovernorComposition::new(Arc::new(stale), &expected, QueueLimits::default(),).is_err()
+        );
+
+        let mut stale_task = activation_task_snapshot(&observed.state_fence());
+        stale_task
+            .tasks
+            .get_mut(&TaskId::new("task-1").expect("task id"))
+            .expect("task")
+            .state_fence = StateFence::new(
+            AuthorityEpoch::genesis(),
+            ResourceGeneration::new(2).expect("generation"),
+        );
+        let mut stale_task_fake = activation_fake(&observed);
+        stale_task_fake.payloads.insert(
+            RecoveryOwner::Task,
+            canonical_json_bytes(&stale_task).expect("stale task bytes"),
+        );
+        assert!(
+            GovernorComposition::new(Arc::new(stale_task_fake), &expected, QueueLimits::default(),)
+                .is_err()
+        );
+
+        let mut stale_session = activation_session_snapshot(&observed.state_fence());
+        stale_session
+            .sessions
+            .get_mut(&SessionId::new("session-1").expect("session id"))
+            .expect("session")
+            .state_fence = StateFence::new(
+            AuthorityEpoch::genesis(),
+            ResourceGeneration::new(2).expect("generation"),
+        );
+        let mut stale_session_fake = activation_fake(&observed);
+        stale_session_fake.payloads.insert(
+            RecoveryOwner::Session,
+            canonical_json_bytes(&stale_session).expect("stale session bytes"),
+        );
+        assert!(
+            GovernorComposition::new(
+                Arc::new(stale_session_fake),
+                &expected,
+                QueueLimits::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn activation_rejects_non_actionable_task_and_canonical_join_mismatch() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+
+        let mut terminal_snapshot = activation_task_snapshot(&observed.state_fence());
+        terminal_snapshot
+            .tasks
+            .get_mut(&TaskId::new("task-1").expect("task id"))
+            .expect("task")
+            .state = TaskState::DoneVerified;
+        let mut terminal = activation_fake(&observed);
+        terminal.payloads.insert(
+            RecoveryOwner::Task,
+            canonical_json_bytes(&terminal_snapshot).expect("terminal task bytes"),
+        );
+        let composition =
+            GovernorComposition::new(Arc::new(terminal), &expected, QueueLimits::default())
+                .expect("composition");
+        assert!(composition.read_unique_agent_activation(20).is_err());
+
+        let mismatched_plan = CanonicalAdmissionSnapshot {
+            state_fence: observed.state_fence(),
+            owner_revision: 1,
+            current_plan: Some(CanonicalPlanBinding {
+                plan_id: "plan:current".to_owned(),
+                plan_revision: "1".to_owned(),
+                task_id: TaskId::new("task-other").expect("task id"),
+                work_scope_id: "scope:work".to_owned(),
+            }),
+        };
+        mismatched_plan.validate().expect("plan shape");
+        let mut mismatch = activation_fake(&observed);
+        mismatch.payloads.insert(
+            RecoveryOwner::Canonical,
+            canonical_json_bytes(&mismatched_plan).expect("mismatched plan bytes"),
+        );
+        let composition =
+            GovernorComposition::new(Arc::new(mismatch), &expected, QueueLimits::default())
+                .expect("composition");
+        assert!(composition.read_unique_agent_activation(20).is_err());
+    }
+
+    #[test]
+    fn activation_rejects_ambiguous_coordination_without_map_order_selection() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let mut fake = activation_fake(&observed);
+        fake.payloads.insert(
+            RecoveryOwner::Coordination,
+            canonical_json_bytes(&activation_ambiguous_coordination_snapshot(
+                &observed.state_fence(),
+            ))
+            .expect("ambiguous coordination bytes"),
+        );
+        let composition =
+            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+                .expect("composition");
+        assert!(composition.read_unique_agent_activation(20).is_err());
     }
 
     #[test]
@@ -1848,5 +2880,26 @@ mod tests {
         partial.missing = Some(RecoveryOwner::Task);
         let result = GovernorComposition::new(Arc::new(partial), &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
+    }
+
+    #[test]
+    fn recovery_rejects_semantically_valid_noncanonical_owner_bytes() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let payloads = [
+            br#"{"tasks":{},"next_sequence":1,"events":[]}"#.as_slice(),
+            br#"{ "events": [], "next_sequence": 1, "tasks": {} }"#.as_slice(),
+        ];
+        for payload in payloads {
+            let mut fake = fake_kernel(observed.clone());
+            fake.payloads.insert(RecoveryOwner::Task, payload.to_vec());
+            let result =
+                GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+            assert!(matches!(
+                result,
+                Err(CompositionError::Recovery(message))
+                    if message.contains("owner task payload is not canonical JSON")
+            ));
+        }
     }
 }

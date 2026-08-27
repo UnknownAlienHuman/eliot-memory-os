@@ -81,7 +81,7 @@ fn run() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    let loop_result = runtime.block_on(run_loop(Arc::clone(&kernel)));
+    let loop_result = runtime.block_on(run_loop(Arc::clone(&kernel), &composition));
     let shutdown_result = composition.shutdown().map_err(|error| error.to_string());
     match (loop_result, shutdown_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -155,12 +155,37 @@ where
     })
 }
 
-async fn run_loop(kernel: Arc<DaemonKernelClient>) -> Result<(), String> {
+async fn run_loop(
+    kernel: Arc<DaemonKernelClient>,
+    composition: &DaemonComposition,
+) -> Result<(), String> {
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("daemon shutdown signal: {error}"))?;
                 return Ok(());
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if let Some(ticket) = kernel
+                    .claim_agent_activation_ticket()
+                    .await
+                    .map_err(|error| format!("Kernel activation ticket claim: {error}"))?
+                {
+                    let now = unix_ms();
+                    if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
+                        // Kernel owns the typed expiry outcome.  Do not call
+                        // the resolver at or after its exact deadline.
+                        continue;
+                    }
+                    if let Ok(decision) = composition.resolve_agent_activation(&ticket, now)
+                        && let Err(error) = kernel.submit_agent_activation_decision(&decision).await
+                    {
+                        // Kernel projects the expected deadline race as an
+                        // explicit known outcome. Any remaining transport
+                        // error is a real daemon-loop failure.
+                        return Err(format!("Kernel activation decision submit: {error}"));
+                    }
+                }
             }
             () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                 KernelTransitionPort::health(&*kernel)
@@ -169,6 +194,19 @@ async fn run_loop(kernel: Arc<DaemonKernelClient>) -> Result<(), String> {
             }
         }
     }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
+    now >= deadline
 }
 
 fn ready_message(status: &DaemonStatus) -> ReadyMessage {

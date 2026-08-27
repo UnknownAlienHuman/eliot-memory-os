@@ -21,16 +21,17 @@ use eliot_governor::{
     CompositionError, CompositionReadiness, GovernorComposition, GovernorGenesisRequest,
     GovernorLaunchConfig, KernelDurableJobPort, KernelGenerationPort, KernelGenerationSnapshot,
     KernelGenerationSnapshotProvider, KernelNamedReadReply, KernelNamedReadRequest,
-    KernelPortError, KernelPortFuture, KernelRecoveryPort, KernelServiceRecovery,
-    KernelTransitionPort, QueueLimits,
+    KernelPortError, KernelPortFuture, KernelRecoveryPort, KernelServiceObservationPort,
+    KernelServiceRecovery, KernelTransitionPort, QueueLimits,
 };
 use eliot_maintenance::MaintenanceJob;
 use eliot_platform_windows::{
-    NamedPipePeerExpectation, ProtectedPathError, ProtectedRuntimePathLease,
-    current_process_named_pipe_expectation, protected_program_data_path,
+    KernelFrontDoorAclMode, KernelFrontDoorServerExpectation, ProtectedPathError,
+    ProtectedRuntimePathLease, current_process_named_pipe_expectation, protected_program_data_path,
 };
 use eliot_protocol::{
-    ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
+    AgentActivationResolutionDecision, AgentActivationResolutionTicket, ClientHello,
+    EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
     ProtocolVersion, RequestIdentity, ServerHello,
 };
 use eliot_receipts::RequestBinding;
@@ -80,7 +81,8 @@ struct KernelLaunchBinding {
     authority_epoch: AuthorityEpoch,
     state_fence: StateFence,
     launch_nonce: String,
-    artifact_hash: String,
+    kernel_artifact_sha256: String,
+    daemon_artifact_sha256: String,
 }
 
 /// Errors raised while loading or composing the daemon.
@@ -206,7 +208,8 @@ impl DaemonConfig {
             authority_epoch: launch.kernel.authority_epoch,
             state_fence: StateFence::new(launch.kernel.authority_epoch, launch.kernel.generation),
             launch_nonce: format!("eliotd:{}", launch.instance_id),
-            artifact_hash: launch.kernel.artifact_digest.clone(),
+            kernel_artifact_sha256: launch.kernel.artifact_digest.clone(),
+            daemon_artifact_sha256: launch.kernel.artifact_digest.clone(),
         };
         Ok(Self {
             launch,
@@ -247,7 +250,8 @@ impl DaemonConfig {
             // KernelGenerationExpectation artifact. The former is supplied by
             // the exact launch descriptor; the latter remains the Kernel
             // peer/generation snapshot identity.
-            artifact_hash: expected_artifact_sha256.to_owned(),
+            kernel_artifact_sha256: launch.kernel.artifact_digest.clone(),
+            daemon_artifact_sha256: expected_artifact_sha256.to_owned(),
         };
         Ok(Self {
             launch,
@@ -299,6 +303,10 @@ enum KernelClientError {
     Unknown(String),
     #[error("Kernel transport: {0}")]
     Transport(String),
+    /// A transient connect/ACL race before the Kernel has rebuilt its
+    /// authenticated front-door peer set for this daemon generation.
+    #[error("Kernel pre-admission transport: {0}")]
+    PreAdmissionTransport(String),
     #[error("Kernel has not yet published the exact launched eliotd process receipt")]
     PreAdmissionPending,
 }
@@ -316,7 +324,10 @@ where
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match operation().await {
-            Err(KernelClientError::PreAdmissionPending) => {
+            Err(
+                KernelClientError::PreAdmissionPending
+                | KernelClientError::PreAdmissionTransport(_),
+            ) => {
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
                     return Err(KernelClientError::Transport(deadline_error.to_owned()));
@@ -359,6 +370,45 @@ struct KernelSnapshotWire {
 }
 
 impl DaemonKernelClient {
+    /// Claims the next Kernel-issued semantic activation ticket, preserving
+    /// Kernel FIFO ownership and returning no caller-selected identifiers.
+    #[cfg(windows)]
+    pub async fn claim_agent_activation_ticket(
+        &self,
+    ) -> Result<Option<AgentActivationResolutionTicket>, DaemonError> {
+        let value = self
+            .transact_async("agent_activation_claim", serde_json::json!({}))
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        let ticket = value.get("ticket").cloned().ok_or_else(|| {
+            DaemonError::Kernel("Kernel claim response omitted ticket".to_owned())
+        })?;
+        match ticket {
+            serde_json::Value::Null => Ok(None),
+            value => serde_json::from_value(value)
+                .map(Some)
+                .map_err(|error| DaemonError::Kernel(error.to_string())),
+        }
+    }
+
+    /// Submits exactly one immutable semantic decision for a claimed ticket.
+    #[cfg(windows)]
+    pub async fn submit_agent_activation_decision(
+        &self,
+        decision: &AgentActivationResolutionDecision,
+    ) -> Result<(), DaemonError> {
+        decision
+            .validate()
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        self.transact_async(
+            "agent_activation_submit",
+            serde_json::json!({ "decision": decision }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| DaemonError::Kernel(error.to_string()))
+    }
+
     /// Establishes an authenticated Kernel session and retrieves the
     /// server-owned generation snapshot before returning a client.
     pub fn connect(config: &DaemonConfig) -> Result<Arc<Self>, DaemonError> {
@@ -632,18 +682,20 @@ impl DaemonKernelClient {
     async fn connect_transport(
         &self,
     ) -> Result<(NamedPipeTransport, TransportLimits), KernelClientError> {
-        let expectation = NamedPipePeerExpectation::new(
+        let expectation = KernelFrontDoorServerExpectation::new(
             self.kernel_binding.expected_kernel_sid.as_str(),
             self.kernel_binding.expected_kernel_session_id,
+            self.kernel_binding.kernel_artifact_sha256.as_str(),
+            KernelFrontDoorAclMode::SystemAndLocalServiceWithOptionalUserClient,
         )
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-        let mut transport = NamedPipeTransport::connect_authenticated(
+        let mut transport = NamedPipeTransport::connect_authenticated_kernel_front_door(
             self.kernel_binding.kernel_pipe_name.as_str(),
             Duration::from_secs(5),
             &expectation,
         )
         .await
-        .map_err(|error| KernelClientError::Transport(error.to_string()))?;
+        .map_err(|error| KernelClientError::PreAdmissionTransport(error.to_string()))?;
         match transport.peer_identity() {
             eliot_ipc::PeerIdentity::Authenticated {
                 process_id,
@@ -915,7 +967,9 @@ impl KernelRecoveryPort for DaemonKernelClient {
         let value = kind_value(&value, "durable_jobs")?;
         serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
     }
+}
 
+impl KernelServiceObservationPort for DaemonKernelClient {
     fn services(
         &self,
         state_fence: &StateFence,
@@ -975,7 +1029,7 @@ fn expected_snapshot(
 fn client_hello(binding: &KernelLaunchBinding) -> Result<ClientHello, KernelClientError> {
     let module_id = ContractId::new("eliotd")
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-    let artifact_id = ArtifactId::new(binding.artifact_hash.as_str())
+    let artifact_id = ArtifactId::new(binding.daemon_artifact_sha256.as_str())
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
     let contract = ModuleContract {
         module_id: module_id.clone(),
@@ -1093,6 +1147,7 @@ fn kernel_port_error(error: KernelClientError) -> KernelPortError {
         KernelClientError::Contract(error) => KernelPortError::Contract(error),
         KernelClientError::Unknown(error) => KernelPortError::Unknown(error),
         KernelClientError::Transport(error) => KernelPortError::NotAdmitted(error),
+        KernelClientError::PreAdmissionTransport(error) => KernelPortError::NotAdmitted(error),
         KernelClientError::PreAdmissionPending => KernelPortError::NotAdmitted(
             "Kernel has not published the exact launched process receipt".to_owned(),
         ),
@@ -1177,6 +1232,44 @@ pub struct DaemonComposition {
     config_path: PathBuf,
     state_root: PathBuf,
     started: bool,
+}
+
+/// Read-only semantic-resolution boundary owned by eliotd.
+///
+/// The boundary accepts only a Kernel-issued correlation ticket. It does not
+/// accept caller-selected semantic IDs and does not issue transport sessions,
+/// fences, capabilities, or effects.
+pub trait AgentActivationResolver {
+    /// Resolves one exact ticket against the current Governor owner set.
+    fn resolve_agent_activation(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+        now: u64,
+    ) -> Result<AgentActivationResolutionDecision, DaemonError>;
+}
+
+fn map_activation_snapshot(
+    ticket: &AgentActivationResolutionTicket,
+    snapshot: eliot_governor::GovernorActivationSnapshot,
+) -> Result<AgentActivationResolutionDecision, DaemonError> {
+    AgentActivationResolutionDecision {
+        wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID.to_owned(),
+        wire_version: AgentActivationResolutionDecision::CONTRACT_VERSION,
+        ticket_id: ticket.ticket_id.clone(),
+        ticket_sha256: ticket.ticket_sha256.clone(),
+        state_fence: snapshot.state_fence,
+        principal_id: snapshot.principal_id,
+        session_id: snapshot.session_id,
+        task_id: snapshot.task_id.to_string(),
+        work_unit_id: snapshot.work_unit_id,
+        work_scope_id: snapshot.work_scope_id,
+        task_revision: snapshot.task_revision.to_string(),
+        plan_id: snapshot.plan_id,
+        plan_revision: snapshot.plan_revision,
+        decision_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .map_err(|error| DaemonError::Lifecycle(error.to_string()))
 }
 
 impl DaemonComposition {
@@ -1275,6 +1368,34 @@ impl DaemonComposition {
         }
     }
 
+    /// Resolves one Kernel-issued semantic ticket through the sole Governor.
+    pub fn resolve_agent_activation(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+        now: u64,
+    ) -> Result<AgentActivationResolutionDecision, DaemonError> {
+        ticket
+            .validate()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Lifecycle(
+                "semantic activation resolution requires a ready Governor".to_owned(),
+            ));
+        }
+        if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
+            return Err(DaemonError::Lifecycle(
+                "semantic activation ticket deadline has expired".to_owned(),
+            ));
+        }
+        let snapshot = self.governor.read_unique_agent_activation(now)?;
+        if snapshot.state_fence != ticket.state_fence {
+            return Err(DaemonError::Lifecycle(
+                "semantic activation ticket fence does not match the Governor snapshot".to_owned(),
+            ));
+        }
+        map_activation_snapshot(ticket, snapshot)
+    }
+
     /// Stops the one daemon owner and releases protected handles together.
     pub fn shutdown(mut self) -> Result<(), DaemonError> {
         if !self.started {
@@ -1286,6 +1407,20 @@ impl DaemonComposition {
         self.started = false;
         let _ = (&self.config_lease, &self.state_lease);
         Ok(())
+    }
+}
+
+fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
+    now >= deadline
+}
+
+impl AgentActivationResolver for DaemonComposition {
+    fn resolve_agent_activation(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+        now: u64,
+    ) -> Result<AgentActivationResolutionDecision, DaemonError> {
+        DaemonComposition::resolve_agent_activation(self, ticket, now)
     }
 }
 
@@ -1307,6 +1442,64 @@ mod tests {
             },
             protected_snapshot_digest: "b".repeat(64),
         })
+    }
+
+    fn resolution_ticket() -> Result<AgentActivationResolutionTicket, Box<dyn std::error::Error>> {
+        AgentActivationResolutionTicket {
+            wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+            ticket_id: "ticket-1".to_owned(),
+            activation_request_id: RequestId::new("activation-request-1")?,
+            activation_request_sha256: "a".repeat(64),
+            peer_admission_receipt_sha256: "b".repeat(64),
+            connection_id: "connection-1".to_owned(),
+            state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
+            kernel_deadline_unix_ms: 100,
+            ticket_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(Into::into)
+    }
+
+    #[test]
+    fn semantic_resolution_mapping_is_immutable_and_ticket_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ticket = resolution_ticket()?;
+        ticket.validate()?;
+        let snapshot = eliot_governor::GovernorActivationSnapshot {
+            state_fence: ticket.state_fence.clone(),
+            principal_id: "principal-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            task_id: eliot_contracts::TaskId::new("task-1")?,
+            work_unit_id: "work-1".to_owned(),
+            work_scope_id: "scope-1".to_owned(),
+            task_revision: 7,
+            plan_id: "plan-1".to_owned(),
+            plan_revision: "plan-revision-1".to_owned(),
+        };
+        let decision = map_activation_snapshot(&ticket, snapshot)?;
+        decision.validate_against(&ticket)?;
+        assert_eq!(decision.principal_id, "principal-1");
+        assert_eq!(decision.task_revision, "7");
+        assert_eq!(decision.plan_revision, "plan-revision-1");
+
+        let mut substituted = ticket.clone();
+        substituted.ticket_id = "ticket-other".to_owned();
+        substituted.ticket_sha256 = substituted.compute_digest()?;
+        assert!(decision.validate_against(&substituted).is_err());
+
+        let mut stale = ticket.clone();
+        stale.state_fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(2)?);
+        stale.ticket_sha256 = stale.compute_digest()?;
+        assert!(decision.validate_against(&stale).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_resolution_deadline_is_inclusive() {
+        assert!(!activation_deadline_expired(99, 100));
+        assert!(activation_deadline_expired(100, 100));
+        assert!(activation_deadline_expired(101, 100));
     }
 
     #[test]
@@ -1361,7 +1554,25 @@ mod tests {
             &child_digest,
         )?;
         assert_eq!(child_bound.launch.kernel.artifact_digest, kernel_digest);
-        assert_eq!(child_bound.kernel_binding.artifact_hash, child_digest);
+        assert_eq!(
+            child_bound.kernel_binding.daemon_artifact_sha256,
+            child_digest
+        );
+        assert_eq!(
+            child_bound.kernel_binding.kernel_artifact_sha256,
+            kernel_digest
+        );
+        let front_door = KernelFrontDoorServerExpectation::new(
+            "S-1-5-19",
+            0,
+            &kernel_digest,
+            KernelFrontDoorAclMode::SystemAndLocalServiceWithOptionalUserClient,
+        )?;
+        assert_eq!(front_door.expected_kernel_artifact_sha256(), kernel_digest);
+        assert!(matches!(
+            front_door.acl_mode(),
+            KernelFrontDoorAclMode::SystemAndLocalServiceWithOptionalUserClient
+        ));
 
         let kernel_digest_substitution =
             DaemonConfig::from_launch_with_binding(launch, config_path, nonce, &kernel_digest)?;
@@ -1370,12 +1581,16 @@ mod tests {
             kernel_digest
         );
         assert_eq!(
-            kernel_digest_substitution.kernel_binding.artifact_hash,
+            kernel_digest_substitution
+                .kernel_binding
+                .kernel_artifact_sha256,
             kernel_digest
         );
         assert_ne!(
-            child_bound.kernel_binding.artifact_hash,
-            kernel_digest_substitution.kernel_binding.artifact_hash
+            child_bound.kernel_binding.daemon_artifact_sha256,
+            kernel_digest_substitution
+                .kernel_binding
+                .daemon_artifact_sha256
         );
         Ok(())
     }
@@ -1421,7 +1636,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn receipt_publication_race_retries_only_exact_pre_admission_rejection()
+    async fn receipt_publication_race_retries_only_exact_pre_admission_failures()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection_id = "eliotd:race:test";
         let pending =
@@ -1446,6 +1661,10 @@ mod tests {
                 let attempt = race_attempts.fetch_add(1, Ordering::Relaxed);
                 async move {
                     if attempt == 0 {
+                        Err(KernelClientError::PreAdmissionTransport(
+                            "access denied while the Kernel peer set was rebuilding".to_owned(),
+                        ))
+                    } else if attempt == 1 {
                         Err(KernelClientError::PreAdmissionPending)
                     } else {
                         Ok("same-bound-peer-admitted")
@@ -1456,7 +1675,7 @@ mod tests {
         )
         .await?;
         assert_eq!(admitted, "same-bound-peer-admitted");
-        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
 
         let substituted_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed_attempts = Arc::clone(&substituted_attempts);

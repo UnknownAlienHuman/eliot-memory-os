@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 
+use eliot_contracts::StateFence;
 use eliot_security_contracts::{
     FreshnessStatus, IntegrityStatus, ObservationDomainRef, PrivacyClass, QuarantineState,
     SourceAssurance,
@@ -319,6 +320,27 @@ pub struct ScopeBindingGuardReceipt {
     pub source_generation: u64,
 }
 
+/// The persisted, exact current `WorkScope` binding owned by the governor.
+///
+/// This is a closed snapshot: it carries no task, plan, session, principal or
+/// kernel-generation authority.  Admission and recovery validate the guard
+/// receipt against the retained binding before exposing the snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkScopeBindingSnapshot {
+    pub state_fence: StateFence,
+    pub owner_revision: u64,
+    pub binding: ScopeBinding,
+    pub guard_receipt: ScopeBindingGuardReceipt,
+}
+
+/// The canonical owner for one current `WorkScope` binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkScopeBindingOwner {
+    snapshot: WorkScopeBindingSnapshot,
+}
+
 /// Validation errors for the bounded core.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum WorkScopeError {
@@ -338,6 +360,14 @@ pub enum WorkScopeError {
     SourceSetMismatch,
     #[error("source privacy class is outside the admitted boundary")]
     PrivacyDenied,
+    #[error("state fence is invalid")]
+    InvalidStateFence,
+    #[error("state fence does not match the retained binding")]
+    StateFenceMismatch,
+    #[error("scope binding guard receipt is not matched")]
+    BindingReceiptNotMatched,
+    #[error("scope binding guard receipt does not match the retained binding")]
+    BindingReceiptMismatch,
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), WorkScopeError> {
@@ -726,6 +756,7 @@ impl OnboardingResolver {
 
 /// ELIOT_ARCH_OWNER: ARCH-SCOPE-01
 /// Stateless mid-task scope binding guard.
+#[allow(clippy::doc_markdown)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScopeBindingGuard;
 
@@ -770,9 +801,129 @@ impl ScopeBindingGuard {
     }
 }
 
+impl ScopeBinding {
+    /// Validates the retained binding without inferring any external authority.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        self.scope.validate()?;
+        counter(
+            self.governing_source_generation,
+            "governing_source_generation",
+        )
+    }
+}
+
+impl WorkScopeBindingSnapshot {
+    /// Constructs a persisted current binding only after full receipt closure.
+    pub fn new(
+        state_fence: StateFence,
+        owner_revision: u64,
+        binding: ScopeBinding,
+        guard_receipt: ScopeBindingGuardReceipt,
+    ) -> Result<Self, WorkScopeError> {
+        let snapshot = Self {
+            state_fence,
+            owner_revision,
+            binding,
+            guard_receipt,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Validates the complete closed snapshot before construction or recovery.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        self.state_fence
+            .validate()
+            .map_err(|_| WorkScopeError::InvalidStateFence)?;
+        counter(self.owner_revision, "owner_revision")?;
+        self.binding.validate()?;
+        let receipt = &self.guard_receipt;
+        if receipt.disposition != ScopeBindingDisposition::Matched {
+            return Err(WorkScopeError::BindingReceiptNotMatched);
+        }
+        text(&receipt.expected_scope_ref, "expected_scope_ref")?;
+        text(&receipt.observed_scope_ref, "observed_scope_ref")?;
+        if let Some(lineage) = &receipt.expected_lineage_ref {
+            text(lineage, "expected_lineage_ref")?;
+        }
+        if let Some(lineage) = &receipt.observed_lineage_ref {
+            text(lineage, "observed_lineage_ref")?;
+        }
+        text(&receipt.expected_instance_ref, "expected_instance_ref")?;
+        text(&receipt.observed_instance_ref, "observed_instance_ref")?;
+        counter(receipt.source_generation, "receipt.source_generation")?;
+        let scope = &self.binding.scope;
+        if receipt.expected_scope_ref != scope.scope_ref
+            || receipt.observed_scope_ref != scope.scope_ref
+            || receipt.expected_lineage_ref != scope.lineage_ref
+            || receipt.observed_lineage_ref != scope.lineage_ref
+            || receipt.expected_instance_ref != scope.instance_ref
+            || receipt.observed_instance_ref != scope.instance_ref
+            || receipt.source_generation != self.binding.governing_source_generation
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkScopeBindingSnapshotWire {
+    state_fence: StateFence,
+    owner_revision: u64,
+    binding: ScopeBinding,
+    guard_receipt: ScopeBindingGuardReceipt,
+}
+
+impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WorkScopeBindingSnapshotWire::deserialize(deserializer)?;
+        Self::new(
+            wire.state_fence,
+            wire.owner_revision,
+            wire.binding,
+            wire.guard_receipt,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl WorkScopeBindingOwner {
+    /// Creates the canonical owner after validating the persisted snapshot.
+    pub fn new(snapshot: WorkScopeBindingSnapshot) -> Result<Self, WorkScopeError> {
+        snapshot.validate()?;
+        Ok(Self { snapshot })
+    }
+
+    /// Recovers the owner through the same fail-closed validation path.
+    pub fn from_snapshot(snapshot: WorkScopeBindingSnapshot) -> Result<Self, WorkScopeError> {
+        Self::new(snapshot)
+    }
+
+    /// Reads the current binding only for its exact state fence.
+    pub fn read_current(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<WorkScopeBindingSnapshot, WorkScopeError> {
+        state_fence
+            .validate()
+            .map_err(|_| WorkScopeError::InvalidStateFence)?;
+        self.snapshot.validate()?;
+        if self.snapshot.state_fence != *state_fence {
+            return Err(WorkScopeError::StateFenceMismatch);
+        }
+        Ok(self.snapshot.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
     use serde::de::DeserializeOwned;
 
     fn source(privacy_class: PrivacyClass) -> SourceAssurance {
@@ -835,6 +986,28 @@ mod tests {
             }),
             privacy_class: PrivacyClass::Internal,
         }
+    }
+
+    fn binding_fixture() -> (StateFence, ScopeBinding, ScopeBindingGuardReceipt) {
+        let one = candidate("instance:a");
+        let binding = ScopeBinding {
+            scope: one.scope.clone(),
+            privacy_class: PrivacyClass::Internal,
+            governing_source_generation: 1,
+        };
+        let receipt = ScopeBindingGuard.check(
+            &binding,
+            &binding,
+            &source_set(&one),
+            &PrivacyProfile {
+                admitted_classes: vec![PrivacyClass::Internal],
+            },
+        );
+        (
+            StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            binding,
+            receipt,
+        )
     }
 
     fn source_set(scope: &WorkScopeCandidate) -> GoverningSourceSet {
@@ -990,5 +1163,129 @@ mod tests {
             receipt.disposition,
             ScopeBindingDisposition::DifferentInstance
         );
+    }
+
+    #[test]
+    fn current_binding_owner_constructs_recovers_and_reads_a_clone() {
+        let (state_fence, binding, receipt) = binding_fixture();
+        let snapshot = match WorkScopeBindingSnapshot::new(state_fence.clone(), 7, binding, receipt)
+        {
+            Ok(value) => value,
+            Err(error) => panic!("binding snapshot fixture is invalid: {error}"),
+        };
+        let owner = match WorkScopeBindingOwner::new(snapshot.clone()) {
+            Ok(value) => value,
+            Err(error) => panic!("binding owner fixture is invalid: {error}"),
+        };
+        let mut read = match owner.read_current(&state_fence) {
+            Ok(value) => value,
+            Err(error) => panic!("current binding read failed: {error}"),
+        };
+        assert_eq!(read, snapshot);
+        read.owner_revision = 8;
+        assert_eq!(
+            owner
+                .read_current(&state_fence)
+                .map(|value| value.owner_revision),
+            Ok(7)
+        );
+
+        let encoded = match serde_json::to_value(&snapshot) {
+            Ok(value) => value,
+            Err(error) => panic!("binding snapshot serialization failed: {error}"),
+        };
+        let recovered_snapshot: WorkScopeBindingSnapshot = from_json(encoded.clone());
+        assert_eq!(recovered_snapshot, snapshot);
+        let recovered_owner = match WorkScopeBindingOwner::from_snapshot(recovered_snapshot) {
+            Ok(value) => value,
+            Err(error) => panic!("binding owner recovery failed: {error}"),
+        };
+        assert_eq!(recovered_owner.read_current(&state_fence), Ok(snapshot));
+    }
+
+    #[test]
+    fn current_binding_owner_rejects_stale_fence_and_zero_revision() {
+        let (expected_fence, binding, receipt) = binding_fixture();
+        let snapshot = match WorkScopeBindingSnapshot::new(
+            expected_fence.clone(),
+            1,
+            binding.clone(),
+            receipt.clone(),
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("binding snapshot fixture is invalid: {error}"),
+        };
+        let owner = match WorkScopeBindingOwner::new(snapshot) {
+            Ok(value) => value,
+            Err(error) => panic!("binding owner fixture is invalid: {error}"),
+        };
+        let stale_fence = StateFence::new(
+            AuthorityEpoch::genesis(),
+            ResourceGeneration::new(2).unwrap_or(ResourceGeneration::genesis()),
+        );
+        assert_eq!(
+            owner.read_current(&stale_fence),
+            Err(WorkScopeError::StateFenceMismatch)
+        );
+        assert_eq!(
+            WorkScopeBindingSnapshot::new(expected_fence, 0, binding, receipt),
+            Err(WorkScopeError::InvalidCounter {
+                field: "owner_revision"
+            })
+        );
+    }
+
+    #[test]
+    fn current_binding_owner_rejects_non_matched_receipts() {
+        let (state_fence, binding, mut receipt) = binding_fixture();
+        receipt.disposition = ScopeBindingDisposition::DifferentInstance;
+        assert_eq!(
+            WorkScopeBindingSnapshot::new(state_fence, 1, binding, receipt),
+            Err(WorkScopeError::BindingReceiptNotMatched)
+        );
+    }
+
+    #[test]
+    fn current_binding_owner_rejects_receipt_identity_drift() {
+        let (state_fence, binding, receipt) = binding_fixture();
+        let mut cases = Vec::new();
+
+        let mut scope_ref = receipt.clone();
+        scope_ref.expected_scope_ref = "scope:other".into();
+        cases.push(scope_ref);
+        let mut lineage = receipt.clone();
+        lineage.observed_lineage_ref = Some("lineage:other".into());
+        cases.push(lineage);
+        let mut instance = receipt.clone();
+        instance.expected_instance_ref = "instance:other".into();
+        cases.push(instance);
+        let mut generation = receipt;
+        generation.source_generation = 2;
+        cases.push(generation);
+
+        for drifted_receipt in cases {
+            assert_eq!(
+                WorkScopeBindingSnapshot::new(
+                    state_fence.clone(),
+                    1,
+                    binding.clone(),
+                    drifted_receipt,
+                ),
+                Err(WorkScopeError::BindingReceiptMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_deserialization_rejects_non_matched_receipt() {
+        let (state_fence, binding, mut receipt) = binding_fixture();
+        receipt.disposition = ScopeBindingDisposition::Conflicted;
+        let invalid = serde_json::json!({
+            "state_fence": state_fence,
+            "owner_revision": 1,
+            "binding": binding,
+            "guard_receipt": receipt,
+        });
+        assert!(serde_json::from_value::<WorkScopeBindingSnapshot>(invalid).is_err());
     }
 }
