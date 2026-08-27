@@ -29,14 +29,16 @@ use serde_json::{Map, Value, json};
 const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * FROM ONLY schema_meta:current; SELECT VALUE body FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
 
 /// The durable canonical fence singleton.
-#[derive(Debug, Serialize, serde::Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FenceRecord {
     state_fence: StateFence,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
 
-#[derive(Debug, Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SchemaMetaRecord {
     generation: String,
     migrations: Vec<SchemaMigrationIdentity>,
@@ -47,7 +49,8 @@ struct SchemaMetaRecord {
     updated_at: String,
 }
 
-#[derive(Debug, Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SchemaMigrationIdentity {
     migration_id: String,
     migration_checksum_sha256: String,
@@ -58,16 +61,63 @@ struct SchemaMigrationIdentity {
 enum MigrationPreflight {
     Empty,
     ExactReplay,
+    V1ToV2,
+}
+
+fn v1_identity() -> SchemaMigrationIdentity {
+    SchemaMigrationIdentity {
+        migration_id: schema::MIGRATION_ID_V1.to_owned(),
+        migration_checksum_sha256: schema::SCHEMA_DDL_V1_SHA256.to_owned(),
+        generation: schema::GENERATION_V1.to_owned(),
+    }
+}
+
+fn validate_v1_pin() -> bool {
+    eliot_store_api::sha256_hex(schema::SCHEMA_DDL.as_bytes()) == schema::SCHEMA_DDL_V1_SHA256
 }
 
 fn schema_meta_record(migration: &CompiledMigration, updated_at: &str) -> SchemaMetaRecord {
-    SchemaMetaRecord {
-        generation: migration.generation_after.as_str().to_owned(),
-        migrations: vec![SchemaMigrationIdentity {
+    let migrations = if migration.generation_after.as_str() == schema::GENERATION_V2 {
+        vec![
+            v1_identity(),
+            SchemaMigrationIdentity {
+                migration_id: migration.migration_id.clone(),
+                migration_checksum_sha256: migration.checksum_sha256.clone(),
+                generation: migration.generation_after.as_str().to_owned(),
+            },
+        ]
+    } else {
+        vec![SchemaMigrationIdentity {
             migration_id: migration.migration_id.clone(),
             migration_checksum_sha256: migration.checksum_sha256.clone(),
             generation: migration.generation_after.as_str().to_owned(),
-        }],
+        }]
+    };
+    SchemaMetaRecord {
+        generation: migration.generation_after.as_str().to_owned(),
+        migrations,
+        compatible_bridge_range: crate::ADAPTER_NAME.to_owned(),
+        migration_state: "APPLIED".to_owned(),
+        migration_id: migration.migration_id.clone(),
+        migration_checksum_sha256: migration.checksum_sha256.clone(),
+        updated_at: updated_at.to_owned(),
+    }
+}
+
+fn schema_meta_record_for_v1_to_v2(
+    existing: &SchemaMetaRecord,
+    migration: &CompiledMigration,
+    updated_at: &str,
+) -> SchemaMetaRecord {
+    let mut migrations = existing.migrations.clone();
+    migrations.push(SchemaMigrationIdentity {
+        migration_id: migration.migration_id.clone(),
+        migration_checksum_sha256: migration.checksum_sha256.clone(),
+        generation: migration.generation_after.as_str().to_owned(),
+    });
+    SchemaMetaRecord {
+        generation: migration.generation_after.as_str().to_owned(),
+        migrations,
         compatible_bridge_range: crate::ADAPTER_NAME.to_owned(),
         migration_state: "APPLIED".to_owned(),
         migration_id: migration.migration_id.clone(),
@@ -88,6 +138,14 @@ fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(), AdapterE
     {
         return Err(AdapterError::PartialOutcome);
     }
+    if record.compatible_bridge_range != crate::ADAPTER_NAME {
+        return Err(AdapterError::Config(
+            "schema metadata belongs to an incompatible adapter".to_owned(),
+        ));
+    }
+    if record.migration_state != "APPLIED" {
+        return Err(AdapterError::PartialOutcome);
+    }
     let Some(last) = record.migrations.last() else {
         return Err(AdapterError::PartialOutcome);
     };
@@ -99,6 +157,65 @@ fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(), AdapterE
         || last.generation != record.generation
     {
         return Err(AdapterError::PartialOutcome);
+    }
+    if record.generation == schema::GENERATION_V1 {
+        if record.migrations.len() != 1 {
+            return Err(AdapterError::PartialOutcome);
+        }
+        let first = &record.migrations[0];
+        let expected = v1_identity();
+        if first.migration_id != expected.migration_id
+            || first.migration_checksum_sha256 != expected.migration_checksum_sha256
+            || first.generation != expected.generation
+        {
+            return Err(AdapterError::PartialOutcome);
+        }
+        if record.migration_id != schema::MIGRATION_ID_V1
+            || record.migration_checksum_sha256 != expected.migration_checksum_sha256
+        {
+            return Err(AdapterError::PartialOutcome);
+        }
+    } else if record.generation == schema::GENERATION_V2 {
+        if record.migrations.len() != 2 {
+            return Err(AdapterError::PartialOutcome);
+        }
+        let first = &record.migrations[0];
+        let expected_v1 = v1_identity();
+        if first.migration_id != expected_v1.migration_id
+            || first.migration_checksum_sha256 != expected_v1.migration_checksum_sha256
+            || first.generation != expected_v1.generation
+        {
+            return Err(AdapterError::PartialOutcome);
+        }
+        let v2_checksum_full = eliot_store_api::sha256_hex(schema::SCHEMA_DDL_V2.as_bytes());
+        let v2_checksum_delta =
+            eliot_store_api::sha256_hex(schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.as_bytes());
+        let last = &record.migrations[1];
+        if last.generation != schema::GENERATION_V2 {
+            return Err(AdapterError::PartialOutcome);
+        }
+        if !(last.migration_id == schema::MIGRATION_ID_V2
+            && last.migration_checksum_sha256 == v2_checksum_full
+            || last.migration_id == schema::MIGRATION_ID_V1_TO_V2
+                && last.migration_checksum_sha256 == v2_checksum_delta)
+        {
+            return Err(AdapterError::PartialOutcome);
+        }
+        if record.migration_id != last.migration_id
+            || record.migration_checksum_sha256 != last.migration_checksum_sha256
+        {
+            return Err(AdapterError::PartialOutcome);
+        }
+    } else {
+        return Err(AdapterError::PartialOutcome);
+    }
+    for entry in &record.migrations {
+        if !non_blank(&entry.migration_id)
+            || !non_blank(&entry.migration_checksum_sha256)
+            || !non_blank(&entry.generation)
+        {
+            return Err(AdapterError::PartialOutcome);
+        }
     }
     Ok(())
 }
@@ -114,12 +231,161 @@ fn validate_fence_record(record: &FenceRecord) -> Result<(), AdapterError> {
     Ok(())
 }
 
+fn is_admitted_migration(migration: &CompiledMigration) -> bool {
+    if !validate_v1_pin() {
+        return false;
+    }
+    if migration.migration_id == schema::MIGRATION_ID_V1
+        && migration.checksum_sha256 == schema::SCHEMA_DDL_V1_SHA256
+        && migration.generation_after.as_str() == schema::GENERATION_V1
+        && migration.statements.trim() == schema::SCHEMA_DDL.trim()
+    {
+        return true;
+    }
+    let v2_full = eliot_store_api::sha256_hex(schema::SCHEMA_DDL_V2.as_bytes());
+    if migration.migration_id == schema::MIGRATION_ID_V2
+        && migration.checksum_sha256 == v2_full
+        && migration.generation_after.as_str() == schema::GENERATION_V2
+        && migration.statements.trim() == schema::SCHEMA_DDL_V2.trim()
+    {
+        return true;
+    }
+    let v2_delta = eliot_store_api::sha256_hex(schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.as_bytes());
+    if migration.migration_id == schema::MIGRATION_ID_V1_TO_V2
+        && migration.checksum_sha256 == v2_delta
+        && migration.generation_after.as_str() == schema::GENERATION_V2
+        && migration.statements.trim() == schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.trim()
+    {
+        return true;
+    }
+    false
+}
+
+fn is_guard_conflict(error: &str) -> bool {
+    error.contains("schema_predecessor_mismatch") || error.contains("schema_fence_guard_mismatch")
+}
+
+fn build_empty_sql(statements: &str) -> String {
+    format!(
+        "{} {} {} {} {}",
+        schema::TX_BEGIN,
+        statements.trim(),
+        schema::TX_CREATE_FENCE,
+        schema::TX_CREATE_SCHEMA_META,
+        schema::TX_COMMIT
+    )
+}
+
+fn build_empty_bindings(
+    migration: &CompiledMigration,
+    updated_at: &str,
+    state_fence: &StateFence,
+) -> Map<String, Value> {
+    let record = schema_meta_record(migration, updated_at);
+    let mut m = Map::new();
+    m.insert(
+        "schema_meta_table".to_owned(),
+        json!(schema::table::SCHEMA_META),
+    );
+    m.insert("schema_meta_key".to_owned(), json!(schema::SCHEMA_META_KEY));
+    m.insert("schema_meta_record".to_owned(), json!(record));
+    m.insert(
+        "fence_table".to_owned(),
+        json!(schema::table::CANONICAL_FENCE),
+    );
+    m.insert("fence_key".to_owned(), json!(schema::FENCE_KEY));
+    m.insert(
+        "fence".to_owned(),
+        json!({
+            "state_fence": state_fence,
+            "next_commit_sequence": 1_u64,
+            "next_outbox_sequence": 1_u64,
+        }),
+    );
+    m
+}
+
+fn build_forward_sql() -> String {
+    schema::forward_migration_sql()
+}
+
+fn build_forward_bindings(
+    existing: &SchemaMetaRecord,
+    fence: &FenceRecord,
+    new_record: &SchemaMetaRecord,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("expected_state_fence".to_owned(), json!(fence.state_fence));
+    m.insert(
+        "expected_commit_sequence".to_owned(),
+        json!(fence.next_commit_sequence),
+    );
+    m.insert(
+        "expected_outbox_sequence".to_owned(),
+        json!(fence.next_outbox_sequence),
+    );
+    m.insert("expected_generation".to_owned(), json!(existing.generation));
+    m.insert(
+        "expected_migration_id".to_owned(),
+        json!(existing.migration_id),
+    );
+    m.insert(
+        "expected_migration_checksum_sha256".to_owned(),
+        json!(existing.migration_checksum_sha256),
+    );
+    m.insert(
+        "expected_bridge_range".to_owned(),
+        json!(existing.compatible_bridge_range),
+    );
+    m.insert(
+        "expected_migration_state".to_owned(),
+        json!(existing.migration_state),
+    );
+    m.insert(
+        "expected_migrations_len".to_owned(),
+        json!(existing.migrations.len()),
+    );
+    let first = &existing.migrations[0];
+    m.insert(
+        "expected_migration_0_id".to_owned(),
+        json!(first.migration_id),
+    );
+    m.insert(
+        "expected_migration_0_checksum".to_owned(),
+        json!(first.migration_checksum_sha256),
+    );
+    m.insert(
+        "expected_migration_0_generation".to_owned(),
+        json!(first.generation),
+    );
+    m.insert("expected_updated_at".to_owned(), json!(existing.updated_at));
+    m.insert(
+        "schema_meta_table".to_owned(),
+        json!(schema::table::SCHEMA_META),
+    );
+    m.insert("schema_meta_key".to_owned(), json!(schema::SCHEMA_META_KEY));
+    m.insert("schema_meta_record".to_owned(), json!(new_record));
+    m
+}
+
 fn migration_preflight(
     record: Option<SchemaMetaRecord>,
     migration: &CompiledMigration,
 ) -> Result<MigrationPreflight, AdapterError> {
+    if !is_admitted_migration(migration) {
+        return Err(AdapterError::Config(
+            "migration plan is not admitted by the S-03 schema compiler".to_owned(),
+        ));
+    }
     let Some(record) = record else {
-        return Ok(MigrationPreflight::Empty);
+        if migration.migration_id == schema::MIGRATION_ID_V2
+            && migration.generation_after.as_str() == schema::GENERATION_V2
+        {
+            return Ok(MigrationPreflight::Empty);
+        }
+        return Err(AdapterError::Config(
+            "empty database admits exactly the v2 initial plan".to_owned(),
+        ));
     };
     validate_schema_meta_record(&record)?;
     if record.migration_state != "APPLIED" {
@@ -135,6 +401,18 @@ fn migration_preflight(
         && record.generation == migration.generation_after.as_str()
     {
         return Ok(MigrationPreflight::ExactReplay);
+    }
+    if record.generation == schema::GENERATION_V1
+        && record.migration_id == schema::MIGRATION_ID_V1
+        && record.migrations.len() == 1
+        && migration.migration_id == schema::MIGRATION_ID_V1_TO_V2
+        && migration.generation_after.as_str() == schema::GENERATION_V2
+    {
+        let expected = v1_identity();
+        if record.migration_checksum_sha256 != expected.migration_checksum_sha256 {
+            return Err(AdapterError::PartialOutcome);
+        }
+        return Ok(MigrationPreflight::V1ToV2);
     }
     Err(AdapterError::Config(
         "schema migration identity does not match the admitted plan".to_owned(),
@@ -254,13 +532,31 @@ pub(crate) async fn probe_readiness(
     adapter: &SurrealStoreAdapter,
 ) -> Result<SemanticReadiness, AdapterError> {
     let db = client(adapter).await?;
-    let observed = probe_generation(db, &adapter.config).await?;
-    let readiness =
-        readiness_from_observation(observed, &adapter.config.expected_schema_generation);
+    observe_readiness(db, &adapter.config).await
+}
+
+async fn observe_readiness(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<SemanticReadiness, AdapterError> {
+    let observed = probe_generation(db, config).await?;
+    let readiness = readiness_from_observation(observed, &config.expected_schema_generation);
     if matches!(readiness, SemanticReadiness::Ready { .. }) {
-        let Some(fence) = read_fence(db, &adapter.config).await? else {
+        let fence = read_fence(db, config).await?;
+        return readiness_with_fence(readiness, fence, &config.expected_schema_generation);
+    }
+    Ok(readiness)
+}
+
+fn readiness_with_fence(
+    readiness: SemanticReadiness,
+    fence: Option<FenceRecord>,
+    expected: &SchemaGeneration,
+) -> Result<SemanticReadiness, AdapterError> {
+    if matches!(readiness, SemanticReadiness::Ready { .. }) {
+        let Some(fence) = fence else {
             return Ok(SemanticReadiness::MigrationRequired {
-                expected: adapter.config.expected_schema_generation.clone(),
+                expected: expected.clone(),
                 observed: None,
             });
         };
@@ -293,12 +589,107 @@ pub(crate) async fn ensure_ready(
     adapter: &SurrealStoreAdapter,
     db: &client::RpcTransport,
 ) -> Result<(), AdapterError> {
-    let observed = probe_generation(db, &adapter.config).await?;
-    match readiness_from_observation(observed, &adapter.config.expected_schema_generation) {
+    match observe_readiness(db, &adapter.config).await? {
         SemanticReadiness::Ready { .. } => Ok(()),
         SemanticReadiness::MigrationRequired { .. } | SemanticReadiness::Unavailable => {
             Err(AdapterError::MigrationRequired)
         }
+    }
+}
+
+async fn handle_empty_migration(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    migration: &CompiledMigration,
+    state_fence: &StateFence,
+    updated_at: &str,
+) -> Result<MigrationReceipt, AdapterError> {
+    let sql = build_empty_sql(migration.statements.trim());
+    let bindings = build_empty_bindings(migration, updated_at, state_fence);
+    let mut response = client::query(db, config, "migration.apply", &sql, bindings).await?;
+    let errors = response.take_errors();
+    if errors.iter().any(|e| is_guard_conflict(e)) {
+        return Err(AdapterError::Config("forward guard conflict".to_owned()));
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::UnknownMigrationOutcome {
+            migration_id: migration.migration_id.clone(),
+        });
+    }
+    let observed = read_schema_meta(db, config).await?;
+    match migration_preflight(observed, migration) {
+        Ok(MigrationPreflight::ExactReplay) => {
+            let fence = read_fence(db, config).await?;
+            let Some(fence) = fence else {
+                return Err(AdapterError::PartialOutcome);
+            };
+            validate_fence_record(&fence)?;
+            if fence.state_fence != *state_fence {
+                return Err(AdapterError::PartialOutcome);
+            }
+            Ok(migration_receipt(migration))
+        }
+        _ => Err(AdapterError::PartialOutcome),
+    }
+}
+
+async fn handle_forward_migration(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    migration: &CompiledMigration,
+    existing: SchemaMetaRecord,
+    fence: FenceRecord,
+    state_fence: &StateFence,
+    updated_at: &str,
+) -> Result<MigrationReceipt, AdapterError> {
+    if migration
+        .statements
+        .trim()
+        .to_ascii_lowercase()
+        .contains("drop ")
+        || migration
+            .statements
+            .trim()
+            .to_ascii_lowercase()
+            .contains("delete ")
+        || migration
+            .statements
+            .trim()
+            .to_ascii_lowercase()
+            .contains("remove ")
+    {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let record = schema_meta_record_for_v1_to_v2(&existing, migration, updated_at);
+    let sql = build_forward_sql();
+    let bindings = build_forward_bindings(&existing, &fence, &record);
+    let mut response = client::query(db, config, "migration.apply", &sql, bindings).await?;
+    let errors = response.take_errors();
+    if errors.iter().any(|e| is_guard_conflict(e)) {
+        return Err(AdapterError::Config("forward guard conflict".to_owned()));
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::UnknownMigrationOutcome {
+            migration_id: migration.migration_id.clone(),
+        });
+    }
+    let observed = read_schema_meta(db, config).await?;
+    match migration_preflight(observed, migration) {
+        Ok(MigrationPreflight::ExactReplay) => {
+            let after = read_fence(db, config).await?;
+            let Some(after) = after else {
+                return Err(AdapterError::PartialOutcome);
+            };
+            validate_fence_record(&after)?;
+            if after.state_fence != *state_fence
+                || after.next_commit_sequence != fence.next_commit_sequence
+                || after.next_outbox_sequence != fence.next_outbox_sequence
+            {
+                return Err(AdapterError::PartialOutcome);
+            }
+            Ok(migration_receipt(migration))
+        }
+        _ => Err(AdapterError::PartialOutcome),
     }
 }
 
@@ -312,29 +703,30 @@ pub(crate) async fn apply_migration(
     let db = client(adapter).await?;
     migration
         .validate()
-        .map_err(|reason| AdapterError::Config(reason.to_owned()))?;
-    if migration.statements.trim() != schema::SCHEMA_DDL.trim() {
+        .map_err(|r| AdapterError::Config(r.to_owned()))?;
+    if !is_admitted_migration(migration) {
         return Err(AdapterError::Config(
             "migration plan is not admitted by the S-03 schema compiler".to_owned(),
         ));
     }
     let _guard = adapter.write_lock.lock().await;
     state_fence.validate().map_err(StoreError::Foundation)?;
-    let preflight = migration_preflight(read_schema_meta(db, &adapter.config).await?, migration)?;
+    let existing = read_schema_meta(db, &adapter.config).await?;
+    let preflight = migration_preflight(existing.clone(), migration)?;
     if matches!(preflight, MigrationPreflight::ExactReplay) {
-        let fence = read_fence(db, &adapter.config).await?;
-        let Some(fence) = fence else {
+        let f = read_fence(db, &adapter.config).await?;
+        let Some(f) = f else {
             return Err(AdapterError::PartialOutcome);
         };
-        validate_fence_record(&fence)?;
-        if fence.state_fence != *state_fence {
+        validate_fence_record(&f)?;
+        if f.state_fence != *state_fence {
             return Err(AdapterError::PartialOutcome);
         }
         return Ok(migration_receipt(migration));
     }
     observed_clock
         .validate()
-        .map_err(|error| AdapterError::Config(error.to_string()))?;
+        .map_err(|e| AdapterError::Config(e.to_string()))?;
     let updated_at = observed_clock
         .known_time_ms
         .or(observed_clock.valid_time_ms)
@@ -342,47 +734,13 @@ pub(crate) async fn apply_migration(
             AdapterError::Config(
                 "migration requires an observed P-01 wall-clock timestamp".to_owned(),
             )
-        })?;
-    let statements = migration.statements.trim();
-    let sql = format!(
-        "{} {} {} {} {}",
-        schema::TX_BEGIN,
-        statements,
-        schema::TX_CREATE_FENCE,
-        schema::TX_CREATE_SCHEMA_META,
-        schema::TX_COMMIT,
-    );
-    let record = schema_meta_record(migration, &updated_at.to_string());
-    let mut bindings = Map::new();
-    bindings.insert(
-        "schema_meta_table".to_owned(),
-        json!(schema::table::SCHEMA_META),
-    );
-    bindings.insert("schema_meta_key".to_owned(), json!(schema::SCHEMA_META_KEY));
-    bindings.insert("schema_meta_record".to_owned(), json!(record));
-    bindings.insert(
-        "fence_table".to_owned(),
-        json!(schema::table::CANONICAL_FENCE),
-    );
-    bindings.insert("fence_key".to_owned(), json!(schema::FENCE_KEY));
-    bindings.insert(
-        "fence".to_owned(),
-        json!({
-            "state_fence": state_fence,
-            "next_commit_sequence": 1_u64,
-            "next_outbox_sequence": 1_u64,
-        }),
-    );
-    let mut response =
-        client::query(db, &adapter.config, "migration.apply", &sql, bindings).await?;
-    if !response.take_errors().is_empty() {
-        return Err(AdapterError::UnknownMigrationOutcome {
-            migration_id: migration.migration_id.clone(),
-        });
-    }
-    let observed = read_schema_meta(db, &adapter.config).await?;
-    match migration_preflight(observed, migration) {
-        Ok(MigrationPreflight::ExactReplay) => {
+        })?
+        .to_string();
+    match preflight {
+        MigrationPreflight::Empty => {
+            handle_empty_migration(db, &adapter.config, migration, state_fence, &updated_at).await
+        }
+        MigrationPreflight::V1ToV2 => {
             let fence = read_fence(db, &adapter.config).await?;
             let Some(fence) = fence else {
                 return Err(AdapterError::PartialOutcome);
@@ -391,9 +749,21 @@ pub(crate) async fn apply_migration(
             if fence.state_fence != *state_fence {
                 return Err(AdapterError::PartialOutcome);
             }
-            Ok(migration_receipt(migration))
+            let Some(existing) = existing else {
+                return Err(AdapterError::PartialOutcome);
+            };
+            handle_forward_migration(
+                db,
+                &adapter.config,
+                migration,
+                existing,
+                fence,
+                state_fence,
+                &updated_at,
+            )
+            .await
         }
-        Ok(MigrationPreflight::Empty) | Err(_) => Err(AdapterError::PartialOutcome),
+        MigrationPreflight::ExactReplay => Ok(migration_receipt(migration)),
     }
 }
 
@@ -502,6 +872,8 @@ pub(crate) async fn apply_prepared(
         fence.is_none(),
         fence.as_ref().map_or(1, |value| value.next_commit_sequence),
         fence.as_ref().map_or(1, |value| value.next_outbox_sequence),
+        &current_revisions,
+        &current_orderings,
     )
     .await?;
 
@@ -928,8 +1300,15 @@ async fn write_transaction(
     initial_state: bool,
     expected_commit_sequence: u64,
     expected_outbox_sequence: u64,
+    current_revisions: &[RevisionHead],
+    current_orderings: &[OrderingHead],
 ) -> Result<(), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
+    let revision = plan.next_revision_heads.first().ok_or_else(|| {
+        AdapterError::Serialization(
+            "prepared transition plan is missing its required revision head".to_owned(),
+        )
+    })?;
     let mut sql = String::from(schema::TX_BEGIN);
     let mut bindings = Map::new();
 
@@ -964,20 +1343,14 @@ async fn write_transaction(
         json!(expected_outbox_sequence),
     );
 
-    sql.push_str(if initial_state {
-        schema::TX_CREATE_REVISION
-    } else {
-        schema::TX_UPSERT_REVISION
-    });
+    let revision_exists = current_revisions
+        .iter()
+        .any(|head| head.key == revision.key);
+    sql.push_str(revision_write_template(initial_state, revision_exists));
     bindings.insert(
         "revision_table".to_owned(),
         json!(schema::table::REVISION_HEAD),
     );
-    let revision = plan.next_revision_heads.first().ok_or_else(|| {
-        AdapterError::Serialization(
-            "prepared transition plan is missing its required revision head".to_owned(),
-        )
-    })?;
     bindings.insert("revision_key".to_owned(), json!(revision.key.to_string()));
     bindings.insert(
         "revision_record".to_owned(),
@@ -996,11 +1369,10 @@ async fn write_transaction(
     );
 
     for (index, head) in plan.next_ordering_heads.iter().enumerate() {
-        let template = if initial_state {
-            schema::TX_CREATE_ORDERING
-        } else {
-            schema::TX_UPSERT_ORDERING
-        };
+        let ordering_exists = current_orderings
+            .iter()
+            .any(|current| current.scope == head.scope);
+        let template = ordering_write_template(initial_state, ordering_exists);
         sql.push_str(&schema::indexed(template, index));
         let suffix = index.to_string();
         bindings.insert(
@@ -1319,60 +1691,263 @@ fn to_value<T: Serialize>(value: &T) -> Result<Value, AdapterError> {
     serde_json::to_value(value).map_err(|error| AdapterError::Serialization(error.to_string()))
 }
 
+fn revision_write_template(initial_state: bool, exists: bool) -> &'static str {
+    if initial_state || !exists {
+        schema::TX_CREATE_REVISION
+    } else {
+        schema::TX_UPSERT_REVISION
+    }
+}
+
+fn ordering_write_template(initial_state: bool, exists: bool) -> &'static str {
+    if initial_state || !exists {
+        schema::TX_CREATE_ORDERING
+    } else {
+        schema::TX_UPSERT_ORDERING
+    }
+}
+
 #[cfg(test)]
 mod migration_tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
 
-    fn migration() -> CompiledMigration {
+    fn v1_migration() -> CompiledMigration {
         CompiledMigration::new(
-            "eliot.store.surreal.schema.v1",
+            schema::MIGRATION_ID_V1,
             schema::SCHEMA_DDL,
-            SchemaGeneration::new("1.0.0").expect("valid generation"),
+            SchemaGeneration::new(schema::GENERATION_V1).expect("valid"),
+        )
+    }
+
+    fn v2_baseline_migration() -> CompiledMigration {
+        CompiledMigration::new(
+            schema::MIGRATION_ID_V2,
+            schema::SCHEMA_DDL_V2,
+            SchemaGeneration::new(schema::GENERATION_V2).expect("valid"),
+        )
+    }
+
+    fn v1_to_v2_migration() -> CompiledMigration {
+        CompiledMigration::new(
+            schema::MIGRATION_ID_V1_TO_V2,
+            schema::SCHEMA_MIGRATION_V1_TO_V2_DDL,
+            SchemaGeneration::new(schema::GENERATION_V2).expect("valid"),
         )
     }
 
     #[test]
     fn exact_applied_identity_is_a_replay_without_provider_effect() {
-        let migration = migration();
+        let migration = v1_migration();
         let observed = schema_meta_record(&migration, "1000");
-
         assert!(matches!(
             migration_preflight(Some(observed), &migration),
+            Ok(MigrationPreflight::ExactReplay)
+        ));
+        let v2 = v2_baseline_migration();
+        let observed_v2 = schema_meta_record(&v2, "1000");
+        assert!(matches!(
+            migration_preflight(Some(observed_v2), &v2),
+            Ok(MigrationPreflight::ExactReplay)
+        ));
+        let fwd = v1_to_v2_migration();
+        let v1_record = schema_meta_record(&v1_migration(), "1000");
+        let v2_from_v1 = schema_meta_record_for_v1_to_v2(&v1_record, &fwd, "2000");
+        assert!(matches!(
+            migration_preflight(Some(v2_from_v1), &fwd),
             Ok(MigrationPreflight::ExactReplay)
         ));
     }
 
     #[test]
     fn identity_mismatch_is_rejected_before_provider_effect() {
-        let migration = migration();
+        let migration = v1_migration();
         let mut observed = schema_meta_record(&migration, "1000");
         observed.generation = "2.0.0".to_owned();
         observed.migrations[0].generation = "2.0.0".to_owned();
-
         assert!(matches!(
             migration_preflight(Some(observed), &migration),
+            Err(AdapterError::Config(_) | AdapterError::PartialOutcome)
+        ));
+    }
+
+    #[test]
+    fn empty_database_admits_exactly_v2_initial_plan() {
+        let v2 = v2_baseline_migration();
+        assert!(matches!(
+            migration_preflight(None, &v2),
+            Ok(MigrationPreflight::Empty)
+        ));
+        let v1 = v1_migration();
+        assert!(matches!(
+            migration_preflight(None, &v1),
+            Err(AdapterError::Config(_))
+        ));
+        let fwd = v1_to_v2_migration();
+        assert!(matches!(
+            migration_preflight(None, &fwd),
             Err(AdapterError::Config(_))
         ));
     }
 
     #[test]
-    fn empty_metadata_admits_the_compiled_migration() {
-        let migration = migration();
-
+    fn valid_exact_v1_admits_exactly_v1_to_v2() {
+        let v1 = v1_migration();
+        let observed = schema_meta_record(&v1, "1000");
+        let fwd = v1_to_v2_migration();
         assert!(matches!(
-            migration_preflight(None, &migration),
-            Ok(MigrationPreflight::Empty)
+            migration_preflight(Some(observed.clone()), &fwd),
+            Ok(MigrationPreflight::V1ToV2)
+        ));
+        let v2_baseline = v2_baseline_migration();
+        assert!(matches!(
+            migration_preflight(Some(observed), &v2_baseline),
+            Err(AdapterError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn exact_v2_yields_replay_no_mutation() {
+        let v2 = v2_baseline_migration();
+        let observed = schema_meta_record(&v2, "1000");
+        assert!(matches!(
+            migration_preflight(Some(observed), &v2),
+            Ok(MigrationPreflight::ExactReplay)
+        ));
+    }
+
+    #[test]
+    fn wrong_predecessor_is_rejected() {
+        let v1 = v1_migration();
+        let v2 = v2_baseline_migration();
+        let observed_v2 = schema_meta_record(&v2, "1000");
+        assert!(matches!(
+            migration_preflight(Some(observed_v2), &v1),
+            Err(AdapterError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn wrong_checksum_is_rejected() {
+        let mut fwd = v1_to_v2_migration();
+        fwd.checksum_sha256 = "0".repeat(64);
+        let v1 = v1_migration();
+        let observed = schema_meta_record(&v1, "1000");
+        assert!(matches!(
+            migration_preflight(Some(observed), &fwd),
+            Err(AdapterError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn wrong_migration_id_is_rejected() {
+        let mut fwd = v1_to_v2_migration();
+        fwd.migration_id = "wrong.id".to_owned();
+        let v1 = v1_migration();
+        let observed = schema_meta_record(&v1, "1000");
+        assert!(matches!(
+            migration_preflight(Some(observed), &fwd),
+            Err(AdapterError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn wrong_generation_is_rejected() {
+        let wrong = CompiledMigration::new(
+            schema::MIGRATION_ID_V2,
+            schema::SCHEMA_DDL_V2,
+            SchemaGeneration::new("9.9.9").expect("valid"),
+        );
+        assert!(matches!(
+            migration_preflight(None, &wrong),
+            Err(AdapterError::Config(_))
+        ));
+        let v1 = v1_migration();
+        let observed = schema_meta_record(&v1, "1000");
+        let mut fwd = v1_to_v2_migration();
+        fwd.generation_after = SchemaGeneration::new("9.9.9").expect("valid");
+        assert!(matches!(
+            migration_preflight(Some(observed), &fwd),
+            Err(AdapterError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn wrong_bridge_range_is_rejected() {
+        let v2 = v2_baseline_migration();
+        let mut observed = schema_meta_record(&v2, "1000");
+        observed.compatible_bridge_range = "wrong.adapter".to_owned();
+        assert!(matches!(
+            migration_preflight(Some(observed), &v2),
+            Err(AdapterError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn partial_metadata_is_fail_closed() {
+        let v2 = v2_baseline_migration();
+        let mut observed = schema_meta_record(&v2, "1000");
+        observed.migrations.clear();
+        assert_eq!(
+            migration_preflight(Some(observed), &v2),
+            Err(AdapterError::PartialOutcome)
+        );
+        let mut observed2 = schema_meta_record(&v2, "1000");
+        observed2.migration_state = "APPLYING".to_owned();
+        assert_eq!(
+            migration_preflight(Some(observed2), &v2),
+            Err(AdapterError::PartialOutcome)
+        );
+        let mut observed3 = schema_meta_record(&v2, "1000");
+        observed3.migrations[0].migration_id = String::new();
+        assert_eq!(
+            migration_preflight(Some(observed3), &v2),
+            Err(AdapterError::PartialOutcome)
+        );
+    }
+
+    #[test]
+    fn unknown_metadata_is_fail_closed() {
+        let v2 = v2_baseline_migration();
+        let mut observed = schema_meta_record(&v2, "1000");
+        observed.generation = "9.9.9".to_owned();
+        assert_eq!(
+            migration_preflight(Some(observed), &v2),
+            Err(AdapterError::PartialOutcome)
+        );
+        let mut observed2 = schema_meta_record(&v2, "1000");
+        observed2.migrations.push(SchemaMigrationIdentity {
+            migration_id: "extra".to_owned(),
+            migration_checksum_sha256: "a".repeat(64),
+            generation: "3.0.0".to_owned(),
+        });
+        assert_eq!(
+            migration_preflight(Some(observed2), &v2),
+            Err(AdapterError::PartialOutcome)
+        );
+    }
+
+    #[test]
+    fn bridge_range_fence_and_state_are_fenced() {
+        let v1 = v1_migration();
+        let observed = schema_meta_record(&v1, "1000");
+        let fwd = v1_to_v2_migration();
+        let ok = migration_preflight(Some(observed.clone()), &fwd).expect("v1 to v2");
+        assert_eq!(ok, MigrationPreflight::V1ToV2);
+        let mut wrong_fence = observed;
+        wrong_fence.compatible_bridge_range = "other".to_owned();
+        assert!(matches!(
+            migration_preflight(Some(wrong_fence), &fwd),
+            Err(AdapterError::Config(_))
         ));
     }
 
     #[test]
     fn post_read_requires_the_complete_durable_identity() {
-        let migration = migration();
+        let migration = v1_migration();
         let mut observed = schema_meta_record(&migration, "1000");
         observed.migrations.clear();
-
         assert_eq!(
             migration_preflight(Some(observed), &migration),
             Err(AdapterError::PartialOutcome)
@@ -1381,13 +1956,339 @@ mod migration_tests {
 
     #[test]
     fn transitional_metadata_is_fail_closed() {
-        let migration = migration();
+        let migration = v1_migration();
         let mut observed = schema_meta_record(&migration, "1000");
         observed.migration_state = "APPLYING".to_owned();
-
         assert_eq!(
             migration_preflight(Some(observed), &migration),
             Err(AdapterError::PartialOutcome)
+        );
+    }
+
+    #[test]
+    fn history_append_preserves_v1_and_appends_v2() {
+        let v2 = v2_baseline_migration();
+        let record = schema_meta_record(&v2, "1000");
+        assert_eq!(record.migrations.len(), 2);
+        assert_eq!(record.migrations[0].migration_id, schema::MIGRATION_ID_V1);
+        assert_eq!(record.migrations[0].generation, schema::GENERATION_V1);
+        assert_eq!(record.migrations[1].migration_id, schema::MIGRATION_ID_V2);
+        assert_eq!(record.generation, schema::GENERATION_V2);
+        assert_eq!(record.migration_id, schema::MIGRATION_ID_V2);
+        let v1 = v1_migration();
+        let v1_record = schema_meta_record(&v1, "1000");
+        let fwd = v1_to_v2_migration();
+        let v1_to_v2_record = schema_meta_record_for_v1_to_v2(&v1_record, &fwd, "2000");
+        assert_eq!(v1_to_v2_record.migrations.len(), 2);
+        assert_eq!(
+            v1_to_v2_record.migrations[0].migration_id,
+            schema::MIGRATION_ID_V1
+        );
+        assert_eq!(
+            v1_to_v2_record.migrations[1].migration_id,
+            schema::MIGRATION_ID_V1_TO_V2
+        );
+        assert_eq!(v1_to_v2_record.generation, schema::GENERATION_V2);
+    }
+
+    #[test]
+    fn v1_ddl_bytes_are_immutable_and_v2_is_additive() {
+        assert!(!schema::SCHEMA_DDL.contains("recovery_owner"));
+        assert!(schema::SCHEMA_DDL_V2.contains(schema::SCHEMA_DDL.trim()));
+        assert!(schema::SCHEMA_DDL_V2.contains("recovery_owner"));
+        assert!(schema::SCHEMA_DDL_V2.contains("recovery_job"));
+        assert!(schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.contains("recovery_owner"));
+        assert!(!schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.contains("DEFINE TABLE schema_meta"));
+    }
+
+    #[test]
+    fn transaction_has_no_destructive_statements_and_no_fence_rewrite_for_forward() {
+        for ddl in [
+            schema::SCHEMA_DDL,
+            schema::SCHEMA_DDL_V2,
+            schema::SCHEMA_MIGRATION_V1_TO_V2_DDL,
+        ] {
+            let lower = ddl.to_ascii_lowercase();
+            assert!(!lower.contains("drop "));
+            assert!(!lower.contains("delete "));
+            assert!(!lower.contains("remove "));
+            assert!(!lower.contains("reset"));
+        }
+        let v1 = v1_migration();
+        let v1_record = schema_meta_record(&v1, "1000");
+        let fwd = v1_to_v2_migration();
+        let record = schema_meta_record_for_v1_to_v2(&v1_record, &fwd, "2000");
+        assert_eq!(record.migrations.len(), 2);
+        let forward_sql = build_forward_sql();
+        assert!(!forward_sql.to_ascii_lowercase().contains("drop "));
+        assert!(!forward_sql.contains(schema::TX_CREATE_FENCE));
+        assert!(!forward_sql.contains(schema::TX_UPSERT_FENCE));
+        assert!(forward_sql.contains(schema::TX_GUARD_FENCE));
+        assert!(forward_sql.contains(schema::TX_GUARD_SCHEMA_PREDECESSOR));
+        assert!(forward_sql.contains(schema::TX_UPDATE_SCHEMA_META_CAS));
+        assert!(forward_sql.contains(schema::RECOVERY_TABLES_DDL.trim()));
+        let fence = FenceRecord {
+            state_fence: StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+                eliot_contracts::ResourceGeneration::new(1).expect("gen"),
+            ),
+            next_commit_sequence: 7,
+            next_outbox_sequence: 9,
+        };
+        let bindings = build_forward_bindings(&v1_record, &fence, &record);
+        assert_eq!(
+            bindings.get("expected_state_fence"),
+            Some(&json!(fence.state_fence))
+        );
+        assert_eq!(
+            bindings.get("expected_commit_sequence"),
+            Some(&json!(7_u64))
+        );
+        assert!(is_guard_conflict("schema_predecessor_mismatch"));
+        assert!(is_guard_conflict("schema_fence_guard_mismatch"));
+        assert!(!is_guard_conflict("other_error"));
+    }
+
+    #[test]
+    fn forward_sql_contains_predecessor_cas_and_fence_guard_no_data_mutation() {
+        let sql = build_forward_sql();
+        assert!(sql.starts_with(schema::TX_BEGIN));
+        assert!(sql.ends_with(schema::TX_COMMIT));
+        assert!(sql.contains(schema::TX_GUARD_FENCE));
+        assert!(sql.contains(schema::TX_GUARD_SCHEMA_PREDECESSOR));
+        assert!(sql.contains(schema::TX_UPDATE_SCHEMA_META_CAS));
+        assert!(!sql.contains(schema::TX_CREATE_FENCE));
+        assert!(!sql.contains(schema::TX_UPSERT_FENCE));
+        assert!(!sql.contains(schema::TX_CREATE_RECEIPT));
+        assert!(!sql.contains(schema::TX_CREATE_REVISION));
+        assert!(!sql.contains(schema::TX_UPSERT_REVISION));
+        let bindings_keys = schema::forward_migration_expected_bindings();
+        assert!(bindings_keys.contains(&"expected_state_fence"));
+        assert!(bindings_keys.contains(&"expected_generation"));
+        for key in bindings_keys {
+            assert!(sql.contains(key) || key.contains("schema_meta"));
+        }
+    }
+
+    #[test]
+    fn wrong_state_fence_is_rejected_by_forward_guard() {
+        let v1 = v1_migration();
+        let existing = schema_meta_record(&v1, "1000");
+        let fence_ok = FenceRecord {
+            state_fence: StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+                eliot_contracts::ResourceGeneration::new(1).expect("gen"),
+            ),
+            next_commit_sequence: 1,
+            next_outbox_sequence: 1,
+        };
+        let fence_bad = FenceRecord {
+            state_fence: StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(2).expect("epoch"),
+                eliot_contracts::ResourceGeneration::new(1).expect("gen"),
+            ),
+            next_commit_sequence: 1,
+            next_outbox_sequence: 1,
+        };
+        let new_record = schema_meta_record_for_v1_to_v2(&existing, &v1_to_v2_migration(), "2000");
+        let ok_bind = build_forward_bindings(&existing, &fence_ok, &new_record);
+        let bad_bind = build_forward_bindings(&existing, &fence_bad, &new_record);
+        assert_ne!(
+            ok_bind.get("expected_state_fence"),
+            bad_bind.get("expected_state_fence")
+        );
+        assert!(is_guard_conflict("schema_fence_guard_mismatch"));
+        let sql = build_forward_sql();
+        assert!(sql.contains("schema_fence_guard_mismatch"));
+    }
+
+    #[test]
+    fn changed_sequence_is_rejected_by_forward_guard() {
+        let v1 = v1_migration();
+        let existing = schema_meta_record(&v1, "1000");
+        let fence_ok = FenceRecord {
+            state_fence: StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+                eliot_contracts::ResourceGeneration::new(1).expect("gen"),
+            ),
+            next_commit_sequence: 1,
+            next_outbox_sequence: 1,
+        };
+        let fence_changed = FenceRecord {
+            state_fence: fence_ok.state_fence.clone(),
+            next_commit_sequence: 99,
+            next_outbox_sequence: 1,
+        };
+        let new_record = schema_meta_record_for_v1_to_v2(&existing, &v1_to_v2_migration(), "2000");
+        let ok_bind = build_forward_bindings(&existing, &fence_ok, &new_record);
+        let changed_bind = build_forward_bindings(&existing, &fence_changed, &new_record);
+        assert_ne!(
+            ok_bind.get("expected_commit_sequence"),
+            changed_bind.get("expected_commit_sequence")
+        );
+        let fence_changed2 = FenceRecord {
+            state_fence: fence_ok.state_fence.clone(),
+            next_commit_sequence: 1,
+            next_outbox_sequence: 99,
+        };
+        let changed_bind2 = build_forward_bindings(&existing, &fence_changed2, &new_record);
+        assert_ne!(
+            ok_bind.get("expected_outbox_sequence"),
+            changed_bind2.get("expected_outbox_sequence")
+        );
+        assert!(is_guard_conflict("schema_fence_guard_mismatch"));
+    }
+
+    #[test]
+    fn unknown_top_level_field_fails_deserialization() {
+        let v2 = v2_baseline_migration();
+        let record = schema_meta_record(&v2, "1000");
+        let mut value = serde_json::to_value(&record).expect("serialize");
+        if let Value::Object(map) = &mut value {
+            map.insert("extra_top_level".to_owned(), json!("boom"));
+        }
+        let res: Result<SchemaMetaRecord, _> = serde_json::from_value(value);
+        assert!(
+            res.is_err(),
+            "deny_unknown_fields must reject extra top-level"
+        );
+    }
+
+    #[test]
+    fn unknown_history_entry_field_fails_deserialization() {
+        let v2 = v2_baseline_migration();
+        let record = schema_meta_record(&v2, "1000");
+        let mut value = serde_json::to_value(&record).expect("serialize");
+        if let Value::Object(map) = &mut value
+            && let Some(Value::Array(arr)) = map.get_mut("migrations")
+            && let Some(Value::Object(entry)) = arr.get_mut(0)
+        {
+            entry.insert("extra_entry_field".to_owned(), json!("boom"));
+        }
+        let res: Result<SchemaMetaRecord, _> = serde_json::from_value(value);
+        assert!(
+            res.is_err(),
+            "deny_unknown_fields must reject extra history entry"
+        );
+    }
+
+    #[test]
+    fn schema_and_fence_records_round_trip_as_json() {
+        let migration = v2_baseline_migration();
+        let schema = schema_meta_record(&migration, "1000");
+        let fence = FenceRecord {
+            state_fence: StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+                eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+            ),
+            next_commit_sequence: 2,
+            next_outbox_sequence: 3,
+        };
+        let schema_json = serde_json::to_vec(&schema).expect("schema serialize");
+        let fence_json = serde_json::to_vec(&fence).expect("fence serialize");
+        assert_eq!(
+            serde_json::from_slice::<SchemaMetaRecord>(&schema_json).expect("schema deserialize"),
+            schema
+        );
+        assert_eq!(
+            serde_json::from_slice::<FenceRecord>(&fence_json).expect("fence deserialize"),
+            fence
+        );
+    }
+
+    #[test]
+    fn unknown_fence_record_field_fails_deserialization() {
+        let fence = FenceRecord {
+            state_fence: StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+                eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+            ),
+            next_commit_sequence: 1,
+            next_outbox_sequence: 1,
+        };
+        let mut value = serde_json::to_value(&fence).expect("serialize");
+        if let Value::Object(map) = &mut value {
+            map.insert("extra_fence_field".to_owned(), json!("boom"));
+        }
+        let result: Result<FenceRecord, _> = serde_json::from_value(value);
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields must reject extra fence field"
+        );
+    }
+
+    #[test]
+    fn predecessor_cas_binds_every_predecessor_field_and_history_value() {
+        let v1 = v1_migration();
+        let existing = schema_meta_record(&v1, "1000");
+        let fence = FenceRecord {
+            state_fence: StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+                eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+            ),
+            next_commit_sequence: 1,
+            next_outbox_sequence: 1,
+        };
+        let next = schema_meta_record_for_v1_to_v2(&existing, &v1_to_v2_migration(), "2000");
+        let bindings = build_forward_bindings(&existing, &fence, &next);
+        for key in schema::forward_migration_expected_bindings() {
+            assert!(bindings.contains_key(key), "missing binding {key}");
+        }
+        assert_eq!(bindings.get("expected_updated_at"), Some(&json!("1000")));
+
+        let mut changed = existing.clone();
+        changed.updated_at = "1001".to_owned();
+        let changed_bindings = build_forward_bindings(&changed, &fence, &next);
+        assert_ne!(
+            bindings.get("expected_updated_at"),
+            changed_bindings.get("expected_updated_at")
+        );
+        let mut changed_history = existing.clone();
+        changed_history.migrations[0].migration_id = "tampered".to_owned();
+        let changed_history_bindings = build_forward_bindings(&changed_history, &fence, &next);
+        assert_ne!(
+            bindings.get("expected_migration_0_id"),
+            changed_history_bindings.get("expected_migration_0_id")
+        );
+        let sql = build_forward_sql();
+        for key in [
+            "expected_bridge_range",
+            "expected_migration_state",
+            "expected_migrations_len",
+            "expected_migration_0_id",
+            "expected_migration_0_checksum",
+            "expected_migration_0_generation",
+            "expected_updated_at",
+        ] {
+            assert!(sql.contains(key), "CAS SQL missing {key}");
+        }
+    }
+
+    #[test]
+    fn genesis_and_mixed_head_presence_choose_create_or_update_per_head() {
+        assert_eq!(
+            revision_write_template(true, false),
+            schema::TX_CREATE_REVISION
+        );
+        assert_eq!(
+            revision_write_template(false, false),
+            schema::TX_CREATE_REVISION
+        );
+        assert_eq!(
+            revision_write_template(false, true),
+            schema::TX_UPSERT_REVISION
+        );
+        assert_eq!(
+            ordering_write_template(true, false),
+            schema::TX_CREATE_ORDERING
+        );
+        assert_eq!(
+            ordering_write_template(false, false),
+            schema::TX_CREATE_ORDERING
+        );
+        assert_eq!(
+            ordering_write_template(false, true),
+            schema::TX_UPSERT_ORDERING
         );
     }
 
@@ -1402,7 +2303,7 @@ mod migration_tests {
 
     #[test]
     fn validation_result_indexes_admit_a_fresh_empty_canonical_store() {
-        let migration = migration();
+        let migration = v2_baseline_migration();
         let fence = StateFence::new(
             eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
             eliot_contracts::ResourceGeneration::new(1).expect("generation"),
@@ -1422,5 +2323,79 @@ mod migration_tests {
         .expect("fresh snapshot");
         assert!(snapshot.revision_heads.is_empty());
         assert_eq!(snapshot.validation_revision, 1);
+    }
+
+    #[test]
+    fn validation_rejects_missing_or_malformed_fence() {
+        let migration = v2_baseline_migration();
+        let missing = build_validation_snapshot(
+            Some(schema_meta_record(&migration, "1000")),
+            None,
+            Vec::new(),
+            &migration.generation_after,
+            1_000,
+            Value::Null,
+        );
+        assert_eq!(missing, Err(AdapterError::Store(StoreError::Unavailable)));
+
+        let malformed = build_validation_snapshot(
+            Some(schema_meta_record(&migration, "1000")),
+            Some(FenceRecord {
+                state_fence: StateFence::new(
+                    eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+                    eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+                ),
+                next_commit_sequence: 0,
+                next_outbox_sequence: 1,
+            }),
+            Vec::new(),
+            &migration.generation_after,
+            1_000,
+            Value::Null,
+        );
+        assert_eq!(malformed, Err(AdapterError::PartialOutcome));
+    }
+
+    #[test]
+    fn readiness_oracle_observed_1_0_0_is_migration_required_and_2_0_0_is_ready() {
+        let expected = SchemaGeneration::v2();
+        let observed_v1 = Some(schema::GENERATION_V1.to_owned());
+        let observed_v2 = Some(schema::GENERATION_V2.to_owned());
+        assert!(matches!(
+            readiness_from_observation(observed_v1, &expected),
+            SemanticReadiness::MigrationRequired { .. }
+        ));
+        assert!(matches!(
+            readiness_from_observation(observed_v2, &expected),
+            SemanticReadiness::Ready { .. }
+        ));
+        assert!(matches!(
+            readiness_from_observation(None, &expected),
+            SemanticReadiness::MigrationRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn ready_v2_requires_a_valid_canonical_fence() {
+        let expected = SchemaGeneration::v2();
+        let ready = readiness_from_observation(Some(schema::GENERATION_V2.to_owned()), &expected);
+        assert!(matches!(ready, SemanticReadiness::Ready { .. }));
+        assert!(matches!(
+            readiness_with_fence(ready.clone(), None, &expected),
+            Ok(SemanticReadiness::MigrationRequired { observed: None, .. })
+        ));
+
+        let malformed = FenceRecord {
+            state_fence: StateFence::new(
+                eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+                eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+            ),
+            next_commit_sequence: 0,
+            next_outbox_sequence: 1,
+        };
+        assert_eq!(
+            readiness_with_fence(ready, Some(malformed), &expected),
+            Err(AdapterError::PartialOutcome)
+        );
     }
 }

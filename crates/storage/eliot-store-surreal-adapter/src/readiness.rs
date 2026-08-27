@@ -100,6 +100,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+    use crate::schema;
 
     #[test]
     fn migration_checksum_is_stable() {
@@ -122,5 +123,117 @@ mod tests {
         };
         assert_eq!(ready, ready);
         assert_ne!(ready, missing);
+    }
+
+    #[test]
+    fn v1_ddl_bytes_are_immutable() {
+        let ddl = schema::SCHEMA_DDL;
+        assert!(ddl.contains("DEFINE TABLE schema_meta SCHEMALESS;"));
+        assert!(ddl.contains("DEFINE TABLE canonical_fence SCHEMALESS;"));
+        assert!(!ddl.contains("recovery_owner"));
+        assert!(!ddl.contains("recovery_job"));
+        let checksum = eliot_store_api::sha256_hex(ddl.as_bytes());
+        assert_eq!(checksum, schema::SCHEMA_DDL_V1_SHA256);
+        let migration = CompiledMigration::new(
+            schema::MIGRATION_ID_V1,
+            ddl,
+            SchemaGeneration::new(schema::GENERATION_V1).expect("valid"),
+        );
+        assert_eq!(migration.checksum_sha256(), checksum);
+        assert_eq!(migration.checksum_sha256(), schema::SCHEMA_DDL_V1_SHA256);
+        assert_eq!(migration.migration_id(), schema::MIGRATION_ID_V1);
+        assert_eq!(migration.generation_after().as_str(), schema::GENERATION_V1);
+    }
+
+    #[test]
+    fn v1_byte_drift_is_detected() {
+        let checksum = eliot_store_api::sha256_hex(schema::SCHEMA_DDL.as_bytes());
+        assert_eq!(checksum, schema::SCHEMA_DDL_V1_SHA256);
+        let mut drifted = schema::SCHEMA_DDL.to_owned();
+        drifted.push(' ');
+        assert_ne!(
+            eliot_store_api::sha256_hex(drifted.as_bytes()),
+            schema::SCHEMA_DDL_V1_SHA256
+        );
+        let mut drifted2 = schema::SCHEMA_DDL.to_owned();
+        drifted2.push('x');
+        assert_ne!(
+            eliot_store_api::sha256_hex(drifted2.as_bytes()),
+            schema::SCHEMA_DDL_V1_SHA256
+        );
+    }
+
+    #[test]
+    fn v2_baseline_is_additive_and_contains_recovery() {
+        let v1 = schema::SCHEMA_DDL.trim();
+        let v2 = schema::SCHEMA_DDL_V2;
+        let delta = schema::SCHEMA_MIGRATION_V1_TO_V2_DDL;
+        assert!(v2.contains(v1));
+        assert!(v2.contains(schema::table::RECOVERY_OWNER));
+        assert!(v2.contains(schema::table::RECOVERY_JOB));
+        assert!(delta.contains(schema::table::RECOVERY_OWNER));
+        assert!(delta.contains(schema::table::RECOVERY_JOB));
+        assert!(!delta.contains("DEFINE TABLE schema_meta"));
+        assert!(v2.contains("DEFINE FIELD namespace ON recovery_owner TYPE string;"));
+        assert!(v2.contains("DEFINE FIELD key ON recovery_owner TYPE string;"));
+        assert!(v2.contains("DEFINE FIELD state_fence ON recovery_owner TYPE object;"));
+        assert!(v2.contains("DEFINE FIELD revision ON recovery_owner TYPE int;"));
+        assert!(v2.contains("DEFINE FIELD schema ON recovery_owner TYPE string;"));
+        assert!(v2.contains("DEFINE FIELD payload ON recovery_owner TYPE bytes;"));
+        assert!(v2.contains("DEFINE FIELD value_digest ON recovery_owner TYPE string;"));
+        assert!(v2.contains(
+            "DEFINE INDEX ro_namespace_key ON recovery_owner FIELDS namespace, key UNIQUE;"
+        ));
+        assert!(v2.contains(
+            "DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;"
+        ));
+    }
+
+    #[test]
+    fn migrations_have_no_destructive_statements() {
+        for ddl in [
+            schema::SCHEMA_DDL,
+            schema::SCHEMA_DDL_V2,
+            schema::SCHEMA_MIGRATION_V1_TO_V2_DDL,
+        ] {
+            let lower = ddl.to_ascii_lowercase();
+            assert!(!lower.contains("drop "), "ddl must not contain DROP");
+            assert!(!lower.contains("delete "), "ddl must not contain DELETE");
+            assert!(!lower.contains("remove "), "ddl must not contain REMOVE");
+            assert!(!lower.contains("reset"), "ddl must not contain reset");
+        }
+        let v2 = CompiledMigration::new(
+            schema::MIGRATION_ID_V2,
+            schema::SCHEMA_DDL_V2,
+            SchemaGeneration::new(schema::GENERATION_V2).expect("valid"),
+        );
+        let v1_to_v2 = CompiledMigration::new(
+            schema::MIGRATION_ID_V1_TO_V2,
+            schema::SCHEMA_MIGRATION_V1_TO_V2_DDL,
+            SchemaGeneration::new(schema::GENERATION_V2).expect("valid"),
+        );
+        assert_ne!(v2.checksum_sha256(), v1_to_v2.checksum_sha256());
+        assert_eq!(v2.generation_after().as_str(), schema::GENERATION_V2);
+        assert_eq!(v1_to_v2.generation_after().as_str(), schema::GENERATION_V2);
+    }
+
+    #[test]
+    fn v2_migrations_are_distinct_from_v1() {
+        let v1 = CompiledMigration::new(
+            schema::MIGRATION_ID_V1,
+            schema::SCHEMA_DDL,
+            SchemaGeneration::new(schema::GENERATION_V1).expect("valid"),
+        );
+        let v2 = CompiledMigration::new(
+            schema::MIGRATION_ID_V2,
+            schema::SCHEMA_DDL_V2,
+            SchemaGeneration::new(schema::GENERATION_V2).expect("valid"),
+        );
+        assert_ne!(v1.checksum_sha256(), v2.checksum_sha256());
+        assert_ne!(v1.migration_id(), v2.migration_id());
+        assert_ne!(
+            v1.generation_after().as_str(),
+            v2.generation_after().as_str()
+        );
     }
 }

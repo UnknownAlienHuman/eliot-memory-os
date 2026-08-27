@@ -18,12 +18,24 @@ pub(crate) mod table {
     pub(crate) const RELATION_RECORD: &str = "relation_record";
     pub(crate) const OUTBOX_EVENT: &str = "outbox_event";
     pub(crate) const CANONICAL_FENCE: &str = "canonical_fence";
+    #[cfg(test)]
+    pub(crate) const RECOVERY_OWNER: &str = "recovery_owner";
+    #[cfg(test)]
+    pub(crate) const RECOVERY_JOB: &str = "recovery_job";
 }
 
 /// Record key of the single canonical fence/sequence row.
 pub(crate) const FENCE_KEY: &str = "current";
 /// Record key of the single schema-meta row.
 pub(crate) const SCHEMA_META_KEY: &str = "current";
+
+pub(crate) const GENERATION_V1: &str = "1.0.0";
+pub(crate) const GENERATION_V2: &str = "2.0.0";
+pub(crate) const MIGRATION_ID_V1: &str = "eliot.store.surreal.schema.v1";
+pub(crate) const MIGRATION_ID_V2: &str = "eliot.store.surreal.schema.v2";
+pub(crate) const MIGRATION_ID_V1_TO_V2: &str = "eliot.store.surreal.schema.v1_to_v2";
+pub(crate) const SCHEMA_DDL_V1_SHA256: &str =
+    "783d3207ab39fc0471e32f893302eedd579ae4980ee95f9f883f92a5f7ba705b";
 
 /// First-generation schema DDL for the canonical control tables. This is
 /// applied only through an explicit migration; it is never executed implicitly
@@ -72,6 +84,96 @@ DEFINE TABLE canonical_fence SCHEMALESS;
 DEFINE FIELD id ON canonical_fence TYPE string;
 DEFINE INDEX fence_id ON canonical_fence FIELDS id UNIQUE;
 ";
+
+pub(crate) const RECOVERY_TABLES_DDL: &str = r"
+DEFINE TABLE recovery_owner SCHEMALESS;
+DEFINE FIELD namespace ON recovery_owner TYPE string;
+DEFINE FIELD key ON recovery_owner TYPE string;
+DEFINE FIELD state_fence ON recovery_owner TYPE object;
+DEFINE FIELD revision ON recovery_owner TYPE int;
+DEFINE FIELD schema ON recovery_owner TYPE string;
+DEFINE FIELD payload ON recovery_owner TYPE bytes;
+DEFINE FIELD value_digest ON recovery_owner TYPE string;
+DEFINE INDEX ro_namespace_key ON recovery_owner FIELDS namespace, key UNIQUE;
+
+DEFINE TABLE recovery_job SCHEMALESS;
+DEFINE FIELD namespace ON recovery_job TYPE string;
+DEFINE FIELD key ON recovery_job TYPE string;
+DEFINE FIELD state_fence ON recovery_job TYPE object;
+DEFINE FIELD revision ON recovery_job TYPE int;
+DEFINE FIELD schema ON recovery_job TYPE string;
+DEFINE FIELD payload ON recovery_job TYPE bytes;
+DEFINE FIELD value_digest ON recovery_job TYPE string;
+DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
+";
+
+pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL: &str = RECOVERY_TABLES_DDL;
+
+pub(crate) const SCHEMA_DDL_V2: &str = r"
+DEFINE TABLE schema_meta SCHEMALESS;
+DEFINE FIELD generation ON schema_meta TYPE string;
+DEFINE FIELD migrations ON schema_meta TYPE array;
+DEFINE FIELD compatible_bridge_range ON schema_meta TYPE string;
+DEFINE FIELD migration_state ON schema_meta TYPE string;
+DEFINE FIELD migration_id ON schema_meta TYPE string;
+DEFINE FIELD migration_checksum_sha256 ON schema_meta TYPE string;
+DEFINE FIELD updated_at ON schema_meta TYPE string;
+
+DEFINE TABLE write_receipt SCHEMALESS;
+DEFINE FIELD operation_id ON write_receipt TYPE string;
+DEFINE FIELD idempotency_key ON write_receipt TYPE string;
+DEFINE INDEX wr_operation ON write_receipt FIELDS operation_id UNIQUE;
+DEFINE INDEX wr_idempotency ON write_receipt FIELDS idempotency_key UNIQUE;
+
+DEFINE TABLE revision_head SCHEMALESS;
+DEFINE FIELD revision_key ON revision_head TYPE string;
+DEFINE INDEX rh_key ON revision_head FIELDS revision_key UNIQUE;
+
+DEFINE TABLE ordering_head SCHEMALESS;
+DEFINE FIELD ordering_scope ON ordering_head TYPE string;
+DEFINE INDEX oh_scope ON ordering_head FIELDS ordering_scope UNIQUE;
+
+DEFINE TABLE canonical_event SCHEMALESS;
+DEFINE FIELD event_id ON canonical_event TYPE string;
+DEFINE INDEX ce_id ON canonical_event FIELDS event_id UNIQUE;
+
+DEFINE TABLE projection_record SCHEMALESS;
+DEFINE FIELD publication_id ON projection_record TYPE string;
+DEFINE INDEX pr_id ON projection_record FIELDS publication_id UNIQUE;
+
+DEFINE TABLE relation_record SCHEMALESS;
+DEFINE FIELD relation_id ON relation_record TYPE string;
+DEFINE INDEX rr_id ON relation_record FIELDS relation_id UNIQUE;
+
+DEFINE TABLE outbox_event SCHEMALESS;
+DEFINE FIELD outbox_id ON outbox_event TYPE string;
+DEFINE INDEX oe_id ON outbox_event FIELDS outbox_id UNIQUE;
+
+DEFINE TABLE canonical_fence SCHEMALESS;
+DEFINE FIELD id ON canonical_fence TYPE string;
+DEFINE INDEX fence_id ON canonical_fence FIELDS id UNIQUE;
+
+DEFINE TABLE recovery_owner SCHEMALESS;
+DEFINE FIELD namespace ON recovery_owner TYPE string;
+DEFINE FIELD key ON recovery_owner TYPE string;
+DEFINE FIELD state_fence ON recovery_owner TYPE object;
+DEFINE FIELD revision ON recovery_owner TYPE int;
+DEFINE FIELD schema ON recovery_owner TYPE string;
+DEFINE FIELD payload ON recovery_owner TYPE bytes;
+DEFINE FIELD value_digest ON recovery_owner TYPE string;
+DEFINE INDEX ro_namespace_key ON recovery_owner FIELDS namespace, key UNIQUE;
+
+DEFINE TABLE recovery_job SCHEMALESS;
+DEFINE FIELD namespace ON recovery_job TYPE string;
+DEFINE FIELD key ON recovery_job TYPE string;
+DEFINE FIELD state_fence ON recovery_job TYPE object;
+DEFINE FIELD revision ON recovery_job TYPE int;
+DEFINE FIELD schema ON recovery_job TYPE string;
+DEFINE FIELD payload ON recovery_job TYPE bytes;
+DEFINE FIELD value_digest ON recovery_job TYPE string;
+DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
+";
+
 /// Transaction delimiters for a single atomic apply.
 pub(crate) const TX_BEGIN: &str = "BEGIN TRANSACTION;";
 pub(crate) const TX_COMMIT: &str = "COMMIT TRANSACTION;";
@@ -111,6 +213,46 @@ pub(crate) fn indexed(template: &str, index: usize) -> String {
 /// durable identity; exact replays are handled by the adapter preflight.
 pub(crate) const TX_CREATE_SCHEMA_META: &str =
     "CREATE type::record($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_record;";
+
+pub(crate) const TX_GUARD_FENCE: &str = "LET $fence_guard = (SELECT * FROM ONLY canonical_fence:current); IF $fence_guard.state_fence != $expected_state_fence OR $fence_guard.next_commit_sequence != $expected_commit_sequence OR $fence_guard.next_outbox_sequence != $expected_outbox_sequence { THROW 'schema_fence_guard_mismatch'; };";
+
+pub(crate) const TX_GUARD_SCHEMA_PREDECESSOR: &str = "LET $pre = (SELECT * FROM ONLY schema_meta:current); IF $pre.generation != $expected_generation OR $pre.migration_id != $expected_migration_id OR $pre.migration_checksum_sha256 != $expected_migration_checksum_sha256 OR $pre.compatible_bridge_range != $expected_bridge_range OR $pre.migration_state != $expected_migration_state OR array::len($pre.migrations) != $expected_migrations_len OR $pre.migrations[0].migration_id != $expected_migration_0_id OR $pre.migrations[0].migration_checksum_sha256 != $expected_migration_0_checksum OR $pre.migrations[0].generation != $expected_migration_0_generation OR $pre.updated_at != $expected_updated_at { THROW 'schema_predecessor_mismatch'; };";
+
+pub(crate) const TX_UPDATE_SCHEMA_META_CAS: &str = "LET $schema_cas = (UPDATE type::record($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_record WHERE generation = $expected_generation AND migration_id = $expected_migration_id AND migration_checksum_sha256 = $expected_migration_checksum_sha256 AND compatible_bridge_range = $expected_bridge_range AND migration_state = $expected_migration_state AND array::len(migrations) = $expected_migrations_len AND migrations[0].migration_id = $expected_migration_0_id AND migrations[0].migration_checksum_sha256 = $expected_migration_0_checksum AND migrations[0].generation = $expected_migration_0_generation AND updated_at = $expected_updated_at RETURN AFTER); IF array::len($schema_cas ?? []) != 1 { THROW 'schema_predecessor_mismatch'; };";
+
+pub(crate) fn forward_migration_sql() -> String {
+    format!(
+        "{} {} {} {} {} {}",
+        TX_BEGIN,
+        TX_GUARD_FENCE,
+        RECOVERY_TABLES_DDL.trim(),
+        TX_GUARD_SCHEMA_PREDECESSOR,
+        TX_UPDATE_SCHEMA_META_CAS,
+        TX_COMMIT
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn forward_migration_expected_bindings() -> Vec<&'static str> {
+    vec![
+        "expected_state_fence",
+        "expected_commit_sequence",
+        "expected_outbox_sequence",
+        "expected_generation",
+        "expected_migration_id",
+        "expected_migration_checksum_sha256",
+        "expected_bridge_range",
+        "expected_migration_state",
+        "expected_migrations_len",
+        "expected_migration_0_id",
+        "expected_migration_0_checksum",
+        "expected_migration_0_generation",
+        "expected_updated_at",
+        "schema_meta_table",
+        "schema_meta_key",
+        "schema_meta_record",
+    ]
+}
 
 /// Closed read templates. Results select `body` values so they deserialize
 /// back into store-API types without a `SurrealDB` `id` field.

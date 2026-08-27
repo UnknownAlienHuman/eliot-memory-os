@@ -191,10 +191,30 @@ impl SurrealStoreAdapter {
     /// generation. The composition owner applies it through
     /// [`SurrealStoreAdapter::apply_migration`] under migration authority.
     pub fn initial_schema_migration(generation: SchemaGeneration) -> CompiledMigration {
+        if generation.as_str() == schema::GENERATION_V2 {
+            CompiledMigration::new(schema::MIGRATION_ID_V2, schema::SCHEMA_DDL_V2, generation)
+        } else {
+            CompiledMigration::new(schema::MIGRATION_ID_V1, schema::SCHEMA_DDL, generation)
+        }
+    }
+
+    /// Builds the additive v1-to-v2 forward migration. The delta DDL creates
+    /// only the new `recovery_owner` and `recovery_job` tables.
+    pub fn v1_to_v2_migration() -> CompiledMigration {
         CompiledMigration::new(
-            "eliot.store.surreal.schema.v1",
-            schema::SCHEMA_DDL,
-            generation,
+            schema::MIGRATION_ID_V1_TO_V2,
+            schema::SCHEMA_MIGRATION_V1_TO_V2_DDL,
+            SchemaGeneration::v2(),
+        )
+    }
+
+    /// Builds the v2 baseline migration (full schema). Empty databases admit
+    /// exactly this plan.
+    pub fn v2_baseline_migration() -> CompiledMigration {
+        CompiledMigration::new(
+            schema::MIGRATION_ID_V2,
+            schema::SCHEMA_DDL_V2,
+            SchemaGeneration::v2(),
         )
     }
 }
@@ -301,6 +321,7 @@ mod tests {
     use secrecy::SecretString;
 
     use super::*;
+    use crate::schema;
 
     fn config() -> SurrealAdapterConfig {
         SurrealAdapterConfig {
@@ -335,7 +356,7 @@ mod tests {
             connect_timeout_ms: 1_000,
             query_timeout_ms: 1_000,
             expected_provider_major: PINNED_SURREALDB_MAJOR,
-            expected_schema_generation: SchemaGeneration::new("1.0.0").expect("valid generation"),
+            expected_schema_generation: SchemaGeneration::v2(),
         }
     }
 
@@ -345,5 +366,55 @@ mod tests {
         assert!(!rendered.contains("test-secret"));
         assert!(!rendered.contains("provider-user"));
         assert!(rendered.contains("REDACTED"));
+    }
+
+    #[test]
+    fn v1_migration_is_immutable() {
+        let generation = SchemaGeneration::new(schema::GENERATION_V1).expect("valid");
+        let m = SurrealStoreAdapter::initial_schema_migration(generation);
+        assert_eq!(m.migration_id(), schema::MIGRATION_ID_V1);
+        assert_eq!(m.generation_after().as_str(), schema::GENERATION_V1);
+        assert_eq!(
+            m.checksum_sha256(),
+            eliot_store_api::sha256_hex(schema::SCHEMA_DDL.as_bytes())
+        );
+        assert!(!m.checksum_sha256().is_empty());
+    }
+
+    #[test]
+    fn v2_baseline_is_full_and_contains_recovery() {
+        let m = SurrealStoreAdapter::v2_baseline_migration();
+        assert_eq!(m.migration_id(), schema::MIGRATION_ID_V2);
+        assert_eq!(m.generation_after().as_str(), schema::GENERATION_V2);
+        assert_ne!(
+            m.checksum_sha256(),
+            eliot_store_api::sha256_hex(schema::SCHEMA_DDL.as_bytes())
+        );
+        assert!(schema::SCHEMA_DDL_V2.contains(schema::table::RECOVERY_OWNER));
+        assert!(schema::SCHEMA_DDL_V2.contains(schema::table::RECOVERY_JOB));
+        assert!(schema::SCHEMA_DDL_V2.contains(schema::SCHEMA_DDL.trim()));
+    }
+
+    #[test]
+    fn v1_to_v2_is_additive_delta() {
+        let m = SurrealStoreAdapter::v1_to_v2_migration();
+        assert_eq!(m.migration_id(), schema::MIGRATION_ID_V1_TO_V2);
+        assert_eq!(m.generation_after().as_str(), schema::GENERATION_V2);
+        assert_ne!(
+            m.checksum_sha256(),
+            eliot_store_api::sha256_hex(schema::SCHEMA_DDL.as_bytes())
+        );
+        assert!(!schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.contains("DEFINE TABLE schema_meta"));
+        assert!(schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.contains(schema::table::RECOVERY_OWNER));
+    }
+
+    #[test]
+    fn v2_migrations_have_no_destructive_statements() {
+        for ddl in [schema::SCHEMA_DDL_V2, schema::SCHEMA_MIGRATION_V1_TO_V2_DDL] {
+            let lower = ddl.to_ascii_lowercase();
+            assert!(!lower.contains("drop "));
+            assert!(!lower.contains("delete "));
+            assert!(!lower.contains("remove "));
+        }
     }
 }

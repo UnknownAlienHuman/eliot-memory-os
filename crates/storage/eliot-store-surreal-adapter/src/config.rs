@@ -30,6 +30,10 @@ impl SchemaGeneration {
         Ok(Self(value))
     }
 
+    pub fn v2() -> Self {
+        Self("2.0.0".to_owned())
+    }
+
     /// Returns the stable generation identifier text.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -194,6 +198,11 @@ impl SurrealAdapterConfig {
                 expected: PINNED_SURREALDB_MAJOR,
             });
         }
+        if self.expected_schema_generation.as_str() != crate::schema::GENERATION_V2 {
+            return Err(ConfigError::InvalidField {
+                field: "expected_schema_generation",
+            });
+        }
         Ok(())
     }
 
@@ -326,7 +335,7 @@ mod tests {
             connect_timeout_ms: 1_000,
             query_timeout_ms: 1_000,
             expected_provider_major: PINNED_SURREALDB_MAJOR,
-            expected_schema_generation: SchemaGeneration::new("1.0.0").expect("valid generation"),
+            expected_schema_generation: SchemaGeneration::v2(),
         }
     }
 
@@ -336,6 +345,12 @@ mod tests {
         assert!(SchemaGeneration::new("  ").is_err());
         assert!(SchemaGeneration::new("bad\nvalue").is_err());
         assert!(SchemaGeneration::new("1.0.0").is_ok());
+    }
+
+    #[test]
+    fn schema_generation_accepts_v2() {
+        assert!(SchemaGeneration::new("2.0.0").is_ok());
+        assert!(SchemaGeneration::new(crate::schema::GENERATION_V2).is_ok());
     }
 
     #[test]
@@ -369,5 +384,32 @@ mod tests {
         let mut bad_digest = config("ws://127.0.0.1:18000/rpc");
         bad_digest.runtime_state_roots_digest = "unknown".to_owned();
         assert!(bad_digest.validate().is_err());
+    }
+
+    #[test]
+    fn expected_generation_must_be_exact_v2() {
+        let mut cfg = config("ws://127.0.0.1:18000/rpc");
+        assert!(cfg.validate().is_ok());
+        cfg.expected_schema_generation = SchemaGeneration::new("1.0.0").expect("valid");
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidField {
+                field: "expected_schema_generation"
+            })
+        );
+        cfg.expected_schema_generation = SchemaGeneration::v2();
+        assert!(cfg.validate().is_ok());
+        cfg.expected_schema_generation = SchemaGeneration::new("2.0.1").expect("valid");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn readiness_oracle_v1_requires_migration_v2_is_ready() {
+        let expected = SchemaGeneration::v2();
+        assert_eq!(expected.as_str(), crate::schema::GENERATION_V2);
+        let observed_v1 = Some(crate::schema::GENERATION_V1.to_owned());
+        let observed_v2 = Some(crate::schema::GENERATION_V2.to_owned());
+        assert_ne!(observed_v1, Some(expected.as_str().to_owned()));
+        assert_eq!(observed_v2, Some(expected.as_str().to_owned()));
     }
 }
