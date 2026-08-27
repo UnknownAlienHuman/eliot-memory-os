@@ -18,6 +18,7 @@ pub mod r13_os_harness;
 
 mod daemon_request_dispatch;
 mod frame_dispatch;
+mod front_door_listener;
 mod front_door_session;
 mod generation_recovery;
 mod health_view;
@@ -121,8 +122,10 @@ use eliot_store_api::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+#[cfg(all(test, windows))]
+use eliot_ipc::NamedPipeServer;
 #[cfg(windows)]
-use eliot_ipc::{NamedPipeServer, NamedPipeTransport};
+use eliot_ipc::NamedPipeTransport;
 #[cfg(windows)]
 use eliot_platform_windows::{
     NamedPipePeerExpectation, current_process_named_pipe_expectation,
@@ -5825,88 +5828,6 @@ impl KernelComposition {
         frame.request_id = Some(request_id);
         frame.validate()?;
         Ok(frame)
-    }
-
-    /// Binds the authenticated local Windows front door to the current
-    /// installation principal.  The returned server must be retained by the
-    /// service loop for the lifetime of the accepted connection.
-    #[cfg(windows)]
-    pub fn bind_authenticated_front_door(&self) -> Result<NamedPipeServer, KernelBuildError> {
-        if self
-            .generation_poison
-            .lock()
-            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
-            .is_some()
-        {
-            return Err(KernelBuildError::Principal(
-                "generation gateway fenced; forward recovery is required".to_owned(),
-            ));
-        }
-        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
-        NamedPipeServer::create(self.ipc.name(), &expectation)
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))
-    }
-
-    /// Binds one additional authenticated Windows front-door instance for a
-    /// concurrent session while the first instance remains connected.
-    #[cfg(windows)]
-    pub fn bind_authenticated_front_door_next(&self) -> Result<NamedPipeServer, KernelBuildError> {
-        if self
-            .generation_poison
-            .lock()
-            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
-            .is_some()
-        {
-            return Err(KernelBuildError::Principal(
-                "generation gateway fenced; forward recovery is required".to_owned(),
-            ));
-        }
-        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
-        NamedPipeServer::create_additional(self.ipc.name(), &expectation)
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))
-    }
-
-    /// Binds the first front-door instance using the exact sealed Host,
-    /// Eliotd, and promoted bridge peer set.
-    #[cfg(windows)]
-    pub fn bind_authenticated_front_door_with_peer_set(
-        &self,
-        peers: &NamedPipePeerSet,
-    ) -> Result<NamedPipeServer, KernelBuildError> {
-        if self
-            .generation_poison
-            .lock()
-            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
-            .is_some()
-        {
-            return Err(KernelBuildError::Principal(
-                "generation gateway fenced; forward recovery is required".to_owned(),
-            ));
-        }
-        NamedPipeServer::create_with_peer_set(self.ipc.name(), peers)
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))
-    }
-
-    /// Binds one replacement instance using the current immutable peer set.
-    #[cfg(windows)]
-    pub fn bind_authenticated_front_door_next_with_peer_set(
-        &self,
-        peers: &NamedPipePeerSet,
-    ) -> Result<NamedPipeServer, KernelBuildError> {
-        if self
-            .generation_poison
-            .lock()
-            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
-            .is_some()
-        {
-            return Err(KernelBuildError::Principal(
-                "generation gateway fenced; forward recovery is required".to_owned(),
-            ));
-        }
-        NamedPipeServer::create_additional_with_peer_set(self.ipc.name(), peers)
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))
     }
 
     /// Returns a cloned, read-only route projection.  Callers cannot obtain a
