@@ -264,6 +264,9 @@ impl EffectAuthorizer {
                 record.canonical_payload_sha256,
             )?;
             let lease_id = LeaseId::new(record.lease_id)?;
+            if record.receipt_obligations.is_empty() {
+                return Err(AuthorityError::InvalidField("receipt_obligations"));
+            }
             for obligation in &record.receipt_obligations {
                 obligation.validate()?;
             }
