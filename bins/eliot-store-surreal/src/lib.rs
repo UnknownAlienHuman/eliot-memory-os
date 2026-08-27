@@ -1917,9 +1917,14 @@ mod tests {
     }
 
     #[test]
-    fn recovery_and_genesis_capabilities_remain_unadvertised() {
-        assert!(!CAPABILITIES.contains(&eliot_store_api::CAPABILITY_RECOVERY));
-        assert!(!CAPABILITIES.contains(&eliot_store_api::CAPABILITY_INITIALIZE_GENESIS));
+    fn recovery_and_genesis_capabilities_are_advertised_in_order() {
+        assert_eq!(
+            &CAPABILITIES[8..],
+            &[
+                eliot_store_api::CAPABILITY_RECOVERY,
+                eliot_store_api::CAPABILITY_INITIALIZE_GENESIS,
+            ]
+        );
     }
 
     #[test]
