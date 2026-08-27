@@ -718,6 +718,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         eliotd_artifact_digest: fixture_handle("8".repeat(64)),
         eliotd_config_path: fixture_path(root, "eliotd-governor.json"),
         eliotd_config_digest: fixture_handle("4".repeat(64)),
+        protected_snapshot_digest: fixture_handle("a".repeat(64)),
         eliotd_descriptor_path: fixture_path(root, "eliotd.json"),
         eliotd_descriptor_digest: fixture_handle("9".repeat(64)),
         eliotd_launch_nonce: fixture_handle(format!("eliotd:{}", "a".repeat(32))),

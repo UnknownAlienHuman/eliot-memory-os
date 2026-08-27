@@ -413,6 +413,7 @@ impl RegistryFixture {
             "manifest_digest": manifest_digest,
             "prior_active_generation": prior_active,
             "approval": approval,
+            "phase_b_agent_bridge_stage_prepared": null,
             "state": state_value,
         })
     }
@@ -592,6 +593,7 @@ impl RegistryFixture {
             eliotd_artifact_digest: handle(eliotd_digest),
             eliotd_config_path: path_handle(&eliotd_config_path),
             eliotd_config_digest: handle(eliotd_config_digest),
+            protected_snapshot_digest: handle(Self::digest(23)),
             eliotd_descriptor_path: path_handle(&eliotd_descriptor_path),
             eliotd_descriptor_digest: handle(eliotd_descriptor_digest),
             eliotd_launch_nonce: handle(format!("eliotd:{}", "a".repeat(32))),

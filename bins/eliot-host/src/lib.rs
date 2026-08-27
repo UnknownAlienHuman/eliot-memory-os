@@ -435,6 +435,7 @@ fn validate_eliotd_launch_descriptor_bytes(
         || descriptor.working_directory != launch.kernel_work_root
         || descriptor.config_descriptor != launch.eliotd_config_path
         || descriptor.config_descriptor_sha256 != launch.eliotd_config_digest.as_str()
+        || descriptor.protected_snapshot_digest != launch.protected_snapshot_digest.as_str()
         || descriptor.launch_nonce != launch.eliotd_launch_nonce
         || descriptor.authority_epoch != launch.authority_state_fence.authority_epoch
         || descriptor.generation != launch.authority_generation

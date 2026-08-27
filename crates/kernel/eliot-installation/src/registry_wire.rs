@@ -725,7 +725,12 @@ fn current_registry_wire_missing_field(value: &serde_json::Value) -> bool {
         .get("pending_activation")
         .and_then(serde_json::Value::as_object)
         .is_some_and(|pending| !pending.contains_key("phase_b_agent_bridge_stage_prepared"));
-    top_level_missing || approval_binding_missing || pending_bridge_field_missing
+    let protected_snapshot_field_missing = registry_runtime_objects(value)
+        .any(|runtime| !runtime.contains_key("protected_snapshot_digest"));
+    top_level_missing
+        || approval_binding_missing
+        || pending_bridge_field_missing
+        || protected_snapshot_field_missing
 }
 
 #[allow(

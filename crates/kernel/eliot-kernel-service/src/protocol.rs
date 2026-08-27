@@ -38,7 +38,7 @@ pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
 pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.eliotd-launch";
 /// Version of the exact `eliotd` child launch contract.
-pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION: u16 = 1;
+pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION: u16 = 2;
 /// Stable identity for the Host-owned agent-bridge admission descriptor.
 pub const AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.agent-bridge-admission";
 /// Version of the immutable agent-bridge admission contract.
@@ -417,6 +417,9 @@ pub struct EliotdLaunchDescriptor {
     pub config_descriptor: PlatformHandle,
     /// Lowercase SHA-256 digest of the exact daemon configuration bytes.
     pub config_descriptor_sha256: String,
+    /// Domain-separated identity of the protected Kernel/eliotd snapshot.
+    /// This is distinct from the digest of `config_descriptor` bytes.
+    pub protected_snapshot_digest: String,
     /// Public launch-correlation nonce carried through the explicit argv
     /// contract. It is not a secret or an authority credential; authenticated
     /// process/Job/pipe evidence remains the authority proof.
@@ -487,6 +490,10 @@ impl EliotdLaunchDescriptor {
         validate_runtime_digest(
             &self.config_descriptor_sha256,
             "eliotd.config_descriptor_sha256",
+        )?;
+        validate_runtime_digest(
+            &self.protected_snapshot_digest,
+            "eliotd.protected_snapshot_digest",
         )?;
         validate_runtime_digest(&self.descriptor_sha256, "eliotd.descriptor_sha256")?;
         let expected_arguments = [
@@ -1882,6 +1889,7 @@ pub fn semantic_store_config_hash_from_json(
         eliotd_artifact_digest: serde_json::Value,
         eliotd_config_path: serde_json::Value,
         eliotd_config_digest: serde_json::Value,
+        protected_snapshot_digest: serde_json::Value,
         eliotd_descriptor_path: serde_json::Value,
         eliotd_descriptor_digest: serde_json::Value,
         eliotd_launch_nonce: serde_json::Value,
@@ -1929,6 +1937,7 @@ pub fn semantic_store_config_hash_from_json(
                 "eliotd_artifact_digest",
                 "eliotd_config_path",
                 "eliotd_config_digest",
+                "protected_snapshot_digest",
                 "eliotd_descriptor_path",
                 "eliotd_descriptor_digest",
                 "eliotd_launch_nonce",
@@ -2020,6 +2029,7 @@ pub fn semantic_store_config_hash_from_json(
             eliotd_artifact_digest: field(value, "eliotd_artifact_digest")?,
             eliotd_config_path: field(value, "eliotd_config_path")?,
             eliotd_config_digest: field(value, "eliotd_config_digest")?,
+            protected_snapshot_digest: field(value, "protected_snapshot_digest")?,
             eliotd_descriptor_path: field(value, "eliotd_descriptor_path")?,
             eliotd_descriptor_digest: field(value, "eliotd_descriptor_digest")?,
             eliotd_launch_nonce: field(value, "eliotd_launch_nonce")?,
@@ -2887,6 +2897,7 @@ mod tests {
             working_directory: handle_value(r"C:\Eliot"),
             config_descriptor: handle_value(r"C:\ProgramData\Eliot\governor\eliotd.json"),
             config_descriptor_sha256,
+            protected_snapshot_digest: "c".repeat(64),
             launch_nonce: handle_value(nonce),
             authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
             generation: ResourceGeneration::new(1).expect("generation"),
@@ -2894,6 +2905,21 @@ mod tests {
         }
         .with_computed_digest()
         .expect("descriptor digest")
+    }
+
+    #[test]
+    fn eliotd_protected_snapshot_identity_is_required_and_lowercase() {
+        let descriptor = eliotd_launch_descriptor();
+        let mut old_wire = serde_json::to_value(&descriptor).expect("descriptor value");
+        old_wire
+            .as_object_mut()
+            .expect("descriptor object")
+            .remove("protected_snapshot_digest");
+        assert!(serde_json::from_value::<EliotdLaunchDescriptor>(old_wire).is_err());
+
+        let mut uppercase = descriptor;
+        uppercase.protected_snapshot_digest = "C".repeat(64);
+        assert!(uppercase.validate().is_err());
     }
 
     fn agent_bridge_admission_descriptor() -> AgentBridgeAdmissionDescriptor {
@@ -3430,6 +3456,7 @@ mod tests {
                 "eliotd_artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "eliotd_config_path": "C:/eliot/eliotd-governor.json",
                 "eliotd_config_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "protected_snapshot_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "eliotd_descriptor_path": "C:/eliot/eliotd.json",
                 "eliotd_descriptor_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "eliotd_launch_nonce": "eliotd:nonce",

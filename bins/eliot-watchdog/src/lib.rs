@@ -3689,6 +3689,7 @@ mod tests {
             "eliotd_artifact_digest": "1".repeat(64),
             "eliotd_config_path": r"C:\ProgramData\Eliot\packages\generation-7\eliotd.json",
             "eliotd_config_digest": "2".repeat(64),
+            "protected_snapshot_digest": "a".repeat(64),
             "eliotd_descriptor_path": r"C:\ProgramData\Eliot\packages\generation-7\eliotd-descriptor.json",
             "eliotd_descriptor_digest": "3".repeat(64),
             "eliotd_launch_nonce": "eliotd-fixture-nonce",

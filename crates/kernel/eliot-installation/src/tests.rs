@@ -1638,6 +1638,7 @@ fn registering_transaction() -> InstallationTransaction {
                 eliotd_artifact_digest: test_handle("8".repeat(64)),
                 eliotd_config_path: test_path(&root, "eliotd-governor.json"),
                 eliotd_config_digest: test_handle("4".repeat(64)),
+                protected_snapshot_digest: test_handle("a".repeat(64)),
                 eliotd_descriptor_path: test_path(&root, "eliotd.json"),
                 eliotd_descriptor_digest: test_handle("9".repeat(64)),
                 eliotd_launch_nonce: test_handle(format!("eliotd:{}", "a".repeat(32))),
@@ -2885,6 +2886,17 @@ fn first_install_bootstrap_handoff_keeps_both_starts_pending_through_projection(
                 format!("content:{name}").into_bytes()
             }
         };
+        let mut kernel_bytes = minimal_pe();
+        kernel_bytes.extend_from_slice(b"eliot-kernel.exe");
+        let protected_snapshot_digest = sha256_hex(
+            format!(
+                "governor-protected:{}:{}:{}",
+                "installation:test",
+                "candidate",
+                sha256_hex(&kernel_bytes)
+            )
+            .as_bytes(),
+        );
         for (name, exe) in [
             ("eliot-host.exe", true),
             ("eliot-watchdog.exe", true),
@@ -2896,7 +2908,13 @@ fn first_install_bootstrap_handoff_keeps_both_starts_pending_through_projection(
             ("eliotd-governor.json", false),
             ("eliotd.json", false),
         ] {
-            std::fs::write(source_dir.path().join(name), file_content(name, exe)).unwrap();
+            let content = if name == "eliotd-governor.json" {
+                format!(r#"{{"protected_snapshot_digest":"{protected_snapshot_digest}"}}"#)
+                    .into_bytes()
+            } else {
+                file_content(name, exe)
+            };
+            std::fs::write(source_dir.path().join(name), content).unwrap();
         }
         let planned_via_planner = must(GenerationPackagePlanner::plan_unbound_for_test(
             GenerationPackagePlanInput {
@@ -8856,6 +8874,13 @@ fn runtime_launch_digest_covers_store_and_authority_inputs() {
         original.as_str()
     );
 
+    let mut protected_snapshot = descriptor.clone();
+    protected_snapshot.protected_snapshot_digest = test_handle("b".repeat(64));
+    assert_ne!(
+        sha256_hex(&must(protected_snapshot.unsigned_bytes())),
+        original.as_str()
+    );
+
     let mut child_argument_swap = descriptor;
     let config_path = transaction.candidate_manifest.config_path;
     child_argument_swap.kernel_arguments[11] = test_handle("9".repeat(64));
@@ -8874,6 +8899,17 @@ fn runtime_launch_rejects_binding_mismatches_and_unknown_fields() {
     let mut unknown = must(serde_json::to_value(descriptor));
     unknown["unexpected"] = serde_json::json!(true);
     assert!(serde_json::from_value::<RuntimeLaunchDescriptor>(unknown).is_err());
+
+    let mut old_wire = must(serde_json::to_value(descriptor));
+    old_wire
+        .as_object_mut()
+        .expect("runtime descriptor object")
+        .remove("protected_snapshot_digest");
+    assert!(serde_json::from_value::<RuntimeLaunchDescriptor>(old_wire).is_err());
+
+    let mut uppercase_protected = descriptor.clone();
+    uppercase_protected.protected_snapshot_digest = test_handle("A".repeat(64));
+    assert!(uppercase_protected.validate().is_err());
 
     let mut wrong_generation = transaction.candidate_manifest.clone();
     wrong_generation.runtime_launch.generation = test_handle("generation:other");

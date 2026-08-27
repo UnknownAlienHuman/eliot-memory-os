@@ -756,6 +756,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         eliotd_artifact_digest: handle("e".repeat(64)),
         eliotd_config_path: path(&portable, "eliotd-governor.json"),
         eliotd_config_digest: handle("2".repeat(64)),
+        protected_snapshot_digest: handle("a".repeat(64)),
         eliotd_descriptor_path: path(&portable, "eliotd.json"),
         eliotd_descriptor_digest: handle("f".repeat(64)),
         eliotd_launch_nonce: handle(format!("eliotd:{}", "1".repeat(32))),
@@ -1378,6 +1379,7 @@ fn materialize_descriptor_bound_host_fixture(
         working_directory: launch.kernel_work_root.clone(),
         config_descriptor: launch.eliotd_config_path.clone(),
         config_descriptor_sha256: launch.eliotd_config_digest.as_str().to_owned(),
+        protected_snapshot_digest: launch.protected_snapshot_digest.as_str().to_owned(),
         launch_nonce: eliotd_nonce,
         authority_epoch: launch.authority_state_fence.authority_epoch,
         generation: descriptor_generation,
@@ -1403,6 +1405,21 @@ fn production_initial_and_relaunch_reject_descriptor_generation_substitution() -
     let substituted_generation =
         ResourceGeneration::new(manifest.runtime_launch.authority_generation.value() + 1)?;
     materialize_descriptor_bound_host_fixture(&mut manifest, &host, substituted_generation)?;
+    let descriptor_bytes = std::fs::read(manifest.runtime_launch.eliotd_descriptor_path.as_str())?;
+    let mut substituted_descriptor: EliotdLaunchDescriptor =
+        serde_json::from_slice(&descriptor_bytes)?;
+    substituted_descriptor.protected_snapshot_digest = "b".repeat(64);
+    let substituted_bytes = serde_json::to_vec(&substituted_descriptor.with_computed_digest()?)?;
+    let substituted_digest =
+        PlatformHandle::new(format!("{:x}", Sha256::digest(&substituted_bytes)))?;
+    assert!(
+        validate_eliotd_launch_descriptor_bytes(
+            &substituted_bytes,
+            &substituted_digest,
+            &manifest.runtime_launch,
+        )
+        .is_err()
+    );
     let config_path = PathBuf::from(manifest.config_path.as_str());
     let mut initial = HostJobBranches::new(&host)?;
     let Err(initial_error) = initial.start_approved(

@@ -1473,6 +1473,7 @@ mod tests {
             eliotd_artifact_digest: handle("c".repeat(64)),
             eliotd_config_path: handle(r"C:\ProgramData\Eliot\governor\eliotd.json"),
             eliotd_config_digest: handle("d".repeat(64)),
+            protected_snapshot_digest: handle("e".repeat(64)),
             eliotd_descriptor_path: handle(r"C:\ProgramData\Eliot\eliotd.json"),
             eliotd_descriptor_digest: handle("e".repeat(64)),
             eliotd_launch_nonce: handle(format!("eliotd:{}", "1".repeat(32))),

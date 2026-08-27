@@ -576,6 +576,20 @@ fn governor_bytes(
         .map_err(|error| MaterializeError::Contract(format!("serialize governor config: {error}")))
 }
 
+fn protected_snapshot_digest_from_governor_bytes(
+    bytes: &[u8],
+) -> Result<PlatformHandle, MaterializeError> {
+    let config: GovernorLaunchConfig = serde_json::from_slice(bytes).map_err(|error| {
+        MaterializeError::Contract(format!("parse protected snapshot identity: {error}"))
+    })?;
+    config.validate().map_err(|error| {
+        MaterializeError::Contract(format!("validate protected snapshot identity: {error}"))
+    })?;
+    PlatformHandle::new(config.protected_snapshot_digest).map_err(|error| {
+        MaterializeError::Contract(format!("protected snapshot identity: {error}"))
+    })
+}
+
 fn bridge_source_plan(
     input: &CanarySourceBundleMaterializeInput,
     kernel_artifact_sha256: &str,
@@ -671,6 +685,7 @@ fn build_typed_bundle(
     let eliotd = by_name("eliotd.exe")?;
     bridge_source_plan(input, &kernel.sha256)?;
     let governor = governor_bytes(&input.generation, &input.installation_epoch, &kernel.sha256)?;
+    let protected_snapshot_digest = protected_snapshot_digest_from_governor_bytes(&governor)?;
     let governor_sha256 = sha256_hex(&governor);
     let template_facts = vec![
         package_digest("eliot-host.exe", host.size, &host.sha256)?,
@@ -785,6 +800,7 @@ fn build_typed_bundle(
         working_directory: roots.kernel_work_root.clone(),
         config_descriptor: governor_path.clone(),
         config_descriptor_sha256: governor_sha256.clone(),
+        protected_snapshot_digest: protected_snapshot_digest.as_str().to_owned(),
         launch_nonce: eliotd_launch_nonce.clone(),
         authority_epoch,
         generation: authority_generation,
@@ -837,6 +853,7 @@ fn build_typed_bundle(
         eliotd_artifact_digest: make_digest(eliotd.sha256.clone(), "eliotd digest")?,
         eliotd_config_path: governor_path,
         eliotd_config_digest: make_digest(governor_sha256.clone(), "governor digest")?,
+        protected_snapshot_digest: protected_snapshot_digest.clone(),
         eliotd_descriptor_path: descriptor_path,
         eliotd_descriptor_digest: make_digest(descriptor_sha256.clone(), "descriptor digest")?,
         eliotd_launch_nonce: eliotd_launch_nonce.clone(),

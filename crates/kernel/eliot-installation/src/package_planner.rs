@@ -78,6 +78,52 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn protected_snapshot_digest_from_governor_bytes(
+    bytes: &[u8],
+    installation: &PlatformHandle,
+    generation: &PlatformHandle,
+    kernel_digest: &str,
+) -> Result<PlatformHandle, InstallationError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::InvalidField {
+            field: "generation.eliotd-governor.json".to_owned(),
+            reason: format!("protected snapshot identity parse failed: {error}"),
+        })?;
+    let digest = value
+        .get("protected_snapshot_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| InstallationError::InvalidField {
+            field: "generation.protected_snapshot_digest".to_owned(),
+            reason: "source governor config must carry the protected snapshot identity".to_owned(),
+        })?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(InstallationError::InvalidField {
+            field: "generation.protected_snapshot_digest".to_owned(),
+            reason: "must be a lowercase SHA-256 digest".to_owned(),
+        });
+    }
+    let expected = hex_digest(
+        format!(
+            "governor-protected:{}:{}:{}",
+            installation.as_str(),
+            generation.as_str(),
+            kernel_digest
+        )
+        .as_bytes(),
+    );
+    if digest != expected {
+        return Err(InstallationError::IdentityConflict);
+    }
+    PlatformHandle::new(digest.to_owned()).map_err(|error| InstallationError::InvalidField {
+        field: "generation.protected_snapshot_digest".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
 const CANARY_ARTIFACT_SET_EVIDENCE_DOMAIN: &[u8] =
     b"eliot.runtime-live.canary-artifact-set-evidence.v1";
 
@@ -1007,6 +1053,18 @@ impl GenerationPackagePlanner {
             InstallationError::Platform(format!("source observe failed: {error}"))
         })?;
         validate_exact_source_inventory(&observed)?;
+        let governor_lease = source
+            .retain_file("eliotd-governor.json")
+            .map_err(|error| {
+                InstallationError::Platform(format!(
+                    "retain eliotd-governor.json through planning: {error}"
+                ))
+            })?;
+        let governor_bytes = governor_lease
+            .read_bounded(16 * 1024 * 1024)
+            .map_err(|error| {
+                InstallationError::Platform(format!("read eliotd-governor.json lease: {error}"))
+            })?;
         let source_store_config = if enforce_store_config {
             let lease = source.retain_file("generation.json").map_err(|error| {
                 InstallationError::Platform(format!(
@@ -1104,6 +1162,12 @@ impl GenerationPackagePlanner {
                 .ok_or(InstallationError::IdentityConflict)
         };
         let kernel_digest = digest_for("eliot-kernel.exe")?;
+        let protected_snapshot_digest = protected_snapshot_digest_from_governor_bytes(
+            &governor_bytes,
+            &input.installation_epoch.installation,
+            &input.generation,
+            kernel_digest.as_str(),
+        )?;
         let host_digest = digest_for("eliot-host.exe")?;
         let watchdog_digest = digest_for("eliot-watchdog.exe")?;
         let store_bridge_digest = digest_for("eliot-store-surreal.exe")?;
@@ -1301,6 +1365,7 @@ impl GenerationPackagePlanner {
             eliotd_artifact_digest: eliotd_digest,
             eliotd_config_path,
             eliotd_config_digest,
+            protected_snapshot_digest,
             eliotd_descriptor_path,
             eliotd_descriptor_digest,
             eliotd_launch_nonce,
@@ -2247,6 +2312,8 @@ mod tests {
             let mut pe = minimal_pe();
             pe.extend_from_slice(name.as_bytes());
             pe
+        } else if name == "eliotd-governor.json" {
+            br#"{"protected_snapshot_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#.to_vec()
         } else {
             format!("content:{name}").into_bytes()
         }
@@ -2310,6 +2377,7 @@ mod tests {
             eliotd_artifact_digest: h("8".repeat(64)),
             eliotd_config_path: test_path(portable_root.as_str(), "eliotd-governor.json"),
             eliotd_config_digest: h("4".repeat(64)),
+            protected_snapshot_digest: h("a".repeat(64)),
             eliotd_descriptor_path: test_path(portable_root.as_str(), "eliotd.json"),
             eliotd_descriptor_digest: h("9".repeat(64)),
             eliotd_launch_nonce: h(format!("eliotd:{}", "a".repeat(32))),
@@ -2826,9 +2894,24 @@ mod tests {
             ("eliotd-governor.json", false),
             ("eliotd.json", false),
         ];
+        let kernel_bytes = file_content("eliot-kernel.exe", true);
+        let protected_snapshot_digest = hex_digest(
+            format!(
+                "governor-protected:{}:{}:{}",
+                "installation:test",
+                "candidate",
+                sha_of(&kernel_bytes)
+            )
+            .as_bytes(),
+        );
         let mut map = std::collections::BTreeMap::new();
         for (name, exe) in roles {
-            let content = file_content(name, exe);
+            let content = if name == "eliotd-governor.json" {
+                format!(r#"{{"protected_snapshot_digest":"{protected_snapshot_digest}"}}"#)
+                    .into_bytes()
+            } else {
+                file_content(name, exe)
+            };
             std::fs::write(dir.join(name), &content).unwrap();
             map.insert(name.to_owned(), sha_of(&content));
         }
@@ -3774,6 +3857,27 @@ mod tests {
                 "source mutation {mutation} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn generation_planner_rejects_substituted_protected_snapshot_digest() {
+        let (_tmp, portable, _roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        populate_source_with_roles(source_dir.path());
+        std::fs::write(
+            source_dir.path().join("eliotd-governor.json"),
+            format!(r#"{{"protected_snapshot_digest":"{}"}}"#, "b".repeat(64)),
+        )
+        .unwrap();
+
+        assert!(
+            GenerationPackagePlanner::plan_unbound_for_test(production_input(
+                source_dir.path(),
+                portable,
+            ))
+            .is_err(),
+            "source protected snapshot identity must match the independently derived domain"
+        );
     }
 
     #[test]

@@ -234,9 +234,10 @@ const LEGACY_PHASE_B_ZERO_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 /// Current installation contract revision.
 ///
-/// Version 4 makes the typed pending/provisioned supervision authority a
-/// mandatory member of every `RuntimeLaunchDescriptor` projection.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
+/// Version 4 made the typed pending/provisioned supervision authority a
+/// mandatory member of every `RuntimeLaunchDescriptor` projection. Version 5
+/// adds the mandatory domain-separated protected snapshot identity.
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// Breaking wire revision for durable [`InstallationTransaction`] records.
 ///
 /// This discriminator is intentionally independent from [`CONTRACT_VERSION`]
@@ -1341,6 +1342,12 @@ pub struct RuntimeLaunchDescriptor {
     pub eliotd_config_path: PlatformHandle,
     /// SHA-256 digest of the exact `GovernorLaunchConfig` bytes.
     pub eliotd_config_digest: PlatformHandle,
+    /// Domain-separated identity of the protected Kernel/eliotd snapshot.
+    ///
+    /// This is the value materialized inside `GovernorLaunchConfig`; it is
+    /// carried independently so consumers cannot substitute a digest of the
+    /// configuration bytes for the protected snapshot identity.
+    pub protected_snapshot_digest: PlatformHandle,
     /// Explicit serialized `EliotdLaunchDescriptor` path.
     pub eliotd_descriptor_path: PlatformHandle,
     /// SHA-256 digest of the serialized `EliotdLaunchDescriptor` bytes.
@@ -1804,6 +1811,7 @@ impl RuntimeLaunchDescriptor {
             eliotd_artifact_digest: &'a PlatformHandle,
             eliotd_config_path: &'a PlatformHandle,
             eliotd_config_digest: &'a PlatformHandle,
+            protected_snapshot_digest: &'a PlatformHandle,
             eliotd_descriptor_path: &'a PlatformHandle,
             eliotd_descriptor_digest: &'a PlatformHandle,
             eliotd_launch_nonce: &'a PlatformHandle,
@@ -1840,6 +1848,7 @@ impl RuntimeLaunchDescriptor {
             eliotd_artifact_digest: &self.eliotd_artifact_digest,
             eliotd_config_path: &self.eliotd_config_path,
             eliotd_config_digest: &self.eliotd_config_digest,
+            protected_snapshot_digest: &self.protected_snapshot_digest,
             eliotd_descriptor_path: &self.eliotd_descriptor_path,
             eliotd_descriptor_digest: &self.eliotd_descriptor_digest,
             eliotd_launch_nonce: &self.eliotd_launch_nonce,
@@ -1965,6 +1974,10 @@ impl RuntimeLaunchDescriptor {
         runtime_sha256_handle(
             &self.eliotd_config_digest,
             "runtime_launch.eliotd_config_digest",
+        )?;
+        runtime_sha256_handle(
+            &self.protected_snapshot_digest,
+            "runtime_launch.protected_snapshot_digest",
         )?;
         approved_path(
             &self.eliotd_descriptor_path,
