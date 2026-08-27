@@ -18,12 +18,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{AuthorityEpoch, sha256_hex};
 use eliot_installation::{
-    ApprovedGenerationRegistry, CandidateManifest, InstallationProfile,
-    InstallerServiceRegistrationApproval, InstallerServiceRole, PendingActivationState,
+    ApprovedGenerationRegistry, CandidateManifest, InstallationProfile, PendingActivationState,
     RedbInstallationRegistry, RuntimeStateRoots, ValidatedRuntimeRootLeases,
     WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider, phase_b_scm_selector,
     verify_file_digest, verify_file_digest_with_lease,
 };
+#[cfg(test)]
+use eliot_installation::{InstallerServiceRegistrationApproval, InstallerServiceRole};
 use eliot_ors::{SupervisionLeaseSnapshot, read_current_supervision_lease_read_only};
 #[cfg(test)]
 use eliot_platform_windows::WindowsAdapterError;
@@ -61,7 +62,17 @@ const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
 mod scm_launch;
+mod service_registration_projection;
 mod supervision_lease_load;
+
+#[cfg(test)]
+pub(crate) use service_registration_projection::{
+    approved_service_registration, service_approval_matches_manifest,
+};
+pub(crate) use service_registration_projection::{
+    load_approved_service_registrations, read_approved_service_registration,
+    validate_bound_service_registrations,
+};
 
 pub use scm_launch::{
     ApprovedHostRegistration, ValidatedWatchdogScmLaunch, WatchdogScmLaunchError,
@@ -2255,7 +2266,7 @@ fn approved_host_artifact_path(manifest: &CandidateManifest) -> Result<PathBuf, 
     Ok(PathBuf::from(path.as_str()))
 }
 
-fn read_registry_for_bootstrap(
+pub(crate) fn read_registry_for_bootstrap(
     bootstrap: &ServiceBootstrapArguments,
 ) -> Result<(ApprovedGenerationRegistry, CandidateManifest), SpoolError> {
     let host_state_root = bootstrap.host_state_root().ok_or_else(|| {
@@ -2272,130 +2283,6 @@ fn read_registry_for_bootstrap(
     .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
     let manifest = select_runtime_manifest(&registry, bootstrap)?;
     Ok((registry, manifest))
-}
-
-fn service_approval_matches_manifest(
-    approval: &InstallerServiceRegistrationApproval,
-    request: &ServiceRegistrationRequest,
-    manifest: &CandidateManifest,
-    role: InstallerServiceRole,
-) -> bool {
-    let launch = &manifest.runtime_launch;
-    let Some(bootstrap) = request.bootstrap() else {
-        return false;
-    };
-    let Some(host_state_root) = bootstrap.host_state_root() else {
-        return false;
-    };
-    let expected_image = match role {
-        InstallerServiceRole::Host => launch.host_executable_path.as_str(),
-        InstallerServiceRole::Watchdog => launch.watchdog_executable_path.as_str(),
-    };
-    let expected_descriptor_digest = phase_b_scm_selector(&launch.authority_descriptor_digest).ok();
-    approval.generation() == &manifest.generation
-        && approval.role() == role
-        && request.service_name()
-            == match role {
-                InstallerServiceRole::Host => eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
-                InstallerServiceRole::Watchdog => SERVICE_NAME,
-            }
-        && windows_paths_equal(
-            bootstrap.config_descriptor_path(),
-            Path::new(launch.authority_descriptor_path.as_str()),
-        )
-        && expected_descriptor_digest
-            .as_ref()
-            .is_some_and(|expected| bootstrap.config_descriptor_digest() == expected.as_str())
-        && bootstrap.installation_id() == launch.installation_epoch.installation.as_str()
-        && bootstrap.transaction_plan_generation() == launch.authority_generation.value()
-        && windows_paths_equal(
-            host_state_root,
-            Path::new(launch.runtime_state_roots.host_state_root.as_str()),
-        )
-        && windows_paths_equal(request.binary_path(), Path::new(expected_image))
-}
-
-fn approved_service_registration(
-    registry: &ApprovedGenerationRegistry,
-    manifest: &CandidateManifest,
-    role: InstallerServiceRole,
-) -> Result<
-    (
-        InstallerServiceRegistrationApproval,
-        ServiceRegistrationRequest,
-    ),
-    SpoolError,
-> {
-    let approval = registry
-        .service_registration_approval(&manifest.generation, role)
-        .ok_or_else(|| {
-            SpoolError::InvalidLease("installer SCM registration approval is missing".to_owned())
-        })?;
-    let request = approval.service_registration_request().map_err(|_| {
-        SpoolError::InvalidLease("installer SCM registration approval is invalid".to_owned())
-    })?;
-    if !service_approval_matches_manifest(approval, &request, manifest, role) {
-        return Err(SpoolError::InvalidLease(
-            "installer SCM registration approval does not bind the selected generation".to_owned(),
-        ));
-    }
-    Ok((approval.clone(), request))
-}
-
-fn load_approved_service_registrations(
-    registry: &ApprovedGenerationRegistry,
-    manifest: &CandidateManifest,
-    bootstrap: &ServiceBootstrapArguments,
-) -> Result<(ApprovedHostRegistration, ServiceRegistrationRequest), SpoolError> {
-    let (host_approval, _) =
-        approved_service_registration(registry, manifest, InstallerServiceRole::Host)?;
-    let (_, watchdog_request) =
-        approved_service_registration(registry, manifest, InstallerServiceRole::Watchdog)?;
-    if watchdog_request.bootstrap() != Some(bootstrap) {
-        return Err(SpoolError::InvalidLease(
-            "Watchdog SCM bootstrap does not match the installer approval".to_owned(),
-        ));
-    }
-    let approved_host_registration = ApprovedHostRegistration::from_approval(&host_approval)?;
-    Ok((approved_host_registration, watchdog_request))
-}
-
-fn read_approved_service_registration(
-    bootstrap: &ServiceBootstrapArguments,
-    role: InstallerServiceRole,
-) -> Result<
-    (
-        CandidateManifest,
-        InstallerServiceRegistrationApproval,
-        ServiceRegistrationRequest,
-    ),
-    SpoolError,
-> {
-    let (registry, manifest) = read_registry_for_bootstrap(bootstrap)?;
-    let (approval, request) = approved_service_registration(&registry, &manifest, role)?;
-    Ok((manifest, approval, request))
-}
-
-fn validate_bound_service_registrations(
-    registry: &ApprovedGenerationRegistry,
-    manifest: &CandidateManifest,
-    expected_host_request: &ServiceRegistrationRequest,
-    expected_watchdog_request: &ServiceRegistrationRequest,
-    bootstrap: &ServiceBootstrapArguments,
-) -> Result<(), SpoolError> {
-    let (_, host_request) =
-        approved_service_registration(registry, manifest, InstallerServiceRole::Host)?;
-    let (_, watchdog_request) =
-        approved_service_registration(registry, manifest, InstallerServiceRole::Watchdog)?;
-    if host_request != *expected_host_request
-        || watchdog_request != *expected_watchdog_request
-        || watchdog_request.bootstrap() != Some(bootstrap)
-    {
-        return Err(SpoolError::InvalidLease(
-            "installer SCM registration approval changed after watchdog binding".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 /// Performs a read-only SCM readback for the exact Host sibling selected by
