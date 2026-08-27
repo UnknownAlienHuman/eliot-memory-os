@@ -14,7 +14,6 @@ use crate::{
     Governor, GovernorConfig, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
     ServiceObservation,
 };
-use eliot_authority::{EffectAuthorizer, GrantGraph};
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
 use eliot_change_monitor::ChangeMonitor;
@@ -41,6 +40,10 @@ use eliot_workscope::{WorkScopeBindingOwner, WorkScopeBindingSnapshot};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
+
+#[path = "authority_recovery.rs"]
+mod authority_recovery;
+pub use authority_recovery::{AuthorityOwner, AuthorityOwnerSnapshot};
 
 /// The only application write port exposed to the daemon.
 ///
@@ -734,23 +737,6 @@ pub struct ReadOwnerSnapshot {
     pub revision: u64,
 }
 
-/// Authority payload sufficient to reject a missing grant-graph read.  A
-/// non-empty graph is intentionally rejected until the authority crate
-/// exposes its typed snapshot constructor; it must never be replaced by an
-/// empty graph silently.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthorityOwnerSnapshot {
-    /// Exact owner fence.
-    pub state_fence: StateFence,
-    /// Durable grant graph revision.
-    pub grant_graph_revision: u64,
-    /// Number of grants in the canonical graph.
-    pub grant_count: u64,
-    /// Number of effect-idempotency entries in the authority projection.
-    pub authorized_effect_count: u64,
-}
-
 fn is_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1174,46 +1160,6 @@ impl<P: KernelDurableJobPort + ?Sized> MaintenanceStateStore for KernelDurableJo
         self.kernel
             .save_durable_job(job)
             .map_err(|error| MaintenanceError::Store(error.to_string()))
-    }
-}
-
-/// Authority owner retaining both effect policy and the validated grant graph.
-#[derive(Clone, Debug)]
-pub struct AuthorityOwner {
-    /// Effect-level authorizer.
-    pub effects: EffectAuthorizer,
-    /// Recovered grant graph lineage.
-    pub grants: GrantGraph,
-}
-
-impl AuthorityOwner {
-    fn from_snapshot(
-        snapshot: &AuthorityOwnerSnapshot,
-        expected_fence: &StateFence,
-    ) -> Result<Self, CompositionError> {
-        if snapshot.state_fence != *expected_fence || snapshot.grant_graph_revision == 0 {
-            return Err(CompositionError::Recovery(
-                "authority snapshot has a stale fence or zero graph revision".to_owned(),
-            ));
-        }
-        if snapshot.grant_count != 0 {
-            return Err(CompositionError::Recovery(
-                "authority grant payload is non-empty but no typed GrantGraph restore route is admitted"
-                    .to_owned(),
-            ));
-        }
-        if snapshot.authorized_effect_count != 0 {
-            return Err(CompositionError::Recovery(
-                "authority effect payload is non-empty but no typed EffectAuthorizer restore route is admitted"
-                    .to_owned(),
-            ));
-        }
-        let grants = GrantGraph::from_grants(std::iter::empty(), snapshot.grant_graph_revision)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        Ok(Self {
-            effects: EffectAuthorizer::default(),
-            grants,
-        })
     }
 }
 
@@ -2131,12 +2077,22 @@ mod tests {
                 sessions: BTreeMap::new(),
                 events: Vec::new(),
             }),
-            RecoveryOwner::Authority => serde_json::to_value(AuthorityOwnerSnapshot {
-                state_fence: state_fence.clone(),
-                grant_graph_revision: 1,
-                grant_count: 0,
-                authorized_effect_count: 0,
-            }),
+            RecoveryOwner::Authority => {
+                let grant_graph = eliot_authority::GrantGraph::from_grants(std::iter::empty(), 1)
+                    .and_then(|graph| graph.recovery_snapshot())
+                    .expect("empty grant graph snapshot");
+                let effect_authorizer = eliot_authority::EffectAuthorizer::default()
+                    .snapshot()
+                    .expect("empty effect authorizer snapshot");
+                serde_json::to_value(
+                    AuthorityOwnerSnapshot::new(
+                        state_fence.clone(),
+                        grant_graph,
+                        effect_authorizer,
+                    )
+                    .expect("empty authority snapshot"),
+                )
+            }
             RecoveryOwner::Budget => {
                 serde_json::to_value(BudgetOwnerSnapshot::unconfigured(state_fence.clone(), 1))
             }
