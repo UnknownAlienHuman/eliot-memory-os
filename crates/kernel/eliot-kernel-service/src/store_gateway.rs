@@ -1,14 +1,25 @@
 //! Kernel-owned canonical Store gateway and its replacement flight fence.
+//!
+//! Architecture traceability: `A12.3` and `ARCH-SEC-02` keep one governed
+//! Store write path; `A13.2`, `A13.6`, `ARCH-AUTH-01`, and `ARCH-RES-01` bind
+//! recovery to the live Kernel route and exact fence. Implementation anchors
+//! are `I1.8`, `I5.1`, `I5.9`, `I5.11`, `B.2`, `P.3`, and `I14.21`: the Store
+//! owns durable records, this gateway verifies route/fence and admission, and
+//! Governor remains the only semantic owner. Recovery payloads stay opaque;
+//! no capability is advertised, no retry/cache/default policy is invented,
+//! and unknown genesis outcomes remain the EBP client's exact-operation
+//! reconciliation result.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eliot_contracts::RequestMetadata;
+use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_store_api::{
     CanonicalStoreClient, CanonicalValidationSnapshot, OrderingHeadExpectation, PreparedTransition,
-    RevisionHeadExpectation, StoreHealth, WriteReceipt,
+    RequestMeta, RevisionHeadExpectation, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt,
 };
 
 use crate::{EbpCanonicalStoreClient, KernelService};
@@ -223,6 +234,83 @@ impl KernelStoreGateway {
         result
     }
 
+    /// Reads one bounded, opaque Store recovery snapshot through the active
+    /// Kernel generation route. The gateway validates only Store-owned shape
+    /// and fencing; Governor remains the semantic owner of payload decoding.
+    pub async fn recovery(
+        &self,
+        request: StoreRecoveryRequest,
+    ) -> Result<StoreRecoverySnapshot, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        request.validate().map_err(|error| error.to_string())?;
+        self.validate_active_route(&request.state_fence)?;
+        let snapshot = self
+            .store
+            .recovery(request.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        snapshot.validate().map_err(|error| error.to_string())?;
+        if snapshot.state_fence != request.state_fence {
+            return Err("Store recovery snapshot fence does not match request".to_owned());
+        }
+        Ok(snapshot)
+    }
+
+    /// Seeds the Store's all-absent genesis state under the active Kernel
+    /// admission lease. Unknown outcome handling remains owned by the EBP
+    /// client, which reconciles the exact operation identity.
+    pub async fn initialize_genesis(
+        &self,
+        context: &RequestMeta,
+        request: StoreGenesisRequest,
+    ) -> Result<WriteReceipt, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        context.validate().map_err(|error| error.to_string())?;
+        request
+            .validate_for_context(context)
+            .map_err(|error| error.to_string())?;
+        if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
+            return Err("genesis caller is not the active daemon".to_owned());
+        }
+        self.validate_active_route(&context.state_fence)?;
+        if request.state_fence != context.state_fence {
+            return Err("genesis request fence does not match request metadata".to_owned());
+        }
+
+        let lease = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            if service.generation_fenced() {
+                return Err("Kernel generation is fenced".to_owned());
+            }
+            let lease = service
+                .acquire_admission()
+                .map_err(|error| error.to_string())?;
+            if lease.authority_epoch() != request.state_fence.authority_epoch {
+                return Err("genesis route authority epoch is stale".to_owned());
+            }
+            lease
+        };
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        let result = self
+            .store
+            .initialize_genesis(context, request)
+            .await
+            .map_err(|error| error.to_string());
+        drop(lease);
+        result
+    }
+
     /// Reads one Host-bound canonical validation snapshot.
     pub async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, String> {
         let _flight = self.flight.enter()?;
@@ -233,6 +321,25 @@ impl KernelStoreGateway {
             .validation_snapshot()
             .await
             .map_err(|error| error.to_string())
+    }
+
+    fn validate_active_route(&self, state_fence: &StateFence) -> Result<(), String> {
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+        if service.generation_fenced() {
+            return Err("Kernel generation is fenced".to_owned());
+        }
+        if self.route.authority_epoch() != service.authority_epoch()
+            || self.route.authority_epoch() != state_fence.authority_epoch
+        {
+            return Err("canonical-store route is outside the active Kernel epoch".to_owned());
+        }
+        if self.route.active_generation() != state_fence.resource_generation {
+            return Err("canonical-store route is outside the active Kernel generation".to_owned());
+        }
+        Ok(())
     }
 
     /// Reads and validates the retained canonical Store health observation.
