@@ -601,8 +601,19 @@ impl DaemonKernelClient {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, KernelClientError> {
-        let (mut transport, limits) = self.connect_transport().await?;
         let identity = self.next_identity(operation)?;
+        self.transact_async_with_identity(operation, payload, identity)
+            .await
+    }
+
+    #[cfg(windows)]
+    async fn transact_async_with_identity(
+        &self,
+        operation: &str,
+        payload: serde_json::Value,
+        identity: RequestIdentity,
+    ) -> Result<serde_json::Value, KernelClientError> {
+        let (mut transport, limits) = self.connect_transport().await?;
         let request_id = identity.request.metadata.request_id.clone();
         let frame = Frame {
             protocol_version: ProtocolVersion::CURRENT,
@@ -670,6 +681,16 @@ impl DaemonKernelClient {
         &self,
         _operation: &str,
         _payload: serde_json::Value,
+    ) -> Result<serde_json::Value, KernelClientError> {
+        Err(KernelClientError::Unsupported)
+    }
+
+    #[cfg(not(windows))]
+    async fn transact_async_with_identity(
+        &self,
+        _operation: &str,
+        _payload: serde_json::Value,
+        _identity: RequestIdentity,
     ) -> Result<serde_json::Value, KernelClientError> {
         Err(KernelClientError::Unsupported)
     }
@@ -798,6 +819,20 @@ impl DaemonKernelClient {
     ) -> Result<serde_json::Value, KernelPortError> {
         let client = self.clone_for_future();
         Self::blocking(async move { client.transact_async(operation, payload).await })
+    }
+
+    fn request_blocking_with_identity(
+        &self,
+        operation: &'static str,
+        payload: serde_json::Value,
+        identity: RequestIdentity,
+    ) -> Result<serde_json::Value, KernelPortError> {
+        let client = self.clone_for_future();
+        Self::blocking(async move {
+            client
+                .transact_async_with_identity(operation, payload, identity)
+                .await
+        })
     }
 
     fn clone_for_future(&self) -> Arc<Self> {

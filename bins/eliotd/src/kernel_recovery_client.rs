@@ -15,27 +15,27 @@
 //! synthesis, semantic authority, lease/token minting, or success on an
 //! unknown or partially observed Store result.
 //!
-//! Governor genesis remains fail-closed here because the current
-//! `GovernorGenesisRequest` carries owner selectors but no opaque
-//! `StoreGenesisRequest::owner_records`. The next contract packet belongs to
-//! Governor/eliotd: carry the complete canonical owner records and their
-//! request digest into the authenticated request, then let this client submit
-//! that exact neutral Store request and reconcile by operation identity.
+//! Governor genesis is lowered here without interpretation: the complete
+//! Governor packet is validated, converted to opaque Store recovery records,
+//! submitted with one stable request identity, and accepted only after the
+//! Store-owned receipt envelope validates against that exact request.
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_governor::{
     GovernorGenesisRequest, KernelNamedReadReply, KernelNamedReadRequest, KernelPortError,
     KernelRecoveryPort,
 };
 use eliot_maintenance::MaintenanceJob;
+use eliot_protocol::RequestIdentity;
+use eliot_receipts::RequestBinding;
 use eliot_store_api::{
-    CONTRACT_VERSION, RecoveryRecordKey, ScopeRevisionView, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt,
+    CONTRACT_VERSION, RecoveryRecord, RecoveryRecordKey, ScopeRevisionView, StoreGenesisRequest,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, validate_genesis_receipt_envelope,
 };
 
-use super::{DaemonKernelClient, kind_value};
+use super::{DaemonKernelClient, SERVICE_NAME, kind_value, unix_ms, unix_ms_i64};
 
 const OWNER_RECOVERY_NAMESPACE: &str = "owner";
 const JOB_RECOVERY_NAMESPACE: &str = "job";
@@ -80,12 +80,64 @@ impl KernelRecoveryPort for DaemonKernelClient {
 
     fn initialize_governor_genesis(
         &self,
-        _request: &GovernorGenesisRequest,
+        request: &GovernorGenesisRequest,
     ) -> Result<(), KernelPortError> {
-        Err(KernelPortError::Contract(
-            "Governor genesis requires opaque owner_records; the current request carries only owner selectors"
-                .to_owned(),
-        ))
+        request
+            .validate(
+                &self.snapshot.state_fence(),
+                &self.snapshot.protected_snapshot_digest,
+            )
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let identity = stable_genesis_identity(self, request)?;
+        let context = identity.request.metadata.clone();
+        let owner_records = request
+            .owner_records
+            .iter()
+            .map(|record| RecoveryRecord {
+                namespace: OWNER_RECOVERY_NAMESPACE.to_owned(),
+                key: record.owner.as_str().to_owned(),
+                state_fence: request.state_fence.clone(),
+                revision: record.revision,
+                schema: record.schema.clone(),
+                payload: record.payload.clone(),
+                value_digest: record.value_digest.clone(),
+            })
+            .collect();
+        let store_request = StoreGenesisRequest {
+            contract_version: CONTRACT_VERSION,
+            operation_id: request.operation_id.clone(),
+            idempotency_key: identity.idempotency_key.clone(),
+            canonical_request_hash: String::new(),
+            state_fence: request.state_fence.clone(),
+            owner_records,
+        }
+        .with_computed_digest()
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        store_request
+            .validate_for_context(&context)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let value = self.request_blocking_with_identity(
+            "store_initialize_genesis",
+            serde_json::json!({
+                "context": context,
+                "request": store_request,
+            }),
+            identity.clone(),
+        )?;
+        let value = kind_value(&value, "store_initialize_genesis")?;
+        let receipt: WriteReceipt = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if receipt.operation_id != request.operation_id
+            || receipt.idempotency_key != identity.idempotency_key
+            || receipt.state_fence != request.state_fence
+        {
+            return Err(KernelPortError::Contract(
+                "Kernel Store genesis receipt does not match the submitted request".to_owned(),
+            ));
+        }
+        validate_genesis_receipt_envelope(&identity.request.metadata, &store_request, &receipt)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        Ok(())
     }
 
     fn canonical_scope(
@@ -157,6 +209,46 @@ impl KernelRecoveryPort for DaemonKernelClient {
             })
             .collect()
     }
+}
+
+fn stable_genesis_identity(
+    client: &DaemonKernelClient,
+    request: &GovernorGenesisRequest,
+) -> Result<RequestIdentity, KernelPortError> {
+    let operation = request.operation_id.as_str();
+    let idempotency_key = format!("{SERVICE_NAME}:governor-genesis:{operation}");
+    let request_id = RequestId::new(format!(
+        "{}:store_initialize_genesis:{operation}",
+        client.connection_id
+    ))
+    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    let fence = request.state_fence.clone();
+    let now = unix_ms_i64();
+    let metadata = RequestMetadata {
+        request_id: request_id.clone(),
+        session_id: None,
+        task_id: None,
+        product_id: ProductId::new(SERVICE_NAME)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?,
+        source_id: SourceId::new(SERVICE_NAME)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?,
+        state_fence: fence.clone(),
+        clock: ClockReading {
+            valid_time_ms: Some(now),
+            known_time_ms: Some(now),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    Ok(RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence: fence,
+        },
+        idempotency_key: idempotency_key.clone(),
+        deadline_unix_ms: unix_ms().saturating_add(30_000),
+        cancellation_id: format!("{idempotency_key}:cancel"),
+    })
 }
 
 impl DaemonKernelClient {
