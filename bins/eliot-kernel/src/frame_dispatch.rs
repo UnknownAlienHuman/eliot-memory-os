@@ -92,7 +92,6 @@ impl KernelComposition {
                         | "daemon_fatal"
                         | "agent_activation_claim"
                         | "agent_activation_submit"
-                        | "services"
                 )
             {
                 if !probe_ready_state_admitted(
