@@ -1,11 +1,34 @@
 //! The single orchestration owner for the Governor service graph.
 //!
-//! This crate deliberately owns coordination state, startup ordering, readiness,
-//! degradation, and shutdown admission only.  Individual services own their
-//! data and effects; they report observations here and never mutate this state
-//! directly.  The owner is deterministic and synchronous so that callers can
-//! place it behind any chosen Tokio task or IPC boundary without introducing a
-//! second lifecycle authority.
+//! Architecture (A2, A13.2) vs Implementation (I1.10, I1.11, I2.2, I2.23):
+//! - A2 (Participants, authority and modularity) and A13.2 (Kernel and failure
+//!   domains) define the intent: one Governor owns admission and lifecycle
+//!   ordering, and optional capability failure is isolated from the required
+//!   base.
+//! - I1.10 defines the shared `ServiceProcessState`/`HealthVector` vocabulary
+//!   without creating a second lifecycle enum; I1.11 defines the normative
+//!   startup order and the required-base readiness gate; I2.2 and I2.23 define
+//!   when a capability becomes a separate crate and the capability-family
+//!   topology. This crate implements those exact contracts.
+//!
+//! Ownership / forbidden authority:
+//! - This crate is the sole owner of Governor orchestration state
+//!   (`Governor`, `GovernorState`, `ServiceRecord`). No second lifecycle
+//!   authority, alternate write path, or hidden readiness inference exists.
+//! - `update_service` is the sole mutable observation path; services only
+//!   report observations and never mutate this state directly.
+//! - Required services `Config`, `ControlWal`, `BlobStore`, `Database`,
+//!   `Migration`, `Writer`, `Read`, `Policy` must each be `Ready` and
+//!   `is_fully_healthy()` for the required base to be admitted (see
+//!   `ServiceId::required_for_ready`). `Running`/`Starting` is not `Ready`.
+//! - Optional services in `Degraded`, `Failed`, `Quarantined`,
+//!   `ManualRecovery`, or with a non-fully-healthy `HealthVector` remain
+//!   visible as `Degraded` but do not block the required base or force
+//!   `Failed`. Only required-service `Failed`/`Quarantined`/`ManualRecovery`
+//!   drives `Failed`.
+//! - No new enum or default is introduced, readiness is never fabricated, and
+//!   existing fail-closed validation (generation, epoch, ordering, lifecycle)
+//!   outside this distinction is preserved.
 
 #![forbid(unsafe_code)]
 
@@ -459,14 +482,15 @@ impl Governor {
             self.state = GovernorState::Failed;
             return Err(GovernorError::RequiredServiceUnavailable(service));
         }
-        let optional_failed = self.services.iter().any(|(service, record)| {
+        let optional_degraded = self.services.iter().any(|(service, record)| {
             !service.required_for_ready()
-                && matches!(
+                && (matches!(
                     record.observation.state,
-                    ServiceProcessState::Failed
+                    ServiceProcessState::Degraded
+                        | ServiceProcessState::Failed
                         | ServiceProcessState::Quarantined
                         | ServiceProcessState::ManualRecovery
-                )
+                ) || !record.observation.health.is_fully_healthy())
         });
         let required_present = STARTUP_ORDER
             .iter()
@@ -475,7 +499,7 @@ impl Governor {
             .all(|service| self.services.contains_key(&service));
         if !required_present {
             self.state = GovernorState::Starting;
-        } else if required_ready && !optional_failed {
+        } else if required_ready && !optional_degraded {
             self.state = GovernorState::Ready;
         } else if required_ready {
             self.state = GovernorState::Degraded;
