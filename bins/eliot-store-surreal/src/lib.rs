@@ -32,12 +32,13 @@ use eliot_protocol::{
     ProtocolVersion, ServerHello,
 };
 use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
+#[cfg(test)]
+use eliot_store_api::StoreGenesisRequest;
 use eliot_store_api::{
     CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, NamedReadRequest,
     NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
     PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey,
-    StoreError, StoreGenesisRequest, StoreHealth, StoreRecoverySnapshot, WriteReceipt,
-    decode_request_frame,
+    StoreError, StoreHealth, WriteReceipt, decode_request_frame,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -50,6 +51,16 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+
+mod request_dispatch;
+pub use request_dispatch::StoreDispatchBackend;
+#[cfg(test)]
+use request_dispatch::UNKNOWN_GENESIS_REASON;
+pub use request_dispatch::dispatch;
+#[cfg(test)]
+use request_dispatch::map_genesis_dispatch_result;
+#[cfg(test)]
+use request_dispatch::map_recovery_dispatch_result;
 
 pub const SERVICE_NAME: &str = "eliot-store-surreal";
 pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
@@ -338,34 +349,6 @@ fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
         },
         AdapterError::Store(error) => StoreCompositionError::Store(error),
         other => StoreCompositionError::Store(other.into_store_error()),
-    }
-}
-
-const UNKNOWN_GENESIS_REASON: &str =
-    "genesis receipt envelope is missing; reconcile by exact operation identity";
-
-fn map_recovery_dispatch_result(result: Result<StoreRecoverySnapshot, StoreError>) -> Response {
-    match result {
-        Ok(snapshot) => Response::Recovery { snapshot },
-        Err(error) => Response::Error {
-            error: error.to_string(),
-        },
-    }
-}
-
-fn map_genesis_dispatch_result(
-    request: StoreGenesisRequest,
-    result: Result<WriteReceipt, StoreError>,
-) -> Response {
-    match result {
-        Ok(receipt) => Response::Genesis { receipt },
-        Err(StoreError::MissingReceiptEnvelope) => Response::Unknown {
-            operation_id: request.operation_id,
-            reason: UNKNOWN_GENESIS_REASON.to_owned(),
-        },
-        Err(error) => Response::Error {
-            error: error.to_string(),
-        },
     }
 }
 
@@ -1153,107 +1136,6 @@ pub fn validate_request_frame(
         return Err(format!("capability is not admitted: {capability}"));
     }
     Ok(request)
-}
-
-/// Store backend used by the reusable EBP request dispatch seam.
-#[allow(async_fn_in_trait)]
-pub trait StoreDispatchBackend: Send + Sync {
-    /// Executes one already session-validated closed store request.
-    async fn dispatch_request(&self, request: Request) -> Response;
-}
-
-/// Dispatches through the same production backend seam used by the binary
-/// loop. Tests may provide a bounded fake backend without copying transport,
-/// handshake, replay, or request validation authority.
-pub async fn dispatch<B: StoreDispatchBackend + ?Sized>(backend: &B, request: Request) -> Response {
-    backend.dispatch_request(request).await
-}
-
-impl StoreDispatchBackend for StoreComposition {
-    async fn dispatch_request(&self, request: Request) -> Response {
-        match request {
-            Request::Health => match self.health().await {
-                Ok(record) => Response::Health { record },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
-            Request::Readiness => match self.readiness().await {
-                Ok(receipt) => Response::Readiness { receipt },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
-            Request::Named { request } => match self.named(request).await {
-                Ok(response) => Response::Named { response },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
-            Request::Apply {
-                context,
-                transition,
-                expected_revision_heads,
-                expected_ordering_heads,
-            } => match self
-                .apply(
-                    &context,
-                    transition,
-                    expected_revision_heads,
-                    expected_ordering_heads,
-                )
-                .await
-            {
-                Ok(receipt) => Response::from_transaction_receipt(receipt),
-                Err(StoreCompositionError::UnknownOutcome {
-                    operation_id,
-                    reason,
-                }) => Response::Unknown {
-                    operation_id,
-                    reason,
-                },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
-            Request::Receipt { operation_id } => match self.receipt(operation_id).await {
-                Ok(receipt) => Response::from_receipt(receipt),
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
-            Request::RevisionHeads { keys } => match self.revision_heads(keys).await {
-                Ok(heads) => Response::RevisionHeads { heads },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
-            Request::OrderingHeads { scopes } => match self.ordering_heads(scopes).await {
-                Ok(heads) => Response::OrderingHeads { heads },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
-            Request::ValidationSnapshot => match self.validation_snapshot().await {
-                Ok(snapshot) => Response::ValidationSnapshot { snapshot },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
-            },
-            Request::Recovery { request } => map_recovery_dispatch_result(
-                CanonicalStoreClient::recovery(&self.store, request).await,
-            ),
-            Request::InitializeGenesis { context, request } => {
-                let result = CanonicalStoreClient::initialize_genesis(
-                    &self.store,
-                    &context,
-                    request.clone(),
-                )
-                .await;
-                map_genesis_dispatch_result(request, result)
-            }
-        }
-    }
 }
 
 /// Purely materializes the credential-bearing adapter configuration from an
