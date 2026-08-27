@@ -633,6 +633,7 @@ fn process_phase_b_requests(host: &mut HostComposition, queue: &HostPhaseBReques
             operation,
             intent,
             credential_receipt,
+            final_receipt,
             reply,
         } = request;
         let response = match operation {
@@ -641,6 +642,19 @@ fn process_phase_b_requests(host: &mut HostComposition, queue: &HostPhaseBReques
             }
             eliot_installation::HostCredentialControlOperation::ReconcilePhaseB => {
                 host.reconcile_phase_b_request(&intent, &credential_receipt)
+            }
+            eliot_installation::HostCredentialControlOperation::FinalizePhaseB => {
+                match final_receipt {
+                    Some(receipt) => {
+                        host.finalize_phase_b_request(&intent, &credential_receipt, &receipt)
+                    }
+                    None => eliot_installation::HostCredentialControlResponse::Unknown {
+                        pending_ref: eliot_platform::PlatformHandle::new(
+                            "phase-b-finalize-missing-receipt",
+                        )
+                        .unwrap_or_else(|_| unreachable!()),
+                    },
+                }
             }
             _ => unreachable!("credential control queue admits only Phase-B operations"),
         };

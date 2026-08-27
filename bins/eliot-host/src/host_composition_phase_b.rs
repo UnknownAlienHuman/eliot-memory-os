@@ -1,5 +1,14 @@
 use super::*;
 
+#[cfg(windows)]
+use super::phase_b_materialization::{
+    prepare_agent_bridge_materialization, publish_agent_bridge_pair,
+    rehydrate_agent_bridge_binding, rehydrate_agent_bridge_binding_from_pending,
+    retain_agent_bridge_profile, rollback_agent_bridge_pair, rollback_agent_bridge_stage,
+};
+#[cfg(windows)]
+use eliot_platform_windows::reconcile_agent_bridge_stage;
+
 impl HostComposition {
     /// Materializes the Host-owned Phase-B authority, Store bootstrap, and
     /// dynamic launch descriptors for one already-approved generation.
@@ -475,6 +484,10 @@ impl HostComposition {
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let pending = self.registry.pending_activation().cloned();
         let active_rebind = self.registry.active_phase_b_rebind().cloned();
+        #[cfg(windows)]
+        let mut agent_bridge_materialization = None;
+        #[cfg(windows)]
+        let mut agent_bridge_binding = None;
         let prepared = if let Some(pending) = pending.as_ref() {
             let intent = pending.phase_b_intent.as_ref().ok_or_else(|| {
                 HostError::RecoveryRequired(
@@ -486,6 +499,60 @@ impl HostComposition {
                     "Phase-B preparation manifest is not the exact pending manifest".to_owned(),
                 ));
             }
+            agent_bridge_materialization =
+                if let Some(source) = intent.agent_bridge_source.as_deref() {
+                    let host_capability = self.owner_lease.activation_capability();
+                    let (installation_root, platform_prepared, installation_prepared) =
+                        prepare_agent_bridge_materialization(
+                            launch_template,
+                            intent,
+                            source,
+                            &manifest_digest,
+                            pending.phase_b_agent_bridge_stage_prepared.as_ref(),
+                        )?;
+                    if pending.phase_b_agent_bridge_stage_prepared.as_ref()
+                        != Some(&installation_prepared)
+                    {
+                        if pending.phase_b_agent_bridge_stage_prepared.is_some() {
+                            return Err(HostError::RecoveryRequired(
+                                "durable Agent Bridge stage differs from the exact Phase-B source"
+                                    .to_owned(),
+                            ));
+                        }
+                        self.persist_pending_phase_b_agent_bridge_stage_prepared(
+                            pending,
+                            &installation_prepared,
+                            &host_capability,
+                        )?;
+                    }
+                    let staging_receipt =
+                        reconcile_agent_bridge_stage(&installation_root, &platform_prepared)
+                            .map_err(|error| {
+                                HostError::RecoveryRequired(format!(
+                                    "reconcile Agent Bridge stage: {error}"
+                                ))
+                            })?;
+                    Some(retain_agent_bridge_profile(
+                        launch_template,
+                        intent,
+                        source,
+                        &manifest_digest,
+                        &platform_prepared,
+                        installation_prepared,
+                        staging_receipt,
+                    )?)
+                } else {
+                    if pending.phase_b_agent_bridge_stage_prepared.is_some() {
+                        return Err(HostError::RecoveryRequired(
+                            "Agent Bridge stage exists without a matching Phase-B source plan"
+                                .to_owned(),
+                        ));
+                    }
+                    None
+                };
+            agent_bridge_binding = agent_bridge_materialization
+                .as_ref()
+                .map(|materialization| materialization.binding.clone());
             let mut prepared = HostPhaseBPreparedMaterialization {
                 wire: PlatformHandle::new(HostPhaseBPreparedMaterialization::WIRE)
                     .map_err(|error| HostError::Platform(error.to_string()))?,
@@ -514,6 +581,7 @@ impl HostComposition {
                 eliotd_descriptor_digest: eliotd_descriptor_digest.clone(),
                 semantic_config_hash: semantic_config_hash.clone(),
                 launch: launch.clone(),
+                agent_bridge: agent_bridge_binding.clone(),
                 prepared_digest: PlatformHandle::new("pending")
                     .map_err(|error| HostError::Platform(error.to_string()))?,
             };
@@ -531,6 +599,13 @@ impl HostComposition {
                         .to_owned(),
                 ));
             }
+            agent_bridge_binding = durable_prior_binding
+                .and_then(|binding| binding.agent_bridge.as_ref())
+                .map(|binding| {
+                    rehydrate_agent_bridge_binding(launch_template, binding)
+                        .map(|final_binding| final_binding.prepared)
+                })
+                .transpose()?;
             let mut prepared = HostPhaseBPreparedMaterialization {
                 wire: PlatformHandle::new(HostPhaseBPreparedMaterialization::WIRE)
                     .map_err(|error| HostError::Platform(error.to_string()))?,
@@ -562,6 +637,7 @@ impl HostComposition {
                 eliotd_descriptor_digest: eliotd_descriptor_digest.clone(),
                 semantic_config_hash: semantic_config_hash.clone(),
                 launch: launch.clone(),
+                agent_bridge: agent_bridge_binding.clone(),
                 prepared_digest: PlatformHandle::new("pending")
                     .map_err(|error| HostError::Platform(error.to_string()))?,
             };
@@ -646,6 +722,31 @@ impl HostComposition {
                 "Phase-B destination readback differs from the durable preparation".to_owned(),
             ));
         }
+        if let Some(agent_bridge) = agent_bridge_materialization.as_ref() {
+            let mut bridge_allowed_profile_digests = vec![&agent_bridge.binding.profile_digest];
+            let mut bridge_allowed_declaration_digests =
+                vec![&agent_bridge.binding.declaration_digest];
+            if let Some(previous_bridge) = self
+                .registry
+                .last_committed_activation_fence()
+                .and_then(|fence| fence.phase_b_live_binding.as_ref())
+                .and_then(|binding| binding.agent_bridge.as_ref())
+            {
+                // A generation replacement may encounter the previous
+                // committed pair.  Only those exact durable leaf digests may
+                // be replaced; an unrelated file remains a hard recovery
+                // failure in phase_b_materialize_file_with_rollback.
+                bridge_allowed_profile_digests.push(&previous_bridge.profile_digest);
+                bridge_allowed_declaration_digests.push(&previous_bridge.declaration_digest);
+            }
+            publish_agent_bridge_pair(
+                profile,
+                portable_root.as_ref(),
+                agent_bridge,
+                &bridge_allowed_profile_digests,
+                &bridge_allowed_declaration_digests,
+            )?;
+        }
         let receipt = HostPhaseBMaterialization {
             transaction_id: None,
             effect_id: None,
@@ -669,6 +770,8 @@ impl HostComposition {
                 bootstrap_identity,
                 eliotd_identity,
             ],
+            agent_bridge: agent_bridge_binding,
+            agent_bridge_final: None,
             launch,
         };
         self.phase_b = Some(receipt.clone());
@@ -818,7 +921,12 @@ impl HostComposition {
         if let Some(rebind) = self.registry.active_phase_b_rebind().cloned()
             && let (Some(prepared), Some(receipt)) = (rebind.prepared, rebind.receipt)
         {
-            let mut materialization = self.rehydrate_phase_b_from_prepared(manifest, &prepared)?;
+            let mut materialization = self.rehydrate_phase_b_from_prepared(
+                manifest,
+                &prepared,
+                None,
+                prior_binding.agent_bridge.as_ref(),
+            )?;
             receipt
                 .validate_against(&intent, &prepared)
                 .map_err(HostError::Installation)?;
@@ -830,6 +938,9 @@ impl HostComposition {
             materialization.host_process_identity = Some(receipt.host_process_identity.clone());
             materialization.request_digest = Some(intent.request_digest.clone());
             materialization.public_receipt_digest = Some(receipt.receipt_digest.clone());
+            materialization
+                .agent_bridge_final
+                .clone_from(&receipt.agent_bridge);
             self.phase_b = Some(materialization);
             return Ok(());
         }
@@ -879,8 +990,12 @@ impl HostComposition {
                 "Active Phase-B publication differs from durable preparation".to_owned(),
             ));
         }
-        let receipt = ActivePhaseBRebindReceipt::from_prepared(&intent, prepared)
-            .map_err(HostError::Installation)?;
+        let receipt = ActivePhaseBRebindReceipt::from_prepared_with_bridge(
+            &intent,
+            prepared,
+            prior_binding.agent_bridge.as_ref(),
+        )
+        .map_err(HostError::Installation)?;
         self.persist_active_phase_b_rebind_receipt(&receipt, &host_capability)?;
         materialization.host_owner_epoch = Some(receipt.host_owner_epoch.clone());
         materialization.host_process_identity = Some(receipt.host_process_identity.clone());
@@ -898,8 +1013,31 @@ impl HostComposition {
         &self,
         manifest: &CandidateManifest,
         prepared: &HostPhaseBPreparedMaterialization,
+        pending: Option<&eliot_installation::PendingActivation>,
+        prior_bridge: Option<&AgentBridgePhaseBBinding>,
     ) -> Result<HostPhaseBMaterialization, HostError> {
         prepared.validate().map_err(HostError::Installation)?;
+        if let Some(pending) = pending {
+            if pending.phase_b_prepared.as_ref() != Some(prepared) {
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B prepared rehydrate is not the exact pending record".to_owned(),
+                ));
+            }
+            let intent = pending.phase_b_intent.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Phase-B prepared rehydrate has no matching pending intent".to_owned(),
+                )
+            })?;
+            if intent.transaction_id != prepared.transaction_id
+                || intent.effect_id != prepared.effect_id
+                || intent.request_digest != prepared.request_digest
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B prepared rehydrate intent differs from the durable preparation"
+                        .to_owned(),
+                ));
+            }
+        }
         let manifest_digest = phase_b_manifest_digest(manifest)?;
         if prepared.manifest_digest != manifest_digest
             || prepared.launch.generation != manifest.generation
@@ -1001,6 +1139,58 @@ impl HostComposition {
             &prepared.eliotd_descriptor_digest,
             "eliotd descriptor",
         )?;
+        let agent_bridge = if let Some(binding) = prepared.agent_bridge.as_ref() {
+            if let Some(pending) = pending {
+                let intent = pending.phase_b_intent.as_ref().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "prepared Agent Bridge binding has no matching Phase-B intent".to_owned(),
+                    )
+                })?;
+                let source = intent.agent_bridge_source.as_deref().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "prepared Agent Bridge binding has no matching source plan".to_owned(),
+                    )
+                })?;
+                let stage = pending
+                    .phase_b_agent_bridge_stage_prepared
+                    .as_ref()
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "prepared Agent Bridge binding has no durable stage proof".to_owned(),
+                        )
+                    })?;
+                if binding.stage_prepared != *stage {
+                    return Err(HostError::RecoveryRequired(
+                        "prepared Agent Bridge binding stage differs from pending stage proof"
+                            .to_owned(),
+                    ));
+                }
+                Some(
+                    rehydrate_agent_bridge_binding_from_pending(
+                        &prepared.launch,
+                        intent,
+                        source,
+                        &manifest_digest,
+                        binding,
+                        prior_bridge,
+                    )?
+                    .prepared,
+                )
+            } else {
+                Some(binding.clone())
+            }
+        } else {
+            if pending.is_some_and(|pending| pending.phase_b_agent_bridge_stage_prepared.is_some())
+            {
+                return Err(HostError::RecoveryRequired(
+                    "pending Agent Bridge stage exists without prepared binding".to_owned(),
+                ));
+            }
+            None
+        };
+        let agent_bridge_final = pending
+            .and_then(|pending| pending.phase_b_receipt.as_ref())
+            .and_then(|receipt| receipt.agent_bridge.clone());
         Ok(HostPhaseBMaterialization {
             transaction_id: Some(prepared.transaction_id.clone()),
             effect_id: Some(prepared.effect_id.clone()),
@@ -1016,6 +1206,8 @@ impl HostComposition {
             config_file_digest: prepared.config_file_digest.clone(),
             semantic_config_hash: prepared.semantic_config_hash.clone(),
             eliotd_descriptor_digest: prepared.eliotd_descriptor_digest.clone(),
+            agent_bridge,
+            agent_bridge_final,
             request_digest: Some(prepared.request_digest.clone()),
             public_receipt_digest: None,
             file_identities: [
@@ -1029,6 +1221,52 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    pub(super) fn reconcile_pending_agent_bridge_stage(
+        pending: &eliot_installation::PendingActivation,
+    ) -> Result<(), HostError> {
+        let stage = pending
+            .phase_b_agent_bridge_stage_prepared
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "pending Agent Bridge stage reconciliation has no durable stage".to_owned(),
+                )
+            })?;
+        let intent = pending.phase_b_intent.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "pending Agent Bridge stage has no matching Phase-B intent".to_owned(),
+            )
+        })?;
+        let source = intent.agent_bridge_source.as_deref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "pending Agent Bridge stage has no matching source plan".to_owned(),
+            )
+        })?;
+        let manifest_digest = phase_b_manifest_digest(&pending.manifest)?;
+        let (installation_root, platform_prepared, installation_prepared) =
+            prepare_agent_bridge_materialization(
+                &pending.manifest.runtime_launch,
+                intent,
+                source,
+                &manifest_digest,
+                Some(stage),
+            )?;
+        if installation_prepared != *stage {
+            return Err(HostError::RecoveryRequired(
+                "pending Agent Bridge stage failed exact durable conversion".to_owned(),
+            ));
+        }
+        eliot_platform_windows::reconcile_agent_bridge_stage(
+            &installation_root,
+            &platform_prepared,
+        )
+        .map_err(|error| {
+            HostError::RecoveryRequired(format!("reconcile pending Agent Bridge stage: {error}"))
+        })?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
         reason = "uncommitted Phase-B rollback keeps all four destination restores and CAS cleanup together"
@@ -1038,9 +1276,17 @@ impl HostComposition {
         pending: &eliot_installation::PendingActivation,
         prepared: &HostPhaseBPreparedMaterialization,
     ) -> Result<(), HostError> {
-        if pending.prior_active_generation.is_some() {
+        if pending.prior_active_generation.is_some()
+            && (prepared.agent_bridge.is_none()
+                || self
+                    .registry
+                    .last_committed_activation_fence()
+                    .and_then(|fence| fence.phase_b_live_binding.as_ref())
+                    .and_then(|binding| binding.agent_bridge.as_ref())
+                    .is_none())
+        {
             return Err(HostError::RecoveryRequired(
-                "interrupted Phase-B upgrade requires an explicit prior-generation recovery proof"
+                "interrupted Phase-B upgrade lacks the committed Agent Bridge rollback proof"
                     .to_owned(),
             ));
         }
@@ -1139,6 +1385,12 @@ impl HostComposition {
             "eliotd descriptor",
             Some(&pending.manifest.runtime_launch.eliotd_descriptor_digest),
         )?;
+        if let Some(binding) = prepared.agent_bridge.as_ref() {
+            rollback_agent_bridge_pair(profile, portable_root.as_ref(), binding)?;
+            rollback_agent_bridge_stage(&binding.stage_prepared)?;
+        } else if let Some(stage) = pending.phase_b_agent_bridge_stage_prepared.as_ref() {
+            rollback_agent_bridge_stage(stage)?;
+        }
         let intent = pending.phase_b_intent.as_ref().ok_or_else(|| {
             HostError::RecoveryRequired(
                 "Phase-B rollback preparation has no matching intent".to_owned(),
@@ -1177,6 +1429,16 @@ impl HostComposition {
         phase_b_remove_rollback_backup(&config_path, "Store config")?;
         phase_b_remove_rollback_backup(&bootstrap_path, "Store bootstrap descriptor")?;
         phase_b_remove_rollback_backup(&eliotd_path, "eliotd descriptor")?;
+        if let Some(binding) = prepared.agent_bridge.as_ref() {
+            phase_b_remove_rollback_backup(
+                Path::new(binding.profile_path.as_str()),
+                "Agent Bridge admission profile",
+            )?;
+            phase_b_remove_rollback_backup(
+                Path::new(binding.declaration_path.as_str()),
+                "Agent Bridge client declaration",
+            )?;
+        }
         Ok(())
     }
 

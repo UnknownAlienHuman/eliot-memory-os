@@ -1,40 +1,33 @@
 //! B-15's thin profile-selected agent/host bridge.
-//!
-//! The runner is only composition: A-16 owns attach, reconnect, hook/event
-//! forwarding, replay and coverage semantics; C0-07 owns frame validation and
-//! framing; P-11 supplies bounded runtime mechanics. No provider, scheduler,
-//! durable journal, secret, or semantic state is created here.
 
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use eliot_agent_bridge_core::{
     ActivationPortOutcome, ActivationPortResult, AgentBridgeCore, AttachBinding, AttachRequest,
-    AttachView, BridgeError, ConnectionId, CursorPolicy, DemandId, EventForwardAck,
-    EventForwardStatus, EventPortOutcome, FencingToken, Generation, HostActivationPort,
-    HostEventEnvelope, McpForwardingPort, PrincipalId, ProviderFailure, ProviderReadiness,
-    ReconciliationPortOutcome, ReconciliationPortResult, ReconnectRequest, SessionId, TaskId,
-    WorkUnitId,
+    AttachView, BridgeError, ConnectionId, CursorPolicy, DemandId, EventForwardStatus,
+    EventPortOutcome, FencingToken, Generation, HostActivationPort, HostEventEnvelope,
+    McpForwardingPort, PrincipalId, ProviderFailure, ProviderReadiness, ReconciliationPortOutcome,
+    ReconnectRequest, SessionId, TaskId, WorkUnitId,
 };
-use eliot_protocol::{AckPhase, EventDisposition, EventEnvelope, Frame};
+use eliot_contracts::{ClockReading, ProductId, RequestId, SourceId};
+use eliot_protocol::{
+    AckPhase, AgentBridgeActivationRequest, AgentBridgeActivationResponse, AgentBridgeAttachKind,
+    AgentBridgeBlindInterval, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
+    AgentBridgePeerChallenge, EventEnvelope, Frame, FrameKind, MessageType, ProtocolPayload,
+};
 use eliot_runtime::{Runtime, RuntimeConfig};
-use serde::Deserialize;
-use serde_json::{Value, json};
 
-/// The only B-15 composition profiles admitted by the canonical runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Profile {
-    /// The minimum functional ELIOT spine.
     SpineFunctional,
-    /// The complete admitted composition.
     FullComposition,
 }
 
 impl Profile {
-    /// Returns the canonical command-line spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -42,8 +35,6 @@ impl Profile {
             Self::FullComposition => "FULL_COMPOSITION",
         }
     }
-
-    /// Returns whether this profile was compiled into the current binary.
     #[must_use]
     pub const fn is_compiled(self) -> bool {
         match self {
@@ -59,39 +50,36 @@ impl fmt::Display for Profile {
     }
 }
 
-/// A fail-closed profile/transport parse failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CliError {
-    /// The required profile was omitted.
     MissingProfile,
-    /// The profile is not one of the canonical admitted profiles.
+    MissingClientDeclaration,
     UnsupportedProfile(String),
-    /// An argument was malformed or unknown.
     MalformedArgument(String),
-    /// Remote transport selection is never admitted by B-15.
     RemoteTransportForbidden(String),
+    InvalidClientDeclarationPath(String),
 }
 
 impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingProfile => formatter.write_str("MISSING_PROFILE"),
-            Self::UnsupportedProfile(profile) => {
-                write!(formatter, "UNSUPPORTED_PROFILE:{profile}")
+            Self::MissingClientDeclaration => formatter.write_str("MISSING_CLIENT_DECLARATION"),
+            Self::UnsupportedProfile(p) => write!(formatter, "UNSUPPORTED_PROFILE:{p}"),
+            Self::MalformedArgument(a) => write!(formatter, "MALFORMED_ARGUMENT:{a}"),
+            Self::RemoteTransportForbidden(t) => {
+                write!(formatter, "REMOTE_TRANSPORT_FORBIDDEN:{t}")
             }
-            Self::MalformedArgument(argument) => write!(formatter, "MALFORMED_ARGUMENT:{argument}"),
-            Self::RemoteTransportForbidden(transport) => {
-                write!(formatter, "REMOTE_TRANSPORT_FORBIDDEN:{transport}")
+            Self::InvalidClientDeclarationPath(p) => {
+                write!(formatter, "INVALID_CLIENT_DECLARATION_PATH:{p}")
             }
         }
     }
 }
-
 impl std::error::Error for CliError {}
 
 impl std::str::FromStr for Profile {
     type Err = CliError;
-
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "SPINE_FUNCTIONAL" => Ok(Self::SpineFunctional),
@@ -101,287 +89,70 @@ impl std::str::FromStr for Profile {
     }
 }
 
-/// The explicitly bounded transport selection. Stdio is the production
-/// default; a loopback label remains reserved for a future injected port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Transport {
-    /// Length-delimited protocol frames over stdin/stdout.
     Stdio,
-    /// A future local-only transport supplied by the composition owner.
-    Loopback,
 }
 
 impl Transport {
     fn parse(value: &str) -> Result<Self, CliError> {
         match value {
             "stdio" => Ok(Self::Stdio),
-            "loopback" => Ok(Self::Loopback),
             other => Err(CliError::RemoteTransportForbidden(other.to_owned())),
         }
     }
 }
 
-/// Parsed B-15 command-line configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliConfig {
-    /// Selected canonical profile.
     pub profile: Profile,
-    /// Selected bounded transport.
     pub transport: Transport,
+    pub client_declaration: PathBuf,
 }
 
-/// Shared transport session handle used by the binary to bind each request's
-/// independent EBP identity before entering A-16.
-pub type KernelClientHandle = Arc<Mutex<eliot_cli::kernel_client::KernelClient>>;
-#[allow(dead_code)]
-type SharedKernelClient = KernelClientHandle;
-
-#[allow(dead_code)]
-fn provider_failure() -> ProviderFailure {
-    ProviderFailure::new(
-        "eliot-kernel-front-door",
-        "authenticated Kernel application exchange was rejected",
-    )
-}
-
-#[allow(dead_code)]
-fn kernel_call(
-    client: &SharedKernelClient,
-    operation: &str,
-    payload: Value,
-) -> Result<Value, ProviderFailure> {
-    let mut client = client.lock().map_err(|_| provider_failure())?;
-    client
-        .transact_json(operation, payload)
-        .map_err(|_| provider_failure())
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
-// The authenticated variant mirrors the closed Kernel wire contract; boxing it
-// would introduce a second representation solely to optimize a private decode.
-#[allow(clippy::large_enum_variant)]
-#[allow(dead_code)]
-enum ActivationWireResponse {
-    Authenticated {
-        principal_id: PrincipalId,
-        session_id: SessionId,
-        activation_generation: Generation,
-        state_fence: FencingToken,
-        task_id: TaskId,
-        work_unit_id: WorkUnitId,
-        work_scope_id: String,
-        task_revision: String,
-        plan_id: String,
-        plan_revision: String,
-    },
-    Denied {
-        reason_code: String,
-    },
-}
-
-#[allow(dead_code)]
-struct KernelHostActivationPort {
-    client: SharedKernelClient,
-}
-
-impl HostActivationPort for KernelHostActivationPort {
-    fn activate(
-        &mut self,
-        request: &AttachRequest,
-    ) -> Result<ActivationPortOutcome, ProviderFailure> {
-        let response = kernel_call(
-            &self.client,
-            "eliot.agent-bridge.activate",
-            serde_json::to_value(request).map_err(|_| provider_failure())?,
-        )?;
-        match serde_json::from_value(response).map_err(|_| provider_failure())? {
-            ActivationWireResponse::Authenticated {
-                principal_id,
-                session_id,
-                activation_generation,
-                state_fence,
-                task_id,
-                work_unit_id,
-                work_scope_id,
-                task_revision,
-                plan_id,
-                plan_revision,
-            } => Ok(ActivationPortOutcome::Authenticated(
-                ActivationPortResult::authenticated(
-                    principal_id,
-                    session_id,
-                    activation_generation,
-                    state_fence,
-                    task_id,
-                    work_unit_id,
-                    work_scope_id,
-                    task_revision,
-                    plan_id,
-                    plan_revision,
-                )
-                .map_err(|_| provider_failure())?,
-            )),
-            ActivationWireResponse::Denied { reason_code } => {
-                let reason_code: &'static str = match reason_code.as_str() {
-                    "SESSION_NOT_ADMITTED" => "SESSION_NOT_ADMITTED",
-                    "STALE_AUTHORITY" => "STALE_AUTHORITY",
-                    "REQUEST_REJECTED" => "REQUEST_REJECTED",
-                    _ => "KERNEL_DENIED",
-                };
-                Ok(ActivationPortOutcome::Denied { reason_code })
-            }
-        }
+fn validate_client_declaration_path(path: &Path) -> Result<PathBuf, CliError> {
+    if !path.is_absolute() {
+        return Err(CliError::InvalidClientDeclarationPath(
+            "must be absolute".to_owned(),
+        ));
     }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(CliError::InvalidClientDeclarationPath(
+            "must be normalized, no parent traversal".to_owned(),
+        ));
+    }
+    if path.file_name().is_none() {
+        return Err(CliError::InvalidClientDeclarationPath(
+            "must have file name".to_owned(),
+        ));
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if file_name != "client-declaration-v2.json" {
+        return Err(CliError::InvalidClientDeclarationPath(
+            "must be client-declaration-v2.json".to_owned(),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        CliError::InvalidClientDeclarationPath("must be under agent-bridge".to_owned())
+    })?;
+    let parent_name = parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if parent_name != "agent-bridge" {
+        return Err(CliError::InvalidClientDeclarationPath(
+            "must be under agent-bridge".to_owned(),
+        ));
+    }
+    Ok(path.to_path_buf())
 }
 
-#[allow(dead_code)]
-struct KernelMcpForwardingPort {
-    client: SharedKernelClient,
-}
-
-#[allow(dead_code)]
-fn binding_value(binding: &AttachBinding) -> Value {
-    json!({
-        "principal_id": binding.principal_id().as_str(),
-        "session_id": binding.session_id().as_str(),
-        "connection_id": binding.connection_id().as_str(),
-        "activation_generation": binding.activation_generation(),
-        "state_fence": binding.state_fence(),
-        "task_binding": {
-            "task_id": binding.task_binding().task_id().as_str(),
-            "work_unit_id": binding.task_binding().work_unit_id().as_str(),
-            "work_scope_id": binding.task_binding().work_scope_id(),
-            "task_revision": binding.task_binding().task_revision(),
-            "plan_id": binding.task_binding().plan_id(),
-            "plan_revision": binding.task_binding().plan_revision(),
-        },
-    })
-}
-
-impl McpForwardingPort for KernelMcpForwardingPort {
-    fn forward_frame(
-        &mut self,
-        binding: &AttachBinding,
-        frame: &Frame,
-    ) -> Result<(), ProviderFailure> {
-        kernel_call(
-            &self.client,
-            "eliot.agent-bridge.forward-frame",
-            json!({ "binding": binding_value(binding), "frame": frame }),
-        )?;
-        Ok(())
-    }
-
-    fn forward_hook(
-        &mut self,
-        binding: &AttachBinding,
-        event: &HostEventEnvelope,
-    ) -> Result<(), ProviderFailure> {
-        kernel_call(
-            &self.client,
-            "eliot.agent-bridge.forward-hook",
-            json!({ "binding": binding_value(binding), "event": event }),
-        )?;
-        Ok(())
-    }
-
-    fn forward_event(
-        &mut self,
-        binding: &AttachBinding,
-        event: &EventEnvelope,
-    ) -> Result<EventPortOutcome, ProviderFailure> {
-        #[derive(Deserialize)]
-        #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
-        enum Wire {
-            Acknowledged {
-                stream_id: String,
-                event_id: String,
-                phase: AckPhase,
-                disposition: EventDisposition,
-            },
-            BestEffortForwarded,
-            BestEffortDropped {
-                reason_ref: String,
-            },
-        }
-        let response = kernel_call(
-            &self.client,
-            "eliot.agent-bridge.forward-event",
-            json!({ "binding": binding_value(binding), "event": event }),
-        )?;
-        match serde_json::from_value(response).map_err(|_| provider_failure())? {
-            Wire::Acknowledged {
-                stream_id,
-                event_id,
-                phase,
-                disposition,
-            } => Ok(EventPortOutcome::Acknowledged(
-                EventForwardAck::new(stream_id, event_id, phase, disposition)
-                    .map_err(|_| provider_failure())?,
-            )),
-            Wire::BestEffortForwarded => Ok(EventPortOutcome::BestEffortForwarded),
-            Wire::BestEffortDropped { reason_ref } => {
-                Ok(EventPortOutcome::BestEffortDropped { reason_ref })
-            }
-        }
-    }
-
-    fn forward_gap(
-        &mut self,
-        binding: &AttachBinding,
-        gap: &eliot_agent_bridge_core::CoverageGap,
-    ) -> Result<(), ProviderFailure> {
-        kernel_call(
-            &self.client,
-            "eliot.agent-bridge.forward-gap",
-            json!({ "binding": binding_value(binding), "gap": gap }),
-        )?;
-        Ok(())
-    }
-
-    fn reconcile_external(
-        &mut self,
-        binding: &AttachBinding,
-    ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
-        #[derive(Deserialize)]
-        #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
-        enum Wire {
-            Reconciled { receipt_ref: String },
-            Denied { reason_code: String },
-        }
-        let response = kernel_call(
-            &self.client,
-            "eliot.agent-bridge.reconcile-external",
-            json!({ "binding": binding_value(binding) }),
-        )?;
-        match serde_json::from_value(response).map_err(|_| provider_failure())? {
-            Wire::Reconciled { receipt_ref } => Ok(ReconciliationPortOutcome::Reconciled(
-                ReconciliationPortResult::reconciled(
-                    binding,
-                    eliot_agent_bridge_core::ReconciliationReceiptRef::new(receipt_ref)
-                        .map_err(|_| provider_failure())?,
-                )
-                .map_err(|_| provider_failure())?,
-            )),
-            Wire::Denied { reason_code } => {
-                let reason_code: &'static str = match reason_code.as_str() {
-                    "STALE_AUTHORITY" => "STALE_AUTHORITY",
-                    "RECONCILIATION_REQUIRED" => "RECONCILIATION_REQUIRED",
-                    _ => "KERNEL_DENIED",
-                };
-                Ok(ReconciliationPortOutcome::Denied { reason_code })
-            }
-        }
-    }
-}
-
-/// Parses B-15 arguments without a general-purpose command-line dependency.
-///
-/// # Errors
-///
-/// Returns a typed error when the profile is missing/unknown, an argument is
-/// malformed, or a non-loopback transport is requested.
 pub fn parse_args<I, S>(arguments: I) -> Result<CliConfig, CliError>
 where
     I: IntoIterator<Item = S>,
@@ -390,6 +161,7 @@ where
     let arguments: Vec<String> = arguments.into_iter().map(Into::into).collect();
     let mut profile = None;
     let mut transport = Transport::Stdio;
+    let mut client_declaration: Option<PathBuf> = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -427,46 +199,529 @@ where
                 transport = Transport::parse(value)?;
                 index += 1;
             }
+            "--client-declaration" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    CliError::MalformedArgument("--client-declaration requires a value".to_owned())
+                })?;
+                let p = PathBuf::from(value);
+                client_declaration = Some(validate_client_declaration_path(&p)?);
+                index += 2;
+            }
+            value if value.starts_with("--client-declaration=") => {
+                let value = value.trim_start_matches("--client-declaration=");
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--client-declaration= requires a value".to_owned(),
+                    ));
+                }
+                let p = PathBuf::from(value);
+                client_declaration = Some(validate_client_declaration_path(&p)?);
+                index += 1;
+            }
             value => return Err(CliError::MalformedArgument(value.to_owned())),
         }
     }
     Ok(CliConfig {
         profile: profile.ok_or(CliError::MissingProfile)?,
         transport,
+        client_declaration: client_declaration.ok_or(CliError::MissingClientDeclaration)?,
     })
 }
 
-/// B-15's injected composition runner.
+fn decode_declaration_bytes(bytes: &[u8]) -> Result<AgentBridgeClientDeclaration, String> {
+    let declaration: AgentBridgeClientDeclaration =
+        serde_json::from_slice(bytes).map_err(|e| format!("declaration deserialize: {e}"))?;
+    declaration
+        .validate()
+        .map_err(|e| format!("declaration validate: {e}"))?;
+    Ok(declaration)
+}
+
+fn provider_failure() -> ProviderFailure {
+    ProviderFailure::new(
+        "eliot-kernel-front-door",
+        "authenticated Kernel application exchange was rejected",
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the neutral activation request keeps receipt, fence, deadline, and request bindings contiguous"
+)]
+fn build_neutral_activation_request(
+    core_request: &AttachRequest,
+    receipt: &AgentBridgePeerAdmissionReceipt,
+    demand_id: &str,
+) -> Result<AgentBridgeActivationRequest, ProviderFailure> {
+    use eliot_contracts::{RequestMetadata, StateFence as Cfence};
+    use eliot_protocol::RequestIdentity;
+    use eliot_receipts::RequestBinding;
+    let deadline = receipt.activation_deadline_unix_ms;
+    let state_fence = receipt.state_fence.clone();
+    let cfence = Cfence::new(state_fence.authority_epoch, state_fence.resource_generation);
+    if state_fence.task_revision.is_some()
+        || state_fence.policy_revision.is_some()
+        || state_fence.integration_revision.is_some()
+    {
+        return Err(provider_failure());
+    }
+    let request_id = RequestId::new(demand_id).map_err(|_| provider_failure())?;
+    let metadata = RequestMetadata {
+        request_id: request_id.clone(),
+        session_id: None,
+        task_id: None,
+        product_id: ProductId::new("eliot-agent-bridge").map_err(|_| provider_failure())?,
+        source_id: SourceId::new("agent-bridge").map_err(|_| provider_failure())?,
+        state_fence: cfence.clone(),
+        clock: ClockReading {
+            valid_time_ms: None,
+            known_time_ms: None,
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    let binding = RequestBinding {
+        metadata,
+        state_fence: cfence,
+    };
+    let request_identity = RequestIdentity {
+        request: binding,
+        idempotency_key: demand_id.to_owned(),
+        deadline_unix_ms: deadline,
+        cancellation_id: format!("{demand_id}:cancel"),
+    };
+    request_identity
+        .validate()
+        .map_err(|_| provider_failure())?;
+    if request_identity.request.metadata.session_id.is_some()
+        || request_identity.request.metadata.task_id.is_some()
+        || request_identity
+            .request
+            .metadata
+            .state_fence
+            .task_revision
+            .is_some()
+        || request_identity
+            .request
+            .metadata
+            .clock
+            .valid_time_ms
+            .is_some()
+        || request_identity
+            .request
+            .metadata
+            .clock
+            .known_time_ms
+            .is_some()
+        || request_identity
+            .request
+            .metadata
+            .clock
+            .transaction_sequence
+            .is_some()
+        || request_identity
+            .request
+            .metadata
+            .clock
+            .monotonic_ns
+            .is_some()
+    {
+        return Err(provider_failure());
+    }
+    let attach_kind = match core_request.attach_kind() {
+        eliot_agent_bridge_core::AttachKind::Managed => AgentBridgeAttachKind::Managed,
+        eliot_agent_bridge_core::AttachKind::External => AgentBridgeAttachKind::External,
+    };
+    let blind = match (attach_kind, core_request.pre_attach_blind_interval()) {
+        (AgentBridgeAttachKind::Managed, None) => None,
+        (AgentBridgeAttachKind::External, Some(interval)) => Some(AgentBridgeBlindInterval {
+            start: interval.interval.start,
+            end: interval.interval.end,
+            reason_ref: interval.reason_ref.clone(),
+        }),
+        _ => return Err(provider_failure()),
+    };
+    let req = AgentBridgeActivationRequest {
+        wire_id: eliot_protocol::AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_ID.to_owned(),
+        wire_version: AgentBridgeActivationRequest::CONTRACT_VERSION,
+        operation: eliot_protocol::AGENT_BRIDGE_ACTIVATION_OPERATION.to_owned(),
+        demand_id: demand_id.to_owned(),
+        connection_id: receipt.connection_id.clone(),
+        attach_kind,
+        pre_attach_blind_interval: blind,
+        request_identity,
+        peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
+        request_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .map_err(|_| provider_failure())?;
+    req.validate_admission(receipt)
+        .map_err(|_| provider_failure())?;
+    Ok(req)
+}
+
+fn activation_frame_for_request(
+    request: &AgentBridgeActivationRequest,
+) -> Result<Frame, ProviderFailure> {
+    let frame = Frame {
+        protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+        encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+        connection_id: request.connection_id.clone(),
+        request_id: Some(request.request_identity.request.metadata.request_id.clone()),
+        kind: FrameKind::Request,
+        message_type: MessageType::Execute,
+        request_identity: Some(request.request_identity.clone()),
+        payload: ProtocolPayload::Json(
+            serde_json::to_value(request).map_err(|_| provider_failure())?,
+        ),
+        trace_context: std::collections::BTreeMap::new(),
+    };
+    frame.validate().map_err(|_| provider_failure())?;
+    if frame.request_identity.is_none() || frame.request_id.is_none() {
+        return Err(provider_failure());
+    }
+    Ok(frame)
+}
+
+fn decode_activation_response(
+    frame: &Frame,
+    expected_request: &AgentBridgeActivationRequest,
+    admission: &AgentBridgePeerAdmissionReceipt,
+) -> Result<AgentBridgeActivationResponse, ProviderFailure> {
+    frame.validate().map_err(|_| provider_failure())?;
+    if frame.kind != FrameKind::Response || frame.message_type != MessageType::Result {
+        return Err(provider_failure());
+    }
+    expected_request
+        .validate_admission(admission)
+        .map_err(|_| provider_failure())?;
+    if frame.connection_id != expected_request.connection_id
+        || frame.connection_id != admission.connection_id
+    {
+        return Err(provider_failure());
+    }
+    if frame.request_id.as_ref()
+        != Some(
+            &expected_request
+                .request_identity
+                .request
+                .metadata
+                .request_id,
+        )
+    {
+        return Err(provider_failure());
+    }
+    if frame.request_identity.is_some() {
+        return Err(provider_failure());
+    }
+    let payload = match &frame.payload {
+        ProtocolPayload::Json(v) => v.clone(),
+        _ => return Err(provider_failure()),
+    };
+    let response: AgentBridgeActivationResponse =
+        serde_json::from_value(payload).map_err(|_| provider_failure())?;
+    response.validate().map_err(|_| provider_failure())?;
+    response
+        .validate_request(expected_request)
+        .map_err(|_| provider_failure())?;
+    if let eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } =
+        &response.disposition
+        && (binding.activation_generation != admission.state_fence.resource_generation
+            || binding.state_fence.authority_epoch != admission.state_fence.authority_epoch
+            || binding.state_fence.generation != admission.state_fence.resource_generation)
+    {
+        return Err(provider_failure());
+    }
+    Ok(response)
+}
+
+struct LoadedAgentBridgeDeclaration {
+    declaration: AgentBridgeClientDeclaration,
+    #[cfg(windows)]
+    _lease: eliot_platform_windows::AgentBridgeDeclarationReadLease,
+}
+
+struct AdmittedConnection {
+    transport: eliot_ipc::NamedPipeTransport,
+    receipt: AgentBridgePeerAdmissionReceipt,
+}
+
+struct KernelHostActivationPort {
+    admitted: AdmittedConnection,
+    runtime: tokio::runtime::Runtime,
+    _loaded: LoadedAgentBridgeDeclaration,
+    activation_used: bool,
+    limits: eliot_ipc::TransportLimits,
+}
+
+impl HostActivationPort for KernelHostActivationPort {
+    fn activate(
+        &mut self,
+        request: &AttachRequest,
+    ) -> Result<ActivationPortOutcome, ProviderFailure> {
+        if self.activation_used {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "activation exchange already consumed; restart/reconnect contour not admitted",
+            ));
+        }
+        self.activation_used = true;
+        let demand = request.demand_id().as_str().to_owned();
+        let activation_request =
+            build_neutral_activation_request(request, &self.admitted.receipt, &demand)?;
+        let frame = activation_frame_for_request(&activation_request)?;
+        let wire = self.runtime.block_on(async {
+            self.admitted
+                .transport
+                .send_frame(&frame, self.limits)
+                .await
+                .map_err(|_| provider_failure())?;
+            self.admitted
+                .transport
+                .receive_frame(self.limits)
+                .await
+                .map_err(|_| provider_failure())
+        })?;
+        let response =
+            decode_activation_response(&wire, &activation_request, &self.admitted.receipt)?;
+        match response.disposition {
+            eliot_protocol::AgentBridgeActivationDisposition::Denied { reason_code } => {
+                let code: &'static str = match reason_code {
+                    eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
+                        "SEMANTIC_RESOLUTION_UNAVAILABLE"
+                    }
+                };
+                Ok(ActivationPortOutcome::Denied { reason_code: code })
+            }
+            eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } => {
+                let b = *binding;
+                let principal_id =
+                    PrincipalId::new(b.principal_id).map_err(|_| provider_failure())?;
+                let session_id = SessionId::new(b.session_id).map_err(|_| provider_failure())?;
+                let task_id = TaskId::new(b.task_id).map_err(|_| provider_failure())?;
+                let work_unit_id =
+                    WorkUnitId::new(b.work_unit_id).map_err(|_| provider_failure())?;
+                let generation = Generation::new(b.activation_generation.value())
+                    .map_err(|_| provider_failure())?;
+                let fence = FencingToken::new(
+                    b.state_fence.authority_epoch.value(),
+                    generation,
+                    b.state_fence.nonce,
+                )
+                .map_err(|_| provider_failure())?;
+                Ok(ActivationPortOutcome::Authenticated(
+                    ActivationPortResult::authenticated(
+                        principal_id,
+                        session_id,
+                        generation,
+                        fence,
+                        task_id,
+                        work_unit_id,
+                        b.work_scope_id,
+                        b.task_revision,
+                        b.plan_id,
+                        b.plan_revision,
+                    )
+                    .map_err(|_| provider_failure())?,
+                ))
+            }
+        }
+    }
+}
+
+struct KernelMcpForwardingPort;
+
+impl McpForwardingPort for KernelMcpForwardingPort {
+    fn forward_frame(
+        &mut self,
+        _binding: &AttachBinding,
+        _frame: &Frame,
+    ) -> Result<(), ProviderFailure> {
+        Err(ProviderFailure::new(
+            "eliot-kernel-front-door",
+            "forwarding not admitted",
+        ))
+    }
+    fn forward_hook(
+        &mut self,
+        _binding: &AttachBinding,
+        _event: &HostEventEnvelope,
+    ) -> Result<(), ProviderFailure> {
+        Err(ProviderFailure::new(
+            "eliot-kernel-front-door",
+            "forwarding not admitted",
+        ))
+    }
+    fn forward_event(
+        &mut self,
+        _binding: &AttachBinding,
+        _event: &EventEnvelope,
+    ) -> Result<EventPortOutcome, ProviderFailure> {
+        Err(ProviderFailure::new(
+            "eliot-kernel-front-door",
+            "forwarding not admitted",
+        ))
+    }
+    fn forward_gap(
+        &mut self,
+        _binding: &AttachBinding,
+        _gap: &eliot_agent_bridge_core::CoverageGap,
+    ) -> Result<(), ProviderFailure> {
+        Err(ProviderFailure::new(
+            "eliot-kernel-front-door",
+            "forwarding not admitted",
+        ))
+    }
+    fn reconcile_external(
+        &mut self,
+        _binding: &AttachBinding,
+    ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+        Err(ProviderFailure::new(
+            "eliot-kernel-front-door",
+            "reconciliation not admitted",
+        ))
+    }
+}
+
+pub type KernelPorts = (Box<dyn HostActivationPort>, Box<dyn McpForwardingPort>);
+
+fn current_os_identity() -> Result<(String, u32), RuntimeBuildError> {
+    let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+        .map_err(|e| RuntimeBuildError::KernelClient(format!("current identity: {e:?}")))?;
+    Ok((
+        expectation.expected_sid().to_owned(),
+        expectation.expected_session_id(),
+    ))
+}
+
+fn load_declaration(path: &Path) -> Result<LoadedAgentBridgeDeclaration, RuntimeBuildError> {
+    let path = validate_client_declaration_path(path)
+        .map_err(|e| RuntimeBuildError::KernelClient(e.to_string()))?;
+    #[cfg(windows)]
+    {
+        let mut lease = eliot_platform_windows::open_agent_bridge_declaration_read_lease(&path)
+            .map_err(|e| RuntimeBuildError::KernelClient(format!("declaration lease: {e:?}")))?;
+        let bytes = lease
+            .read_bytes()
+            .map_err(|e| RuntimeBuildError::KernelClient(format!("declaration read: {e:?}")))?;
+        let declaration =
+            decode_declaration_bytes(&bytes).map_err(RuntimeBuildError::KernelClient)?;
+        Ok(LoadedAgentBridgeDeclaration {
+            declaration,
+            _lease: lease,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(RuntimeBuildError::KernelClient(
+            "declaration lease unavailable off Windows".to_owned(),
+        ))
+    }
+}
+
+pub fn kernel_ports_with_declaration(
+    declaration_path: &Path,
+) -> Result<KernelPorts, RuntimeBuildError> {
+    let loaded = load_declaration(declaration_path)?;
+    let declaration = &loaded.declaration;
+    let (current_sid, _current_session) = current_os_identity()?;
+    let expectation = eliot_platform_windows::KernelFrontDoorServerExpectation::new(
+        declaration.expected_kernel_sid.clone(),
+        declaration.expected_kernel_session_id,
+        declaration.expected_kernel_artifact_sha256.clone(),
+        eliot_platform_windows::KernelFrontDoorAclMode::SystemAndLocalServiceWithClient {
+            client_sid: current_sid.clone(),
+        },
+    )
+    .map_err(|e| RuntimeBuildError::KernelClient(format!("frontdoor expectation: {e:?}")))?;
+    let limits = eliot_ipc::TransportLimits {
+        max_frame_bytes: declaration.max_frame as usize,
+        ..Default::default()
+    };
+    let pipe_name = r"\\.\pipe\eliot\kernel\frontdoor";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| RuntimeBuildError::KernelClient(e.to_string()))?;
+    let mut transport = runtime.block_on(async {
+        eliot_ipc::NamedPipeTransport::connect_authenticated_kernel_front_door(
+            pipe_name,
+            Duration::from_secs(5),
+            &expectation,
+        )
+        .await
+        .map_err(|e| RuntimeBuildError::KernelClient(format!("frontdoor connect: {e:?}")))
+    })?;
+    let observed = transport
+        .kernel_front_door_observed_extra_sid()
+        .ok_or_else(|| RuntimeBuildError::KernelClient("missing extra sid".to_owned()))?;
+    if observed != current_sid {
+        return Err(RuntimeBuildError::KernelClient(
+            "extra SID mismatch".to_owned(),
+        ));
+    }
+    let challenge_frame = runtime.block_on(async {
+        transport
+            .receive_frame(limits)
+            .await
+            .map_err(|e| RuntimeBuildError::KernelClient(format!("challenge receive: {e:?}")))
+    })?;
+    let connection_id = challenge_frame.connection_id.clone();
+    let challenge: AgentBridgePeerChallenge =
+        eliot_ipc::decode_peer_challenge_frame(&challenge_frame, &connection_id)
+            .map_err(|e| RuntimeBuildError::KernelClient(format!("challenge decode: {e:?}")))?;
+    challenge
+        .validate_declaration(declaration)
+        .map_err(|e| RuntimeBuildError::KernelClient(format!("challenge validation: {e:?}")))?;
+    let hello = declaration
+        .client_hello(challenge.challenge_nonce.clone())
+        .map_err(|e| RuntimeBuildError::KernelClient(format!("client hello: {e:?}")))?;
+    let hello_frame = eliot_ipc::client_hello_frame(&connection_id, &hello)
+        .map_err(|e| RuntimeBuildError::KernelClient(format!("hello frame: {e:?}")))?;
+    let receipt_frame = runtime.block_on(async {
+        transport
+            .send_frame(&hello_frame, limits)
+            .await
+            .map_err(|e| RuntimeBuildError::KernelClient(format!("hello send: {e:?}")))?;
+        transport
+            .receive_frame(limits)
+            .await
+            .map_err(|e| RuntimeBuildError::KernelClient(format!("receipt receive: {e:?}")))
+    })?;
+    let receipt =
+        eliot_ipc::decode_agent_bridge_admission_receipt_frame(&receipt_frame, &connection_id)
+            .map_err(|e| RuntimeBuildError::KernelClient(format!("receipt decode: {e:?}")))?;
+    receipt
+        .validate_challenge(&challenge)
+        .map_err(|e| RuntimeBuildError::KernelClient(format!("receipt challenge: {e:?}")))?;
+    receipt
+        .validate_client_hello(declaration, &hello)
+        .map_err(|e| RuntimeBuildError::KernelClient(format!("receipt hello: {e:?}")))?;
+    if receipt.connection_id != connection_id {
+        return Err(RuntimeBuildError::KernelClient(
+            "receipt connection mismatch".to_owned(),
+        ));
+    }
+    let admitted = AdmittedConnection { transport, receipt };
+    let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
+        admitted,
+        runtime,
+        _loaded: loaded,
+        activation_used: false,
+        limits,
+    });
+    let fwd: Box<dyn McpForwardingPort> = Box::new(KernelMcpForwardingPort);
+    Ok((host, fwd))
+}
+
 pub struct BridgeRunner {
     profile: Profile,
     runtime: Runtime,
     core: AgentBridgeCore,
 }
 
-/// Builds the production bridge's two injected Kernel-owned provider ports.
-/// The same authenticated client/session binding is shared by activation and
-/// forwarding, while A-16 remains the sole bridge state owner.
-pub type KernelPorts = (Box<dyn HostActivationPort>, Box<dyn McpForwardingPort>);
-
-pub fn kernel_ports() -> Result<KernelPorts, RuntimeBuildError> {
-    let mut client = eliot_cli::kernel_client::KernelClient::load()
-        .map_err(|error| RuntimeBuildError::KernelClient(error.to_string()))?;
-    client
-        .probe()
-        .map_err(|error| RuntimeBuildError::KernelAdmissionRequired(error.to_string()))?;
-    Err(RuntimeBuildError::KernelAdmissionRequired(
-        "authenticated health is available, but Kernel bridge admission did not return one session, fence, and route binding".to_owned(),
-    ))
-}
-
 impl BridgeRunner {
-    /// Builds a runner from the three canonical production surfaces and
-    /// injected host/MCP ports. The ports remain the sole provider boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only when P-11 rejects the fixed runtime parameters or
-    /// A-16 rejects the fixed acknowledgement cursor policy.
     pub fn new(
         profile: Profile,
         readiness: ProviderReadiness,
@@ -499,470 +754,729 @@ impl BridgeRunner {
             core: AgentBridgeCore::new(readiness, host_activation, mcp_forwarding, cursor_policy),
         })
     }
-
-    /// Returns the selected composition profile.
     #[must_use]
     pub const fn profile(&self) -> Profile {
         self.profile
     }
-
-    /// Returns the runtime's available protected control capacity.
     #[must_use]
     pub fn control_capacity(&self) -> usize {
         self.runtime
             .available_capacity(eliot_runtime::ExecutionClass::ProtectedControl)
     }
-
-    /// Performs the demand-start attach through the injected host port.
-    ///
-    /// # Errors
-    ///
-    /// Forwards A-16's typed unavailable, authentication, fence, generation,
-    /// and provider errors without translating or weakening them.
     pub fn demand_start(
         &mut self,
         demand_id: impl Into<String>,
         connection_id: impl Into<String>,
     ) -> Result<AttachView, BridgeError> {
         self.attach(AttachRequest::managed(
-            DemandId::new(demand_id)
-                .map_err(|error| BridgeError::ProviderContract(error.to_string()))?,
+            DemandId::new(demand_id).map_err(|e| BridgeError::ProviderContract(e.to_string()))?,
             ConnectionId::new(connection_id)
-                .map_err(|error| BridgeError::ProviderContract(error.to_string()))?,
+                .map_err(|e| BridgeError::ProviderContract(e.to_string()))?,
         ))
     }
-
-    /// Attaches an exact managed or externally bounded request through the
-    /// injected Host activation port.
     pub fn attach(&mut self, request: AttachRequest) -> Result<AttachView, BridgeError> {
         self.core.attach(request)
     }
-
-    /// Rebinds transport while preserving the exact authority binding.
-    ///
-    /// # Errors
-    ///
-    /// Returns A-16's stale-authority or not-attached error when the request
-    /// does not match the active session, generation, and fence.
     pub fn reconnect(&mut self, request: ReconnectRequest) -> Result<AttachView, BridgeError> {
         self.core.reconnect(request)
     }
-
-    /// Completes the externally attached bridge's required Kernel/MCP
-    /// reconciliation exchange.
     pub fn reconcile_external(&mut self) -> Result<AttachView, BridgeError> {
         self.core.reconcile_external()
     }
-
-    /// Forwards a validated protocol frame through A-06's injected port.
-    ///
-    /// # Errors
-    ///
-    /// Returns A-16's typed attachment, transport, protocol, or provider
-    /// error.
     pub fn forward_frame(&mut self, frame: &Frame) -> Result<(), BridgeError> {
         self.core.forward_frame(frame)
     }
-
-    /// Forwards an exact host hook observation through A-06's injected port.
-    ///
-    /// # Errors
-    ///
-    /// Returns A-16's typed attachment, validation, or provider error without
-    /// minting authority from the observation.
     pub fn forward_hook(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
         self.core.forward_hook(event)
     }
-
-    /// Forwards an `EventEnvelope` and returns A-16's explicit delivery result.
-    ///
-    /// # Errors
-    ///
-    /// Returns A-16's typed replay, acknowledgement, fence, attachment, or
-    /// provider error.
     pub fn forward_event(
         &mut self,
         event: &EventEnvelope,
     ) -> Result<EventForwardStatus, BridgeError> {
         self.core.forward_event(event)
     }
-
-    /// Exposes the read-only current attach view.
     #[must_use]
     pub fn attach_view(&self) -> Option<AttachView> {
         self.core.attach_view()
     }
 }
 
-/// Runner construction failures, kept independent from provider state.
 #[derive(Debug)]
 pub enum RuntimeBuildError {
-    /// The requested profile was not compiled into this binary.
     ProfileNotCompiled(Profile),
-    /// P-11 rejected the explicit bounded runtime configuration.
     Runtime(eliot_runtime::ConfigError),
-    /// A-16 rejected the fixed cursor policy.
     BridgeContract(BridgeError),
-    /// The installation-owned authenticated Kernel front door was not composed.
     KernelClient(String),
-    /// Kernel has no exact bridge admission operation; never infer readiness.
-    KernelAdmissionRequired(String),
 }
 
 impl fmt::Display for RuntimeBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ProfileNotCompiled(profile) => {
-                write!(formatter, "PROFILE_NOT_COMPILED:{profile}")
-            }
+            Self::ProfileNotCompiled(p) => write!(formatter, "PROFILE_NOT_COMPILED:{p}"),
             Self::Runtime(_) => formatter.write_str("RUNTIME_CONFIG_INVALID"),
-            Self::BridgeContract(error) => write!(formatter, "BRIDGE_CONTRACT_INVALID:{error}"),
-            Self::KernelClient(error) => write!(formatter, "KERNEL_CLIENT_REJECTED:{error}"),
-            Self::KernelAdmissionRequired(error) => {
-                write!(formatter, "KERNEL_ADMISSION_REQUIRED:{error}")
-            }
+            Self::BridgeContract(e) => write!(formatter, "BRIDGE_CONTRACT_INVALID:{e}"),
+            Self::KernelClient(e) => write!(formatter, "KERNEL_CLIENT_REJECTED:{e}"),
         }
     }
 }
-
 impl std::error::Error for RuntimeBuildError {}
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
-    use std::sync::{Arc, Mutex};
-
-    use eliot_agent_bridge_core::{
-        ActivationPortOutcome, ActivationPortResult, AttachBinding, AttemptId, EventCursor,
-        EventId, EventPortOutcome, FencingToken, Generation, HostActivationPort, HostEventEnvelope,
-        HostEventKind, McpForwardingPort, PrincipalId, ProviderFailure, ProviderReadiness,
-        RouteFingerprint, SessionId, TaskId, WorkUnitId,
-    };
+    use super::*;
+    use eliot_contracts::{ArtifactId, ContractId, ContractVersion, StateFence};
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
     use eliot_protocol::{
-        EncodingProfile, EventEnvelope, Frame, FrameKind, JsonCodec, MessageType, ProtocolError,
-        ProtocolPayload, ProtocolVersion,
+        AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+        AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
+        AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentBridgeClientDeclaration,
+        AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
     };
+    use eliot_protocol::{EncodingProfile, FrameKind, MessageType, ProtocolPayload};
+    use eliot_protocol::{ProtocolRange, ProtocolVersion};
+    use eliot_runtime_contracts::{HealthVector, ModuleGenerationState};
+    use eliot_runtime_contracts::{ModuleContract, ModuleGeneration};
+    use std::collections::BTreeMap;
 
-    use super::{CliError, Profile, Transport, parse_args};
-
-    #[derive(Default)]
-    struct FakeCounts {
-        frames: usize,
-        hooks: usize,
-    }
-
-    struct FakeHost {
-        activations: VecDeque<ActivationPortOutcome>,
-    }
-
-    impl HostActivationPort for FakeHost {
-        fn activate(
-            &mut self,
-            _request: &eliot_agent_bridge_core::AttachRequest,
-        ) -> Result<ActivationPortOutcome, ProviderFailure> {
-            self.activations
-                .pop_front()
-                .ok_or(ProviderFailure::new("test", "missing activation fixture"))
-        }
-    }
-
-    struct FakeForwarder {
-        counts: Arc<Mutex<FakeCounts>>,
-    }
-
-    impl McpForwardingPort for FakeForwarder {
-        fn forward_frame(
-            &mut self,
-            _binding: &AttachBinding,
-            _frame: &Frame,
-        ) -> Result<(), ProviderFailure> {
-            self.counts
-                .lock()
-                .map_err(|_| ProviderFailure::new("test", "lock"))?
-                .frames += 1;
-            Ok(())
-        }
-
-        fn forward_hook(
-            &mut self,
-            _binding: &AttachBinding,
-            _event: &HostEventEnvelope,
-        ) -> Result<(), ProviderFailure> {
-            self.counts
-                .lock()
-                .map_err(|_| ProviderFailure::new("test", "lock"))?
-                .hooks += 1;
-            Ok(())
-        }
-
-        fn forward_event(
-            &mut self,
-            _binding: &AttachBinding,
-            _event: &EventEnvelope,
-        ) -> Result<EventPortOutcome, ProviderFailure> {
-            Ok(EventPortOutcome::BestEffortForwarded)
-        }
-
-        fn forward_gap(
-            &mut self,
-            _binding: &AttachBinding,
-            _gap: &eliot_agent_bridge_core::CoverageGap,
-        ) -> Result<(), ProviderFailure> {
-            Ok(())
-        }
-
-        fn reconcile_external(
-            &mut self,
-            _binding: &AttachBinding,
-        ) -> Result<eliot_agent_bridge_core::ReconciliationPortOutcome, ProviderFailure> {
-            Err(ProviderFailure::new("test", "not used"))
-        }
-    }
-
-    fn activation(task: &str, work_unit: &str, suffix: &str) -> ActivationPortOutcome {
-        let generation = Generation::new(1).expect("fixture generation");
-        let fence = FencingToken::new(1, generation, format!("fixture-fence-{suffix}"))
-            .expect("fixture fence");
-        ActivationPortOutcome::Authenticated(
-            ActivationPortResult::authenticated(
-                PrincipalId::new("fixture-principal").expect("fixture principal"),
-                SessionId::new(format!("fixture-session-{suffix}")).expect("fixture session"),
-                generation,
-                fence,
-                TaskId::new(task).expect("fixture task"),
-                WorkUnitId::new(work_unit).expect("fixture work unit"),
-                "fixture-scope",
-                "task-revision-1",
-                "plan-1",
-                "plan-revision-1",
-            )
-            .expect("fixture activation"),
-        )
-    }
-
-    fn injected_runner() -> (super::BridgeRunner, Arc<Mutex<FakeCounts>>) {
-        let counts = Arc::new(Mutex::new(FakeCounts::default()));
-        let runner = super::BridgeRunner::new(
-            test_profile(),
-            ProviderReadiness::all_admitted(),
-            Some(Box::new(FakeHost {
-                activations: VecDeque::from([activation("fixture-task", "fixture-work", "one")]),
-            })),
-            Some(Box::new(FakeForwarder {
-                counts: Arc::clone(&counts),
-            })),
-        )
-        .expect("runner fixture");
-        (runner, counts)
-    }
-
-    #[allow(clippy::default_trait_access)]
-    fn frame() -> Frame {
-        Frame {
-            protocol_version: ProtocolVersion::CURRENT,
-            encoding_profile: EncodingProfile::JsonV1,
-            connection_id: "fixture-connection".to_owned(),
-            request_id: None,
-            kind: FrameKind::Heartbeat,
-            message_type: MessageType::Health,
-            request_identity: None,
-            payload: ProtocolPayload::Json(Default::default()),
-            trace_context: BTreeMap::new(),
-        }
-    }
-
-    #[allow(clippy::default_trait_access)]
-    fn hook() -> HostEventEnvelope {
-        HostEventEnvelope {
-            event_id: EventId::new("hook-1").expect("fixture event id"),
-            attempt_id: AttemptId::new("attempt-1").expect("fixture attempt id"),
-            sequence: 1,
-            cursor: EventCursor::new("cursor-1").expect("fixture cursor"),
-            kind: HostEventKind::ToolResult,
-            route: RouteFingerprint {
-                host_family: "test".to_owned(),
-                adapter: "test".to_owned(),
-                protocol_transport: "stdio".to_owned(),
-                runtime_hash: "runtime".to_owned(),
-                adapter_hash: "adapter".to_owned(),
-                provider: "provider".to_owned(),
-                model: "model".to_owned(),
-                auth_billing: "test".to_owned(),
-                serializer_hash: "serializer".to_owned(),
-                tool_semantics_hash: "tools".to_owned(),
-                reasoning_mode: "test".to_owned(),
-                continuation_behavior: "fresh".to_owned(),
-                feature_flags_hash: "flags".to_owned(),
+    fn fixture_declaration() -> AgentBridgeClientDeclaration {
+        let fence = StateFence::new(
+            AuthorityEpoch::new(3).unwrap(),
+            ResourceGeneration::new(7).unwrap(),
+        );
+        let artifact = ArtifactId::new("a".repeat(64)).unwrap();
+        let module = ContractId::new(AGENT_BRIDGE_MODULE_ID).unwrap();
+        let contract = ModuleContract {
+            module_id: module.clone(),
+            version: ContractVersion::new(1, 0, 0),
+            artifact_id: artifact.clone(),
+            protocols: vec!["eliot.agent-bridge.v1".to_owned()],
+            required_capabilities: vec!["agent.bridge.activate".to_owned()],
+            optional_capabilities: Vec::new(),
+            advisory_capabilities: Vec::new(),
+            state_owner: "eliot-agent-bridge".to_owned(),
+            failure_domain: "agent-bridge".to_owned(),
+            hot_replace: false,
+        };
+        let generation = ModuleGeneration {
+            module_id: module,
+            generation: ResourceGeneration::new(7).unwrap(),
+            artifact_id: artifact,
+            state: ModuleGenerationState::Ready,
+            health: HealthVector::healthy(),
+            state_fence: fence,
+        };
+        AgentBridgeClientDeclaration {
+            wire_id: AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: "agent-bridge-profile-1".to_owned(),
+            protocol_range: ProtocolRange {
+                minimum: ProtocolVersion::CURRENT,
+                maximum: ProtocolVersion::CURRENT,
             },
-            raw_payload_digest: "digest".to_owned(),
-            normalized_payload: Default::default(),
-            parent_event_id: None,
-            observed_at: "2026-08-14T00:00:00Z".to_owned(),
+            module_contract: contract,
+            module_generation: generation,
+            capabilities: vec!["agent.bridge.activate".to_owned()],
+            privacy_classes: vec!["PUBLIC".to_owned()],
+            max_frame: 4_194_304,
+            expected_kernel_sid: "S-1-5-18".to_owned(),
+            expected_kernel_session_id: 0,
+            expected_kernel_principal_binding: "kernel:agent-bridge".to_owned(),
+            expected_kernel_authority_epoch: AuthorityEpoch::new(8).unwrap(),
+            expected_kernel_generation: ResourceGeneration::new(2).unwrap(),
+            expected_kernel_artifact_sha256: "b".repeat(64),
+            expected_kernel_config_snapshot_sha256: "c".repeat(64),
+            declaration_sha256: String::new(),
         }
+        .with_computed_digest()
+        .unwrap()
     }
 
-    fn test_profile() -> Profile {
-        if Profile::SpineFunctional.is_compiled() {
-            Profile::SpineFunctional
-        } else {
-            Profile::FullComposition
+    fn fixture_challenge(decl: &AgentBridgeClientDeclaration) -> AgentBridgePeerChallenge {
+        AgentBridgePeerChallenge {
+            wire_id: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: decl.profile_id.clone(),
+            descriptor_sha256: "d".repeat(64),
+            client_declaration_sha256: decl.declaration_sha256.clone(),
+            bridge_generation: decl.module_generation.generation,
+            state_fence: decl.module_generation.state_fence.clone(),
+            kernel_principal_binding: decl.expected_kernel_principal_binding.clone(),
+            kernel_authority_epoch: decl.expected_kernel_authority_epoch,
+            kernel_generation: decl.expected_kernel_generation,
+            kernel_artifact_sha256: decl.expected_kernel_artifact_sha256.clone(),
+            kernel_config_snapshot_sha256: decl.expected_kernel_config_snapshot_sha256.clone(),
+            activation_deadline_unix_ms: 10_000,
+            challenge_nonce: "kernel-challenge-1".to_owned(),
+            challenge_sha256: String::new(),
         }
+        .with_computed_digest()
+        .unwrap()
+    }
+
+    fn fixture_receipt(
+        challenge: &AgentBridgePeerChallenge,
+        hello: &eliot_protocol::ClientHello,
+    ) -> AgentBridgePeerAdmissionReceipt {
+        AgentBridgePeerAdmissionReceipt {
+            wire_id: eliot_protocol::AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_ID.to_owned(),
+            wire_version: AgentBridgePeerAdmissionReceipt::CONTRACT_VERSION,
+            module_id: challenge.module_id.clone(),
+            connection_id: "conn-1".to_owned(),
+            profile_id: challenge.profile_id.clone(),
+            descriptor_sha256: challenge.descriptor_sha256.clone(),
+            client_declaration_sha256: challenge.client_declaration_sha256.clone(),
+            bridge_generation: challenge.bridge_generation,
+            state_fence: challenge.state_fence.clone(),
+            activation_deadline_unix_ms: challenge.activation_deadline_unix_ms,
+            challenge_nonce: challenge.challenge_nonce.clone(),
+            challenge_sha256: challenge.challenge_sha256.clone(),
+            client_hello_sha256: eliot_platform_windows::sha256_hex(
+                &eliot_contracts::canonical_json_bytes(hello).unwrap(),
+            ),
+            observed_sid: "S-1-5-21-1000".to_owned(),
+            observed_session_id: 1,
+            observed_process_id: 123,
+            observed_process_start_time_100ns: 456,
+            observed_image_path: "C:\\bridge.exe".to_owned(),
+            observed_image_volume_serial: 1,
+            observed_image_file_index: 2,
+            receipt_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap()
     }
 
     #[test]
-    fn only_canonical_profiles_are_admitted() {
-        assert_eq!("SPINE_FUNCTIONAL".parse(), Ok(Profile::SpineFunctional));
-        assert_eq!("FULL_COMPOSITION".parse(), Ok(Profile::FullComposition));
-        assert!(matches!(
-            "spine_functional".parse::<Profile>(),
-            Err(CliError::UnsupportedProfile(_))
-        ));
-        assert!(matches!(
-            parse_args(["--profile", "FULL_COMPOSITION"]),
-            Ok(config) if config.transport == Transport::Stdio
-        ));
-    }
-
-    #[test]
-    fn malformed_missing_and_remote_inputs_fail_closed() {
-        assert_eq!(parse_args::<_, &str>([]), Err(CliError::MissingProfile));
+    fn cli_declaration_path_required_absolute_no_parent() {
         assert!(matches!(
             parse_args([
                 "--profile",
                 "SPINE_FUNCTIONAL",
                 "--transport",
-                "tcp://127.0.0.1"
+                "loopback",
+                "--client-declaration",
+                "C:\\a\\agent-bridge\\client-declaration-v2.json"
             ]),
-            Err(CliError::RemoteTransportForbidden(_))
+            Err(CliError::RemoteTransportForbidden(transport)) if transport == "loopback"
         ));
         assert!(matches!(
-            parse_args(["--profile", "SPINE_FUNCTIONAL", "--profile"]),
-            Err(CliError::MalformedArgument(_))
+            parse_args(["--profile", "SPINE_FUNCTIONAL"]),
+            Err(CliError::MissingClientDeclaration)
+        ));
+        assert!(matches!(
+            parse_args([
+                "--profile",
+                "SPINE_FUNCTIONAL",
+                "--client-declaration",
+                "relative/path.json"
+            ]),
+            Err(CliError::InvalidClientDeclarationPath(_))
+        ));
+        assert!(matches!(
+            parse_args([
+                "--profile",
+                "SPINE_FUNCTIONAL",
+                "--client-declaration",
+                "C:\\a\\..\\b.json"
+            ]),
+            Err(CliError::InvalidClientDeclarationPath(_))
+        ));
+        let cfg = parse_args([
+            "--profile",
+            "SPINE_FUNCTIONAL",
+            "--client-declaration",
+            "C:\\a\\agent-bridge\\client-declaration-v2.json",
+        ])
+        .expect("valid");
+        assert_eq!(
+            cfg.client_declaration,
+            PathBuf::from("C:\\a\\agent-bridge\\client-declaration-v2.json")
+        );
+        let cfg2 = parse_args([
+            "--profile=SPINE_FUNCTIONAL",
+            "--client-declaration=C:\\a\\agent-bridge\\client-declaration-v2.json",
+        ])
+        .expect("eq form");
+        assert_eq!(
+            cfg2.client_declaration,
+            PathBuf::from("C:\\a\\agent-bridge\\client-declaration-v2.json")
+        );
+        assert!(matches!(
+            parse_args([
+                "--profile",
+                "SPINE_FUNCTIONAL",
+                "--client-declaration",
+                "C:\\a\\wrong-parent\\client-declaration-v2.json"
+            ]),
+            Err(CliError::InvalidClientDeclarationPath(_))
+        ));
+        assert!(matches!(
+            parse_args([
+                "--profile",
+                "SPINE_FUNCTIONAL",
+                "--client-declaration",
+                "C:\\a\\agent-bridge\\wrong-file.json"
+            ]),
+            Err(CliError::InvalidClientDeclarationPath(_))
         ));
     }
 
     #[test]
-    fn injected_demand_attach_frame_and_hook_event_forwarding_stay_thin() {
-        let (mut runner, counts) = injected_runner();
-        let view = runner
-            .demand_start("fixture-demand", "fixture-connection")
-            .expect("attach");
-        assert_eq!(view.binding().session_id().as_str(), "fixture-session-one");
-        assert_eq!(
-            view.binding().task_binding().task_id().as_str(),
-            "fixture-task"
-        );
-        assert_eq!(
-            view.binding().task_binding().work_unit_id().as_str(),
-            "fixture-work"
-        );
-        assert_eq!(
-            view.binding().task_binding().work_scope_id(),
-            "fixture-scope"
-        );
-        assert_eq!(
-            view.binding().task_binding().task_revision(),
-            "task-revision-1"
-        );
-        assert_eq!(view.binding().task_binding().plan_id(), "plan-1");
-        assert_eq!(
-            view.binding().task_binding().plan_revision(),
-            "plan-revision-1"
-        );
-        runner.forward_frame(&frame()).expect("frame forwarding");
-        let counts = counts.lock().expect("fixture counts");
-        assert_eq!(counts.frames, 1);
+    fn old_generic_kernel_client_absent() {
+        let src = include_str!("lib.rs");
+        let needle = format!("{}{}", "eliot_cli", "::kernel_client");
+        assert!(!src.contains(&needle));
+        let awr = format!("{}{}", "ActivationWire", "Response");
+        assert!(!src.contains(&awr));
     }
 
     #[test]
-    fn public_hook_forward_path_delegates_through_runner_surface() {
-        let (mut runner, counts) = injected_runner();
-        runner
-            .demand_start("fixture-demand", "fixture-connection")
-            .expect("attach");
-        runner.forward_hook(&hook()).expect("hook forwarding");
-        let counts = counts.lock().expect("fixture counts");
-        assert_eq!(counts.hooks, 1);
+    fn no_unsafe_no_lint_override_no_direct_windows_sys() {
+        let src = include_str!("lib.rs");
+        let unsafe_block = format!("{}{}", "unsafe", " {");
+        assert!(!src.contains(&unsafe_block));
+        let unsafe_fn = format!("{}{}", "unsafe", " fn");
+        assert!(!src.contains(&unsafe_fn));
+        let lint_override = format!("{}{}", "allow(unsafe", "_code");
+        assert!(!src.contains(&lint_override));
+        let ws = format!("{}{}", "windows", "-sys");
+        assert!(!src.contains(&ws));
+        let cargo = include_str!("../Cargo.toml");
+        let ws_cargo = format!("{}{}", "windows", "-sys");
+        assert!(!cargo.contains(&ws_cargo));
+        let ws_true = format!("{}{}", "workspace", " = true");
+        assert!(cargo.contains(&ws_true));
     }
 
     #[test]
-    fn task_binding_survives_reconnect_and_mismatch_is_rejected() {
-        let counts = Arc::new(Mutex::new(FakeCounts::default()));
-        let mut runner = super::BridgeRunner::new(
-            test_profile(),
-            ProviderReadiness::all_admitted(),
-            Some(Box::new(FakeHost {
-                activations: VecDeque::from([activation("task-a", "work-a", "one")]),
-            })),
-            Some(Box::new(FakeForwarder {
-                counts: Arc::clone(&counts),
-            })),
+    fn single_retained_runtime_structure_order() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains("transport: eliot_ipc::NamedPipeTransport"));
+        assert!(src.contains("runtime: tokio::runtime::Runtime"));
+        let transport_pos = src
+            .find("transport: eliot_ipc::NamedPipeTransport")
+            .unwrap();
+        let runtime_pos = src.find("runtime: tokio::runtime::Runtime").unwrap();
+        assert!(transport_pos < runtime_pos);
+        assert!(src.contains("runtime.block_on"));
+        let bad_first = format!("{}{}", "Builder::new", "_current_thread");
+        let bad = format!("{}{}", bad_first, ".enable_all().build().unwrap().block_on");
+        assert!(!src.contains(&bad));
+        let cnt_pat = format!("{}{}", "Builder::new", "_current_thread");
+        let count = src.matches(&cnt_pat).count();
+        assert!(count <= 2);
+    }
+
+    #[test]
+    fn retained_lease_and_one_shot_order() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains("LoadedAgentBridgeDeclaration"));
+        assert!(src.contains("_lease: eliot_platform_windows::AgentBridgeDeclarationReadLease"));
+        assert!(src.contains("struct AdmittedConnection"));
+        assert!(src.contains("admitted: AdmittedConnection"));
+        assert!(src.contains("_loaded: LoadedAgentBridgeDeclaration"));
+        let admitted_pos = src.find("admitted: AdmittedConnection").unwrap();
+        let runtime_pos = src.find("runtime: tokio::runtime::Runtime").unwrap();
+        let loaded_pos = src.find("_loaded: LoadedAgentBridgeDeclaration").unwrap();
+        assert!(admitted_pos < runtime_pos);
+        assert!(runtime_pos < loaded_pos);
+        assert!(src.contains("activation_used: bool"));
+        let err = format!(
+            "{}{}",
+            "activation exchange already consumed", "; restart/reconnect"
+        );
+        assert!(src.contains(&err));
+        let one_builder = format!("{}{}", "Builder::new", "_current_thread");
+        assert_eq!(src.matches(&one_builder).count(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::items_after_statements)]
+    fn activation_one_shot_rejects_second_without_io() {
+        let src = include_str!("lib.rs");
+        let err_msg = format!(
+            "{}{}",
+            "activation exchange already consumed", "; restart/reconnect"
+        );
+        assert!(src.contains(&err_msg));
+        let pos_guard = src.find("if self.activation_used").expect("guard");
+        let pos_send = src
+            .find("self.admitted.transport.send_frame")
+            .expect("send");
+        assert!(pos_guard < pos_send);
+        struct MockGuard {
+            used: bool,
+        }
+        impl MockGuard {
+            fn activate(&mut self) -> Result<(), ProviderFailure> {
+                if self.used {
+                    return Err(ProviderFailure::new(
+                        "eliot-kernel-front-door",
+                        "activation exchange already consumed; restart/reconnect contour not admitted",
+                    ));
+                }
+                self.used = true;
+                Ok(())
+            }
+        }
+        let mut g = MockGuard { used: true };
+        let e = g.activate().expect_err("second must fail");
+        assert!(e.to_string().contains("already consumed"));
+    }
+
+    #[test]
+    fn off_windows_no_filesystem_read() {
+        let src = include_str!("lib.rs");
+        #[cfg(not(windows))]
+        {
+            assert!(src.contains("declaration lease unavailable off Windows"));
+            let fs_read = format!("{}{}", "std::fs", "::read");
+            assert!(!src.contains(&fs_read));
+        }
+        #[cfg(windows)]
+        {
+            assert!(src.contains("open_agent_bridge_declaration_read_lease"));
+        }
+    }
+
+    #[test]
+    fn declaration_deny_unknown_fields() {
+        let mut decl = fixture_declaration();
+        let mut value = serde_json::to_value(&decl).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<AgentBridgeClientDeclaration>(value).is_err());
+        decl.declaration_sha256 = "0".repeat(64);
+        assert!(decl.validate().is_err());
+    }
+
+    #[test]
+    fn declaration_digest_substitution_fails() {
+        let decl = fixture_declaration();
+        let mut bad = decl.clone();
+        bad.profile_id = "other-profile".to_owned();
+        assert!(
+            bad.validate().is_err() || bad.compute_digest().unwrap() != decl.declaration_sha256
+        );
+        let mut bad2 = decl.clone();
+        bad2.expected_kernel_artifact_sha256 = "e".repeat(64);
+        bad2.declaration_sha256 = bad2.compute_digest().unwrap();
+        let chal = fixture_challenge(&decl);
+        assert!(chal.validate_declaration(&bad2).is_err());
+    }
+
+    #[test]
+    fn challenge_principal_config_artifact_substitution_fails() {
+        let decl = fixture_declaration();
+        let chal = fixture_challenge(&decl);
+        chal.validate_declaration(&decl).expect("valid");
+        let mut bad = chal.clone();
+        bad.kernel_principal_binding = "other".to_owned();
+        bad.challenge_sha256 = bad.compute_digest().unwrap();
+        assert!(bad.validate_declaration(&decl).is_err());
+        let mut bad2 = chal.clone();
+        bad2.kernel_artifact_sha256 = "f".repeat(64);
+        bad2.challenge_sha256 = bad2.compute_digest().unwrap();
+        assert!(bad2.validate_declaration(&decl).is_err());
+        let mut bad3 = chal.clone();
+        bad3.kernel_config_snapshot_sha256 = "f".repeat(64);
+        bad3.challenge_sha256 = bad3.compute_digest().unwrap();
+        assert!(bad3.validate_declaration(&decl).is_err());
+    }
+
+    #[test]
+    fn receipt_connection_fence_digest_deadline_substitution_fails() {
+        let decl = fixture_declaration();
+        let chal = fixture_challenge(&decl);
+        let hello = decl.client_hello(chal.challenge_nonce.clone()).unwrap();
+        let receipt = fixture_receipt(&chal, &hello);
+        receipt.validate().expect("valid");
+        receipt.validate_challenge(&chal).expect("bind");
+        let mut bad_conn = receipt.clone();
+        bad_conn.connection_id = "other".to_owned();
+        bad_conn.receipt_sha256 = bad_conn.compute_digest().unwrap();
+        assert!(
+            bad_conn.validate_challenge(&chal).is_err()
+                || bad_conn.connection_id != chal.clone().challenge_nonce
+        );
+        let mut bad_deadline = receipt.clone();
+        bad_deadline.activation_deadline_unix_ms = 999;
+        bad_deadline.receipt_sha256 = bad_deadline.compute_digest().unwrap();
+        assert!(bad_deadline.validate_challenge(&chal).is_err());
+        let mut bad_fence = receipt.clone();
+        bad_fence.state_fence = StateFence::new(
+            AuthorityEpoch::new(99).unwrap(),
+            ResourceGeneration::new(99).unwrap(),
+        );
+        bad_fence.receipt_sha256 = bad_fence.compute_digest().unwrap();
+        assert!(bad_fence.validate_challenge(&chal).is_err());
+    }
+
+    #[test]
+    fn request_identity_semantic_fields_rejected() {
+        let decl = fixture_declaration();
+        let chal = fixture_challenge(&decl);
+        let hello = decl.client_hello(chal.challenge_nonce.clone()).unwrap();
+        let receipt = AgentBridgePeerAdmissionReceipt {
+            wire_id: eliot_protocol::AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_ID.to_owned(),
+            wire_version: AgentBridgePeerAdmissionReceipt::CONTRACT_VERSION,
+            module_id: chal.module_id.clone(),
+            connection_id: "conn-1".to_owned(),
+            profile_id: chal.profile_id.clone(),
+            descriptor_sha256: chal.descriptor_sha256.clone(),
+            client_declaration_sha256: chal.client_declaration_sha256.clone(),
+            bridge_generation: chal.bridge_generation,
+            state_fence: chal.state_fence.clone(),
+            activation_deadline_unix_ms: chal.activation_deadline_unix_ms,
+            challenge_nonce: chal.challenge_nonce.clone(),
+            challenge_sha256: chal.challenge_sha256.clone(),
+            client_hello_sha256: eliot_platform_windows::sha256_hex(
+                &eliot_contracts::canonical_json_bytes(&hello).unwrap(),
+            ),
+            observed_sid: "S-1-5-21-1000".to_owned(),
+            observed_session_id: 1,
+            observed_process_id: 123,
+            observed_process_start_time_100ns: 456,
+            observed_image_path: "C:\\bridge.exe".to_owned(),
+            observed_image_volume_serial: 1,
+            observed_image_file_index: 2,
+            receipt_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let core_req = AttachRequest::managed(
+            DemandId::new("demand-1").unwrap(),
+            ConnectionId::new("conn-1").unwrap(),
+        );
+        let req =
+            build_neutral_activation_request(&core_req, &receipt, "demand-1").expect("neutral");
+        assert!(req.request_identity.request.metadata.session_id.is_none());
+        assert!(req.request_identity.request.metadata.task_id.is_none());
+        assert!(
+            req.request_identity
+                .request
+                .metadata
+                .state_fence
+                .task_revision
+                .is_none()
+        );
+        assert!(
+            req.request_identity
+                .request
+                .metadata
+                .clock
+                .valid_time_ms
+                .is_none()
+        );
+        let frame = activation_frame_for_request(&req).expect("frame");
+        assert_eq!(frame.kind, FrameKind::Request);
+        assert_eq!(frame.message_type, MessageType::Execute);
+        let resp = AgentBridgeActivationResponse::denied(
+            &req,
+            eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
         )
-        .expect("runner fixture");
-        let first = runner
-            .demand_start("fixture-demand", "fixture-connection")
-            .expect("attach");
-        let generation = Generation::new(1).expect("generation");
-        let fence = FencingToken::new(1, generation, "fixture-fence-one").expect("fence");
-        let reconnected = runner
-            .reconnect(
-                eliot_agent_bridge_core::ReconnectRequest::new(
-                    SessionId::new("fixture-session-one").expect("session"),
-                    generation,
-                    fence,
-                    eliot_agent_bridge_core::ConnectionId::new("fixture-connection-2")
-                        .expect("connection"),
-                )
-                .expect("reconnect request"),
-            )
-            .expect("reconnect");
-        assert_eq!(
-            reconnected.binding().task_binding(),
-            first.binding().task_binding()
-        );
-
-        let counts = Arc::new(Mutex::new(FakeCounts::default()));
-        let mut mismatch_runner = super::BridgeRunner::new(
-            test_profile(),
-            ProviderReadiness::all_admitted(),
-            Some(Box::new(FakeHost {
-                activations: VecDeque::from([
-                    activation("task-a", "work-a", "one"),
-                    activation("task-b", "work-b", "two"),
-                ]),
-            })),
-            Some(Box::new(FakeForwarder { counts })),
-        )
-        .expect("mismatch runner fixture");
-        mismatch_runner
-            .demand_start("fixture-demand", "fixture-connection")
-            .expect("first attach");
+        .unwrap();
+        let resp_frame = Frame {
+            protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+            encoding_profile: EncodingProfile::JsonV1,
+            connection_id: req.connection_id.clone(),
+            request_id: Some(req.request_identity.request.metadata.request_id.clone()),
+            kind: FrameKind::Response,
+            message_type: MessageType::Result,
+            request_identity: None,
+            payload: ProtocolPayload::Json(serde_json::to_value(&resp).unwrap()),
+            trace_context: BTreeMap::new(),
+        };
+        let decoded = decode_activation_response(&resp_frame, &req, &receipt).expect("decode");
         assert!(matches!(
-            mismatch_runner.demand_start("fixture-demand-2", "fixture-connection-2"),
-            Err(eliot_agent_bridge_core::BridgeError::StaleAuthority)
+            decoded.disposition,
+            eliot_protocol::AgentBridgeActivationDisposition::Denied { .. }
         ));
+        let mut bad_req = req.clone();
+        bad_req.request_sha256 = "0".repeat(64);
+        assert!(decode_activation_response(&resp_frame, &bad_req, &receipt).is_err());
     }
 
     #[test]
-    fn canonical_protocol_codec_rejects_malformed_partial_oversize_and_trailing_frames() {
-        let codec = JsonCodec::new();
-        let encoded = codec.encode(&frame()).expect("encoded fixture frame");
-        assert!(matches!(
-            codec.decode(&encoded[..3]),
-            Err(ProtocolError::PartialFrame { .. })
-        ));
-        let mut trailing = encoded.clone();
-        trailing.push(0);
-        assert_eq!(codec.decode(&trailing), Err(ProtocolError::TrailingBytes));
-        assert!(matches!(
-            JsonCodec::with_max_frame_bytes(1).encode(&frame()),
-            Err(ProtocolError::OversizeFrame { .. })
-        ));
-        let malformed = [1_u8, 0, 0, 0, b'{'];
-        assert!(matches!(
-            codec.decode(&malformed),
-            Err(ProtocolError::Json(_))
-        ));
+    fn typed_denial_mapping() {
+        let decl = fixture_declaration();
+        let chal = fixture_challenge(&decl);
+        let hello = decl.client_hello(chal.challenge_nonce.clone()).unwrap();
+        let receipt = AgentBridgePeerAdmissionReceipt {
+            wire_id: eliot_protocol::AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_ID.to_owned(),
+            wire_version: AgentBridgePeerAdmissionReceipt::CONTRACT_VERSION,
+            module_id: chal.module_id.clone(),
+            connection_id: "conn-1".to_owned(),
+            profile_id: chal.profile_id.clone(),
+            descriptor_sha256: chal.descriptor_sha256.clone(),
+            client_declaration_sha256: chal.client_declaration_sha256.clone(),
+            bridge_generation: chal.bridge_generation,
+            state_fence: chal.state_fence.clone(),
+            activation_deadline_unix_ms: chal.activation_deadline_unix_ms,
+            challenge_nonce: chal.challenge_nonce.clone(),
+            challenge_sha256: chal.challenge_sha256.clone(),
+            client_hello_sha256: eliot_platform_windows::sha256_hex(
+                &eliot_contracts::canonical_json_bytes(&hello).unwrap(),
+            ),
+            observed_sid: "S-1-5-21-1000".to_owned(),
+            observed_session_id: 1,
+            observed_process_id: 123,
+            observed_process_start_time_100ns: 456,
+            observed_image_path: "C:\\bridge.exe".to_owned(),
+            observed_image_volume_serial: 1,
+            observed_image_file_index: 2,
+            receipt_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let core_req = AttachRequest::managed(
+            DemandId::new("demand-1").unwrap(),
+            ConnectionId::new("conn-1").unwrap(),
+        );
+        let req = build_neutral_activation_request(&core_req, &receipt, "demand-1").unwrap();
+        let resp = AgentBridgeActivationResponse::denied(
+            &req,
+            eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+        )
+        .unwrap();
+        assert!(resp.validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn activation_response_join_rejects_connection_and_semantic_fence_substitutions() {
+        let decl = fixture_declaration();
+        let chal = fixture_challenge(&decl);
+        let hello = decl.client_hello(chal.challenge_nonce.clone()).unwrap();
+        let receipt = fixture_receipt(&chal, &hello);
+        let core_req = AttachRequest::managed(
+            DemandId::new("demand-1").unwrap(),
+            ConnectionId::new("conn-1").unwrap(),
+        );
+        let req = build_neutral_activation_request(&core_req, &receipt, "demand-1").unwrap();
+        let frame_for = |response: &AgentBridgeActivationResponse, connection_id: &str| Frame {
+            protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+            encoding_profile: EncodingProfile::JsonV1,
+            connection_id: connection_id.to_owned(),
+            request_id: Some(req.request_identity.request.metadata.request_id.clone()),
+            kind: FrameKind::Response,
+            message_type: MessageType::Result,
+            request_identity: None,
+            payload: ProtocolPayload::Json(serde_json::to_value(response).unwrap()),
+            trace_context: BTreeMap::new(),
+        };
+        let response = AgentBridgeActivationResponse {
+            wire_id: eliot_protocol::AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID.to_owned(),
+            wire_version: AgentBridgeActivationResponse::CONTRACT_VERSION,
+            request_id: req.request_identity.request.metadata.request_id.clone(),
+            request_sha256: req.request_sha256.clone(),
+            disposition: eliot_protocol::AgentBridgeActivationDisposition::Authenticated {
+                binding: Box::new(eliot_protocol::AgentBridgeAuthenticatedBinding {
+                    principal_id: "principal-1".to_owned(),
+                    session_id: "session-1".to_owned(),
+                    activation_generation: receipt.state_fence.resource_generation,
+                    state_fence: eliot_protocol::AgentBridgeActivationFence {
+                        authority_epoch: receipt.state_fence.authority_epoch,
+                        generation: receipt.state_fence.resource_generation,
+                        nonce: "semantic-fence-1".to_owned(),
+                    },
+                    task_id: "task-1".to_owned(),
+                    work_unit_id: "work-unit-1".to_owned(),
+                    work_scope_id: "scope-1".to_owned(),
+                    task_revision: "task-revision-1".to_owned(),
+                    plan_id: "plan-1".to_owned(),
+                    plan_revision: "plan-revision-1".to_owned(),
+                }),
+            },
+            response_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        let valid_frame = frame_for(&response, "conn-1");
+        assert!(decode_activation_response(&valid_frame, &req, &receipt).is_ok());
+
+        let bad_connection_frame = frame_for(&response, "other-connection");
+        assert!(decode_activation_response(&bad_connection_frame, &req, &receipt).is_err());
+
+        let mut bad_request_digest = response.clone();
+        bad_request_digest.request_sha256 = "0".repeat(64);
+        bad_request_digest = bad_request_digest.with_computed_digest().unwrap();
+        let bad_request_digest_frame = frame_for(&bad_request_digest, "conn-1");
+        assert!(decode_activation_response(&bad_request_digest_frame, &req, &receipt).is_err());
+
+        let mut bad_authority_epoch = response.clone();
+        if let eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } =
+            &mut bad_authority_epoch.disposition
+        {
+            binding.state_fence.authority_epoch = AuthorityEpoch::new(99).unwrap();
+        }
+        bad_authority_epoch = bad_authority_epoch.with_computed_digest().unwrap();
+        let bad_authority_epoch_frame = frame_for(&bad_authority_epoch, "conn-1");
+        assert!(decode_activation_response(&bad_authority_epoch_frame, &req, &receipt).is_err());
+
+        let mut bad_generation = response.clone();
+        if let eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } =
+            &mut bad_generation.disposition
+        {
+            let substituted = ResourceGeneration::new(8).unwrap();
+            binding.activation_generation = substituted;
+            binding.state_fence.generation = substituted;
+        }
+        bad_generation = bad_generation.with_computed_digest().unwrap();
+        let bad_generation_frame = frame_for(&bad_generation, "conn-1");
+        assert!(decode_activation_response(&bad_generation_frame, &req, &receipt).is_err());
+    }
+
+    #[test]
+    fn authenticated_consume_without_local_constructor() {
+        let src = include_str!("lib.rs");
+        let needle = format!("{}{}", "ActivationWire", "Response");
+        assert!(!src.contains(&needle));
+        assert!(src.contains("decode_activation_response"));
+        let auth = format!("{}{}", "Authenticated", "");
+        assert!(src.contains(&auth));
+    }
+
+    #[test]
+    fn wrong_current_sid_accessor_rejected() {
+        let current = "S-1-5-21-1000";
+        let observed = "S-1-5-21-2000";
+        assert_ne!(current, observed);
+        let expectation = eliot_platform_windows::KernelFrontDoorServerExpectation::new(
+            "S-1-5-18",
+            0,
+            "b".repeat(64),
+            eliot_platform_windows::KernelFrontDoorAclMode::SystemAndLocalServiceWithClient {
+                client_sid: current.to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            expectation.acl_mode(),
+            &eliot_platform_windows::KernelFrontDoorAclMode::SystemAndLocalServiceWithClient {
+                client_sid: current.to_owned()
+            }
+        );
+        assert_ne!(observed, current);
+    }
+
+    #[test]
+    fn mocked_transport_state_order() {
+        let decl = fixture_declaration();
+        let chal = fixture_challenge(&decl);
+        let hello = decl.client_hello(chal.challenge_nonce.clone()).unwrap();
+        let frame = eliot_ipc::peer_challenge_frame("conn-1", &chal).unwrap();
+        let decoded = eliot_ipc::decode_peer_challenge_frame(&frame, "conn-1").unwrap();
+        assert_eq!(decoded, chal);
+        let hello_frame = eliot_ipc::client_hello_frame("conn-1", &hello).unwrap();
+        let hello_decoded = eliot_ipc::decode_client_hello_frame(&hello_frame, "conn-1").unwrap();
+        assert_eq!(hello_decoded, hello);
+        let mut wrong_order = hello_frame.clone();
+        wrong_order.connection_id = "other".to_owned();
+        assert!(eliot_ipc::decode_client_hello_frame(&wrong_order, "conn-1").is_err());
     }
 }

@@ -112,6 +112,8 @@ pub use owned_directory_retirement::{
     observe_owned_directory_exact, retire_owned_directory_exact,
 };
 pub use package_staging::{
+    AGENT_BRIDGE_STAGE_WIRE, AGENT_BRIDGE_STAGE_WIRE_VERSION, AgentBridgeStagePrepared,
+    AgentBridgeStagingCreateDisposition, AgentBridgeStagingReceipt, AgentBridgeStagingRequest,
     AuthenticodeError, AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier,
     MAX_ENUMERATED_ENTRIES, PackageFileSpec, PackageManifest, PackageRelativePath,
     PackageSourceFileObservation, PackageSourceObservation, PackageStager, PackageStagingError,
@@ -119,6 +121,7 @@ pub use package_staging::{
     StagePackageAuthorization, StagePackageExpectedFile, StagedDirectoryReceipt, StagedFileReceipt,
     StagingReceipt, TrustedSourceBundle, TrustedSourceFileLease, WindowsAuthenticodeVerifier,
     ordinal_cmp_str, ordinal_component_cmp, ordinal_eq_str, ordinal_path_cmp, parse_pe_coff,
+    prepare_agent_bridge_stage, publish_agent_bridge_stage, reconcile_agent_bridge_stage,
     validate_package_relative_path,
 };
 pub use supervision_authority_key::{
@@ -3322,6 +3325,66 @@ pub fn open_no_follow_directory(
     }
 }
 
+/// Creates the Agent Bridge child directory only when absent, retaining the
+/// returned object identity. Existing objects are reopened without following
+/// reparse points and are never replaced. The child initially inherits the
+/// canonical service-only Host contour; the elevated installer converges its
+/// final traversal ACL later.
+#[cfg(windows)]
+pub fn ensure_agent_bridge_directory(
+    host_state_root: &Path,
+) -> Result<FileIdentity, WindowsAdapterError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_GENERIC_READ | FILE_ADD_SUBDIRECTORY)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let parent = options.open(host_state_root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            WindowsAdapterError::NotFound
+        } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+            WindowsAdapterError::PermissionDenied
+        } else {
+            WindowsAdapterError::Failed
+        }
+    })?;
+    let metadata = parent.metadata().map_err(|_| WindowsAdapterError::Failed)?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let child = match create_owned_directory_relative(&parent, "agent-bridge", std::ptr::null_mut())
+    {
+        Ok(child) => child,
+        Err(DirectoryPublicationError::AlreadyExists) => {
+            open_owned_directory_relative(&parent, "agent-bridge")
+                .map_err(|_| WindowsAdapterError::IdentityMismatch)?
+        }
+        Err(DirectoryPublicationError::ReparsePoint) => {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Err(_) => return Err(WindowsAdapterError::Failed),
+    };
+    let metadata = child.metadata().map_err(|_| WindowsAdapterError::Failed)?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    file_identity_from_handle(&child).map_err(|_| WindowsAdapterError::Failed)
+}
+
+#[cfg(not(windows))]
+pub fn ensure_agent_bridge_directory(
+    host_state_root: &Path,
+) -> Result<FileIdentity, WindowsAdapterError> {
+    let _ = host_state_root;
+    Err(WindowsAdapterError::Unavailable)
+}
+
 /// Deletes one retained regular file object by handle after checking its
 /// exact volume/file identity.  The operation never re-resolves a pathname,
 /// so a replacement at the former name cannot redirect deletion to a foreign
@@ -3461,7 +3524,10 @@ const OWNED_RUNTIME_RECEIPT_PUBLICATION_LOCK: &str = ".eliot-owned-runtime-recei
 /// Returns a typed path, identity, or provider error before publication, and
 /// preserves a post-commit unknown outcome when the final identity/readback
 /// cannot be classified.
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "publication, post-commit classification, and exact readback remain one fail-closed boundary"
+)]
 pub fn publish_atomic_owned_runtime_receipt(
     path: &Path,
     bytes: &[u8],
@@ -4201,6 +4267,7 @@ impl ProcessIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamedPipePeerProcessBinding {
     identity: ProcessIdentity,
+    executable_file: Option<FileIdentity>,
 }
 
 impl NamedPipePeerProcessBinding {
@@ -4208,7 +4275,25 @@ impl NamedPipePeerProcessBinding {
         if !identity.is_usable() {
             return Err(WindowsAdapterError::InvalidInput);
         }
-        Ok(Self { identity })
+        let executable_file = file_identity(Path::new(&identity.image_path)).ok();
+        Ok(Self {
+            identity,
+            executable_file,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(
+        identity: ProcessIdentity,
+        executable_file: Option<FileIdentity>,
+    ) -> Result<Self, WindowsAdapterError> {
+        if !identity.is_usable() {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            identity,
+            executable_file,
+        })
     }
 
     /// Returns the read-only process evidence captured by the platform.
@@ -4234,6 +4319,13 @@ impl NamedPipePeerProcessBinding {
     #[must_use]
     pub fn image_path(&self) -> &str {
         &self.identity.image_path
+    }
+
+    /// Returns the file-object identity observed for the executable image when
+    /// the platform could open it without following a reparse point.
+    #[must_use]
+    pub const fn executable_file_identity(&self) -> Option<FileIdentity> {
+        self.executable_file
     }
 }
 
@@ -4283,7 +4375,225 @@ pub struct NamedPipePeerExpectation {
     expected_session_id: u32,
     approved_process: Option<NamedPipePeerProcessBinding>,
     approved_job_process: Option<NamedPipePeerJobBinding>,
+    dynamic_image_path: Option<String>,
+    dynamic_executable_file: Option<FileIdentity>,
     builtin_administrators: bool,
+}
+
+/// Stable role of one admitted local named-pipe peer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum NamedPipePeerKind {
+    /// The Host control client.
+    Host,
+    /// The exact Kernel-launched `eliotd` process.
+    Eliotd,
+    /// The separately installed agent bridge module.
+    AgentBridge,
+}
+
+impl NamedPipePeerKind {
+    /// Returns the fixed module identity used by this peer role.
+    #[must_use]
+    pub const fn module_id(self) -> &'static str {
+        match self {
+            Self::Host => "eliot-host",
+            Self::Eliotd => "eliotd",
+            Self::AgentBridge => "eliot-agent-bridge",
+        }
+    }
+}
+
+/// One immutable role/profile and its inert platform expectation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedPipePeerProfile {
+    kind: NamedPipePeerKind,
+    module_id: String,
+    profile_id: Option<String>,
+    expectation: NamedPipePeerExpectation,
+}
+
+impl NamedPipePeerProfile {
+    /// Creates one role entry.  The role and module identity are fixed and the
+    /// expectation remains inert until a live pipe handle is observed.
+    pub fn new(
+        kind: NamedPipePeerKind,
+        expectation: NamedPipePeerExpectation,
+        profile_id: Option<String>,
+    ) -> Result<Self, WindowsAdapterError> {
+        if profile_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+            || (kind == NamedPipePeerKind::AgentBridge && profile_id.is_none())
+            || (kind != NamedPipePeerKind::AgentBridge && profile_id.is_some())
+            || (kind == NamedPipePeerKind::AgentBridge && !expectation.is_dynamic_process())
+            || (kind != NamedPipePeerKind::AgentBridge && expectation.is_dynamic_process())
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            kind,
+            module_id: kind.module_id().to_owned(),
+            profile_id,
+            expectation,
+        })
+    }
+
+    /// Returns the role.
+    #[must_use]
+    pub const fn kind(&self) -> NamedPipePeerKind {
+        self.kind
+    }
+
+    /// Returns the fixed module identity.
+    #[must_use]
+    pub fn module_id(&self) -> &str {
+        &self.module_id
+    }
+
+    /// Returns the static profile identity for the bridge role.
+    #[must_use]
+    pub fn profile_id(&self) -> Option<&str> {
+        self.profile_id.as_deref()
+    }
+
+    /// Returns the inert SID/process/Job expectation.
+    #[must_use]
+    pub const fn expectation(&self) -> &NamedPipePeerExpectation {
+        &self.expectation
+    }
+}
+
+/// Bounded immutable peer set used for deterministic post-observation role
+/// selection.  Entries are sorted by role and cannot be changed after build.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedPipePeerSet {
+    entries: Vec<NamedPipePeerProfile>,
+}
+
+impl NamedPipePeerSet {
+    /// Maximum number of local peer roles in one set.
+    pub const MAX_ENTRIES: usize = 3;
+
+    /// Seals a bounded set with at most one Host, Eliotd, and `AgentBridge`.
+    pub fn new(mut entries: Vec<NamedPipePeerProfile>) -> Result<Self, WindowsAdapterError> {
+        if entries.is_empty() || entries.len() > Self::MAX_ENTRIES {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        if entries.iter().any(|entry| {
+            let static_process = entry.expectation.approved_process_binding();
+            let dynamic_process = entry.expectation.is_dynamic_process();
+            let valid = if entry.kind == NamedPipePeerKind::AgentBridge {
+                dynamic_process
+            } else {
+                !dynamic_process && static_process.is_some()
+            };
+            !valid
+        }) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        entries.sort_by_key(NamedPipePeerProfile::kind);
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].kind() == pair[1].kind())
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self { entries })
+    }
+
+    /// Alias emphasizing that construction seals the immutable set.
+    pub fn seal(entries: Vec<NamedPipePeerProfile>) -> Result<Self, WindowsAdapterError> {
+        Self::new(entries)
+    }
+
+    /// Returns entries in deterministic role order.
+    #[must_use]
+    pub fn entries(&self) -> &[NamedPipePeerProfile] {
+        &self.entries
+    }
+
+    /// Returns whether any entry requires OS-proved built-in Administrators
+    /// membership during live authentication.
+    #[must_use]
+    pub fn requires_builtin_administrators(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.expectation.requires_builtin_administrators())
+    }
+
+    /// Returns whether a dynamic bridge entry requires an OS-observed active
+    /// interactive session during live authentication.
+    #[must_use]
+    pub fn requires_active_interactive_session(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.expectation.is_dynamic_process())
+    }
+
+    /// Returns the approved SID principals used to build and verify a set DACL.
+    #[must_use]
+    pub fn expected_sids(&self) -> Vec<&str> {
+        let mut sids = Vec::with_capacity(self.entries.len());
+        for sid in self
+            .entries
+            .iter()
+            .map(|entry| entry.expectation.expected_sid())
+        {
+            if !sids.contains(&sid) {
+                sids.push(sid);
+            }
+        }
+        sids
+    }
+
+    /// Selects exactly one role from trusted, handle-bound peer evidence.
+    /// Zero matches and multiple matches are both fail-closed.
+    pub fn select(
+        &self,
+        evidence: &NamedPipePeerEvidence,
+    ) -> Result<NamedPipePeerSelection, WindowsAdapterError> {
+        let matches = self
+            .entries
+            .iter()
+            .filter(|entry| entry.expectation.matches_evidence(evidence))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [entry] => Ok(NamedPipePeerSelection {
+                kind: entry.kind,
+                module_id: entry.module_id.clone(),
+                profile_id: entry.profile_id.clone(),
+            }),
+            _ => Err(WindowsAdapterError::IdentityMismatch),
+        }
+    }
+}
+
+/// Result of exact peer-set selection; it contains no semantic Session or task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedPipePeerSelection {
+    kind: NamedPipePeerKind,
+    module_id: String,
+    profile_id: Option<String>,
+}
+
+impl NamedPipePeerSelection {
+    /// Returns the selected role.
+    #[must_use]
+    pub const fn kind(&self) -> NamedPipePeerKind {
+        self.kind
+    }
+
+    /// Returns the selected module identity.
+    #[must_use]
+    pub fn module_id(&self) -> &str {
+        &self.module_id
+    }
+
+    /// Returns the selected static profile identity, if this is the bridge role.
+    #[must_use]
+    pub fn profile_id(&self) -> Option<&str> {
+        self.profile_id.as_deref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5121,6 +5431,8 @@ impl NamedPipePeerExpectation {
             expected_session_id,
             approved_process: None,
             approved_job_process: None,
+            dynamic_image_path: None,
+            dynamic_executable_file: None,
             builtin_administrators: false,
         })
     }
@@ -5140,7 +5452,38 @@ impl NamedPipePeerExpectation {
             expected_session_id: 0,
             approved_process: None,
             approved_job_process: None,
+            dynamic_image_path: None,
+            dynamic_executable_file: None,
             builtin_administrators: true,
+        })
+    }
+
+    /// Creates a bridge expectation for a fresh process generation. The SID,
+    /// normalized executable path and no-follow file identity are stable
+    /// policy; PID, start time and interactive session are observed afresh on
+    /// each connected handle.
+    pub fn new_for_dynamic_process(
+        expected_sid: impl Into<String>,
+        image_path: impl Into<String>,
+        executable_file: FileIdentity,
+    ) -> Result<Self, WindowsAdapterError> {
+        let expected_sid = expected_sid.into();
+        let image_path = image_path.into();
+        if !valid_sid_text(&expected_sid)
+            || !valid_process_image_path(&image_path)
+            || executable_file.volume_serial_number == 0
+            || executable_file.file_index == 0
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            expected_sid,
+            expected_session_id: 0,
+            approved_process: None,
+            approved_job_process: None,
+            dynamic_image_path: Some(image_path),
+            dynamic_executable_file: Some(executable_file),
+            builtin_administrators: false,
         })
     }
 
@@ -5187,6 +5530,9 @@ impl NamedPipePeerExpectation {
         mut self,
         approved_process: NamedPipePeerProcessBinding,
     ) -> Result<Self, WindowsAdapterError> {
+        if self.is_dynamic_process() {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
         self.approved_process = Some(approved_process);
         Ok(self)
     }
@@ -5199,6 +5545,9 @@ impl NamedPipePeerExpectation {
         mut self,
         approved_process: NamedPipePeerJobBinding,
     ) -> Result<Self, WindowsAdapterError> {
+        if self.is_dynamic_process() {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
         self.approved_process = Some(approved_process.process.clone());
         self.approved_job_process = Some(approved_process);
         Ok(self)
@@ -5241,6 +5590,249 @@ impl NamedPipePeerExpectation {
     pub fn approved_process_job_binding(&self) -> Option<&NamedPipePeerJobBinding> {
         self.approved_job_process.as_ref()
     }
+
+    /// Returns whether PID/start/session are intentionally per-connection.
+    #[must_use]
+    pub const fn is_dynamic_process(&self) -> bool {
+        self.dynamic_image_path.is_some()
+    }
+
+    /// Returns the stable executable path for a dynamic process profile.
+    #[must_use]
+    pub fn dynamic_image_path(&self) -> Option<&str> {
+        self.dynamic_image_path.as_deref()
+    }
+
+    /// Returns the stable no-follow executable file identity for a dynamic
+    /// process profile.
+    #[must_use]
+    pub const fn dynamic_executable_file_identity(&self) -> Option<FileIdentity> {
+        self.dynamic_executable_file
+    }
+
+    fn matches_dynamic_observation(&self, evidence: &NamedPipePeerEvidence) -> bool {
+        if !self.is_dynamic_process() || evidence.sid != self.expected_sid {
+            return false;
+        }
+        let Some(image_path) = self.dynamic_image_path.as_deref() else {
+            return false;
+        };
+        same_process_image_path(&evidence.process.image_path, image_path)
+            && evidence.executable_file == self.dynamic_executable_file
+    }
+
+    fn matches_evidence(&self, evidence: &NamedPipePeerEvidence) -> bool {
+        if self.builtin_administrators {
+            // The peer-set selector only consumes the already authenticated
+            // token evidence. Administrator-group membership is proved by the
+            // existing live impersonation boundary, not by SID text alone.
+            if !evidence.builtin_administrators {
+                return false;
+            }
+        } else if self.is_dynamic_process() {
+            if evidence.session_id == 0
+                || !evidence.interactive_session
+                || !self.matches_dynamic_observation(evidence)
+            {
+                return false;
+            }
+        } else if evidence.sid != self.expected_sid
+            || evidence.session_id != self.expected_session_id
+        {
+            return false;
+        }
+        if let Some(approved) = self.approved_process_binding()
+            && (!same_process_identity(&evidence.process, approved.identity())
+                || approved.executable_file_identity() != evidence.executable_file)
+        {
+            return false;
+        }
+        if let Some(approved) = self.approved_process_job_binding()
+            && evidence.job_name.as_deref() != Some(approved.job_name())
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// The only DACL contours accepted for the Kernel front door.
+///
+/// `ServiceOnly` is the exact SY+LS contour used only when the bridge is
+/// disabled. `SystemAndLocalServiceWithClient` adds exactly one canonical
+/// installed client SID for the dynamic `AgentBridge` process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelFrontDoorAclMode {
+    ServiceOnly,
+    SystemAndLocalServiceWithClient {
+        client_sid: String,
+    },
+    /// Accepts exactly one additional canonical non-service SID.
+    SystemAndLocalServiceWithOneClient,
+    /// Accepts the bridge-disabled SY+LS contour or exactly one additional
+    /// OS-resolved user SID. Eliotd uses this bounded reconnect-safe mode
+    /// because it does not own the installed bridge SID.
+    SystemAndLocalServiceWithOptionalUserClient,
+}
+
+/// Host-carried expectation for proving the live Kernel process at the far
+/// end of a client named-pipe connection.
+///
+/// This is policy input only. The corresponding [`KernelFrontDoorServerProof`]
+/// is created from the connected pipe handle and retains the process and
+/// executable file handles for the lifetime of the transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelFrontDoorServerExpectation {
+    expected_server_sid: String,
+    expected_server_session_id: u32,
+    expected_kernel_artifact_sha256: String,
+    approved_process: Option<NamedPipePeerProcessBinding>,
+    approved_job_process: Option<NamedPipePeerJobBinding>,
+    acl_mode: KernelFrontDoorAclMode,
+}
+
+impl KernelFrontDoorServerExpectation {
+    /// Creates an inert front-door server expectation.
+    pub fn new(
+        expected_server_sid: impl Into<String>,
+        expected_server_session_id: u32,
+        expected_kernel_artifact_sha256: impl Into<String>,
+        acl_mode: KernelFrontDoorAclMode,
+    ) -> Result<Self, WindowsAdapterError> {
+        let expected_server_sid = expected_server_sid.into();
+        let expected_kernel_artifact_sha256 = expected_kernel_artifact_sha256.into();
+        if !valid_sid_text(&expected_server_sid)
+            || !valid_sha256_hex(&expected_kernel_artifact_sha256)
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        match &acl_mode {
+            KernelFrontDoorAclMode::ServiceOnly
+            | KernelFrontDoorAclMode::SystemAndLocalServiceWithOneClient
+            | KernelFrontDoorAclMode::SystemAndLocalServiceWithOptionalUserClient => {}
+            KernelFrontDoorAclMode::SystemAndLocalServiceWithClient { client_sid } => {
+                if !valid_sid_text(client_sid)
+                    || matches!(
+                        client_sid.as_str(),
+                        "S-1-5-18" | "S-1-5-19" | "S-1-5-20" | "S-1-5-32-544"
+                    )
+                {
+                    return Err(WindowsAdapterError::InvalidInput);
+                }
+            }
+        }
+        Ok(Self {
+            expected_server_sid,
+            expected_server_session_id,
+            expected_kernel_artifact_sha256,
+            approved_process: None,
+            approved_job_process: None,
+            acl_mode,
+        })
+    }
+
+    /// Adds an exact OS-observed process binding for the Kernel server.
+    #[must_use]
+    pub fn with_process_binding(mut self, approved_process: NamedPipePeerProcessBinding) -> Self {
+        self.approved_process = Some(approved_process);
+        self
+    }
+
+    /// Adds an exact OS-observed process and Job binding for the Kernel server.
+    #[must_use]
+    pub fn with_process_and_job_binding(
+        mut self,
+        approved_process: NamedPipePeerJobBinding,
+    ) -> Self {
+        self.approved_process = Some(approved_process.process.clone());
+        self.approved_job_process = Some(approved_process);
+        self
+    }
+
+    #[must_use]
+    pub fn expected_server_sid(&self) -> &str {
+        &self.expected_server_sid
+    }
+
+    #[must_use]
+    pub const fn expected_server_session_id(&self) -> u32 {
+        self.expected_server_session_id
+    }
+
+    #[must_use]
+    pub fn expected_kernel_artifact_sha256(&self) -> &str {
+        &self.expected_kernel_artifact_sha256
+    }
+
+    #[must_use]
+    pub const fn acl_mode(&self) -> &KernelFrontDoorAclMode {
+        &self.acl_mode
+    }
+
+    #[must_use]
+    pub fn approved_process_binding(&self) -> Option<&NamedPipePeerProcessBinding> {
+        self.approved_process.as_ref()
+    }
+
+    #[must_use]
+    pub fn approved_process_job_binding(&self) -> Option<&NamedPipePeerJobBinding> {
+        self.approved_job_process.as_ref()
+    }
+}
+
+/// Opaque live proof of the Kernel server on a connected named pipe.
+///
+/// The process and executable handles are retained until this value is
+/// dropped. The proof observes the executable path object while the process
+/// handle is live; it does not claim a mapped-image/section proof.
+#[cfg(windows)]
+pub struct KernelFrontDoorServerProof {
+    process: OwnedProcessHandle,
+    executable: PinnedExecutable,
+    evidence: NamedPipePeerEvidence,
+    artifact_sha256: String,
+    observed_extra_sid: Option<String>,
+}
+
+#[cfg(windows)]
+impl KernelFrontDoorServerProof {
+    #[must_use]
+    pub fn evidence(&self) -> &NamedPipePeerEvidence {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub fn observed_extra_sid(&self) -> Option<&str> {
+        self.observed_extra_sid.as_deref()
+    }
+
+    #[must_use]
+    pub fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+
+    /// Returns whether the retained process handle is still non-null. The
+    /// handle itself remains opaque and is never exposed to callers.
+    #[must_use]
+    pub fn retains_live_process(&self) -> bool {
+        !self.process.0.is_null()
+    }
+
+    /// Returns the retained executable file identity.
+    #[must_use]
+    pub const fn executable_file_identity(&self) -> FileIdentity {
+        self.executable.identity
+    }
+}
+
+#[cfg(not(windows))]
+pub struct KernelFrontDoorServerProof;
+
+#[cfg(not(windows))]
+impl KernelFrontDoorServerProof {
+    pub fn evidence(&self) -> ! {
+        unreachable!("Windows proof is unavailable on this target")
+    }
 }
 
 /// Sealed observation of the server at the other end of a live pipe handle.
@@ -5252,9 +5844,38 @@ pub struct NamedPipePeerEvidence {
     process: ProcessIdentity,
     sid: String,
     session_id: u32,
+    executable_file: Option<FileIdentity>,
+    job_name: Option<String>,
+    builtin_administrators: bool,
+    interactive_session: bool,
 }
 
 impl NamedPipePeerEvidence {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(
+        process: ProcessIdentity,
+        sid: impl Into<String>,
+        session_id: u32,
+        executable_file: Option<FileIdentity>,
+        job_name: Option<String>,
+        builtin_administrators: bool,
+        interactive_session: bool,
+    ) -> Result<Self, WindowsAdapterError> {
+        let sid = sid.into();
+        if !process.is_usable() || !valid_sid_text(&sid) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            process,
+            sid,
+            session_id,
+            executable_file,
+            job_name,
+            builtin_administrators,
+            interactive_session,
+        })
+    }
+
     #[must_use]
     pub fn process(&self) -> &ProcessIdentity {
         &self.process
@@ -5268,6 +5889,30 @@ impl NamedPipePeerEvidence {
     #[must_use]
     pub const fn session_id(&self) -> u32 {
         self.session_id
+    }
+
+    /// Returns the OS-observed executable file identity, when available.
+    #[must_use]
+    pub const fn executable_file_identity(&self) -> Option<FileIdentity> {
+        self.executable_file
+    }
+
+    /// Returns the owner Job name revalidated for this peer, when applicable.
+    #[must_use]
+    pub fn job_name(&self) -> Option<&str> {
+        self.job_name.as_deref()
+    }
+
+    /// Returns the OS-proved built-in Administrators membership result.
+    #[must_use]
+    pub const fn is_builtin_administrator(&self) -> bool {
+        self.builtin_administrators
+    }
+
+    /// Returns the OS-observed WTS active-interactive state.
+    #[must_use]
+    pub const fn has_active_interactive_session(&self) -> bool {
+        self.interactive_session
     }
 }
 
@@ -6984,6 +7629,511 @@ pub(crate) fn verify_exact_file_security(
     }
 }
 
+/// Exact masks used by the installed Agent Bridge security contour.
+pub const AGENT_BRIDGE_FILE_TRAVERSE_ACCESS_MASK: u32 = 0x0000_0020;
+pub const AGENT_BRIDGE_DECLARATION_READ_ACCESS_MASK: u32 = 0x0012_0089;
+
+/// Provider readback for the four Agent Bridge objects after ACL convergence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentBridgeSecurityConvergenceReceipt {
+    /// Retained Host state-root identity.
+    pub host_state_root_identity: FileIdentity,
+    /// Retained `agent-bridge` directory identity.
+    pub bridge_directory_identity: FileIdentity,
+    /// Retained admission-profile identity.
+    pub profile_identity: FileIdentity,
+    /// Retained client-declaration identity.
+    pub declaration_identity: FileIdentity,
+    /// Raw security-descriptor digests read from the four retained handles.
+    pub host_state_root_descriptor_sha256: String,
+    pub bridge_directory_descriptor_sha256: String,
+    pub profile_descriptor_sha256: String,
+    pub declaration_descriptor_sha256: String,
+}
+
+#[cfg(windows)]
+fn open_agent_bridge_acl_target(
+    path: &Path,
+    directory: bool,
+) -> Result<std::fs::File, WindowsAdapterError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
+    };
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_GENERIC_READ | WRITE_DAC)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(
+            FILE_FLAG_OPEN_REPARSE_POINT
+                | if directory {
+                    FILE_FLAG_BACKUP_SEMANTICS
+                } else {
+                    0
+                },
+        );
+    let file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            WindowsAdapterError::NotFound
+        } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+            WindowsAdapterError::PermissionDenied
+        } else {
+            WindowsAdapterError::Failed
+        }
+    })?;
+    let metadata = file.metadata().map_err(|_| WindowsAdapterError::Failed)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    if metadata.is_dir() != directory {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn descriptor_digest_raw(
+    raw: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+) -> Result<String, WindowsAdapterError> {
+    use windows_sys::Win32::Security::GetSecurityDescriptorLength;
+    if raw.is_null() {
+        return Err(WindowsAdapterError::AclMismatch);
+    }
+    let length = unsafe { GetSecurityDescriptorLength(raw) };
+    if length == 0 {
+        return Err(WindowsAdapterError::AclMismatch);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(raw.cast::<u8>(), length as usize) };
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(windows)]
+fn descriptor_digest_for_handle(file: &std::fs::File) -> Result<String, WindowsAdapterError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(WindowsAdapterError::AclMismatch);
+    }
+    let digest = descriptor_digest_raw(descriptor);
+    unsafe { LocalFree(descriptor.cast()) };
+    digest
+}
+
+#[cfg(windows)]
+fn apply_agent_bridge_descriptor(
+    file: &std::fs::File,
+    expected: &OwnedSecurityDescriptor,
+) -> Result<(), WindowsAdapterError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let dacl = expected.dacl()?;
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null(),
+        )
+    };
+    if status != 0 {
+        return Err(
+            if status == windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED {
+                WindowsAdapterError::PermissionDenied
+            } else {
+                WindowsAdapterError::AclMismatch
+            },
+        );
+    }
+    verify_exact_file_security(file, expected, "S-1-5-18")
+}
+
+#[cfg(windows)]
+fn converge_agent_bridge_acl_target(
+    file: &std::fs::File,
+    old: &OwnedSecurityDescriptor,
+    final_descriptor: &OwnedSecurityDescriptor,
+) -> Result<String, WindowsAdapterError> {
+    if verify_exact_file_security(file, final_descriptor, "S-1-5-18").is_err() {
+        if verify_exact_file_security(file, old, "S-1-5-18").is_err() {
+            return Err(WindowsAdapterError::AclMismatch);
+        }
+        apply_agent_bridge_descriptor(file, final_descriptor)?;
+    }
+    verify_exact_file_security(file, final_descriptor, "S-1-5-18")?;
+    descriptor_digest_for_handle(file)
+}
+
+/// Converges the installed Agent Bridge pair and traversal contour.
+///
+/// The Host only publishes under its pre-existing service-only ACL. This
+/// elevated provider operation classifies every retained no-follow handle as
+/// either the exact old service contour or the exact final contour, then
+/// applies the final descriptors in files → child → root order. A foreign or
+/// partial descriptor is never rewritten.
+#[cfg(windows)]
+pub fn converge_agent_bridge_security(
+    host_state_root: &Path,
+    approved_user_sid: &str,
+    profile_path: &Path,
+    declaration_path: &Path,
+) -> Result<AgentBridgeSecurityConvergenceReceipt, WindowsAdapterError> {
+    if !valid_sid_text(approved_user_sid) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let bridge_directory = host_state_root.join("agent-bridge");
+    if profile_path != bridge_directory.join("admission-profile-v1.json")
+        || declaration_path != bridge_directory.join("client-declaration-v2.json")
+    {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let root = open_agent_bridge_acl_target(host_state_root, true)?;
+    let child = open_agent_bridge_acl_target(&bridge_directory, true)?;
+    let profile = open_agent_bridge_acl_target(profile_path, false)?;
+    let declaration = open_agent_bridge_acl_target(declaration_path, false)?;
+    let old_directory = OwnedSecurityDescriptor::for_installer_system_object(true)?;
+    let old_file = OwnedSecurityDescriptor::for_installer_system_object(false)?;
+    let service_only =
+        OwnedSecurityDescriptor::from_sddl("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)")?;
+    let child_final = OwnedSecurityDescriptor::from_sddl(&format!(
+        "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)(A;;0x{AGENT_BRIDGE_FILE_TRAVERSE_ACCESS_MASK:08X};;;{approved_user_sid})"
+    ))?;
+    let declaration_final = OwnedSecurityDescriptor::from_sddl(&format!(
+        "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)(A;;0x{AGENT_BRIDGE_DECLARATION_READ_ACCESS_MASK:08X};;;{approved_user_sid})"
+    ))?;
+    // Root is deliberately opened and retained first but converged last.
+    let profile_digest = converge_agent_bridge_acl_target(&profile, &old_file, &service_only)?;
+    let declaration_digest =
+        converge_agent_bridge_acl_target(&declaration, &old_file, &declaration_final)?;
+    let child_digest = converge_agent_bridge_acl_target(&child, &old_directory, &child_final)?;
+    let root_digest = converge_agent_bridge_acl_target(&root, &old_directory, &child_final)?;
+    Ok(AgentBridgeSecurityConvergenceReceipt {
+        host_state_root_identity: file_identity_from_handle(&root)
+            .map_err(|_| WindowsAdapterError::Failed)?,
+        bridge_directory_identity: file_identity_from_handle(&child)
+            .map_err(|_| WindowsAdapterError::Failed)?,
+        profile_identity: file_identity_from_handle(&profile)
+            .map_err(|_| WindowsAdapterError::Failed)?,
+        declaration_identity: file_identity_from_handle(&declaration)
+            .map_err(|_| WindowsAdapterError::Failed)?,
+        host_state_root_descriptor_sha256: root_digest,
+        bridge_directory_descriptor_sha256: child_digest,
+        profile_descriptor_sha256: profile_digest,
+        declaration_descriptor_sha256: declaration_digest,
+    })
+}
+
+/// Verifies the final Agent Bridge ACL contour without mutating any object.
+/// This is the dedicated Host recovery/admission reader; it does not use the
+/// legacy protected-path lease, and rejects the pre-convergence service ACL.
+#[cfg(windows)]
+pub struct AgentBridgeFinalReadLease {
+    #[allow(dead_code)]
+    root: std::fs::File,
+    #[allow(dead_code)]
+    child: std::fs::File,
+    profile: std::fs::File,
+    declaration: std::fs::File,
+    receipt: AgentBridgeSecurityConvergenceReceipt,
+}
+
+/// Narrow bridge-client reader. It deliberately never opens the
+/// service-only admission profile; only the declaration and its traversable
+/// root contour are retained.
+#[cfg(windows)]
+pub struct AgentBridgeDeclarationReadLease {
+    #[allow(dead_code)]
+    root: std::fs::File,
+    #[allow(dead_code)]
+    child: std::fs::File,
+    declaration: std::fs::File,
+    pub root_identity: FileIdentity,
+    pub child_identity: FileIdentity,
+    pub declaration_identity: FileIdentity,
+    pub root_descriptor_sha256: Option<String>,
+    pub child_descriptor_sha256: Option<String>,
+    pub declaration_descriptor_sha256: String,
+}
+
+#[cfg(windows)]
+fn open_agent_bridge_traverse_directory(
+    path: &Path,
+) -> Result<(FileIdentity, std::fs::File), WindowsAdapterError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .access_mode(FILE_TRAVERSE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options
+        .open(path)
+        .map_err(|_| WindowsAdapterError::PermissionDenied)?;
+    let metadata = file.metadata().map_err(|_| WindowsAdapterError::Failed)?;
+    if metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+        || !metadata.is_dir()
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let identity = file_identity_from_handle(&file).map_err(|_| WindowsAdapterError::Failed)?;
+    Ok((identity, file))
+}
+
+#[cfg(windows)]
+impl AgentBridgeDeclarationReadLease {
+    pub fn read_bytes(&mut self) -> Result<Vec<u8>, WindowsAdapterError> {
+        read_agent_bridge_lease_bytes(&mut self.declaration)
+    }
+}
+
+#[cfg(windows)]
+pub fn open_agent_bridge_declaration_read_lease(
+    declaration_path: &Path,
+) -> Result<AgentBridgeDeclarationReadLease, WindowsAdapterError> {
+    let bridge_directory = declaration_path
+        .parent()
+        .ok_or(WindowsAdapterError::InvalidInput)?;
+    let host_state_root = bridge_directory
+        .parent()
+        .ok_or(WindowsAdapterError::InvalidInput)?;
+    if declaration_path.file_name().and_then(|name| name.to_str())
+        != Some("client-declaration-v2.json")
+        || bridge_directory.file_name().and_then(|name| name.to_str()) != Some("agent-bridge")
+    {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let approved_user_sid = current_process_sid().map_err(|_| WindowsAdapterError::Unavailable)?;
+    if !valid_sid_text(&approved_user_sid) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let bridge_directory = host_state_root.join("agent-bridge");
+    let (root_identity, root) = open_agent_bridge_traverse_directory(host_state_root)?;
+    let (child_identity, child) = open_agent_bridge_traverse_directory(&bridge_directory)?;
+    let (declaration_identity, declaration) =
+        open_no_follow_file(declaration_path).map_err(|_| WindowsAdapterError::PermissionDenied)?;
+    let final_declaration = OwnedSecurityDescriptor::from_sddl(&format!(
+        "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)(A;;0x{AGENT_BRIDGE_DECLARATION_READ_ACCESS_MASK:08X};;;{approved_user_sid})"
+    ))?;
+    verify_exact_file_security(&declaration, &final_declaration, "S-1-5-18")?;
+    Ok(AgentBridgeDeclarationReadLease {
+        root_descriptor_sha256: None,
+        child_descriptor_sha256: None,
+        declaration_descriptor_sha256: descriptor_digest_for_handle(&declaration)?,
+        root,
+        child,
+        declaration,
+        root_identity,
+        child_identity,
+        declaration_identity,
+    })
+}
+
+#[cfg(windows)]
+impl AgentBridgeFinalReadLease {
+    pub fn receipt(&self) -> &AgentBridgeSecurityConvergenceReceipt {
+        &self.receipt
+    }
+
+    pub fn read_profile_bytes(&mut self) -> Result<Vec<u8>, WindowsAdapterError> {
+        read_agent_bridge_lease_bytes(&mut self.profile)
+    }
+
+    pub fn read_declaration_bytes(&mut self) -> Result<Vec<u8>, WindowsAdapterError> {
+        read_agent_bridge_lease_bytes(&mut self.declaration)
+    }
+}
+
+#[cfg(windows)]
+fn read_agent_bridge_lease_bytes(file: &mut std::fs::File) -> Result<Vec<u8>, WindowsAdapterError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| WindowsAdapterError::Failed)?;
+    let length = file
+        .metadata()
+        .map_err(|_| WindowsAdapterError::Failed)?
+        .len();
+    if length == 0 || length > 16 * 1024 * 1024 {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(length).map_err(|_| WindowsAdapterError::InvalidInput)?);
+    file.take(length)
+        .read_to_end(&mut bytes)
+        .map_err(|_| WindowsAdapterError::Failed)?;
+    if bytes.len() as u64 != length {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+pub fn open_agent_bridge_final_read_lease(
+    host_state_root: &Path,
+    approved_user_sid: &str,
+    profile_path: &Path,
+    declaration_path: &Path,
+) -> Result<AgentBridgeFinalReadLease, WindowsAdapterError> {
+    if !valid_sid_text(approved_user_sid) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let bridge_directory = host_state_root.join("agent-bridge");
+    if profile_path != bridge_directory.join("admission-profile-v1.json")
+        || declaration_path != bridge_directory.join("client-declaration-v2.json")
+    {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let (root_identity, root) = open_no_follow_directory(host_state_root)
+        .map_err(|_| WindowsAdapterError::PermissionDenied)?;
+    let (child_identity, child) = open_no_follow_directory(&bridge_directory)
+        .map_err(|_| WindowsAdapterError::PermissionDenied)?;
+    let (profile_identity, profile) =
+        open_no_follow_file(profile_path).map_err(|_| WindowsAdapterError::PermissionDenied)?;
+    let (declaration_identity, declaration) =
+        open_no_follow_file(declaration_path).map_err(|_| WindowsAdapterError::PermissionDenied)?;
+    let service_only =
+        OwnedSecurityDescriptor::from_sddl("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)")?;
+    let final_directory = OwnedSecurityDescriptor::from_sddl(&format!(
+        "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)(A;;0x{AGENT_BRIDGE_FILE_TRAVERSE_ACCESS_MASK:08X};;;{approved_user_sid})"
+    ))?;
+    let final_declaration = OwnedSecurityDescriptor::from_sddl(&format!(
+        "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)(A;;0x{AGENT_BRIDGE_DECLARATION_READ_ACCESS_MASK:08X};;;{approved_user_sid})"
+    ))?;
+    verify_exact_file_security(&profile, &service_only, "S-1-5-18")?;
+    verify_exact_file_security(&declaration, &final_declaration, "S-1-5-18")?;
+    verify_exact_file_security(&child, &final_directory, "S-1-5-18")?;
+    verify_exact_file_security(&root, &final_directory, "S-1-5-18")?;
+    let receipt = AgentBridgeSecurityConvergenceReceipt {
+        host_state_root_identity: root_identity,
+        bridge_directory_identity: child_identity,
+        profile_identity,
+        declaration_identity,
+        host_state_root_descriptor_sha256: descriptor_digest_for_handle(&root)?,
+        bridge_directory_descriptor_sha256: descriptor_digest_for_handle(&child)?,
+        profile_descriptor_sha256: descriptor_digest_for_handle(&profile)?,
+        declaration_descriptor_sha256: descriptor_digest_for_handle(&declaration)?,
+    };
+    Ok(AgentBridgeFinalReadLease {
+        root,
+        child,
+        profile,
+        declaration,
+        receipt,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn open_agent_bridge_declaration_read_lease(
+    declaration_path: &Path,
+) -> Result<(), WindowsAdapterError> {
+    let _ = declaration_path;
+    Err(WindowsAdapterError::Unavailable)
+}
+
+#[cfg(windows)]
+pub fn verify_agent_bridge_security(
+    host_state_root: &Path,
+    approved_user_sid: &str,
+    profile_path: &Path,
+    declaration_path: &Path,
+) -> Result<AgentBridgeSecurityConvergenceReceipt, WindowsAdapterError> {
+    Ok(open_agent_bridge_final_read_lease(
+        host_state_root,
+        approved_user_sid,
+        profile_path,
+        declaration_path,
+    )?
+    .receipt)
+}
+
+#[cfg(not(windows))]
+pub fn converge_agent_bridge_security(
+    host_state_root: &Path,
+    approved_user_sid: &str,
+    profile_path: &Path,
+    declaration_path: &Path,
+) -> Result<AgentBridgeSecurityConvergenceReceipt, WindowsAdapterError> {
+    let _ = (
+        host_state_root,
+        approved_user_sid,
+        profile_path,
+        declaration_path,
+    );
+    Err(WindowsAdapterError::Unavailable)
+}
+
+#[cfg(not(windows))]
+pub fn verify_agent_bridge_security(
+    host_state_root: &Path,
+    approved_user_sid: &str,
+    profile_path: &Path,
+    declaration_path: &Path,
+) -> Result<AgentBridgeSecurityConvergenceReceipt, WindowsAdapterError> {
+    let _ = (
+        host_state_root,
+        approved_user_sid,
+        profile_path,
+        declaration_path,
+    );
+    Err(WindowsAdapterError::Unavailable)
+}
+
+#[cfg(not(windows))]
+pub fn open_agent_bridge_final_read_lease(
+    host_state_root: &Path,
+    approved_user_sid: &str,
+    profile_path: &Path,
+    declaration_path: &Path,
+) -> Result<(), WindowsAdapterError> {
+    let _ = (
+        host_state_root,
+        approved_user_sid,
+        profile_path,
+        declaration_path,
+    );
+    Err(WindowsAdapterError::Unavailable)
+}
+
 /// RAII wrapper for a named Windows Job Object configured to terminate
 /// assigned processes when the sole owning handle closes.
 #[cfg(windows)]
@@ -7413,7 +8563,7 @@ impl Drop for SuspendedProcessCleanup {
 
 #[cfg(windows)]
 struct PinnedExecutable {
-    _file: std::fs::File,
+    file: std::fs::File,
     identity: FileIdentity,
 }
 
@@ -7445,7 +8595,7 @@ impl PinnedExecutable {
             return Err(last_windows_adapter_error());
         }
         Ok(Self {
-            _file: file,
+            file,
             identity: FileIdentity {
                 volume_serial_number: information.dwVolumeSerialNumber,
                 file_index: (u64::from(information.nFileIndexHigh) << 32)
@@ -9957,6 +11107,20 @@ fn same_process_identity(observed: &ProcessIdentity, approved: &ProcessIdentity)
     }
 }
 
+fn same_process_image_path(observed: &str, approved: &str) -> bool {
+    if !valid_process_image_path(observed) || !valid_process_image_path(approved) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        same_windows_path(observed, approved)
+    }
+    #[cfg(not(windows))]
+    {
+        observed == approved
+    }
+}
+
 /// Authenticates the server bound to a connected client-end named-pipe handle.
 ///
 /// # Errors
@@ -9995,14 +11159,403 @@ pub fn authenticate_named_pipe_server(
         if sid != expectation.expected_sid || session_id != expectation.expected_session_id {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
+        let executable_file = file_identity(Path::new(&identity.image_path)).ok();
         Ok(NamedPipePeerEvidence {
             process: identity,
             sid,
             session_id,
+            executable_file,
+            job_name: expectation
+                .approved_process_job_binding()
+                .map(|binding| binding.job_name().to_owned()),
+            builtin_administrators: false,
+            interactive_session: false,
         })
     })();
     unsafe { CloseHandle(process) };
     observed
+}
+
+/// Proves the exact Kernel server bound to a connected client-end pipe.
+///
+/// Unlike the generic peer APIs this function retains both the queried
+/// process handle and the no-follow executable handle in the returned proof.
+/// The DACL is independently checked against the narrow front-door contour.
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the specialized Kernel proof keeps process, executable, artifact, and ACL checks contiguous"
+)]
+pub fn authenticate_kernel_front_door_server(
+    pipe: std::os::windows::io::BorrowedHandle<'_>,
+    expectation: &KernelFrontDoorServerExpectation,
+) -> Result<KernelFrontDoorServerProof, WindowsAdapterError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let pipe_handle: windows_sys::Win32::Foundation::HANDLE = pipe.as_raw_handle().cast();
+    if pipe_handle.is_null() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let observed_extra_sid = validate_kernel_front_door_dacl(pipe_handle, expectation)?;
+    let mut process_id = 0_u32;
+    if unsafe { GetNamedPipeServerProcessId(pipe_handle, &raw mut process_id) } == 0
+        || process_id == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return Err(last_windows_adapter_error());
+    }
+    let result = (|| {
+        let identity = inspect_process_handle(process_id, process)
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        validate_kernel_front_door_process_identity(&identity, expectation)?;
+        if let Some(approved) = expectation.approved_process_job_binding() {
+            if !same_process_identity(&identity, approved.process_binding().identity()) {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            let current = observe_named_pipe_peer_process_in_job(approved.job_name(), process_id)?;
+            if !same_process_identity(
+                current.process_binding().identity(),
+                approved.process_binding().identity(),
+            ) {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+        }
+        let (sid, session_id) = process_token_identity(process)?;
+        if sid != expectation.expected_server_sid
+            || session_id != expectation.expected_server_session_id
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+
+        let mut executable = PinnedExecutable::open(Path::new(&identity.image_path))?;
+        let final_path = final_windows_path_from_handle(&executable.file)
+            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+        let final_path = final_path
+            .to_str()
+            .ok_or(WindowsAdapterError::IdentityMismatch)?;
+        validate_kernel_front_door_executable_identity(
+            &identity.image_path,
+            final_path,
+            executable.identity,
+            expectation,
+        )?;
+        executable
+            .file
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| WindowsAdapterError::Failed)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let count = executable
+                .file
+                .read(&mut buffer)
+                .map_err(|_| WindowsAdapterError::Failed)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let artifact_sha256 = format!("{:x}", hasher.finalize());
+        validate_kernel_front_door_artifact(&artifact_sha256, expectation)?;
+        let evidence = NamedPipePeerEvidence {
+            process: identity,
+            sid,
+            session_id,
+            executable_file: Some(executable.identity),
+            job_name: expectation
+                .approved_process_job_binding()
+                .map(|binding| binding.job_name().to_owned()),
+            builtin_administrators: false,
+            interactive_session: false,
+        };
+        let process = OwnedProcessHandle::new(process)?;
+        Ok(KernelFrontDoorServerProof {
+            process,
+            executable,
+            evidence,
+            artifact_sha256,
+            observed_extra_sid,
+        })
+    })();
+    if result.is_err() {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(process) };
+    }
+    result
+}
+
+#[cfg(windows)]
+fn validate_kernel_front_door_process_identity(
+    observed: &ProcessIdentity,
+    expectation: &KernelFrontDoorServerExpectation,
+) -> Result<(), WindowsAdapterError> {
+    if let Some(approved) = expectation.approved_process_binding()
+        && !same_process_identity(observed, approved.identity())
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_kernel_front_door_executable_identity(
+    observed_image_path: &str,
+    retained_final_path: &str,
+    retained_file_identity: FileIdentity,
+    expectation: &KernelFrontDoorServerExpectation,
+) -> Result<(), WindowsAdapterError> {
+    if !same_process_image_path(retained_final_path, observed_image_path) {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    if let Some(expected_file) = expectation
+        .approved_process_binding()
+        .and_then(NamedPipePeerProcessBinding::executable_file_identity)
+        && expected_file != retained_file_identity
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn validate_kernel_front_door_artifact(
+    observed_sha256: &str,
+    expectation: &KernelFrontDoorServerExpectation,
+) -> Result<(), WindowsAdapterError> {
+    if observed_sha256 == expectation.expected_kernel_artifact_sha256 {
+        Ok(())
+    } else {
+        Err(WindowsAdapterError::IdentityMismatch)
+    }
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the specialized Kernel DACL readback keeps all ACE classification in one fail-closed boundary"
+)]
+fn validate_kernel_front_door_dacl(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    expectation: &KernelFrontDoorServerExpectation,
+) -> Result<Option<String>, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, PSECURITY_DESCRIPTOR,
+    };
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            pipe,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut dacl,
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || dacl.is_null() || descriptor.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(WindowsAdapterError::AclMismatch);
+    }
+    let result = (|| {
+        let mut entries = Vec::with_capacity(usize::from(unsafe { (*dacl).AceCount }));
+        for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+            let mut ace = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &raw mut ace) } == 0 || ace.is_null() {
+                return Err(WindowsAdapterError::AclMismatch);
+            }
+            let header = unsafe { &*ace.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid = (&raw const allowed.SidStart).cast_mut().cast();
+            let text = sid_to_string(sid)?;
+            let is_user_account = match expectation.acl_mode() {
+                KernelFrontDoorAclMode::SystemAndLocalServiceWithClient { client_sid }
+                    if client_sid == &text =>
+                {
+                    sid_text_is_user_account(&text)?
+                }
+                KernelFrontDoorAclMode::SystemAndLocalServiceWithOneClient
+                | KernelFrontDoorAclMode::SystemAndLocalServiceWithOptionalUserClient
+                    if !matches!(
+                        text.as_str(),
+                        "S-1-5-18" | "S-1-5-19" | "S-1-5-20" | "S-1-5-32-544"
+                    ) =>
+                {
+                    sid_text_is_user_account(&text)?
+                }
+                _ => false,
+            };
+            entries.push(KernelFrontDoorAce {
+                sid: text,
+                mask: allowed.Mask,
+                ace_type: header.AceType,
+                ace_flags: header.AceFlags,
+                is_user_account,
+            });
+        }
+        classify_kernel_front_door_acl(&entries, expectation.acl_mode())
+    })();
+    unsafe { LocalFree(descriptor.cast()) };
+    result
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KernelFrontDoorAce {
+    sid: String,
+    mask: u32,
+    ace_type: u8,
+    ace_flags: u8,
+    is_user_account: bool,
+}
+
+fn classify_kernel_front_door_acl(
+    entries: &[KernelFrontDoorAce],
+    mode: &KernelFrontDoorAclMode,
+) -> Result<Option<String>, WindowsAdapterError> {
+    let mut expected = vec!["S-1-5-18", "S-1-5-19"];
+    let exactly_one_extra = matches!(
+        mode,
+        KernelFrontDoorAclMode::SystemAndLocalServiceWithOneClient
+    );
+    let optional_extra = matches!(
+        mode,
+        KernelFrontDoorAclMode::SystemAndLocalServiceWithOptionalUserClient
+    );
+    if let KernelFrontDoorAclMode::SystemAndLocalServiceWithClient { client_sid } = mode {
+        expected.push(client_sid.as_str());
+    }
+    let valid_count = if exactly_one_extra {
+        entries.len() == expected.len() + 1
+    } else if optional_extra {
+        (expected.len()..=expected.len() + 1).contains(&entries.len())
+    } else {
+        entries.len() == expected.len()
+    };
+    if !valid_count {
+        return Err(WindowsAdapterError::AclMismatch);
+    }
+    let mut seen = vec![false; expected.len()];
+    let mut observed_extra = None::<String>;
+    for ace in entries {
+        if ace.ace_type != 0 || ace.ace_flags != 0 || ace.mask != PEER_SET_GENERIC_ALL_MAPPED {
+            return Err(WindowsAdapterError::AclMismatch);
+        }
+        if let Some(position) = expected.iter().position(|value| *value == ace.sid) {
+            if position >= 2
+                && matches!(
+                    mode,
+                    KernelFrontDoorAclMode::SystemAndLocalServiceWithClient { .. }
+                )
+                && !ace.is_user_account
+            {
+                return Err(WindowsAdapterError::AclMismatch);
+            }
+            if seen[position] {
+                return Err(WindowsAdapterError::AclMismatch);
+            }
+            seen[position] = true;
+        } else if (exactly_one_extra || optional_extra)
+            && observed_extra.is_none()
+            && valid_sid_text(&ace.sid)
+            && !matches!(
+                ace.sid.as_str(),
+                "S-1-1-0"
+                    | "S-1-5-11"
+                    | "S-1-5-18"
+                    | "S-1-5-19"
+                    | "S-1-5-20"
+                    | "S-1-5-32-544"
+                    | "S-1-5-32-545"
+            )
+            && !ace.sid.starts_with("S-1-5-80-")
+            && ace.is_user_account
+        {
+            observed_extra = Some(ace.sid.clone());
+        } else {
+            return Err(WindowsAdapterError::AclMismatch);
+        }
+    }
+    if !seen.into_iter().all(std::convert::identity)
+        || exactly_one_extra && observed_extra.is_none()
+    {
+        return Err(WindowsAdapterError::AclMismatch);
+    }
+    Ok(match mode {
+        KernelFrontDoorAclMode::ServiceOnly => None,
+        KernelFrontDoorAclMode::SystemAndLocalServiceWithClient { client_sid } => {
+            Some(client_sid.clone())
+        }
+        KernelFrontDoorAclMode::SystemAndLocalServiceWithOneClient
+        | KernelFrontDoorAclMode::SystemAndLocalServiceWithOptionalUserClient => observed_extra,
+    })
+}
+
+#[cfg(windows)]
+fn sid_text_is_user_account(value: &str) -> Result<bool, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows_sys::Win32::Security::{LookupAccountSidW, SID_NAME_USE, SidTypeUser};
+
+    let text = value.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut sid = std::ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(text.as_ptr(), &raw mut sid) } == 0 || sid.is_null() {
+        return Err(last_windows_adapter_error());
+    }
+    let result = (|| {
+        let mut name_len = 0_u32;
+        let mut domain_len = 0_u32;
+        let mut sid_type: SID_NAME_USE = 0;
+        let first = unsafe {
+            LookupAccountSidW(
+                std::ptr::null(),
+                sid,
+                std::ptr::null_mut(),
+                &raw mut name_len,
+                std::ptr::null_mut(),
+                &raw mut domain_len,
+                &raw mut sid_type,
+            )
+        };
+        if first != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+            return Err(last_windows_adapter_error());
+        }
+        if name_len == 0 || name_len > 32 * 1024 || domain_len > 32 * 1024 {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        let mut name =
+            vec![0_u16; usize::try_from(name_len).map_err(|_| WindowsAdapterError::Failed)?];
+        let mut domain = vec![
+            0_u16;
+            usize::try_from(domain_len.max(1))
+                .map_err(|_| WindowsAdapterError::Failed)?
+        ];
+        if unsafe {
+            LookupAccountSidW(
+                std::ptr::null(),
+                sid,
+                name.as_mut_ptr(),
+                &raw mut name_len,
+                domain.as_mut_ptr(),
+                &raw mut domain_len,
+                &raw mut sid_type,
+            )
+        } == 0
+        {
+            return Err(last_windows_adapter_error());
+        }
+        Ok(sid_type == SidTypeUser)
+    })();
+    unsafe { LocalFree(sid.cast()) };
+    result
 }
 
 /// Authenticates the client bound to a connected server-end named-pipe handle.
@@ -10069,14 +11622,213 @@ pub fn authenticate_named_pipe_client(
         if !principal_matches {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
+        let executable_file = file_identity(Path::new(&identity.image_path)).ok();
         Ok(NamedPipePeerEvidence {
             process: identity,
             sid: process_token.0,
             session_id: process_token.1,
+            executable_file,
+            job_name: expectation
+                .approved_process_job_binding()
+                .map(|binding| binding.job_name().to_owned()),
+            builtin_administrators: matches!(
+                expectation.auth_discriminator(),
+                NamedPipeAuthDiscriminator::BuiltinAdministrators
+            ),
+            interactive_session: false,
         })
     })();
     unsafe { CloseHandle(process) };
     observed
+}
+
+/// Authenticates a connected server-end pipe against a sealed peer set.
+///
+/// The DACL is checked as a bounded allow-list, then the server PID is read
+/// from the live pipe handle and all identity fields are captured before the
+/// immutable set performs exact selection.  No SID or username supplied by a
+/// caller is used as a selector.
+#[cfg(windows)]
+pub fn authenticate_named_pipe_server_with_peer_set(
+    pipe: std::os::windows::io::BorrowedHandle<'_>,
+    peers: &NamedPipePeerSet,
+) -> Result<(NamedPipePeerEvidence, NamedPipePeerSelection), WindowsAdapterError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let pipe_handle: windows_sys::Win32::Foundation::HANDLE = pipe.as_raw_handle().cast();
+    if pipe_handle.is_null() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    validate_pipe_dacl_for_peer_set(pipe_handle, peers)?;
+    let mut process_id = 0_u32;
+    if unsafe { GetNamedPipeServerProcessId(pipe_handle, &raw mut process_id) } == 0
+        || process_id == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return Err(last_windows_adapter_error());
+    }
+    let observed = (|| {
+        let identity = inspect_process_handle(process_id, process)
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        let (sid, session_id) = process_token_identity(process)?;
+        let builtin_administrators = if peers.requires_builtin_administrators() {
+            process_token_is_builtin_administrator(process)? && sid != "S-1-5-18"
+        } else {
+            false
+        };
+        let executable_file = file_identity(Path::new(&identity.image_path)).ok();
+        let job_name = observed_peer_job_name(process_id, peers)?;
+        let mut evidence = NamedPipePeerEvidence {
+            process: identity,
+            sid,
+            session_id,
+            executable_file,
+            job_name,
+            builtin_administrators,
+            interactive_session: false,
+        };
+        if session_id != 0
+            && peers
+                .entries()
+                .iter()
+                .any(|entry| entry.expectation.matches_dynamic_observation(&evidence))
+        {
+            evidence.interactive_session = active_interactive_session(session_id)?;
+        }
+        let selection = peers.select(&evidence)?;
+        Ok((evidence, selection))
+    })();
+    unsafe { CloseHandle(process) };
+    observed
+}
+
+/// Authenticates a connected client-end pipe against a sealed peer set.
+///
+/// Built-in Administrators membership is accepted only when both the retained
+/// process token and a short-lived impersonated pipe token prove the group.
+/// The latter is reverted before this function returns.
+#[cfg(windows)]
+pub fn authenticate_named_pipe_client_with_peer_set(
+    pipe: std::os::windows::io::BorrowedHandle<'_>,
+    peers: &NamedPipePeerSet,
+) -> Result<(NamedPipePeerEvidence, NamedPipePeerSelection), WindowsAdapterError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let pipe_handle: windows_sys::Win32::Foundation::HANDLE = pipe.as_raw_handle().cast();
+    if pipe_handle.is_null() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    validate_pipe_dacl_for_peer_set(pipe_handle, peers)?;
+    let mut process_id = 0_u32;
+    if unsafe { GetNamedPipeClientProcessId(pipe_handle, &raw mut process_id) } == 0
+        || process_id == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return Err(last_windows_adapter_error());
+    }
+    let observed = (|| {
+        let identity = inspect_process_handle(process_id, process)
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        let (sid, session_id) = process_token_identity(process)?;
+        let builtin_administrators = if peers.requires_builtin_administrators() {
+            let process_is_admin = process_token_is_builtin_administrator(process)?;
+            let impersonation = ImpersonationGuard::begin(pipe_handle)?;
+            let thread_is_admin = thread_token_is_builtin_administrator()?;
+            impersonation.revert()?;
+            process_is_admin && thread_is_admin && sid != "S-1-5-18"
+        } else {
+            false
+        };
+        let executable_file = file_identity(Path::new(&identity.image_path)).ok();
+        let job_name = observed_peer_job_name(process_id, peers)?;
+        let mut evidence = NamedPipePeerEvidence {
+            process: identity,
+            sid,
+            session_id,
+            executable_file,
+            job_name,
+            builtin_administrators,
+            interactive_session: false,
+        };
+        if session_id != 0
+            && peers
+                .entries()
+                .iter()
+                .any(|entry| entry.expectation.matches_dynamic_observation(&evidence))
+        {
+            evidence.interactive_session = active_interactive_session(session_id)?;
+        }
+        let selection = peers.select(&evidence)?;
+        Ok((evidence, selection))
+    })();
+    unsafe { CloseHandle(process) };
+    observed
+}
+
+#[cfg(windows)]
+fn observed_peer_job_name(
+    process_id: u32,
+    peers: &NamedPipePeerSet,
+) -> Result<Option<String>, WindowsAdapterError> {
+    let mut observed = None::<String>;
+    for entry in peers.entries() {
+        let Some(binding) = entry.expectation().approved_process_job_binding() else {
+            continue;
+        };
+        if observe_named_pipe_peer_process_in_job(binding.job_name(), process_id).is_ok() {
+            if observed
+                .as_deref()
+                .is_some_and(|existing| existing != binding.job_name())
+            {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            observed = Some(binding.job_name().to_owned());
+        }
+    }
+    Ok(observed)
+}
+
+#[cfg(windows)]
+fn active_interactive_session(session_id: u32) -> Result<bool, WindowsAdapterError> {
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTS_CURRENT_SERVER_HANDLE, WTSActive, WTSConnectState, WTSFreeMemory,
+        WTSQuerySessionInformationW,
+    };
+    if session_id == 0 {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let mut state_ptr = std::ptr::null_mut();
+    let mut state_bytes = 0_u32;
+    let ok = unsafe {
+        WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSConnectState,
+            &raw mut state_ptr,
+            &raw mut state_bytes,
+        )
+    } != 0;
+    if !ok || state_ptr.is_null() || state_bytes < 4 {
+        if !state_ptr.is_null() {
+            unsafe { WTSFreeMemory(state_ptr.cast()) };
+        }
+        return Err(last_windows_adapter_error());
+    }
+    let state = unsafe { std::ptr::read_unaligned(state_ptr.cast::<i32>()) };
+    unsafe { WTSFreeMemory(state_ptr.cast()) };
+    Ok(state == WTSActive)
 }
 
 /// Observes the current process token for use as an inert named-pipe server
@@ -10632,7 +12384,9 @@ fn unix_millis(time: SystemTime) -> Option<i64> {
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Computes a lowercase SHA-256 digest for cross-crate identity binding.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -12213,12 +13967,23 @@ fn wide(value: &Path) -> Vec<u16> {
 }
 
 fn valid_sid_text(value: &str) -> bool {
-    value.strip_prefix("S-1-").is_some_and(|tail| {
-        !tail.is_empty()
-            && tail.len() <= 180
-            && tail
-                .chars()
-                .all(|character| character.is_ascii_digit() || character == '-')
+    let Some(tail) = value.strip_prefix("S-1-") else {
+        return false;
+    };
+    let parts = tail.split('-').collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 16 || value.len() > 184 {
+        return false;
+    }
+    parts.iter().enumerate().all(|(index, part)| {
+        !part.is_empty()
+            && (part == &"0" || !part.starts_with('0'))
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && if index == 0 {
+                part.parse::<u64>()
+                    .is_ok_and(|authority| authority <= 0x0000_FFFF_FFFF_FFFF)
+            } else {
+                part.parse::<u32>().is_ok()
+            }
     })
 }
 
@@ -12499,17 +14264,82 @@ pub fn resolve_service_sid(_service_name: &str) -> Result<String, WindowsAdapter
     Err(WindowsAdapterError::Unavailable)
 }
 
-fn valid_service_sid_text(value: &str) -> bool {
-    let Some(tail) = value.strip_prefix("S-1-5-80-") else {
-        return false;
+/// Resolves an explicitly selected Windows account name to its canonical SID.
+///
+/// The account text is lookup input only.  The returned value is serialized
+/// from the OS-owned SID object and is the only identity suitable for an
+/// installation profile; callers must never persist the account alias itself.
+#[cfg(windows)]
+pub fn resolve_account_sid(account_name: &str) -> Result<String, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError};
+    use windows_sys::Win32::Security::{IsValidSid, LookupAccountNameW, SID_NAME_USE};
+
+    if account_name.trim().is_empty()
+        || account_name.chars().any(char::is_control)
+        || account_name.encode_utf16().any(|unit| unit == 0)
+        || account_name.len() > 512
+    {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let account = account_name
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut sid_bytes = 0_u32;
+    let mut domain_chars = 0_u32;
+    let mut sid_use: SID_NAME_USE = 0;
+    let first = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            account.as_ptr(),
+            std::ptr::null_mut(),
+            &raw mut sid_bytes,
+            std::ptr::null_mut(),
+            &raw mut domain_chars,
+            &raw mut sid_use,
+        )
     };
-    let parts = tail.split('-').collect::<Vec<_>>();
-    parts.len() == 5
-        && parts.iter().all(|part| {
-            !part.is_empty()
-                && part.bytes().all(|byte| byte.is_ascii_digit())
-                && part.parse::<u32>().is_ok()
-        })
+    if first != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || sid_bytes == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    // Windows SIDs are small; reject a hostile size before allocation.
+    if sid_bytes > 68 * 1024 || domain_chars > 32 * 1024 {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let mut sid = vec![0_u8; usize::try_from(sid_bytes).map_err(|_| WindowsAdapterError::Failed)?];
+    let mut domain = vec![0_u16; usize::try_from(domain_chars).unwrap_or(0).max(1)];
+    if unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            account.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &raw mut sid_bytes,
+            domain.as_mut_ptr(),
+            &raw mut domain_chars,
+            &raw mut sid_use,
+        )
+    } == 0
+        || unsafe { IsValidSid(sid.as_ptr().cast_mut().cast()) } == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+    let resolved = sid_to_string(sid.as_mut_ptr().cast())?;
+    if !valid_sid_text(&resolved) {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(resolved)
+}
+
+#[cfg(not(windows))]
+pub fn resolve_account_sid(_account_name: &str) -> Result<String, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
+fn valid_service_sid_text(value: &str) -> bool {
+    valid_sid_text(value)
+        && value
+            .strip_prefix("S-1-5-80-")
+            .is_some_and(|tail| tail.split('-').count() == 5)
 }
 
 #[cfg(windows)]
@@ -12804,6 +14634,116 @@ fn validate_pipe_dacl(
     })();
     unsafe { LocalFree(descriptor.cast()) };
     result
+}
+
+#[cfg(windows)]
+fn validate_pipe_dacl_for_peer_set(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    peers: &NamedPipePeerSet,
+) -> Result<(), WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, PSECURITY_DESCRIPTOR,
+    };
+
+    let mut expected = vec!["S-1-5-18"];
+    for sid in peers.expected_sids() {
+        if !expected.contains(&sid) {
+            expected.push(sid);
+        }
+    }
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            pipe,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut dacl,
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || dacl.is_null() || descriptor.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(WindowsAdapterError::AclMismatch);
+    }
+    let result = (|| {
+        let ace_count = unsafe { (*dacl).AceCount };
+        if ace_count == 0 || ace_count > 32 {
+            return Err(WindowsAdapterError::AclMismatch);
+        }
+        let mut observed_sids = Vec::with_capacity(expected.len());
+        if usize::from(ace_count) != expected.len() {
+            return Err(WindowsAdapterError::AclMismatch);
+        }
+        for index in 0..u32::from(ace_count) {
+            let mut ace = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &raw mut ace) } == 0 || ace.is_null() {
+                return Err(WindowsAdapterError::AclMismatch);
+            }
+            let header = unsafe { &*ace.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
+            if header.AceType != 0 {
+                return Err(WindowsAdapterError::AclMismatch);
+            }
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            validate_peer_set_ace_fields(header.AceType, header.AceFlags, allowed.Mask)?;
+            let sid = (&raw const allowed.SidStart).cast_mut().cast();
+            observed_sids.push(sid_to_string(sid)?);
+        }
+        validate_peer_set_sids(&expected, &observed_sids)
+    })();
+    unsafe { LocalFree(descriptor.cast()) };
+    result
+}
+
+const PEER_SET_GENERIC_ALL_MAPPED: u32 = 0x001F_01FF;
+
+fn validate_peer_set_ace_fields(
+    ace_type: u8,
+    ace_flags: u8,
+    mask: u32,
+) -> Result<(), WindowsAdapterError> {
+    if ace_type == 0 && ace_flags == 0 && mask == PEER_SET_GENERIC_ALL_MAPPED {
+        Ok(())
+    } else {
+        Err(WindowsAdapterError::AclMismatch)
+    }
+}
+
+fn validate_peer_set_sid(expected: &[&str], observed: &str) -> Result<usize, WindowsAdapterError> {
+    if let Some(index) = expected.iter().position(|value| *value == observed) {
+        Ok(index)
+    } else {
+        Err(WindowsAdapterError::AclMismatch)
+    }
+}
+
+fn validate_peer_set_sids(
+    expected: &[&str],
+    observed: &[String],
+) -> Result<(), WindowsAdapterError> {
+    if observed.len() != expected.len() {
+        return Err(WindowsAdapterError::AclMismatch);
+    }
+    let mut present = vec![false; expected.len()];
+    for sid in observed {
+        let index = validate_peer_set_sid(expected, sid)?;
+        if present[index] {
+            return Err(WindowsAdapterError::AclMismatch);
+        }
+        present[index] = true;
+    }
+    if present.into_iter().all(|value| value) {
+        Ok(())
+    } else {
+        Err(WindowsAdapterError::AclMismatch)
+    }
 }
 
 fn pipe_dacl_principal_allowed(expected_sid: &str, observed_sid: &str) -> bool {
@@ -15143,6 +17083,16 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn account_name_resolution_returns_os_sid_and_rejects_unknown_account() {
+        let sid = resolve_account_sid("NT AUTHORITY\\LocalService")
+            .unwrap_or_else(|error| panic!("LocalService lookup failed: {error}"));
+        assert_eq!(sid, "S-1-5-19");
+        assert!(resolve_account_sid("ELIOT-ACCOUNT-DOES-NOT-EXIST-9D7C").is_err());
+        assert!(resolve_account_sid("S-1-5-19").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn known_folder_hresult_preserves_the_unsigned_bit_pattern() {
         assert_eq!(
             known_folder_hresult_error(i32::from_ne_bytes(0x8007_0005_u32.to_ne_bytes())),
@@ -16027,6 +17977,17 @@ mod tests {
     }
 
     #[test]
+    fn agent_bridge_sid_parser_rejects_noncanonical_components() {
+        assert!(valid_sid_text("S-1-5-19"));
+        assert!(!valid_sid_text("S-1-05-19"));
+        assert!(!valid_sid_text("S-1-5--19"));
+        assert!(!valid_sid_text("S-1-5-19-"));
+        assert!(!valid_sid_text("S-1-5-19-4294967296"));
+        assert!(!valid_sid_text("S-1-18446744073709551616"));
+        assert!(!valid_service_sid_text("S-1-5-80-01-2-3-4-5"));
+    }
+
+    #[test]
     fn named_pipe_expectations_select_ordinary_or_admin_auth_discriminator() {
         let ordinary =
             NamedPipePeerExpectation::new("S-1-5-19", 1).unwrap_or_else(|_| unreachable!());
@@ -16058,6 +18019,48 @@ mod tests {
             assert!(!pipe_dacl_principal_allowed(expected, "S-1-5-21-1000"));
         }
         assert!(!pipe_dacl_principal_allowed("S-1-5-21-1000", "S-1-5-19"));
+    }
+
+    #[test]
+    fn peer_set_acl_rejects_broad_inherited_non_allow_and_substituted_entries() {
+        assert!(validate_peer_set_ace_fields(0, 0, PEER_SET_GENERIC_ALL_MAPPED).is_ok());
+        assert!(validate_peer_set_ace_fields(0, 0, 0x0002_0000).is_err());
+        assert!(validate_peer_set_ace_fields(0, 0x10, PEER_SET_GENERIC_ALL_MAPPED).is_err());
+        assert!(validate_peer_set_ace_fields(1, 0, PEER_SET_GENERIC_ALL_MAPPED).is_err());
+
+        let expected = ["S-1-5-18", "S-1-5-21-1000"];
+        let valid = vec!["S-1-5-18".to_owned(), "S-1-5-21-1000".to_owned()];
+        assert!(validate_peer_set_sids(&expected, &valid).is_ok());
+        assert!(
+            validate_peer_set_sids(&expected, &["S-1-5-18".to_owned(), "S-1-5-18".to_owned()])
+                .is_err()
+        );
+        assert!(
+            validate_peer_set_sids(
+                &expected,
+                &["S-1-5-21-1000".to_owned(), "S-1-5-21-1000".to_owned()]
+            )
+            .is_err()
+        );
+        assert!(validate_peer_set_sids(&expected, &["S-1-5-18".to_owned()]).is_err());
+        assert!(
+            validate_peer_set_sids(
+                &expected,
+                &[
+                    "S-1-5-18".to_owned(),
+                    "S-1-5-21-1000".to_owned(),
+                    "S-1-5-21-1001".to_owned(),
+                ]
+            )
+            .is_err()
+        );
+        assert!(
+            validate_peer_set_sids(
+                &expected,
+                &["S-1-5-18".to_owned(), "S-1-5-21-1001".to_owned()]
+            )
+            .is_err()
+        );
     }
 
     #[cfg(windows)]
@@ -16225,6 +18228,337 @@ mod tests {
             admit_named_pipe_peer_process(&observed, &expectation),
             Ok(())
         );
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded matrix covers role selection and every identity substitution"
+    )]
+    fn sealed_peer_set_selects_one_role_and_rejects_substitution_or_ambiguity() {
+        let process = ProcessIdentity {
+            process_id: 41,
+            start_time_100ns: 99,
+            image_path: r"C:\Eliot\eliot-agent-bridge.exe".to_owned(),
+        };
+        let file = FileIdentity {
+            volume_serial_number: 7,
+            file_index: 11,
+        };
+        let expectation = NamedPipePeerExpectation::new_for_dynamic_process(
+            "S-1-5-21-1000",
+            &process.image_path,
+            file,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let bridge = NamedPipePeerProfile::new(
+            NamedPipePeerKind::AgentBridge,
+            expectation.clone(),
+            Some("profile-1".to_owned()),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let host = NamedPipePeerProfile::new(
+            NamedPipePeerKind::Host,
+            NamedPipePeerExpectation::new_with_process_binding(
+                "S-1-5-19",
+                4,
+                NamedPipePeerProcessBinding::for_test(process.clone(), Some(file))
+                    .unwrap_or_else(|_| unreachable!()),
+            )
+            .unwrap_or_else(|_| unreachable!()),
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let set = NamedPipePeerSet::new(vec![bridge, host]).unwrap_or_else(|_| unreachable!());
+        let evidence = NamedPipePeerEvidence::for_test(
+            process.clone(),
+            "S-1-5-21-1000",
+            4,
+            Some(file),
+            None,
+            false,
+            true,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let selected = set.select(&evidence).unwrap_or_else(|_| unreachable!());
+        assert_eq!(selected.kind(), NamedPipePeerKind::AgentBridge);
+        assert_eq!(selected.module_id(), "eliot-agent-bridge");
+        assert_eq!(selected.profile_id(), Some("profile-1"));
+
+        let wrong_file = NamedPipePeerEvidence::for_test(
+            process.clone(),
+            "S-1-5-21-1000",
+            4,
+            Some(FileIdentity {
+                volume_serial_number: 7,
+                file_index: 12,
+            }),
+            None,
+            false,
+            false,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert!(set.select(&wrong_file).is_err());
+
+        for (sid, session_id, process) in [
+            ("S-1-5-21-1001", 4, process.clone()),
+            ("S-1-5-21-1000", 5, process.clone()),
+            (
+                "S-1-5-21-1000",
+                4,
+                ProcessIdentity {
+                    process_id: process.process_id.saturating_add(1),
+                    ..process.clone()
+                },
+            ),
+            (
+                "S-1-5-21-1000",
+                4,
+                ProcessIdentity {
+                    start_time_100ns: process.start_time_100ns.saturating_add(1),
+                    ..process.clone()
+                },
+            ),
+            (
+                "S-1-5-21-1000",
+                4,
+                ProcessIdentity {
+                    image_path: r"C:\Eliot\other.exe".to_owned(),
+                    ..process.clone()
+                },
+            ),
+        ] {
+            let substituted = NamedPipePeerEvidence::for_test(
+                process,
+                sid,
+                session_id,
+                Some(file),
+                None,
+                false,
+                false,
+            )
+            .unwrap_or_else(|_| unreachable!());
+            assert!(set.select(&substituted).is_err());
+        }
+
+        let admin = NamedPipePeerProfile::new(
+            NamedPipePeerKind::Host,
+            NamedPipePeerExpectation::new_for_builtin_administrators()
+                .unwrap_or_else(|_| unreachable!())
+                .with_process_binding(
+                    NamedPipePeerProcessBinding::for_test(process.clone(), Some(file))
+                        .unwrap_or_else(|_| unreachable!()),
+                )
+                .unwrap_or_else(|_| unreachable!()),
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let admin_set = NamedPipePeerSet::new(vec![admin]).unwrap_or_else(|_| unreachable!());
+        assert!(admin_set.select(&evidence).is_err());
+        let admin_evidence = NamedPipePeerEvidence::for_test(
+            process,
+            "S-1-5-21-1000",
+            4,
+            Some(file),
+            None,
+            true,
+            false,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            admin_set
+                .select(&admin_evidence)
+                .unwrap_or_else(|_| unreachable!())
+                .kind(),
+            NamedPipePeerKind::Host
+        );
+
+        let duplicate = NamedPipePeerSet::new(vec![
+            NamedPipePeerProfile::new(
+                NamedPipePeerKind::AgentBridge,
+                expectation,
+                Some("profile-2".to_owned()),
+            )
+            .unwrap_or_else(|_| unreachable!()),
+            NamedPipePeerProfile::new(
+                NamedPipePeerKind::AgentBridge,
+                NamedPipePeerExpectation::new_for_dynamic_process(
+                    "S-1-5-21-1000",
+                    r"C:\Eliot\eliot-agent-bridge.exe",
+                    file,
+                )
+                .unwrap_or_else(|_| unreachable!()),
+                Some("profile-3".to_owned()),
+            )
+            .unwrap_or_else(|_| unreachable!()),
+        ]);
+        assert!(duplicate.is_err());
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one reconnect matrix covers dynamic and mixed static peer behavior"
+    )]
+    fn dynamic_bridge_profile_rebinds_pid_start_and_session_but_pins_sid_image_and_file() {
+        let image_path = r"C:\Eliot\eliot-agent-bridge.exe";
+        let file = FileIdentity {
+            volume_serial_number: 7,
+            file_index: 11,
+        };
+        let expectation =
+            NamedPipePeerExpectation::new_for_dynamic_process("S-1-5-21-1000", image_path, file)
+                .unwrap_or_else(|_| unreachable!());
+        let profile = NamedPipePeerProfile::new(
+            NamedPipePeerKind::AgentBridge,
+            expectation,
+            Some("profile-1".to_owned()),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let set = NamedPipePeerSet::new(vec![profile]).unwrap_or_else(|_| unreachable!());
+
+        let host_binding = NamedPipePeerProcessBinding::for_test(
+            ProcessIdentity {
+                process_id: 41,
+                start_time_100ns: 99,
+                image_path: image_path.to_owned(),
+            },
+            Some(file),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let host = NamedPipePeerProfile::new(
+            NamedPipePeerKind::Host,
+            NamedPipePeerExpectation::new_with_process_binding("S-1-5-19", 0, host_binding)
+                .unwrap_or_else(|_| unreachable!()),
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let mixed = NamedPipePeerSet::new(vec![
+            NamedPipePeerProfile::new(
+                NamedPipePeerKind::AgentBridge,
+                NamedPipePeerExpectation::new_for_dynamic_process(
+                    "S-1-5-21-1000",
+                    image_path,
+                    file,
+                )
+                .unwrap_or_else(|_| unreachable!()),
+                Some("profile-mixed".to_owned()),
+            )
+            .unwrap_or_else(|_| unreachable!()),
+            host,
+        ])
+        .unwrap_or_else(|_| unreachable!());
+        let session_zero_host = NamedPipePeerEvidence::for_test(
+            ProcessIdentity {
+                process_id: 41,
+                start_time_100ns: 99,
+                image_path: image_path.to_owned(),
+            },
+            "S-1-5-19",
+            0,
+            Some(file),
+            None,
+            false,
+            false,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            mixed
+                .select(&session_zero_host)
+                .unwrap_or_else(|_| unreachable!())
+                .kind(),
+            NamedPipePeerKind::Host
+        );
+
+        for (process_id, start_time_100ns, session_id) in [(41, 99, 4), (77, 101, 9)] {
+            let evidence = NamedPipePeerEvidence::for_test(
+                ProcessIdentity {
+                    process_id,
+                    start_time_100ns,
+                    image_path: image_path.to_owned(),
+                },
+                "S-1-5-21-1000",
+                session_id,
+                Some(file),
+                None,
+                false,
+                true,
+            )
+            .unwrap_or_else(|_| unreachable!());
+            assert_eq!(
+                set.select(&evidence)
+                    .unwrap_or_else(|_| unreachable!())
+                    .kind(),
+                NamedPipePeerKind::AgentBridge
+            );
+        }
+
+        let disconnected = NamedPipePeerEvidence::for_test(
+            ProcessIdentity {
+                process_id: 81,
+                start_time_100ns: 110,
+                image_path: image_path.to_owned(),
+            },
+            "S-1-5-21-1000",
+            9,
+            Some(file),
+            None,
+            false,
+            false,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert!(set.select(&disconnected).is_err());
+
+        let wrong_sid = NamedPipePeerEvidence::for_test(
+            ProcessIdentity {
+                process_id: 88,
+                start_time_100ns: 120,
+                image_path: image_path.to_owned(),
+            },
+            "S-1-5-21-1001",
+            9,
+            Some(file),
+            None,
+            false,
+            false,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert!(set.select(&wrong_sid).is_err());
+        let wrong_file = NamedPipePeerEvidence::for_test(
+            ProcessIdentity {
+                process_id: 89,
+                start_time_100ns: 121,
+                image_path: image_path.to_owned(),
+            },
+            "S-1-5-21-1000",
+            9,
+            Some(FileIdentity {
+                volume_serial_number: 7,
+                file_index: 12,
+            }),
+            None,
+            false,
+            false,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert!(set.select(&wrong_file).is_err());
+        let wrong_image = NamedPipePeerEvidence::for_test(
+            ProcessIdentity {
+                process_id: 90,
+                start_time_100ns: 122,
+                image_path: r"C:\Eliot\other.exe".to_owned(),
+            },
+            "S-1-5-21-1000",
+            9,
+            Some(file),
+            None,
+            false,
+            false,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert!(set.select(&wrong_image).is_err());
     }
 
     #[test]
@@ -18826,5 +21160,207 @@ mod tests {
             lease.release().unwrap_or_else(|_| unreachable!());
             assert!(started.elapsed() >= std::time::Duration::from_millis(75));
         });
+    }
+
+    fn front_door_ace(sid: &str, is_user_account: bool) -> KernelFrontDoorAce {
+        KernelFrontDoorAce {
+            sid: sid.to_owned(),
+            mask: 0x001F_01FF,
+            ace_type: 0,
+            ace_flags: 0,
+            is_user_account,
+        }
+    }
+
+    #[test]
+    fn kernel_front_door_expectation_rejects_invalid_hash_and_client_contours() {
+        assert!(
+            KernelFrontDoorServerExpectation::new(
+                "S-1-5-19",
+                0,
+                "A".repeat(64),
+                KernelFrontDoorAclMode::ServiceOnly,
+            )
+            .is_err()
+        );
+        assert!(
+            KernelFrontDoorServerExpectation::new(
+                "S-1-5-19",
+                0,
+                "a".repeat(64),
+                KernelFrontDoorAclMode::SystemAndLocalServiceWithClient {
+                    client_sid: "S-1-5-32-545".to_owned(),
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            KernelFrontDoorServerExpectation::new(
+                "S-1-5-19",
+                0,
+                "a".repeat(64),
+                KernelFrontDoorAclMode::SystemAndLocalServiceWithClient {
+                    client_sid: "S-1-5-32-544".to_owned(),
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kernel_front_door_acl_optional_zero_one_and_negative_matrix() {
+        let mode = KernelFrontDoorAclMode::SystemAndLocalServiceWithOptionalUserClient;
+        let base = || {
+            vec![
+                front_door_ace("S-1-5-18", false),
+                front_door_ace("S-1-5-19", false),
+            ]
+        };
+        assert_eq!(classify_kernel_front_door_acl(&base(), &mode), Ok(None));
+
+        let user_sid = "S-1-5-21-111-222-333-1001";
+        let mut one = base();
+        one.push(front_door_ace(user_sid, true));
+        assert_eq!(
+            classify_kernel_front_door_acl(&one, &mode),
+            Ok(Some(user_sid.to_owned()))
+        );
+
+        let mut two = one.clone();
+        two.push(front_door_ace("S-1-5-21-111-222-333-1002", true));
+        assert_eq!(
+            classify_kernel_front_door_acl(&two, &mode),
+            Err(WindowsAdapterError::AclMismatch)
+        );
+
+        let mut duplicate = base();
+        duplicate.push(front_door_ace("S-1-5-18", false));
+        assert_eq!(
+            classify_kernel_front_door_acl(&duplicate, &mode),
+            Err(WindowsAdapterError::AclMismatch)
+        );
+        for mutation in [
+            {
+                let mut value = base();
+                value[0].ace_type = 1;
+                value
+            },
+            {
+                let mut value = base();
+                value[0].mask = 1;
+                value
+            },
+            {
+                let mut value = base();
+                value.push(front_door_ace("S-1-1-0", true));
+                value
+            },
+            {
+                let mut value = base();
+                value.push(front_door_ace("S-1-5-32-545", false));
+                value
+            },
+            {
+                let mut value = base();
+                value.push(front_door_ace("S-1-5-80-123456789", true));
+                value
+            },
+        ] {
+            assert_eq!(
+                classify_kernel_front_door_acl(&mutation, &mode),
+                Err(WindowsAdapterError::AclMismatch)
+            );
+        }
+
+        assert_eq!(
+            classify_kernel_front_door_acl(&one, &KernelFrontDoorAclMode::ServiceOnly),
+            Err(WindowsAdapterError::AclMismatch)
+        );
+        assert_eq!(
+            classify_kernel_front_door_acl(
+                &one,
+                &KernelFrontDoorAclMode::SystemAndLocalServiceWithOneClient,
+            ),
+            Ok(Some(user_sid.to_owned()))
+        );
+        assert_eq!(
+            classify_kernel_front_door_acl(
+                &base(),
+                &KernelFrontDoorAclMode::SystemAndLocalServiceWithOneClient,
+            ),
+            Err(WindowsAdapterError::AclMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kernel_front_door_proof_binds_process_image_file_and_artifact() {
+        let image = std::env::current_exe().unwrap_or_else(|_| unreachable!());
+        let image_text = image.to_string_lossy().into_owned();
+        let process = ProcessIdentity {
+            process_id: 41,
+            start_time_100ns: 99,
+            image_path: image_text.clone(),
+        };
+        let file = file_identity(&image).unwrap_or_else(|_| unreachable!());
+        let approved = NamedPipePeerProcessBinding::for_test(process.clone(), Some(file))
+            .unwrap_or_else(|_| unreachable!());
+        let expectation = KernelFrontDoorServerExpectation::new(
+            "S-1-5-19",
+            0,
+            "a".repeat(64),
+            KernelFrontDoorAclMode::ServiceOnly,
+        )
+        .unwrap_or_else(|_| unreachable!())
+        .with_process_binding(approved);
+        assert!(validate_kernel_front_door_process_identity(&process, &expectation).is_ok());
+        let mut wrong_pid = process.clone();
+        wrong_pid.process_id += 1;
+        assert!(validate_kernel_front_door_process_identity(&wrong_pid, &expectation).is_err());
+        let mut wrong_start = process.clone();
+        wrong_start.start_time_100ns += 1;
+        assert!(validate_kernel_front_door_process_identity(&wrong_start, &expectation).is_err());
+        let mut wrong_image = process.clone();
+        wrong_image.image_path.push_str(".substituted");
+        assert!(validate_kernel_front_door_process_identity(&wrong_image, &expectation).is_err());
+        assert!(
+            validate_kernel_front_door_executable_identity(
+                &image_text,
+                &image_text,
+                file,
+                &expectation,
+            )
+            .is_ok()
+        );
+        let substituted_file = FileIdentity {
+            volume_serial_number: file.volume_serial_number,
+            file_index: file.file_index.saturating_add(1),
+        };
+        assert!(
+            validate_kernel_front_door_executable_identity(
+                &image_text,
+                &image_text,
+                substituted_file,
+                &expectation,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_kernel_front_door_executable_identity(
+                &image_text,
+                &format!("{image_text}.substituted"),
+                file,
+                &expectation,
+            )
+            .is_err()
+        );
+        assert!(validate_kernel_front_door_artifact(&"a".repeat(64), &expectation).is_ok());
+        assert!(validate_kernel_front_door_artifact(&"b".repeat(64), &expectation).is_err());
+        assert_eq!(
+            expectation
+                .approved_process_binding()
+                .and_then(NamedPipePeerProcessBinding::executable_file_identity),
+            Some(file)
+        );
     }
 }

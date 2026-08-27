@@ -222,6 +222,119 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    pub(super) fn persist_pending_phase_b_agent_bridge_stage_prepared(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+        stage: &AgentBridgeStagePrepared,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
+            current.phase_b_agent_bridge_stage_prepared.as_ref() == Some(stage)
+        }) {
+            expected_revision
+        } else {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Agent Bridge stage-prepared registry revision overflow".to_owned(),
+                )
+            })?
+        };
+        let outcome = self
+            .registry_store
+            .record_pending_phase_b_agent_bridge_stage_prepared(
+                host_capability,
+                expected_revision,
+                &pending.approval,
+                stage,
+            );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "Agent Bridge stage-prepared outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable.pending_activation().is_some_and(|current| {
+                current.transaction_id == pending.transaction_id
+                    && current.plan_digest == pending.plan_digest
+                    && current.approval == pending.approval
+                    && current.phase_b_agent_bridge_stage_prepared.as_ref() == Some(stage)
+                    && current.phase_b_prepared.is_none()
+                    && current.phase_b_receipt.is_none()
+            });
+        self.registry = durable;
+        match outcome {
+            Ok(returned) if exact_readback && returned == *stage => Ok(()),
+            Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
+                "Agent Bridge stage-prepared succeeded but exact registry readback differed"
+                    .to_owned(),
+            )),
+            Ok(_) => Err(HostError::RecoveryRequired(
+                "Agent Bridge stage-prepared succeeded but exact registry readback failed"
+                    .to_owned(),
+            )),
+            Err(_error) if exact_readback => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Agent Bridge stage-prepared failed and exact registry readback did not confirm it: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn clear_pending_phase_b_agent_bridge_stage_prepared(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+        stage: &AgentBridgeStagePrepared,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
+            current.phase_b_agent_bridge_stage_prepared.as_ref() == Some(stage)
+        }) {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Agent Bridge stage-clear registry revision overflow".to_owned(),
+                )
+            })?
+        } else {
+            expected_revision
+        };
+        let outcome = self
+            .registry_store
+            .clear_pending_phase_b_agent_bridge_stage_prepared(
+                host_capability,
+                expected_revision,
+                &pending.approval,
+                stage,
+            );
+        let durable = self.registry_store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "Agent Bridge stage-clear outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable.pending_activation().is_some_and(|current| {
+                current.transaction_id == pending.transaction_id
+                    && current.plan_digest == pending.plan_digest
+                    && current.approval == pending.approval
+                    && current.phase_b_agent_bridge_stage_prepared.is_none()
+                    && current.phase_b_prepared.is_none()
+                    && current.phase_b_receipt.is_none()
+            });
+        self.registry = durable;
+        match outcome {
+            Ok(()) if exact_readback => Ok(()),
+            Ok(()) => Err(HostError::RecoveryRequired(
+                "Agent Bridge stage-clear succeeded but exact registry readback failed".to_owned(),
+            )),
+            Err(_error) if exact_readback => Ok(()),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "Agent Bridge stage-clear failed and exact registry readback did not confirm it: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(windows)]
     pub(super) fn persist_pending_phase_b_receipt(
         &mut self,
         pending: &eliot_installation::PendingActivation,
@@ -260,7 +373,7 @@ impl HostComposition {
                     && current.phase_b_receipt.as_ref() == Some(receipt)
             });
         self.registry = durable;
-        match outcome {
+        let result = match outcome {
             Ok(returned) if exact_readback && returned == *receipt => Ok(()),
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
                 "Phase-B receipt succeeded but exact registry readback differed".to_owned(),
@@ -271,6 +384,72 @@ impl HostComposition {
             Err(_error) if exact_readback => Ok(()),
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Phase-B receipt failed and exact registry readback did not confirm it: {error}"
+            ))),
+        };
+        if result.is_ok()
+            && let Some(binding) = receipt.agent_bridge.as_ref()
+        {
+            // Pair rollback backups are retained across the publication and
+            // receipt crash window.  They become disposable only after the
+            // receipt CAS has exact durable readback.
+            phase_b_remove_rollback_backup(
+                std::path::Path::new(binding.profile_path.as_str()),
+                "Agent Bridge admission profile",
+            )?;
+            phase_b_remove_rollback_backup(
+                std::path::Path::new(binding.declaration_path.as_str()),
+                "Agent Bridge client declaration",
+            )?;
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    pub(super) fn persist_pending_phase_b_prepared_receipt(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+        receipt: &eliot_installation::HostPhaseBPreparedReceipt,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
+    ) -> Result<(), HostError> {
+        let expected_revision = self.registry.revision();
+        let expected_post_revision = if self
+            .registry
+            .pending_activation()
+            .is_some_and(|current| current.phase_b_prepared_receipt.as_ref() == Some(receipt))
+        {
+            expected_revision
+        } else {
+            expected_revision.checked_add(1).ok_or_else(|| {
+                HostError::RecoveryRequired("Phase-B prepared receipt revision overflow".to_owned())
+            })?
+        };
+        let outcome = self.registry_store.record_pending_phase_b_prepared_receipt(
+            host_capability,
+            expected_revision,
+            &pending.approval,
+            receipt,
+        );
+        let durable = self.registry_store.load().map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "prepared receipt outcome is unknown and registry readback failed: {error}"
+            ))
+        })?;
+        let exact_readback = durable.revision() == expected_post_revision
+            && durable.pending_activation().is_some_and(|current| {
+                current.transaction_id == pending.transaction_id
+                    && current.plan_digest == pending.plan_digest
+                    && current.phase_b_prepared_receipt.as_ref() == Some(receipt)
+                    && current.phase_b_receipt.is_none()
+            });
+        self.registry = durable;
+        match outcome {
+            Ok(returned) if exact_readback && returned == *receipt => Ok(()),
+            Err(_) if exact_readback => Ok(()),
+            Ok(_) => Err(HostError::RecoveryRequired(
+                "prepared receipt succeeded but exact readback differed".to_owned(),
+            )),
+            Err(error) => Err(HostError::RecoveryRequired(format!(
+                "prepared receipt failed and exact readback did not confirm it: {error}"
             ))),
         }
     }
@@ -657,6 +836,17 @@ impl HostComposition {
                 "activation commit readiness fence is stale or substituted".to_owned(),
             ));
         }
+        let agent_bridge = match (phase_b.agent_bridge(), phase_b.final_agent_bridge()) {
+            (Some(_prepared), Some(final_binding)) => Some(final_binding.clone()),
+            (Some(_prepared), None) => {
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B activation has only a prepared Agent Bridge proof; final provider receipt is required"
+                        .to_owned(),
+                ));
+            }
+            (None, Some(final_binding)) => Some(final_binding.clone()),
+            (None, None) => None,
+        };
         let fence = ActivationCommitFence {
             generation: pending.manifest.generation.clone(),
             config_digest: pending.manifest.config_digest.clone(),
@@ -715,6 +905,7 @@ impl HostComposition {
                     .provisioned_supervision_authority()
                     .map_err(HostError::Installation)?
                     .clone(),
+                agent_bridge,
             }),
             authority_generation: phase_b.launch.authority_generation,
             authority_state_fence: phase_b.launch.authority_state_fence.clone(),

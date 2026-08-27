@@ -2135,7 +2135,7 @@ impl InstallationTransactionWire {
 }
 
 /// Validates the canonical transaction JSON without exposing a deserialized
-/// transaction authority object to another crate. Pre-v22 records are
+/// transaction authority object to another crate. Pre-v23 records are
 /// classified as an explicit migration requirement rather than synthesizing
 /// missing progress.
 pub fn validate_installation_transaction_json(bytes: &[u8]) -> Result<(), InstallationError> {
@@ -2218,7 +2218,7 @@ fn validate_current_transaction_progress(
                 if !object.contains_key(field) {
                     return Err(InstallationError::MigrationRequired {
                         reason: format!(
-                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v22 is required"
+                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v23 is required"
                         ),
                     });
                 }
@@ -2257,7 +2257,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v22 discriminator".to_owned(),
+            reason: "installation transaction predates the required v23 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {

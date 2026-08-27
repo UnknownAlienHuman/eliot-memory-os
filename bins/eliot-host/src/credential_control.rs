@@ -20,10 +20,10 @@ use eliot_host_state::{HostInstallationEpoch, host_owner_epoch_digest};
 use eliot_installation::{
     CredentialAccessReceipt, CredentialOwnershipMarkerIdentity, HOST_CREDENTIAL_CONTROL_PIPE,
     HostCredentialControlOperation, HostCredentialControlRequest, HostCredentialControlResponse,
-    HostPhaseBMaterializationIntent, LOCAL_SERVICE_SID, StoreCredentialAbsentSnapshot,
-    credential_absent_response_digest, credential_control_response_frame,
-    credential_deleted_response_digest, credential_matching_response_digest,
-    decode_credential_control_request_frame,
+    HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt, LOCAL_SERVICE_SID,
+    StoreCredentialAbsentSnapshot, credential_absent_response_digest,
+    credential_control_response_frame, credential_deleted_response_digest,
+    credential_matching_response_digest, decode_credential_control_request_frame,
 };
 use eliot_ipc::{NamedPipeServer, TransportLimits};
 use eliot_platform::PlatformHandle;
@@ -53,6 +53,8 @@ pub struct HostPhaseBRequest {
     pub intent: HostPhaseBMaterializationIntent,
     /// Exact prior LocalService credential receipt admitted by the request.
     pub credential_receipt: CredentialAccessReceipt,
+    /// Provider-supplied final receipt for the finalize operation.
+    pub final_receipt: Option<HostPhaseBMaterializationReceipt>,
     /// One-shot response path back to the authenticated endpoint.
     pub reply: oneshot::Sender<HostCredentialControlResponse>,
 }
@@ -234,6 +236,7 @@ impl HostCredentialControl {
             request.intent.operation,
             HostCredentialControlOperation::MaterializePhaseB
                 | HostCredentialControlOperation::ReconcilePhaseB
+                | HostCredentialControlOperation::FinalizePhaseB
         ) {
             return self.enqueue_phase_b(request).await;
         }
@@ -265,6 +268,7 @@ impl HostCredentialControl {
                 operation: request.intent.operation,
                 intent,
                 credential_receipt,
+                final_receipt: request.phase_b_final.as_deref().cloned(),
                 reply,
             });
         }
@@ -341,6 +345,7 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             | HostCredentialControlOperation::ReconcilePhaseB => {
                 unknown(request, "phase-b-dispatch")
             }
+            HostCredentialControlOperation::FinalizePhaseB => unknown(request, "phase-b-dispatch"),
         }
     }
 
@@ -1040,6 +1045,7 @@ mod tests {
             },
             expected_receipt: None,
             phase_b: None,
+            phase_b_final: None,
         }
     }
 

@@ -450,7 +450,7 @@ impl RedbInstallationTransactionStore {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
                 reason:
-                    "create_planned accepts only constructor-produced Planned/Pending v21 state"
+                    "create_planned accepts only constructor-produced Planned/Pending v23 state"
                         .to_owned(),
             });
         }
@@ -1177,7 +1177,7 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
                 reason:
-                    "create_planned accepts only constructor-produced Planned/Pending v21 state"
+                    "create_planned accepts only constructor-produced Planned/Pending v23 state"
                         .to_owned(),
             });
         }
@@ -3150,15 +3150,15 @@ mod tests {
     }
 
     #[test]
-    fn transaction_envelope_requires_v21_migration_and_rejects_unknown_current_outer_members() {
-        let legacy_bytes = br#"{"wire_version":{"major":21,"minor":0,"patch":0},"transaction":{},"unexpected":true}"#;
+    fn transaction_envelope_requires_v22_migration_and_rejects_unknown_current_outer_members() {
+        let legacy_bytes = br#"{"wire_version":{"major":22,"minor":0,"patch":0},"transaction":{},"unexpected":true}"#;
         assert!(matches!(
             decode(legacy_bytes),
             Err(InstallationError::MigrationRequired { reason })
-                if reason.contains("wire 21.0.0")
+                if reason.contains("wire 22.0.0")
         ));
 
-        let bytes = br#"{"wire_version":{"major":22,"minor":0,"patch":0},"transaction":{},"unexpected":true}"#;
+        let bytes = br#"{"wire_version":{"major":23,"minor":0,"patch":0},"transaction":{},"unexpected":true}"#;
         assert!(matches!(
             decode(bytes),
             Err(InstallationError::CorruptRegistry { reason })

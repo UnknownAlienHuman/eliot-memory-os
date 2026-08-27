@@ -2,13 +2,15 @@ use serde::Deserialize;
 
 use super::{
     ActivationCommitFence, ActivePhaseBRebind, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
-    ActivePhaseBRebindRecovery, ApprovedGeneration, ApprovedGenerationRegistry, CandidateManifest,
-    ContractVersion, HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
-    HostPhaseBPreparedMaterialization, INSTALLATION_REGISTRY_WIRE_VERSION,
-    InstallationActivationApproval, InstallationEpoch, InstallationError, InstallationProfile,
-    InstallerServiceRegistrationApproval, PendingActivation, PendingActivationState,
-    PendingActivationTerminal, PendingActivationTerminalDisposition, PlatformHandle,
-    ResourceGeneration, RuntimeStateRoots, StateFence,
+    ActivePhaseBRebindRecovery, AgentBridgeStagePrepared, ApprovedGeneration,
+    ApprovedGenerationRegistry, CandidateManifest, ContractVersion,
+    HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
+    HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt,
+    INSTALLATION_REGISTRY_WIRE_VERSION, InstallationActivationApproval, InstallationEpoch,
+    InstallationError, InstallationProfile, InstallerServiceRegistrationApproval,
+    PendingActivation, PendingActivationState, PendingActivationTerminal,
+    PendingActivationTerminalDisposition, PlatformHandle, ResourceGeneration, RuntimeStateRoots,
+    StateFence,
 };
 
 /// Private deserialization mirror for an authority-issued approval.  The
@@ -88,6 +90,9 @@ struct PendingActivationWire {
     approval: InstallationActivationApprovalWire,
     phase_b_intent: RequiredOption<HostPhaseBMaterializationIntent>,
     phase_b_prepared: RequiredOption<HostPhaseBPreparedMaterialization>,
+    #[serde(default)]
+    phase_b_prepared_receipt: Option<HostPhaseBPreparedReceipt>,
+    phase_b_agent_bridge_stage_prepared: RequiredOption<AgentBridgeStagePrepared>,
     phase_b_receipt: RequiredOption<HostPhaseBMaterializationReceipt>,
     state: PendingActivationState,
 }
@@ -110,6 +115,8 @@ impl PendingActivationWire {
             approval: self.approval.into_approval(),
             phase_b_intent: self.phase_b_intent.0,
             phase_b_prepared: self.phase_b_prepared.0,
+            phase_b_prepared_receipt: self.phase_b_prepared_receipt,
+            phase_b_agent_bridge_stage_prepared: self.phase_b_agent_bridge_stage_prepared.0,
             phase_b_receipt: self.phase_b_receipt.0,
             state: self.state,
         }
@@ -714,7 +721,11 @@ fn current_registry_wire_missing_field(value: &serde_json::Value) -> bool {
                     .is_none_or(|approval| !approval.contains_key("service_control_grant"))
             })
         });
-    top_level_missing || approval_binding_missing
+    let pending_bridge_field_missing = value
+        .get("pending_activation")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|pending| !pending.contains_key("phase_b_agent_bridge_stage_prepared"));
+    top_level_missing || approval_binding_missing || pending_bridge_field_missing
 }
 
 #[allow(
@@ -744,8 +755,9 @@ pub(super) fn decode_registry_bytes(
         && current_registry_wire_missing_field(&value)
     {
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v14 is missing mandatory fields or contains an invalid field"
-                .to_owned(),
+            reason:
+                "current registry wire is missing mandatory fields or contains an invalid field"
+                    .to_owned(),
         });
     }
 
@@ -782,8 +794,9 @@ pub(super) fn decode_registry_bytes(
             });
         }
         return Err(InstallationError::CorruptRegistry {
-            reason: "registry wire v14 is missing mandatory fields or contains an invalid field"
-                .to_owned(),
+            reason:
+                "current registry wire is missing mandatory fields or contains an invalid field"
+                    .to_owned(),
         });
     }
 

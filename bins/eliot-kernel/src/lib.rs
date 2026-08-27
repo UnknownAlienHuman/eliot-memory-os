@@ -7,7 +7,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, btree_map::Entry};
+#[cfg(feature = "r13-os-harness")]
+pub mod r13_os_harness;
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,7 +22,9 @@ use eliot_contracts::{
     StateFence,
 };
 use eliot_ipc::{
-    HandshakeResult, PeerIdentity, ServerHandshakePolicy, Session, TransportError, TransportLimits,
+    AcceptedAgentBridgeTransport, HandshakeResult, PeerIdentity, ServerFirstConnection,
+    ServerHandshakePolicy, Session, TransportError, TransportLimits,
+    agent_bridge_admission_receipt_frame,
 };
 use eliot_kernel_core::{
     AuthoritySnapshotBinding, AuthoritySnapshotBindingWire, DispatchSnapshotCodec, GenerationRoute,
@@ -31,12 +36,12 @@ use eliot_kernel_core::{
 #[cfg(windows)]
 use eliot_kernel_service::StoreRebindQuery;
 use eliot_kernel_service::{
-    EbpCanonicalStoreClient, EliotdLaunchDescriptor, HostKernelCandidateBinding,
-    HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationReceipt,
-    KernelControlCommand, KernelControlRequest, KernelControlResponse, KernelReadyReceipt,
-    KernelService, KernelServiceError, KernelServiceState, ProcessAuthorityHandoffDescriptor,
-    ProcessExecutionRequest, ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
-    StoreClientError,
+    AgentBridgeAdmissionDescriptor, EbpCanonicalStoreClient, EliotdLaunchDescriptor,
+    HostKernelCandidateBinding, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE,
+    KernelActivationReceipt, KernelControlCommand, KernelControlRequest, KernelControlResponse,
+    KernelReadyReceipt, KernelService, KernelServiceError, KernelServiceState,
+    ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest, ProcessExecutionResponse,
+    ProcessObservation, StoreBootstrapHandoff, StoreClientError,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
@@ -51,16 +56,18 @@ use eliot_ors::{
     SupervisionLeaseStageReceipt,
 };
 use eliot_platform::{ClockObservation, PlatformHandle, PortError};
+#[cfg(windows)]
+use eliot_platform_windows::{
+    FileIdentity as WindowsFileIdentity, NamedPipePeerKind, NamedPipePeerProfile,
+    NamedPipePeerSelection, NamedPipePeerSet, ProtectedRootLease, ProtectedRuntimePathLease,
+    PublicationOutcome, PublicationPrecondition, fresh_activation_nonce_material,
+    publish_atomic_owned_runtime_receipt, read_protected_file, windows_paths_equal,
+};
 use eliot_platform_windows::{
     InstallerRootPrimitiveSpec, InstallerRootProfile, ProtectedPathLease, ProtectedSecret,
     RecoverableJobBinding, RecoverableJobObject, RetainedProcessPathLease, UserOwnedPathLease,
     UserOwnedRootLease, WindowsPlatform, WindowsSupervisionAuthorityKeyStore,
     protected_program_data_root,
-};
-#[cfg(windows)]
-use eliot_platform_windows::{
-    ProtectedRootLease, ProtectedRuntimePathLease, PublicationOutcome, PublicationPrecondition,
-    publish_atomic_owned_runtime_receipt, windows_paths_equal,
 };
 use eliot_process::{
     ActionLeaseRef, CancellationStatus, DispatchAuthorityId, DispatchValidationContext,
@@ -73,7 +80,15 @@ use eliot_process::{
     SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
-use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
+use eliot_protocol::{
+    AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDecision,
+    AgentActivationResolutionTicket, AgentBridgeActivationDenialCode,
+    AgentBridgeActivationDisposition, AgentBridgeActivationFence, AgentBridgeActivationRequest,
+    AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration,
+    AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind,
+    MessageType, ProtocolPayload,
+};
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 use eliot_runtime_contracts::{
     Ed25519SupervisionLeaseSigner, GenerationCutoverRecord as RuntimeGenerationCutoverRecord,
@@ -115,6 +130,13 @@ const SUPERVISION_LEASE_VALIDITY_MS: u64 = 60_000;
 const SUPERVISION_LEASE_RENEW_AFTER_MS: u64 = 30_000;
 const ELIOTD_RECEIPT_PENDING_DEPENDENCY: &str = "eliotd-process-receipt";
 const ELIOTD_RECEIPT_PENDING_REASON: &str = "exact launched process receipt publication is pending";
+#[cfg(windows)]
+const AGENT_BRIDGE_ACTIVATION_WINDOW_MS: u64 = 30_000;
+#[cfg(windows)]
+/// A daemon claim is retained for a short, bounded interval.  If semantic
+/// resolution fails transiently, the same Kernel-owned ticket becomes
+/// claimable again without allocating a new request or ticket identity.
+const AGENT_ACTIVATION_CLAIM_LEASE_MS: u64 = 1_000;
 #[cfg(windows)]
 const ELIOTD_MAX_RECOVERY_ATTEMPTS: u64 = 1;
 
@@ -378,6 +400,9 @@ pub struct KernelConfig {
     /// receipt. This is intentionally separate from `work_root`: integrated
     /// manifests use distinct Kernel and Host state roots.
     pub eliotd_receipt_binding: Option<EliotdReceiptRootBinding>,
+    /// Host-approved immutable agent-bridge admission input.  The descriptor
+    /// is inert until the Kernel compares it with a live authenticated peer.
+    pub agent_bridge_admission: Option<AgentBridgeAdmissionDescriptor>,
     /// Host-approved protected supervision signing authority.  The absence of
     /// this binding keeps the lease surface unavailable; no in-memory or test
     /// signer is fabricated by the production composition.
@@ -402,6 +427,7 @@ impl KernelConfig {
             kernel_artifact_sha256: None,
             eliotd_descriptor_artifact_sha256: None,
             eliotd_receipt_binding: None,
+            agent_bridge_admission: None,
             #[cfg(windows)]
             supervision_lease_authority: None,
             #[cfg(windows)]
@@ -451,6 +477,16 @@ impl KernelConfig {
     #[must_use]
     pub fn with_eliotd_receipt_binding(mut self, binding: EliotdReceiptRootBinding) -> Self {
         self.eliotd_receipt_binding = Some(binding);
+        self
+    }
+
+    /// Injects the exact Host-validated agent-bridge admission descriptor.
+    #[must_use]
+    pub fn with_agent_bridge_admission(
+        mut self,
+        admission: AgentBridgeAdmissionDescriptor,
+    ) -> Self {
+        self.agent_bridge_admission = Some(admission);
         self
     }
 
@@ -625,6 +661,127 @@ pub struct KernelComposition {
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
     supervision_lease_authority: Option<Arc<KernelSupervisionLeaseAuthority>>,
+    /// The atomically retained Host-approved bridge profile and its protected
+    /// declaration, if the active candidate supplied one.
+    #[cfg(windows)]
+    agent_bridge_profile: Mutex<Option<AgentBridgeProfile>>,
+    #[cfg(windows)]
+    /// Host-carried descriptor retained as inert composition input. It is
+    /// never exposed to the front door until the matching candidate is Ready.
+    agent_bridge_admission: Option<AgentBridgeAdmissionDescriptor>,
+    #[cfg(windows)]
+    agent_bridge_peer_set_revision: AtomicU64,
+    #[cfg(windows)]
+    agent_bridge_peer_set_changed: tokio::sync::Notify,
+    #[cfg(windows)]
+    agent_bridge_connections: Mutex<BTreeMap<String, AgentBridgeConnectionState>>,
+    #[cfg(windows)]
+    agent_activation_pending: Mutex<AgentActivationPendingState>,
+    #[cfg(windows)]
+    agent_activation_changed: tokio::sync::Notify,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct AgentBridgeProfile {
+    admission: AgentBridgeAdmissionDescriptor,
+    declaration: AgentBridgeClientDeclaration,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct AgentBridgeConnectionState {
+    exchange: ServerFirstConnection,
+    declaration: AgentBridgeClientDeclaration,
+    peer: PeerIdentity,
+    accepted_transport: Option<AcceptedAgentBridgeTransport>,
+    /// Kernel-owned transport Session retained after successful activation.
+    session: Option<Session>,
+    activation_completed: bool,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct AgentActivationPendingState {
+    fifo: VecDeque<String>,
+    entries: BTreeMap<String, AgentActivationPending>,
+    /// Bounded replay ledger. A request identity is never rebound to a new
+    /// connection after completion or disconnect.
+    replay: BTreeMap<String, String>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct AgentActivationPending {
+    ticket: AgentActivationResolutionTicket,
+    request: AgentBridgeActivationRequest,
+    decision: Option<AgentActivationResolutionDecision>,
+    /// Private Kernel claim lease; it is deliberately absent from the wire
+    /// ticket so retries cannot mint or select a caller-owned identity.
+    claim_lease_until_unix_ms: Option<u64>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationDecisionDisposition {
+    Commit,
+    ExactReplay,
+    Conflict,
+}
+
+#[cfg(windows)]
+fn classify_activation_decision(
+    existing: Option<&AgentActivationResolutionDecision>,
+    incoming: &AgentActivationResolutionDecision,
+) -> ActivationDecisionDisposition {
+    match existing {
+        None => ActivationDecisionDisposition::Commit,
+        Some(existing) if existing == incoming => ActivationDecisionDisposition::ExactReplay,
+        Some(_) => ActivationDecisionDisposition::Conflict,
+    }
+}
+
+#[cfg(windows)]
+impl AgentActivationPendingState {
+    fn claim_at(&mut self, now: u64) -> Option<AgentActivationResolutionTicket> {
+        let queue_len = self.fifo.len();
+        for _ in 0..queue_len {
+            let ticket_id = self.fifo.pop_front()?;
+            let Some(entry) = self.entries.get_mut(&ticket_id) else {
+                continue;
+            };
+            if entry.decision.is_some()
+                || activation_deadline_expired(now, entry.ticket.kernel_deadline_unix_ms)
+            {
+                continue;
+            }
+            if entry
+                .claim_lease_until_unix_ms
+                .is_some_and(|lease_until| now < lease_until)
+            {
+                self.fifo.push_back(ticket_id);
+                continue;
+            }
+            entry.claim_lease_until_unix_ms = Some(
+                now.saturating_add(AGENT_ACTIVATION_CLAIM_LEASE_MS)
+                    .min(entry.ticket.kernel_deadline_unix_ms),
+            );
+            let ticket = entry.ticket.clone();
+            self.fifo.push_back(ticket_id);
+            return Some(ticket);
+        }
+        None
+    }
+}
+
+/// Server-first bridge handshake material returned by Kernel composition.
+/// This carries transport evidence only; it is not a Kernel `Session`.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct AgentBridgeHandshake {
+    pub connection_id: String,
+    pub challenge: AgentBridgePeerChallenge,
+    pub challenge_frame: Frame,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2892,6 +3049,29 @@ fn unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+#[cfg(windows)]
+fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
+    now >= deadline
+}
+
+#[cfg(windows)]
+fn load_agent_bridge_declaration(
+    admission: &AgentBridgeAdmissionDescriptor,
+) -> Result<AgentBridgeClientDeclaration, KernelBuildError> {
+    admission
+        .validate()
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+    let path = Path::new(admission.client_declaration_path.as_str());
+    let bytes = read_protected_file(path, eliot_protocol::MAX_FRAME_BYTES as u64)
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+    let declaration: AgentBridgeClientDeclaration = serde_json::from_slice(&bytes)
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+    admission
+        .validate_client_declaration(&declaration)
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+    Ok(declaration)
+}
+
 fn caller_binding(
     session: &Session,
 ) -> Result<(ProcessOwnerBinding, ProcessSessionBinding), TransportError> {
@@ -3423,6 +3603,12 @@ fn update_handshake_policy(
 ) -> Result<(), String> {
     let daemon = RouteScope::new("daemon").map_err(|error| error.to_string())?;
     if let Ok(route) = generations.route(&daemon) {
+        // The Kernel artifact belongs to the Kernel-owned handshake domain and
+        // must survive every route publication.  `begin_agent_bridge` reads
+        // this exact value when it constructs the server-first challenge; a
+        // rebuilt snapshot that drops it would fence an otherwise valid bridge
+        // after the first generation update.
+        let artifact_digest = policy.config_snapshot.get("artifact_digest").cloned();
         policy.module_generation.generation = route.active_generation();
         policy.module_generation.state_fence =
             StateFence::new(route.authority_epoch(), route.active_generation());
@@ -3432,6 +3618,9 @@ fn update_handshake_policy(
             "generation": route.active_generation().value(),
             "authority_epoch": route.authority_epoch().value(),
         });
+        if let Some(artifact_digest) = artifact_digest {
+            policy.config_snapshot["artifact_digest"] = artifact_digest;
+        }
     }
     Ok(())
 }
@@ -4057,6 +4246,18 @@ impl KernelComposition {
             binding.validate().map_err(KernelBuildError::Service)?;
         }
         #[cfg(windows)]
+        let agent_bridge_admission = config.agent_bridge_admission.clone();
+        #[cfg(windows)]
+        if let Some(admission) = agent_bridge_admission.as_ref() {
+            admission
+                .validate()
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+            // Read and validate the protected declaration during composition,
+            // but retain only the inert descriptor until a matching Host
+            // candidate reaches Ready. This prevents preactivation exposure.
+            let _ = load_agent_bridge_declaration(admission)?;
+        }
+        #[cfg(windows)]
         if config.require_descriptor_supervision_authority
             && config.supervision_lease_authority.is_none()
         {
@@ -4286,6 +4487,20 @@ impl KernelComposition {
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]
             supervision_lease_authority: supervision_lease_authority.map(Arc::new),
+            #[cfg(windows)]
+            agent_bridge_profile: Mutex::new(None),
+            #[cfg(windows)]
+            agent_bridge_admission,
+            #[cfg(windows)]
+            agent_bridge_peer_set_revision: AtomicU64::new(0),
+            #[cfg(windows)]
+            agent_bridge_peer_set_changed: tokio::sync::Notify::new(),
+            #[cfg(windows)]
+            agent_bridge_connections: Mutex::new(BTreeMap::new()),
+            #[cfg(windows)]
+            agent_activation_pending: Mutex::new(AgentActivationPendingState::default()),
+            #[cfg(windows)]
+            agent_activation_changed: tokio::sync::Notify::new(),
         })
     }
 
@@ -4306,6 +4521,170 @@ impl KernelComposition {
     #[must_use]
     pub const fn ipc_limits(&self) -> TransportLimits {
         IpcImplementation::limits()
+    }
+
+    /// Builds the immutable, bounded peer set for the production front door.
+    /// Host and Eliotd are pinned to fresh OS-observed process bindings. The
+    /// bridge is dynamic: its stable SID, image and file identity come from
+    /// the promoted Host descriptor while PID/start/session are observed by
+    /// the platform adapter for each pipe handle.
+    #[cfg(windows)]
+    pub fn front_door_peer_set(
+        &self,
+        host_expectation: &NamedPipePeerExpectation,
+    ) -> Result<NamedPipePeerSet, KernelBuildError> {
+        if host_expectation.approved_process_binding().is_none()
+            || host_expectation.is_dynamic_process()
+        {
+            return Err(KernelBuildError::Principal(
+                "front-door Host expectation must contain one exact OS-observed process binding"
+                    .to_owned(),
+            ));
+        }
+        let host =
+            NamedPipePeerProfile::new(NamedPipePeerKind::Host, host_expectation.clone(), None)
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+        let mut entries = vec![host];
+
+        let daemon_receipt = {
+            let state = self.daemon_runtime.lock().map_err(|_| {
+                KernelBuildError::Principal("daemon runtime lock poisoned".to_owned())
+            })?;
+            if matches!(
+                state.status,
+                DaemonRuntimeStatus::Running | DaemonRuntimeStatus::Ready
+            ) {
+                state.receipt.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(receipt) = daemon_receipt {
+            receipt
+                .validate()
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+            let physical = receipt.identity().physical();
+            let observed = observe_named_pipe_peer_process(physical.process_id())
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+            if observed.start_time_100ns() != physical.start_time_100ns()
+                || !observed
+                    .image_path()
+                    .eq_ignore_ascii_case(physical.image_path())
+                || observed.executable_file_identity().is_none()
+            {
+                return Err(KernelBuildError::Principal(
+                    "current eliotd receipt does not match fresh handle-bound process evidence"
+                        .to_owned(),
+                ));
+            }
+            let expectation = NamedPipePeerExpectation::new_with_process_binding(
+                host_expectation.expected_sid().to_owned(),
+                host_expectation.expected_session_id(),
+                observed,
+            )
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+            entries.push(
+                NamedPipePeerProfile::new(NamedPipePeerKind::Eliotd, expectation, None)
+                    .map_err(|error| KernelBuildError::Principal(error.to_string()))?,
+            );
+        }
+
+        let bridge = self
+            .agent_bridge_profile
+            .lock()
+            .map_err(|_| KernelBuildError::Principal("bridge profile lock poisoned".to_owned()))?
+            .clone();
+        if let Some(profile) = bridge {
+            if self
+                .agent_bridge_admission
+                .as_ref()
+                .is_some_and(|configured| configured != &profile.admission)
+            {
+                return Err(KernelBuildError::Principal(
+                    "promoted bridge profile differs from retained Host admission".to_owned(),
+                ));
+            }
+            let expectation = NamedPipePeerExpectation::new_for_dynamic_process(
+                profile.admission.approved_user_sid.clone(),
+                profile.admission.executable.as_str().to_owned(),
+                WindowsFileIdentity {
+                    volume_serial_number: profile
+                        .admission
+                        .executable_identity
+                        .volume_serial_number,
+                    file_index: profile.admission.executable_identity.file_index,
+                },
+            )
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+            entries.push(
+                NamedPipePeerProfile::new(
+                    NamedPipePeerKind::AgentBridge,
+                    expectation,
+                    Some(profile.admission.profile_id.as_str().to_owned()),
+                )
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))?,
+            );
+        }
+        NamedPipePeerSet::new(entries)
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))
+    }
+
+    /// Returns a peer set paired with the exact revision observed before and
+    /// after construction. Monotonic revisions make this snapshot safe from
+    /// publishing a stale DACL under a newer revision during concurrent Host
+    /// activation or eliotd lifecycle changes.
+    #[cfg(windows)]
+    pub fn front_door_peer_set_snapshot(
+        &self,
+        host_expectation: &NamedPipePeerExpectation,
+    ) -> Result<(u64, NamedPipePeerSet), KernelBuildError> {
+        for _ in 0..8 {
+            let before = self.agent_bridge_peer_set_revision();
+            let peers = self.front_door_peer_set(host_expectation)?;
+            let after = self.agent_bridge_peer_set_revision();
+            if before == after {
+                return Ok((after, peers));
+            }
+        }
+        Err(KernelBuildError::Principal(
+            "front-door peer set changed continuously during snapshot".to_owned(),
+        ))
+    }
+
+    /// Monotonic revision of the promoted bridge profile. The production
+    /// listener uses this to rebuild a pending pipe after Host activation
+    /// changes the bounded DACL/peer set.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn agent_bridge_peer_set_revision(&self) -> u64 {
+        self.agent_bridge_peer_set_revision.load(Ordering::Acquire)
+    }
+
+    /// Waits for a real peer-set change without cancelling an in-flight pipe
+    /// authentication. The revision check before and after registration makes
+    /// the notification lost-wake safe.
+    #[cfg(windows)]
+    pub async fn wait_for_agent_bridge_peer_set_revision(&self, observed: u64) -> u64 {
+        loop {
+            let current = self.agent_bridge_peer_set_revision();
+            if current != observed {
+                return current;
+            }
+            let notified = self.agent_bridge_peer_set_changed.notified();
+            if self.agent_bridge_peer_set_revision() != observed {
+                return self.agent_bridge_peer_set_revision();
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(windows)]
+    fn note_agent_bridge_peer_set_change(&self) {
+        self.agent_bridge_peer_set_revision
+            .fetch_add(1, Ordering::AcqRel);
+        // `notify_one` retains a permit if the listener changes state in the
+        // check-to-await gap; `notify_waiters` would lose that wake.
+        self.agent_bridge_peer_set_changed.notify_one();
     }
 
     /// Returns the Host-approved store bootstrap requirement, if injected.
@@ -5215,6 +5594,8 @@ impl KernelComposition {
             .map_err(|_| KernelBuildError::Service("daemon runtime lock poisoned".to_owned()))?;
         state.status = DaemonRuntimeStatus::Running;
         state.receipt = Some(receipt.clone());
+        drop(state);
+        self.note_agent_bridge_peer_set_change();
         Ok(receipt)
     }
 
@@ -5530,6 +5911,7 @@ impl KernelComposition {
             state.supervision = None;
             state.live_ready = None;
         }
+        self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
         let launched = match self.launch_eliotd().await {
             Ok(receipt) => receipt,
@@ -5618,6 +6000,8 @@ impl KernelComposition {
         }
         state.status = DaemonRuntimeStatus::Ready;
         drop(state);
+        #[cfg(windows)]
+        self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
         Ok(())
     }
@@ -5633,6 +6017,10 @@ impl KernelComposition {
         }
         state.status = DaemonRuntimeStatus::Degraded(reason);
         drop(state);
+        #[cfg(windows)]
+        let _ = self.promote_agent_bridge_profile(None);
+        #[cfg(windows)]
+        self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
         Ok(())
     }
@@ -5662,6 +6050,10 @@ impl KernelComposition {
             state.live_ready = None;
         }
         drop(state);
+        #[cfg(windows)]
+        let _ = self.promote_agent_bridge_profile(None);
+        #[cfg(windows)]
+        self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
         let mut service = self
             .service
@@ -5822,6 +6214,842 @@ impl KernelComposition {
         &self.platform
     }
 
+    /// Reports whether the exact bounded peer-set selection and Host-approved
+    /// bridge profile admit this authenticated OS peer. A positive result is
+    /// transport admission only; it does not create a semantic Session or
+    /// principal.
+    #[cfg(windows)]
+    pub fn agent_bridge_peer_admitted(
+        &self,
+        selection: &NamedPipePeerSelection,
+        peer: &PeerIdentity,
+    ) -> bool {
+        self.agent_bridge_profile
+            .lock()
+            .ok()
+            .and_then(|profile| profile.clone())
+            .is_some_and(|profile| {
+                selection.kind() == NamedPipePeerKind::AgentBridge
+                    && selection.module_id() == AGENT_BRIDGE_MODULE_ID
+                    && selection.profile_id() == Some(profile.admission.profile_id.as_str())
+                    && Self::validate_agent_bridge_peer(&profile.admission, peer).is_ok()
+            })
+    }
+
+    #[cfg(windows)]
+    fn validate_agent_bridge_peer(
+        admission: &AgentBridgeAdmissionDescriptor,
+        peer: &PeerIdentity,
+    ) -> Result<(), TransportError> {
+        admission
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let PeerIdentity::Authenticated {
+            user_identity,
+            session_identity,
+            ..
+        } = peer
+        else {
+            return Err(TransportError::PeerIdentityUnavailable);
+        };
+        if user_identity != &admission.approved_user_sid {
+            return Err(TransportError::SessionFenced);
+        }
+        let session_id = session_identity
+            .parse::<u32>()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if session_id == 0 {
+            return Err(TransportError::SessionFenced);
+        }
+        match admission.process_policy {
+            eliot_kernel_service::AgentBridgeProcessPolicy::ExactProcessPerConnection => {}
+        }
+        let process = peer
+            .process_binding()
+            .ok_or(TransportError::PeerIdentityUnavailable)?;
+        if !process
+            .image_path()
+            .eq_ignore_ascii_case(admission.executable.as_str())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let (volume_serial_number, file_index) = process
+            .executable_file_identity()
+            .ok_or(TransportError::PeerIdentityUnavailable)?;
+        if volume_serial_number != admission.executable_identity.volume_serial_number
+            || file_index != admission.executable_identity.file_index
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    /// Validates and materializes the exact protected declaration before the
+    /// enclosing Host activation mutates service state.
+    #[cfg(windows)]
+    fn prepare_agent_bridge_admission(
+        admission: Option<&AgentBridgeAdmissionDescriptor>,
+    ) -> Result<Option<AgentBridgeProfile>, TransportError> {
+        admission
+            .as_ref()
+            .map(|admission| -> Result<AgentBridgeProfile, TransportError> {
+                admission
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Ok(AgentBridgeProfile {
+                    admission: (*admission).clone(),
+                    declaration: load_agent_bridge_declaration(admission)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Atomically replaces the live bridge profile after the enclosing Host
+    /// activation succeeds. Replacing or removing a profile revokes every
+    /// pending connection from the previous activation lineage.
+    #[cfg(windows)]
+    fn promote_agent_bridge_profile(
+        &self,
+        next: Option<AgentBridgeProfile>,
+    ) -> Result<(), TransportError> {
+        self.revoke_all_agent_bridges()?;
+        *self
+            .agent_bridge_profile
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)? = next;
+        self.note_agent_bridge_peer_set_change();
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn revoke_all_agent_bridges(&self) -> Result<(), TransportError> {
+        let mut connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        for (_, mut state) in std::mem::take(&mut *connections) {
+            state.exchange.abort();
+            if let Some(mut session) = state.session {
+                session.fence();
+            }
+            state.accepted_transport = None;
+        }
+        if let Ok(mut pending) = self.agent_activation_pending.lock() {
+            pending.fifo.clear();
+            pending.entries.clear();
+        } else {
+            return Err(TransportError::SessionFenced);
+        }
+        self.agent_activation_changed.notify_waiters();
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn validate_active_bridge_profile(
+        &self,
+        admission: &AgentBridgeAdmissionDescriptor,
+    ) -> Result<(), TransportError> {
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if service.state() != KernelServiceState::Ready {
+            return Err(TransportError::SessionFenced);
+        }
+        let candidate = service
+            .candidate_binding()
+            .ok_or(TransportError::SessionFenced)?;
+        if candidate.agent_bridge_admission.as_ref() != Some(admission) {
+            return Err(TransportError::SessionFenced);
+        }
+        let activation = service
+            .activation_receipt()
+            .ok_or(TransportError::SessionFenced)?;
+        if activation.generation != admission.generation
+            || activation.authority_epoch != admission.authority_epoch
+            || activation.candidate_binding_digest
+                != candidate
+                    .compute_digest()
+                    .map_err(|_| TransportError::SessionFenced)?
+            || admission.state_fence.resource_generation != activation.generation
+            || admission.state_fence.authority_epoch != activation.authority_epoch
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    /// Starts one server-first bridge exchange for the exact admitted peer.
+    /// The returned identity and nonce are fresh and retained by Kernel until
+    /// hello acceptance, timeout, disconnect, or explicit revocation.
+    #[cfg(windows)]
+    pub fn begin_agent_bridge(
+        &self,
+        selection: &NamedPipePeerSelection,
+        peer: PeerIdentity,
+    ) -> Result<AgentBridgeHandshake, TransportError> {
+        let profile = self
+            .agent_bridge_profile
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let admission = &profile.admission;
+        self.validate_active_bridge_profile(admission)?;
+        if selection.kind() != NamedPipePeerKind::AgentBridge
+            || selection.module_id() != AGENT_BRIDGE_MODULE_ID
+            || selection.profile_id() != Some(admission.profile_id.as_str())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Self::validate_agent_bridge_peer(admission, &peer)?;
+        let declaration = profile.declaration;
+        let kernel_policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone();
+        let kernel_artifact_sha256 = kernel_policy
+            .config_snapshot
+            .get("artifact_digest")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(TransportError::SessionFenced)?
+            .to_owned();
+        let kernel_config_snapshot_sha256 = sha256_json(&kernel_policy.config_snapshot)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if declaration.expected_kernel_principal_binding != kernel_policy.session_principal_binding
+            || declaration.expected_kernel_authority_epoch
+                != kernel_policy.module_generation.state_fence.authority_epoch
+            || declaration.expected_kernel_generation != kernel_policy.module_generation.generation
+            || declaration.expected_kernel_artifact_sha256 != kernel_artifact_sha256
+            || declaration.expected_kernel_config_snapshot_sha256 != kernel_config_snapshot_sha256
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let nonce = fresh_activation_nonce_material()
+            .map_err(|_| TransportError::SessionFenced)?
+            .to_string();
+        let connection_nonce = fresh_activation_nonce_material()
+            .map_err(|_| TransportError::SessionFenced)?
+            .to_string();
+        let connection_id = format!("agent-bridge:{connection_nonce}");
+        let challenge = AgentBridgePeerChallenge {
+            wire_id: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: admission.profile_id.as_str().to_owned(),
+            descriptor_sha256: admission.descriptor_sha256.clone(),
+            client_declaration_sha256: admission.client_declaration_sha256.clone(),
+            bridge_generation: admission.generation,
+            state_fence: admission.state_fence.clone(),
+            kernel_principal_binding: kernel_policy.session_principal_binding,
+            kernel_authority_epoch: kernel_policy.module_generation.state_fence.authority_epoch,
+            kernel_generation: kernel_policy.module_generation.generation,
+            kernel_artifact_sha256,
+            kernel_config_snapshot_sha256,
+            activation_deadline_unix_ms: unix_ms()
+                .saturating_add(AGENT_BRIDGE_ACTIVATION_WINDOW_MS),
+            challenge_nonce: nonce,
+            challenge_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|_| TransportError::SessionFenced)?;
+        let exchange = ServerFirstConnection::new(&connection_id, challenge.clone(), &declaration)?;
+        let challenge_frame = exchange.challenge_frame()?;
+        let mut connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if connections.contains_key(&connection_id) {
+            return Err(TransportError::SessionFenced);
+        }
+        connections.insert(
+            connection_id.clone(),
+            AgentBridgeConnectionState {
+                exchange,
+                declaration,
+                peer,
+                accepted_transport: None,
+                session: None,
+                activation_completed: false,
+            },
+        );
+        Ok(AgentBridgeHandshake {
+            connection_id,
+            challenge,
+            challenge_frame,
+        })
+    }
+
+    /// Accepts the one exact dynamic bridge hello and retains its immutable
+    /// OS-observation receipt for the subsequent closed activation operation.
+    #[cfg(windows)]
+    pub fn accept_agent_bridge_hello(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+    ) -> Result<AgentBridgePeerAdmissionReceipt, TransportError> {
+        let mut connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let result = {
+            let state = connections
+                .get_mut(connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            if activation_deadline_expired(
+                unix_ms(),
+                state.exchange.challenge().activation_deadline_unix_ms,
+            ) {
+                return Err(TransportError::SessionFenced);
+            }
+            state
+                .exchange
+                .accept_client_hello_with_peer(frame, &state.declaration, &state.peer)
+                .map(|accepted| {
+                    let receipt = accepted.admission_receipt().clone();
+                    state.accepted_transport = Some(accepted);
+                    receipt
+                })
+        };
+        if result.is_err()
+            && let Some(mut state) = connections.remove(connection_id)
+        {
+            state.exchange.fence();
+            state.accepted_transport = None;
+        }
+        result
+    }
+
+    /// Builds the typed Control/Ready receipt sent after the exact bridge
+    /// hello. The bridge must consume this Kernel-authored receipt to form its
+    /// activation request; it is never reconstructed from caller input.
+    #[cfg(windows)]
+    pub fn agent_bridge_admission_receipt_frame(
+        &self,
+        connection_id: &str,
+    ) -> Result<Frame, TransportError> {
+        let connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let state = connections
+            .get(connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        let receipt = state
+            .accepted_transport
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?
+            .admission_receipt();
+        agent_bridge_admission_receipt_frame(connection_id, receipt)
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the queue admission gate keeps request, receipt, and replay checks ordered"
+    )]
+    fn enqueue_agent_bridge_activation(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+    ) -> Result<AgentActivationResolutionTicket, TransportError> {
+        let (request, receipt) = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            if state.activation_completed || state.session.is_some() {
+                return Err(TransportError::IdentityConflict);
+            }
+            let accepted = state
+                .accepted_transport
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            let receipt = accepted.admission_receipt();
+            let profile = self
+                .agent_bridge_profile
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            if receipt.descriptor_sha256 != profile.admission.descriptor_sha256
+                || receipt.profile_id != profile.admission.profile_id.as_str()
+                || receipt.state_fence != profile.admission.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            self.validate_active_bridge_profile(&profile.admission)?;
+            if activation_deadline_expired(unix_ms(), receipt.activation_deadline_unix_ms) {
+                return Err(TransportError::Timeout);
+            }
+            frame.validate()?;
+            if frame.connection_id != connection_id
+                || frame.kind != FrameKind::Request
+                || frame.message_type != MessageType::Execute
+                || frame.request_identity.is_none()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let request_id = frame
+                .request_id
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            let ProtocolPayload::Json(payload) = &frame.payload else {
+                return Err(TransportError::SessionFenced);
+            };
+            let request: AgentBridgeActivationRequest = serde_json::from_value(payload.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+            if frame.request_identity.as_ref() != Some(&request.request_identity)
+                || request.request_identity.request.metadata.request_id != request_id
+                || request.operation != AGENT_BRIDGE_ACTIVATION_OPERATION
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            request
+                .validate_admission(receipt)
+                .map_err(|_| TransportError::SessionFenced)?;
+            (request, receipt.clone())
+        };
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let request_id = request
+            .request_identity
+            .request
+            .metadata
+            .request_id
+            .as_str();
+        if pending.replay.contains_key(request_id)
+            || pending.entries.values().any(|entry| {
+                entry.ticket.connection_id == connection_id
+                    || entry.ticket.activation_request_id
+                        == request.request_identity.request.metadata.request_id
+            })
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        if pending.entries.len() >= 32 {
+            return Err(TransportError::RegistryFull);
+        }
+        let ticket_nonce = fresh_activation_nonce_material()
+            .map_err(|_| TransportError::SessionFenced)?
+            .to_string();
+        let ticket = AgentActivationResolutionTicket {
+            wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+            ticket_id: format!("agent-activation:{ticket_nonce}"),
+            activation_request_id: request.request_identity.request.metadata.request_id.clone(),
+            activation_request_sha256: request.request_sha256.clone(),
+            peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
+            connection_id: connection_id.to_owned(),
+            state_fence: receipt.state_fence.clone(),
+            kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
+            ticket_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|_| TransportError::SessionFenced)?;
+        ticket
+            .validate_against(&request, &receipt)
+            .map_err(|_| TransportError::SessionFenced)?;
+        pending.fifo.push_back(ticket.ticket_id.clone());
+        if pending.replay.len() >= 64
+            && let Some(oldest) = pending.replay.keys().next().cloned()
+        {
+            pending.replay.remove(&oldest);
+        }
+        pending
+            .replay
+            .insert(request_id.to_owned(), ticket.ticket_id.clone());
+        pending.entries.insert(
+            ticket.ticket_id.clone(),
+            AgentActivationPending {
+                ticket: ticket.clone(),
+                request,
+                decision: None,
+                claim_lease_until_unix_ms: None,
+            },
+        );
+        self.agent_activation_changed.notify_waiters();
+        Ok(ticket)
+    }
+
+    #[cfg(windows)]
+    fn claim_agent_activation_ticket(
+        &self,
+    ) -> Result<Option<AgentActivationResolutionTicket>, TransportError> {
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(pending.claim_at(unix_ms()))
+    }
+
+    #[cfg(windows)]
+    fn submit_agent_activation_decision(
+        &self,
+        decision: AgentActivationResolutionDecision,
+    ) -> Result<(), TransportError> {
+        decision
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let entry = pending
+            .entries
+            .get_mut(&decision.ticket_id)
+            .ok_or(TransportError::UnknownRequest)?;
+        decision
+            .validate_against(&entry.ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        match classify_activation_decision(entry.decision.as_ref(), &decision) {
+            ActivationDecisionDisposition::ExactReplay => return Ok(()),
+            ActivationDecisionDisposition::Conflict => {
+                return Err(TransportError::IdentityConflict);
+            }
+            ActivationDecisionDisposition::Commit => {}
+        }
+        if activation_deadline_expired(unix_ms(), entry.ticket.kernel_deadline_unix_ms) {
+            return Err(TransportError::Timeout);
+        }
+        entry.decision = Some(decision);
+        // A decision is terminal for this ticket.  Remove its FIFO marker so
+        // no later claim can reclaim a ticket that already crossed the
+        // resolver decision boundary.
+        let ticket_id = entry.ticket.ticket_id.clone();
+        pending.fifo.retain(|queued_id| queued_id != &ticket_id);
+        drop(pending);
+        self.agent_activation_changed.notify_waiters();
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn activation_response_frame(
+        &self,
+        connection_id: &str,
+        original: &Frame,
+        pending: &AgentActivationPending,
+        decision: &AgentActivationResolutionDecision,
+    ) -> Result<Frame, TransportError> {
+        decision
+            .validate_against(&pending.ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let session_nonce = fresh_activation_nonce_material()
+            .map_err(|_| TransportError::SessionFenced)?
+            .to_string();
+        let accepted = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            state
+                .accepted_transport
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?
+                .clone()
+        };
+        let session = Session::establish_agent_bridge(
+            connection_id,
+            accepted.peer().clone(),
+            accepted.client_hello().module_generation.clone(),
+            session_nonce.clone(),
+        )?;
+        let binding = AgentBridgeAuthenticatedBinding {
+            principal_id: decision.principal_id.clone(),
+            session_id: decision.session_id.clone(),
+            activation_generation: decision.state_fence.resource_generation,
+            state_fence: AgentBridgeActivationFence {
+                authority_epoch: decision.state_fence.authority_epoch,
+                generation: decision.state_fence.resource_generation,
+                nonce: session_nonce,
+            },
+            task_id: decision.task_id.clone(),
+            work_unit_id: decision.work_unit_id.clone(),
+            work_scope_id: decision.work_scope_id.clone(),
+            task_revision: decision.task_revision.clone(),
+            plan_id: decision.plan_id.clone(),
+            plan_revision: decision.plan_revision.clone(),
+        };
+        let response = AgentBridgeActivationResponse {
+            wire_id: eliot_protocol::AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID.to_owned(),
+            wire_version: AgentBridgeActivationResponse::CONTRACT_VERSION,
+            request_id: pending
+                .request
+                .request_identity
+                .request
+                .metadata
+                .request_id
+                .clone(),
+            request_sha256: pending.request.request_sha256.clone(),
+            disposition: AgentBridgeActivationDisposition::Authenticated {
+                binding: Box::new(binding),
+            },
+            response_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|_| TransportError::SessionFenced)?;
+        response
+            .validate_request(&pending.request)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let reply = Frame {
+            protocol_version: original.protocol_version,
+            encoding_profile: original.encoding_profile,
+            connection_id: connection_id.to_owned(),
+            request_id: Some(response.request_id.clone()),
+            kind: FrameKind::Response,
+            message_type: MessageType::Result,
+            request_identity: None,
+            payload: ProtocolPayload::Json(
+                serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?,
+            ),
+            trace_context: original.trace_context.clone(),
+        };
+        reply.validate()?;
+        let mut connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let state = connections
+            .get_mut(connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if state.activation_completed || state.session.is_some() {
+            return Err(TransportError::IdentityConflict);
+        }
+        state.session = Some(session);
+        state.activation_completed = true;
+        Ok(reply)
+    }
+
+    /// Queues one validated bridge request and waits for the sole eliotd
+    /// resolver decision. Kernel owns the final transport Session/fence.
+    #[cfg(windows)]
+    pub async fn await_agent_bridge_activation_response(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+    ) -> Result<Frame, TransportError> {
+        let ticket = self.enqueue_agent_bridge_activation(connection_id, frame)?;
+        loop {
+            let outcome = {
+                let pending = self
+                    .agent_activation_pending
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                pending
+                    .entries
+                    .get(&ticket.ticket_id)
+                    .and_then(|entry| entry.decision.clone())
+            };
+            if let Some(decision) = outcome {
+                let pending = {
+                    let pending = self
+                        .agent_activation_pending
+                        .lock()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    pending
+                        .entries
+                        .get(&ticket.ticket_id)
+                        .ok_or(TransportError::SessionFenced)?
+                        .clone()
+                };
+                let reply =
+                    self.activation_response_frame(connection_id, frame, &pending, &decision)?;
+                self.agent_activation_pending
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .entries
+                    .remove(&ticket.ticket_id);
+                return Ok(reply);
+            }
+            let now = unix_ms();
+            if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
+                let request = {
+                    let pending = self
+                        .agent_activation_pending
+                        .lock()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    pending
+                        .entries
+                        .get(&ticket.ticket_id)
+                        .ok_or(TransportError::SessionFenced)?
+                        .request
+                        .clone()
+                };
+                self.agent_activation_pending
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .entries
+                    .remove(&ticket.ticket_id);
+                self.revoke_agent_bridge(connection_id);
+                let response = AgentBridgeActivationResponse::denied(
+                    &request,
+                    AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                let reply = Frame {
+                    protocol_version: frame.protocol_version,
+                    encoding_profile: frame.encoding_profile,
+                    connection_id: connection_id.to_owned(),
+                    request_id: Some(response.request_id.clone()),
+                    kind: FrameKind::Response,
+                    message_type: MessageType::Result,
+                    request_identity: None,
+                    payload: ProtocolPayload::Json(
+                        serde_json::to_value(response)
+                            .map_err(|_| TransportError::SessionFenced)?,
+                    ),
+                    trace_context: frame.trace_context.clone(),
+                };
+                reply.validate()?;
+                return Ok(reply);
+            }
+            let notified = self.agent_activation_changed.notified();
+            tokio::select! {
+                () = notified => {}
+                () = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+    }
+
+    /// Validates one closed bridge activation operation and emits the sole
+    /// R13.1b typed denial. No Kernel `Session` or semantic authority is made.
+    #[cfg(windows)]
+    pub fn agent_bridge_activation_response(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+    ) -> Result<Frame, TransportError> {
+        let mut connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let result = (|| {
+            let state = connections
+                .get_mut(connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            let accepted = state
+                .accepted_transport
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            let receipt = accepted.admission_receipt();
+            let profile = self
+                .agent_bridge_profile
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            if receipt.descriptor_sha256 != profile.admission.descriptor_sha256
+                || receipt.profile_id != profile.admission.profile_id.as_str()
+                || receipt.state_fence != profile.admission.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            self.validate_active_bridge_profile(&profile.admission)?;
+            if activation_deadline_expired(unix_ms(), receipt.activation_deadline_unix_ms) {
+                return Err(TransportError::SessionFenced);
+            }
+            frame.validate()?;
+            if frame.connection_id != connection_id
+                || frame.kind != FrameKind::Request
+                || frame.message_type != MessageType::Execute
+                || frame.request_identity.is_none()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let request_id = frame
+                .request_id
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            let ProtocolPayload::Json(payload) = &frame.payload else {
+                return Err(TransportError::SessionFenced);
+            };
+            let request: AgentBridgeActivationRequest = serde_json::from_value(payload.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+            if frame.request_identity.as_ref() != Some(&request.request_identity)
+                || request.request_identity.request.metadata.request_id != request_id
+                || request.operation != AGENT_BRIDGE_ACTIVATION_OPERATION
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            request
+                .validate_admission(receipt)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let response = AgentBridgeActivationResponse::denied(
+                &request,
+                AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+            response
+                .validate_request(&request)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let reply = Frame {
+                protocol_version: frame.protocol_version,
+                encoding_profile: frame.encoding_profile,
+                connection_id: connection_id.to_owned(),
+                request_id: Some(response.request_id.clone()),
+                kind: FrameKind::Response,
+                message_type: MessageType::Result,
+                request_identity: None,
+                payload: ProtocolPayload::Json(
+                    serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?,
+                ),
+                trace_context: frame.trace_context.clone(),
+            };
+            reply.validate()?;
+            Ok(reply)
+        })();
+        if let Some(mut state) = connections.remove(connection_id) {
+            if result.is_ok() {
+                state.exchange.abort();
+            } else {
+                state.exchange.fence();
+            }
+            state.accepted_transport = None;
+        }
+        result
+    }
+
+    /// Revokes all retained bridge authority for one disconnected connection.
+    #[cfg(windows)]
+    pub fn revoke_agent_bridge(&self, connection_id: &str) {
+        if let Ok(mut connections) = self.agent_bridge_connections.lock()
+            && let Some(mut state) = connections.remove(connection_id)
+        {
+            state.exchange.abort();
+            if let Some(mut session) = state.session.take() {
+                session.fence();
+            }
+            state.accepted_transport = None;
+        }
+        if let Ok(mut pending) = self.agent_activation_pending.lock() {
+            let removed = pending
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.ticket.connection_id == connection_id)
+                .map(|(ticket_id, _)| ticket_id.clone())
+                .collect::<Vec<_>>();
+            for ticket_id in removed {
+                pending.entries.remove(&ticket_id);
+            }
+            let live_ticket_ids = pending.entries.keys().cloned().collect::<BTreeSet<_>>();
+            pending
+                .fifo
+                .retain(|ticket_id| live_ticket_ids.contains(ticket_id));
+        }
+        self.agent_activation_changed.notify_waiters();
+    }
+
     /// Binds an authenticated local peer to the selected principal/session.
     pub fn bind_session(
         &self,
@@ -5834,6 +7062,12 @@ impl KernelComposition {
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         if generation_poison.is_some() {
+            return Err(TransportError::SessionFenced);
+        }
+        #[cfg(windows)]
+        if client.module_bridge_identity == AGENT_BRIDGE_MODULE_ID {
+            // The bridge has a server-first transport owner. It must never
+            // enter the legacy client-first Session/dispatch path.
             return Err(TransportError::SessionFenced);
         }
         #[cfg(windows)]
@@ -6042,7 +7276,13 @@ impl KernelComposition {
             if session.module_generation.module_id.as_str() == ACTIVE_DAEMON_CALLER
                 && matches!(
                     operation,
-                    "snapshot" | "daemon_ready" | "health" | "daemon_degraded" | "daemon_fatal"
+                    "snapshot"
+                        | "daemon_ready"
+                        | "health"
+                        | "daemon_degraded"
+                        | "daemon_fatal"
+                        | "agent_activation_claim"
+                        | "agent_activation_submit"
                 )
             {
                 if !probe_ready_state_admitted(
@@ -6324,6 +7564,54 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)
                     .map(|()| Self::accepted_daemon_response())
             }
+            "agent_activation_claim" => {
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_agent_activation_ticket().map(|ticket| {
+                        serde_json::json!({
+                            "status": "known",
+                            "value": { "ticket": ticket },
+                            "recovery": null,
+                        })
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "agent_activation_submit" => {
+                #[cfg(windows)]
+                {
+                    let decision_value = payload
+                        .get("decision")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let decision: AgentActivationResolutionDecision =
+                        serde_json::from_value(decision_value)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_agent_activation_decision(decision) {
+                        Ok(()) => Ok(Self::accepted_daemon_response()),
+                        // Deadline expiry is an expected race at this
+                        // boundary, not a daemon-fatal transport failure.
+                        // Return an explicit known outcome so the caller can
+                        // retain liveness without parsing error strings.
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
             _ => return Err(TransportError::SessionFenced),
         };
         let value = result.map_err(|_| TransportError::SessionFenced)?;
@@ -6337,6 +7625,14 @@ impl KernelComposition {
         serde_json::json!({
             "status": "known",
             "value": { "accepted": true },
+            "recovery": null,
+        })
+    }
+
+    fn expired_activation_daemon_response() -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": { "accepted": false, "expired": true },
             "recovery": null,
         })
     }
@@ -6481,6 +7777,47 @@ impl KernelComposition {
         let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
             .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
         NamedPipeServer::create_additional(self.ipc.name(), &expectation)
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))
+    }
+
+    /// Binds the first front-door instance using the exact sealed Host,
+    /// Eliotd, and promoted bridge peer set.
+    #[cfg(windows)]
+    pub fn bind_authenticated_front_door_with_peer_set(
+        &self,
+        peers: &NamedPipePeerSet,
+    ) -> Result<NamedPipeServer, KernelBuildError> {
+        if self
+            .generation_poison
+            .lock()
+            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
+            .is_some()
+        {
+            return Err(KernelBuildError::Principal(
+                "generation gateway fenced; forward recovery is required".to_owned(),
+            ));
+        }
+        NamedPipeServer::create_with_peer_set(self.ipc.name(), peers)
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))
+    }
+
+    /// Binds one replacement instance using the current immutable peer set.
+    #[cfg(windows)]
+    pub fn bind_authenticated_front_door_next_with_peer_set(
+        &self,
+        peers: &NamedPipePeerSet,
+    ) -> Result<NamedPipeServer, KernelBuildError> {
+        if self
+            .generation_poison
+            .lock()
+            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
+            .is_some()
+        {
+            return Err(KernelBuildError::Principal(
+                "generation gateway fenced; forward recovery is required".to_owned(),
+            ));
+        }
+        NamedPipeServer::create_additional_with_peer_set(self.ipc.name(), peers)
             .map_err(|error| KernelBuildError::Principal(error.to_string()))
     }
 
@@ -8177,6 +9514,23 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
         }
+        #[cfg(windows)]
+        let prepared_bridge_profile = if matches!(
+            &request.command,
+            KernelControlCommand::Activate(_) | KernelControlCommand::ProbeReady
+        ) {
+            Some(Self::prepare_agent_bridge_admission(
+                request.candidate.agent_bridge_admission.as_ref(),
+            )?)
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        if matches!(&request.command, KernelControlCommand::Activate(_)) {
+            // A new candidate immediately revokes the prior bridge lineage;
+            // it is republished only after this candidate reaches Ready.
+            self.promote_agent_bridge_profile(None)?;
+        }
         let activation_receipt: Option<KernelActivationReceipt> = match &request.command {
             KernelControlCommand::Activate(permit) => Some(
                 self.service
@@ -8232,6 +9586,12 @@ impl KernelComposition {
                         .map_err(|_| TransportError::SessionFenced)?;
                 }
             }
+        }
+        #[cfg(windows)]
+        if matches!(&request.command, KernelControlCommand::ProbeReady)
+            && let Some(next) = prepared_bridge_profile
+        {
+            self.promote_agent_bridge_profile(next)?;
         }
         let state = self
             .service_state()
@@ -8378,6 +9738,152 @@ mod tests {
         SupervisionSealedKeyFileIdentity,
     };
     use eliot_store_api::{RevisionHead, RevisionKey};
+    use std::process::Stdio;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(windows)]
+    fn activation_test_entry(deadline: u64) -> (String, AgentActivationPending) {
+        let state_fence = StateFence::new(
+            AuthorityEpoch::new(1).expect("authority epoch"),
+            ResourceGeneration::new(1).expect("resource generation"),
+        );
+        let request_id = RequestId::new("activation-request-test").expect("request id");
+        let request: AgentBridgeActivationRequest = serde_json::from_value(serde_json::json!({
+            "wire_id": eliot_protocol::AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_ID,
+            "wire_version": eliot_protocol::AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_VERSION,
+            "operation": AGENT_BRIDGE_ACTIVATION_OPERATION,
+            "demand_id": "activation-demand-test",
+            "connection_id": "activation-connection-test",
+            "attach_kind": "MANAGED",
+            "pre_attach_blind_interval": null,
+            "request_identity": {
+                "request": {
+                    "metadata": {
+                        "request_id": request_id.as_str(),
+                        "session_id": null,
+                        "task_id": null,
+                        "product_id": "eliot-agent-bridge",
+                        "source_id": "agent-bridge-test",
+                        "state_fence": state_fence.clone(),
+                        "clock": {
+                            "valid_time_ms": null,
+                            "known_time_ms": null,
+                            "transaction_sequence": null,
+                            "monotonic_ns": null
+                        }
+                    },
+                    "state_fence": state_fence.clone()
+                },
+                "idempotency_key": "activation-idempotency-test",
+                "deadline_unix_ms": deadline,
+                "cancellation_id": "activation-cancellation-test"
+            },
+            "peer_admission_receipt_sha256": "b".repeat(64),
+            "request_sha256": "a".repeat(64)
+        }))
+        .expect("activation request");
+        let ticket_id = "activation-ticket-test".to_owned();
+        let ticket = AgentActivationResolutionTicket {
+            wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+            ticket_id: ticket_id.clone(),
+            activation_request_id: request_id,
+            activation_request_sha256: request.request_sha256.clone(),
+            peer_admission_receipt_sha256: request.peer_admission_receipt_sha256.clone(),
+            connection_id: request.connection_id.clone(),
+            state_fence,
+            kernel_deadline_unix_ms: deadline,
+            ticket_sha256: "c".repeat(64),
+        };
+        (
+            ticket_id,
+            AgentActivationPending {
+                ticket,
+                request,
+                decision: None,
+                claim_lease_until_unix_ms: None,
+            },
+        )
+    }
+
+    #[cfg(windows)]
+    fn activation_test_decision(ticket_id: &str) -> AgentActivationResolutionDecision {
+        AgentActivationResolutionDecision {
+            wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID.to_owned(),
+            wire_version: AgentActivationResolutionDecision::CONTRACT_VERSION,
+            ticket_id: ticket_id.to_owned(),
+            ticket_sha256: "c".repeat(64),
+            state_fence: StateFence::new(
+                AuthorityEpoch::new(1).expect("authority epoch"),
+                ResourceGeneration::new(1).expect("resource generation"),
+            ),
+            principal_id: "principal-test".to_owned(),
+            session_id: "session-test".to_owned(),
+            task_id: "task-test".to_owned(),
+            work_unit_id: "work-unit-test".to_owned(),
+            work_scope_id: "scope-test".to_owned(),
+            task_revision: "task-revision-test".to_owned(),
+            plan_id: "plan-test".to_owned(),
+            plan_revision: "plan-revision-test".to_owned(),
+            decision_sha256: "d".repeat(64),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn activation_claim_lease_retries_transient_resolution_without_duplicate_claim() {
+        let (ticket_id, entry) = activation_test_entry(2_000);
+        let mut pending = AgentActivationPendingState::default();
+        pending.fifo.push_back(ticket_id.clone());
+        pending.entries.insert(ticket_id, entry);
+
+        let first = pending.claim_at(1).expect("first claim");
+        assert_eq!(first.ticket_id, "activation-ticket-test");
+        assert!(pending.claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS).is_none());
+        let retry = pending
+            .claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS + 1)
+            .expect("claim after lease expiry");
+        assert_eq!(retry, first, "retry reuses the exact Kernel ticket");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn activation_claim_expires_at_deadline_and_decided_ticket_is_not_reclaimed() {
+        let (ticket_id, mut entry) = activation_test_entry(2_000);
+        let mut pending = AgentActivationPendingState::default();
+        pending.fifo.push_back(ticket_id.clone());
+        pending.entries.insert(ticket_id.clone(), entry.clone());
+        assert!(pending.claim_at(2_000).is_none(), "deadline is inclusive");
+
+        entry.decision = Some(activation_test_decision(&ticket_id));
+        pending.fifo.clear();
+        pending.fifo.push_back(ticket_id.clone());
+        pending.entries.insert(ticket_id, entry);
+        assert!(
+            pending.claim_at(1).is_none(),
+            "decided tickets are terminal"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn activation_decision_replay_is_exact_and_conflicts_are_rejected() {
+        let first = activation_test_decision("activation-ticket-test");
+        assert_eq!(
+            classify_activation_decision(None, &first),
+            ActivationDecisionDisposition::Commit
+        );
+        assert_eq!(
+            classify_activation_decision(Some(&first), &first),
+            ActivationDecisionDisposition::ExactReplay
+        );
+        let mut conflicting = first.clone();
+        conflicting.plan_id = "different-plan".to_owned();
+        assert_eq!(
+            classify_activation_decision(Some(&first), &conflicting),
+            ActivationDecisionDisposition::Conflict
+        );
+    }
 
     #[test]
     fn daemon_health_response_matches_the_eliotd_typed_value_contract() {
@@ -8686,6 +10192,46 @@ mod tests {
     }
 
     #[test]
+    fn repeated_handshake_policy_updates_retain_kernel_artifact_for_bridge_begin() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-handshake-artifact-retention-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let expected_artifact = "d".repeat(64);
+        let kernel = KernelComposition::new(
+            KernelConfig::new(&root).with_kernel_artifact_sha256(expected_artifact.clone()),
+        )
+        .expect("kernel composition");
+        let generations = kernel
+            .generations
+            .lock()
+            .expect("generation router lock")
+            .clone();
+        let mut policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy lock")
+            .clone();
+
+        for _ in 0..2 {
+            update_handshake_policy(&mut policy, &generations).expect("policy update");
+            assert_eq!(
+                policy
+                    .config_snapshot
+                    .get("artifact_digest")
+                    .and_then(serde_json::Value::as_str),
+                Some(expected_artifact.as_str()),
+                "begin_agent_bridge must retain the exact artifact prerequisite after policy updates"
+            );
+        }
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn ready_receipt_rejects_absent_running_degraded_and_fatal_daemon_states() {
         assert!(daemon_status_proves_ready(&DaemonRuntimeStatus::Ready));
         for status in [
@@ -8833,6 +10379,555 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    #[ignore = "requires the built external bridge, the protected Windows ACL fixture, and the production 30s no-resolver deadline"]
+    #[allow(clippy::too_many_lines)]
+    async fn external_agent_bridge_os_process_receives_typed_semantic_resolution_denial() {
+        let bridge_exe = PathBuf::from(
+            std::env::var_os("ELIOT_AGENT_BRIDGE_EXE")
+                .expect("ELIOT_AGENT_BRIDGE_EXE must name the external bridge executable"),
+        );
+        assert!(
+            bridge_exe.is_absolute(),
+            "ELIOT_AGENT_BRIDGE_EXE must be an absolute path"
+        );
+        assert_eq!(
+            bridge_exe.extension().and_then(|value| value.to_str()),
+            Some("exe"),
+            "ELIOT_AGENT_BRIDGE_EXE must point to an .exe"
+        );
+        let bridge_bytes = std::fs::read(&bridge_exe).expect("read external bridge executable");
+        let bridge_sha256 = sha256_hex(&bridge_bytes);
+        assert_eq!(bridge_sha256.len(), 64);
+        let bridge_identity = eliot_platform_windows::file_identity_for_path(&bridge_exe)
+            .expect("bridge file identity");
+        assert_ne!(bridge_identity.volume_serial_number, 0);
+        assert_ne!(bridge_identity.file_index, 0);
+
+        let host_process =
+            eliot_platform_windows::observe_named_pipe_peer_process(std::process::id())
+                .expect("current Host process binding");
+        let host_expectation = current_process_named_pipe_expectation()
+            .expect("current Host token identity")
+            .with_process_binding(host_process)
+            .expect("current Host process identity");
+        let bridge_generation = ResourceGeneration::new(7).expect("bridge generation");
+        let bridge_authority_epoch = AuthorityEpoch::new(8).expect("bridge authority epoch");
+        let bridge_state_fence = StateFence::new(bridge_authority_epoch, bridge_generation);
+        let work_root = std::env::temp_dir().join(format!(
+            "eliot-kernel-r13-denied-os-harness-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&work_root).expect("harness work root");
+
+        // Read the production Kernel ServerHello inputs from a real composition
+        // before constructing the protected bridge declaration. This is only
+        // fixture setup; admission still goes through the exact descriptor,
+        // declaration, peer-set, and Ready checks below.
+        let kernel_artifact_sha256 = "e".repeat(64);
+        let provisional = KernelComposition::new(
+            KernelConfig::new(&work_root)
+                .with_kernel_artifact_sha256(kernel_artifact_sha256.clone()),
+        )
+        .expect("provisional Kernel composition");
+        let kernel_policy = provisional
+            .front_door_policy
+            .lock()
+            .expect("front-door policy")
+            .clone();
+        let kernel_config_snapshot_sha256 =
+            sha256_json(&kernel_policy.config_snapshot).expect("Kernel config snapshot digest");
+        drop(provisional);
+
+        let protected_root = protected_program_data_root().expect("ProgramData root");
+        let installation_id = sha256_hex(
+            format!("r13-denied-os-harness-{}-{}", std::process::id(), unix_ms()).as_bytes(),
+        );
+        let installation_root = protected_root
+            .join("Eliot")
+            .join("installations")
+            .join(&installation_id);
+        let installer = eliot_platform_windows::WindowsInstallerRootPrimitive::new();
+        let installation_spec = eliot_platform_windows::InstallerRootPrimitiveSpec {
+            root: installation_root.clone(),
+            installation_root: installation_root.clone(),
+            profile_anchor: protected_root.clone(),
+            profile: InstallerRootProfile::SystemService,
+        };
+        let installation_absence = match installer
+            .inspect(&installation_spec)
+            .expect("inspect exact system-service installation root")
+        {
+            eliot_platform_windows::InstallerRootPrimitiveObservation::Absent(absence) => absence,
+            eliot_platform_windows::InstallerRootPrimitiveObservation::Matching(_) => {
+                panic!("unique installation root unexpectedly exists")
+            }
+            eliot_platform_windows::InstallerRootPrimitiveObservation::Mismatch => {
+                panic!("unique installation root has a foreign contour")
+            }
+        };
+        installer
+            .create(&installation_spec, &installation_absence)
+            .expect("create exact system-service installation root");
+        let host_state_root = installation_root;
+        let bridge_directory = host_state_root.join("agent-bridge");
+        let bridge_spec = eliot_platform_windows::InstallerRootPrimitiveSpec {
+            root: bridge_directory.clone(),
+            installation_root: host_state_root.clone(),
+            profile_anchor: protected_root.clone(),
+            profile: InstallerRootProfile::SystemService,
+        };
+        let bridge_absence = match installer
+            .inspect(&bridge_spec)
+            .expect("inspect exact system-service bridge directory")
+        {
+            eliot_platform_windows::InstallerRootPrimitiveObservation::Absent(absence) => absence,
+            eliot_platform_windows::InstallerRootPrimitiveObservation::Matching(_) => {
+                panic!("unique Agent Bridge directory unexpectedly exists")
+            }
+            eliot_platform_windows::InstallerRootPrimitiveObservation::Mismatch => {
+                panic!("unique Agent Bridge directory has a foreign contour")
+            }
+        };
+        installer
+            .create(&bridge_spec, &bridge_absence)
+            .expect("create exact system-service Agent Bridge directory");
+        eliot_platform_windows::ensure_agent_bridge_directory(&host_state_root)
+            .expect("protected bridge directory");
+        let profile_path = bridge_directory.join("admission-profile-v1.json");
+        let declaration_path = bridge_directory.join("client-declaration-v2.json");
+        let profile_id = sha256_hex(host_state_root.to_string_lossy().as_bytes());
+        let profile_bytes = serde_json::to_vec(&serde_json::json!({
+            "profile_id": profile_id.clone(),
+            "executable": bridge_exe.to_string_lossy(),
+            "executable_sha256": bridge_sha256.clone(),
+            "client_declaration": declaration_path.to_string_lossy(),
+        }))
+        .expect("profile bytes");
+        let profile_sha256 = sha256_hex(&profile_bytes);
+
+        let module_id = ContractId::new(AGENT_BRIDGE_MODULE_ID).expect("bridge module id");
+        let artifact_id = ArtifactId::new(bridge_sha256.clone()).expect("bridge artifact id");
+        let capabilities = vec!["agent.bridge.activate".to_owned()];
+        let privacy_classes = vec!["PUBLIC".to_owned()];
+        let declaration = AgentBridgeClientDeclaration {
+            wire_id: eliot_protocol::AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: profile_id.clone(),
+            protocol_range: eliot_protocol::ProtocolRange {
+                minimum: eliot_protocol::ProtocolVersion::CURRENT,
+                maximum: eliot_protocol::ProtocolVersion::CURRENT,
+            },
+            module_contract: ModuleContract {
+                module_id: module_id.clone(),
+                version: ContractVersion::new(1, 0, 0),
+                artifact_id: artifact_id.clone(),
+                protocols: vec!["eliot.agent-bridge.v1".to_owned()],
+                required_capabilities: capabilities.clone(),
+                optional_capabilities: Vec::new(),
+                advisory_capabilities: Vec::new(),
+                state_owner: "eliot-host".to_owned(),
+                failure_domain: "agent-bridge".to_owned(),
+                hot_replace: false,
+            },
+            module_generation: ModuleGeneration {
+                module_id,
+                generation: bridge_generation,
+                artifact_id,
+                state: ModuleGenerationState::Ready,
+                health: HealthVector::healthy(),
+                state_fence: bridge_state_fence.clone(),
+            },
+            capabilities: capabilities.clone(),
+            privacy_classes: privacy_classes.clone(),
+            max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES).expect("frame ceiling"),
+            expected_kernel_sid: host_expectation.expected_sid().to_owned(),
+            expected_kernel_session_id: host_expectation.expected_session_id(),
+            expected_kernel_principal_binding: kernel_policy.session_principal_binding.clone(),
+            expected_kernel_authority_epoch: kernel_policy
+                .module_generation
+                .state_fence
+                .authority_epoch,
+            expected_kernel_generation: kernel_policy.module_generation.generation,
+            expected_kernel_artifact_sha256: kernel_artifact_sha256,
+            expected_kernel_config_snapshot_sha256: kernel_config_snapshot_sha256.clone(),
+            declaration_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("declaration digest");
+        declaration.validate().expect("exact declaration");
+        let declaration_sha256 = declaration.declaration_sha256.clone();
+        let admission = AgentBridgeAdmissionDescriptor {
+            wire_id: eliot_kernel_service::AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: PlatformHandle::new(profile_id.clone()).expect("profile handle"),
+            profile_sha256,
+            executable: PlatformHandle::new(bridge_exe.to_string_lossy()).expect("bridge path"),
+            executable_sha256: bridge_sha256.clone(),
+            executable_identity: eliot_kernel_service::HostFileIdentity {
+                volume_serial_number: bridge_identity.volume_serial_number,
+                file_index: bridge_identity.file_index,
+            },
+            generation: bridge_generation,
+            authority_epoch: bridge_authority_epoch,
+            state_fence: bridge_state_fence,
+            approved_user_sid: host_expectation.expected_sid().to_owned(),
+            caller_session_policy:
+                eliot_kernel_service::AgentBridgeCallerSessionPolicy::AnyInteractiveSessionForApprovedSid,
+            process_policy: eliot_kernel_service::AgentBridgeProcessPolicy::ExactProcessPerConnection,
+            allowed_capabilities: capabilities,
+            allowed_privacy_classes: privacy_classes,
+            max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES).expect("frame ceiling"),
+            allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
+            expected_kernel_principal_binding: kernel_policy.session_principal_binding,
+            expected_kernel_config_snapshot_sha256: kernel_config_snapshot_sha256,
+            client_declaration_path: PlatformHandle::new(declaration_path.to_string_lossy())
+                .expect("declaration path"),
+            client_declaration_sha256: declaration_sha256,
+            descriptor_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("admission descriptor digest");
+        admission.validate().expect("exact admission descriptor");
+        admission
+            .validate_client_declaration(&declaration)
+            .expect("descriptor/declaration binding");
+
+        installer
+            .create_protected_file(&bridge_spec, &profile_path, |_| Ok(profile_bytes.clone()))
+            .expect("publish protected profile fixture");
+        let declaration_bytes = serde_json::to_vec(&declaration).expect("declaration bytes");
+        installer
+            .create_protected_file(&bridge_spec, &declaration_path, |_| {
+                Ok(declaration_bytes.clone())
+            })
+            .expect("publish protected declaration fixture");
+        eliot_platform_windows::converge_agent_bridge_security(
+            &host_state_root,
+            host_expectation.expected_sid(),
+            &profile_path,
+            &declaration_path,
+        )
+        .expect("converge exact Agent Bridge ACL fixture");
+        eliot_platform_windows::verify_agent_bridge_security(
+            &host_state_root,
+            host_expectation.expected_sid(),
+            &profile_path,
+            &declaration_path,
+        )
+        .expect("verify exact Agent Bridge ACL fixture");
+
+        let kernel = KernelComposition::new(
+            KernelConfig::new(&work_root)
+                .with_kernel_artifact_sha256("e".repeat(64))
+                .with_agent_bridge_admission(admission.clone()),
+        )
+        .expect("Kernel composition with protected bridge admission");
+
+        // Host Phase-B/ProbeReady is a separate integration gate. For this
+        // transport harness, install the same validated profile and Ready
+        // service state directly, without weakening any production validator.
+        *kernel
+            .agent_bridge_profile
+            .lock()
+            .expect("bridge profile lock") = Some(AgentBridgeProfile {
+            admission: admission.clone(),
+            declaration,
+        });
+        let candidate = HostKernelCandidateBinding {
+            installation_id: PlatformHandle::new("installation-1").expect("installation"),
+            host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
+            kernel_epoch: bridge_authority_epoch,
+            activation_id: PlatformHandle::new("activation-1").expect("activation"),
+            artifact_hash: PlatformHandle::new("artifact-r13-denied-os").expect("artifact"),
+            config_hash: PlatformHandle::new("config-r13-denied-os").expect("config"),
+            job_object_id: PlatformHandle::new("Local\\Eliot-R13-Denied-OS").expect("job"),
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).expect("pipe"),
+            host_process: eliot_kernel_service::HostProcessBinding {
+                process_id: 7,
+                start_time_100ns: 9,
+                image_path: r"C:\eliot\host.exe".to_owned(),
+            },
+            job_binding: eliot_kernel_service::HostJobBinding {
+                job: eliot_kernel_service::HostJobIdentity {
+                    name: "Local\\Eliot-R13-Denied-OS".to_owned(),
+                },
+                root: eliot_kernel_service::HostJobRoot {
+                    process: eliot_kernel_service::HostProcessBinding {
+                        process_id: 42,
+                        start_time_100ns: 10,
+                        image_path: r"C:\eliot\kernel.exe".to_owned(),
+                    },
+                    executable: eliot_kernel_service::HostFileIdentity {
+                        volume_serial_number: 1,
+                        file_index: 2,
+                    },
+                },
+            },
+            supervision_incarnation: supervision_incarnation(),
+            restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).expect("restart budget"),
+            agent_bridge_admission: Some(admission),
+            containment_action: None,
+        };
+        {
+            let mut service = kernel.service.lock().expect("service lock");
+            service
+                .reconcile(candidate.clone())
+                .expect("candidate reconcile");
+            service
+                .apply(KernelControlCommand::Shadow)
+                .expect("shadow transition");
+            service
+                .apply(KernelControlCommand::PrepareHandoff)
+                .expect("handoff transition");
+            let permit = eliot_kernel_service::KernelActivationPermit {
+                operation_id: PlatformHandle::new("activation-op-r13-denied-os")
+                    .expect("operation"),
+                candidate_binding_digest: candidate.compute_digest().expect("candidate digest"),
+                prior_kernel_disposition_digest: "b".repeat(64),
+                journal_transaction_id: PlatformHandle::new("txn-r13-denied-os")
+                    .expect("transaction"),
+                journal_sequence: 1,
+                generation: bridge_generation,
+                authority_epoch: bridge_authority_epoch,
+                activation_nonce: eliot_platform::KernelActivationNonce::new(
+                    PlatformHandle::new("a".repeat(64)).expect("activation nonce"),
+                )
+                .expect("activation nonce"),
+            };
+            service
+                .activate_permit(&permit, bridge_generation, "c".repeat(64))
+                .expect("activate candidate");
+            let activation_nonce_digest = service
+                .activation_receipt()
+                .expect("activation receipt")
+                .activation_nonce_digest
+                .clone();
+            service
+                .publish_ready(KernelReadyReceipt {
+                    activation_id: candidate.activation_id.clone(),
+                    activation_operation_id: permit.operation_id,
+                    activation_nonce_digest,
+                    process: eliot_kernel_service::ProcessObservation {
+                        process_id: PlatformHandle::new("pid:42:start:10").expect("process"),
+                        job_object_id: candidate.job_object_id.clone(),
+                        state: eliot_runtime_contracts::ServiceProcessState::Ready,
+                        health: HealthVector::healthy(),
+                        evidence_refs: vec![
+                            PlatformHandle::new("ev-r13-denied-os").expect("evidence"),
+                        ],
+                    },
+                    health: HealthVector::healthy(),
+                    evidence_refs: vec![PlatformHandle::new("ev-r13-denied-os").expect("evidence")],
+                })
+                .expect("publish Ready state");
+        }
+        kernel.note_agent_bridge_peer_set_change();
+
+        let peers = kernel
+            .front_door_peer_set(&host_expectation)
+            .expect("production bridge peer set");
+        assert!(peers.entries().iter().any(|entry| {
+            entry.kind() == NamedPipePeerKind::AgentBridge
+                && entry.profile_id() == Some(profile_id.as_str())
+        }));
+        let mut server = NamedPipeServer::create_with_peer_set(DEFAULT_PIPE_NAME, &peers)
+            .expect("default Kernel front-door pipe");
+        let mut child_command = tokio::process::Command::new(&bridge_exe);
+        child_command
+            .args([
+                "--profile",
+                "SPINE_FUNCTIONAL",
+                "--transport",
+                "stdio",
+                "--client-declaration",
+                declaration_path.to_str().expect("declaration UTF-8 path"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = child_command
+            .spawn()
+            .expect("spawn real external Agent Bridge process");
+        let mut child_stdin = child.stdin.take().expect("child stdin");
+        let mut child_stdout = child.stdout.take().expect("child stdout");
+        let mut child_stderr = child.stderr.take().expect("child stderr");
+        let stderr_reader = tokio::spawn(async move {
+            let mut stderr = Vec::new();
+            child_stderr.read_to_end(&mut stderr).await.map(|_| stderr)
+        });
+
+        let selection = match server
+            .wait_for_authenticated_client_with_peer_set(Duration::from_secs(5), &peers)
+            .await
+        {
+            Ok(selection) => selection,
+            Err(error) => {
+                drop(child_stdin);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let stderr = stderr_reader
+                    .await
+                    .expect("join bridge stderr reader")
+                    .expect("read bridge stderr");
+                panic!(
+                    "authenticated real bridge peer-set selection failed: {error}; bridge stderr: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+        };
+        assert_eq!(selection.kind(), NamedPipePeerKind::AgentBridge);
+        assert_eq!(selection.profile_id(), Some(profile_id.as_str()));
+        let peer = server.peer_identity().clone();
+        assert!(kernel.agent_bridge_peer_admitted(&selection, &peer));
+        let observed = peer
+            .process_binding()
+            .expect("observed bridge process binding");
+        assert!(
+            observed
+                .image_path()
+                .eq_ignore_ascii_case(&bridge_exe.to_string_lossy())
+        );
+        assert_eq!(
+            observed.executable_file_identity(),
+            Some((
+                bridge_identity.volume_serial_number,
+                bridge_identity.file_index,
+            ))
+        );
+
+        let handshake = kernel
+            .begin_agent_bridge(&selection, peer)
+            .expect("server-first challenge");
+        server
+            .send_frame(&handshake.challenge_frame, kernel.ipc_limits())
+            .await
+            .expect("send server challenge");
+        let hello_frame = server
+            .receive_frame(kernel.ipc_limits())
+            .await
+            .expect("receive bridge hello");
+        let hello_receipt = kernel
+            .accept_agent_bridge_hello(&handshake.connection_id, &hello_frame)
+            .expect("accept exact bridge hello");
+        hello_receipt.validate().expect("typed admission receipt");
+        let receipt_frame = kernel
+            .agent_bridge_admission_receipt_frame(&handshake.connection_id)
+            .expect("build typed admission receipt frame");
+        server
+            .send_frame(&receipt_frame, kernel.ipc_limits())
+            .await
+            .expect("send typed admission receipt");
+
+        let attach_line = serde_json::json!({
+            "op": "attach",
+            "request": {
+                "demand_id": "r13-denied-os-demand",
+                "connection_id": handshake.connection_id,
+                "attach_kind": "MANAGED",
+                "pre_attach_blind_interval": null
+            }
+        });
+        child_stdin
+            .write_all(format!("{attach_line}\n").as_bytes())
+            .await
+            .expect("send bridge attach request");
+        let activation_frame = server
+            .receive_frame(kernel.ipc_limits())
+            .await
+            .expect("receive real bridge activation request");
+        let denial_frame = kernel
+            .await_agent_bridge_activation_response(&handshake.connection_id, &activation_frame)
+            .await
+            .expect("production no-resolver denial");
+        let denial = match &denial_frame.payload {
+            ProtocolPayload::Json(payload) => {
+                serde_json::from_value::<AgentBridgeActivationResponse>(payload.clone())
+                    .expect("typed denial payload")
+            }
+            _ => panic!("denial must be JSON"),
+        };
+        assert!(matches!(
+            denial.disposition,
+            AgentBridgeActivationDisposition::Denied {
+                reason_code: AgentBridgeActivationDenialCode::SemanticResolutionUnavailable
+            }
+        ));
+        assert!(
+            !kernel
+                .agent_bridge_connections
+                .lock()
+                .expect("bridge connection lock")
+                .values()
+                .any(|state| state.session.is_some() || state.activation_completed),
+            "denial must not mint an Authenticated binding or session"
+        );
+        server
+            .send_frame(&denial_frame, kernel.ipc_limits())
+            .await
+            .expect("send typed denial to real child");
+        drop(child_stdin);
+        let mut stdout = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            child_stdout.read_to_end(&mut stdout),
+        )
+        .await
+        .expect("bridge stdout deadline")
+        .expect("read bridge stdout");
+        let stdout = String::from_utf8(stdout).expect("bridge stdout UTF-8");
+        assert_eq!(
+            stdout,
+            concat!(
+                r#"{"status":"error","code":"BRIDGE_REQUEST_REJECTED","detail":"activation denied by the trusted host provider: SEMANTIC_RESOLUTION_UNAVAILABLE"}"#,
+                "\n"
+            )
+        );
+        assert!(child.wait().await.expect("wait bridge child").success());
+        let stderr = stderr_reader
+            .await
+            .expect("join bridge stderr reader")
+            .expect("read bridge stderr");
+        assert!(
+            stderr.is_empty(),
+            "successful bridge child wrote stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        drop(server);
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(&work_root);
+        if std::fs::remove_dir_all(&host_state_root).is_err() {
+            // Final ACLs intentionally preserve only the exact bridge
+            // declaration read/traverse rights for the approved user. If a
+            // normal recursive removal is denied, use the production
+            // identity/content-fenced retirement API on the exact child,
+            // then remove the now-empty unique installation root.
+            let observation = eliot_platform_windows::observe_owned_directory_exact(
+                &bridge_directory,
+                &["admission-profile-v1.json", "client-declaration-v2.json"],
+                16 * 1024 * 1024,
+            )
+            .expect("observe exact bridge files for cleanup");
+            let outcome = eliot_platform_windows::retire_owned_directory_exact(
+                &bridge_directory,
+                &observation.retirement_precondition(),
+            )
+            .expect("retire exact bridge files for cleanup");
+            assert!(matches!(
+                outcome,
+                eliot_platform_windows::OwnedDirectoryRetirementOutcome::Retired
+                    | eliot_platform_windows::OwnedDirectoryRetirementOutcome::CommittedUnknown(_)
+            ));
+            std::fs::remove_dir(&host_state_root)
+                .expect("remove empty unique installation root after retirement");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn real_executor_receipt_child() {
         if std::env::var(REAL_EXECUTOR_CHILD_ENV).as_deref() != Ok("1") {
             return;
@@ -8972,6 +11067,37 @@ mod tests {
             max_frame: policy.max_frame,
             authority_epoch: policy.module_generation.state_fence.authority_epoch,
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bridge_client_first_identity_is_fenced_before_session_creation() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-bridge-client-first-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy")
+            .clone();
+        let mut client = test_client(&policy);
+        client.module_bridge_identity = AGENT_BRIDGE_MODULE_ID.to_owned();
+        assert!(matches!(
+            kernel.bind_session(
+                "bridge-client-first",
+                PeerIdentity::Unavailable {
+                    reason: eliot_ipc::PeerIdentityUnavailable::ProviderProofNotComposed,
+                },
+                &client,
+            ),
+            Err(TransportError::SessionFenced)
+        ));
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]

@@ -6,12 +6,13 @@ use super::{
     ActivePhaseBRebindIntent, AuthorityEpoch, AuthoritySnapshotBindingWire, CandidateManifest,
     CredentialAccessReceipt, DispatchAuthorityId, EpochIdentity, EpochLineage, HostError,
     HostInstallationEpoch, HostPhaseBMaterialization, HostPhaseBMaterializationIntent,
-    HostPhaseBMaterializationReceipt, LOCAL_SERVICE_SID, OpaqueLabel, OperationIdentity,
-    OrsEpochIdentity, PhaseBLiveBinding, PlatformHandle, ProcessAuthorityHandoffDescriptor,
-    ProvisionedSupervisionAuthority, SecretReference, Sha256, StateFence, StateFenceSnapshot,
-    StoreCredentialProvider, StoreCredentialScope, host_owner_epoch_digest,
-    installation_phase_b_credential_receipt_digest, installation_phase_b_host_state_root_digest,
-    installation_phase_b_watchdog_selector_digest, observe_named_pipe_peer_process,
+    HostPhaseBMaterializationReceipt, HostPhaseBPreparedReceipt, LOCAL_SERVICE_SID, OpaqueLabel,
+    OperationIdentity, OrsEpochIdentity, PhaseBLiveBinding, PlatformHandle,
+    ProcessAuthorityHandoffDescriptor, ProvisionedSupervisionAuthority, RuntimeLaunchDescriptor,
+    SecretReference, Sha256, StateFence, StateFenceSnapshot, StoreCredentialProvider,
+    StoreCredentialScope, host_owner_epoch_digest, installation_phase_b_credential_receipt_digest,
+    installation_phase_b_host_state_root_digest, installation_phase_b_watchdog_selector_digest,
+    observe_named_pipe_peer_process,
 };
 
 #[cfg(windows)]
@@ -109,6 +110,23 @@ pub(super) fn phase_b_root_binding_digest(
 }
 
 #[cfg(windows)]
+pub(super) fn phase_b_root_binding_digest_from_launch(
+    launch: &RuntimeLaunchDescriptor,
+) -> Result<PlatformHandle, HostError> {
+    PlatformHandle::new(format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "eliot.phase-b.host-root.v1\0{}",
+                launch.runtime_state_roots.host_state_root.as_str()
+            )
+            .as_bytes(),
+        )
+    ))
+    .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
 pub(super) fn phase_b_watchdog_selector_digest(
     manifest: &CandidateManifest,
 ) -> Result<PlatformHandle, HostError> {
@@ -116,16 +134,18 @@ pub(super) fn phase_b_watchdog_selector_digest(
 }
 
 #[cfg(windows)]
-pub(super) fn phase_b_public_receipt(
+pub(super) fn phase_b_prepared_public_receipt(
     intent: &HostPhaseBMaterializationIntent,
     materialization: &HostPhaseBMaterialization,
     host: &HostInstallationEpoch,
-) -> Result<HostPhaseBMaterializationReceipt, HostError> {
+    pending: Option<&eliot_installation::PendingActivation>,
+) -> Result<HostPhaseBPreparedReceipt, HostError> {
     if materialization.request_digest.as_ref() != Some(&intent.request_digest) {
         return Err(HostError::RecoveryRequired(
             "Host Phase-B receipt is not bound to the requested transaction effect".to_owned(),
         ));
     }
+    validate_bridge_binding(intent, pending, materialization.agent_bridge.as_ref())?;
     let host_owner_epoch = materialization
         .host_owner_epoch
         .clone()
@@ -134,7 +154,9 @@ pub(super) fn phase_b_public_receipt(
         .host_process_identity
         .clone()
         .unwrap_or(host_process_identity_digest()?);
-    let mut receipt = HostPhaseBMaterializationReceipt {
+    let mut receipt = HostPhaseBPreparedReceipt {
+        wire: PlatformHandle::new(HostPhaseBPreparedReceipt::WIRE)
+            .map_err(|error| HostError::Platform(error.to_string()))?,
         transaction_id: intent.transaction_id.clone(),
         effect_id: intent.effect_id.clone(),
         candidate_manifest_digest: materialization.manifest_digest.clone(),
@@ -148,6 +170,49 @@ pub(super) fn phase_b_public_receipt(
             .clone(),
         eliotd_descriptor_digest: materialization.eliotd_descriptor_digest.clone(),
         provisioned_supervision_authority: intent.provisioned_supervision_authority.clone(),
+        agent_bridge: materialization.agent_bridge.clone(),
+        receipt_digest: PlatformHandle::new("pending")
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+    };
+    receipt.receipt_digest = receipt
+        .computed_digest()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    receipt
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    Ok(receipt)
+}
+
+/// Constructs a final receipt only for the bridge-absent legacy contour.
+/// Bridge-bearing materialization must go through provider `FinalizePhaseB`.
+#[cfg(windows)]
+pub(super) fn phase_b_public_receipt(
+    intent: &HostPhaseBMaterializationIntent,
+    materialization: &HostPhaseBMaterialization,
+    host: &HostInstallationEpoch,
+    pending: Option<&eliot_installation::PendingActivation>,
+) -> Result<HostPhaseBMaterializationReceipt, HostError> {
+    let prepared = phase_b_prepared_public_receipt(intent, materialization, host, pending)?;
+    if prepared.agent_bridge.is_some() {
+        return Err(HostError::RecoveryRequired(
+            "bridge-bearing Phase-B materialization requires provider finalization".to_owned(),
+        ));
+    }
+    let mut receipt = HostPhaseBMaterializationReceipt {
+        wire: PlatformHandle::new(HostPhaseBMaterializationReceipt::WIRE)
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        transaction_id: prepared.transaction_id,
+        effect_id: prepared.effect_id,
+        candidate_manifest_digest: prepared.candidate_manifest_digest,
+        request_digest: prepared.request_digest,
+        host_owner_epoch: prepared.host_owner_epoch,
+        host_process_identity: prepared.host_process_identity,
+        authority_descriptor_digest: prepared.authority_descriptor_digest,
+        config_file_digest: prepared.config_file_digest,
+        store_bootstrap_descriptor_digest: prepared.store_bootstrap_descriptor_digest,
+        eliotd_descriptor_digest: prepared.eliotd_descriptor_digest,
+        provisioned_supervision_authority: prepared.provisioned_supervision_authority,
+        agent_bridge: None,
         receipt_digest: PlatformHandle::new("pending")
             .map_err(|error| HostError::Platform(error.to_string()))?,
     };
@@ -165,6 +230,7 @@ pub(super) fn phase_b_public_receipt_from_binding(
     intent: &HostPhaseBMaterializationIntent,
     binding: &PhaseBLiveBinding,
     credential_receipt: &CredentialAccessReceipt,
+    pending: Option<&eliot_installation::PendingActivation>,
 ) -> Result<HostPhaseBMaterializationReceipt, HostError> {
     credential_receipt
         .validate()
@@ -183,7 +249,10 @@ pub(super) fn phase_b_public_receipt_from_binding(
             "persisted Phase-B receipt is bound to a different request".to_owned(),
         ));
     }
+    validate_bridge_binding(intent, pending, binding.agent_bridge.as_deref())?;
     let receipt = HostPhaseBMaterializationReceipt {
+        wire: PlatformHandle::new(HostPhaseBMaterializationReceipt::WIRE)
+            .map_err(|error| HostError::Platform(error.to_string()))?,
         transaction_id: intent.transaction_id.clone(),
         effect_id: binding.effect_id.clone(),
         candidate_manifest_digest: binding.manifest_digest.clone(),
@@ -195,12 +264,43 @@ pub(super) fn phase_b_public_receipt_from_binding(
         store_bootstrap_descriptor_digest: binding.store_bootstrap_descriptor_digest.clone(),
         eliotd_descriptor_digest: binding.eliotd_descriptor_digest.clone(),
         provisioned_supervision_authority: binding.provisioned_supervision_authority.clone(),
+        agent_bridge: binding.agent_bridge.clone(),
         receipt_digest: binding.public_receipt_digest.clone(),
     };
     receipt
         .validate()
         .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
     Ok(receipt)
+}
+
+#[cfg(windows)]
+fn validate_bridge_binding(
+    intent: &HostPhaseBMaterializationIntent,
+    pending: Option<&eliot_installation::PendingActivation>,
+    bridge: Option<&eliot_installation::AgentBridgePreparedBinding>,
+) -> Result<(), HostError> {
+    match (intent.agent_bridge_source.as_ref(), bridge, pending) {
+        (None, None, Some(pending)) if pending.phase_b_agent_bridge_stage_prepared.is_none() => {
+            Ok(())
+        }
+        (None, None, None) => Ok(()),
+        (Some(_), Some(bridge), Some(pending)) => {
+            bridge
+                .validate_against_phase_b(intent, pending)
+                .map_err(HostError::Installation)?;
+            if pending.phase_b_agent_bridge_stage_prepared.as_ref() != Some(&bridge.stage_prepared)
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B bridge proof does not match the durable stage carrier".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        (Some(_), Some(bridge), None) => bridge.validate().map_err(HostError::Installation),
+        _ => Err(HostError::RecoveryRequired(
+            "Phase-B bridge proof is absent or substituted for the exact intent".to_owned(),
+        )),
+    }
 }
 
 #[cfg(windows)]

@@ -879,6 +879,7 @@ fn active_startup_prior_binding(
             manifest.runtime_launch.generation.as_str(),
             manifest.runtime_launch.authority_generation,
         ),
+        agent_bridge: None,
     }
 }
 
@@ -925,6 +926,224 @@ fn phase_b_materialization_reuses_exact_bytes_and_rejects_substitution() -> Test
         return Err(std::io::Error::other("substituted bytes must not be overwritten").into());
     };
     assert!(error.to_string().contains("neither the immutable template"));
+    drop(portable_lease);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn agent_bridge_profile_leaf_recovery_reconstructs_missing_declaration() -> TestResult {
+    let (_manifest, root) = liveness_manifest_with_distinct_store_digests()?;
+    let portable = root.join("portable");
+    let portable_lease = UserOwnedRootLease::open_existing(&portable)?;
+    let profile_path = portable.join("agent-bridge-profile.json");
+    let declaration_path = portable.join("agent-bridge-declaration.json");
+    let profile = br#"{"profile":"canonical"}"#;
+    let declaration = br#"{"module":"agent-bridge"}"#;
+    let (profile_digest, _) = phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &profile_path,
+        profile,
+        &[],
+        "Agent Bridge profile",
+    )?;
+    assert!(!declaration_path.exists());
+    phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &declaration_path,
+        declaration,
+        &[&phase_b_bytes_digest(declaration)?],
+        "Agent Bridge declaration",
+    )?;
+    assert_eq!(
+        phase_b_bytes_digest(&std::fs::read(&profile_path)?)?,
+        profile_digest
+    );
+    assert_eq!(std::fs::read(&declaration_path)?, declaration);
+    drop(portable_lease);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn agent_bridge_declaration_leaf_recovery_reconstructs_missing_profile() -> TestResult {
+    let (_manifest, root) = liveness_manifest_with_distinct_store_digests()?;
+    let portable = root.join("portable");
+    let portable_lease = UserOwnedRootLease::open_existing(&portable)?;
+    let profile_path = portable.join("agent-bridge-profile.json");
+    let declaration_path = portable.join("agent-bridge-declaration.json");
+    let profile = br#"{"profile":"canonical"}"#;
+    let declaration = br#"{"module":"agent-bridge"}"#;
+    let (declaration_digest, _) = phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &declaration_path,
+        declaration,
+        &[],
+        "Agent Bridge declaration",
+    )?;
+    assert!(!profile_path.exists());
+    phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &profile_path,
+        profile,
+        &[&phase_b_bytes_digest(profile)?],
+        "Agent Bridge profile",
+    )?;
+    assert_eq!(
+        phase_b_bytes_digest(&std::fs::read(&declaration_path)?)?,
+        declaration_digest
+    );
+    assert_eq!(std::fs::read(&profile_path)?, profile);
+    drop(portable_lease);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn agent_bridge_pair_foreign_profile_or_declaration_fails_closed() -> TestResult {
+    let (_manifest, root) = liveness_manifest_with_distinct_store_digests()?;
+    let portable = root.join("portable");
+    let portable_lease = UserOwnedRootLease::open_existing(&portable)?;
+    let profile_path = portable.join("agent-bridge-profile.json");
+    let declaration_path = portable.join("agent-bridge-declaration.json");
+    let profile = br#"{"profile":"canonical"}"#;
+    let declaration = br#"{"module":"agent-bridge"}"#;
+    let profile_digest = phase_b_bytes_digest(profile)?;
+    let declaration_digest = phase_b_bytes_digest(declaration)?;
+    std::fs::write(&profile_path, b"foreign-profile")?;
+    let profile_result = phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &profile_path,
+        profile,
+        &[&profile_digest],
+        "Agent Bridge profile",
+    );
+    assert!(profile_result.is_err());
+    std::fs::write(&declaration_path, b"foreign-declaration")?;
+    let declaration_result = phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &declaration_path,
+        declaration,
+        &[&declaration_digest],
+        "Agent Bridge declaration",
+    );
+    assert!(declaration_result.is_err());
+    let cross_leaf_path = portable.join("agent-bridge-cross-leaf.json");
+    std::fs::write(&cross_leaf_path, declaration)?;
+    let cross_leaf_result = phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &cross_leaf_path,
+        profile,
+        &[&profile_digest],
+        "Agent Bridge profile",
+    );
+    assert!(cross_leaf_result.is_err());
+    drop(portable_lease);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn agent_bridge_response_loss_rehydrate_is_idempotent_and_exact() -> TestResult {
+    let (_manifest, root) = liveness_manifest_with_distinct_store_digests()?;
+    let portable = root.join("portable");
+    let portable_lease = UserOwnedRootLease::open_existing(&portable)?;
+    let destination = portable.join("agent-bridge-profile.json");
+    let desired = br#"{"profile":"canonical"}"#;
+    let (first_digest, first_identity) = phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &destination,
+        desired,
+        &[],
+        "Agent Bridge profile",
+    )?;
+    let (retry_digest, retry_identity) = phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &destination,
+        desired,
+        &[&first_digest],
+        "Agent Bridge profile",
+    )?;
+    assert_eq!(retry_digest, first_digest);
+    assert_eq!(retry_identity, first_identity);
+    drop(portable_lease);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn agent_bridge_generation_replacement_rollback_restores_exact_pair() -> TestResult {
+    let (_manifest, root) = liveness_manifest_with_distinct_store_digests()?;
+    let portable = root.join("portable");
+    let portable_lease = UserOwnedRootLease::open_existing(&portable)?;
+    let profile_path = portable.join("agent-bridge-profile.json");
+    let declaration_path = portable.join("agent-bridge-declaration.json");
+    let old_profile = br#"{"profile":"old"}"#;
+    let old_declaration = br#"{"module":"old"}"#;
+    let new_profile = br#"{"profile":"new"}"#;
+    let new_declaration = br#"{"module":"new"}"#;
+    let (old_profile_digest, _) = phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &profile_path,
+        old_profile,
+        &[],
+        "Agent Bridge profile",
+    )?;
+    let (old_declaration_digest, _) = phase_b_materialize_file(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &declaration_path,
+        old_declaration,
+        &[],
+        "Agent Bridge declaration",
+    )?;
+    phase_b_materialize_file_with_rollback(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &profile_path,
+        new_profile,
+        &[&old_profile_digest],
+        "Agent Bridge profile",
+    )?;
+    phase_b_materialize_file_with_rollback(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &declaration_path,
+        new_declaration,
+        &[&old_declaration_digest],
+        "Agent Bridge declaration",
+    )?;
+    phase_b_restore_or_remove(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &profile_path,
+        "Agent Bridge profile",
+        None,
+    )?;
+    phase_b_restore_or_remove(
+        InstallationProfile::PortableDev,
+        Some(&portable_lease),
+        &declaration_path,
+        "Agent Bridge declaration",
+        None,
+    )?;
+    assert_eq!(std::fs::read(&profile_path)?, old_profile);
+    assert_eq!(std::fs::read(&declaration_path)?, old_declaration);
     drop(portable_lease);
     std::fs::remove_dir_all(root)?;
     Ok(())
@@ -2154,6 +2373,7 @@ fn production_host_journal_crash_retry_substitution_and_reset_negatives() -> Tes
             "candidate",
             ResourceGeneration::genesis(),
         ),
+        agent_bridge: None,
     };
     let fresh_intent = ActivePhaseBRebindIntent::new(
         handle(&"b".repeat(64))?,

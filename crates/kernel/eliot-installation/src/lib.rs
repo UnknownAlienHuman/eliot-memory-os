@@ -15,7 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_contracts::{
-    ContractIdentity, ContractVersion, contract_identity as make_contract_identity, sha256_hex,
+    ContractIdentity, ContractVersion, canonical_json_bytes,
+    contract_identity as make_contract_identity, sha256_hex,
 };
 use eliot_ipc::{NamedPipeTransport, TransportLimits};
 pub use eliot_platform::{HostProcessNonce, PlatformHandle};
@@ -24,28 +25,33 @@ use eliot_platform::{
     ProviderError, ProviderErrorCode, UnknownReason,
 };
 pub use eliot_platform_windows::UserOwnedRootLease;
+use eliot_platform_windows::{
+    AgentBridgeSecurityConvergenceReceipt as PlatformAgentBridgeSecurityConvergenceReceipt,
+    AgentBridgeStagePrepared as PlatformAgentBridgeStagePrepared,
+    AgentBridgeStagingReceipt as PlatformAgentBridgeStagingReceipt,
+};
 #[cfg(test)]
 use eliot_platform_windows::{
-    AuthenticodeVerdict, FileIdentity, PackageManifest, PackageStagingError, PackageStagingStage,
-    PeCoffError, TrustedSourceBundle,
+    AuthenticodeVerdict, PackageManifest, PackageStagingError, PackageStagingStage, PeCoffError,
+    TrustedSourceBundle,
 };
 use eliot_platform_windows::{
     CredentialSecret, ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
-    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerEpochCapability,
-    InstallerRootAbsentSnapshot, InstallerRootCreateAttempt, InstallerRootCreateDisposition,
-    InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveCreate,
-    InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
-    InstallerRootStage, InstallerSecretCreateDisposition, InstallerSecretObservation,
-    ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease, ServiceAccount,
-    ServiceBootstrapArguments, ServiceRegistrationCurrent, ServiceRegistrationInspection,
-    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
-    ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome, StagingReceipt,
-    SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease,
-    WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider, WindowsPlatform,
-    WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
-    current_user_local_app_data_root, fresh_service_registration_nonce,
-    observe_running_eliot_host_process, protected_program_data_root,
-    require_protected_program_data_path, resolve_service_sid,
+    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, FileIdentity,
+    HostOwnerEpochCapability, InstallerRootAbsentSnapshot, InstallerRootCreateAttempt,
+    InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
+    InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
+    InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
+    InstallerSecretObservation, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
+    ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
+    ServiceRegistrationInspection, ServiceRegistrationOutcome, ServiceRegistrationRequest,
+    ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStartOutcome,
+    ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
+    SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease, WindowsInstallerRootPrimitive,
+    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
+    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
+    fresh_service_registration_nonce, observe_running_eliot_host_process,
+    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
 use eliot_platform_windows::{
@@ -107,6 +113,7 @@ fn test_provisioned_supervision_authority(
 }
 
 mod activation;
+mod agent_bridge_profile;
 mod credential_provision;
 mod package;
 mod package_planner;
@@ -122,14 +129,23 @@ pub use activation::{
     InstallationActivationApproval, InstallationActivationApprovalBinding,
     InstallationActivationProjectionIntent, InstallationActivationRegistryRevisionPolicy,
 };
+pub use agent_bridge_profile::{
+    AGENT_BRIDGE_INSTALLATION_PROFILE_WIRE_ID, AGENT_BRIDGE_INSTALLATION_PROFILE_WIRE_VERSION,
+    AGENT_BRIDGE_MAX_FRAME_BYTES, AGENT_BRIDGE_MAX_POLICY_ENTRIES, AGENT_BRIDGE_MODULE_ID,
+    AGENT_BRIDGE_SOURCE_MAX_BYTES, AgentBridgeCallerSessionPolicy, AgentBridgeInstallationProfile,
+    AgentBridgeProcessPolicy, AgentBridgeProtectedPaths, AgentBridgeSourceMaterializationFactory,
+    AgentBridgeSourceMaterializationPlan, AgentBridgeSourceObserverFactory,
+    RetainedAgentBridgeArtifact, RetainedAgentBridgeSource, RetainedAgentBridgeSourceObserver,
+    agent_bridge_source_plan_from_observed_kernel, derive_agent_bridge_protected_paths,
+};
 pub use credential_provision::{
     CredentialAccessReceipt, CredentialOwnershipMarkerIdentity, HOST_CREDENTIAL_CONTROL_PIPE,
     HOST_CREDENTIAL_CONTROL_WIRE, HostCredentialControlIntent, HostCredentialControlOperation,
     HostCredentialControlRequest, HostCredentialControlResponse, HostPhaseBMaterializationIntent,
-    HostPhaseBMaterializationReceipt, HostPhaseBStaticTemplate, LOCAL_SERVICE_SID,
-    StoreCredentialAbsentSnapshot, StoreCredentialLifecycle, StoreCredentialProgress,
-    StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
-    credential_absent_response_digest, credential_control_request_frame,
+    HostPhaseBMaterializationReceipt, HostPhaseBPreparedReceipt, HostPhaseBStaticTemplate,
+    LOCAL_SERVICE_SID, StoreCredentialAbsentSnapshot, StoreCredentialLifecycle,
+    StoreCredentialProgress, StoreCredentialProvider, StoreCredentialProvisionPlan,
+    StoreCredentialScope, credential_absent_response_digest, credential_control_request_frame,
     credential_control_response_frame, credential_deleted_response_digest,
     credential_matching_response_digest, decode_credential_control_request_frame,
     decode_credential_control_response_frame, dispatch_credential_target_for_store_target,
@@ -242,18 +258,19 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(4, 0, 0);
 /// makes the durable registration nonce and service-start deadline members
 /// mandatory on the current wire; v20 records require explicit migration.
 /// Version 22 separates filesystem and Credential Manager create dispositions
-/// and requires the keyed non-secret credential creation proof.
+/// and requires the keyed non-secret credential creation proof. Version 23
+/// adds the optional, digest-bound agent-bridge source materialization plan.
 /// Older wires cannot be interpreted as this effect set.
 /// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(22, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(23, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
 /// Registry wire version 12 binds the provisioned supervision authority into
-/// pending Phase-B receipts and committed/rebound live bindings. Version 14
+/// pending Phase-B receipts and committed/rebound live bindings. Version 15
 /// binds each Watchdog approval to the exact installer-read SCM control grant.
 /// Older projections are never defaulted into current authority.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(14, 0, 0);
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(15, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -2490,6 +2507,715 @@ pub struct ApprovedGeneration {
     pub last_known_good: bool,
 }
 
+/// Durable provider-neutral proof that an auxiliary Agent Bridge stage was
+/// prepared but not yet published.  The Windows adapter maps its retained
+/// temporary-file identity into this record; the installation registry owns
+/// the transaction and recovery authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeStagePrepared {
+    /// Explicit durable stage-prepared wire discriminator.
+    pub wire: PlatformHandle,
+    /// Installation identity bound to the launch contour.
+    pub installation_id: PlatformHandle,
+    /// Sole installation transaction identity.
+    pub transaction_id: PlatformHandle,
+    /// Immutable installer plan identity.
+    pub installation_plan_digest: PlatformHandle,
+    /// Phase-B effect identity.
+    pub effect_id: PlatformHandle,
+    /// Exact Phase-B request identity.
+    pub request_digest: PlatformHandle,
+    /// Digest of the retained Host state root.
+    pub host_state_root_digest: PlatformHandle,
+    /// Candidate manifest identity.
+    pub manifest_digest: PlatformHandle,
+    /// Runtime launch descriptor identity.
+    pub launch_descriptor_digest: PlatformHandle,
+    /// Exact launch generation.
+    pub launch_generation: PlatformHandle,
+    /// Source executable path and retained identity.
+    pub source_path: PlatformHandle,
+    /// Source executable object identity.
+    pub source_identity: FileIdentity,
+    /// Source executable SHA-256.
+    pub source_sha256: PlatformHandle,
+    /// Source executable byte length.
+    pub source_size: u64,
+    /// Same-parent operation-scoped temporary path.
+    pub temporary_path: PlatformHandle,
+    /// Temporary object identity captured before durable publication.
+    pub temporary_identity: FileIdentity,
+    /// Deterministic final destination path.
+    pub destination_path: PlatformHandle,
+    /// Final destination parent identity.
+    pub destination_parent_identity: FileIdentity,
+    /// Digest of all fields except this digest.
+    pub prepared_digest: PlatformHandle,
+}
+
+impl AgentBridgeStagePrepared {
+    /// Current durable stage-prepared wire.
+    pub const WIRE: &'static str = "eliot.host.agent-bridge-stage-prepared.v1";
+
+    /// Recomputes the domain-separated stage-prepared identity.
+    pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        let bytes = canonical_json_bytes(&(
+            (
+                Self::WIRE,
+                self.installation_id.as_str(),
+                self.transaction_id.as_str(),
+                self.installation_plan_digest.as_str(),
+                self.effect_id.as_str(),
+                self.request_digest.as_str(),
+                self.host_state_root_digest.as_str(),
+                self.manifest_digest.as_str(),
+                self.launch_descriptor_digest.as_str(),
+                self.launch_generation.as_str(),
+            ),
+            (
+                self.source_path.as_str(),
+                self.source_identity,
+                self.source_sha256.as_str(),
+                self.source_size,
+            ),
+            (
+                self.temporary_path.as_str(),
+                self.temporary_identity,
+                self.destination_path.as_str(),
+                self.destination_parent_identity,
+            ),
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "agent_bridge.stage_prepared.prepared_digest".to_owned(),
+            reason: error.to_string(),
+        })?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+            field: "agent_bridge.stage_prepared.prepared_digest".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// Validates the durable stage proof without adopting any destination.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.wire.as_str() != Self::WIRE {
+            return Err(InstallationError::MigrationRequired {
+                reason: "agent-bridge stage-prepared wire requires explicit re-stage".to_owned(),
+            });
+        }
+        for (value, field) in [
+            (&self.installation_id, "agent_bridge.installation_id"),
+            (&self.transaction_id, "agent_bridge.transaction_id"),
+            (
+                &self.installation_plan_digest,
+                "agent_bridge.installation_plan_digest",
+            ),
+            (&self.effect_id, "agent_bridge.effect_id"),
+            (&self.request_digest, "agent_bridge.request_digest"),
+            (
+                &self.host_state_root_digest,
+                "agent_bridge.host_state_root_digest",
+            ),
+            (&self.manifest_digest, "agent_bridge.manifest_digest"),
+            (
+                &self.launch_descriptor_digest,
+                "agent_bridge.launch_descriptor_digest",
+            ),
+            (&self.launch_generation, "agent_bridge.launch_generation"),
+            (&self.source_path, "agent_bridge.source_path"),
+            (&self.temporary_path, "agent_bridge.temporary_path"),
+            (&self.destination_path, "agent_bridge.destination_path"),
+        ] {
+            handle(value, field)?;
+        }
+        for (value, field) in [
+            (
+                &self.installation_plan_digest,
+                "agent_bridge.installation_plan_digest",
+            ),
+            (&self.request_digest, "agent_bridge.request_digest"),
+            (
+                &self.host_state_root_digest,
+                "agent_bridge.host_state_root_digest",
+            ),
+            (&self.manifest_digest, "agent_bridge.manifest_digest"),
+            (
+                &self.launch_descriptor_digest,
+                "agent_bridge.launch_descriptor_digest",
+            ),
+            (&self.source_sha256, "agent_bridge.source_sha256"),
+            (&self.prepared_digest, "agent_bridge.prepared_digest"),
+        ] {
+            sha256_handle(value, field)?;
+        }
+        if self.source_size == 0 || self.source_size > AGENT_BRIDGE_SOURCE_MAX_BYTES {
+            return Err(InstallationError::InvalidField {
+                field: "agent_bridge.source_size".to_owned(),
+                reason: "must be non-zero and within the source bound".to_owned(),
+            });
+        }
+        if self.source_identity.volume_serial_number == 0
+            || self.source_identity.file_index == 0
+            || self.temporary_identity.volume_serial_number == 0
+            || self.temporary_identity.file_index == 0
+            || self.destination_parent_identity.volume_serial_number == 0
+            || self.destination_parent_identity.file_index == 0
+        {
+            return Err(InstallationError::InvalidField {
+                field: "agent_bridge.stage_prepared.file_identity".to_owned(),
+                reason: "must identify non-zero file objects".to_owned(),
+            });
+        }
+        if self.prepared_digest != self.computed_digest()? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Adapts the Windows provider capability into this durable installation
+    /// shape. The caller supplies context owned by the pending Phase-B intent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_platform(
+        prepared: &PlatformAgentBridgeStagePrepared,
+        installation_id: PlatformHandle,
+        installation_plan_digest: PlatformHandle,
+        host_state_root_digest: PlatformHandle,
+        manifest_digest: PlatformHandle,
+        launch_descriptor_digest: PlatformHandle,
+        launch_generation: PlatformHandle,
+    ) -> Result<Self, InstallationError> {
+        if prepared.wire != eliot_platform_windows::AGENT_BRIDGE_STAGE_WIRE
+            || prepared.wire_version != eliot_platform_windows::AGENT_BRIDGE_STAGE_WIRE_VERSION
+        {
+            return Err(InstallationError::MigrationRequired {
+                reason: "platform agent-bridge stage wire requires explicit re-stage".to_owned(),
+            });
+        }
+        let path_handle = |path: &Path, field: &str| {
+            PlatformHandle::new(path.to_string_lossy()).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: field.to_owned(),
+                    reason: error.to_string(),
+                }
+            })
+        };
+        let mut value = Self {
+            wire: PlatformHandle::new(Self::WIRE).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "agent_bridge.stage_prepared.wire".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            installation_id,
+            transaction_id: PlatformHandle::new(&prepared.transaction_id)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?,
+            installation_plan_digest,
+            effect_id: PlatformHandle::new(&prepared.effect_id)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?,
+            request_digest: PlatformHandle::new(&prepared.request_digest)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?,
+            host_state_root_digest,
+            manifest_digest,
+            launch_descriptor_digest,
+            launch_generation,
+            source_path: path_handle(&prepared.source_path, "agent_bridge.source_path")?,
+            source_identity: prepared.source_identity,
+            source_sha256: PlatformHandle::new(&prepared.source_sha256)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?,
+            source_size: prepared.source_size,
+            temporary_path: path_handle(&prepared.temporary_path, "agent_bridge.temporary_path")?,
+            temporary_identity: prepared.temporary_identity,
+            destination_path: path_handle(
+                &prepared.destination_path,
+                "agent_bridge.destination_path",
+            )?,
+            destination_parent_identity: prepared.parent_identity,
+            prepared_digest: PlatformHandle::new("pending")
+                .map_err(|error| InstallationError::Platform(error.to_string()))?,
+        };
+        value.prepared_digest = value.computed_digest()?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Rejects plan, pending-candidate, root, launch, and request substitution.
+    pub fn validate_against_phase_b(
+        &self,
+        intent: &HostPhaseBMaterializationIntent,
+        pending: &PendingActivation,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        let source = intent
+            .agent_bridge_source
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?;
+        source.validate()?;
+        let launch = &pending.manifest.runtime_launch;
+        if self.installation_id != launch.installation_epoch.installation
+            || self.transaction_id != intent.transaction_id
+            || self.installation_plan_digest != intent.installation_plan_digest
+            || self.effect_id != intent.effect_id
+            || self.request_digest != intent.request_digest
+            || self.host_state_root_digest != intent.host_state_root_digest
+            || self.manifest_digest != pending.manifest_digest
+            || self.launch_descriptor_digest != launch.descriptor_digest
+            || self.launch_generation != launch.generation
+            || self.source_path != source.source_executable_path
+            || self.source_identity != source.source_executable_identity
+            || self.source_sha256 != source.source_executable_sha256
+            || self.source_size != source.source_executable_size
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Bridge proof carried by prepared and final Phase-B records. The staged
+/// object and content pair are available before publication; security
+/// identities/digests remain absent until the provider returns exact retained
+/// post-publication readback.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgePreparedBinding {
+    /// Explicit binding wire discriminator.
+    pub wire: PlatformHandle,
+    /// Durable pre-publication stage proof.
+    pub stage_prepared: AgentBridgeStagePrepared,
+    /// Digest of the provider's final staging receipt.
+    pub staging_receipt_digest: PlatformHandle,
+    /// Exact staged final path.
+    pub staged_destination_path: PlatformHandle,
+    /// Exact staged final object identity.
+    pub staged_destination_identity: FileIdentity,
+    /// Exact staged bytes.
+    pub staged_sha256: PlatformHandle,
+    /// Exact staged byte length.
+    pub staged_size: u64,
+    /// Protected profile/declaration paths and readback digests.
+    pub profile_path: PlatformHandle,
+    /// SHA-256 of the protected profile bytes.
+    pub profile_digest: PlatformHandle,
+    /// Protected static client declaration path.
+    pub declaration_path: PlatformHandle,
+    /// SHA-256 of the protected declaration bytes.
+    pub declaration_digest: PlatformHandle,
+    /// Domain-separated digest binding the protected pair.
+    pub pair_digest: PlatformHandle,
+}
+
+/// Durable identity and descriptor proof for the complete protected contour.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeSecurityContour {
+    /// Canonical Host state root path.
+    pub host_state_root_path: PlatformHandle,
+    /// Identity retained from the root handle.
+    pub host_state_root_identity: FileIdentity,
+    /// Actual root security descriptor digest.
+    pub host_state_root_security_descriptor_digest: PlatformHandle,
+    /// Canonical `agent-bridge` child path.
+    pub bridge_directory_path: PlatformHandle,
+    /// Identity retained from the child handle.
+    pub bridge_directory_identity: FileIdentity,
+    /// Actual child security descriptor digest.
+    pub bridge_directory_security_descriptor_digest: PlatformHandle,
+}
+
+impl AgentBridgePreparedBinding {
+    /// Current bridge Phase-B binding wire.
+    pub const WIRE: &'static str = "eliot.host.agent-bridge-phase-b.v1";
+
+    /// Constructs the binding after exact staged and pair observations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        stage_prepared: AgentBridgeStagePrepared,
+        staging_receipt_digest: PlatformHandle,
+        staged_destination_path: PlatformHandle,
+        staged_destination_identity: FileIdentity,
+        staged_sha256: PlatformHandle,
+        staged_size: u64,
+        profile_path: PlatformHandle,
+        profile_digest: PlatformHandle,
+        declaration_path: PlatformHandle,
+        declaration_digest: PlatformHandle,
+        profile_identity: FileIdentity,
+        profile_security_descriptor_digest: PlatformHandle,
+        declaration_identity: FileIdentity,
+        declaration_security_descriptor_digest: PlatformHandle,
+    ) -> Result<Self, InstallationError> {
+        let mut value = Self {
+            wire: PlatformHandle::new(Self::WIRE).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "agent_bridge.binding.wire".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            stage_prepared,
+            staging_receipt_digest,
+            staged_destination_path,
+            staged_destination_identity,
+            staged_sha256,
+            staged_size,
+            profile_path,
+            profile_digest,
+            declaration_path,
+            declaration_digest,
+            pair_digest: PlatformHandle::new("pending").map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "agent_bridge.binding.pair_digest".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+        };
+        let _ = (
+            profile_identity,
+            profile_security_descriptor_digest,
+            declaration_identity,
+            declaration_security_descriptor_digest,
+        );
+        value.pair_digest = value.computed_pair_digest()?;
+        value.validate_prepared()?;
+        Ok(value)
+    }
+
+    /// Computes the domain-separated profile/declaration pair digest.
+    pub fn computed_pair_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        let bytes = canonical_json_bytes(&(
+            "eliot.host.agent-bridge.profile-declaration-pair.v1\0",
+            self.profile_path.as_str(),
+            self.profile_digest.as_str(),
+            self.declaration_path.as_str(),
+            self.declaration_digest.as_str(),
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "agent_bridge.binding.pair_digest".to_owned(),
+            reason: error.to_string(),
+        })?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+            field: "agent_bridge.binding.pair_digest".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// Validates the local stage and protected-pair proof before ACL
+    /// convergence. This is not sufficient for a final receipt.
+    pub(crate) fn validate_prepared(&self) -> Result<(), InstallationError> {
+        if self.wire.as_str() != Self::WIRE {
+            return Err(InstallationError::MigrationRequired {
+                reason: "agent-bridge Phase-B binding requires explicit re-stage".to_owned(),
+            });
+        }
+        self.stage_prepared.validate()?;
+        for (value, field) in [
+            (
+                &self.staging_receipt_digest,
+                "agent_bridge.staging_receipt_digest",
+            ),
+            (
+                &self.staged_destination_path,
+                "agent_bridge.staged_destination_path",
+            ),
+            (&self.profile_path, "agent_bridge.profile_path"),
+            (&self.declaration_path, "agent_bridge.declaration_path"),
+        ] {
+            handle(value, field)?;
+        }
+        for (value, field) in [
+            (
+                &self.staging_receipt_digest,
+                "agent_bridge.staging_receipt_digest",
+            ),
+            (&self.staged_sha256, "agent_bridge.staged_sha256"),
+            (&self.profile_digest, "agent_bridge.profile_digest"),
+            (&self.declaration_digest, "agent_bridge.declaration_digest"),
+            (&self.pair_digest, "agent_bridge.pair_digest"),
+        ] {
+            sha256_handle(value, field)?;
+        }
+        if self.staged_destination_identity.volume_serial_number == 0
+            || self.staged_destination_identity.file_index == 0
+            || self.staged_size == 0
+            || self.staged_size != self.stage_prepared.source_size
+            || self.staged_sha256 != self.stage_prepared.source_sha256
+            || self.pair_digest != self.computed_pair_digest()?
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.staged_destination_path != self.stage_prepared.destination_path {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Validates the prepared binding. A prepared binding cannot be used as a
+    /// final receipt because the final type is distinct.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        self.validate_prepared()
+    }
+
+    /// Attaches provider-owned convergence evidence to the prepared carrier.
+    /// Final consumers must still use the dedicated final validation path.
+    pub fn with_final_security(
+        &self,
+        approved_user_sid: &str,
+        host_state_root_path: PlatformHandle,
+        bridge_directory_path: PlatformHandle,
+        receipt: &PlatformAgentBridgeSecurityConvergenceReceipt,
+    ) -> Result<AgentBridgePhaseBBinding, InstallationError> {
+        AgentBridgePhaseBBinding::from_prepared_security(
+            self.clone(),
+            approved_user_sid,
+            host_state_root_path,
+            bridge_directory_path,
+            receipt,
+        )
+    }
+
+    /// Compares immutable prepared fields while ignoring provider ACL proof.
+    pub fn matches_prepared_core(&self, prepared: &Self) -> bool {
+        self.stage_prepared == prepared.stage_prepared
+            && self.staging_receipt_digest == prepared.staging_receipt_digest
+            && self.staged_destination_path == prepared.staged_destination_path
+            && self.staged_destination_identity == prepared.staged_destination_identity
+            && self.staged_sha256 == prepared.staged_sha256
+            && self.staged_size == prepared.staged_size
+            && self.profile_path == prepared.profile_path
+            && self.profile_digest == prepared.profile_digest
+            && self.declaration_path == prepared.declaration_path
+            && self.declaration_digest == prepared.declaration_digest
+    }
+
+    /// Validates all cross-record bindings against the exact pending Phase-B.
+    pub fn validate_against_phase_b(
+        &self,
+        intent: &HostPhaseBMaterializationIntent,
+        pending: &PendingActivation,
+    ) -> Result<(), InstallationError> {
+        self.validate_prepared()?;
+        self.stage_prepared
+            .validate_against_phase_b(intent, pending)?;
+        Ok(())
+    }
+
+    /// Joins the platform's prepared capability and final staging receipt
+    /// into the installation-owned proof persisted by Host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_platform(
+        prepared: &PlatformAgentBridgeStagePrepared,
+        receipt: &PlatformAgentBridgeStagingReceipt,
+        installation_id: PlatformHandle,
+        installation_plan_digest: PlatformHandle,
+        host_state_root_digest: PlatformHandle,
+        manifest_digest: PlatformHandle,
+        launch_descriptor_digest: PlatformHandle,
+        launch_generation: PlatformHandle,
+        profile_path: PlatformHandle,
+        profile_digest: PlatformHandle,
+        declaration_path: PlatformHandle,
+        declaration_digest: PlatformHandle,
+    ) -> Result<Self, InstallationError> {
+        if receipt.transaction_id != prepared.transaction_id
+            || receipt.effect_id != prepared.effect_id
+            || receipt.request_digest != prepared.request_digest
+            || receipt.destination_path != prepared.destination_path
+            || receipt.temporary_identity != prepared.temporary_identity
+            || receipt.sha256 != prepared.source_sha256
+            || receipt.size != prepared.source_size
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let stage = AgentBridgeStagePrepared::from_platform(
+            prepared,
+            installation_id,
+            installation_plan_digest,
+            host_state_root_digest,
+            manifest_digest,
+            launch_descriptor_digest,
+            launch_generation,
+        )?;
+        let receipt_digest = PlatformHandle::new(receipt.digest())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let destination_path = PlatformHandle::new(receipt.destination_path.to_string_lossy())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let staged_sha256 = PlatformHandle::new(&receipt.sha256)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let mut value = Self {
+            wire: PlatformHandle::new(Self::WIRE).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "agent_bridge.binding.wire".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+            stage_prepared: stage,
+            staging_receipt_digest: receipt_digest,
+            staged_destination_path: destination_path,
+            staged_destination_identity: receipt.destination_identity,
+            staged_sha256,
+            staged_size: receipt.size,
+            profile_path,
+            profile_digest,
+            declaration_path,
+            declaration_digest,
+            pair_digest: PlatformHandle::new("pending")
+                .map_err(|error| InstallationError::Platform(error.to_string()))?,
+        };
+        value.pair_digest = value.computed_pair_digest()?;
+        value.validate_prepared()?;
+        Ok(value)
+    }
+}
+
+/// Final Agent Bridge Phase-B proof. Unlike the prepared record, this public
+/// contract contains no optional security evidence: it can only be formed from
+/// a provider convergence receipt and is the sole binding accepted by final
+/// receipts and Host projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgePhaseBBinding {
+    /// Prepared immutable stage/content proof.
+    pub prepared: AgentBridgePreparedBinding,
+    /// Approved SID from the static profile.
+    pub approved_user_sid: PlatformHandle,
+    /// Profile object identity and final descriptor digest.
+    pub profile_identity: FileIdentity,
+    /// Profile descriptor digest observed after convergence.
+    pub profile_security_descriptor_digest: PlatformHandle,
+    /// Declaration object identity and final descriptor digest.
+    pub declaration_identity: FileIdentity,
+    /// Declaration descriptor digest observed after convergence.
+    pub declaration_security_descriptor_digest: PlatformHandle,
+    /// Root/child identity and descriptor contour.
+    pub security_contour: AgentBridgeSecurityContour,
+    /// Digest binding all prepared and final fields.
+    pub pair_digest: PlatformHandle,
+}
+
+impl std::ops::Deref for AgentBridgePhaseBBinding {
+    type Target = AgentBridgePreparedBinding;
+
+    fn deref(&self) -> &Self::Target {
+        &self.prepared
+    }
+}
+
+impl AgentBridgePhaseBBinding {
+    /// Current final bridge binding wire.
+    pub const WIRE: &'static str = AgentBridgePreparedBinding::WIRE;
+
+    /// Forms a final proof from the exact retained provider convergence readback.
+    pub fn from_prepared_security(
+        prepared: AgentBridgePreparedBinding,
+        approved_user_sid: &str,
+        host_state_root_path: PlatformHandle,
+        bridge_directory_path: PlatformHandle,
+        receipt: &PlatformAgentBridgeSecurityConvergenceReceipt,
+    ) -> Result<Self, InstallationError> {
+        let approved_user_sid = PlatformHandle::new(approved_user_sid)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let profile_security_descriptor_digest =
+            PlatformHandle::new(&receipt.profile_descriptor_sha256)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let declaration_security_descriptor_digest =
+            PlatformHandle::new(&receipt.declaration_descriptor_sha256)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let security_contour = AgentBridgeSecurityContour {
+            host_state_root_path,
+            host_state_root_identity: receipt.host_state_root_identity,
+            host_state_root_security_descriptor_digest: PlatformHandle::new(
+                &receipt.host_state_root_descriptor_sha256,
+            )
+            .map_err(|error| InstallationError::Platform(error.to_string()))?,
+            bridge_directory_path,
+            bridge_directory_identity: receipt.bridge_directory_identity,
+            bridge_directory_security_descriptor_digest: PlatformHandle::new(
+                &receipt.bridge_directory_descriptor_sha256,
+            )
+            .map_err(|error| InstallationError::Platform(error.to_string()))?,
+        };
+        let mut value = Self {
+            prepared,
+            approved_user_sid,
+            profile_identity: receipt.profile_identity,
+            profile_security_descriptor_digest,
+            declaration_identity: receipt.declaration_identity,
+            declaration_security_descriptor_digest,
+            security_contour,
+            pair_digest: PlatformHandle::new("pending")
+                .map_err(|error| InstallationError::Platform(error.to_string()))?,
+        };
+        value.pair_digest = value.computed_pair_digest()?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Computes the final pair digest.
+    pub fn computed_pair_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        let bytes = canonical_json_bytes(&(
+            "eliot.host.agent-bridge.final-pair.v1\0",
+            &self.prepared,
+            self.approved_user_sid.as_str(),
+            self.profile_identity,
+            self.profile_security_descriptor_digest.as_str(),
+            self.declaration_identity,
+            self.declaration_security_descriptor_digest.as_str(),
+            &self.security_contour,
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "agent_bridge.binding.pair_digest".to_owned(),
+            reason: error.to_string(),
+        })?;
+        PlatformHandle::new(sha256_hex(&bytes))
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Validates final-only security evidence and its immutable prepared core.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        self.prepared.validate_prepared()?;
+        if !self.approved_user_sid.as_str().starts_with("S-")
+            || self.profile_identity.volume_serial_number == 0
+            || self.profile_identity.file_index == 0
+            || self.declaration_identity.volume_serial_number == 0
+            || self.declaration_identity.file_index == 0
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "Agent Bridge final binding has incomplete identity evidence".to_owned(),
+            ));
+        }
+        sha256_handle(
+            &self.profile_security_descriptor_digest,
+            "agent_bridge.profile_security_descriptor_digest",
+        )?;
+        sha256_handle(
+            &self.declaration_security_descriptor_digest,
+            "agent_bridge.declaration_security_descriptor_digest",
+        )?;
+        sha256_handle(
+            &self
+                .security_contour
+                .host_state_root_security_descriptor_digest,
+            "agent_bridge.security_contour.host_state_root_security_descriptor_digest",
+        )?;
+        sha256_handle(
+            &self
+                .security_contour
+                .bridge_directory_security_descriptor_digest,
+            "agent_bridge.security_contour.bridge_directory_security_descriptor_digest",
+        )?;
+        sha256_handle(&self.pair_digest, "agent_bridge.binding.pair_digest")?;
+        if self.pair_digest != self.computed_pair_digest()? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Verifies the immutable prepared join without admitting a second final
+    /// security record.
+    pub fn matches_prepared_core(&self, prepared: &AgentBridgePreparedBinding) -> bool {
+        self.prepared == *prepared
+    }
+}
+
 /// Host-owned durable preparation record for one Phase-B publication.
 ///
 /// The record is committed before the first destination write.  It is the
@@ -2539,6 +3265,8 @@ pub struct HostPhaseBPreparedMaterialization {
     pub semantic_config_hash: PlatformHandle,
     /// Exact dynamic launch overlay consumed after readback.
     pub launch: RuntimeLaunchDescriptor,
+    /// Optional bridge stage/pair proof. `None` preserves legacy Phase-B.
+    pub agent_bridge: Option<AgentBridgePreparedBinding>,
     /// Digest of all prepared fields except this digest.
     pub prepared_digest: PlatformHandle,
 }
@@ -2550,7 +3278,7 @@ impl HostPhaseBPreparedMaterialization {
     /// persisted v1 preparation therefore cannot be replayed as a current
     /// proof after a Host restart; its discriminator is rejected before any
     /// destination readback or mutation.
-    pub const WIRE: &'static str = "eliot.host.phase-b-prepared.v3";
+    pub const WIRE: &'static str = "eliot.host.phase-b-prepared.v4";
 
     /// Recomputes the prepared record digest without its self-reference.
     pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
@@ -2578,6 +3306,7 @@ impl HostPhaseBPreparedMaterialization {
                 self.eliotd_descriptor_digest.as_str(),
                 self.semantic_config_hash.as_str(),
                 &self.launch,
+                &self.agent_bridge,
             ),
         ))
         .map_err(|error| InstallationError::InvalidField {
@@ -2663,6 +3392,9 @@ impl HostPhaseBPreparedMaterialization {
             });
         }
         self.launch.validate()?;
+        if let Some(bridge) = self.agent_bridge.as_ref() {
+            bridge.validate_prepared()?;
+        }
         if self.launch.authority_descriptor_digest != self.authority_descriptor_digest
             || self.launch.store_bootstrap_descriptor_digest
                 != self.store_bootstrap_descriptor_digest
@@ -2726,6 +3458,8 @@ pub struct PhaseBLiveBinding {
     /// Exact installer-provisioned public authority retained after Pending is
     /// consumed, so verifier-only processes never consult ambient state.
     pub provisioned_supervision_authority: ProvisionedSupervisionAuthority,
+    /// Final immutable bridge proof retained for active rebinds.
+    pub agent_bridge: Option<AgentBridgePhaseBBinding>,
 }
 
 impl PhaseBLiveBinding {
@@ -2785,7 +3519,11 @@ impl PhaseBLiveBinding {
             .map_err(|error| InstallationError::InvalidField {
                 field: "phase_b.provisioned_supervision_authority".to_owned(),
                 reason: error.to_string(),
-            })
+            })?;
+        if let Some(bridge) = self.agent_bridge.as_ref() {
+            bridge.validate()?;
+        }
+        Ok(())
     }
 
     /// Returns the exact public authority retained by the active registry
@@ -3120,6 +3858,8 @@ pub struct ActivePhaseBRebindReceipt {
     pub store_bootstrap_descriptor_digest: PlatformHandle,
     /// Exact eliotd descriptor readback digest.
     pub eliotd_descriptor_digest: PlatformHandle,
+    /// Final bridge proof carried through active rebind.
+    pub agent_bridge: Option<AgentBridgePhaseBBinding>,
     /// Digest of all receipt fields except this digest.
     pub receipt_digest: PlatformHandle,
 }
@@ -3132,6 +3872,16 @@ impl ActivePhaseBRebindReceipt {
     pub fn from_prepared(
         intent: &ActivePhaseBRebindIntent,
         prepared: &HostPhaseBPreparedMaterialization,
+    ) -> Result<Self, InstallationError> {
+        Self::from_prepared_with_bridge(intent, prepared, None)
+    }
+
+    /// Constructs an exact rebind receipt while carrying forward the prior
+    /// final Agent Bridge proof when the prepared contour contains one.
+    pub fn from_prepared_with_bridge(
+        intent: &ActivePhaseBRebindIntent,
+        prepared: &HostPhaseBPreparedMaterialization,
+        prior_bridge: Option<&AgentBridgePhaseBBinding>,
     ) -> Result<Self, InstallationError> {
         let mut value = Self {
             wire: PlatformHandle::new(Self::WIRE).map_err(|error| {
@@ -3153,6 +3903,7 @@ impl ActivePhaseBRebindReceipt {
             config_file_digest: prepared.config_file_digest.clone(),
             store_bootstrap_descriptor_digest: prepared.store_bootstrap_descriptor_digest.clone(),
             eliotd_descriptor_digest: prepared.eliotd_descriptor_digest.clone(),
+            agent_bridge: prior_bridge.cloned(),
             receipt_digest: PlatformHandle::new("pending").map_err(|error| {
                 InstallationError::InvalidField {
                     field: "active_phase_b_rebind.receipt.receipt_digest".to_owned(),
@@ -3236,6 +3987,9 @@ impl ActivePhaseBRebindReceipt {
                 reason: "must be non-zero".to_owned(),
             });
         }
+        if let Some(bridge) = self.agent_bridge.as_ref() {
+            bridge.validate()?;
+        }
         if self.receipt_digest != active_phase_b_rebind_receipt_digest(self)? {
             return Err(InstallationError::IdentityConflict);
         }
@@ -3264,6 +4018,11 @@ impl ActivePhaseBRebindReceipt {
             || self.config_file_digest != prepared.config_file_digest
             || self.store_bootstrap_descriptor_digest != prepared.store_bootstrap_descriptor_digest
             || self.eliotd_descriptor_digest != prepared.eliotd_descriptor_digest
+            || self
+                .agent_bridge
+                .as_ref()
+                .map(|bridge| bridge.prepared.clone())
+                != prepared.agent_bridge
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -3289,6 +4048,7 @@ fn active_phase_b_rebind_receipt_digest(
         value.config_file_digest.as_str(),
         value.store_bootstrap_descriptor_digest.as_str(),
         value.eliotd_descriptor_digest.as_str(),
+        &value.agent_bridge,
     ))
     .map_err(|error| InstallationError::InvalidField {
         field: "active_phase_b_rebind.receipt.receipt_digest".to_owned(),
@@ -4157,6 +4917,12 @@ pub struct PendingActivation {
     /// Host-owned preparation record committed before the first Phase-B
     /// destination write. It is required for restart readback/adoption.
     pub phase_b_prepared: Option<HostPhaseBPreparedMaterialization>,
+    /// Durable prepared receipt, distinct from the final receipt below.
+    pub phase_b_prepared_receipt: Option<HostPhaseBPreparedReceipt>,
+    /// Durable bridge stage proof committed after the auxiliary `CREATE_NEW`
+    /// and before any final publication. It closes the crash/response-loss
+    /// window without allowing recovery to adopt foreign bytes.
+    pub phase_b_agent_bridge_stage_prepared: Option<AgentBridgeStagePrepared>,
     /// Secret-free Host Phase-B receipt durably persisted before Host starts
     /// the pending generation. This is query/reconcile evidence only; it does
     /// not make the pending registry generation active.
@@ -4817,6 +5583,38 @@ impl RedbInstallationRegistry {
         })
     }
 
+    /// Atomically records the prepared Phase-B receipt. This is a distinct
+    /// durable state and cannot satisfy the final receipt field.
+    pub fn record_pending_phase_b_prepared_receipt(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        approval: &InstallationActivationApproval,
+        receipt: &HostPhaseBPreparedReceipt,
+    ) -> Result<HostPhaseBPreparedReceipt, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        approval.validate()?;
+        receipt.validate()?;
+        let approval = approval.clone();
+        let receipt = receipt.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            let pending = registry.pending_activation.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            if pending.approval != approval
+                || receipt.transaction_id != pending.transaction_id
+                || receipt.candidate_manifest_digest != pending.manifest_digest
+                || pending.phase_b_prepared.is_none()
+                || pending.phase_b_receipt.is_some()
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            registry.record_pending_phase_b_prepared_receipt_unchecked(&receipt)
+        })
+    }
+
     /// Atomically records the exact secret-free Phase-B intent before Host
     /// materializes any destination. The intent is a projection of the sole
     /// installation transaction and is never an activation approval.
@@ -4915,6 +5713,67 @@ impl RedbInstallationRegistry {
                 return Err(InstallationError::IdentityConflict);
             }
             registry.record_pending_phase_b_prepared_unchecked(&prepared)
+        })
+    }
+
+    /// Atomically records the exact auxiliary Agent Bridge stage proof after
+    /// `CREATE_NEW` and before publication. This is the durable recovery carrier
+    /// for a crash or lost response in that interval; it never adopts bytes.
+    pub fn record_pending_phase_b_agent_bridge_stage_prepared(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        approval: &InstallationActivationApproval,
+        stage: &AgentBridgeStagePrepared,
+    ) -> Result<AgentBridgeStagePrepared, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        approval.validate()?;
+        stage.validate()?;
+        let approval = approval.clone();
+        let stage = stage.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            let pending = registry.pending_activation.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            if pending.approval != approval {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let intent = pending.phase_b_intent.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "Agent Bridge stage proof requires a pending Phase-B intent".to_owned(),
+                )
+            })?;
+            stage.validate_against_phase_b(intent, pending)?;
+            registry.record_pending_phase_b_agent_bridge_stage_prepared_unchecked(&stage)
+        })
+    }
+
+    /// Clears one exact stage proof only during rollback, before a prepared or
+    /// final Phase-B receipt exists. Final receipts retain the same proof.
+    pub fn clear_pending_phase_b_agent_bridge_stage_prepared(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        approval: &InstallationActivationApproval,
+        stage: &AgentBridgeStagePrepared,
+    ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        approval.validate()?;
+        stage.validate()?;
+        let approval = approval.clone();
+        let stage = stage.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            let pending = registry.pending_activation.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+            })?;
+            if pending.approval != approval {
+                return Err(InstallationError::IdentityConflict);
+            }
+            registry.clear_pending_phase_b_agent_bridge_stage_prepared_unchecked(&stage)
         })
     }
 
@@ -5299,6 +6158,14 @@ impl ApprovedGenerationRegistry {
         self.revision
     }
 
+    /// Returns the exact durable stage proof currently carried by Pending.
+    #[must_use]
+    pub fn pending_phase_b_agent_bridge_stage_prepared(&self) -> Option<&AgentBridgeStagePrepared> {
+        self.pending_activation
+            .as_ref()
+            .and_then(|pending| pending.phase_b_agent_bridge_stage_prepared.as_ref())
+    }
+
     /// Looks up one exact role approval for a generation without exposing a
     /// mutation seam.
     #[must_use]
@@ -5385,6 +6252,8 @@ impl ApprovedGenerationRegistry {
             approval,
             phase_b_intent: None,
             phase_b_prepared: None,
+            phase_b_prepared_receipt: None,
+            phase_b_agent_bridge_stage_prepared: None,
             phase_b_receipt: None,
             state: PendingActivationState::Pending,
         };
@@ -5567,9 +6436,81 @@ impl ApprovedGenerationRegistry {
         {
             return Err(InstallationError::IdentityConflict);
         }
+        let intent = pending
+            .phase_b_intent
+            .as_ref()
+            .ok_or(InstallationError::IdentityConflict)?;
+        let prepared_stage = pending.phase_b_agent_bridge_stage_prepared.as_ref();
+        match (prepared_stage, receipt.agent_bridge.as_ref()) {
+            (None, None) if intent.agent_bridge_source.is_none() => {}
+            (Some(stage), Some(bridge))
+                if intent.agent_bridge_source.is_some()
+                    && bridge.stage_prepared == *stage
+                    && bridge.validate_against_phase_b(intent, pending).is_ok() =>
+            {
+                // The final receipt now retains the exact stage proof; clear
+                // only the pre-publication carrier at this terminal boundary.
+            }
+            _ => return Err(InstallationError::IdentityConflict),
+        }
+        pending.phase_b_agent_bridge_stage_prepared = None;
+        pending.phase_b_prepared_receipt = None;
         pending.phase_b_receipt = Some(receipt.clone());
         let recorded = pending
             .phase_b_receipt
+            .clone()
+            .ok_or(InstallationError::IdentityConflict)?;
+        self.validate()?;
+        Ok(recorded)
+    }
+
+    fn record_pending_phase_b_prepared_receipt_unchecked(
+        &mut self,
+        receipt: &HostPhaseBPreparedReceipt,
+    ) -> Result<HostPhaseBPreparedReceipt, InstallationError> {
+        self.validate()?;
+        let pending = self.pending_activation.as_mut().ok_or_else(|| {
+            InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+        })?;
+        if !matches!(pending.state, PendingActivationState::Pending)
+            || pending.phase_b_intent.is_none()
+            || pending.phase_b_prepared.is_none()
+            || pending.phase_b_receipt.is_some()
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "prepared receipt requires pending Phase-B preparation".to_owned(),
+            ));
+        }
+        if pending
+            .phase_b_prepared_receipt
+            .as_ref()
+            .is_some_and(|existing| existing != receipt)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let Some(prepared) = pending.phase_b_prepared.as_ref() else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        let expected_authority = prepared.launch.provisioned_supervision_authority()?;
+        if receipt.transaction_id != pending.transaction_id
+            || receipt.effect_id != prepared.effect_id
+            || receipt.candidate_manifest_digest != prepared.manifest_digest
+            || receipt.request_digest != prepared.request_digest
+            || receipt.host_owner_epoch != prepared.host_owner_epoch
+            || receipt.host_process_identity != prepared.host_process_identity
+            || receipt.authority_descriptor_digest != prepared.authority_descriptor_digest
+            || receipt.config_file_digest != prepared.config_file_digest
+            || receipt.store_bootstrap_descriptor_digest
+                != prepared.store_bootstrap_descriptor_digest
+            || receipt.eliotd_descriptor_digest != prepared.eliotd_descriptor_digest
+            || receipt.provisioned_supervision_authority != *expected_authority
+            || receipt.agent_bridge != prepared.agent_bridge
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        pending.phase_b_prepared_receipt = Some(receipt.clone());
+        let recorded = pending
+            .phase_b_prepared_receipt
             .clone()
             .ok_or(InstallationError::IdentityConflict)?;
         self.validate()?;
@@ -5640,6 +6581,58 @@ impl ApprovedGenerationRegistry {
         Ok(recorded)
     }
 
+    fn record_pending_phase_b_agent_bridge_stage_prepared_unchecked(
+        &mut self,
+        stage: &AgentBridgeStagePrepared,
+    ) -> Result<AgentBridgeStagePrepared, InstallationError> {
+        self.validate()?;
+        let pending = self.pending_activation.as_mut().ok_or_else(|| {
+            InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+        })?;
+        if !matches!(pending.state, PendingActivationState::Pending)
+            || pending.phase_b_intent.is_none()
+            || pending.phase_b_prepared.is_some()
+            || pending.phase_b_receipt.is_some()
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "Agent Bridge stage proof requires an intent before Phase-B preparation".to_owned(),
+            ));
+        }
+        if pending
+            .phase_b_agent_bridge_stage_prepared
+            .as_ref()
+            .is_some_and(|existing| existing != stage)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        pending.phase_b_agent_bridge_stage_prepared = Some(stage.clone());
+        let recorded = pending
+            .phase_b_agent_bridge_stage_prepared
+            .clone()
+            .ok_or(InstallationError::IdentityConflict)?;
+        self.validate()?;
+        Ok(recorded)
+    }
+
+    fn clear_pending_phase_b_agent_bridge_stage_prepared_unchecked(
+        &mut self,
+        stage: &AgentBridgeStagePrepared,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        let pending = self.pending_activation.as_mut().ok_or_else(|| {
+            InstallationError::IncompleteObservation("no pending activation exists".to_owned())
+        })?;
+        if pending.phase_b_agent_bridge_stage_prepared.as_ref() != Some(stage)
+            || pending.phase_b_prepared.is_some()
+            || pending.phase_b_receipt.is_some()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        pending.phase_b_agent_bridge_stage_prepared = None;
+        self.validate()?;
+        Ok(())
+    }
+
     fn clear_pending_phase_b_prepared_unchecked(
         &mut self,
         prepared: &HostPhaseBPreparedMaterialization,
@@ -5669,6 +6662,7 @@ impl ApprovedGenerationRegistry {
             return Err(InstallationError::IdentityConflict);
         }
         pending.phase_b_intent = None;
+        pending.phase_b_agent_bridge_stage_prepared = None;
         self.validate()?;
         Ok(())
     }
@@ -6606,6 +7600,15 @@ impl PendingActivation {
                 return Err(InstallationError::IdentityConflict);
             }
         }
+        if let Some(stage) = &self.phase_b_agent_bridge_stage_prepared {
+            let Some(intent) = self.phase_b_intent.as_ref() else {
+                return Err(InstallationError::IdentityConflict);
+            };
+            if intent.agent_bridge_source.is_none() {
+                return Err(InstallationError::IdentityConflict);
+            }
+            stage.validate_against_phase_b(intent, self)?;
+        }
         if let Some(prepared) = &self.phase_b_prepared {
             if self.manifest.runtime_launch.profile != InstallationProfile::SystemService {
                 return Err(InstallationError::ProfileViolation(
@@ -6630,6 +7633,43 @@ impl PendingActivation {
             {
                 return Err(InstallationError::IdentityConflict);
             }
+            match (
+                &intent.agent_bridge_source,
+                &self.phase_b_agent_bridge_stage_prepared,
+                &prepared.agent_bridge,
+            ) {
+                (None, None, None) => {}
+                (Some(_), Some(stage), Some(bridge)) if bridge.stage_prepared == *stage => {
+                    bridge.validate_against_phase_b(intent, self)?;
+                }
+                _ => return Err(InstallationError::IdentityConflict),
+            }
+        }
+        if let Some(receipt) = &self.phase_b_prepared_receipt {
+            receipt.validate()?;
+            let Some(prepared) = self.phase_b_prepared.as_ref() else {
+                return Err(InstallationError::IdentityConflict);
+            };
+            if receipt.transaction_id != self.transaction_id
+                || receipt.candidate_manifest_digest != self.manifest_digest
+                || receipt.effect_id != prepared.effect_id
+                || receipt.request_digest != prepared.request_digest
+                || receipt.host_owner_epoch != prepared.host_owner_epoch
+                || receipt.host_process_identity != prepared.host_process_identity
+                || receipt.authority_descriptor_digest != prepared.authority_descriptor_digest
+                || receipt.config_file_digest != prepared.config_file_digest
+                || receipt.store_bootstrap_descriptor_digest
+                    != prepared.store_bootstrap_descriptor_digest
+                || receipt.eliotd_descriptor_digest != prepared.eliotd_descriptor_digest
+                || receipt.provisioned_supervision_authority
+                    != prepared.launch.provisioned_supervision_authority()?.clone()
+                || receipt.agent_bridge != prepared.agent_bridge
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if self.phase_b_receipt.is_some() {
+                return Err(InstallationError::IdentityConflict);
+            }
         }
         if let Some(receipt) = &self.phase_b_receipt {
             if self.manifest.runtime_launch.profile != InstallationProfile::SystemService {
@@ -6646,13 +7686,31 @@ impl PendingActivation {
             let Some(intent) = self.phase_b_intent.as_ref() else {
                 return Err(InstallationError::IdentityConflict);
             };
-            if self.phase_b_prepared.is_none() {
+            if self.phase_b_prepared.is_none() || self.phase_b_agent_bridge_stage_prepared.is_some()
+            {
                 return Err(InstallationError::IdentityConflict);
             }
             if receipt.effect_id != intent.effect_id
                 || receipt.request_digest != intent.request_digest
             {
                 return Err(InstallationError::IdentityConflict);
+            }
+            let prepared_bridge = self
+                .phase_b_prepared
+                .as_ref()
+                .and_then(|prepared| prepared.agent_bridge.as_ref());
+            match (
+                &intent.agent_bridge_source,
+                prepared_bridge,
+                receipt.agent_bridge.as_ref(),
+            ) {
+                (None, None, None) => {}
+                (Some(_), Some(prepared_bridge), Some(receipt_bridge))
+                    if receipt_bridge.matches_prepared_core(prepared_bridge) =>
+                {
+                    receipt_bridge.validate_against_phase_b(intent, self)?;
+                }
+                _ => return Err(InstallationError::IdentityConflict),
             }
         }
         if let PendingActivationState::RecoveryRequired { reason } = &self.state {
@@ -7892,6 +8950,7 @@ impl WindowsInstallationEffectPort {
             })
             .flatten(),
             phase_b: None,
+            phase_b_final: None,
         };
         value
             .validate()
@@ -7915,6 +8974,7 @@ impl WindowsInstallationEffectPort {
             watchdog_selector_digest,
             supervision_authority,
             provision,
+            agent_bridge_source,
             ..
         } = &request.plan
         else {
@@ -7988,6 +9048,7 @@ impl WindowsInstallationEffectPort {
             host_state_root_digest.clone(),
             static_template.clone(),
             watchdog_selector_digest.clone(),
+            agent_bridge_source.clone(),
             provisioned_supervision_authority,
         )
         .map_err(|_| PortError::InvalidRequestMetadata)?;
@@ -8004,6 +9065,7 @@ impl WindowsInstallationEffectPort {
             ownership_key: Vec::new(),
             expected_receipt: Some(receipt.clone()),
             phase_b: Some(phase_b),
+            phase_b_final: None,
         };
         value
             .validate()
@@ -8011,6 +9073,13 @@ impl WindowsInstallationEffectPort {
         Ok(value)
     }
 
+    #[allow(
+        clippy::manual_let_else,
+        clippy::match_same_arms,
+        clippy::needless_return,
+        clippy::too_many_lines,
+        reason = "the two-phase provider handoff keeps validation, convergence and FinalizePhaseB together"
+    )]
     fn call_phase_b_host(
         &self,
         request: &InstallationEffectRequest,
@@ -8021,7 +9090,27 @@ impl WindowsInstallationEffectPort {
             Err(error) => return PortOutcome::Error(error),
         };
         match self.call_credential_host(&host_request) {
-            Ok(HostCredentialControlResponse::PhaseBReady { receipt }) => {
+            Ok(HostCredentialControlResponse::PhaseBReady { receipt })
+                if operation == HostCredentialControlOperation::ReconcilePhaseB =>
+            {
+                return if receipt.validate().is_ok() {
+                    PortOutcome::Known(*receipt)
+                } else {
+                    PortOutcome::Unknown(UnknownReason::Indeterminate)
+                };
+            }
+            Ok(HostCredentialControlResponse::PhaseBReady { .. })
+                if operation == HostCredentialControlOperation::MaterializePhaseB =>
+            {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            }
+            Ok(HostCredentialControlResponse::PhaseBPrepared { receipt })
+                if matches!(
+                    operation,
+                    HostCredentialControlOperation::MaterializePhaseB
+                        | HostCredentialControlOperation::ReconcilePhaseB
+                ) =>
+            {
                 let Some(intent) = host_request.phase_b.as_ref() else {
                     return PortOutcome::Unknown(UnknownReason::Indeterminate);
                 };
@@ -8035,7 +9124,106 @@ impl WindowsInstallationEffectPort {
                 {
                     return PortOutcome::Unknown(UnknownReason::Indeterminate);
                 }
-                PortOutcome::Known(*receipt)
+                let mut final_bridge = None;
+                if let Some(source) = intent.agent_bridge_source.as_ref() {
+                    let Some(binding) = receipt.agent_bridge.as_ref() else {
+                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    };
+                    let Some(bridge_directory) = Path::new(binding.profile_path.as_str()).parent()
+                    else {
+                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    };
+                    let Some(host_state_root) = bridge_directory.parent() else {
+                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    };
+                    let acl = eliot_platform_windows::converge_agent_bridge_security(
+                        host_state_root,
+                        &source.approved_user_sid,
+                        Path::new(binding.profile_path.as_str()),
+                        Path::new(binding.declaration_path.as_str()),
+                    );
+                    let Ok(acl) = acl else {
+                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    };
+                    let root_handle = PlatformHandle::new(host_state_root.to_string_lossy());
+                    let child_handle = PlatformHandle::new(bridge_directory.to_string_lossy());
+                    let (Ok(root_handle), Ok(child_handle)) = (root_handle, child_handle) else {
+                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    };
+                    let Ok(final_binding) = binding.with_final_security(
+                        &source.approved_user_sid,
+                        root_handle,
+                        child_handle,
+                        &acl,
+                    ) else {
+                        return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                    };
+                    final_bridge = Some(final_binding);
+                }
+                let mut final_receipt = HostPhaseBMaterializationReceipt {
+                    wire: PlatformHandle::new(HostPhaseBMaterializationReceipt::WIRE)
+                        .map_err(|_| PortError::InvalidRequestMetadata)
+                        .ok()
+                        .unwrap_or_else(|| unreachable!()),
+                    transaction_id: receipt.transaction_id.clone(),
+                    effect_id: receipt.effect_id.clone(),
+                    candidate_manifest_digest: receipt.candidate_manifest_digest.clone(),
+                    request_digest: receipt.request_digest.clone(),
+                    host_owner_epoch: receipt.host_owner_epoch.clone(),
+                    host_process_identity: receipt.host_process_identity.clone(),
+                    authority_descriptor_digest: receipt.authority_descriptor_digest.clone(),
+                    config_file_digest: receipt.config_file_digest.clone(),
+                    store_bootstrap_descriptor_digest: receipt
+                        .store_bootstrap_descriptor_digest
+                        .clone(),
+                    eliotd_descriptor_digest: receipt.eliotd_descriptor_digest.clone(),
+                    provisioned_supervision_authority: receipt
+                        .provisioned_supervision_authority
+                        .clone(),
+                    agent_bridge: final_bridge,
+                    receipt_digest: PlatformHandle::new("pending")
+                        .map_err(|_| PortError::InvalidRequestMetadata)
+                        .ok()
+                        .unwrap_or_else(|| unreachable!()),
+                };
+                final_receipt.receipt_digest = match final_receipt.computed_digest() {
+                    Ok(digest) => digest,
+                    Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+                };
+                if final_receipt.validate().is_err() {
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                }
+                let Some(phase_b) = host_request.phase_b.clone() else {
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                };
+                let finalize_intent = match HostCredentialControlIntent::new(
+                    HostCredentialControlOperation::FinalizePhaseB,
+                    host_request.intent.transaction_id.clone(),
+                    host_request.intent.effect_id.clone(),
+                    host_request.intent.provision.clone(),
+                    host_request.intent.installation_plan_digest.clone(),
+                ) {
+                    Ok(value) => value,
+                    Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+                };
+                let finalize_request = HostCredentialControlRequest {
+                    intent: finalize_intent,
+                    ownership_key: Vec::new(),
+                    expected_receipt: host_request.expected_receipt.clone(),
+                    phase_b: Some(phase_b),
+                    phase_b_final: Some(Box::new(final_receipt)),
+                };
+                if finalize_request.validate().is_err() {
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                }
+                match self.call_credential_host(&finalize_request) {
+                    Ok(HostCredentialControlResponse::PhaseBReady { receipt })
+                        if receipt.validate().is_ok() =>
+                    {
+                        PortOutcome::Known(*receipt)
+                    }
+                    Ok(_) | Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+                }
             }
             Ok(HostCredentialControlResponse::Unknown { .. }) => {
                 PortOutcome::Unknown(UnknownReason::Indeterminate)
@@ -8197,17 +9385,15 @@ impl WindowsInstallationEffectPort {
                             HostCredentialControlResponse::Matching { receipt } => {
                                 receipt.host_process_identity == host_process_digest
                             }
+                            HostCredentialControlResponse::PhaseBPrepared { receipt } => {
+                                receipt.host_process_identity == host_process_digest
+                            }
+                            HostCredentialControlResponse::PhaseBReady { receipt } => {
+                                receipt.host_process_identity == host_process_digest
+                            }
                             HostCredentialControlResponse::Deleted { .. } => {
                                 request.expected_receipt.as_ref().is_some_and(|receipt| {
                                     receipt.host_process_identity == host_process_digest
-                                })
-                            }
-                            HostCredentialControlResponse::PhaseBReady { receipt } => {
-                                request.phase_b.as_ref().is_some_and(|intent| {
-                                    receipt.request_digest == intent.request_digest
-                                        && (request.intent.operation
-                                            == HostCredentialControlOperation::ReconcilePhaseB
-                                            || receipt.host_process_identity == host_process_digest)
                                 })
                             }
                             HostCredentialControlResponse::Unknown { .. } => true,
@@ -8972,7 +10158,10 @@ impl WindowsInstallationEffectPort {
                     service_runtime_lineage: None,
                 })
             }
-            HostCredentialControlResponse::PhaseBReady { .. } => Err(PortError::IdentityConflict),
+            HostCredentialControlResponse::PhaseBReady { .. }
+            | HostCredentialControlResponse::PhaseBPrepared { .. } => {
+                Err(PortError::IdentityConflict)
+            }
             HostCredentialControlResponse::Unknown { pending_ref } => {
                 Ok(InstallationEffectObservation::Mismatch { pending_ref })
             }

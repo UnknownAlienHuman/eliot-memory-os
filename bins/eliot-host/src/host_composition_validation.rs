@@ -52,6 +52,7 @@ impl HostComposition {
                 .provisioned_supervision_authority()
                 .map_err(HostError::Installation)?
                 .clone(),
+            agent_bridge: receipt.agent_bridge.clone(),
         })
     }
 

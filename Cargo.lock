@@ -633,11 +633,16 @@ name = "eliot-agent-bridge"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-bridge-core",
- "eliot-cli",
+ "eliot-contracts",
+ "eliot-ipc",
+ "eliot-platform-windows",
  "eliot-protocol",
+ "eliot-receipts",
  "eliot-runtime",
+ "eliot-runtime-contracts",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1414,6 +1419,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "windows-service",
 ]
 
 [[package]]
@@ -2272,6 +2278,7 @@ dependencies = [
 name = "eliot-workscope"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-security-contracts",
  "schemars",
  "serde",

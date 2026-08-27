@@ -30,7 +30,8 @@ use tokio::task::JoinSet;
 use eliot_contracts::sha256_hex;
 #[cfg(windows)]
 use eliot_platform_windows::{
-    NamedPipePeerProcessBinding, ProtectedRuntimePathLease, UserOwnedPathLease, UserOwnedRootLease,
+    NamedPipePeerKind, NamedPipePeerProcessBinding, NamedPipePeerSelection,
+    ProtectedRuntimePathLease, UserOwnedPathLease, UserOwnedRootLease,
     current_process_named_pipe_expectation, observe_named_pipe_peer_process,
 };
 #[cfg(windows)]
@@ -285,7 +286,12 @@ async fn main() {
             Ok(expectation) => expectation,
             Err(error) => exit_error("PRINCIPAL_FAILURE", &error.to_string()),
         };
-        let mut front_door = match kernel.bind_authenticated_front_door() {
+        let (mut peer_set_revision, mut peer_set) =
+            match kernel.front_door_peer_set_snapshot(&principal) {
+                Ok(snapshot) => snapshot,
+                Err(error) => exit_build_error(&error),
+            };
+        let mut front_door = match kernel.bind_authenticated_front_door_with_peer_set(&peer_set) {
             Ok(server) => server,
             Err(error) => exit_build_error(&error),
         };
@@ -307,23 +313,62 @@ async fn main() {
                     }
                     break;
                 }
-                result = front_door.wait_for_authenticated_client(
+                _ = kernel.wait_for_agent_bridge_peer_set_revision(peer_set_revision) => {
+                    let (next_revision, next_peers) = match kernel.front_door_peer_set_snapshot(&principal) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            write_error("FRONT_DOOR_FAILURE", &error.to_string());
+                            break;
+                        }
+                    };
+                    let next_front_door = match kernel.bind_authenticated_front_door_next_with_peer_set(&next_peers) {
+                        Ok(server) => server,
+                        Err(error) => {
+                            write_error("FRONT_DOOR_FAILURE", &error.to_string());
+                            break;
+                        }
+                    };
+                    drop(front_door);
+                    front_door = next_front_door;
+                    peer_set = next_peers;
+                    peer_set_revision = next_revision;
+                }
+                result = front_door.wait_for_authenticated_client_with_peer_set(
                     std::time::Duration::from_hours(24),
-                    &principal,
+                    &peer_set,
                 ) => {
-                    if let Err(error) = result {
+                    let selection = match result {
+                        Ok(selection) => selection,
+                        Err(error) => {
                         write_error("FRONT_DOOR_FAILURE", &error.to_string());
                         drop(front_door);
-                        front_door = match kernel.bind_authenticated_front_door_next() {
+                        let (next_revision, next_peers) = match kernel.front_door_peer_set_snapshot(&principal) {
+                            Ok(snapshot) => snapshot,
+                            Err(bind_error) => {
+                                write_error("FRONT_DOOR_FAILURE", &bind_error.to_string());
+                                break;
+                            }
+                        };
+                        front_door = match kernel.bind_authenticated_front_door_next_with_peer_set(&next_peers) {
                             Ok(server) => server,
                             Err(bind_error) => {
                                 write_error("FRONT_DOOR_FAILURE", &bind_error.to_string());
                                 break;
                             }
                         };
+                        peer_set = next_peers;
+                        peer_set_revision = next_revision;
                         continue;
-                    }
-                    let replacement = match kernel.bind_authenticated_front_door_next() {
+                        }
+                    };
+                    let (replacement_revision, replacement_peers) = match kernel.front_door_peer_set_snapshot(&principal) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            write_error("FRONT_DOOR_FAILURE", &error.to_string());
+                            break;
+                        }
+                    };
+                    let replacement = match kernel.bind_authenticated_front_door_next_with_peer_set(&replacement_peers) {
                         Ok(server) => server,
                         Err(error) => {
                             write_error("FRONT_DOOR_FAILURE", &error.to_string());
@@ -331,6 +376,8 @@ async fn main() {
                         }
                     };
                     let accepted_server = std::mem::replace(&mut front_door, replacement);
+                    peer_set = replacement_peers;
+                    peer_set_revision = replacement_revision;
                     let Some(permit) = permits.clone().try_acquire_owned().ok() else {
                         drop(accepted_server);
                         continue;
@@ -342,6 +389,7 @@ async fn main() {
                             task_kernel,
                             accepted_server,
                             task_shutdown,
+                            selection,
                         ))
                         .await;
                         drop(permit);
@@ -384,15 +432,22 @@ async fn serve_connection(
     kernel: Arc<KernelComposition>,
     mut front_door: NamedPipeServer,
     mut shutdown: watch::Receiver<bool>,
+    selection: NamedPipePeerSelection,
 ) -> Result<(), TransportError> {
     let limits = kernel.ipc_limits();
+    let peer = front_door.peer_identity().clone();
+    if selection.kind() == NamedPipePeerKind::AgentBridge {
+        return Box::pin(serve_agent_bridge_connection(
+            kernel, front_door, shutdown, selection, peer,
+        ))
+        .await;
+    }
     let Some(client_frame) =
         receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await?
     else {
         return Ok(());
     };
     let connection_id = client_frame.connection_id.clone();
-    let peer = front_door.peer_identity().clone();
     if decode_control_request_frame(&client_frame).is_ok() {
         return Box::pin(serve_control_connection(
             kernel,
@@ -487,6 +542,96 @@ async fn serve_connection(
                 result?;
                 return Ok(());
             }
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn serve_agent_bridge_connection(
+    kernel: Arc<KernelComposition>,
+    mut front_door: NamedPipeServer,
+    mut shutdown: watch::Receiver<bool>,
+    selection: NamedPipePeerSelection,
+    peer: eliot_ipc::PeerIdentity,
+) -> Result<(), TransportError> {
+    let limits = kernel.ipc_limits();
+    let Ok(handshake) = kernel.begin_agent_bridge(&selection, peer) else {
+        // A peer-set match is transport admission only. Until the exact
+        // promoted Ready profile is present, close without a legacy
+        // client-first rejection or semantic response.
+        return Ok(());
+    };
+    let connection_id = handshake.connection_id.clone();
+    if let Err(error) = send_checked(&mut front_door, &handshake.challenge_frame, limits).await {
+        kernel.revoke_agent_bridge(&connection_id);
+        return Err(error);
+    }
+    let hello = match receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await {
+        Err(error) => {
+            kernel.revoke_agent_bridge(&connection_id);
+            return Err(error);
+        }
+        Ok(Some(frame)) => frame,
+        Ok(None) => {
+            kernel.revoke_agent_bridge(&connection_id);
+            return Ok(());
+        }
+    };
+    if let Err(error) = kernel.accept_agent_bridge_hello(&connection_id, &hello) {
+        kernel.revoke_agent_bridge(&connection_id);
+        return Err(error);
+    }
+    let receipt_frame = match kernel.agent_bridge_admission_receipt_frame(&connection_id) {
+        Ok(frame) => frame,
+        Err(error) => {
+            kernel.revoke_agent_bridge(&connection_id);
+            return Err(error);
+        }
+    };
+    if let Err(error) = send_checked(&mut front_door, &receipt_frame, limits).await {
+        kernel.revoke_agent_bridge(&connection_id);
+        return Err(error);
+    }
+    let request = match receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await {
+        Err(error) => {
+            kernel.revoke_agent_bridge(&connection_id);
+            return Err(error);
+        }
+        Ok(Some(frame)) => frame,
+        Ok(None) => {
+            kernel.revoke_agent_bridge(&connection_id);
+            return Ok(());
+        }
+    };
+    let response = match kernel
+        .await_agent_bridge_activation_response(&connection_id, &request)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            kernel.revoke_agent_bridge(&connection_id);
+            return Err(error);
+        }
+    };
+    if let Err(error) = send_checked(&mut front_door, &response, limits).await {
+        kernel.revoke_agent_bridge(&connection_id);
+        return Err(error);
+    }
+    // Keep the Kernel-owned Session retained until the bridge disconnects or
+    // the owner explicitly revokes it. A successful response is not a
+    // disconnect boundary.
+    match receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await {
+        Ok(None) => {
+            kernel.revoke_agent_bridge(&connection_id);
+            Ok(())
+        }
+        Ok(Some(_)) => {
+            kernel.revoke_agent_bridge(&connection_id);
+            Err(TransportError::SessionFenced)
+        }
+        Err(error) => {
+            kernel.revoke_agent_bridge(&connection_id);
+            Err(error)
         }
     }
 }

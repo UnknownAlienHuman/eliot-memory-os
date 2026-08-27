@@ -14,6 +14,8 @@ use std::io::{Read, Write};
 #[cfg(windows)]
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,12 @@ pub const MAX_PE_HEADER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_AUTHENTICODE_CERT_DER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AUTHENTICODE_PROVIDER_CHAIN_ELEMENTS: u32 = 1024;
+#[cfg(test)]
+const AGENT_BRIDGE_FAIL_FINAL_PATH: u8 = 1;
+#[cfg(test)]
+const AGENT_BRIDGE_FAIL_DESTINATION_EXISTS: u8 = 2;
+#[cfg(test)]
+static AGENT_BRIDGE_POST_CREATE_FAILURE: AtomicU8 = AtomicU8::new(0);
 /// Maximum number of files plus directories walked from one source root.
 pub const MAX_ENUMERATED_ENTRIES: usize = MAX_PACKAGE_FILES * 2 + MAX_PACKAGE_PATH_DEPTH;
 
@@ -51,6 +59,142 @@ pub struct StagePackageExpectedFile {
     pub size: u64,
     /// Lowercase source SHA-256.
     pub sha256: String,
+}
+
+/// Explicit source and destination facts for one auxiliary Agent Bridge file.
+///
+/// The caller must have observed the source before handing this request to the
+/// provider.  The staging operation reopens that exact source path without
+/// following reparse points and proves all three supplied source facts again.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeStagingRequest {
+    /// Absolute source path observed by the caller.
+    pub source_path: PathBuf,
+    /// Source file-object identity observed by the caller.
+    pub source_identity: FileIdentity,
+    /// Lowercase SHA-256 observed by the caller.
+    pub source_sha256: String,
+    /// Source byte length observed by the caller.
+    pub source_size: u64,
+    /// Exact absent destination path below the retained installation root.
+    pub destination_path: PathBuf,
+}
+
+/// Raw create disposition for one auxiliary Agent Bridge file stage.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentBridgeStagingCreateDisposition {
+    /// The destination was created by this staging call with `CREATE_NEW`.
+    Created,
+}
+
+/// Complete immutable receipt for one auxiliary Agent Bridge file stage.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeStagingReceipt {
+    /// Versioned receipt discriminator.
+    pub wire: String,
+    /// Version of the receipt wire.
+    pub wire_version: u32,
+    /// Durable transaction binding.
+    pub transaction_id: String,
+    /// Durable effect binding.
+    pub effect_id: String,
+    /// Durable request binding.
+    pub request_digest: String,
+    /// Canonical source path observed through the retained source handle.
+    pub source_path: PathBuf,
+    /// Source file-object identity observed before copying.
+    pub source_identity: FileIdentity,
+    /// Canonical destination path observed through the retained destination
+    /// handle.
+    pub destination_path: PathBuf,
+    /// Destination file-object identity observed after create and readback.
+    pub destination_identity: FileIdentity,
+    /// Canonical final-parent path retained during publication.
+    pub parent_path: PathBuf,
+    /// Final-parent identity retained during publication.
+    pub parent_identity: FileIdentity,
+    /// Operation-scoped temporary path used before publication.
+    pub temporary_path: PathBuf,
+    /// Identity of the temporary object, preserved by rename.
+    pub temporary_identity: FileIdentity,
+    /// Lowercase SHA-256 of the exact copied bytes.
+    pub sha256: String,
+    /// Number of copied bytes.
+    pub size: u64,
+    /// OS create disposition retained by the provider.
+    pub create_disposition: AgentBridgeStagingCreateDisposition,
+}
+
+impl AgentBridgeStagingReceipt {
+    /// Return a stable digest of this receipt for a durable plan or outer
+    /// transaction receipt.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        serde_json::to_vec(self).map_or_else(
+            |_| hex_digest(b"agent-bridge-staging-receipt-serialization-failed"),
+            |bytes| hex_digest(&bytes),
+        )
+    }
+}
+
+/// Current wire identity for the crash-safe auxiliary bridge stage.
+pub const AGENT_BRIDGE_STAGE_WIRE: &str = "eliot.agent-bridge.stage.v1";
+/// Current prepared/receipt wire version.
+pub const AGENT_BRIDGE_STAGE_WIRE_VERSION: u32 = 1;
+
+/// Durable, serializable pre-rename capability for one auxiliary bridge file.
+///
+/// This record contains only observed source facts and exact same-parent
+/// temporary/final identities. It is intentionally not a transaction record;
+/// callers retain it durably after their own intent commit.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeStagePrepared {
+    /// Explicit prepared-stage wire discriminator.
+    pub wire: String,
+    /// Prepared-stage wire version.
+    pub wire_version: u32,
+    /// Durable transaction binding.
+    pub transaction_id: String,
+    /// Durable effect binding.
+    pub effect_id: String,
+    /// Durable request binding.
+    pub request_digest: String,
+    /// Exact source path observed before preparation.
+    pub source_path: PathBuf,
+    /// Exact source object identity.
+    pub source_identity: FileIdentity,
+    /// Exact source SHA-256.
+    pub source_sha256: String,
+    /// Exact source byte length.
+    pub source_size: u64,
+    /// Canonical parent path shared by temporary and final leaves.
+    pub parent_path: PathBuf,
+    /// Canonical parent identity.
+    pub parent_identity: FileIdentity,
+    /// Operation-scoped temporary path.
+    pub temporary_path: PathBuf,
+    /// Temporary object identity captured after `CREATE_NEW`.
+    pub temporary_identity: FileIdentity,
+    /// Exact final destination path.
+    pub destination_path: PathBuf,
+    /// Final identity expected after the atomic rename (the rename preserves
+    /// the temporary object identity).
+    pub destination_identity: FileIdentity,
+}
+
+impl AgentBridgeStagePrepared {
+    /// Return a stable digest of this prepared capability.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        serde_json::to_vec(self).map_or_else(
+            |_| hex_digest(b"agent-bridge-stage-prepared-serialization-failed"),
+            |bytes| hex_digest(&bytes),
+        )
+    }
 }
 
 /// Native operation that failed while the `StagePackage` provider was observing
@@ -1965,8 +2109,592 @@ pub enum PackageStagingObservation {
 #[derive(Debug)]
 struct RetainedDestinationParent {
     path: PathBuf,
+    identity: FileIdentity,
     #[cfg(windows)]
-    _contour: Vec<std::fs::File>,
+    contour: Vec<std::fs::File>,
+}
+
+fn agent_bridge_path_is_at_or_below(root: &Path, candidate: &Path) -> bool {
+    let mut root_components = root.components();
+    let mut candidate_components = candidate.components();
+    loop {
+        match (root_components.next(), candidate_components.next()) {
+            (Some(root_component), Some(candidate_component))
+                if root_component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&candidate_component.as_os_str().to_string_lossy()) => {}
+            (None, Some(_)) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn validate_agent_bridge_request(
+    installation_root: &Path,
+    request: &AgentBridgeStagingRequest,
+) -> Result<(), PackageStagingError> {
+    if !request.source_path.is_absolute()
+        || !request.destination_path.is_absolute()
+        || request.source_identity.volume_serial_number == 0
+        || request.source_identity.file_index == 0
+        || !super::valid_sha256_hex(&request.source_sha256)
+        || request.source_size > MAX_PACKAGE_FILE_BYTES
+        || request.destination_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    if !agent_bridge_path_is_at_or_below(installation_root, &request.destination_path)
+        || super::windows_paths_equal(installation_root, &request.destination_path)
+        || request.destination_path.file_name().is_none()
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn final_path_after_agent_bridge_create(
+    file: &std::fs::File,
+) -> Result<PathBuf, PackageStagingError> {
+    #[cfg(test)]
+    if AGENT_BRIDGE_POST_CREATE_FAILURE
+        .compare_exchange(
+            AGENT_BRIDGE_FAIL_FINAL_PATH,
+            0,
+            AtomicOrdering::SeqCst,
+            AtomicOrdering::SeqCst,
+        )
+        .is_ok()
+    {
+        return Err(PackageStagingError::Win32 {
+            stage: PackageStagingStage::GetFinalPathNameByHandleW,
+            code: 5,
+        });
+    }
+    final_path_from_handle(file)
+}
+
+fn destination_exists_after_agent_bridge_create(path: &Path) -> Result<bool, PackageStagingError> {
+    #[cfg(test)]
+    if AGENT_BRIDGE_POST_CREATE_FAILURE
+        .compare_exchange(
+            AGENT_BRIDGE_FAIL_DESTINATION_EXISTS,
+            0,
+            AtomicOrdering::SeqCst,
+            AtomicOrdering::SeqCst,
+        )
+        .is_ok()
+    {
+        return Err(PackageStagingError::Win32 {
+            stage: PackageStagingStage::GetFileInformationByHandle,
+            code: 5,
+        });
+    }
+    path_exists(path)
+}
+
+fn agent_bridge_operation_temporary_prefix(
+    parent: &Path,
+    destination: &Path,
+    transaction_id: &str,
+    effect_id: &str,
+    request_digest: &str,
+) -> String {
+    let name_digest = hex_digest(
+        serde_json::to_vec(&(
+            "eliot-agent-bridge-stage-temp-v1",
+            parent,
+            transaction_id,
+            effect_id,
+            request_digest,
+            destination,
+        ))
+        .unwrap_or_default()
+        .as_slice(),
+    );
+    format!(".eliot-agent-bridge.{name_digest}.")
+}
+
+fn agent_bridge_operation_temporary_path(
+    parent: &Path,
+    destination: &Path,
+    transaction_id: &str,
+    effect_id: &str,
+    request_digest: &str,
+) -> PathBuf {
+    parent.join(format!(
+        "{}{nonce}.tmp",
+        agent_bridge_operation_temporary_prefix(
+            parent,
+            destination,
+            transaction_id,
+            effect_id,
+            request_digest,
+        ),
+        nonce = super::unique_suffix()
+    ))
+}
+
+fn validate_agent_bridge_temporary_name(
+    parent: &Path,
+    destination: &Path,
+    temporary: &Path,
+    transaction_id: &str,
+    effect_id: &str,
+    request_digest: &str,
+) -> Result<(), PackageStagingError> {
+    let temporary_parent = temporary
+        .parent()
+        .ok_or(PackageStagingError::InvalidRelativePath)?;
+    if !super::windows_paths_equal(parent, temporary_parent) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    if super::windows_paths_equal(destination, temporary) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let name = temporary
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(PackageStagingError::InvalidRelativePath)?;
+    let prefix = agent_bridge_operation_temporary_prefix(
+        parent,
+        destination,
+        transaction_id,
+        effect_id,
+        request_digest,
+    );
+    let Some(nonce) = name
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix(".tmp"))
+    else {
+        return Err(PackageStagingError::IdentityMismatch);
+    };
+    let nonce_parts = nonce.split('-').collect::<Vec<_>>();
+    if nonce_parts.len() != 3
+        || nonce_parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        || nonce.is_empty()
+        || nonce.len() > 128
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn validate_stage_binding(
+    transaction_id: &str,
+    effect_id: &str,
+    request_digest: &str,
+) -> Result<(), PackageStagingError> {
+    if transaction_id.trim().is_empty()
+        || effect_id.trim().is_empty()
+        || !super::valid_sha256_hex(request_digest)
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn validate_agent_bridge_prepared(
+    installation_root: &Path,
+    prepared: &AgentBridgeStagePrepared,
+) -> Result<(), PackageStagingError> {
+    if prepared.wire != AGENT_BRIDGE_STAGE_WIRE
+        || prepared.wire_version != AGENT_BRIDGE_STAGE_WIRE_VERSION
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    if prepared.destination_identity != prepared.temporary_identity {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    validate_stage_binding(
+        &prepared.transaction_id,
+        &prepared.effect_id,
+        &prepared.request_digest,
+    )?;
+    if !prepared.source_path.is_absolute()
+        || !prepared.parent_path.is_absolute()
+        || !prepared.temporary_path.is_absolute()
+        || !prepared.destination_path.is_absolute()
+        || prepared.source_identity.volume_serial_number == 0
+        || prepared.source_identity.file_index == 0
+        || prepared.parent_identity.volume_serial_number == 0
+        || prepared.parent_identity.file_index == 0
+        || prepared.temporary_identity.volume_serial_number == 0
+        || prepared.temporary_identity.file_index == 0
+        || prepared.source_size == 0
+        || prepared.source_size > MAX_PACKAGE_FILE_BYTES
+        || !super::valid_sha256_hex(&prepared.source_sha256)
+        || prepared.destination_identity.volume_serial_number == 0
+        || prepared.destination_identity.file_index == 0
+        || prepared
+            .source_path
+            .components()
+            .chain(prepared.parent_path.components())
+            .chain(prepared.temporary_path.components())
+            .chain(prepared.destination_path.components())
+            .any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    if !agent_bridge_path_is_at_or_below(installation_root, &prepared.parent_path)
+        || super::windows_paths_equal(installation_root, &prepared.parent_path)
+        || !agent_bridge_path_is_at_or_below(&prepared.parent_path, &prepared.destination_path)
+        || !agent_bridge_path_is_at_or_below(&prepared.parent_path, &prepared.temporary_path)
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let destination_name = prepared
+        .destination_path
+        .file_name()
+        .ok_or(PackageStagingError::InvalidRelativePath)?;
+    let expected_destination = prepared.parent_path.join(destination_name);
+    if !super::windows_paths_equal(&expected_destination, &prepared.destination_path)
+        || validate_agent_bridge_temporary_name(
+            &prepared.parent_path,
+            &prepared.destination_path,
+            &prepared.temporary_path,
+            &prepared.transaction_id,
+            &prepared.effect_id,
+            &prepared.request_digest,
+        )
+        .is_err()
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn agent_bridge_receipt_from_prepared(
+    prepared: &AgentBridgeStagePrepared,
+    destination_identity: FileIdentity,
+) -> AgentBridgeStagingReceipt {
+    AgentBridgeStagingReceipt {
+        wire: prepared.wire.clone(),
+        wire_version: prepared.wire_version,
+        transaction_id: prepared.transaction_id.clone(),
+        effect_id: prepared.effect_id.clone(),
+        request_digest: prepared.request_digest.clone(),
+        source_path: prepared.source_path.clone(),
+        source_identity: prepared.source_identity,
+        destination_path: prepared.destination_path.clone(),
+        destination_identity,
+        parent_path: prepared.parent_path.clone(),
+        parent_identity: prepared.parent_identity,
+        temporary_path: prepared.temporary_path.clone(),
+        temporary_identity: prepared.temporary_identity,
+        sha256: prepared.source_sha256.clone(),
+        size: prepared.source_size,
+        create_disposition: AgentBridgeStagingCreateDisposition::Created,
+    }
+}
+
+#[cfg(windows)]
+fn verify_retained_agent_bridge_parent(
+    parent: &RetainedDestinationParent,
+) -> Result<(), PackageStagingError> {
+    let handle = parent
+        .contour
+        .last()
+        .ok_or(PackageStagingError::RootUnavailable)?;
+    let identity = file_identity_from_open_handle(handle)?;
+    let canonical = final_path_from_handle(handle)?;
+    if identity != parent.identity
+        || !super::windows_paths_equal(&canonical, &parent.path)
+        || verify_system_security(handle, true).is_err()
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_retained_agent_bridge_parent(
+    _parent: &RetainedDestinationParent,
+) -> Result<(), PackageStagingError> {
+    Err(PackageStagingError::UnsupportedPlatform)
+}
+
+/// Prepare one operation-scoped bridge file without publishing its final
+/// pathname. The returned value is the only durable capability needed for
+/// later publish/reconcile; no transaction state is persisted here.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the prepared capability keeps the complete create-and-verify proof in one boundary"
+)]
+pub fn prepare_agent_bridge_stage(
+    installation_root: &super::ProtectedRootLease,
+    request: &AgentBridgeStagingRequest,
+    transaction_id: &str,
+    effect_id: &str,
+    request_digest: &str,
+) -> Result<AgentBridgeStagePrepared, PackageStagingError> {
+    let root_path = installation_root
+        .canonical_path()
+        .map_err(map_protected_path_error)?;
+    installation_root
+        .verify_stable_identity()
+        .map_err(map_protected_path_error)?;
+    validate_stage_binding(transaction_id, effect_id, request_digest)?;
+    if request.source_size == 0 {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    validate_agent_bridge_request(&root_path, request)?;
+    verify_system_directory_at(&root_path)?;
+    let parent = retain_destination_parent(
+        request
+            .destination_path
+            .parent()
+            .ok_or(PackageStagingError::RootUnavailable)?,
+    )?;
+    let destination_name = request
+        .destination_path
+        .file_name()
+        .ok_or(PackageStagingError::InvalidRelativePath)?;
+    let destination_path = parent.path.join(destination_name);
+    if !super::windows_paths_equal(&destination_path, &request.destination_path) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    if path_exists(&destination_path)? {
+        return Err(PackageStagingError::GenerationExists);
+    }
+    let source = snapshot_source_file(&request.source_path, request.source_size)?;
+    if source.identity != request.source_identity
+        || !super::windows_paths_equal(&final_path_from_handle(&source.file)?, &request.source_path)
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    if source.sha256 != request.source_sha256 {
+        return Err(PackageStagingError::HashMismatch);
+    }
+    let mut staged = None;
+    for _ in 0..64 {
+        let temporary_path = agent_bridge_operation_temporary_path(
+            &parent.path,
+            &destination_path,
+            transaction_id,
+            effect_id,
+            request_digest,
+        );
+        if path_exists(&temporary_path)? {
+            continue;
+        }
+        match copy_destination_bytes(&source, &temporary_path, request.source_size) {
+            Ok(copied) => {
+                staged = Some((temporary_path, copied));
+                break;
+            }
+            Err(PackageStagingError::GenerationExists) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let (temporary_path, (temporary, temporary_identity, readback)) =
+        staged.ok_or(PackageStagingError::GenerationExists)?;
+    let temporary_path_observed = match final_path_after_agent_bridge_create(&temporary) {
+        Ok(path) => path,
+        Err(error) => {
+            return Err(cleanup_created_handle(temporary, temporary_identity, error));
+        }
+    };
+    let destination_exists = match destination_exists_after_agent_bridge_create(&destination_path) {
+        Ok(exists) => exists,
+        Err(error) => {
+            return Err(cleanup_created_handle(temporary, temporary_identity, error));
+        }
+    };
+    if !super::windows_paths_equal(&temporary_path_observed, &temporary_path)
+        || verify_retained_agent_bridge_parent(&parent).is_err()
+        || readback.sha256 != request.source_sha256
+        || readback.size != request.source_size
+        || destination_exists
+    {
+        return Err(cleanup_created_handle(
+            temporary,
+            temporary_identity,
+            PackageStagingError::IdentityMismatch,
+        ));
+    }
+    drop(temporary);
+    Ok(AgentBridgeStagePrepared {
+        wire: AGENT_BRIDGE_STAGE_WIRE.to_owned(),
+        wire_version: AGENT_BRIDGE_STAGE_WIRE_VERSION,
+        transaction_id: transaction_id.to_owned(),
+        effect_id: effect_id.to_owned(),
+        request_digest: request_digest.to_owned(),
+        source_path: request.source_path.clone(),
+        source_identity: source.identity,
+        source_sha256: source.sha256,
+        source_size: source.size,
+        parent_path: parent.path,
+        parent_identity: parent.identity,
+        temporary_path,
+        temporary_identity,
+        destination_path,
+        destination_identity: temporary_identity,
+    })
+}
+
+#[cfg(windows)]
+fn rename_agent_bridge_file_from_handle(
+    temporary: &std::fs::File,
+    parent: &RetainedDestinationParent,
+    destination_name: &str,
+) -> Result<(), PackageStagingError> {
+    let parent_handle = parent
+        .contour
+        .last()
+        .ok_or(PackageStagingError::RootUnavailable)?;
+    super::rename_directory_from_handle(temporary, parent_handle, destination_name)
+        .map_err(map_directory_publication_error)
+}
+
+#[cfg(not(windows))]
+fn rename_agent_bridge_file_from_handle(
+    _temporary: &std::fs::File,
+    _parent: &RetainedDestinationParent,
+    _destination_name: &str,
+) -> Result<(), PackageStagingError> {
+    Err(PackageStagingError::UnsupportedPlatform)
+}
+
+fn read_prepared_final(
+    prepared: &AgentBridgeStagePrepared,
+) -> Result<AgentBridgeStagingReceipt, PackageStagingError> {
+    let final_file = open_existing_file(&prepared.destination_path)?;
+    let actual = read_destination_snapshot_handle(
+        &final_file,
+        &prepared.destination_path,
+        prepared.source_size,
+        prepared.destination_identity,
+    )?;
+    if actual.sha256 != prepared.source_sha256 || actual.size != prepared.source_size {
+        return Err(PackageStagingError::HashMismatch);
+    }
+    Ok(agent_bridge_receipt_from_prepared(
+        prepared,
+        prepared.destination_identity,
+    ))
+}
+
+#[cfg(windows)]
+fn flush_agent_bridge_parent(
+    parent: &RetainedDestinationParent,
+) -> Result<(), PackageStagingError> {
+    flush_file_buffers(
+        parent
+            .contour
+            .last()
+            .ok_or(PackageStagingError::RootUnavailable)?,
+    )
+}
+
+#[cfg(not(windows))]
+fn flush_agent_bridge_parent(
+    _parent: &RetainedDestinationParent,
+) -> Result<(), PackageStagingError> {
+    Err(PackageStagingError::UnsupportedPlatform)
+}
+
+/// Publish a completely prepared bridge file with an atomic, no-replace
+/// same-parent rename. The prepared capability remains valid for recovery if
+/// post-rename readback is interrupted.
+pub fn publish_agent_bridge_stage(
+    installation_root: &super::ProtectedRootLease,
+    prepared: &AgentBridgeStagePrepared,
+) -> Result<AgentBridgeStagingReceipt, PackageStagingError> {
+    let root_path = installation_root
+        .canonical_path()
+        .map_err(map_protected_path_error)?;
+    installation_root
+        .verify_stable_identity()
+        .map_err(map_protected_path_error)?;
+    validate_agent_bridge_prepared(&root_path, prepared)?;
+    verify_system_directory_at(&root_path)?;
+    let parent = retain_destination_parent(&prepared.parent_path)?;
+    if parent.identity != prepared.parent_identity
+        || !super::windows_paths_equal(&parent.path, &prepared.parent_path)
+    {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    verify_retained_agent_bridge_parent(&parent)?;
+    if path_exists(&prepared.destination_path)? {
+        if path_exists(&prepared.temporary_path)? {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        return read_prepared_final(prepared);
+    }
+    if !path_exists(&prepared.temporary_path)? {
+        return Err(PackageStagingError::PartialTree);
+    }
+    let temporary = open_existing_file_for_delete(&prepared.temporary_path)?;
+    let actual = read_destination_snapshot_handle(
+        &temporary,
+        &prepared.temporary_path,
+        prepared.source_size,
+        prepared.temporary_identity,
+    )?;
+    if actual.sha256 != prepared.source_sha256 || actual.size != prepared.source_size {
+        return Err(PackageStagingError::HashMismatch);
+    }
+    let destination_name = prepared
+        .destination_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PackageStagingError::InvalidRelativePath)?;
+    rename_agent_bridge_file_from_handle(&temporary, &parent, destination_name)?;
+    flush_agent_bridge_parent(&parent)?;
+    let destination_path = final_path_from_handle(&temporary)?;
+    if !super::windows_paths_equal(&destination_path, &prepared.destination_path) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let receipt = read_prepared_final(prepared)?;
+    installation_root
+        .verify_stable_identity()
+        .map_err(map_protected_path_error)?;
+    Ok(receipt)
+}
+
+/// Reconcile a prepared bridge operation after a crash or response loss.
+///
+/// Only the exact prepared temporary identity or the same identity after the
+/// no-replace rename can become a matching receipt. Foreign or partial state
+/// is never adopted.
+pub fn reconcile_agent_bridge_stage(
+    installation_root: &super::ProtectedRootLease,
+    prepared: &AgentBridgeStagePrepared,
+) -> Result<AgentBridgeStagingReceipt, PackageStagingError> {
+    let root_path = installation_root
+        .canonical_path()
+        .map_err(map_protected_path_error)?;
+    installation_root
+        .verify_stable_identity()
+        .map_err(map_protected_path_error)?;
+    validate_agent_bridge_prepared(&root_path, prepared)?;
+    verify_system_directory_at(&root_path)?;
+    let parent = retain_destination_parent(&prepared.parent_path)?;
+    if parent.identity != prepared.parent_identity {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    verify_retained_agent_bridge_parent(&parent)?;
+    let final_exists = path_exists(&prepared.destination_path)?;
+    let temporary_exists = path_exists(&prepared.temporary_path)?;
+    match (final_exists, temporary_exists) {
+        (true, false) => read_prepared_final(prepared),
+        (false, true) => publish_agent_bridge_stage(installation_root, prepared),
+        (false, false) => Err(PackageStagingError::PartialTree),
+        (true, true) => Err(PackageStagingError::IdentityMismatch),
+    }
 }
 
 /// Measurement/mutation primitive for one retained source and installation
@@ -3471,7 +4199,10 @@ fn retain_destination_parent(
     verify_system_directory_handles(&contour)?;
     Ok(RetainedDestinationParent {
         path: canonical,
-        _contour: contour,
+        identity: file_identity_from_open_handle(
+            contour.last().ok_or(PackageStagingError::RootUnavailable)?,
+        )?,
+        contour,
     })
 }
 
@@ -3783,6 +4514,11 @@ fn verify_system_directory_at(path: &Path) -> Result<(), PackageStagingError> {
     let file = open_existing_directory(path)?;
     let _ = verify_system_security(&file, true)?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_system_directory_at(_path: &Path) -> Result<(), PackageStagingError> {
+    Err(PackageStagingError::UnsupportedPlatform)
 }
 
 #[cfg(windows)]
@@ -4450,6 +5186,8 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+    #[cfg(windows)]
+    type FixtureResult<T> = Result<T, Box<dyn std::error::Error>>;
 
     fn file(path: &str, executable: bool) -> PackageFileSpec {
         PackageFileSpec {
@@ -4473,6 +5211,594 @@ mod tests {
             ),
             _ => false,
         }
+    }
+
+    #[cfg(windows)]
+    struct AgentBridgeFixture {
+        root_path: PathBuf,
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        root: crate::ProtectedRootLease,
+    }
+
+    #[cfg(windows)]
+    fn agent_bridge_fixture() -> FixtureResult<Option<AgentBridgeFixture>> {
+        let root_path = crate::protected_program_data_root()?.join(format!(
+            "eliot-agent-bridge-stage-{}",
+            super::super::unique_suffix()
+        ));
+        let source_path = std::env::temp_dir().join(format!(
+            "eliot-agent-bridge-source-{}",
+            super::super::unique_suffix()
+        ));
+        let destination_path = root_path
+            .join("external-modules")
+            .join("eliot-agent-bridge")
+            .join("generation")
+            .join("eliot-agent-bridge.exe");
+        let mut created = Vec::new();
+        for directory in [
+            root_path.clone(),
+            root_path.join("external-modules"),
+            root_path
+                .join("external-modules")
+                .join("eliot-agent-bridge"),
+            root_path
+                .join("external-modules")
+                .join("eliot-agent-bridge")
+                .join("generation"),
+        ] {
+            match create_destination_directory(&directory) {
+                Ok((file, identity, _)) => {
+                    created.push((file, identity));
+                }
+                Err(error) if security_fixture_unavailable(&error) => {
+                    drop(created);
+                    let _ = std::fs::remove_dir_all(&root_path);
+                    return Ok(None);
+                }
+                Err(error) => {
+                    drop(created);
+                    let _ = std::fs::remove_dir_all(&root_path);
+                    return Err(error.into());
+                }
+            }
+        }
+        drop(created);
+        if let Err(error) = std::fs::write(&source_path, b"agent-bridge-fixture") {
+            let _ = std::fs::remove_file(&source_path);
+            let _ = std::fs::remove_dir_all(&root_path);
+            return Err(error.into());
+        }
+        let root = match crate::ProtectedRootLease::open_existing(&root_path) {
+            Ok(root) => root,
+            Err(error) => {
+                let _ = std::fs::remove_file(&source_path);
+                let _ = std::fs::remove_dir_all(&root_path);
+                return Err(std::io::Error::other(error.to_string()).into());
+            }
+        };
+        Ok(Some(AgentBridgeFixture {
+            root_path,
+            source_path,
+            destination_path,
+            root,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn agent_bridge_request(
+        fixture: &AgentBridgeFixture,
+    ) -> Result<AgentBridgeStagingRequest, PackageStagingError> {
+        let observed = snapshot_source_file(&fixture.source_path, 20)?;
+        Ok(AgentBridgeStagingRequest {
+            source_path: fixture.source_path.clone(),
+            source_identity: observed.identity,
+            source_sha256: observed.sha256,
+            source_size: observed.size,
+            destination_path: fixture.destination_path.clone(),
+        })
+    }
+
+    #[cfg(windows)]
+    fn cleanup_agent_bridge_fixture(fixture: AgentBridgeFixture) {
+        drop(fixture.root);
+        let _ = std::fs::remove_file(&fixture.source_path);
+        let _ = std::fs::remove_dir_all(&fixture.root_path);
+    }
+
+    #[cfg(windows)]
+    fn arm_agent_bridge_post_create_failure(kind: u8) {
+        AGENT_BRIDGE_POST_CREATE_FAILURE.store(kind, AtomicOrdering::SeqCst);
+    }
+
+    #[cfg(windows)]
+    fn clear_agent_bridge_post_create_failure() {
+        AGENT_BRIDGE_POST_CREATE_FAILURE.store(0, AtomicOrdering::SeqCst);
+    }
+
+    #[cfg(windows)]
+    fn assert_no_agent_bridge_temporary(
+        fixture: &AgentBridgeFixture,
+        transaction_id: &str,
+        effect_id: &str,
+        request_digest: &str,
+    ) -> TestResult {
+        let parent = fixture
+            .destination_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("fixture destination has no parent"))?;
+        let prefix = agent_bridge_operation_temporary_prefix(
+            parent,
+            &fixture.destination_path,
+            transaction_id,
+            effect_id,
+            request_digest,
+        );
+        let found = std::fs::read_dir(parent)?.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name.starts_with(&prefix))
+        });
+        assert!(!found, "unexpected retained Agent Bridge temporary");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_post_create_failures_clean_exact_temporary() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let transaction_id = "transaction:post-create-final-path";
+        let effect_id = "effect:post-create-final-path";
+        let request_digest = "4".repeat(64);
+        arm_agent_bridge_post_create_failure(AGENT_BRIDGE_FAIL_FINAL_PATH);
+        let result = prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            transaction_id,
+            effect_id,
+            &request_digest,
+        );
+        clear_agent_bridge_post_create_failure();
+        match result {
+            Err(PackageStagingError::Win32 {
+                stage: PackageStagingStage::GetFinalPathNameByHandleW,
+                code: 5,
+            }) => {}
+            Err(error) if security_fixture_unavailable(&error) => {
+                cleanup_agent_bridge_fixture(fixture);
+                return Ok(());
+            }
+            other => panic!("unexpected post-create final-path result: {other:?}"),
+        }
+        assert_no_agent_bridge_temporary(&fixture, transaction_id, effect_id, &request_digest)?;
+        cleanup_agent_bridge_fixture(fixture);
+
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let transaction_id = "transaction:post-create-path-exists";
+        let effect_id = "effect:post-create-path-exists";
+        let request_digest = "5".repeat(64);
+        arm_agent_bridge_post_create_failure(AGENT_BRIDGE_FAIL_DESTINATION_EXISTS);
+        let result = prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            transaction_id,
+            effect_id,
+            &request_digest,
+        );
+        clear_agent_bridge_post_create_failure();
+        match result {
+            Err(PackageStagingError::Win32 {
+                stage: PackageStagingStage::GetFileInformationByHandle,
+                code: 5,
+            }) => {}
+            Err(error) if security_fixture_unavailable(&error) => {
+                cleanup_agent_bridge_fixture(fixture);
+                return Ok(());
+            }
+            other => panic!("unexpected post-create path-exists result: {other:?}"),
+        }
+        assert_no_agent_bridge_temporary(&fixture, transaction_id, effect_id, &request_digest)?;
+        cleanup_agent_bridge_fixture(fixture);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_staging_success_receipts_are_serializable_and_read_back() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let prepared = match prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            "transaction:success",
+            "effect:success",
+            &"0".repeat(64),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) if security_fixture_unavailable(&error) => {
+                cleanup_agent_bridge_fixture(fixture);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let receipt = reconcile_agent_bridge_stage(&fixture.root, &prepared)?;
+        assert_eq!(receipt.source_identity, request.source_identity);
+        assert_eq!(receipt.destination_path, request.destination_path);
+        assert_eq!(receipt.sha256, request.source_sha256);
+        assert_eq!(receipt.size, request.source_size);
+        assert_eq!(
+            receipt.create_disposition,
+            AgentBridgeStagingCreateDisposition::Created
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentBridgeStagingReceipt>(&serde_json::to_string(&receipt)?)?,
+            receipt
+        );
+        assert_eq!(receipt.destination_identity, prepared.destination_identity);
+        cleanup_agent_bridge_fixture(fixture);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_staging_rejects_source_substitution() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let replacement = fixture.source_path.with_extension("replacement");
+        std::fs::rename(&fixture.source_path, &replacement)?;
+        std::fs::write(&fixture.source_path, b"substituted-source-file")?;
+        assert_eq!(
+            prepare_agent_bridge_stage(
+                &fixture.root,
+                &request,
+                "transaction:source-substitution",
+                "effect:source-substitution",
+                &"1".repeat(64),
+            ),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        let _ = std::fs::remove_file(replacement);
+        cleanup_agent_bridge_fixture(fixture);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_staging_rejects_destination_preexistence_without_overwrite() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        std::fs::write(&fixture.destination_path, b"foreign")?;
+        let request = agent_bridge_request(&fixture)?;
+        assert_eq!(
+            prepare_agent_bridge_stage(
+                &fixture.root,
+                &request,
+                "transaction:destination-preexisting",
+                "effect:destination-preexisting",
+                &"2".repeat(64),
+            ),
+            Err(PackageStagingError::GenerationExists)
+        );
+        assert_eq!(std::fs::read(&fixture.destination_path)?, b"foreign");
+        cleanup_agent_bridge_fixture(fixture);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_staging_retry_rejects_foreign_bytes_and_absence() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let prepared = match prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            "transaction:retry",
+            "effect:retry",
+            &"3".repeat(64),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) if security_fixture_unavailable(&error) => {
+                cleanup_agent_bridge_fixture(fixture);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        reconcile_agent_bridge_stage(&fixture.root, &prepared)?;
+        drop(fixture.root);
+        std::fs::write(&fixture.destination_path, b"foreign")?;
+        let root = crate::ProtectedRootLease::open_existing(&fixture.root_path)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert!(matches!(
+            reconcile_agent_bridge_stage(&root, &prepared),
+            Err(PackageStagingError::HashMismatch | PackageStagingError::IdentityMismatch)
+        ));
+        drop(root);
+        std::fs::remove_file(&fixture.destination_path)?;
+        let root = crate::ProtectedRootLease::open_existing(&fixture.root_path)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(
+            reconcile_agent_bridge_stage(&root, &prepared),
+            Err(PackageStagingError::PartialTree)
+        );
+        drop(root);
+        let _ = std::fs::remove_file(&fixture.source_path);
+        let _ = std::fs::remove_dir_all(&fixture.root_path);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_prepared_roundtrip_and_binding_substitution_are_rejected() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let prepared = match prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            "transaction:prepared",
+            "effect:prepared",
+            &"a".repeat(64),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) if security_fixture_unavailable(&error) => {
+                cleanup_agent_bridge_fixture(fixture);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let encoded = serde_json::to_string(&prepared)?;
+        assert_eq!(
+            serde_json::from_str::<AgentBridgeStagePrepared>(&encoded)?,
+            prepared
+        );
+        assert!(prepared.temporary_path.exists());
+        let mut substituted = prepared.clone();
+        substituted.request_digest = "b".repeat(64);
+        assert_eq!(
+            reconcile_agent_bridge_stage(&fixture.root, &substituted),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        let mut nested = prepared.clone();
+        nested.source_size += 1;
+        assert_eq!(
+            publish_agent_bridge_stage(&fixture.root, &nested),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        let mut transaction = prepared.clone();
+        transaction.transaction_id.push_str(":substituted");
+        assert_eq!(
+            reconcile_agent_bridge_stage(&fixture.root, &transaction),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        let mut effect = prepared.clone();
+        effect.effect_id.push_str(":substituted");
+        assert_eq!(
+            reconcile_agent_bridge_stage(&fixture.root, &effect),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        let mut parent = prepared.clone();
+        parent.parent_identity.file_index += 1;
+        assert_eq!(
+            reconcile_agent_bridge_stage(&fixture.root, &parent),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        let mut temporary = prepared.clone();
+        temporary.temporary_identity.file_index += 1;
+        assert_eq!(
+            reconcile_agent_bridge_stage(&fixture.root, &temporary),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        let mut destination = prepared.clone();
+        destination.destination_identity.file_index += 1;
+        assert_eq!(
+            reconcile_agent_bridge_stage(&fixture.root, &destination),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        let mut wire = prepared.clone();
+        wire.wire.push_str(":substituted");
+        assert_eq!(
+            reconcile_agent_bridge_stage(&fixture.root, &wire),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        let mut version = prepared.clone();
+        version.wire_version += 1;
+        assert_eq!(
+            reconcile_agent_bridge_stage(&fixture.root, &version),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        cleanup_agent_bridge_fixture(fixture);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_prepared_reconcile_publishes_before_rename_recovery() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let prepared = match prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            "transaction:before-rename",
+            "effect:before-rename",
+            &"c".repeat(64),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) if security_fixture_unavailable(&error) => {
+                cleanup_agent_bridge_fixture(fixture);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let receipt = reconcile_agent_bridge_stage(&fixture.root, &prepared)?;
+        assert_eq!(
+            std::fs::read(&fixture.destination_path)?,
+            b"agent-bridge-fixture"
+        );
+        assert!(!prepared.temporary_path.exists());
+        assert_eq!(receipt.destination_identity, prepared.temporary_identity);
+        cleanup_agent_bridge_fixture(fixture);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_prepared_response_loss_after_rename_reconciles_exactly() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let prepared = match prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            "transaction:response-loss",
+            "effect:response-loss",
+            &"d".repeat(64),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) if security_fixture_unavailable(&error) => {
+                cleanup_agent_bridge_fixture(fixture);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let first = publish_agent_bridge_stage(&fixture.root, &prepared)?;
+        let second = reconcile_agent_bridge_stage(&fixture.root, &prepared)?;
+        assert_eq!(first, second);
+        cleanup_agent_bridge_fixture(fixture);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_prepare_retry_uses_fresh_temp_without_adopting_orphan() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let first = match prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            "transaction:orphan-retry",
+            "effect:orphan-retry",
+            &"a".repeat(64),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) if security_fixture_unavailable(&error) => {
+                cleanup_agent_bridge_fixture(fixture);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        assert!(first.temporary_path.exists());
+
+        let second = prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            "transaction:orphan-retry",
+            "effect:orphan-retry",
+            &"a".repeat(64),
+        )?;
+        assert_ne!(first.temporary_path, second.temporary_path);
+        assert_ne!(first.temporary_identity, second.temporary_identity);
+        assert!(first.temporary_path.exists());
+        publish_agent_bridge_stage(&fixture.root, &second)?;
+        assert_eq!(
+            std::fs::read(&fixture.destination_path)?,
+            b"agent-bridge-fixture"
+        );
+        assert!(first.temporary_path.exists());
+        cleanup_agent_bridge_fixture(fixture);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_prepared_foreign_temp_and_final_never_adopted() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let prepared = match prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            "transaction:foreign",
+            "effect:foreign",
+            &"e".repeat(64),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) if security_fixture_unavailable(&error) => {
+                cleanup_agent_bridge_fixture(fixture);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        std::fs::remove_file(&prepared.temporary_path)?;
+        std::fs::write(&prepared.temporary_path, b"foreign-temp")?;
+        assert_eq!(
+            reconcile_agent_bridge_stage(&fixture.root, &prepared),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        std::fs::remove_file(&prepared.temporary_path)?;
+        std::fs::write(&fixture.destination_path, b"foreign-final")?;
+        assert!(matches!(
+            reconcile_agent_bridge_stage(&fixture.root, &prepared),
+            Err(PackageStagingError::IdentityMismatch | PackageStagingError::HashMismatch)
+        ));
+        cleanup_agent_bridge_fixture(fixture);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_bridge_prepared_rejects_foreign_temp_shape() -> TestResult {
+        let Some(fixture) = agent_bridge_fixture()? else {
+            return Ok(());
+        };
+        let request = agent_bridge_request(&fixture)?;
+        let prepared = match prepare_agent_bridge_stage(
+            &fixture.root,
+            &request,
+            "transaction:cleanup",
+            "effect:cleanup",
+            &"f".repeat(64),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) if security_fixture_unavailable(&error) => {
+                cleanup_agent_bridge_fixture(fixture);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let parent = prepared
+            .temporary_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("prepared temp parent"))?;
+        let mut foreign = prepared.clone();
+        foreign.temporary_path = parent.join(".eliot-agent-bridge.foreign.tmp");
+        assert_eq!(
+            reconcile_agent_bridge_stage(&fixture.root, &foreign),
+            Err(PackageStagingError::IdentityMismatch)
+        );
+        cleanup_agent_bridge_fixture(fixture);
+        Ok(())
     }
 
     #[test]

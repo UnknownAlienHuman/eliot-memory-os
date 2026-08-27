@@ -668,6 +668,7 @@ fn planner_bound_status_transaction(root: &Path) -> InstallationTransaction {
         staging_root: fixture_path(root, "staging"),
         minimum_store_available_bytes: 1,
         recovery_command: fixture_handle("recover:cli-status"),
+        agent_bridge_source: None,
     };
     GenerationPackagePlanner::plan_with_source_publication_binding(
         input,

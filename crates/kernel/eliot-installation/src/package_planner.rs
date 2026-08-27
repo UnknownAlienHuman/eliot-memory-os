@@ -12,13 +12,14 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AuthorityEpoch, CandidateManifest, InstallationEpoch, InstallationError, InstallationProfile,
-    InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, InstallerServiceAccount,
-    InstallerServiceRole, LOCAL_SERVICE_SID, ManagedEnvironmentAction,
-    ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange,
-    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
-    StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
-    SupervisionAuthorityProvisionPlan, candidate_manifest_digest as candidate_digest_fn, handle,
+    AgentBridgeSourceMaterializationPlan, AuthorityEpoch, CandidateManifest, InstallationEpoch,
+    InstallationError, InstallationProfile, InstallationTransaction, InstallerAclPrincipal,
+    InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole, LOCAL_SERVICE_SID,
+    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER,
+    PackageArtifactDigest, PlannedChange, ResourceGeneration, RuntimeLaunchDescriptor,
+    RuntimeStateRoots, StateFence, StoreCredentialProvider, StoreCredentialProvisionPlan,
+    StoreCredentialScope, SupervisionAuthorityProvisionPlan,
+    candidate_manifest_digest as candidate_digest_fn, handle,
     phase_b_static_template_for_candidate, supervision_key_slot_for_scope_id,
 };
 
@@ -858,6 +859,9 @@ pub struct GenerationPackagePlanInput {
     pub minimum_store_available_bytes: u64,
     /// Explicit recovery command/reference retained in the transaction.
     pub recovery_command: PlatformHandle,
+    /// Optional immutable external agent-bridge source materialization plan.
+    /// `None` preserves the legacy package-plan carrier.
+    pub agent_bridge_source: Option<Box<AgentBridgeSourceMaterializationPlan>>,
 }
 
 /// The sole production package/transaction composition seam.
@@ -943,6 +947,9 @@ impl GenerationPackagePlanner {
                 field: "generation.minimum_store_available_bytes".to_owned(),
                 reason: "must be an explicit non-zero policy value".to_owned(),
             });
+        }
+        if let Some(source) = input.agent_bridge_source.as_ref() {
+            source.validate()?;
         }
         let canonical_generation =
             validate_package_relative_path(Path::new(input.generation.as_str()))
@@ -1140,6 +1147,37 @@ impl GenerationPackagePlanner {
                 reason: error.to_string(),
             })?;
         let authority_state_fence = StateFence::new(authority_epoch, authority_generation);
+        if let Some(source) = input.agent_bridge_source.as_ref() {
+            let expected_kernel_snapshot = serde_json::json!({
+                "service": "eliot-kernel",
+                "protocol": "eliot.kernel.v1",
+                "generation": authority_generation.value(),
+                "authority_epoch": authority_epoch.value(),
+                "artifact_digest": kernel_digest.as_str(),
+            });
+            let expected_kernel_snapshot_digest = hex_digest(
+                &serde_json::to_vec(&expected_kernel_snapshot).map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "generation.agent_bridge.expected_kernel_config_snapshot_sha256"
+                            .to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?,
+            );
+            let declaration = &source.client_declaration;
+            if declaration.expected_kernel_sid != LOCAL_SERVICE_SID
+                || declaration.expected_kernel_session_id != 0
+                || declaration.expected_kernel_principal_binding
+                    != format!("sid={LOCAL_SERVICE_SID};session=0")
+                || declaration.expected_kernel_authority_epoch != authority_epoch
+                || declaration.expected_kernel_generation != authority_generation
+                || declaration.expected_kernel_artifact_sha256 != kernel_digest.as_str()
+                || declaration.expected_kernel_config_snapshot_sha256
+                    != expected_kernel_snapshot_digest
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
         let nonce_seed = format!(
             "eliotd:phase-a-template:{}:{}:{}:{}",
             input.transaction_id,
@@ -1579,6 +1617,7 @@ impl GenerationPackagePlanner {
                     generation: authority_generation,
                     config_digest: candidate.config_digest.clone(),
                 }),
+                agent_bridge_source: input.agent_bridge_source.clone(),
             });
         }
         let planned_changes = effects
@@ -2918,6 +2957,7 @@ mod tests {
             recovery_command: h(
                 "eliot installation recover --transaction-id transaction:generation",
             ),
+            agent_bridge_source: None,
         }
     }
 

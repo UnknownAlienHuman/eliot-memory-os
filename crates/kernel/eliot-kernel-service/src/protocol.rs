@@ -92,10 +92,16 @@ pub struct AgentBridgeAdmissionDescriptor {
     pub wire_version: u16,
     /// Exact admitted module identity (`eliot-agent-bridge`).
     pub module_id: String,
+    /// Stable profile identity derived by the installation-owned profile.
+    pub profile_id: PlatformHandle,
+    /// Digest of the exact protected admission-profile bytes.
+    pub profile_sha256: String,
     /// Absolute approved bridge executable path.
     pub executable: PlatformHandle,
     /// Lowercase SHA-256 digest of the approved executable bytes.
     pub executable_sha256: String,
+    /// File-object identity observed for the approved executable.
+    pub executable_identity: HostFileIdentity,
     /// Resource generation approved by Host/installation.
     pub generation: ResourceGeneration,
     /// Authority epoch approved by Host/installation.
@@ -112,6 +118,8 @@ pub struct AgentBridgeAdmissionDescriptor {
     pub allowed_capabilities: Vec<String>,
     /// Privacy classes the bridge may carry during handshake.
     pub allowed_privacy_classes: Vec<String>,
+    /// Maximum frame body admitted by the static profile.
+    pub max_frame: u32,
     /// Effects the bridge may request during handshake.
     pub allowed_effects: Vec<String>,
     /// Exact Kernel principal binding expected by the protected client declaration.
@@ -120,7 +128,7 @@ pub struct AgentBridgeAdmissionDescriptor {
     pub expected_kernel_config_snapshot_sha256: String,
     /// Absolute protected module-specific client declaration path.
     pub client_declaration_path: PlatformHandle,
-    /// Digest of the exact protected client declaration bytes.
+    /// Canonical digest of every protected client declaration field except its digest field.
     pub client_declaration_sha256: String,
     /// Lowercase SHA-256 over every descriptor field except this field.
     pub descriptor_sha256: String,
@@ -208,6 +216,13 @@ impl AgentBridgeAdmissionDescriptor {
                 field: "agent_bridge.allowed_capabilities",
             });
         }
+        if declaration.profile_id != self.profile_id.as_str()
+            || declaration.max_frame != self.max_frame
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "agent_bridge.profile_id_or_max_frame",
+            });
+        }
         if !declaration
             .module_contract
             .required_capabilities
@@ -265,7 +280,16 @@ impl AgentBridgeAdmissionDescriptor {
                 });
             }
         }
+        validate_runtime_digest(self.profile_id.as_str(), "agent_bridge.profile_id")?;
         validate_windows_sid_text(&self.approved_user_sid)?;
+        if self.executable_identity.volume_serial_number == 0
+            || self.executable_identity.file_index == 0
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "agent_bridge.executable_identity",
+                reason: "must contain a non-zero file identity",
+            });
+        }
         self.state_fence
             .validate()
             .map_err(|_| KernelServiceError::HandshakeMismatch {
@@ -289,6 +313,15 @@ impl AgentBridgeAdmissionDescriptor {
             "agent_bridge.allowed_privacy_classes",
         )?;
         validate_policy_set(&self.allowed_effects, "agent_bridge.allowed_effects")?;
+        if self.max_frame == 0
+            || usize::try_from(self.max_frame).unwrap_or(usize::MAX)
+                > eliot_protocol::MAX_FRAME_BYTES
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "agent_bridge.max_frame",
+                reason: "must be within the protocol frame ceiling",
+            });
+        }
         validate_text(
             &self.expected_kernel_principal_binding,
             "agent_bridge.expected_kernel_principal_binding",
@@ -298,6 +331,7 @@ impl AgentBridgeAdmissionDescriptor {
                 self.executable_sha256.as_str(),
                 "agent_bridge.executable_sha256",
             ),
+            (self.profile_sha256.as_str(), "agent_bridge.profile_sha256"),
             (
                 self.expected_kernel_config_snapshot_sha256.as_str(),
                 "agent_bridge.expected_kernel_config_snapshot_sha256",
@@ -2869,8 +2903,14 @@ mod tests {
             wire_id: AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID.to_owned(),
             wire_version: AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
             module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: handle_value(&"d".repeat(64)),
+            profile_sha256: "d".repeat(64),
             executable: handle_value(r"C:\Eliot\eliot-agent-bridge.exe"),
             executable_sha256: "a".repeat(64),
+            executable_identity: HostFileIdentity {
+                volume_serial_number: 7,
+                file_index: 11,
+            },
             generation,
             authority_epoch,
             state_fence: StateFence::new(authority_epoch, generation),
@@ -2881,6 +2921,7 @@ mod tests {
             allowed_capabilities: vec!["agent.attach".to_owned()],
             allowed_privacy_classes: vec!["project_code".to_owned()],
             allowed_effects: vec!["tool.call".to_owned()],
+            max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES).expect("frame limit"),
             expected_kernel_principal_binding: "kernel-principal:generation-11".to_owned(),
             expected_kernel_config_snapshot_sha256: "b".repeat(64),
             client_declaration_path: handle_value(
@@ -2902,7 +2943,7 @@ mod tests {
             wire_id: eliot_protocol::AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID.to_owned(),
             wire_version: eliot_protocol::AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
             module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
-            profile_id: "agent-bridge-profile-1".to_owned(),
+            profile_id: descriptor.profile_id.as_str().to_owned(),
             protocol_range: ProtocolRange {
                 minimum: ProtocolVersion::CURRENT,
                 maximum: ProtocolVersion::CURRENT,
@@ -2929,7 +2970,7 @@ mod tests {
             },
             capabilities: descriptor.allowed_capabilities.clone(),
             privacy_classes: descriptor.allowed_privacy_classes.clone(),
-            max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES).expect("frame limit"),
+            max_frame: descriptor.max_frame,
             expected_kernel_sid: "S-1-5-18".to_owned(),
             expected_kernel_session_id: 0,
             expected_kernel_principal_binding: descriptor.expected_kernel_principal_binding.clone(),
@@ -3689,6 +3730,46 @@ mod tests {
             .expect("descriptor")
             .module_id = "unapproved-bridge".to_owned();
         assert!(tampered.validate().is_err());
+    }
+
+    #[test]
+    fn candidate_bridge_descriptor_digest_binds_profile_and_file_evidence() {
+        let baseline = candidate_binding();
+        let baseline_digest = baseline.compute_digest().expect("baseline digest");
+        let mutations: [fn(&mut AgentBridgeAdmissionDescriptor); 5] = [
+            |descriptor: &mut AgentBridgeAdmissionDescriptor| {
+                descriptor.profile_id = handle_value(&"e".repeat(64));
+            },
+            |descriptor: &mut AgentBridgeAdmissionDescriptor| {
+                descriptor.profile_sha256 = "e".repeat(64);
+            },
+            |descriptor: &mut AgentBridgeAdmissionDescriptor| {
+                descriptor.executable_identity.file_index += 1;
+            },
+            |descriptor: &mut AgentBridgeAdmissionDescriptor| {
+                descriptor.max_frame -= 1;
+            },
+            |descriptor: &mut AgentBridgeAdmissionDescriptor| {
+                descriptor.client_declaration_path =
+                    handle_value(r"C:\ProgramData\Eliot\kernel\replacement.json");
+            },
+        ];
+        for mutate in mutations {
+            let mut candidate = baseline.clone();
+            let descriptor = candidate
+                .agent_bridge_admission
+                .insert(agent_bridge_admission_descriptor());
+            mutate(descriptor);
+            descriptor.descriptor_sha256 = descriptor.compute_digest().expect("digest");
+            candidate
+                .validate()
+                .expect("valid substituted descriptor shape");
+            assert_ne!(
+                candidate.compute_digest().expect("candidate digest"),
+                baseline_digest,
+                "profile/file/declaration evidence substitution must change candidate digest"
+            );
+        }
     }
 
     #[test]

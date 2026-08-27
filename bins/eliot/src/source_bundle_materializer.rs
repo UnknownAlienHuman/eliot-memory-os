@@ -7,20 +7,21 @@ use std::path::{Path, PathBuf};
 
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationExpectation};
 use eliot_installation::{
-    AuthorityEpoch, GenerationPackagePlanner, InstallationEpoch, InstallationError,
-    InstallationProfile, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
-    PlatformHandle, RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
+    AgentBridgeSourceMaterializationFactory, AgentBridgeSourceMaterializationPlan, AuthorityEpoch,
+    GenerationPackagePlanner, InstallationEpoch, InstallationError, InstallationProfile,
+    LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlatformHandle,
+    RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
     RuntimeStateRoots, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
     SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
     SourceBundlePublicationRole, StateFence, SupervisionAuthorityBinding,
-    source_bundle_publication_operation_id,
+    agent_bridge_source_plan_from_observed_kernel, source_bundle_publication_operation_id,
 };
 use eliot_kernel_service::EliotdLaunchDescriptor;
 use eliot_platform_windows::{
     AuthenticodeEvidence, AuthenticodeVerifier, DirectoryPublicationOutcome,
     DirectoryPublicationReceipt, FileIdentity, OwnedDirectoryPublication, PackageFileSpec,
     PackageManifest, PeCoffEvidence, TrustedSourceBundle, WindowsAuthenticodeVerifier,
-    canonical_windows_path, open_no_follow_directory, parse_pe_coff,
+    canonical_windows_path, open_no_follow_directory, parse_pe_coff, resolve_account_sid,
     validate_package_relative_path,
 };
 use eliot_runtime_contracts::{
@@ -65,6 +66,10 @@ pub struct CanarySourceBundleMaterializeInput {
     pub surreal_exe: PathBuf,
     /// Release `eliotd.exe` path.
     pub eliotd_exe: PathBuf,
+    /// Optional explicit external agent-bridge executable source.
+    pub agent_bridge_exe: Option<PathBuf>,
+    /// Optional account name resolved by Windows to the approved stable SID.
+    pub agent_bridge_account: Option<String>,
     /// Absent absolute directory to create exactly once.
     pub output_bundle: PathBuf,
     /// Exact redb store that owns the publication intent/outcome journal.
@@ -571,6 +576,61 @@ fn governor_bytes(
         .map_err(|error| MaterializeError::Contract(format!("serialize governor config: {error}")))
 }
 
+fn bridge_source_plan(
+    input: &CanarySourceBundleMaterializeInput,
+    kernel_artifact_sha256: &str,
+) -> Result<Option<Box<AgentBridgeSourceMaterializationPlan>>, MaterializeError> {
+    match (
+        input.agent_bridge_exe.as_ref(),
+        input.agent_bridge_account.as_deref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(path), Some(account)) => {
+            if path.file_name().and_then(|name| name.to_str()) != Some("eliot-agent-bridge.exe") {
+                return Err(MaterializeError::Invalid(
+                    "agent_bridge_exe must name eliot-agent-bridge.exe".to_owned(),
+                ));
+            }
+            let path = handle_path(path, "agent_bridge_exe")?;
+            let retained = AgentBridgeSourceMaterializationFactory::retain_source(&path)
+                .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+            let approved_user_sid = resolve_account_sid(account).map_err(|error| {
+                MaterializeError::Invalid(format!(
+                    "agent_bridge_account could not be resolved to a canonical SID: {error}"
+                ))
+            })?;
+            let plan = agent_bridge_source_plan_from_observed_kernel(
+                &retained,
+                approved_user_sid,
+                kernel_artifact_sha256,
+            )
+            .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+            Ok(Some(Box::new(plan)))
+        }
+        _ => Err(MaterializeError::Invalid(
+            "agent_bridge_exe and agent_bridge_account must be supplied together".to_owned(),
+        )),
+    }
+}
+
+/// Rebuilds the optional bridge source plan after the durable Phase-A
+/// publication readback.  The Kernel artifact digest is taken from that
+/// receipt, never from a caller-supplied value.
+pub(crate) fn bridge_source_plan_for_receipt(
+    input: &CanarySourceBundleMaterializeInput,
+    receipt: &CanarySourceBundleReceipt,
+) -> Result<Option<Box<AgentBridgeSourceMaterializationPlan>>, InstallationError> {
+    let kernel_sha256 = receipt
+        .files
+        .iter()
+        .find(|file| file.relative_path == "eliot-kernel.exe")
+        .map(|file| file.sha256.as_str())
+        .ok_or_else(|| {
+            InstallationError::IncompleteObservation("kernel receipt role missing".to_owned())
+        })?;
+    bridge_source_plan(input, kernel_sha256).map_err(InstallationError::from)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the typed bundle seam keeps all launch and evidence bindings auditable"
@@ -609,6 +669,7 @@ fn build_typed_bundle(
     let store_bridge = by_name("eliot-store-surreal.exe")?;
     let canonical_store = by_name("surreal.exe")?;
     let eliotd = by_name("eliotd.exe")?;
+    bridge_source_plan(input, &kernel.sha256)?;
     let governor = governor_bytes(&input.generation, &input.installation_epoch, &kernel.sha256)?;
     let governor_sha256 = sha256_hex(&governor);
     let template_facts = vec![
@@ -1837,6 +1898,8 @@ mod tests {
             eliot_store_surreal_exe: PathBuf::new(),
             surreal_exe: PathBuf::new(),
             eliotd_exe: PathBuf::new(),
+            agent_bridge_exe: None,
+            agent_bridge_account: None,
             output_bundle: source_parent.path().join("bundle"),
             store_path: source_parent.path().join("transaction.redb"),
             generation: handle("generation-test"),
@@ -1879,6 +1942,39 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn bridge_source_inputs_are_paired_and_legacy_none_is_preserved() {
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let mut input = test_input(&source_parent, &anchor, &staging);
+        assert_eq!(bridge_source_plan(&input, &"a".repeat(64)).unwrap(), None);
+
+        input.agent_bridge_exe = Some(source_parent.path().join("eliot-agent-bridge.exe"));
+        assert!(bridge_source_plan(&input, &"a".repeat(64)).is_err());
+        input.agent_bridge_exe = None;
+        input.agent_bridge_account = Some("ELIOT-ACCOUNT-DOES-NOT-EXIST-9D7C".to_owned());
+        assert!(bridge_source_plan(&input, &"a".repeat(64)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bridge_source_plan_rejects_observed_kernel_substitution() {
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let mut input = test_input(&source_parent, &anchor, &staging);
+        let bridge = source_parent.path().join("eliot-agent-bridge.exe");
+        fs::write(&bridge, b"bridge-source").unwrap();
+        input.agent_bridge_exe = Some(bridge);
+        input.agent_bridge_account = Some("NT AUTHORITY\\LocalService".to_owned());
+        let source = bridge_source_plan(&input, &"a".repeat(64)).unwrap();
+        let source = source.expect("paired bridge source");
+        assert_ne!(source.source_executable_sha256.as_str(), "a".repeat(64));
+        assert!(bridge_source_plan(&input, source.source_executable_sha256.as_str()).is_err());
+    }
+
+    #[cfg(windows)]
     fn crash_after_publication_intent(
         input: &CanarySourceBundleMaterializeInput,
     ) -> SourceBundlePublicationJournal {
@@ -1918,6 +2014,7 @@ mod tests {
             staging_root: input.staging_root.clone(),
             minimum_store_available_bytes: 1,
             recovery_command: handle("eliot recover --transaction-id transaction:test"),
+            agent_bridge_source: None,
         }
     }
 
@@ -1981,6 +2078,7 @@ mod tests {
                 staging_root: input.staging_root.clone(),
                 minimum_store_available_bytes: 1,
                 recovery_command: handle("eliot recover --transaction-id transaction:test"),
+                agent_bridge_source: None,
             },
             binding.source_identity,
             binding.files,

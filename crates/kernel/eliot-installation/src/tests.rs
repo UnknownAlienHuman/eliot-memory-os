@@ -559,6 +559,159 @@ fn test_secret_creation_proof() -> InstallationSecretCreationProof {
 }
 
 #[test]
+fn agent_bridge_stage_carrier_is_roundtrip_and_pair_digest_bound() {
+    let identity = FileIdentity {
+        volume_serial_number: 7,
+        file_index: 11,
+    };
+    let mut stage = AgentBridgeStagePrepared {
+        wire: test_handle(AgentBridgeStagePrepared::WIRE),
+        installation_id: test_handle("installation:test"),
+        transaction_id: test_handle("transaction:test"),
+        installation_plan_digest: test_handle("a".repeat(64)),
+        effect_id: test_handle("effect:test"),
+        request_digest: test_handle("b".repeat(64)),
+        host_state_root_digest: test_handle("c".repeat(64)),
+        manifest_digest: test_handle("d".repeat(64)),
+        launch_descriptor_digest: test_handle("e".repeat(64)),
+        launch_generation: test_handle("generation:test"),
+        source_path: test_handle(r"C:\source\eliot-agent-bridge.exe"),
+        source_identity: identity,
+        source_sha256: test_handle("f".repeat(64)),
+        source_size: 12,
+        temporary_path: test_handle(r"C:\root\tmp\bridge.tmp"),
+        temporary_identity: FileIdentity {
+            volume_serial_number: 7,
+            file_index: 12,
+        },
+        destination_path: test_handle(r"C:\root\external-modules\bridge.exe"),
+        destination_parent_identity: FileIdentity {
+            volume_serial_number: 7,
+            file_index: 13,
+        },
+        prepared_digest: test_handle("pending"),
+    };
+    stage.prepared_digest = must(stage.computed_digest());
+    assert!(stage.validate().is_ok());
+    let mut old_stage = stage.clone();
+    old_stage.wire = test_handle("eliot.host.agent-bridge-stage-prepared.v0");
+    old_stage.prepared_digest = must(old_stage.computed_digest());
+    assert!(matches!(
+        old_stage.validate(),
+        Err(InstallationError::MigrationRequired { .. })
+    ));
+    let mut binding = must(AgentBridgePreparedBinding::new(
+        stage.clone(),
+        test_handle("1".repeat(64)),
+        stage.destination_path.clone(),
+        FileIdentity {
+            volume_serial_number: 7,
+            file_index: 14,
+        },
+        stage.source_sha256.clone(),
+        stage.source_size,
+        test_handle(r"C:\root\agent-bridge\admission-profile-v1.json"),
+        test_handle("2".repeat(64)),
+        test_handle(r"C:\root\agent-bridge\client-declaration-v2.json"),
+        test_handle("3".repeat(64)),
+        FileIdentity {
+            volume_serial_number: 1,
+            file_index: 2,
+        },
+        test_handle("4".repeat(64)),
+        FileIdentity {
+            volume_serial_number: 3,
+            file_index: 4,
+        },
+        test_handle("5".repeat(64)),
+    ));
+    let original_pair = binding.pair_digest.clone();
+    assert!(binding.validate().is_ok());
+    binding.declaration_digest = test_handle("6".repeat(64));
+    assert!(binding.validate().is_err());
+    assert_ne!(
+        original_pair,
+        binding
+            .computed_pair_digest()
+            .unwrap_or_else(|_| unreachable!())
+    );
+
+    let bytes = must(serde_json::to_vec(&stage));
+    let decoded: AgentBridgeStagePrepared = must(serde_json::from_slice(&bytes));
+    assert_eq!(decoded, stage);
+}
+
+#[test]
+fn pending_agent_bridge_stage_slot_is_explicit_and_requires_pending_intent() {
+    let mut value = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+    value["pending_activation"] = serde_json::json!({});
+    let bytes = must(serde_json::to_vec(&value));
+    assert!(matches!(
+        decode_registry_bytes(&bytes),
+        Err(InstallationError::CorruptRegistry { .. })
+    ));
+
+    let transaction = registering_transaction();
+    let approval =
+        test_transaction_activation_approval(&transaction, test_handle("approval:stage-order"));
+    let path = std::env::temp_dir().join(format!(
+        "eliot-installation-stage-order-{}-{}.redb",
+        std::process::id(),
+        NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let database = must(Database::create(&path));
+    let registry = RedbInstallationRegistry::from_database_for_test(database);
+    let stage = AgentBridgeStagePrepared {
+        wire: test_handle(AgentBridgeStagePrepared::WIRE),
+        installation_id: test_handle("installation:test"),
+        transaction_id: test_handle("transaction:test"),
+        installation_plan_digest: test_handle("a".repeat(64)),
+        effect_id: test_handle("effect:test"),
+        request_digest: test_handle("b".repeat(64)),
+        host_state_root_digest: test_handle("c".repeat(64)),
+        manifest_digest: test_handle("d".repeat(64)),
+        launch_descriptor_digest: test_handle("e".repeat(64)),
+        launch_generation: test_handle("generation:test"),
+        source_path: test_handle(r"C:\source\eliot-agent-bridge.exe"),
+        source_identity: FileIdentity {
+            volume_serial_number: 7,
+            file_index: 11,
+        },
+        source_sha256: test_handle("f".repeat(64)),
+        source_size: 12,
+        temporary_path: test_handle(r"C:\root\tmp\bridge.tmp"),
+        temporary_identity: FileIdentity {
+            volume_serial_number: 7,
+            file_index: 12,
+        },
+        destination_path: test_handle(r"C:\root\external-modules\bridge.exe"),
+        destination_parent_identity: FileIdentity {
+            volume_serial_number: 7,
+            file_index: 13,
+        },
+        prepared_digest: test_handle("pending"),
+    };
+    let mut stage = stage;
+    stage.prepared_digest = must(stage.computed_digest());
+    let result = registry.record_pending_phase_b_agent_bridge_stage_prepared(
+        &host_capability(),
+        1,
+        &approval,
+        &stage,
+    );
+    assert!(matches!(
+        result,
+        Err(InstallationError::IncompleteObservation(_))
+    ));
+    assert!(
+        must(registry.load())
+            .pending_phase_b_agent_bridge_stage_prepared()
+            .is_none()
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn root_win32_error_uses_a_stable_typed_pending_reference() {
     let pending = port_pending(root_execution_error::<()>(InstallerRootError::Win32 {
         stage: InstallerRootStage::CreateDirectory,
@@ -1076,7 +1229,7 @@ fn v21_and_missing_secret_proof_require_explicit_migration() {
     assert!(matches!(
         validate_installation_transaction_json(&legacy_bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("21.0.0") && reason.contains("22.0.0")
+            if reason.contains("21.0.0") && reason.contains("23.0.0")
     ));
 
     let mut missing = serde_json::to_value(&transaction).unwrap_or_else(|_| unreachable!());
@@ -1094,7 +1247,7 @@ fn v21_and_missing_secret_proof_require_explicit_migration() {
     assert!(matches!(
         validate_installation_transaction_json(&missing_bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("creation proof") && reason.contains("v22")
+            if reason.contains("creation proof") && reason.contains("v23")
     ));
 }
 
@@ -1177,6 +1330,7 @@ fn test_commit_fence(manifest: &CandidateManifest) -> ActivationCommitFence {
                 manifest.generation.as_str(),
                 runtime.authority_generation,
             ),
+            agent_bridge: None,
         }),
         authority_generation: runtime.authority_generation,
         authority_state_fence: runtime.authority_state_fence.clone(),
@@ -1345,6 +1499,7 @@ fn installer_plan_parts(
                 service_sid_type: SUPERVISION_AUTHORITY_SERVICE_SID_TYPE,
             }),
             provision: Box::new(provision),
+            agent_bridge_source: None,
         });
     }
     let changes = effects
@@ -2082,6 +2237,7 @@ fn fully_applied_system_registration_transaction() -> InstallationTransaction {
                 transaction.effect_progress[index].admitted_precondition =
                     Some(must(InstallationEffectPrecondition::from_change(&change)));
                 let mut receipt = HostPhaseBMaterializationReceipt {
+                    wire: test_handle(HostPhaseBMaterializationReceipt::WIRE),
                     transaction_id: transaction.transaction_id.clone(),
                     effect_id: transaction.effect_progress[index].effect_id.clone(),
                     candidate_manifest_digest: must(candidate_manifest_digest(
@@ -2107,6 +2263,7 @@ fn fully_applied_system_registration_transaction() -> InstallationTransaction {
                             .runtime_launch
                             .authority_generation,
                     ),
+                    agent_bridge: None,
                     receipt_digest: test_handle("0".repeat(64)),
                 };
                 receipt.receipt_digest = must(receipt.computed_digest());
@@ -2768,6 +2925,7 @@ fn first_install_bootstrap_handoff_keeps_both_starts_pending_through_projection(
                 )),
                 minimum_store_available_bytes: 1,
                 recovery_command: test_handle("recovery:command"),
+                agent_bridge_source: None,
             },
         ));
         let tail = &planned_via_planner.installer_effects
@@ -6413,7 +6571,7 @@ fn pre_v7_transaction_json_requires_explicit_migration() {
 }
 
 #[test]
-fn v8_transaction_json_requires_explicit_migration_to_v21() {
+fn v8_transaction_json_requires_explicit_migration_to_v23() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -6427,7 +6585,7 @@ fn v8_transaction_json_requires_explicit_migration_to_v21() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("requires explicit migration to 22.0.0")
+            if reason.contains("requires explicit migration to 23.0.0")
     ));
 }
 
@@ -6476,7 +6634,7 @@ fn v9_transaction_json_requires_explicit_migration_without_start_synthesis() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("wire 9.0.0 requires explicit migration to 22.0.0")
+            if reason.contains("wire 9.0.0 requires explicit migration to 23.0.0")
     ));
 }
 
@@ -6496,7 +6654,7 @@ fn v4_transaction_json_requires_explicit_migration_without_defaults() {
 }
 
 #[test]
-fn v10_transaction_json_requires_explicit_migration_to_v21() {
+fn v10_transaction_json_requires_explicit_migration_to_v23() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -6522,12 +6680,12 @@ fn v10_transaction_json_requires_explicit_migration_to_v21() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 10.0.0 requires explicit migration to 22.0.0")
+            if reason.contains("wire 10.0.0 requires explicit migration to 23.0.0")
     ));
 }
 
 #[test]
-fn v13_transaction_json_requires_explicit_migration_to_v21() {
+fn v13_transaction_json_requires_explicit_migration_to_v23() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -6538,12 +6696,12 @@ fn v13_transaction_json_requires_explicit_migration_to_v21() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 13.0.0 requires explicit migration to 22.0.0")
+            if reason.contains("wire 13.0.0 requires explicit migration to 23.0.0")
     ));
 }
 
 #[test]
-fn v14_transaction_json_requires_explicit_migration_to_v21() {
+fn v14_transaction_json_requires_explicit_migration_to_v23() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -6554,36 +6712,36 @@ fn v14_transaction_json_requires_explicit_migration_to_v21() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 14.0.0 requires explicit migration to 22.0.0")
+            if reason.contains("wire 14.0.0 requires explicit migration to 23.0.0")
     ));
 }
 
 #[test]
-fn v15_transaction_json_requires_explicit_migration_to_v21() {
+fn v15_transaction_json_requires_explicit_migration_to_v23() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(15, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 15.0.0 requires explicit migration to 22.0.0")
+            if reason.contains("wire 15.0.0 requires explicit migration to 23.0.0")
     ));
 }
 
 #[test]
-fn v16_transaction_json_requires_explicit_migration_to_v21() {
+fn v16_transaction_json_requires_explicit_migration_to_v23() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(16, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 16.0.0") && reason.contains("22.0.0")
+            if reason.contains("wire 16.0.0") && reason.contains("23.0.0")
     ));
 }
 
 #[test]
-fn v17_transaction_json_requires_explicit_migration_to_v21() {
+fn v17_transaction_json_requires_explicit_migration_to_v23() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(17, 0, 0)));
     for progress in legacy["effect_progress"]
@@ -6599,12 +6757,12 @@ fn v17_transaction_json_requires_explicit_migration_to_v21() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 17.0.0") && reason.contains("22.0.0")
+            if reason.contains("wire 17.0.0") && reason.contains("23.0.0")
     ));
 }
 
 #[test]
-fn v18_transaction_json_requires_explicit_migration_to_v21() {
+fn v18_transaction_json_requires_explicit_migration_to_v23() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(18, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
@@ -6614,19 +6772,34 @@ fn v18_transaction_json_requires_explicit_migration_to_v21() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("wire 18.0.0") && reason.contains("22.0.0")
+            if reason.contains("wire 18.0.0") && reason.contains("23.0.0")
     ));
 }
 
 #[test]
-fn v20_transaction_json_requires_explicit_migration_to_v21() {
+fn v20_transaction_json_requires_explicit_migration_to_v23() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(20, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 20.0.0") && reason.contains("22.0.0")
+            if reason.contains("wire 20.0.0") && reason.contains("23.0.0")
+    ));
+}
+
+#[test]
+fn v22_transaction_json_is_rejected_before_payload_authority() {
+    let mut legacy = must(serde_json::to_value(planned_transaction()));
+    legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(22, 0, 0)));
+    // Deliberately corrupt a nested authority field as well.  The version
+    // discriminator must fence the old wire before nested payload acceptance.
+    legacy["installer_effects"][0]["effect_id"] = serde_json::json!(null);
+    let bytes = must(serde_json::to_vec(&legacy));
+    assert!(matches!(
+        decode_installation_transaction_json(&bytes),
+        Err(InstallationError::MigrationRequired { reason })
+            if reason.contains("wire 22.0.0") && reason.contains("23.0.0")
     ));
 }
 
@@ -6653,7 +6826,7 @@ fn current_transaction_missing_nonce_or_deadline_is_corrupt_not_synthesized() {
 
 #[cfg(windows)]
 #[test]
-fn current_v22_ownership_members_are_mandatory_and_never_synthesized() {
+fn current_v23_ownership_members_are_mandatory_and_never_synthesized() {
     for field in [
         "reference",
         "create_disposition",
@@ -6678,7 +6851,7 @@ fn current_v22_ownership_members_are_mandatory_and_never_synthesized() {
         ownership.remove(field);
         let bytes = must(serde_json::to_vec(&value));
         let error = decode_installation_transaction_json(&bytes)
-            .expect_err("missing current-v22 ownership member must reject the record");
+            .expect_err("missing current-v23 ownership member must reject the record");
         assert!(
             matches!(
                 error,
@@ -7457,6 +7630,7 @@ fn pending_phase_b_intent_is_durable_before_destination_publication_and_rejects_
         must(phase_b_watchdog_selector_digest(
             &transaction.candidate_manifest,
         )),
+        None,
         test_provisioned_supervision_authority(
             transaction
                 .candidate_manifest
@@ -7525,6 +7699,7 @@ fn pending_phase_b_intent_is_durable_before_destination_publication_and_rejects_
         eliotd_descriptor_digest: test_handle("5".repeat(64)),
         semantic_config_hash: test_handle("9".repeat(64)),
         launch: phase_b_launch,
+        agent_bridge: None,
         prepared_digest: test_handle("pending"),
     };
     prepared.prepared_digest = must(prepared.computed_digest());
@@ -7564,7 +7739,6 @@ fn pending_phase_b_intent_is_durable_before_destination_publication_and_rejects_
         &intent,
     ));
     assert_eq!(must(registry.load()), before_retry);
-
     let substituted = HostPhaseBMaterializationIntent::new(
         intent.transaction_id.clone(),
         intent.effect_id.clone(),
@@ -7575,6 +7749,7 @@ fn pending_phase_b_intent_is_durable_before_destination_publication_and_rejects_
         intent.host_state_root_digest.clone(),
         intent.static_template.clone(),
         intent.watchdog_selector_digest.clone(),
+        None,
         intent.provisioned_supervision_authority.clone(),
     )
     .unwrap_or_else(|_| unreachable!());
@@ -7588,6 +7763,44 @@ fn pending_phase_b_intent_is_durable_before_destination_publication_and_rejects_
         Err(InstallationError::IdentityConflict)
     ));
     assert_eq!(must(registry.load()), before_retry);
+    let mut prepared_receipt = HostPhaseBPreparedReceipt {
+        wire: test_handle(HostPhaseBPreparedReceipt::WIRE),
+        transaction_id: prepared.transaction_id.clone(),
+        effect_id: prepared.effect_id.clone(),
+        candidate_manifest_digest: prepared.manifest_digest.clone(),
+        request_digest: prepared.request_digest.clone(),
+        host_owner_epoch: prepared.host_owner_epoch.clone(),
+        host_process_identity: prepared.host_process_identity.clone(),
+        authority_descriptor_digest: prepared.authority_descriptor_digest.clone(),
+        config_file_digest: prepared.config_file_digest.clone(),
+        store_bootstrap_descriptor_digest: prepared.store_bootstrap_descriptor_digest.clone(),
+        eliotd_descriptor_digest: prepared.eliotd_descriptor_digest.clone(),
+        provisioned_supervision_authority: intent.provisioned_supervision_authority.clone(),
+        agent_bridge: prepared.agent_bridge.clone(),
+        receipt_digest: test_handle("pending"),
+    };
+    prepared_receipt.receipt_digest = must(prepared_receipt.computed_digest());
+    let prepared_receipt_revision = must(registry.load()).revision();
+    must(registry.record_pending_phase_b_prepared_receipt(
+        &capability,
+        prepared_receipt_revision,
+        &approval,
+        &prepared_receipt,
+    ));
+    let before_receipt_substitution = must(registry.load());
+    let mut substituted_receipt = prepared_receipt.clone();
+    substituted_receipt.host_process_identity = test_handle("f".repeat(64));
+    substituted_receipt.receipt_digest = must(substituted_receipt.computed_digest());
+    assert!(matches!(
+        registry.record_pending_phase_b_prepared_receipt(
+            &capability,
+            before_receipt_substitution.revision(),
+            &approval,
+            &substituted_receipt,
+        ),
+        Err(InstallationError::IdentityConflict)
+    ));
+    assert_eq!(must(registry.load()), before_receipt_substitution);
     drop(registry);
     let _ = std::fs::remove_file(path);
 }
@@ -8089,7 +8302,7 @@ fn current_registry_rejects_omitted_watchdog_service_control_grant_member() {
     assert!(matches!(
         decode_registry_bytes(&bytes),
         Err(InstallationError::CorruptRegistry { reason })
-            if reason.contains("wire v14")
+            if reason.contains("current registry wire")
     ));
 }
 
@@ -8131,7 +8344,7 @@ fn v2_registry_wire_requires_explicit_restage_without_defaults() {
 }
 
 #[test]
-fn v9_registry_wire_requires_explicit_migration_to_v14() {
+fn v9_registry_wire_requires_explicit_migration_to_v15() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object["registry_wire_version"] = serde_json::json!({
@@ -8148,7 +8361,7 @@ fn v9_registry_wire_requires_explicit_migration_to_v14() {
         matches!(
             error,
             InstallationError::MigrationRequired { ref reason }
-                if reason.contains("registry wire 9.0.0") && reason.contains("14.0.0")
+                if reason.contains("registry wire 9.0.0") && reason.contains("15.0.0")
         ),
         "unexpected raw v9 classification: {error:?}"
     );
@@ -8207,56 +8420,68 @@ fn v10_registry_with_v1_rebind_requires_restage_without_adoption() {
 }
 
 #[test]
-fn v11_registry_wire_requires_explicit_migration_to_v14() {
+fn v11_registry_wire_requires_explicit_migration_to_v15() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     legacy["registry_wire_version"] = must(serde_json::to_value(ContractVersion::new(11, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_registry_bytes(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("registry wire 11.0.0") && reason.contains("14.0.0")
+            if reason.contains("registry wire 11.0.0") && reason.contains("15.0.0")
     ));
 }
 
 #[test]
-fn v14_registry_wire_round_trips_without_synthesizing_control_grants() {
+fn v15_registry_wire_round_trips_without_synthesizing_control_grants() {
     let current = ApprovedGenerationRegistry::new();
     let bytes = must(serde_json::to_vec(&current));
     let decoded = must(decode_registry_bytes(&bytes));
     assert_eq!(decoded, current);
     assert_eq!(
         decoded.registry_wire_version(),
-        ContractVersion::new(14, 0, 0)
+        ContractVersion::new(15, 0, 0)
     );
     assert!(decoded.active_phase_b_rebind().is_none());
 }
 
 #[test]
-fn v12_registry_wire_requires_explicit_migration_to_v14() {
+fn v12_registry_wire_requires_explicit_migration_to_v15() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     legacy["registry_wire_version"] = must(serde_json::to_value(ContractVersion::new(12, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_registry_bytes(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("registry wire 12.0.0") && reason.contains("14.0.0")
+            if reason.contains("registry wire 12.0.0") && reason.contains("15.0.0")
     ));
 }
 
 #[test]
-fn v13_registry_wire_requires_explicit_migration_to_v14() {
+fn v13_registry_wire_requires_explicit_migration_to_v15() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     legacy["registry_wire_version"] = must(serde_json::to_value(ContractVersion::new(13, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_registry_bytes(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("registry wire 13.0.0") && reason.contains("14.0.0")
+            if reason.contains("registry wire 13.0.0") && reason.contains("15.0.0")
     ));
 }
 
 #[test]
-fn v14_registry_wire_rejects_omitted_mandatory_rebind_member() {
+fn v14_registry_wire_requires_explicit_migration_to_v15() {
+    let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+    legacy["registry_wire_version"] = must(serde_json::to_value(ContractVersion::new(14, 0, 0)));
+    let bytes = must(serde_json::to_vec(&legacy));
+    assert!(matches!(
+        decode_registry_bytes(&bytes),
+        Err(InstallationError::MigrationRequired { reason })
+            if reason.contains("registry wire 14.0.0") && reason.contains("15.0.0")
+    ));
+}
+
+#[test]
+fn v15_registry_wire_rejects_omitted_mandatory_rebind_member() {
     let mut current = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
     current
         .as_object_mut()
@@ -9344,6 +9569,7 @@ fn active_phase_b_rebind_completed_receipt_requires_fresh_owner_recovery_cas() {
         eliotd_descriptor_digest: launch.eliotd_descriptor_digest.clone(),
         semantic_config_hash: test_handle("c".repeat(64)),
         launch,
+        agent_bridge: None,
         prepared_digest: test_handle("pending"),
     };
     let mut prepared = prepared;
@@ -9803,6 +10029,7 @@ fn staging_new_generation_clears_active_phase_b_rebind_before_commit() {
         eliotd_descriptor_digest: launch.eliotd_descriptor_digest.clone(),
         semantic_config_hash: test_handle("c".repeat(64)),
         launch,
+        agent_bridge: None,
         prepared_digest: test_handle("pending"),
     };
     prepared.prepared_digest = must(prepared.computed_digest());
@@ -10122,6 +10349,8 @@ fn registry_rejects_pending_while_active_rebind_is_active() {
         approval: pending_approval,
         phase_b_intent: None,
         phase_b_prepared: None,
+        phase_b_prepared_receipt: None,
+        phase_b_agent_bridge_stage_prepared: None,
         phase_b_receipt: None,
         state: PendingActivationState::Pending,
     };

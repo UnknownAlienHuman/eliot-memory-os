@@ -233,6 +233,14 @@ enum InstallationCommand {
         surreal: PathBuf,
         #[arg(long, value_parser = absolute_path)]
         eliotd: PathBuf,
+        /// Optional explicit external agent-bridge executable source. Must be
+        /// supplied together with `--agent-bridge-account`.
+        #[arg(long, value_parser = absolute_path)]
+        agent_bridge_exe: Option<PathBuf>,
+        /// Optional account name whose canonical SID is resolved by Windows.
+        /// Raw SID text is not accepted as an admission input.
+        #[arg(long)]
+        agent_bridge_account: Option<String>,
         #[arg(long, value_parser = absolute_path)]
         output_bundle: PathBuf,
         /// Absolute create-new diagnostic JSON path. This file is never an
@@ -1146,6 +1154,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_store_surreal,
             surreal,
             eliotd,
+            agent_bridge_exe,
+            agent_bridge_account,
             output_bundle,
             output,
             store,
@@ -1181,6 +1191,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             profile,
             profile_anchor_root,
             installation_key,
+            agent_bridge_exe,
+            agent_bridge_account,
         ),
     }
 }
@@ -1243,6 +1255,7 @@ fn run_installation_generate(
     output: PathBuf,
     store_path: PathBuf,
     source_publication: source_bundle_materializer::SourceBundlePublicationBinding,
+    agent_bridge_source: Option<Box<eliot_installation::AgentBridgeSourceMaterializationPlan>>,
 ) -> Result<InstallationGenerationOutcome> {
     run_installation_generate_with_output_writer(
         GenerationPackagePlanInput {
@@ -1262,6 +1275,7 @@ fn run_installation_generate(
             staging_root: cli_path_handle(&staging_root, "staging_root")?,
             minimum_store_available_bytes,
             recovery_command: cli_handle(recovery_command, "recovery_command")?,
+            agent_bridge_source,
         },
         output,
         store_path,
@@ -1397,6 +1411,8 @@ fn run_installation_materialize_source_bundle(
     profile: InstallationProfile,
     profile_anchor_root: PathBuf,
     installation_key: Option<String>,
+    agent_bridge_exe: Option<PathBuf>,
+    agent_bridge_account: Option<String>,
 ) -> Result<i32> {
     let materialize_input = source_bundle_materializer::CanarySourceBundleMaterializeInput {
         eliot_host_exe: eliot_host,
@@ -1405,6 +1421,8 @@ fn run_installation_materialize_source_bundle(
         eliot_store_surreal_exe: eliot_store_surreal,
         surreal_exe: surreal,
         eliotd_exe: eliotd,
+        agent_bridge_exe,
+        agent_bridge_account,
         output_bundle: output_bundle.clone(),
         store_path: store.clone(),
         generation: cli_handle(generation.clone(), "generation")?,
@@ -1452,6 +1470,8 @@ fn run_installation_materialize_source_bundle(
             }
         };
     let source_publication = receipt.planner_binding()?;
+    let agent_bridge_source =
+        source_bundle_materializer::bridge_source_plan_for_receipt(&materialize_input, &receipt)?;
     let generated = run_installation_generate(
         output_bundle,
         profile,
@@ -1468,6 +1488,7 @@ fn run_installation_materialize_source_bundle(
         output,
         store,
         source_publication,
+        agent_bridge_source,
     )?;
     match generated {
         InstallationGenerationOutcome::Generated {

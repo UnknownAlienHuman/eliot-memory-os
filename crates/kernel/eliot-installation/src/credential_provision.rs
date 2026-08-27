@@ -10,7 +10,10 @@ use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{InstallationError, handle, handles, sha256_handle, sha256_hex};
+use crate::{
+    AgentBridgePhaseBBinding, AgentBridgePreparedBinding, AgentBridgeSourceMaterializationPlan,
+    InstallationError, handle, handles, sha256_handle, sha256_hex,
+};
 
 /// Stable one-shot Host credential-control wire.
 ///
@@ -48,6 +51,7 @@ impl HostPhaseBStaticTemplate {
     }
 
     /// Validates the static template and all required non-empty bindings.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), InstallationError> {
         if self.wire.as_str() != Self::WIRE {
             return Err(InstallationError::InvalidField {
@@ -145,6 +149,9 @@ pub struct HostPhaseBMaterializationIntent {
     pub static_template_digest: PlatformHandle,
     /// Digest of the immutable Watchdog selector domain.
     pub watchdog_selector_digest: PlatformHandle,
+    /// Optional immutable external agent-bridge source materialization plan.
+    /// `None` preserves the legacy Phase-B intent carrier.
+    pub agent_bridge_source: Option<Box<AgentBridgeSourceMaterializationPlan>>,
     /// Exact public receipt of the installer-owned sealed signing-key effect.
     pub provisioned_supervision_authority: ProvisionedSupervisionAuthority,
     /// Digest of these fields excluding itself.
@@ -153,7 +160,7 @@ pub struct HostPhaseBMaterializationIntent {
 
 impl HostPhaseBMaterializationIntent {
     /// Current Phase-B operation wire.
-    pub const WIRE: &'static str = "eliot.host.phase-b.v3";
+    pub const WIRE: &'static str = "eliot.host.phase-b.v4";
 
     /// Creates a fully bound Phase-B request from transaction-owned values.
     #[allow(clippy::too_many_arguments)]
@@ -167,6 +174,7 @@ impl HostPhaseBMaterializationIntent {
         host_state_root_digest: PlatformHandle,
         static_template: HostPhaseBStaticTemplate,
         watchdog_selector_digest: PlatformHandle,
+        agent_bridge_source: Option<Box<AgentBridgeSourceMaterializationPlan>>,
         provisioned_supervision_authority: ProvisionedSupervisionAuthority,
     ) -> Result<Self, InstallationError> {
         let static_template_digest = static_template.digest()?;
@@ -187,6 +195,7 @@ impl HostPhaseBMaterializationIntent {
             static_template,
             static_template_digest,
             watchdog_selector_digest,
+            agent_bridge_source,
             provisioned_supervision_authority,
             request_digest: PlatformHandle::new("pending").map_err(|error| {
                 InstallationError::InvalidField {
@@ -208,6 +217,7 @@ impl HostPhaseBMaterializationIntent {
                 &value.static_template,
                 value.static_template_digest.as_str(),
                 value.watchdog_selector_digest.as_str(),
+                &value.agent_bridge_source,
                 &value.provisioned_supervision_authority,
             ),
             "phase_b.request_digest",
@@ -255,6 +265,9 @@ impl HostPhaseBMaterializationIntent {
             &self.watchdog_selector_digest,
             "phase_b.watchdog_selector_digest",
         )?;
+        if let Some(source) = self.agent_bridge_source.as_ref() {
+            source.validate()?;
+        }
         self.provisioned_supervision_authority
             .validate()
             .map_err(|error| InstallationError::InvalidField {
@@ -275,6 +288,7 @@ impl HostPhaseBMaterializationIntent {
                 &self.static_template,
                 self.static_template_digest.as_str(),
                 self.watchdog_selector_digest.as_str(),
+                &self.agent_bridge_source,
                 &self.provisioned_supervision_authority,
             ),
             "phase_b.request_digest",
@@ -286,12 +300,111 @@ impl HostPhaseBMaterializationIntent {
     }
 }
 
-/// Secret-free Host proof returned after Phase-B publication and live
-/// activation handoff.  Dynamic descriptor bytes are never returned over the
+/// Secret-free Host proof returned after Phase-B files are prepared, but
+/// before elevated ACL convergence. This is deliberately a distinct wire
+/// type and cannot be consumed as a final Phase-B proof.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(missing_docs)]
+pub struct HostPhaseBPreparedReceipt {
+    pub wire: PlatformHandle,
+    pub transaction_id: PlatformHandle,
+    pub effect_id: PlatformHandle,
+    pub candidate_manifest_digest: PlatformHandle,
+    pub request_digest: PlatformHandle,
+    pub host_owner_epoch: PlatformHandle,
+    pub host_process_identity: PlatformHandle,
+    pub authority_descriptor_digest: PlatformHandle,
+    pub config_file_digest: PlatformHandle,
+    pub store_bootstrap_descriptor_digest: PlatformHandle,
+    pub eliotd_descriptor_digest: PlatformHandle,
+    pub provisioned_supervision_authority: ProvisionedSupervisionAuthority,
+    pub agent_bridge: Option<AgentBridgePreparedBinding>,
+    pub receipt_digest: PlatformHandle,
+}
+
+#[allow(missing_docs)]
+impl HostPhaseBPreparedReceipt {
+    pub const WIRE: &'static str = "eliot.host.phase-b-prepared-receipt.v1";
+
+    pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        digest_json(
+            &(
+                self.wire.as_str(),
+                self.transaction_id.as_str(),
+                self.effect_id.as_str(),
+                self.candidate_manifest_digest.as_str(),
+                self.request_digest.as_str(),
+                self.host_owner_epoch.as_str(),
+                self.host_process_identity.as_str(),
+                self.authority_descriptor_digest.as_str(),
+                self.config_file_digest.as_str(),
+                self.store_bootstrap_descriptor_digest.as_str(),
+                self.eliotd_descriptor_digest.as_str(),
+                &self.provisioned_supervision_authority,
+                &self.agent_bridge,
+            ),
+            "phase_b.prepared_receipt_digest",
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.wire.as_str() != Self::WIRE {
+            return Err(InstallationError::MigrationRequired {
+                reason: "Phase-B prepared receipt requires explicit re-stage".to_owned(),
+            });
+        }
+        handle(
+            &self.transaction_id,
+            "phase_b_prepared_receipt.transaction_id",
+        )?;
+        handle(&self.effect_id, "phase_b_prepared_receipt.effect_id")?;
+        for (value, field) in [
+            (&self.candidate_manifest_digest, "candidate_manifest_digest"),
+            (&self.request_digest, "request_digest"),
+            (&self.host_process_identity, "host_process_identity"),
+            (
+                &self.authority_descriptor_digest,
+                "authority_descriptor_digest",
+            ),
+            (&self.config_file_digest, "config_file_digest"),
+            (
+                &self.store_bootstrap_descriptor_digest,
+                "store_bootstrap_descriptor_digest",
+            ),
+            (&self.eliotd_descriptor_digest, "eliotd_descriptor_digest"),
+            (&self.receipt_digest, "receipt_digest"),
+        ] {
+            sha256_handle(value, &format!("phase_b_prepared_receipt.{field}"))?;
+        }
+        handle(
+            &self.host_owner_epoch,
+            "phase_b_prepared_receipt.host_owner_epoch",
+        )?;
+        self.provisioned_supervision_authority
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "phase_b_prepared_receipt.provisioned_supervision_authority".to_owned(),
+                reason: error.to_string(),
+            })?;
+        if let Some(bridge) = self.agent_bridge.as_ref() {
+            bridge.validate()?;
+        }
+        if self.receipt_digest != self.computed_digest()? {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Secret-free Host proof returned only after Phase-B publication and final
+/// ACL convergence. Dynamic descriptor bytes are never returned over the
 /// installer pipe.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostPhaseBMaterializationReceipt {
+    /// Explicit receipt wire discriminator; old receipts require re-stage.
+    pub wire: PlatformHandle,
     /// Transaction/effect binding.
     pub transaction_id: PlatformHandle,
     /// Credential effect identity.
@@ -314,15 +427,21 @@ pub struct HostPhaseBMaterializationReceipt {
     pub eliotd_descriptor_digest: PlatformHandle,
     /// Exact public supervision authority retained by the Host receipt.
     pub provisioned_supervision_authority: ProvisionedSupervisionAuthority,
+    /// Optional exact bridge stage/profile/declaration proof.
+    pub agent_bridge: Option<AgentBridgePhaseBBinding>,
     /// Digest of the complete Host-owned Phase-B receipt.
     pub receipt_digest: PlatformHandle,
 }
 
 impl HostPhaseBMaterializationReceipt {
+    /// Current Phase-B receipt wire.
+    pub const WIRE: &'static str = "eliot.host.phase-b-receipt.v2";
+
     /// Computes the receipt digest over every receipt field except the digest.
     pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
         digest_json(
             &(
+                self.wire.as_str(),
                 self.transaction_id.as_str(),
                 self.effect_id.as_str(),
                 self.candidate_manifest_digest.as_str(),
@@ -334,6 +453,7 @@ impl HostPhaseBMaterializationReceipt {
                 self.store_bootstrap_descriptor_digest.as_str(),
                 self.eliotd_descriptor_digest.as_str(),
                 &self.provisioned_supervision_authority,
+                &self.agent_bridge,
             ),
             "phase_b.receipt_digest",
         )
@@ -341,6 +461,15 @@ impl HostPhaseBMaterializationReceipt {
 
     /// Validates the receipt and recomputes its public digest.
     pub fn validate(&self) -> Result<(), InstallationError> {
+        self.validate_mode()
+    }
+
+    fn validate_mode(&self) -> Result<(), InstallationError> {
+        if self.wire.as_str() != Self::WIRE {
+            return Err(InstallationError::MigrationRequired {
+                reason: "Phase-B receipt requires explicit re-stage".to_owned(),
+            });
+        }
         handle(&self.transaction_id, "phase_b_receipt.transaction_id")?;
         handle(&self.effect_id, "phase_b_receipt.effect_id")?;
         sha256_handle(
@@ -380,6 +509,9 @@ impl HostPhaseBMaterializationReceipt {
                 field: "phase_b_receipt.provisioned_supervision_authority".to_owned(),
                 reason: error.to_string(),
             })?;
+        if let Some(bridge) = self.agent_bridge.as_ref() {
+            bridge.validate()?;
+        }
         if self.receipt_digest != self.computed_digest()? {
             return Err(InstallationError::IdentityConflict);
         }
@@ -798,6 +930,9 @@ pub enum HostCredentialControlOperation {
     /// Query-only reconciliation of an already materialized Phase-B contour;
     /// this operation never republishes files or resumes activation.
     ReconcilePhaseB,
+    /// Commit the elevated provider's exact final Phase-B receipt. The Host
+    /// performs the live retained-handle readback before durable CAS.
+    FinalizePhaseB,
 }
 
 /// Secret-free part of one authenticated Host credential request.
@@ -961,10 +1096,14 @@ pub struct HostCredentialControlRequest {
     pub expected_receipt: Option<CredentialAccessReceipt>,
     /// Present only for the transaction-bound Phase-B handoff operation.
     pub phase_b: Option<HostPhaseBMaterializationIntent>,
+    /// Provider-supplied final receipt, accepted only by `FinalizePhaseB`.
+    #[serde(default)]
+    pub phase_b_final: Option<Box<HostPhaseBMaterializationReceipt>>,
 }
 
 impl HostCredentialControlRequest {
     /// Validates the request without exposing its key.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), InstallationError> {
         self.intent.validate()?;
         if self.intent.operation == HostCredentialControlOperation::Inspect {
@@ -978,6 +1117,7 @@ impl HostCredentialControlRequest {
             self.intent.operation,
             HostCredentialControlOperation::MaterializePhaseB
                 | HostCredentialControlOperation::ReconcilePhaseB
+                | HostCredentialControlOperation::FinalizePhaseB
         ) && self.ownership_key.len() != 32
         {
             return Err(InstallationError::InvalidField {
@@ -1009,7 +1149,16 @@ impl HostCredentialControlRequest {
             self.intent.operation,
             HostCredentialControlOperation::MaterializePhaseB
                 | HostCredentialControlOperation::ReconcilePhaseB
+                | HostCredentialControlOperation::FinalizePhaseB
         ) {
+            if self.intent.operation != HostCredentialControlOperation::FinalizePhaseB
+                && self.phase_b_final.is_some()
+            {
+                return Err(InstallationError::InvalidField {
+                    field: "host_credential_control.phase_b_final".to_owned(),
+                    reason: "only FinalizePhaseB may carry a final receipt".to_owned(),
+                });
+            }
             let Some(phase_b) = self.phase_b.as_ref() else {
                 return Err(InstallationError::IncompleteObservation(
                     "Phase-B operation requires its typed handoff intent".to_owned(),
@@ -1038,6 +1187,26 @@ impl HostCredentialControlRequest {
             {
                 return Err(InstallationError::IdentityConflict);
             }
+            if self.intent.operation == HostCredentialControlOperation::FinalizePhaseB {
+                let Some(receipt) = self.phase_b_final.as_ref() else {
+                    return Err(InstallationError::IncompleteObservation(
+                        "FinalizePhaseB requires its final receipt".to_owned(),
+                    ));
+                };
+                receipt.validate()?;
+                if receipt.transaction_id != phase_b.transaction_id
+                    || receipt.effect_id != phase_b.effect_id
+                    || receipt.candidate_manifest_digest != phase_b.candidate_manifest_digest
+                    || receipt.request_digest != phase_b.request_digest
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+        } else if self.phase_b_final.is_some() {
+            return Err(InstallationError::InvalidField {
+                field: "host_credential_control.phase_b_final".to_owned(),
+                reason: "final Phase-B receipt is valid only for FinalizePhaseB".to_owned(),
+            });
         } else if self.phase_b.is_some() {
             return Err(InstallationError::InvalidField {
                 field: "host_credential_control.phase_b".to_owned(),
@@ -1079,6 +1248,11 @@ pub enum HostCredentialControlResponse {
         /// Secret-free dynamic overlay receipt.
         receipt: Box<HostPhaseBMaterializationReceipt>,
     },
+    /// Host has durably prepared files; provider ACL convergence is pending.
+    PhaseBPrepared {
+        #[allow(missing_docs)]
+        receipt: Box<HostPhaseBPreparedReceipt>,
+    },
     /// Credential and marker were both authoritatively absent after delete.
     Deleted {
         /// Digest binding request, Host epoch and both absence observations.
@@ -1104,6 +1278,7 @@ impl HostCredentialControlResponse {
             }
             Self::Matching { receipt } => receipt.validate(),
             Self::PhaseBReady { receipt } => receipt.validate(),
+            Self::PhaseBPrepared { receipt } => receipt.validate(),
             Self::Deleted { absence_digest } => {
                 sha256_handle(absence_digest, "host_credential_response.absence_digest")
             }
@@ -1298,6 +1473,31 @@ mod tests {
         PlatformHandle::new(value.into()).unwrap_or_else(|_| unreachable!())
     }
 
+    fn valid_phase_b_receipt() -> HostPhaseBMaterializationReceipt {
+        let mut receipt = HostPhaseBMaterializationReceipt {
+            wire: handle(HostPhaseBMaterializationReceipt::WIRE),
+            transaction_id: handle("transaction:test"),
+            effect_id: handle("effect:phase-b"),
+            candidate_manifest_digest: handle("a".repeat(64)),
+            request_digest: handle("b".repeat(64)),
+            host_owner_epoch: handle("host-owner:test"),
+            host_process_identity: handle("c".repeat(64)),
+            authority_descriptor_digest: handle("d".repeat(64)),
+            config_file_digest: handle("e".repeat(64)),
+            store_bootstrap_descriptor_digest: handle("f".repeat(64)),
+            eliotd_descriptor_digest: handle("1".repeat(64)),
+            provisioned_supervision_authority: crate::test_provisioned_supervision_authority(
+                "installation:test",
+                "candidate:test",
+                ResourceGeneration::genesis(),
+            ),
+            agent_bridge: None,
+            receipt_digest: handle("pending"),
+        };
+        receipt.receipt_digest = receipt.computed_digest().unwrap_or_else(|_| unreachable!());
+        receipt
+    }
+
     #[test]
     fn credential_delete_lifecycle_is_strictly_intent_before_effect() {
         assert!(
@@ -1344,6 +1544,7 @@ mod tests {
             handle("d".repeat(64)),
             template.clone(),
             handle("e".repeat(64)),
+            None,
             crate::test_provisioned_supervision_authority(
                 "installation:test",
                 "candidate:test",
@@ -1361,6 +1562,7 @@ mod tests {
             first.host_state_root_digest.clone(),
             template,
             first.watchdog_selector_digest.clone(),
+            None,
             first.provisioned_supervision_authority.clone(),
         )
         .unwrap_or_else(|_| unreachable!());
@@ -1373,6 +1575,7 @@ mod tests {
     #[test]
     fn phase_b_public_receipt_digest_binds_request_and_rejects_stale_digest() {
         let mut receipt = HostPhaseBMaterializationReceipt {
+            wire: handle(HostPhaseBMaterializationReceipt::WIRE),
             transaction_id: handle("transaction:test"),
             effect_id: handle("effect:phase-b"),
             candidate_manifest_digest: handle("a".repeat(64)),
@@ -1388,12 +1591,60 @@ mod tests {
                 "candidate:test",
                 ResourceGeneration::genesis(),
             ),
+            agent_bridge: None,
             receipt_digest: handle("pending"),
         };
         receipt.receipt_digest = receipt.computed_digest().unwrap_or_else(|_| unreachable!());
         assert!(receipt.validate().is_ok());
+        receipt.wire = handle("eliot.host.phase-b-receipt.v1");
+        receipt.receipt_digest = receipt.computed_digest().unwrap_or_else(|_| unreachable!());
+        assert!(matches!(
+            receipt.validate(),
+            Err(InstallationError::MigrationRequired { .. })
+        ));
+        receipt.wire = handle(HostPhaseBMaterializationReceipt::WIRE);
+        receipt.receipt_digest = receipt.computed_digest().unwrap_or_else(|_| unreachable!());
         receipt.request_digest = handle("2".repeat(64));
         assert!(receipt.validate().is_err());
+    }
+
+    #[test]
+    fn prepared_and_final_receipts_are_not_interchangeable() {
+        let final_receipt = valid_phase_b_receipt();
+        let bytes = serde_json::to_vec(&final_receipt).unwrap_or_else(|_| unreachable!());
+        let prepared: HostPhaseBPreparedReceipt =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| unreachable!());
+        assert!(prepared.validate().is_err());
+        assert!(final_receipt.validate().is_ok());
+    }
+
+    #[test]
+    fn non_finalize_request_rejects_a_final_receipt_payload() {
+        let intent = HostCredentialControlIntent::new(
+            HostCredentialControlOperation::Inspect,
+            handle("tx:test"),
+            handle("effect:test"),
+            StoreCredentialProvisionPlan {
+                generation: ResourceGeneration::genesis(),
+                config_digest: handle("a".repeat(64)),
+                target: handle("eliot/store/v1/".to_owned() + &"b".repeat(32)),
+                provider: StoreCredentialProvider::WindowsCredentialManager,
+                scope: StoreCredentialScope::LocalService,
+                expected_principal_sid: handle(LOCAL_SERVICE_SID),
+                expected_host_executable: handle(r"C:\\eliot-host.exe"),
+                host_state_root: handle(r"C:\\eliot-host"),
+            },
+            handle("c".repeat(64)),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let request = HostCredentialControlRequest {
+            intent,
+            ownership_key: Vec::new(),
+            expected_receipt: None,
+            phase_b: None,
+            phase_b_final: Some(Box::new(valid_phase_b_receipt())),
+        };
+        assert!(request.validate().is_err());
     }
 
     #[test]

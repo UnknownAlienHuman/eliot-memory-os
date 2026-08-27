@@ -63,13 +63,15 @@ use eliot_host_state::{
 };
 use eliot_installation::{
     ActivationCommitFence, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
-    ActivePhaseBRebindRecovery, ApprovedGenerationRegistry, CandidateManifest,
+    ActivePhaseBRebindRecovery, AgentBridgePhaseBBinding, AgentBridgePreparedBinding,
+    AgentBridgeStagePrepared, ApprovedGenerationRegistry, CandidateManifest,
     CredentialAccessReceipt, HostCredentialControlResponse, HostPhaseBMaterializationIntent,
-    HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, InstallationEpoch,
-    InstallationError, InstallationProfile, InstallerServiceRegistrationApproval,
-    InstallerServiceRole, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PendingActivationState,
-    PhaseBLiveBinding, ProvisionedSupervisionAuthority, RedbInstallationRegistry,
-    RuntimeLaunchDescriptor, StoreCredentialProvider, StoreCredentialScope,
+    HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt,
+    InstallationEpoch, InstallationError, InstallationProfile,
+    InstallerServiceRegistrationApproval, InstallerServiceRole, LOCAL_SERVICE_SID,
+    PHASE_B_PENDING_MARKER, PendingActivationState, PhaseBLiveBinding,
+    ProvisionedSupervisionAuthority, RedbInstallationRegistry, RuntimeLaunchDescriptor,
+    StoreCredentialProvider, StoreCredentialScope,
     phase_b_credential_receipt_digest as installation_phase_b_credential_receipt_digest,
     phase_b_host_state_root_digest as installation_phase_b_host_state_root_digest,
     phase_b_scm_selector, phase_b_static_template_for_candidate,
@@ -255,6 +257,7 @@ where
 use eliot_platform_windows::{
     JobObjectIdentity, PinnedRuntimeFile, ProcessIdentity, RunningJobChild, SuspendedJobChild,
     SuspendedLaunchSpec, UserOwnedRootLease, WindowsAdapterError, observe_named_pipe_peer_process,
+    observe_named_pipe_peer_process_in_job,
 };
 
 #[cfg(windows)]
@@ -450,8 +453,8 @@ mod phase_b_projection;
 use phase_b_projection::{
     host_process_identity_digest, host_process_identity_digest_for_host, phase_b_authority_marker,
     phase_b_build_authority_descriptor, phase_b_build_authority_descriptor_for_rebind,
-    phase_b_credential_receipt_digest, phase_b_manifest_digest, phase_b_public_receipt,
-    phase_b_public_receipt_from_binding, phase_b_root_binding_digest,
+    phase_b_credential_receipt_digest, phase_b_manifest_digest, phase_b_prepared_public_receipt,
+    phase_b_public_receipt, phase_b_public_receipt_from_binding, phase_b_root_binding_digest,
     phase_b_watchdog_selector_digest, validate_phase_b_credential_receipt,
 };
 
@@ -467,9 +470,9 @@ use phase_b_previous_authority::{
 mod phase_b_materialization;
 #[cfg(windows)]
 use phase_b_materialization::{
-    phase_b_bytes_digest, phase_b_lease_bytes, phase_b_lease_identity,
-    phase_b_materialize_file_with_rollback, phase_b_remove_rollback_backup,
-    phase_b_restore_or_remove, phase_b_template_bytes,
+    agent_bridge_admission_descriptor, open_agent_bridge_final_lease, phase_b_bytes_digest,
+    phase_b_lease_bytes, phase_b_lease_identity, phase_b_materialize_file_with_rollback,
+    phase_b_remove_rollback_backup, phase_b_restore_or_remove, phase_b_template_bytes,
 };
 #[cfg(all(windows, test))]
 use phase_b_materialization::{phase_b_materialize_file, phase_b_template_path};
@@ -582,6 +585,119 @@ fn validate_authenticated_kernel_peer(
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn kernel_front_door_expectation(
+    candidate: &HostKernelCandidateBinding,
+    kernel_process: &ProcessIdentity,
+) -> Result<eliot_platform_windows::KernelFrontDoorServerExpectation, HostError> {
+    let binding = observe_named_pipe_peer_process_in_job(
+        candidate.job_object_id.as_str(),
+        kernel_process.process_id,
+    )
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let observed = binding.process_binding().identity();
+    if observed != kernel_process {
+        return Err(HostError::ProcessContour(
+            "Kernel Job observation is not the retained process identity".to_owned(),
+        ));
+    }
+    if binding
+        .process_binding()
+        .executable_file_identity()
+        .is_none()
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel process executable FileIdentity is unavailable".to_owned(),
+        ));
+    }
+    let expected_extra_sid = candidate
+        .agent_bridge_admission
+        .as_ref()
+        .map(|descriptor| descriptor.approved_user_sid.clone());
+    let acl_mode = kernel_front_door_acl_mode(expected_extra_sid.as_deref());
+    eliot_platform_windows::KernelFrontDoorServerExpectation::new(
+        LOCAL_SERVICE_SID,
+        0,
+        candidate.artifact_hash.as_str(),
+        acl_mode,
+    )
+    .map(|expectation| expectation.with_process_and_job_binding(binding))
+    .map_err(|error| HostError::ProcessContour(error.to_string()))
+}
+
+#[cfg(windows)]
+fn kernel_front_door_acl_mode(
+    approved_user_sid: Option<&str>,
+) -> eliot_platform_windows::KernelFrontDoorAclMode {
+    match approved_user_sid {
+        None => eliot_platform_windows::KernelFrontDoorAclMode::ServiceOnly,
+        Some(client_sid) => {
+            eliot_platform_windows::KernelFrontDoorAclMode::SystemAndLocalServiceWithClient {
+                client_sid: client_sid.to_owned(),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn connect_authenticated_kernel_front_door(
+    candidate: &HostKernelCandidateBinding,
+    kernel_process: &ProcessIdentity,
+) -> Result<NamedPipeTransport, HostError> {
+    let expected_extra_sid = candidate
+        .agent_bridge_admission
+        .as_ref()
+        .map(|descriptor| descriptor.approved_user_sid.as_str());
+    let expectation = kernel_front_door_expectation(candidate, kernel_process)?;
+    let transport = NamedPipeTransport::connect_authenticated_kernel_front_door(
+        candidate.pipe_identity.as_str(),
+        Duration::from_secs(5),
+        &expectation,
+    )
+    .await
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    match (
+        transport.kernel_front_door_observed_extra_sid(),
+        expected_extra_sid,
+    ) {
+        (None, None) => Ok(transport),
+        (Some(observed), Some(expected)) if observed == expected => Ok(transport),
+        _ => Err(HostError::ProcessContour(
+            "Kernel front-door extra SID does not match the retained bridge policy".to_owned(),
+        )),
+    }
+}
+
+#[cfg(all(windows, test))]
+mod kernel_front_door_tests {
+    use super::{LOCAL_SERVICE_SID, kernel_front_door_acl_mode};
+    use eliot_platform_windows::KernelFrontDoorAclMode;
+
+    #[test]
+    fn bridge_disabled_uses_service_only_acl() {
+        assert_eq!(
+            kernel_front_door_acl_mode(None),
+            KernelFrontDoorAclMode::ServiceOnly
+        );
+    }
+
+    #[test]
+    fn bridge_sid_is_the_only_extra_acl_contour() {
+        let approved = "S-1-5-21-1000";
+        assert_eq!(
+            kernel_front_door_acl_mode(Some(approved)),
+            KernelFrontDoorAclMode::SystemAndLocalServiceWithClient {
+                client_sid: approved.to_owned()
+            }
+        );
+        assert_ne!(
+            kernel_front_door_acl_mode(Some("S-1-5-21-2000")),
+            kernel_front_door_acl_mode(Some(approved))
+        );
+        assert_ne!(approved, LOCAL_SERVICE_SID);
+    }
 }
 
 fn unique_ready_evidence<'a>(
@@ -801,6 +917,7 @@ pub(crate) struct HostJobBranches {
     config_digest: Option<PlatformHandle>,
     store_config_semantic_hash: Option<PlatformHandle>,
     approved_generation: Option<PlatformHandle>,
+    agent_bridge_admission: Option<eliot_kernel_service::AgentBridgeAdmissionDescriptor>,
     kernel_candidate: Option<HostKernelCandidateBinding>,
     kernel_activation_receipt: Option<KernelActivationReceipt>,
     kernel_restart_attempts: u8,
@@ -1088,6 +1205,15 @@ where
 #[cfg(windows)]
 #[allow(dead_code)]
 impl HostJobBranches {
+    /// Installs the exact Phase-B bridge descriptor for the next Kernel
+    /// launch/relaunch. `None` is the legacy, bridge-disabled contour.
+    fn set_agent_bridge_admission(
+        &mut self,
+        descriptor: Option<eliot_kernel_service::AgentBridgeAdmissionDescriptor>,
+    ) {
+        self.agent_bridge_admission = descriptor;
+    }
+
     /// Creates two owner-scoped Job identities.  The actual Job handles are
     /// created only by the approved suspended launch below; there is no
     /// unbound PID assignment path.
@@ -1128,6 +1254,7 @@ impl HostJobBranches {
             config_digest: None,
             store_config_semantic_hash: None,
             approved_generation: None,
+            agent_bridge_admission: None,
             kernel_candidate: None,
             kernel_activation_receipt: None,
             kernel_restart_attempts: 0,
@@ -1194,6 +1321,7 @@ impl HostJobBranches {
             config_digest: None,
             store_config_semantic_hash: None,
             approved_generation: None,
+            agent_bridge_admission: None,
             kernel_candidate: None,
             kernel_activation_receipt: None,
             kernel_restart_attempts: 0,
@@ -1523,7 +1651,10 @@ impl HostJobBranches {
             supervision_incarnation,
             restart_budget: RestartBudget::new(3, 3)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
-            agent_bridge_admission: None,
+            // The bridge descriptor is projected only after the exact
+            // Phase-B public receipt and protected profile/declaration pair
+            // have been reopened and the staged executable revalidated.
+            agent_bridge_admission: self.agent_bridge_admission.clone(),
             containment_action: None,
         };
         candidate
@@ -1608,15 +1739,8 @@ impl HostJobBranches {
             .build()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let ready = runtime.block_on(async {
-            let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            let mut transport = NamedPipeTransport::connect_authenticated(
-                KERNEL_CONTROL_PIPE,
-                std::time::Duration::from_secs(5),
-                &expectation,
-            )
-            .await
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let mut transport =
+                connect_authenticated_kernel_front_door(&candidate, process).await?;
             validate_authenticated_kernel_peer(
                 transport.peer_identity(),
                 process.process_id,
@@ -1739,13 +1863,9 @@ impl HostJobBranches {
                 // Receive/decode/binding loss after Delivered is also an
                 // unknown outcome and follows this same path.
                 drop(transport);
-                transport = NamedPipeTransport::connect_authenticated(
-                    KERNEL_CONTROL_PIPE,
-                    std::time::Duration::from_secs(5),
-                    &expectation,
-                )
-                .await
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                transport = connect_authenticated_kernel_front_door(&candidate, process)
+                    .await
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
                 validate_authenticated_kernel_peer(
                     transport.peer_identity(),
                     process.process_id,
@@ -1907,15 +2027,17 @@ impl HostJobBranches {
         expected_kernel_image: &Path,
         label: &str,
     ) -> Result<Option<StoreRebindReceipt>, HostError> {
-        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let mut transport = NamedPipeTransport::connect_authenticated(
-            KERNEL_CONTROL_PIPE,
-            Duration::from_secs(5),
-            &expectation,
-        )
-        .await
-        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let kernel_process = ProcessIdentity {
+            process_id: kernel_process_id,
+            start_time_100ns: kernel_process_start_time_100ns,
+            image_path: expected_kernel_image
+                .to_str()
+                .ok_or_else(|| HostError::ProcessContour("Kernel image is not UTF-8".to_owned()))?
+                .to_owned(),
+        };
+        let mut transport = connect_authenticated_kernel_front_door(candidate, &kernel_process)
+            .await
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
         validate_authenticated_kernel_peer(
             transport.peer_identity(),
             kernel_process_id,
@@ -2224,8 +2346,6 @@ impl HostJobBranches {
             .build()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let result = runtime.block_on(async {
-            let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let expected_kernel_image = self
                 .kernel_executable
                 .as_ref()
@@ -2237,13 +2357,8 @@ impl HostJobBranches {
                 .ok_or_else(|| HostError::ProcessContour("Kernel process is missing".to_owned()))?
                 .evidence()
                 .process();
-            let mut transport = NamedPipeTransport::connect_authenticated(
-                KERNEL_CONTROL_PIPE,
-                std::time::Duration::from_secs(5),
-                &expectation,
-            )
-            .await
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let mut transport =
+                connect_authenticated_kernel_front_door(candidate, kprocess).await?;
             validate_authenticated_kernel_peer(
                 transport.peer_identity(),
                 kprocess.process_id,
@@ -2277,13 +2392,10 @@ impl HostJobBranches {
                     &pending_query_request,
                 )
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-                let mut query_transport = NamedPipeTransport::connect_authenticated(
-                    KERNEL_CONTROL_PIPE,
-                    std::time::Duration::from_secs(5),
-                    &expectation,
-                )
-                .await
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                let mut query_transport =
+                    connect_authenticated_kernel_front_door(candidate, kprocess)
+                        .await
+                        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
                 validate_authenticated_kernel_peer(
                     query_transport.peer_identity(),
                     kprocess.process_id,
@@ -2466,13 +2578,9 @@ impl HostJobBranches {
                 r
             } else {
                 drop(transport);
-                let mut transport2 = NamedPipeTransport::connect_authenticated(
-                    KERNEL_CONTROL_PIPE,
-                    std::time::Duration::from_secs(5),
-                    &expectation,
-                )
-                .await
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                let mut transport2 = connect_authenticated_kernel_front_door(candidate, kprocess)
+                    .await
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
                 validate_authenticated_kernel_peer(
                     transport2.peer_identity(),
                     kprocess.process_id,
@@ -2739,15 +2847,7 @@ impl HostJobBranches {
             .build()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         runtime.block_on(async {
-            let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            let mut transport = NamedPipeTransport::connect_authenticated(
-                candidate.pipe_identity.as_str(),
-                std::time::Duration::from_secs(5),
-                &expectation,
-            )
-            .await
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let mut transport = connect_authenticated_kernel_front_door(candidate, process).await?;
             validate_authenticated_kernel_peer(
                 transport.peer_identity(),
                 process.process_id,
@@ -3909,6 +4009,7 @@ impl HostJobBranches {
         self.kernel_artifact_digest = None;
         self.store_artifact_digest = None;
         self.config_digest = None;
+        self.agent_bridge_admission = None;
         self.store_config_semantic_hash = None;
         self.approved_generation = None;
         self.kernel_candidate = None;
@@ -4226,6 +4327,11 @@ pub struct HostPhaseBMaterialization {
     /// published through the transaction-owned installer handoff.
     request_digest: Option<PlatformHandle>,
     public_receipt_digest: Option<PlatformHandle>,
+    /// Exact stage/profile/declaration proof for the optional Agent Bridge.
+    /// This is never synthesized from a manifest or runtime descriptor.
+    agent_bridge: Option<AgentBridgePreparedBinding>,
+    /// Final provider proof, populated only after `FinalizePhaseB` CAS.
+    agent_bridge_final: Option<AgentBridgePhaseBBinding>,
     file_identities: [FileIdentity; 4],
     launch: RuntimeLaunchDescriptor,
 }
@@ -4273,6 +4379,18 @@ impl HostPhaseBMaterialization {
     #[must_use]
     pub const fn file_identities(&self) -> &[FileIdentity; 4] {
         &self.file_identities
+    }
+
+    /// Returns the verified Agent Bridge proof, when this is a bridge-enabled
+    /// Phase-B materialization.
+    #[must_use]
+    pub const fn agent_bridge(&self) -> Option<&AgentBridgePreparedBinding> {
+        self.agent_bridge.as_ref()
+    }
+
+    #[must_use]
+    pub const fn final_agent_bridge(&self) -> Option<&AgentBridgePhaseBBinding> {
+        self.agent_bridge_final.as_ref()
     }
 }
 
@@ -4475,10 +4593,29 @@ impl HostComposition {
         }
         #[cfg(windows)]
         if let Some(pending) = composition.registry.pending_activation().cloned() {
+            if pending.phase_b_agent_bridge_stage_prepared.is_some()
+                && pending.phase_b_prepared.is_none()
+            {
+                // The executable stage is an independent durable crash
+                // carrier.  Reconcile it before considering prepared data,
+                // but do not manufacture a profile/declaration or publish a
+                // pair: the exact original handoff must retry preparation.
+                Self::reconcile_pending_agent_bridge_stage(&pending)?;
+                composition.readiness_gate.branch_degraded();
+                return Ok(composition);
+            }
             if let Some(prepared) = pending.phase_b_prepared.as_ref() {
-                let materialization = match composition
-                    .rehydrate_phase_b_from_prepared(&pending.manifest, prepared)
-                {
+                let prior_bridge = composition
+                    .registry
+                    .last_committed_activation_fence()
+                    .and_then(|fence| fence.phase_b_live_binding.as_ref())
+                    .and_then(|binding| binding.agent_bridge.as_ref());
+                let mut materialization = match composition.rehydrate_phase_b_from_prepared(
+                    &pending.manifest,
+                    prepared,
+                    Some(&pending),
+                    prior_bridge,
+                ) {
                     Ok(materialization) => materialization,
                     Err(error) if pending.phase_b_receipt.is_none() => {
                         composition.rollback_uncommitted_phase_b(&pending, prepared)?;
@@ -4486,6 +4623,11 @@ impl HostComposition {
                     }
                     Err(error) => return Err(error),
                 };
+                if let Some(receipt) = pending.phase_b_receipt.as_ref() {
+                    materialization
+                        .agent_bridge_final
+                        .clone_from(&receipt.agent_bridge);
+                }
                 composition.phase_b = Some(materialization.clone());
                 let pending_after_readback = composition
                     .registry
@@ -4497,23 +4639,43 @@ impl HostComposition {
                         )
                     })?;
                 if pending_after_readback.phase_b_receipt.is_none() {
-                    let intent =
-                        pending_after_readback
-                            .phase_b_intent
-                            .as_ref()
-                            .ok_or_else(|| {
-                                HostError::RecoveryRequired(
-                                    "Phase-B preparation has no matching transaction intent"
-                                        .to_owned(),
-                                )
-                            })?;
-                    let receipt =
-                        phase_b_public_receipt(intent, &materialization, &composition.host)?;
-                    let host_capability = composition.owner_lease.activation_capability();
-                    composition.persist_pending_phase_b_receipt(
-                        &pending_after_readback,
-                        &receipt,
-                        &host_capability,
+                    if pending_after_readback.phase_b_prepared_receipt.is_none() {
+                        let intent =
+                            pending_after_readback
+                                .phase_b_intent
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    HostError::RecoveryRequired(
+                                        "Phase-B preparation has no matching transaction intent"
+                                            .to_owned(),
+                                    )
+                                })?;
+                        let receipt = phase_b_prepared_public_receipt(
+                            intent,
+                            &materialization,
+                            &composition.host,
+                            Some(&pending_after_readback),
+                        )?;
+                        let host_capability = composition.owner_lease.activation_capability();
+                        composition.persist_pending_phase_b_prepared_receipt(
+                            &pending_after_readback,
+                            &receipt,
+                            &host_capability,
+                        )?;
+                    }
+                    composition.readiness_gate.branch_degraded();
+                    return Ok(composition);
+                } else if let Some(binding) = materialization.agent_bridge() {
+                    // A crash after the receipt CAS and before backup cleanup
+                    // is harmless: exact receipt readback above is the
+                    // durable ownership proof, so cleanup may now finish.
+                    phase_b_remove_rollback_backup(
+                        std::path::Path::new(binding.profile_path.as_str()),
+                        "Agent Bridge admission profile",
+                    )?;
+                    phase_b_remove_rollback_backup(
+                        std::path::Path::new(binding.declaration_path.as_str()),
+                        "Agent Bridge client declaration",
                     )?;
                 }
                 composition.resume_pending_activation_after_phase_b()?;
@@ -4592,6 +4754,10 @@ impl HostComposition {
     /// the only production ingress that can publish the live overlay and
     /// resume the pending activation.
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Phase-B request keeps authenticated handoff, durable CAS reload, receipt, and resume ordering together"
+    )]
     pub fn handle_phase_b_request(
         &mut self,
         intent: &HostPhaseBMaterializationIntent,
@@ -4634,8 +4800,9 @@ impl HostComposition {
                 // activation handoff without rematerializing any destination.
                 // This closes the response-loss window after the receipt CAS
                 // but before the activation terminal CAS.
-                self.resume_pending_phase_b_receipt()?;
-                return Ok(receipt.clone());
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B is already final; use ReconcilePhaseB".to_owned(),
+                ));
             }
             let live_process_identity = host_process_identity_digest()?;
             if intent.transaction_id != pending.transaction_id
@@ -4679,21 +4846,151 @@ impl HostComposition {
             materialization.credential_receipt_digest =
                 Some(intent.credential_receipt_digest.clone());
             materialization.request_digest = Some(intent.request_digest.clone());
-            let receipt = phase_b_public_receipt(intent, &materialization, &self.host)?;
+            // `materialize_phase_b` durably records the executable-stage
+            // proof and prepared binding.  The pre-materialization snapshot
+            // is therefore stale; constructing a receipt from it would omit
+            // the bridge proof and make a response-loss restart unable to
+            // validate the exact contour.
+            let pending_after_materialization =
+                self.registry.pending_activation().cloned().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Phase-B materialization lost the exact pending activation".to_owned(),
+                    )
+                })?;
+            if pending_after_materialization.transaction_id != pending.transaction_id
+                || pending_after_materialization.plan_digest != pending.plan_digest
+                || pending_after_materialization.approval != pending.approval
+                || pending_after_materialization.phase_b_intent.as_ref() != Some(intent)
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B materialization changed the exact pending transaction contour"
+                        .to_owned(),
+                ));
+            }
+            let receipt = phase_b_prepared_public_receipt(
+                intent,
+                &materialization,
+                &self.host,
+                Some(&pending_after_materialization),
+            )?;
             materialization.host_owner_epoch = Some(receipt.host_owner_epoch.clone());
             materialization.host_process_identity = Some(receipt.host_process_identity.clone());
             materialization.public_receipt_digest = Some(receipt.receipt_digest.clone());
-            self.persist_pending_phase_b_receipt(&pending, &receipt, &host_capability)?;
+            self.persist_pending_phase_b_prepared_receipt(
+                &pending_after_materialization,
+                &receipt,
+                &host_capability,
+            )?;
             self.phase_b = Some(materialization.clone());
-            self.resume_pending_activation_after_phase_b()?;
             Ok(receipt)
+        })();
+        match result {
+            Ok(receipt) => HostCredentialControlResponse::PhaseBPrepared {
+                receipt: Box::new(receipt),
+            },
+            Err(_error) => HostCredentialControlResponse::Unknown {
+                pending_ref: phase_b_unknown_ref("phase-b", "MaterializePhaseB", intent),
+            },
+        }
+    }
+
+    /// Commits the provider's final Phase-B proof after retained-handle
+    /// verification. Prepared state alone never resumes activation.
+    #[cfg(windows)]
+    pub fn finalize_phase_b_request(
+        &mut self,
+        intent: &HostPhaseBMaterializationIntent,
+        credential_receipt: &CredentialAccessReceipt,
+        final_receipt: &HostPhaseBMaterializationReceipt,
+    ) -> HostCredentialControlResponse {
+        let result = (|| {
+            intent
+                .validate()
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            final_receipt
+                .validate()
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "FinalizePhaseB requires the exact pending activation".to_owned(),
+                )
+            })?;
+            validate_phase_b_credential_receipt(credential_receipt, &pending.manifest, intent)?;
+            let prepared = pending.phase_b_prepared_receipt.as_ref().ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "FinalizePhaseB has no durable prepared receipt".to_owned(),
+                )
+            })?;
+            if pending.phase_b_receipt.is_some()
+                || final_receipt.transaction_id != intent.transaction_id
+                || final_receipt.effect_id != intent.effect_id
+                || final_receipt.candidate_manifest_digest != intent.candidate_manifest_digest
+                || final_receipt.request_digest != intent.request_digest
+                || prepared.transaction_id != final_receipt.transaction_id
+                || prepared.effect_id != final_receipt.effect_id
+                || prepared.request_digest != final_receipt.request_digest
+                || prepared.candidate_manifest_digest != final_receipt.candidate_manifest_digest
+                || prepared.host_owner_epoch != final_receipt.host_owner_epoch
+                || prepared.host_process_identity != final_receipt.host_process_identity
+                || prepared.authority_descriptor_digest != final_receipt.authority_descriptor_digest
+                || prepared.config_file_digest != final_receipt.config_file_digest
+                || prepared.store_bootstrap_descriptor_digest
+                    != final_receipt.store_bootstrap_descriptor_digest
+                || prepared.eliotd_descriptor_digest != final_receipt.eliotd_descriptor_digest
+                || prepared.provisioned_supervision_authority
+                    != final_receipt.provisioned_supervision_authority
+                || prepared
+                    .agent_bridge
+                    .as_ref()
+                    .map(|b| b.stage_prepared.clone())
+                    != final_receipt
+                        .agent_bridge
+                        .as_ref()
+                        .map(|b| b.prepared.stage_prepared.clone())
+            {
+                return Err(HostError::RecoveryRequired(
+                    "final Phase-B receipt is not bound to the prepared proof".to_owned(),
+                ));
+            }
+            if let Some(final_bridge) = final_receipt.agent_bridge.as_ref() {
+                let prepared_bridge = prepared.agent_bridge.as_ref().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "final bridge proof has no prepared counterpart".to_owned(),
+                    )
+                })?;
+                if !final_bridge.matches_prepared_core(prepared_bridge) {
+                    return Err(HostError::RecoveryRequired(
+                        "final bridge proof substituted its prepared core".to_owned(),
+                    ));
+                }
+                final_bridge
+                    .validate_against_phase_b(intent, &pending)
+                    .map_err(HostError::Installation)?;
+                let _lease = open_agent_bridge_final_lease(
+                    final_bridge,
+                    final_bridge.approved_user_sid.as_str(),
+                )?;
+            } else if intent.agent_bridge_source.is_some() || prepared.agent_bridge.is_some() {
+                return Err(HostError::RecoveryRequired(
+                    "bridge-enabled Phase-B final proof is absent".to_owned(),
+                ));
+            }
+            let host_capability = self.owner_lease.activation_capability();
+            self.persist_pending_phase_b_receipt(&pending, final_receipt, &host_capability)?;
+            if let Some(materialization) = self.phase_b.as_mut() {
+                materialization
+                    .agent_bridge_final
+                    .clone_from(&final_receipt.agent_bridge);
+            }
+            self.resume_pending_activation_after_phase_b()?;
+            Ok(final_receipt.clone())
         })();
         match result {
             Ok(receipt) => HostCredentialControlResponse::PhaseBReady {
                 receipt: Box::new(receipt),
             },
-            Err(_error) => HostCredentialControlResponse::Unknown {
-                pending_ref: phase_b_unknown_ref("phase-b", "MaterializePhaseB", intent),
+            Err(_) => HostCredentialControlResponse::Unknown {
+                pending_ref: phase_b_unknown_ref("phase-b-finalize", "FinalizePhaseB", intent),
             },
         }
     }
@@ -4720,6 +5017,23 @@ impl HostComposition {
                 pending_ref: phase_b_unknown_ref("store-recovery-fence", "ReconcilePhaseB", intent),
             };
         }
+        // Query-only prepared readback: return the exact durable prepared
+        // wire proof without rehydrating, converging ACLs, or resuming.
+        if let Some(pending) = self.registry.pending_activation().cloned()
+            && let Some(receipt) = pending.phase_b_prepared_receipt.as_ref()
+            && pending.phase_b_receipt.is_none()
+            && intent.validate().is_ok()
+            && validate_phase_b_credential_receipt(credential_receipt, &pending.manifest, intent)
+                .is_ok()
+            && receipt.validate().is_ok()
+            && receipt.transaction_id == intent.transaction_id
+            && receipt.effect_id == intent.effect_id
+            && receipt.request_digest == intent.request_digest
+        {
+            return HostCredentialControlResponse::PhaseBPrepared {
+                receipt: Box::new(receipt.clone()),
+            };
+        }
         let result = (|| {
             intent
                 .validate()
@@ -4730,6 +5044,7 @@ impl HostComposition {
                 committed_binding,
                 pending_intent,
                 pending_prepared,
+                pending_prepared_receipt,
                 pending_receipt,
             ) = if let Some(pending) = self.registry.pending_activation().cloned() {
                 if pending
@@ -4747,6 +5062,7 @@ impl HostComposition {
                     None,
                     pending.phase_b_intent,
                     pending.phase_b_prepared,
+                    pending.phase_b_prepared_receipt,
                     pending.phase_b_receipt,
                 )
             } else {
@@ -4783,6 +5099,7 @@ impl HostComposition {
                     active.manifest,
                     terminal.plan_digest().clone(),
                     Some(binding),
+                    None,
                     None,
                     None,
                     None,
@@ -4827,7 +5144,12 @@ impl HostComposition {
                 ));
             }
             if let Some(binding) = committed_binding.as_ref() {
-                return phase_b_public_receipt_from_binding(intent, binding, credential_receipt);
+                return phase_b_public_receipt_from_binding(
+                    intent,
+                    binding,
+                    credential_receipt,
+                    self.registry.pending_activation(),
+                );
             }
             if let Some(receipt) = pending_receipt.as_ref() {
                 if receipt.validate().is_err()
@@ -4848,6 +5170,22 @@ impl HostComposition {
                 // journal records, or advance the registry.  The mutable
                 // continuation is owned by the Host startup/worker contour.
                 return Ok(receipt.clone());
+            }
+            if let Some(receipt) = pending_prepared_receipt.as_ref() {
+                if receipt.validate().is_err()
+                    || receipt.transaction_id != intent.transaction_id
+                    || receipt.effect_id != intent.effect_id
+                    || receipt.candidate_manifest_digest != manifest_digest
+                    || receipt.request_digest != intent.request_digest
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "pending prepared Phase-B receipt is not bound to the exact query"
+                            .to_owned(),
+                    ));
+                }
+                return Err(HostError::RecoveryRequired(
+                    "Phase-B remains prepared; provider finalization is required".to_owned(),
+                ));
             }
             if pending_intent.is_some() && pending_prepared.is_none() {
                 return Err(HostError::RecoveryRequired(
@@ -4886,7 +5224,12 @@ impl HostComposition {
                         .to_owned(),
                 ));
             }
-            phase_b_public_receipt(intent, materialization, &self.host)
+            phase_b_public_receipt(
+                intent,
+                materialization,
+                &self.host,
+                self.registry.pending_activation(),
+            )
         })();
         match result {
             Ok(receipt) => HostCredentialControlResponse::PhaseBReady {
@@ -5606,8 +5949,17 @@ impl HostComposition {
                     "Phase-B receipt continuation has no durable preparation".to_owned(),
                 )
             })?;
-            let materialization =
-                self.rehydrate_phase_b_from_prepared(&pending.manifest, prepared)?;
+            let prior_bridge = self
+                .registry
+                .last_committed_activation_fence()
+                .and_then(|fence| fence.phase_b_live_binding.as_ref())
+                .and_then(|binding| binding.agent_bridge.as_ref());
+            let materialization = self.rehydrate_phase_b_from_prepared(
+                &pending.manifest,
+                prepared,
+                Some(&pending),
+                prior_bridge,
+            )?;
             self.phase_b = Some(materialization);
         }
         // This is the exact post-receipt continuation. It may start the
@@ -5708,6 +6060,23 @@ impl HostComposition {
             &self.host,
             &phase_b.launch,
         )?;
+        let agent_bridge_admission = match (phase_b.agent_bridge(), phase_b.final_agent_bridge()) {
+            (Some(_prepared), None) => Err(HostError::RecoveryRequired(
+                "Agent Bridge admission requires the final provider binding".to_owned(),
+            )),
+            (_, Some(binding)) => agent_bridge_admission_descriptor(
+                phase_b.launch.profile,
+                self.jobs.portable_root.as_ref(),
+                binding,
+            )
+            .map(Some),
+            (None, None) => Ok(None),
+        };
+        let agent_bridge_admission = match agent_bridge_admission {
+            Ok(value) => value,
+            Err(error) => return self.cleanup_launched_contour(error),
+        };
+        self.jobs.set_agent_bridge_admission(agent_bridge_admission);
         let (_activation_receipt, receipt) = match self.jobs.complete_kernel_control(
             &manifest.generation,
             &self.host,

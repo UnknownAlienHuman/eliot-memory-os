@@ -50,12 +50,36 @@ pub const AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION: u16 = 2;
 /// Stable wire identity for a Kernel-issued bridge peer challenge.
 pub const AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID: &str = "eliot.protocol.agent-bridge-peer-challenge";
 /// Current bridge peer challenge wire version.
-pub const AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION: u16 = 1;
+pub const AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION: u16 = 2;
 /// Stable wire identity for a Kernel-produced bridge peer admission receipt.
 pub const AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-peer-admission-receipt";
 /// Current bridge peer admission receipt wire version.
-pub const AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_VERSION: u16 = 1;
+pub const AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_VERSION: u16 = 2;
+/// Stable Kernel operation used for agent-bridge activation.
+pub const AGENT_BRIDGE_ACTIVATION_OPERATION: &str = "eliot.agent-bridge.activate";
+/// Stable wire identity for a pre-semantic agent-bridge activation request.
+pub const AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_ID: &str =
+    "eliot.protocol.agent-bridge-activation-request";
+/// Current pre-semantic agent-bridge activation request wire version.
+pub const AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_VERSION: u16 = 1;
+/// Stable wire identity for an agent-bridge activation response.
+pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID: &str =
+    "eliot.protocol.agent-bridge-activation-response";
+/// Current agent-bridge activation response wire version.
+pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 1;
+/// Stable denial code used until the eliotd semantic resolver exists.
+pub const AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE: &str = "SEMANTIC_RESOLUTION_UNAVAILABLE";
+/// Stable wire identity for a Kernel-to-eliotd semantic-resolution ticket.
+pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID: &str =
+    "eliot.protocol.agent-activation-resolution-ticket";
+/// Current semantic-resolution ticket wire version.
+pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION: u16 = 1;
+/// Stable wire identity for an eliotd-to-Kernel semantic-resolution decision.
+pub const AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID: &str =
+    "eliot.protocol.agent-activation-resolution-decision";
+/// Current semantic-resolution decision wire version.
+pub const AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_VERSION: u16 = 1;
 const FRAME_PREFIX_BYTES: usize = 4;
 
 /// A protocol contract validation or compatibility failure.
@@ -1144,6 +1168,18 @@ pub struct AgentBridgePeerChallenge {
     pub bridge_generation: ResourceGeneration,
     /// Generation/authority fence selected by the static profile.
     pub state_fence: StateFence,
+    /// Exact Kernel handshake principal binding observed by the Kernel.
+    pub kernel_principal_binding: String,
+    /// Exact Kernel authority epoch observed by the Kernel.
+    pub kernel_authority_epoch: AuthorityEpoch,
+    /// Exact Kernel generation observed by the Kernel.
+    pub kernel_generation: ResourceGeneration,
+    /// Lowercase SHA-256 of the exact Kernel executable artifact.
+    pub kernel_artifact_sha256: String,
+    /// Lowercase SHA-256 of the canonical Kernel handshake configuration.
+    pub kernel_config_snapshot_sha256: String,
+    /// Kernel-issued absolute deadline for the pre-activation request.
+    pub activation_deadline_unix_ms: u64,
     /// Fresh per-connection Kernel challenge nonce.
     pub challenge_nonce: String,
     /// Lowercase SHA-256 over every challenge field except this field.
@@ -1191,7 +1227,26 @@ impl AgentBridgePeerChallenge {
             &self.client_declaration_sha256,
             self.bridge_generation,
             &self.state_fence,
+            self.activation_deadline_unix_ms,
             &self.challenge_nonce,
+        )?;
+        text(
+            &self.kernel_principal_binding,
+            "agent_bridge_peer_challenge.kernel_principal_binding",
+        )?;
+        if self.kernel_authority_epoch.value() == 0 || self.kernel_generation.value() == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_peer_challenge.kernel_generation",
+                reason: "Kernel authority and generation must be nonzero and generation-bound",
+            });
+        }
+        lowercase_sha256(
+            &self.kernel_artifact_sha256,
+            "agent_bridge_peer_challenge.kernel_artifact_sha256",
+        )?;
+        lowercase_sha256(
+            &self.kernel_config_snapshot_sha256,
+            "agent_bridge_peer_challenge.kernel_config_snapshot_sha256",
         )?;
         lowercase_sha256(
             &self.challenge_sha256,
@@ -1218,6 +1273,12 @@ impl AgentBridgePeerChallenge {
             || declaration.module_generation.generation != self.bridge_generation
             || declaration.module_generation.state_fence != self.state_fence
             || declaration.compute_digest()? != self.client_declaration_sha256
+            || declaration.expected_kernel_principal_binding != self.kernel_principal_binding
+            || declaration.expected_kernel_authority_epoch != self.kernel_authority_epoch
+            || declaration.expected_kernel_generation != self.kernel_generation
+            || declaration.expected_kernel_artifact_sha256 != self.kernel_artifact_sha256
+            || declaration.expected_kernel_config_snapshot_sha256
+                != self.kernel_config_snapshot_sha256
         {
             return Err(ProtocolError::InvalidField {
                 field: "agent_bridge_peer_challenge.client_declaration_sha256",
@@ -1243,6 +1304,8 @@ pub struct AgentBridgePeerAdmissionReceipt {
     pub wire_version: u16,
     /// Exact bridge module identity.
     pub module_id: String,
+    /// Kernel-created identity of the exact admitted transport connection.
+    pub connection_id: String,
     /// Static bridge profile identity.
     pub profile_id: String,
     /// Digest of the immutable admission descriptor.
@@ -1253,6 +1316,8 @@ pub struct AgentBridgePeerAdmissionReceipt {
     pub bridge_generation: ResourceGeneration,
     /// Generation/authority fence selected by the static profile.
     pub state_fence: StateFence,
+    /// Kernel-issued absolute deadline copied from the exact challenge.
+    pub activation_deadline_unix_ms: u64,
     /// Exact challenge nonce observed by Kernel.
     pub challenge_nonce: String,
     /// Digest of the exact challenge packet.
@@ -1314,6 +1379,7 @@ impl AgentBridgePeerAdmissionReceipt {
             || self.client_declaration_sha256 != challenge.client_declaration_sha256
             || self.bridge_generation != challenge.bridge_generation
             || self.state_fence != challenge.state_fence
+            || self.activation_deadline_unix_ms != challenge.activation_deadline_unix_ms
             || self.challenge_nonce != challenge.challenge_nonce
             || self.challenge_sha256 != challenge.challenge_sha256
         {
@@ -1373,7 +1439,13 @@ impl AgentBridgePeerAdmissionReceipt {
             &self.client_declaration_sha256,
             self.bridge_generation,
             &self.state_fence,
+            self.activation_deadline_unix_ms,
             &self.challenge_nonce,
+        )?;
+        bounded_text(
+            &self.connection_id,
+            "agent_bridge_peer_admission_receipt.connection_id",
+            512,
         )?;
         for (digest, field) in [
             (
@@ -1420,6 +1492,746 @@ impl AgentBridgePeerAdmissionReceipt {
     }
 }
 
+/// Origin class of an agent-bridge attach request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentBridgeAttachKind {
+    /// Attach originated from an already governed route.
+    Managed,
+    /// Attach originated outside the governed route and preserves its blind interval.
+    External,
+}
+
+/// Transport-neutral projection of an externally observed blind interval.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeBlindInterval {
+    /// Inclusive first unobserved cursor.
+    pub start: u64,
+    /// Inclusive last unobserved cursor.
+    pub end: u64,
+    /// Stable evidence reference explaining why the interval is blind.
+    pub reason_ref: String,
+}
+
+impl AgentBridgeBlindInterval {
+    /// Validates interval ordering and the evidence reference.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.end < self.start {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_request.pre_attach_blind_interval",
+                reason: "end must be greater than or equal to start",
+            });
+        }
+        bounded_text(
+            &self.reason_ref,
+            "agent_bridge_activation_request.pre_attach_blind_interval.reason_ref",
+            512,
+        )
+    }
+}
+
+/// Pre-semantic bridge activation request bound to one admitted transport receipt.
+///
+/// The request deliberately carries no semantic Session, task, `WorkScope`, or
+/// plan. Its [`RequestIdentity`] must remain unattached and share the exact
+/// transport fence observed by the Kernel admission receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeActivationRequest {
+    /// Activation request wire identity.
+    pub wire_id: String,
+    /// Activation request wire version.
+    pub wire_version: u16,
+    /// Closed Kernel operation selector.
+    pub operation: String,
+    /// Demand identity supplied by the bridge surface.
+    pub demand_id: String,
+    /// Kernel-created transport connection identity.
+    pub connection_id: String,
+    /// Whether the attach originated inside or outside a governed route.
+    pub attach_kind: AgentBridgeAttachKind,
+    /// Required evidence gap for an external attach and forbidden for a managed attach.
+    pub pre_attach_blind_interval: Option<AgentBridgeBlindInterval>,
+    /// Request/idempotency identity with no semantic Session or task binding.
+    pub request_identity: RequestIdentity,
+    /// Digest of the exact Kernel-produced transport admission receipt.
+    pub peer_admission_receipt_sha256: String,
+    /// Lowercase SHA-256 over every request field except this field.
+    pub request_sha256: String,
+}
+
+impl AgentBridgeActivationRequest {
+    /// Current activation request contract version.
+    pub const CONTRACT_VERSION: u16 = AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_VERSION;
+
+    /// Returns canonical bytes covered by `request_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.request_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical activation request digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical activation request digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.request_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the pre-semantic request shape without admitting its transport.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+            || self.operation != AGENT_BRIDGE_ACTIVATION_OPERATION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_request.wire",
+                reason: "unsupported agent-bridge activation request",
+            });
+        }
+        bounded_text(
+            &self.demand_id,
+            "agent_bridge_activation_request.demand_id",
+            512,
+        )?;
+        bounded_text(
+            &self.connection_id,
+            "agent_bridge_activation_request.connection_id",
+            512,
+        )?;
+        match (self.attach_kind, &self.pre_attach_blind_interval) {
+            (AgentBridgeAttachKind::Managed, None) => {}
+            (AgentBridgeAttachKind::External, Some(interval)) => interval.validate()?,
+            (AgentBridgeAttachKind::Managed, Some(_)) => {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_bridge_activation_request.pre_attach_blind_interval",
+                    reason: "managed attach cannot claim an external blind interval",
+                });
+            }
+            (AgentBridgeAttachKind::External, None) => {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_bridge_activation_request.pre_attach_blind_interval",
+                    reason: "external attach must preserve its blind interval",
+                });
+            }
+        }
+        self.request_identity.validate()?;
+        let metadata = &self.request_identity.request.metadata;
+        if metadata.session_id.is_some()
+            || metadata.task_id.is_some()
+            || metadata.state_fence.task_revision.is_some()
+            || metadata.clock.valid_time_ms.is_some()
+            || metadata.clock.known_time_ms.is_some()
+            || metadata.clock.transaction_sequence.is_some()
+            || metadata.clock.monotonic_ns.is_some()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_request.request_identity",
+                reason: "pre-activation identity must not contain semantic Session, task, or caller-clock state",
+            });
+        }
+        lowercase_sha256(
+            &self.peer_admission_receipt_sha256,
+            "agent_bridge_activation_request.peer_admission_receipt_sha256",
+        )?;
+        lowercase_sha256(
+            &self.request_sha256,
+            "agent_bridge_activation_request.request_sha256",
+        )?;
+        if self.request_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_request.request_sha256",
+                reason: "activation request digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the request against the exact live transport admission receipt.
+    pub fn validate_admission(
+        &self,
+        receipt: &AgentBridgePeerAdmissionReceipt,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        receipt.validate()?;
+        if self.connection_id != receipt.connection_id
+            || self.peer_admission_receipt_sha256 != receipt.receipt_sha256
+            || self.request_identity.request.state_fence != receipt.state_fence
+            || self.request_identity.deadline_unix_ms != receipt.activation_deadline_unix_ms
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_request.peer_admission_receipt_sha256",
+                reason: "must bind the exact connection-scoped transport admission receipt",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Correlation-only ticket handed from Kernel to the trusted eliotd resolver.
+///
+/// This binds the exact pre-semantic request and transport receipt without
+/// carrying any caller-selected semantic identity.  The ticket does not issue
+/// a Session, fence, capability, or effect authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActivationResolutionTicket {
+    /// Ticket wire identity.
+    pub wire_id: String,
+    /// Ticket wire version.
+    pub wire_version: u16,
+    /// Stable ticket identity allocated by Kernel.
+    pub ticket_id: String,
+    /// Exact activation request identity.
+    pub activation_request_id: RequestId,
+    /// Digest of the exact activation request.
+    pub activation_request_sha256: String,
+    /// Digest of the exact Kernel peer-admission receipt.
+    pub peer_admission_receipt_sha256: String,
+    /// Kernel-created transport connection identity.
+    pub connection_id: String,
+    /// Exact transport fence retained for semantic resolution.
+    pub state_fence: StateFence,
+    /// Kernel-owned absolute resolution deadline.
+    pub kernel_deadline_unix_ms: u64,
+    /// Lowercase SHA-256 over every ticket field except this field.
+    pub ticket_sha256: String,
+}
+
+impl AgentActivationResolutionTicket {
+    /// Current ticket contract version.
+    pub const CONTRACT_VERSION: u16 = AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION;
+
+    /// Returns canonical bytes covered by `ticket_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.ticket_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical ticket digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical ticket digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.ticket_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the closed correlation-only ticket shape.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_ticket.wire",
+                reason: "unsupported semantic resolution ticket",
+            });
+        }
+        if self.ticket_id.trim().is_empty() || self.ticket_id.chars().any(char::is_control) {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_ticket.ticket_id",
+                reason: "must be non-blank and free of control characters",
+            });
+        }
+        if self.ticket_id.len() > 512 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_ticket.ticket_id",
+                reason: "exceeds the bounded wire length",
+            });
+        }
+        lowercase_sha256(
+            &self.activation_request_sha256,
+            "agent_activation_resolution_ticket.activation_request_sha256",
+        )?;
+        lowercase_sha256(
+            &self.peer_admission_receipt_sha256,
+            "agent_activation_resolution_ticket.peer_admission_receipt_sha256",
+        )?;
+        bounded_text(
+            &self.connection_id,
+            "agent_activation_resolution_ticket.connection_id",
+            512,
+        )?;
+        self.state_fence
+            .validate()
+            .map_err(ProtocolError::Foundation)?;
+        if self.kernel_deadline_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_ticket.kernel_deadline_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        lowercase_sha256(
+            &self.ticket_sha256,
+            "agent_activation_resolution_ticket.ticket_sha256",
+        )?;
+        if self.ticket_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_ticket.ticket_sha256",
+                reason: "ticket digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that this ticket binds the exact request and peer receipt.
+    pub fn validate_against(
+        &self,
+        request: &AgentBridgeActivationRequest,
+        receipt: &AgentBridgePeerAdmissionReceipt,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        request.validate_admission(receipt)?;
+        receipt.validate()?;
+        if self.activation_request_id != request.request_identity.request.metadata.request_id
+            || self.activation_request_sha256 != request.request_sha256
+            || self.peer_admission_receipt_sha256 != receipt.receipt_sha256
+            || self.connection_id != receipt.connection_id
+            || self.state_fence != receipt.state_fence
+            || self.kernel_deadline_unix_ms != receipt.activation_deadline_unix_ms
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_ticket.binding",
+                reason: "must bind the exact activation request and peer receipt",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Immutable semantic decision returned by eliotd for one exact ticket.
+///
+/// These fields are a clone of the Governor's validated activation projection.
+/// No transport Session, nonce, fencing token, capability, or effect is
+/// issued by this contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActivationResolutionDecision {
+    /// Stable decision wire identity.
+    pub wire_id: String,
+    /// Decision wire version.
+    pub wire_version: u16,
+    /// Exact resolution ticket identity.
+    pub ticket_id: String,
+    /// Digest of the exact resolution ticket.
+    pub ticket_sha256: String,
+    /// Exact Governor fence used for the decision.
+    pub state_fence: StateFence,
+    /// Resolved semantic principal identity.
+    pub principal_id: String,
+    /// Resolved semantic session identity.
+    pub session_id: String,
+    /// Resolved task identity.
+    pub task_id: String,
+    /// Resolved work-unit identity.
+    pub work_unit_id: String,
+    /// Resolved `WorkScope` identity.
+    pub work_scope_id: String,
+    /// Exact task revision.
+    pub task_revision: String,
+    /// Exact current plan identity.
+    pub plan_id: String,
+    /// Exact current plan revision.
+    pub plan_revision: String,
+    /// Lowercase SHA-256 over every decision field except this field.
+    pub decision_sha256: String,
+}
+
+impl AgentActivationResolutionDecision {
+    /// Current decision contract version.
+    pub const CONTRACT_VERSION: u16 = AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_VERSION;
+
+    /// Returns canonical bytes covered by `decision_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.decision_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical decision digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical decision digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.decision_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the closed immutable semantic projection.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_decision.wire",
+                reason: "unsupported semantic resolution decision",
+            });
+        }
+        bounded_text(
+            &self.ticket_id,
+            "agent_activation_resolution_decision.ticket_id",
+            512,
+        )?;
+        lowercase_sha256(
+            &self.ticket_sha256,
+            "agent_activation_resolution_decision.ticket_sha256",
+        )?;
+        self.state_fence
+            .validate()
+            .map_err(ProtocolError::Foundation)?;
+        for (value, field) in [
+            (
+                self.principal_id.as_str(),
+                "agent_activation_resolution_decision.principal_id",
+            ),
+            (
+                self.session_id.as_str(),
+                "agent_activation_resolution_decision.session_id",
+            ),
+            (
+                self.task_id.as_str(),
+                "agent_activation_resolution_decision.task_id",
+            ),
+            (
+                self.work_unit_id.as_str(),
+                "agent_activation_resolution_decision.work_unit_id",
+            ),
+            (
+                self.work_scope_id.as_str(),
+                "agent_activation_resolution_decision.work_scope_id",
+            ),
+            (
+                self.task_revision.as_str(),
+                "agent_activation_resolution_decision.task_revision",
+            ),
+            (
+                self.plan_id.as_str(),
+                "agent_activation_resolution_decision.plan_id",
+            ),
+            (
+                self.plan_revision.as_str(),
+                "agent_activation_resolution_decision.plan_revision",
+            ),
+        ] {
+            bounded_text(value, field, 512)?;
+        }
+        lowercase_sha256(
+            &self.decision_sha256,
+            "agent_activation_resolution_decision.decision_sha256",
+        )?;
+        if self.decision_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_decision.decision_sha256",
+                reason: "decision digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the decision against the exact ticket it resolves.
+    pub fn validate_against(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        ticket.validate()?;
+        if self.ticket_id != ticket.ticket_id
+            || self.ticket_sha256 != ticket.ticket_sha256
+            || self.state_fence != ticket.state_fence
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_decision.binding",
+                reason: "must bind the exact ticket identity, digest, and fence",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Transport-neutral projection of the Kernel-owned semantic activation fence.
+///
+/// This is a response contract only. eliotd copies the authenticated Kernel
+/// fence; constructing it does not issue a Kernel Session or authorize a
+/// semantic binding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeActivationFence {
+    /// Semantic authority epoch selected by Kernel admission.
+    pub authority_epoch: AuthorityEpoch,
+    /// Semantic activation generation selected by Kernel admission.
+    pub generation: ResourceGeneration,
+    /// Kernel-issued fence nonce.
+    pub nonce: String,
+}
+
+impl AgentBridgeActivationFence {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.authority_epoch.value() == 0 || self.generation.value() == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.state_fence",
+                reason: "authority epoch and activation generation must be nonzero",
+            });
+        }
+        bounded_text(
+            &self.nonce,
+            "agent_bridge_activation_response.state_fence.nonce",
+            512,
+        )
+    }
+}
+
+/// Exact semantic binding shape reserved for the future eliotd resolver.
+///
+/// R13.1 transport code must not construct this value. It exists so both ends
+/// share one versioned wire shape without treating transport evidence as
+/// semantic authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeAuthenticatedBinding {
+    /// Resolved semantic principal identity.
+    pub principal_id: String,
+    /// Resolved semantic Session identity.
+    pub session_id: String,
+    /// Resolver-issued activation generation.
+    pub activation_generation: ResourceGeneration,
+    /// Resolver-issued semantic fence.
+    pub state_fence: AgentBridgeActivationFence,
+    /// Resolved task identity.
+    pub task_id: String,
+    /// Resolved work-unit identity.
+    pub work_unit_id: String,
+    /// Resolved `WorkScope` identity.
+    pub work_scope_id: String,
+    /// Exact task revision.
+    pub task_revision: String,
+    /// Exact admitted plan identity.
+    pub plan_id: String,
+    /// Exact admitted plan revision.
+    pub plan_revision: String,
+}
+
+impl AgentBridgeAuthenticatedBinding {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        for (value, field) in [
+            (
+                self.principal_id.as_str(),
+                "agent_bridge_activation_response.principal_id",
+            ),
+            (
+                self.session_id.as_str(),
+                "agent_bridge_activation_response.session_id",
+            ),
+            (
+                self.task_id.as_str(),
+                "agent_bridge_activation_response.task_id",
+            ),
+            (
+                self.work_unit_id.as_str(),
+                "agent_bridge_activation_response.work_unit_id",
+            ),
+            (
+                self.work_scope_id.as_str(),
+                "agent_bridge_activation_response.work_scope_id",
+            ),
+            (
+                self.task_revision.as_str(),
+                "agent_bridge_activation_response.task_revision",
+            ),
+            (
+                self.plan_id.as_str(),
+                "agent_bridge_activation_response.plan_id",
+            ),
+            (
+                self.plan_revision.as_str(),
+                "agent_bridge_activation_response.plan_revision",
+            ),
+        ] {
+            bounded_text(value, field, 512)?;
+        }
+        self.state_fence.validate()?;
+        if self.activation_generation != self.state_fence.generation {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.activation_generation",
+                reason: "must match the semantic state fence generation",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Typed reason why an admitted bridge transport cannot be activated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentBridgeActivationDenialCode {
+    /// The trusted eliotd semantic resolver is not yet available.
+    SemanticResolutionUnavailable,
+}
+
+impl AgentBridgeActivationDenialCode {
+    /// Returns the stable wire code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SemanticResolutionUnavailable => AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE,
+        }
+    }
+}
+
+/// Closed activation result returned after transport admission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentBridgeActivationDisposition {
+    /// Exact semantic binding produced by the future trusted resolver.
+    Authenticated {
+        /// Complete resolver-owned semantic binding.
+        binding: Box<AgentBridgeAuthenticatedBinding>,
+    },
+    /// Typed fail-closed outcome with no semantic binding.
+    Denied {
+        /// Stable denial code.
+        reason_code: AgentBridgeActivationDenialCode,
+    },
+}
+
+impl AgentBridgeActivationDisposition {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Authenticated { binding } => binding.validate(),
+            Self::Denied { .. } => Ok(()),
+        }
+    }
+}
+
+/// Versioned response to one exact agent-bridge activation request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeActivationResponse {
+    /// Activation response wire identity.
+    pub wire_id: String,
+    /// Activation response wire version.
+    pub wire_version: u16,
+    /// Request identity copied from the activation request.
+    pub request_id: RequestId,
+    /// Digest of the exact activation request.
+    pub request_sha256: String,
+    /// Typed activation outcome.
+    pub disposition: AgentBridgeActivationDisposition,
+    /// Lowercase SHA-256 over every response field except this field.
+    pub response_sha256: String,
+}
+
+impl AgentBridgeActivationResponse {
+    /// Current activation response contract version.
+    pub const CONTRACT_VERSION: u16 = AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION;
+
+    /// Constructs the only R13.1b-authorized response while semantic resolution is absent.
+    pub fn denied(
+        request: &AgentBridgeActivationRequest,
+        reason_code: AgentBridgeActivationDenialCode,
+    ) -> Result<Self, ProtocolError> {
+        request.validate()?;
+        Self {
+            wire_id: AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID.to_owned(),
+            wire_version: Self::CONTRACT_VERSION,
+            request_id: request.request_identity.request.metadata.request_id.clone(),
+            request_sha256: request.request_sha256.clone(),
+            disposition: AgentBridgeActivationDisposition::Denied { reason_code },
+            response_sha256: String::new(),
+        }
+        .with_computed_digest()
+    }
+
+    /// Returns canonical bytes covered by `response_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.response_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical activation response digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical activation response digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.response_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates response shape and canonical self digest.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.wire",
+                reason: "unsupported agent-bridge activation response",
+            });
+        }
+        text(
+            self.request_id.as_str(),
+            "agent_bridge_activation_response.request_id",
+        )?;
+        lowercase_sha256(
+            &self.request_sha256,
+            "agent_bridge_activation_response.request_sha256",
+        )?;
+        self.disposition.validate()?;
+        lowercase_sha256(
+            &self.response_sha256,
+            "agent_bridge_activation_response.response_sha256",
+        )?;
+        if self.response_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.response_sha256",
+                reason: "activation response digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that this response belongs to the exact activation request.
+    pub fn validate_request(
+        &self,
+        request: &AgentBridgeActivationRequest,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        request.validate()?;
+        if self.request_id != request.request_identity.request.metadata.request_id
+            || self.request_sha256 != request.request_sha256
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.request_sha256",
+                reason: "must bind the exact activation request",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the complete challenge/receipt binding remains explicit at one protocol boundary"
+)]
 fn validate_peer_bindings(
     module_id: &str,
     profile_id: &str,
@@ -1427,6 +2239,7 @@ fn validate_peer_bindings(
     client_declaration_sha256: &str,
     bridge_generation: ResourceGeneration,
     state_fence: &StateFence,
+    activation_deadline_unix_ms: u64,
     challenge_nonce: &str,
 ) -> Result<(), ProtocolError> {
     if module_id != AGENT_BRIDGE_MODULE_ID {
@@ -1446,6 +2259,12 @@ fn validate_peer_bindings(
         return Err(ProtocolError::InvalidField {
             field: "agent_bridge_peer.bridge_generation",
             reason: "must match the state fence resource generation",
+        });
+    }
+    if activation_deadline_unix_ms == 0 {
+        return Err(ProtocolError::InvalidField {
+            field: "agent_bridge_peer.activation_deadline_unix_ms",
+            reason: "must be a nonzero Kernel-issued deadline",
         });
     }
     bounded_text(challenge_nonce, "agent_bridge_peer.challenge_nonce", 512)?;
@@ -1863,6 +2682,14 @@ mod tests {
             client_declaration_sha256: declaration.declaration_sha256.clone(),
             bridge_generation: declaration.module_generation.generation,
             state_fence: declaration.module_generation.state_fence.clone(),
+            kernel_principal_binding: declaration.expected_kernel_principal_binding.clone(),
+            kernel_authority_epoch: declaration.expected_kernel_authority_epoch,
+            kernel_generation: declaration.expected_kernel_generation,
+            kernel_artifact_sha256: declaration.expected_kernel_artifact_sha256.clone(),
+            kernel_config_snapshot_sha256: declaration
+                .expected_kernel_config_snapshot_sha256
+                .clone(),
+            activation_deadline_unix_ms: 10_000,
             challenge_nonce: "kernel-challenge-1".to_owned(),
             challenge_sha256: String::new(),
         }
@@ -1880,11 +2707,13 @@ mod tests {
             wire_id: AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_ID.to_owned(),
             wire_version: AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_VERSION,
             module_id: challenge.module_id.clone(),
+            connection_id: "kernel-connection-1".to_owned(),
             profile_id: challenge.profile_id.clone(),
             descriptor_sha256: challenge.descriptor_sha256.clone(),
             client_declaration_sha256: challenge.client_declaration_sha256.clone(),
             bridge_generation: challenge.bridge_generation,
             state_fence: challenge.state_fence.clone(),
+            activation_deadline_unix_ms: challenge.activation_deadline_unix_ms,
             challenge_nonce: challenge.challenge_nonce.clone(),
             challenge_sha256: challenge.challenge_sha256.clone(),
             client_hello_sha256,
@@ -1896,6 +2725,69 @@ mod tests {
             observed_image_volume_serial: 77,
             observed_image_file_index: 88,
             receipt_sha256: String::new(),
+        }
+        .with_computed_digest()
+    }
+
+    fn activation_request(
+        receipt: &AgentBridgePeerAdmissionReceipt,
+        attach_kind: AgentBridgeAttachKind,
+    ) -> Result<AgentBridgeActivationRequest, ProtocolError> {
+        let pre_attach_blind_interval = match attach_kind {
+            AgentBridgeAttachKind::Managed => None,
+            AgentBridgeAttachKind::External => Some(AgentBridgeBlindInterval {
+                start: 10,
+                end: 20,
+                reason_ref: "external-observation-gap-1".to_owned(),
+            }),
+        };
+        let request_id = RequestId::new("agent-bridge-activation-request-1")?;
+        AgentBridgeActivationRequest {
+            wire_id: AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_VERSION,
+            operation: AGENT_BRIDGE_ACTIVATION_OPERATION.to_owned(),
+            demand_id: "agent-bridge-demand-1".to_owned(),
+            connection_id: receipt.connection_id.clone(),
+            attach_kind,
+            pre_attach_blind_interval,
+            request_identity: RequestIdentity {
+                request: RequestBinding {
+                    metadata: RequestMetadata {
+                        request_id,
+                        session_id: None,
+                        task_id: None,
+                        product_id: ProductId::new("eliot-agent-bridge")?,
+                        source_id: SourceId::new("agent-bridge-transport")?,
+                        state_fence: receipt.state_fence.clone(),
+                        clock: ClockReading::default(),
+                    },
+                    state_fence: receipt.state_fence.clone(),
+                },
+                idempotency_key: "agent-bridge-activation-idempotency-1".to_owned(),
+                deadline_unix_ms: receipt.activation_deadline_unix_ms,
+                cancellation_id: "agent-bridge-activation-cancellation-1".to_owned(),
+            },
+            peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
+            request_sha256: String::new(),
+        }
+        .with_computed_digest()
+    }
+
+    fn resolution_ticket(
+        request: &AgentBridgeActivationRequest,
+        receipt: &AgentBridgePeerAdmissionReceipt,
+    ) -> Result<AgentActivationResolutionTicket, ProtocolError> {
+        AgentActivationResolutionTicket {
+            wire_id: AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+            wire_version: AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+            ticket_id: "activation-ticket-1".to_owned(),
+            activation_request_id: request.request_identity.request.metadata.request_id.clone(),
+            activation_request_sha256: request.request_sha256.clone(),
+            peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
+            connection_id: receipt.connection_id.clone(),
+            state_fence: receipt.state_fence.clone(),
+            kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
+            ticket_sha256: String::new(),
         }
         .with_computed_digest()
     }
@@ -1936,6 +2828,255 @@ mod tests {
     }
 
     #[test]
+    fn bridge_activation_request_binds_transport_receipt_without_semantic_identity()
+    -> Result<(), ProtocolError> {
+        let declaration = agent_bridge_client_declaration()?;
+        let challenge = peer_challenge(&declaration)?;
+        let hello = declaration.client_hello(&challenge.challenge_nonce)?;
+        let receipt = peer_receipt(&challenge, &hello)?;
+        let request = activation_request(&receipt, AgentBridgeAttachKind::Managed)?;
+
+        request.validate()?;
+        request.validate_admission(&receipt)?;
+        assert!(
+            request
+                .request_identity
+                .request
+                .metadata
+                .session_id
+                .is_none()
+        );
+        assert!(request.request_identity.request.metadata.task_id.is_none());
+
+        let mut other_connection = request.clone();
+        other_connection.connection_id = "kernel-connection-other".to_owned();
+        other_connection = other_connection.with_computed_digest()?;
+        other_connection.validate()?;
+        assert!(other_connection.validate_admission(&receipt).is_err());
+
+        let mut other_receipt = receipt.clone();
+        other_receipt.connection_id = "kernel-connection-other".to_owned();
+        other_receipt = other_receipt.with_computed_digest()?;
+        other_receipt.validate()?;
+        assert!(request.validate_admission(&other_receipt).is_err());
+
+        let mut semantic_session = request.clone();
+        semantic_session
+            .request_identity
+            .request
+            .metadata
+            .session_id = Some(eliot_contracts::SessionId::new("forbidden-session")?);
+        semantic_session
+            .request_identity
+            .request
+            .metadata
+            .state_fence = semantic_session
+            .request_identity
+            .request
+            .state_fence
+            .clone();
+        semantic_session = semantic_session.with_computed_digest()?;
+        assert!(semantic_session.validate().is_err());
+
+        let mut caller_clock = request.clone();
+        caller_clock
+            .request_identity
+            .request
+            .metadata
+            .clock
+            .known_time_ms = Some(1);
+        caller_clock = caller_clock.with_computed_digest()?;
+        assert!(caller_clock.validate().is_err());
+
+        let mut other_deadline = request.clone();
+        other_deadline.request_identity.deadline_unix_ms -= 1;
+        other_deadline = other_deadline.with_computed_digest()?;
+        other_deadline.validate()?;
+        assert!(other_deadline.validate_admission(&receipt).is_err());
+
+        let mut managed_blind = request.clone();
+        managed_blind.pre_attach_blind_interval = Some(AgentBridgeBlindInterval {
+            start: 1,
+            end: 2,
+            reason_ref: "forbidden-managed-gap".to_owned(),
+        });
+        managed_blind = managed_blind.with_computed_digest()?;
+        assert!(managed_blind.validate().is_err());
+
+        let mut external = activation_request(&receipt, AgentBridgeAttachKind::External)?;
+        external.pre_attach_blind_interval = None;
+        external = external.with_computed_digest()?;
+        assert!(external.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_resolution_ticket_and_decision_bind_exact_inputs() -> Result<(), ProtocolError> {
+        let declaration = agent_bridge_client_declaration()?;
+        let challenge = peer_challenge(&declaration)?;
+        let hello = declaration.client_hello(&challenge.challenge_nonce)?;
+        let receipt = peer_receipt(&challenge, &hello)?;
+        let request = activation_request(&receipt, AgentBridgeAttachKind::Managed)?;
+        let ticket = resolution_ticket(&request, &receipt)?;
+        ticket.validate()?;
+        ticket.validate_against(&request, &receipt)?;
+
+        let decision = AgentActivationResolutionDecision {
+            wire_id: AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID.to_owned(),
+            wire_version: AgentActivationResolutionDecision::CONTRACT_VERSION,
+            ticket_id: ticket.ticket_id.clone(),
+            ticket_sha256: ticket.ticket_sha256.clone(),
+            state_fence: ticket.state_fence.clone(),
+            principal_id: "principal-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            work_unit_id: "work-1".to_owned(),
+            work_scope_id: "scope-1".to_owned(),
+            task_revision: "1".to_owned(),
+            plan_id: "plan-1".to_owned(),
+            plan_revision: "plan-revision-1".to_owned(),
+            decision_sha256: String::new(),
+        }
+        .with_computed_digest()?;
+        decision.validate_against(&ticket)?;
+
+        let mut substituted_ticket = ticket.clone();
+        substituted_ticket.connection_id = "other-connection".to_owned();
+        substituted_ticket.ticket_sha256 = substituted_ticket.compute_digest()?;
+        assert!(
+            substituted_ticket
+                .validate_against(&request, &receipt)
+                .is_err()
+        );
+
+        let mut old_ticket = ticket.clone();
+        old_ticket.wire_version = 0;
+        old_ticket.ticket_sha256 = old_ticket.compute_digest()?;
+        assert!(old_ticket.validate().is_err());
+
+        let mut inconsistent_request = request.clone();
+        inconsistent_request.connection_id = "other-connection".to_owned();
+        inconsistent_request.request_sha256 = inconsistent_request.compute_digest()?;
+        assert!(
+            ticket
+                .validate_against(&inconsistent_request, &receipt)
+                .is_err()
+        );
+
+        let mut stale_ticket = ticket.clone();
+        stale_ticket.kernel_deadline_unix_ms = 1;
+        stale_ticket.ticket_sha256 = stale_ticket.compute_digest()?;
+        assert!(stale_ticket.validate().is_ok());
+        assert!(stale_ticket.validate_against(&request, &receipt).is_err());
+
+        let mut wrong_decision = decision.clone();
+        wrong_decision.ticket_id = "other-ticket".to_owned();
+        wrong_decision.decision_sha256 = wrong_decision.compute_digest()?;
+        assert!(wrong_decision.validate_against(&ticket).is_err());
+
+        let mut unknown = serde_json::to_value(&ticket)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        unknown
+            .as_object_mut()
+            .ok_or(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_ticket",
+                reason: "test ticket must serialize as an object",
+            })?
+            .insert(
+                "principal_id".to_owned(),
+                Value::String("forbidden".to_owned()),
+            );
+        assert!(serde_json::from_value::<AgentActivationResolutionTicket>(unknown).is_err());
+
+        let mut no_deadline = ticket;
+        no_deadline.kernel_deadline_unix_ms = 0;
+        no_deadline.ticket_sha256 = no_deadline.compute_digest()?;
+        assert!(no_deadline.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_activation_denial_roundtrips_and_binds_exact_request() -> Result<(), ProtocolError> {
+        let declaration = agent_bridge_client_declaration()?;
+        let challenge = peer_challenge(&declaration)?;
+        let hello = declaration.client_hello(&challenge.challenge_nonce)?;
+        let receipt = peer_receipt(&challenge, &hello)?;
+        let request = activation_request(&receipt, AgentBridgeAttachKind::Managed)?;
+        let response = AgentBridgeActivationResponse::denied(
+            &request,
+            AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+        )?;
+
+        response.validate()?;
+        response.validate_request(&request)?;
+        assert_eq!(
+            AgentBridgeActivationDenialCode::SemanticResolutionUnavailable.as_str(),
+            AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE
+        );
+        let encoded = serde_json::to_value(&response)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        assert_eq!(
+            encoded["disposition"]["reason_code"],
+            Value::String(AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE.to_owned())
+        );
+
+        let mut other_request = request.clone();
+        other_request.demand_id = "agent-bridge-demand-other".to_owned();
+        other_request = other_request.with_computed_digest()?;
+        other_request.validate()?;
+        assert!(response.validate_request(&other_request).is_err());
+
+        let mut wrong_response_digest = response.clone();
+        wrong_response_digest.response_sha256 = "f".repeat(64);
+        assert!(wrong_response_digest.validate().is_err());
+
+        let mut unknown_request = serde_json::to_value(&request)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        unknown_request["principal_id"] = Value::String("forbidden-principal".to_owned());
+        assert!(serde_json::from_value::<AgentBridgeActivationRequest>(unknown_request).is_err());
+
+        let mut unknown_response = encoded;
+        unknown_response["session_id"] = Value::String("forbidden-session".to_owned());
+        assert!(serde_json::from_value::<AgentBridgeActivationResponse>(unknown_response).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_authenticated_shape_rejects_incomplete_or_mismatched_semantic_bindings()
+    -> Result<(), ProtocolError> {
+        let binding = AgentBridgeAuthenticatedBinding {
+            principal_id: "principal-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            activation_generation: ResourceGeneration::new(3)?,
+            state_fence: AgentBridgeActivationFence {
+                authority_epoch: AuthorityEpoch::new(2)?,
+                generation: ResourceGeneration::new(3)?,
+                nonce: "semantic-fence-nonce-1".to_owned(),
+            },
+            task_id: "task-1".to_owned(),
+            work_unit_id: "work-unit-1".to_owned(),
+            work_scope_id: "work-scope-1".to_owned(),
+            task_revision: "task-revision-1".to_owned(),
+            plan_id: "plan-1".to_owned(),
+            plan_revision: "plan-revision-1".to_owned(),
+        };
+        binding.validate()?;
+
+        let mut missing_plan = binding.clone();
+        missing_plan.plan_id.clear();
+        assert!(missing_plan.validate().is_err());
+
+        let mut mismatched_generation = binding;
+        mismatched_generation.activation_generation = ResourceGeneration::new(4)?;
+        assert!(mismatched_generation.validate().is_err());
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the relational bridge negative matrix keeps all digest substitutions together"
+    )]
+    #[test]
     fn bridge_peer_relational_bindings_reject_recomputed_substitutions() -> Result<(), ProtocolError>
     {
         let declaration = agent_bridge_client_declaration()?;
@@ -1975,6 +3116,12 @@ mod tests {
         assert!(substituted_nonce.validate().is_ok());
         assert!(receipt.validate_challenge(&substituted_nonce).is_err());
 
+        let mut substituted_deadline = challenge.clone();
+        substituted_deadline.activation_deadline_unix_ms += 1;
+        substituted_deadline = substituted_deadline.with_computed_digest()?;
+        assert!(substituted_deadline.validate().is_ok());
+        assert!(receipt.validate_challenge(&substituted_deadline).is_err());
+
         let mut substituted_hash = receipt.clone();
         substituted_hash.challenge_sha256 = "a".repeat(64);
         substituted_hash = substituted_hash.with_computed_digest()?;
@@ -1993,6 +3140,26 @@ mod tests {
         substituted_fence = substituted_fence.with_computed_digest()?;
         assert!(substituted_fence.validate().is_ok());
         assert!(receipt.validate_challenge(&substituted_fence).is_err());
+
+        let mut substituted_kernel = challenge.clone();
+        substituted_kernel.kernel_principal_binding = "kernel:substituted".to_owned();
+        substituted_kernel = substituted_kernel.with_computed_digest()?;
+        assert!(substituted_kernel.validate().is_ok());
+        assert!(
+            substituted_kernel
+                .validate_declaration(&declaration)
+                .is_err()
+        );
+
+        let mut substituted_kernel_config = challenge.clone();
+        substituted_kernel_config.kernel_config_snapshot_sha256 = "e".repeat(64);
+        substituted_kernel_config = substituted_kernel_config.with_computed_digest()?;
+        assert!(substituted_kernel_config.validate().is_ok());
+        assert!(
+            substituted_kernel_config
+                .validate_declaration(&declaration)
+                .is_err()
+        );
 
         let hello_other = declaration.client_hello("kernel-challenge-other")?;
         let mut receipt_other_hello = receipt.clone();
@@ -2051,10 +3218,10 @@ mod tests {
         unknown["session_id"] = Value::String("semantic-session".to_owned());
         assert!(serde_json::from_value::<AgentBridgePeerChallenge>(unknown).is_err());
 
-        let mut legacy = serde_json::to_value(&receipt)
-            .map_err(|error| ProtocolError::Json(error.to_string()))?;
-        legacy["connection_id"] = Value::String("legacy".to_owned());
-        assert!(serde_json::from_value::<AgentBridgePeerAdmissionReceipt>(legacy).is_err());
+        let mut legacy = receipt.clone();
+        legacy.wire_version = 1;
+        legacy = legacy.with_computed_digest()?;
+        assert!(legacy.validate().is_err());
 
         let mut bad_challenge = challenge.clone();
         bad_challenge.wire_version = 0;

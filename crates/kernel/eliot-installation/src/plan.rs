@@ -7,9 +7,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CandidateManifest, ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME,
-    HostPhaseBStaticTemplate, InstallationError, InstallationProfile, PlatformHandle,
-    ResourceGeneration, RuntimeStateRoots, SUPERVISION_AUTHORITY_HOST_SERVICE,
+    AgentBridgeSourceMaterializationPlan, CandidateManifest, ELIOT_HOST_SERVICE_NAME,
+    ELIOT_WATCHDOG_SERVICE_NAME, HostPhaseBStaticTemplate, InstallationError, InstallationProfile,
+    PlatformHandle, ResourceGeneration, RuntimeStateRoots, SUPERVISION_AUTHORITY_HOST_SERVICE,
     SUPERVISION_AUTHORITY_SERVICE_SID_TYPE, StoreCredentialProvisionPlan, WindowsPathIdentity,
     approved_path, handle, handles, package_plan_error, phase_b_host_state_root_digest,
     phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest, sha256_handle,
@@ -269,6 +269,9 @@ pub enum InstallerEffectPlan {
         /// Exact bundled credential provision contract repeated for Host
         /// admission; no secret bytes cross this boundary.
         provision: Box<StoreCredentialProvisionPlan>,
+        /// Optional immutable external agent-bridge source materialization
+        /// contract.  `None` is the legacy transaction shape.
+        agent_bridge_source: Option<Box<AgentBridgeSourceMaterializationPlan>>,
     },
 }
 
@@ -408,6 +411,7 @@ impl InstallerEffectPlan {
                 watchdog_selector_digest,
                 supervision_authority,
                 provision,
+                agent_bridge_source,
                 ..
             } => {
                 sha256_handle(
@@ -424,7 +428,11 @@ impl InstallerEffectPlan {
                     "installer_effect.watchdog_selector_digest",
                 )?;
                 supervision_authority.validate()?;
-                provision.validate()
+                provision.validate()?;
+                if let Some(source) = agent_bridge_source {
+                    source.validate()?;
+                }
+                Ok(())
             }
         }
     }

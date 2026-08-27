@@ -1,17 +1,14 @@
-use std::io::{self, BufRead, Write};
-
-use eliot_agent_bridge::{BridgeRunner, CliError, Profile, kernel_ports, parse_args};
+use eliot_agent_bridge::{
+    BridgeRunner, CliError, Profile, kernel_ports_with_declaration, parse_args,
+};
 use eliot_agent_bridge_core::{AttachRequest, BridgeError, HostEventEnvelope};
 use eliot_protocol::{EventEnvelope, Frame};
 use serde::{Deserialize, Serialize};
-
+use std::io::{self, BufRead, Write};
 const INVALID_ARGUMENT_EXIT: i32 = 2;
 const PROVIDER_PORT_EXIT: i32 = 69;
-
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-// This closed line protocol mirrors the existing frame contracts without an
-// extra heap representation at the trusted process boundary.
 #[allow(clippy::large_enum_variant)]
 enum Request {
     Attach { request: AttachRequest },
@@ -22,7 +19,6 @@ enum Request {
     Status,
     Stop,
 }
-
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Response {
@@ -41,9 +37,6 @@ enum Response {
         detail: String,
     },
 }
-
-// The entrypoint keeps the complete request/identity/response loop in one place
-// so every branch shares the same provider-failure exit accounting.
 #[allow(clippy::too_many_lines)]
 fn main() {
     let config = match parse_args(std::env::args().skip(1)) {
@@ -51,35 +44,34 @@ fn main() {
         Err(error) => {
             let (code, detail) = match error {
                 CliError::MissingProfile => ("MISSING_PROFILE", "--profile is required".to_owned()),
+                CliError::MissingClientDeclaration => (
+                    "MISSING_CLIENT_DECLARATION",
+                    "--client-declaration is required".to_owned(),
+                ),
                 CliError::UnsupportedProfile(profile) => ("UNSUPPORTED_PROFILE", profile),
                 CliError::MalformedArgument(argument) => ("MALFORMED_ARGUMENT", argument),
                 CliError::RemoteTransportForbidden(transport) => {
                     ("REMOTE_TRANSPORT_FORBIDDEN", transport)
+                }
+                CliError::InvalidClientDeclarationPath(path) => {
+                    ("INVALID_CLIENT_DECLARATION_PATH", path)
                 }
             };
             emit_error(code, &detail);
             std::process::exit(INVALID_ARGUMENT_EXIT);
         }
     };
-
-    let (host_activation, mcp_forwarding) = match kernel_ports() {
-        Ok(ports) => ports,
-        Err(error) => {
-            let code = if matches!(
-                error,
-                eliot_agent_bridge::RuntimeBuildError::KernelAdmissionRequired(_)
-            ) {
-                "KERNEL_ADMISSION_REQUIRED"
-            } else {
-                "KERNEL_CLIENT_REJECTED"
-            };
-            emit_error(code, &error.to_string());
-            std::process::exit(PROVIDER_PORT_EXIT);
-        }
-    };
+    let (host_activation, mcp_forwarding) =
+        match kernel_ports_with_declaration(&config.client_declaration) {
+            Ok(ports) => ports,
+            Err(error) => {
+                emit_error("KERNEL_CLIENT_REJECTED", &error.to_string());
+                std::process::exit(PROVIDER_PORT_EXIT);
+            }
+        };
     let mut runner = match BridgeRunner::new(
         config.profile,
-        eliot_agent_bridge_core::ProviderReadiness::unprobed(),
+        eliot_agent_bridge_core::ProviderReadiness::all_admitted(),
         Some(host_activation),
         Some(mcp_forwarding),
     ) {
@@ -133,7 +125,7 @@ fn main() {
                     profile: Profile::as_str(config.profile),
                     control_capacity: runner.control_capacity(),
                     activation_port: "observed after Kernel admission",
-                    forwarding_port: "observed after Kernel admission",
+                    forwarding_port: "unavailable: Kernel forwarding route not admitted",
                 },
                 Ok(Request::Stop) => Response::Stopped,
                 Err(error) => Response::Error {
@@ -155,7 +147,6 @@ fn main() {
         std::process::exit(PROVIDER_PORT_EXIT);
     }
 }
-
 fn bridge_error(error: &BridgeError) -> Response {
     if matches!(error, BridgeError::PlanGap(_)) {
         Response::Error {
@@ -169,16 +160,13 @@ fn bridge_error(error: &BridgeError) -> Response {
         }
     }
 }
-
 fn is_provider_failure(error: &BridgeError) -> bool {
     matches!(error, BridgeError::PlanGap(_) | BridgeError::Provider(_))
 }
-
 fn emit_error(code: &str, detail: &str) {
     let mut stderr = io::stderr().lock();
     let _ = writeln!(stderr, "{{\"error\":{code:?},\"detail\":{detail:?}}}");
 }
-
 fn write_response(response: &Response) -> bool {
     let stdout = io::stdout();
     let mut output = stdout.lock();

@@ -9,15 +9,25 @@ description = "ELIOT Kernel composition root and lifecycle entrypoint"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+r13-os-harness = ["dep:eliot-installation", "dep:windows-service"]
+
 [[bin]]
 name = "eliot-kernel"
 path = "src/main.rs"
+
+[[bin]]
+name = "eliot-r13-two-token-harness"
+path = "src/r13_two_token_harness.rs"
+required-features = ["r13-os-harness"]
 
 [dependencies]
 eliot-contracts.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true
+eliot-installation = { workspace = true, optional = true }
 eliot-ors.workspace = true
 eliot-process-executor.workspace = true
 eliot-protocol.workspace = true
@@ -31,6 +41,7 @@ serde_json.workspace = true
 serde.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+windows-service = { workspace = true, optional = true }
 
 [dev-dependencies]
 eliot-ipc = { workspace = true, features = ["test-support"] }
