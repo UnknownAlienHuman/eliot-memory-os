@@ -86,6 +86,7 @@ pub mod test_support {
 mod directory_publication;
 mod installer_authority_key;
 mod installer_root;
+mod kernel_front_door_expectation;
 mod named_pipe_process_admission;
 mod owned_directory_retirement;
 mod package_staging;
@@ -120,6 +121,7 @@ pub use installer_root::{
     InstallerRootProfile, InstallerRootStage, WindowsInstallerRootPrimitive, is_process_elevated,
     windows_path_identity_digest, windows_paths_equal,
 };
+pub use kernel_front_door_expectation::{KernelFrontDoorAclMode, KernelFrontDoorServerExpectation};
 pub(crate) use named_pipe_process_admission::admit_named_pipe_peer_process;
 pub use named_pipe_process_admission::{
     NamedPipePeerEvidence, NamedPipePeerExpectation, NamedPipePeerJobBinding,
@@ -3919,131 +3921,6 @@ fn xml_open_tag_names(xml: &str) -> Vec<String> {
     }
     names
 }
-
-/// The only DACL contours accepted for the Kernel front door.
-///
-/// `ServiceOnly` is the exact SY+LS contour used only when the bridge is
-/// disabled. `SystemAndLocalServiceWithClient` adds exactly one canonical
-/// installed client SID for the dynamic `AgentBridge` process.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum KernelFrontDoorAclMode {
-    ServiceOnly,
-    SystemAndLocalServiceWithClient {
-        client_sid: String,
-    },
-    /// Accepts exactly one additional canonical non-service SID.
-    SystemAndLocalServiceWithOneClient,
-    /// Accepts the bridge-disabled SY+LS contour or exactly one additional
-    /// OS-resolved user SID. Eliotd uses this bounded reconnect-safe mode
-    /// because it does not own the installed bridge SID.
-    SystemAndLocalServiceWithOptionalUserClient,
-}
-
-/// Host-carried expectation for proving the live Kernel process at the far
-/// end of a client named-pipe connection.
-///
-/// This is policy input only. The corresponding [`KernelFrontDoorServerProof`]
-/// is created from the connected pipe handle and retains the process and
-/// executable file handles for the lifetime of the transport.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KernelFrontDoorServerExpectation {
-    expected_server_sid: String,
-    expected_server_session_id: u32,
-    expected_kernel_artifact_sha256: String,
-    approved_process: Option<NamedPipePeerProcessBinding>,
-    approved_job_process: Option<NamedPipePeerJobBinding>,
-    acl_mode: KernelFrontDoorAclMode,
-}
-
-impl KernelFrontDoorServerExpectation {
-    /// Creates an inert front-door server expectation.
-    pub fn new(
-        expected_server_sid: impl Into<String>,
-        expected_server_session_id: u32,
-        expected_kernel_artifact_sha256: impl Into<String>,
-        acl_mode: KernelFrontDoorAclMode,
-    ) -> Result<Self, WindowsAdapterError> {
-        let expected_server_sid = expected_server_sid.into();
-        let expected_kernel_artifact_sha256 = expected_kernel_artifact_sha256.into();
-        if !valid_sid_text(&expected_server_sid)
-            || !valid_sha256_hex(&expected_kernel_artifact_sha256)
-        {
-            return Err(WindowsAdapterError::InvalidInput);
-        }
-        match &acl_mode {
-            KernelFrontDoorAclMode::ServiceOnly
-            | KernelFrontDoorAclMode::SystemAndLocalServiceWithOneClient
-            | KernelFrontDoorAclMode::SystemAndLocalServiceWithOptionalUserClient => {}
-            KernelFrontDoorAclMode::SystemAndLocalServiceWithClient { client_sid } => {
-                if !valid_sid_text(client_sid)
-                    || matches!(
-                        client_sid.as_str(),
-                        "S-1-5-18" | "S-1-5-19" | "S-1-5-20" | "S-1-5-32-544"
-                    )
-                {
-                    return Err(WindowsAdapterError::InvalidInput);
-                }
-            }
-        }
-        Ok(Self {
-            expected_server_sid,
-            expected_server_session_id,
-            expected_kernel_artifact_sha256,
-            approved_process: None,
-            approved_job_process: None,
-            acl_mode,
-        })
-    }
-
-    /// Adds an exact OS-observed process binding for the Kernel server.
-    #[must_use]
-    pub fn with_process_binding(mut self, approved_process: NamedPipePeerProcessBinding) -> Self {
-        self.approved_process = Some(approved_process);
-        self
-    }
-
-    /// Adds an exact OS-observed process and Job binding for the Kernel server.
-    #[must_use]
-    pub fn with_process_and_job_binding(
-        mut self,
-        approved_process: NamedPipePeerJobBinding,
-    ) -> Self {
-        self.approved_process = Some(approved_process.process.clone());
-        self.approved_job_process = Some(approved_process);
-        self
-    }
-
-    #[must_use]
-    pub fn expected_server_sid(&self) -> &str {
-        &self.expected_server_sid
-    }
-
-    #[must_use]
-    pub const fn expected_server_session_id(&self) -> u32 {
-        self.expected_server_session_id
-    }
-
-    #[must_use]
-    pub fn expected_kernel_artifact_sha256(&self) -> &str {
-        &self.expected_kernel_artifact_sha256
-    }
-
-    #[must_use]
-    pub const fn acl_mode(&self) -> &KernelFrontDoorAclMode {
-        &self.acl_mode
-    }
-
-    #[must_use]
-    pub fn approved_process_binding(&self) -> Option<&NamedPipePeerProcessBinding> {
-        self.approved_process.as_ref()
-    }
-
-    #[must_use]
-    pub fn approved_process_job_binding(&self) -> Option<&NamedPipePeerJobBinding> {
-        self.approved_job_process.as_ref()
-    }
-}
-
 #[cfg(windows)]
 pub(crate) struct OwnedProcessHandle(pub(crate) windows_sys::Win32::Foundation::HANDLE);
 
@@ -6511,8 +6388,8 @@ pub fn authenticate_kernel_front_door_server(
             }
         }
         let (sid, session_id) = process_token_identity(process)?;
-        if sid != expectation.expected_server_sid
-            || session_id != expectation.expected_server_session_id
+        if sid != expectation.expected_server_sid()
+            || session_id != expectation.expected_server_session_id()
         {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
@@ -6610,7 +6487,7 @@ fn validate_kernel_front_door_artifact(
     observed_sha256: &str,
     expectation: &KernelFrontDoorServerExpectation,
 ) -> Result<(), WindowsAdapterError> {
-    if observed_sha256 == expectation.expected_kernel_artifact_sha256 {
+    if observed_sha256 == expectation.expected_kernel_artifact_sha256() {
         Ok(())
     } else {
         Err(WindowsAdapterError::IdentityMismatch)
