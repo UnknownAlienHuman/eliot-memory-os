@@ -2381,9 +2381,11 @@ mod tests {
     }
 
     #[test]
-    fn recovery_and_genesis_caps_are_not_advertised_before_provider_support() {
-        assert!(!CAPABILITIES.contains(&CAPABILITY_RECOVERY));
-        assert!(!CAPABILITIES.contains(&CAPABILITY_INITIALIZE_GENESIS));
+    fn recovery_and_genesis_caps_are_advertised_after_validation_snapshot() {
+        assert_eq!(
+            &CAPABILITIES[8..],
+            &[CAPABILITY_RECOVERY, CAPABILITY_INITIALIZE_GENESIS]
+        );
     }
 
     #[test]

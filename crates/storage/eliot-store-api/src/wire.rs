@@ -47,6 +47,8 @@ pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_REVISION_HEADS,
     CAPABILITY_ORDERING_HEADS,
     CAPABILITY_VALIDATION_SNAPSHOT,
+    CAPABILITY_RECOVERY,
+    CAPABILITY_INITIALIZE_GENESIS,
 ];
 
 /// Effects exposed by the canonical store process.
@@ -665,4 +667,33 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), StoreWireError>
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertised_capabilities_are_complete_unique_and_canonical() {
+        const EXPECTED: &[&str] = &[
+            CAPABILITY_HEALTH,
+            CAPABILITY_READINESS,
+            CAPABILITY_NAMED_READ,
+            CAPABILITY_APPLY,
+            CAPABILITY_RECEIPT,
+            CAPABILITY_REVISION_HEADS,
+            CAPABILITY_ORDERING_HEADS,
+            CAPABILITY_VALIDATION_SNAPSHOT,
+            CAPABILITY_RECOVERY,
+            CAPABILITY_INITIALIZE_GENESIS,
+        ];
+
+        assert_eq!(CAPABILITIES, EXPECTED);
+        assert!(CAPABILITIES
+            .iter()
+            .all(|capability| capability.starts_with("store.") && !capability.trim().is_empty()));
+
+        let unique: BTreeSet<&str> = CAPABILITIES.iter().copied().collect();
+        assert_eq!(unique.len(), CAPABILITIES.len());
+    }
 }
