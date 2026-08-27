@@ -61,10 +61,9 @@ pub use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
 use eliot_runtime_contracts::{
     SUPERVISION_AUTHORITY_HOST_SERVICE, SUPERVISION_AUTHORITY_SERVICE_SID_TYPE,
 };
-use redb::{
-    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, TableHandle,
-    WriteTransaction,
-};
+#[cfg(test)]
+use redb::ReadableDatabase;
+use redb::{Database, TableDefinition};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -2387,130 +2386,6 @@ impl RedbInstallationRegistry {
         }))
     }
 
-    /// Inspects an existing registry without creating a file, database or
-    /// table. The retained protected lease covers the complete read so a
-    /// deletion or replacement race fails closed before redb is opened.
-    pub fn inspect_existing(
-        path: impl AsRef<Path>,
-    ) -> Result<Option<ApprovedGenerationRegistry>, InstallationError> {
-        let path = path.as_ref();
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_file() => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Ok(_) | Err(_) => {
-                return Err(InstallationError::Platform(
-                    "registry path is not an existing regular file".to_owned(),
-                ));
-            }
-        }
-        require_protected_program_data_path(path, REGISTRY_RELATIVE_PATH)
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        let path_lease = ProtectedPathLease::open_existing_absolute(path)
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        if path_lease.path() != path {
-            return Err(InstallationError::Platform(
-                "registry path is not the exact protected ProgramData path".to_owned(),
-            ));
-        }
-        path_lease
-            .verify_path_identity()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        let database = ReadOnlyDatabase::open(path_lease.path())
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        path_lease
-            .verify_path_identity()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        let read = database
-            .begin_read()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        reject_legacy_registry_table(&read)?;
-        let table = match read.open_table(REGISTRY_TABLE) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                classify_missing_registry_table(&read)?;
-                return Ok(Some(ApprovedGenerationRegistry::new()));
-            }
-            Err(error) => return Err(InstallationError::Platform(error.to_string())),
-        };
-        let Some(value) = table
-            .get("registry")
-            .map_err(|error| InstallationError::Platform(error.to_string()))?
-        else {
-            return Ok(Some(ApprovedGenerationRegistry::new()));
-        };
-        let registry = decode_registry_bytes(value.value())?;
-        registry.validate()?;
-        Ok(Some(registry))
-    }
-
-    /// Inspects an existing registry below one retained per-installation
-    /// Host root without creating a file, database, table, or ACL.
-    ///
-    /// The retained root is consumed for the duration of this read so the
-    /// caller cannot drop the containment proof while redb is open. None
-    /// means only that the fixed registry child is absent.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "the inspection must retain the caller-provided Host root lease during the read"
-    )]
-    pub fn inspect_existing_at(
-        host_root: ProtectedRootLease,
-    ) -> Result<Option<ApprovedGenerationRegistry>, InstallationError> {
-        let path = installation_registry_path(&host_root)?;
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Ok(_) | Err(_) => {
-                return Err(InstallationError::Platform(
-                    "installation registry path is not an existing regular file".to_owned(),
-                ));
-            }
-        }
-        let file = ProtectedRuntimePathLease::open_existing_absolute(&path)
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        if file.path() != path {
-            return Err(InstallationError::Platform(
-                "installation registry path is not the retained canonical Host child".to_owned(),
-            ));
-        }
-        file.verify_path_identity()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        let database = ReadOnlyDatabase::open(file.path())
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        file.verify_path_identity()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        read_existing_registry(&database).map(Some)
-    }
-
-    /// Loads the registry, returning an empty value on first use.
-    pub fn load(&self) -> Result<ApprovedGenerationRegistry, InstallationError> {
-        let read = self
-            .database
-            .begin_read()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        reject_legacy_registry_table(&read)?;
-        let table = match read.open_table(REGISTRY_TABLE) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                classify_missing_registry_table(&read)?;
-                return Ok(ApprovedGenerationRegistry::new());
-            }
-            Err(error) => return Err(InstallationError::Platform(error.to_string())),
-        };
-        let Some(value) = table
-            .get("registry")
-            .map_err(|error| InstallationError::Platform(error.to_string()))?
-        else {
-            return Ok(ApprovedGenerationRegistry::new());
-        };
-        let registry = decode_registry_bytes(value.value())?;
-        // A durable registry is an authority projection, not an opaque cache.
-        // Never allow malformed or contradictory bytes to become an empty or
-        // partially trusted activation decision.
-        registry.validate()?;
-        Ok(registry)
-    }
-
     /// Seeds one physically persisted active generation for a production-bound
     /// Host recovery test. The helper is feature-gated and constructs the
     /// same typed approval/fence projection that the installer transaction
@@ -2735,51 +2610,6 @@ impl RedbInstallationRegistry {
         self.mutate_atomic(expected_revision, |registry| {
             registry.stage_pending_activation_from_transaction_with_approval(&transaction, approval)
         })
-    }
-
-    fn mutate_atomic<T, F>(&self, expected_revision: u64, mutate: F) -> Result<T, InstallationError>
-    where
-        F: FnOnce(&mut ApprovedGenerationRegistry) -> Result<T, InstallationError>,
-    {
-        let write = self
-            .database
-            .begin_write()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        let mut current = read_registry_in_write(&write)?;
-        current.validate()?;
-        let actual_revision = current.revision();
-        if actual_revision != expected_revision {
-            return Err(InstallationError::CompareAndSaveConflict {
-                expected: expected_revision,
-                actual: actual_revision,
-            });
-        }
-        let before = current.clone();
-        let result = mutate(&mut current)?;
-        current.validate()?;
-        if current != before {
-            current.revision =
-                current
-                    .revision
-                    .checked_add(1)
-                    .ok_or_else(|| InstallationError::InvalidField {
-                        field: "registry.revision".to_owned(),
-                        reason: "overflow".to_owned(),
-                    })?;
-            current.validate()?;
-            let bytes = serde_json::to_vec(&current)
-                .map_err(|error| InstallationError::Platform(error.to_string()))?;
-            let mut table = write
-                .open_table(REGISTRY_TABLE)
-                .map_err(|error| InstallationError::Platform(error.to_string()))?;
-            table
-                .insert("registry", bytes.as_slice())
-                .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        }
-        write
-            .commit()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        Ok(result)
     }
 
     /// Atomically claims one exact pending activation for the live Host owner.
@@ -3269,126 +3099,11 @@ fn validate_installation_host_root(path: &Path) -> Result<(), InstallationError>
     Ok(())
 }
 
-fn read_existing_registry(
-    database: &ReadOnlyDatabase,
-) -> Result<ApprovedGenerationRegistry, InstallationError> {
-    let read = database
-        .begin_read()
-        .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    reject_legacy_registry_table(&read)?;
-    let table = match read.open_table(REGISTRY_TABLE) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => {
-            classify_missing_registry_table(&read)?;
-            return Ok(ApprovedGenerationRegistry::new());
-        }
-        Err(error) => return Err(InstallationError::Platform(error.to_string())),
-    };
-    let Some(value) = table
-        .get("registry")
-        .map_err(|error| InstallationError::Platform(error.to_string()))?
-    else {
-        return Ok(ApprovedGenerationRegistry::new());
-    };
-    let registry = decode_registry_bytes(value.value())?;
-    registry.validate()?;
-    Ok(registry)
-}
-
-fn reject_legacy_registry_table(read: &redb::ReadTransaction) -> Result<(), InstallationError> {
-    match read.open_table(LEGACY_REGISTRY_TABLE) {
-        Ok(_) => Err(InstallationError::MigrationRequired {
-            reason: "approved-generation registry uses the retired v1 table and requires explicit re-stage"
-                .to_owned(),
-        }),
-        Err(redb::TableError::TableDoesNotExist(_)) => Ok(()),
-        Err(error) => Err(InstallationError::Platform(error.to_string())),
-    }
-}
-
-fn classify_missing_registry_table(read: &redb::ReadTransaction) -> Result<(), InstallationError> {
-    reject_legacy_registry_table(read)?;
-    let has_standard_tables = read
-        .list_tables()
-        .map_err(|error| InstallationError::Platform(error.to_string()))?
-        .next()
-        .is_some();
-    let has_multimap_tables = read
-        .list_multimap_tables()
-        .map_err(|error| InstallationError::Platform(error.to_string()))?
-        .next()
-        .is_some();
-    if has_standard_tables || has_multimap_tables {
-        return Err(InstallationError::MigrationRequired {
-            reason: "existing nonempty registry store has no installation-registry v2 table"
-                .to_owned(),
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
-fn classify_registry_table(database: &impl ReadableDatabase) -> Result<bool, InstallationError> {
-    let read = database
-        .begin_read()
-        .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    reject_legacy_registry_table(&read)?;
-    match read.open_table(REGISTRY_TABLE) {
-        Ok(_) => Ok(true),
-        Err(redb::TableError::TableDoesNotExist(_)) => {
-            classify_missing_registry_table(&read)?;
-            Ok(false)
-        }
-        Err(error) => Err(InstallationError::Platform(error.to_string())),
-    }
-}
-
-fn read_registry_in_write(
-    write: &WriteTransaction,
-) -> Result<ApprovedGenerationRegistry, InstallationError> {
-    let has_registry_table = write
-        .list_tables()
-        .map_err(|error| InstallationError::Platform(error.to_string()))?
-        .any(|table| table.name() == REGISTRY_TABLE.name());
-    let has_legacy_table = write
-        .list_tables()
-        .map_err(|error| InstallationError::Platform(error.to_string()))?
-        .any(|table| table.name() == LEGACY_REGISTRY_TABLE.name());
-    if has_legacy_table {
-        return Err(InstallationError::MigrationRequired {
-            reason: "approved-generation registry uses the retired v1 table and requires explicit re-stage"
-                .to_owned(),
-        });
-    }
-    if !has_registry_table {
-        let has_standard_tables = write
-            .list_tables()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?
-            .next()
-            .is_some();
-        let has_multimap_tables = write
-            .list_multimap_tables()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?
-            .next()
-            .is_some();
-        if has_standard_tables || has_multimap_tables {
-            return Err(InstallationError::MigrationRequired {
-                reason: "existing nonempty registry store has no installation-registry v3 table"
-                    .to_owned(),
-            });
-        }
-        return Ok(ApprovedGenerationRegistry::new());
-    }
-    let table = write
-        .open_table(REGISTRY_TABLE)
-        .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let Some(value) = table
-        .get("registry")
-        .map_err(|error| InstallationError::Platform(error.to_string()))?
-    else {
-        return Ok(ApprovedGenerationRegistry::new());
-    };
-    decode_registry_bytes(value.value())
+fn classify_registry_table(
+    database: &impl redb::ReadableDatabase,
+) -> Result<bool, InstallationError> {
+    redb_state::classify_registry_table(database)
 }
 
 fn platform_error(error: &PortError) -> InstallationError {
