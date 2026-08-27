@@ -44,6 +44,13 @@ use thiserror::Error;
 #[path = "authority_recovery.rs"]
 mod authority_recovery;
 pub use authority_recovery::{AuthorityOwner, AuthorityOwnerSnapshot};
+#[path = "genesis_owner_packet.rs"]
+mod genesis_owner_packet;
+pub use genesis_owner_packet::GovernorGenesisPacket as GovernorGenesisRequest;
+pub use genesis_owner_packet::{
+    GOVERNOR_GENESIS_PACKET_SCHEMA, GOVERNOR_GENESIS_PACKET_VERSION, GovernorGenesisOwnerRecord,
+    GovernorGenesisPacket,
+};
 
 /// The only application write port exposed to the daemon.
 ///
@@ -406,59 +413,6 @@ pub struct KernelNamedReadRequest {
     pub state_fence: StateFence,
     /// The protected Kernel handoff digest.
     pub protected_snapshot_digest: String,
-}
-
-/// Single idempotent genesis seed request.  The Kernel implementation must
-/// submit this through Canonical and persist all owner records atomically; it
-/// is not a permission to create individual local defaults.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GovernorGenesisRequest {
-    /// Genesis state fence.
-    pub state_fence: StateFence,
-    /// Protected Kernel handoff digest.
-    pub protected_snapshot_digest: String,
-    /// Stable idempotency identity for the seed transaction.
-    pub operation_id: OperationId,
-    /// Complete owner set that must be created atomically.
-    pub owner_ids: Vec<RecoveryOwner>,
-}
-
-impl GovernorGenesisRequest {
-    fn new(
-        state_fence: &StateFence,
-        protected_snapshot_digest: &str,
-    ) -> Result<Self, CompositionError> {
-        let operation_id = OperationId::new(format!(
-            "eliotd:governor-genesis:{}:{}",
-            state_fence.authority_epoch.value(),
-            state_fence.resource_generation.value()
-        ))
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        Ok(Self {
-            state_fence: state_fence.clone(),
-            protected_snapshot_digest: protected_snapshot_digest.to_owned(),
-            operation_id,
-            owner_ids: RecoveryOwner::ALL.to_vec(),
-        })
-    }
-
-    fn validate(
-        &self,
-        expected_fence: &StateFence,
-        expected_digest: &str,
-    ) -> Result<(), CompositionError> {
-        if self.state_fence != *expected_fence
-            || self.protected_snapshot_digest != expected_digest
-            || !is_sha256(&self.protected_snapshot_digest)
-            || self.owner_ids.as_slice() != RecoveryOwner::ALL.as_slice()
-        {
-            return Err(CompositionError::Recovery(
-                "genesis seed request is not the complete exact owner transaction".to_owned(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Evidence returned by one Kernel-owned named recovery read.
@@ -1700,8 +1654,8 @@ fn recover_from_kernel<P: KernelRecoveryPort + ?Sized>(
                     .to_owned(),
             ));
         }
-        let genesis_request = GovernorGenesisRequest::new(state_fence, protected_snapshot_digest)?;
-        genesis_request.validate(state_fence, protected_snapshot_digest)?;
+        let genesis_request =
+            GovernorGenesisPacket::genesis(state_fence, protected_snapshot_digest)?;
         kernel
             .initialize_governor_genesis(&genesis_request)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
