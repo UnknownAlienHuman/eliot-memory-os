@@ -14,6 +14,24 @@ in [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md) and
 [`reports/audit/RUNTIME_LIVE_V3_STATUS_2026-08-24.md`](reports/audit/RUNTIME_LIVE_V3_STATUS_2026-08-24.md);
 these are routing/status documents, not acceptance evidence.
 
+## Related repositories
+
+ELIOT spans three repositories with one authority direction. This one is the core and the only
+normative pair holder; the other two are separate products that attach as optional providers through
+typed contracts.
+
+| Repository | Owns |
+|---|---|
+| **eliot-memory-os** — this repository | Principal, WorkScope, task and authority; canonical records and history; Context Compiler; Governor, Dreamer, Watchdog and Doctor; verification and completion |
+| [**eliot-search**](https://github.com/UnknownAlienHuman/eliot-search) | Local data preparation and retrieval: source identity and revisions, safe no-execute reads, materialization, exact/lexical/structural projections, publication and coherent readback |
+| [**eliot-research**](https://github.com/UnknownAlienHuman/eliot-research) | External corpora at scale: acquisition, evidence library, corpus lens, research wiki and controlled investigations |
+
+Neither provider is required for the first cognitive spine. A provider returns candidates, coverage,
+freshness, provider assurance and reason codes; it never receives canonical credentials, task
+authority, Context Compiler admission or finish authority. An absent or degraded provider narrows
+declared coverage and is reported as a gap — it never transfers its responsibility to another owner
+and never blocks unrelated local work.
+
 ## Development
 
 MSVC Rust 1.97.1, pinned exactly by `rust-toolchain.toml`.
