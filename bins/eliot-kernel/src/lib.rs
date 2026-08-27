@@ -47,6 +47,7 @@ mod daemon_session_guard;
 mod frame_dispatch;
 mod front_door_listener;
 mod front_door_session;
+mod generation_control;
 mod generation_recovery;
 mod health_view;
 mod runtime_identity;
@@ -3859,74 +3860,6 @@ impl KernelComposition {
         frame.request_id = Some(request_id);
         frame.validate()?;
         Ok(frame)
-    }
-
-    /// Returns a cloned, read-only route projection.  Callers cannot obtain a
-    /// mutable router guard or bypass the ORS transition gateway.
-    pub fn generation_route_snapshot(&self) -> Result<GenerationRouter, KernelServiceError> {
-        if let Some(reason) = self
-            .generation_poison
-            .lock()
-            .map_err(|_| {
-                KernelServiceError::Platform("generation poison lock poisoned".to_owned())
-            })?
-            .clone()
-        {
-            return Err(KernelServiceError::Platform(format!(
-                "generation gateway fenced: {reason}"
-            )));
-        }
-        self.generations
-            .lock()
-            .map(|router| router.clone())
-            .map_err(|_| KernelServiceError::Platform("generation lock poisoned".to_owned()))
-    }
-
-    /// Persists and publishes one epoch-raising generation cutover through the
-    /// sole semantic gateway.  A failed publish permanently fences this
-    /// composition instance until restart/recovery proves a durable route.
-    pub fn apply_generation_cutover(
-        &self,
-        decision: &eliot_kernel_core::CutoverDecision,
-    ) -> Result<(), KernelServiceError> {
-        let mut poison = self.generation_poison.lock().map_err(|_| {
-            KernelServiceError::Platform("generation poison lock poisoned".to_owned())
-        })?;
-        if let Some(reason) = poison.clone() {
-            return Err(KernelServiceError::Platform(format!(
-                "generation gateway fenced: {reason}"
-            )));
-        }
-        let result = (|| {
-            let mut generations = self
-                .generations
-                .lock()
-                .map_err(|_| "generation lock poisoned".to_owned())?;
-            let mut service = self
-                .service
-                .lock()
-                .map_err(|_| "service lock poisoned".to_owned())?;
-            let mut policy = self
-                .front_door_policy
-                .lock()
-                .map_err(|_| "front-door policy lock poisoned".to_owned())?;
-            self.generation_gateway.persist_and_publish(
-                decision,
-                &mut generations,
-                &mut service,
-                &mut policy,
-            )
-        })();
-        if let Err(reason) = result {
-            *poison = Some(reason.clone());
-            if let Ok(mut service) = self.service.lock() {
-                let _ = service.fence_generation(reason.clone());
-            }
-            return Err(KernelServiceError::Platform(format!(
-                "generation cutover fenced: {reason}"
-            )));
-        }
-        Ok(())
     }
 
     #[cfg(windows)]
