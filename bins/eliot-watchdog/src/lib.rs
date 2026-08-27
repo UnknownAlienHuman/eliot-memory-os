@@ -33,8 +33,7 @@ use eliot_platform_windows::WindowsAdapterError;
 use eliot_platform_windows::{
     NamedPipePeerProcessBinding, ProcessIdentity, ProtectedPathLease, ProtectedRootLease,
     ProtectedRuntimePathLease, ServiceBootstrapArguments, ServiceRegistrationRequest,
-    ServiceRegistrationRuntimeInspection, WindowsPlatform, observe_owned_directory_exact,
-    windows_paths_equal,
+    WindowsPlatform, observe_owned_directory_exact, windows_paths_equal,
 };
 use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
@@ -65,6 +64,7 @@ const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
 mod runtime_manifest_selection;
 mod scm_launch;
+mod self_admission;
 mod service_registration_projection;
 mod supervision_lease_load;
 
@@ -86,6 +86,14 @@ pub use scm_launch::{
     ApprovedHostRegistration, ValidatedWatchdogScmLaunch, WatchdogScmLaunchError,
     parse_watchdog_process_argv, parse_watchdog_scm_argv, validate_watchdog_scm_bootstrap,
     validate_watchdog_scm_launch, validate_watchdog_service_main_argv,
+};
+#[cfg(test)]
+use self_admission::SELF_ADMISSION_MIN_POLL_MS;
+pub use self_admission::{
+    WATCHDOG_SELF_ADMISSION_DEADLINE_MS, WatchdogRuntimeReadback, WatchdogRuntimeState,
+    WatchdogSelfAdmissionError, WatchdogSelfAdmissionProbe, WatchdogSelfAdmissionStatus,
+    admit_watchdog_self_start, admit_watchdog_self_start_with_deadline,
+    project_service_runtime_inspection,
 };
 
 /// Canonical public admission template shared with Host/runtime-status.
@@ -938,247 +946,6 @@ pub enum HostObservationState {
     ImageSubstituted,
     IdentityChanged,
     Unknown,
-}
-
-/// Provider-neutral lifecycle state projected from one Windows SCM runtime
-/// observation. The projection keeps the Watchdog composition independent of
-/// the lower-level `eliot-platform` crate while preserving every state needed
-/// by bounded self-admission and Host liveness.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WatchdogRuntimeState {
-    Absent,
-    Stopped,
-    Starting,
-    Running,
-    Stopping,
-    Unknown,
-}
-
-/// One atomic read-only SCM registration/runtime readback. The `Matching`
-/// variant already contains the configuration, lifecycle state, and
-/// handle-bound process identity from one platform query; callers must not
-/// reconstruct a second status/PID observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WatchdogRuntimeReadback {
-    Matching {
-        state: WatchdogRuntimeState,
-        process: Option<ProcessIdentity>,
-        checkpoint: u32,
-        wait_hint_ms: u32,
-    },
-    Absent,
-    Mismatched,
-    Unknown,
-}
-
-/// Projects the Windows runtime seam into the small state surface used by
-/// Watchdog. The Windows adapter has already checked the complete service
-/// configuration and, when required by the service state, captured process
-/// PID, creation time, and image path through a live process handle.
-#[must_use]
-pub fn project_service_runtime_inspection(
-    inspection: ServiceRegistrationRuntimeInspection,
-) -> WatchdogRuntimeReadback {
-    match inspection {
-        ServiceRegistrationRuntimeInspection::Matching { observation } => {
-            let state = if observation.is_starting() {
-                WatchdogRuntimeState::Starting
-            } else if observation.is_running() {
-                WatchdogRuntimeState::Running
-            } else if observation.is_stopping() {
-                WatchdogRuntimeState::Stopping
-            } else if observation.is_stopped() {
-                WatchdogRuntimeState::Stopped
-            } else {
-                WatchdogRuntimeState::Unknown
-            };
-            WatchdogRuntimeReadback::Matching {
-                state,
-                process: observation.process().cloned(),
-                checkpoint: observation.checkpoint(),
-                wait_hint_ms: observation.wait_hint_ms(),
-            }
-        }
-        ServiceRegistrationRuntimeInspection::Absent => WatchdogRuntimeReadback::Absent,
-        ServiceRegistrationRuntimeInspection::Mismatched => WatchdogRuntimeReadback::Mismatched,
-        ServiceRegistrationRuntimeInspection::Unknown => WatchdogRuntimeReadback::Unknown,
-    }
-}
-
-/// Fixed maximum interval in which the Watchdog may remain in
-/// `SERVICE_START_PENDING` while it reconciles its own SCM runtime identity.
-pub const WATCHDOG_SELF_ADMISSION_DEADLINE_MS: u64 = 30_000;
-const SELF_ADMISSION_MIN_POLL_MS: u32 = 25;
-const SELF_ADMISSION_MAX_POLL_MS: u32 = 250;
-const SELF_ADMISSION_DEFAULT_WAIT_HINT_MS: u32 = 250;
-
-/// Fail-closed outcomes for the bounded Watchdog self-admission gate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
-pub enum WatchdogSelfAdmissionError {
-    #[error("current Watchdog process identity is unavailable")]
-    CurrentProcessUnavailable,
-    #[error("Watchdog SCM registration is absent during self-admission")]
-    RegistrationAbsent,
-    #[error("Watchdog SCM registration or process identity mismatched during self-admission")]
-    RegistrationMismatched,
-    #[error("Watchdog SCM service stopped before self-admission")]
-    ServiceStopped,
-    #[error("Watchdog SCM service is stopping during self-admission")]
-    ServiceStopping,
-    #[error("Watchdog SCM self-admission timed out after the bounded deadline")]
-    Timeout,
-}
-
-/// Injectable read-only mechanics used by the bounded self-admission loop.
-/// Production supplies the Windows SCM runtime inspection and a monotonic
-/// clock; tests supply a deterministic sequence without sleeping 30 seconds.
-pub trait WatchdogSelfAdmissionProbe {
-    fn now_ms(&mut self) -> u64;
-    fn current_process_identity(&mut self) -> Option<ProcessIdentity>;
-    fn inspect(&mut self) -> WatchdogRuntimeReadback;
-    fn sleep_ms(&mut self, milliseconds: u32);
-}
-
-/// Injectable SCM status publisher for the self-admission loop. It is limited
-/// to progress updates while the service is already `START_PENDING`; it has
-/// no start/stop or registration mutation capability.
-pub trait WatchdogSelfAdmissionStatus {
-    fn report_start_pending(&mut self, checkpoint: u32, wait_hint_ms: u32);
-}
-
-/// Performs the production bounded self-admission with the fixed 30-second
-/// deadline required by the Runtime Live service contract.
-///
-/// # Errors
-///
-/// Returns a fail-closed error when the current process identity cannot be
-/// observed, the SCM registration is absent/mismatched/stopped, or the
-/// bounded deadline expires before an exact `Starting`/`Running` match.
-pub fn admit_watchdog_self_start<P, S>(
-    probe: &mut P,
-    status: &mut S,
-) -> Result<ProcessIdentity, WatchdogSelfAdmissionError>
-where
-    P: WatchdogSelfAdmissionProbe,
-    S: WatchdogSelfAdmissionStatus,
-{
-    admit_watchdog_self_start_with_deadline(probe, status, WATCHDOG_SELF_ADMISSION_DEADLINE_MS)
-}
-
-/// Testable form of [`admit_watchdog_self_start`] with a bounded injected
-/// deadline. The production entry point always uses the fixed 30-second
-/// value above; this form exists only to make timeout and transient-unknown
-/// behavior deterministic in unit tests.
-///
-/// # Errors
-///
-/// Returns a fail-closed error when the current process identity cannot be
-/// observed, the SCM registration is absent/mismatched/stopped, or the
-/// injected deadline expires before an exact `Starting`/`Running` match.
-pub fn admit_watchdog_self_start_with_deadline<P, S>(
-    probe: &mut P,
-    status: &mut S,
-    deadline_ms: u64,
-) -> Result<ProcessIdentity, WatchdogSelfAdmissionError>
-where
-    P: WatchdogSelfAdmissionProbe,
-    S: WatchdogSelfAdmissionStatus,
-{
-    let expected = probe
-        .current_process_identity()
-        .ok_or(WatchdogSelfAdmissionError::CurrentProcessUnavailable)?;
-    let started_at = probe.now_ms();
-    let deadline = started_at.saturating_add(deadline_ms);
-    let mut checkpoint = 1u32;
-
-    loop {
-        let now = probe.now_ms();
-        if now >= deadline {
-            return Err(WatchdogSelfAdmissionError::Timeout);
-        }
-        let observation = probe.inspect();
-        let wait_hint_ms = match observation {
-            WatchdogRuntimeReadback::Matching {
-                state: WatchdogRuntimeState::Starting | WatchdogRuntimeState::Running,
-                process: Some(ref actual),
-                ..
-            } if same_process_identity(actual, &expected) => {
-                if probe.now_ms() >= deadline {
-                    return Err(WatchdogSelfAdmissionError::Timeout);
-                }
-                return Ok(actual.clone());
-            }
-            WatchdogRuntimeReadback::Matching {
-                state: WatchdogRuntimeState::Starting | WatchdogRuntimeState::Running,
-                process: Some(_),
-                ..
-            }
-            | WatchdogRuntimeReadback::Mismatched => {
-                return Err(WatchdogSelfAdmissionError::RegistrationMismatched);
-            }
-            WatchdogRuntimeReadback::Matching {
-                state: WatchdogRuntimeState::Stopped,
-                ..
-            } => return Err(WatchdogSelfAdmissionError::ServiceStopped),
-            WatchdogRuntimeReadback::Matching {
-                state: WatchdogRuntimeState::Stopping,
-                ..
-            } => return Err(WatchdogSelfAdmissionError::ServiceStopping),
-            WatchdogRuntimeReadback::Matching {
-                state: WatchdogRuntimeState::Absent,
-                ..
-            } => return Err(WatchdogSelfAdmissionError::RegistrationAbsent),
-            WatchdogRuntimeReadback::Absent => {
-                return Err(WatchdogSelfAdmissionError::RegistrationAbsent);
-            }
-            WatchdogRuntimeReadback::Matching {
-                state: WatchdogRuntimeState::Starting | WatchdogRuntimeState::Running,
-                process: None,
-                wait_hint_ms,
-                ..
-            }
-            | WatchdogRuntimeReadback::Matching {
-                state: WatchdogRuntimeState::Unknown,
-                wait_hint_ms,
-                ..
-            } => wait_hint_ms,
-            WatchdogRuntimeReadback::Unknown => 0,
-        };
-
-        let wait_hint_ms = bounded_wait_hint_ms(wait_hint_ms);
-        let remaining_ms = deadline.saturating_sub(probe.now_ms());
-        if remaining_ms == 0 {
-            return Err(WatchdogSelfAdmissionError::Timeout);
-        }
-        let status_wait_hint_ms = wait_hint_ms.min(u32::try_from(remaining_ms).unwrap_or(u32::MAX));
-        checkpoint = checkpoint.saturating_add(1);
-        status.report_start_pending(checkpoint, status_wait_hint_ms);
-        let poll_ms = u64::from(bounded_poll_ms(wait_hint_ms)).min(remaining_ms);
-        probe.sleep_ms(u32::try_from(poll_ms).unwrap_or(u32::MAX));
-    }
-}
-
-fn bounded_wait_hint_ms(wait_hint_ms: u32) -> u32 {
-    if wait_hint_ms == 0 {
-        SELF_ADMISSION_DEFAULT_WAIT_HINT_MS
-    } else {
-        wait_hint_ms.clamp(SELF_ADMISSION_MIN_POLL_MS, 1_000)
-    }
-}
-
-fn bounded_poll_ms(wait_hint_ms: u32) -> u32 {
-    wait_hint_ms
-        .saturating_div(4)
-        .clamp(SELF_ADMISSION_MIN_POLL_MS, SELF_ADMISSION_MAX_POLL_MS)
-}
-
-fn same_process_identity(observed: &ProcessIdentity, expected: &ProcessIdentity) -> bool {
-    observed.process_id == expected.process_id
-        && observed.start_time_100ns == expected.start_time_100ns
-        && windows_paths_equal(
-            Path::new(&observed.image_path),
-            Path::new(&expected.image_path),
-        )
 }
 
 /// Retains the last trusted Host process identity and compares every later
