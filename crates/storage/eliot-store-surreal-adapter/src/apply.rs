@@ -17,19 +17,22 @@ use crate::plan::{
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 use crate::{client, schema};
 use eliot_store_api::{
-    CONTRACT_VERSION, CanonicalValidationSnapshot, NamedReadOperation, NamedReadRequest,
+    CONTRACT_VERSION, CanonicalValidationSnapshot, CommitId, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StateFence,
-    StoreError, StoreHealth, StoreHealthStatus, WriteReceipt, validate_store_receipt_envelope,
+    RecoveryRecord, RecoveryRecordKey, Resubmission, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, ScopeId, ScopeRevisionView, StateFence, StoreError, StoreGenesisRequest,
+    StoreHealth, StoreHealthStatus, StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, genesis_manifest, is_genesis_fence,
+    issue_genesis_receipt_envelope, validate_genesis_receipt_envelope,
+    validate_store_receipt_envelope,
 };
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
 const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * FROM ONLY schema_meta:current; SELECT VALUE body FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
 
 /// The durable canonical fence singleton.
-#[derive(Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FenceRecord {
     state_fence: StateFence,
@@ -995,6 +998,523 @@ async fn read_fence(
     take_optional::<FenceRecord>(&mut response, 0)
 }
 
+fn build_recovery_sql(request: &StoreRecoveryRequest) -> String {
+    let mut sql = String::from(schema::TX_BEGIN);
+    sql.push_str(schema::READ_SCHEMA_META);
+    sql.push_str("SELECT VALUE body FROM ONLY canonical_fence:current;");
+    for index in 0..request.records.len() {
+        sql.push_str(&schema::indexed(schema::READ_RECOVERY_OWNER_BY_KEY, index));
+    }
+    if request.include_jobs {
+        sql.push_str(schema::READ_ALL_RECOVERY_JOBS);
+    }
+    if request.include_receipts {
+        sql.push_str(schema::READ_ALL_RECEIPTS);
+    }
+    sql.push_str(schema::READ_ALL_REVISION_HEADS);
+    sql.push_str(schema::READ_ALL_ORDERING_HEADS);
+    sql.push_str(schema::TX_COMMIT);
+    sql
+}
+
+fn build_recovery_bindings(request: &StoreRecoveryRequest) -> Map<String, Value> {
+    let mut bindings = Map::new();
+    for (index, key) in request.records.iter().enumerate() {
+        let suffix = index.to_string();
+        bindings.insert(format!("recovery_namespace{suffix}"), json!(key.namespace));
+        bindings.insert(format!("recovery_key{suffix}"), json!(key.key));
+    }
+    bindings
+}
+
+struct RecoverySnapshotInput {
+    schema: Option<SchemaMetaRecord>,
+    fence: Option<FenceRecord>,
+    owner_records: Vec<RecoveryRecord>,
+    job_records: Vec<RecoveryRecord>,
+    receipts: Vec<WriteReceipt>,
+    revision_heads: Vec<RevisionHead>,
+    ordering_heads: Vec<OrderingHead>,
+}
+
+fn build_recovery_snapshot(
+    mut input: RecoverySnapshotInput,
+    expected_generation: &SchemaGeneration,
+    expected_fence: &StateFence,
+    requested_keys: &[RecoveryRecordKey],
+) -> Result<StoreRecoverySnapshot, AdapterError> {
+    let schema = input.schema.take().ok_or(AdapterError::MigrationRequired)?;
+    validate_schema_meta_record(&schema)?;
+    if schema.generation != expected_generation.as_str() || schema.migration_state != "APPLIED" {
+        return Err(AdapterError::MigrationRequired);
+    }
+    let fence = input.fence.take().ok_or(AdapterError::MigrationRequired)?;
+    validate_fence_record(&fence)?;
+    if fence.state_fence != *expected_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let mut actual_keys = input
+        .owner_records
+        .iter()
+        .map(RecoveryRecord::record_key)
+        .collect::<Vec<_>>();
+    actual_keys.sort();
+    let mut expected_keys = requested_keys.to_vec();
+    expected_keys.sort();
+    if actual_keys != expected_keys {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "recovery.records",
+            reason: "requested record is missing",
+        }));
+    }
+    for record in input.owner_records.iter().chain(input.job_records.iter()) {
+        record.validate()?;
+        if record.state_fence != *expected_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+    }
+    for receipt in &input.receipts {
+        receipt.validate()?;
+        if receipt.state_fence != *expected_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+    }
+    validate_revision_heads(&input.revision_heads)?;
+    plan::validate_ordering_heads(&input.ordering_heads)?;
+    input.owner_records.sort_by_key(RecoveryRecord::record_key);
+    input.job_records.sort_by_key(RecoveryRecord::record_key);
+    input
+        .receipts
+        .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    input
+        .revision_heads
+        .sort_by_key(|head| head.key.to_string());
+    input
+        .ordering_heads
+        .sort_by_key(|head| head.scope.to_string());
+
+    let snapshot = StoreRecoverySnapshot {
+        contract_version: CONTRACT_VERSION,
+        state_fence: fence.state_fence.clone(),
+        validation_revision: fence.next_commit_sequence,
+        canonical_scope: ScopeRevisionView {
+            scope_id: ScopeId::new("store")?,
+            revision_heads: input.revision_heads,
+            ordering_heads: input.ordering_heads,
+            state_fence: fence.state_fence,
+        },
+        owner_records: input.owner_records,
+        job_records: input.job_records,
+        receipts: input.receipts,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+/// Reads one bounded recovery snapshot from one coherent provider transaction.
+pub(crate) async fn recovery(
+    adapter: &SurrealStoreAdapter,
+    request: StoreRecoveryRequest,
+) -> Result<StoreRecoverySnapshot, AdapterError> {
+    request.validate()?;
+    let db = client(adapter).await?;
+    let sql = build_recovery_sql(&request);
+    let mut response = client::query(
+        db,
+        &adapter.config,
+        "recovery.snapshot",
+        &sql,
+        build_recovery_bindings(&request),
+    )
+    .await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+
+    let schema = take_schema_meta(&mut response, 1)?;
+    let fence = response.take::<Option<FenceRecord>>(2)?;
+
+    let mut index = 3;
+    let mut owner_records = Vec::with_capacity(request.records.len());
+    for key in &request.records {
+        let records = response.take::<Vec<RecoveryRecord>>(index)?;
+        index += 1;
+        if records.len() != 1 {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "recovery.records",
+                reason: "requested record must have exactly one match",
+            }));
+        }
+        let record = records.into_iter().next().ok_or({
+            AdapterError::Store(StoreError::InvalidField {
+                field: "recovery.records",
+                reason: "requested record is missing",
+            })
+        })?;
+        if record.record_key() != *key {
+            return Err(AdapterError::Store(StoreError::IdentityConflict));
+        }
+        owner_records.push(record);
+    }
+    let job_records = if request.include_jobs {
+        let jobs = response.take::<Vec<RecoveryRecord>>(index)?;
+        index += 1;
+        jobs
+    } else {
+        Vec::new()
+    };
+    let receipts = if request.include_receipts {
+        let receipts = response.take::<Vec<WriteReceipt>>(index)?;
+        index += 1;
+        receipts
+    } else {
+        Vec::new()
+    };
+    let revision_heads = response.take::<Vec<RevisionHead>>(index)?;
+    index += 1;
+    let ordering_heads = response.take::<Vec<OrderingHead>>(index)?;
+    build_recovery_snapshot(
+        RecoverySnapshotInput {
+            schema,
+            fence,
+            owner_records,
+            job_records,
+            receipts,
+            revision_heads,
+            ordering_heads,
+        },
+        &adapter.config.expected_schema_generation,
+        &request.state_fence,
+        &request.records,
+    )
+}
+
+#[derive(Clone, Debug)]
+struct GenesisState {
+    schema: Option<SchemaMetaRecord>,
+    fence: Option<FenceRecord>,
+    owners: Vec<RecoveryRecord>,
+    jobs: Vec<RecoveryRecord>,
+    receipts: Vec<WriteReceipt>,
+    revision_heads: Vec<Value>,
+    ordering_heads: Vec<Value>,
+    events: Vec<Value>,
+    projections: Vec<Value>,
+    outbox: Vec<Value>,
+    relations: Vec<Value>,
+}
+
+async fn read_genesis_state(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<GenesisState, AdapterError> {
+    let mut response = client::query(
+        db,
+        config,
+        "genesis.preflight",
+        schema::READ_GENESIS_SCHEMA_AND_STATE,
+        Map::new(),
+    )
+    .await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    Ok(GenesisState {
+        schema: take_schema_meta(&mut response, 1)?,
+        fence: response.take::<Option<FenceRecord>>(2)?,
+        owners: response.take::<Vec<RecoveryRecord>>(3)?,
+        jobs: response.take::<Vec<RecoveryRecord>>(4)?,
+        receipts: response.take::<Vec<WriteReceipt>>(5)?,
+        revision_heads: response.take::<Vec<Value>>(6)?,
+        ordering_heads: response.take::<Vec<Value>>(7)?,
+        events: response.take::<Vec<Value>>(8)?,
+        projections: response.take::<Vec<Value>>(9)?,
+        outbox: response.take::<Vec<Value>>(10)?,
+        relations: response.take::<Vec<Value>>(11)?,
+    })
+}
+
+fn validate_genesis_schema_fence(
+    state: &GenesisState,
+    config: &SurrealAdapterConfig,
+    request: &StoreGenesisRequest,
+) -> Result<(), AdapterError> {
+    let schema = state
+        .schema
+        .as_ref()
+        .ok_or(AdapterError::MigrationRequired)?;
+    validate_schema_meta_record(schema)?;
+    if schema.generation != config.expected_schema_generation.as_str()
+        || schema.migration_state != "APPLIED"
+    {
+        return Err(AdapterError::MigrationRequired);
+    }
+    let fence = state
+        .fence
+        .as_ref()
+        .ok_or(AdapterError::MigrationRequired)?;
+    validate_fence_record(fence)?;
+    if fence.state_fence != request.state_fence || !is_genesis_fence(&fence.state_fence) {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    for record in state.owners.iter().chain(state.jobs.iter()) {
+        record.validate()?;
+        if record.state_fence != request.state_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+    }
+    for receipt in &state.receipts {
+        receipt.validate()?;
+        if receipt.state_fence != request.state_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fresh_genesis_state(state: &GenesisState) -> Result<(), AdapterError> {
+    let fence = state
+        .fence
+        .as_ref()
+        .ok_or(AdapterError::MigrationRequired)?;
+    if fence.next_commit_sequence != 1 || fence.next_outbox_sequence != 1 {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    if !genesis_state_is_absent(state) {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    Ok(())
+}
+
+fn validate_replayed_genesis_state(
+    state: &GenesisState,
+    request: &StoreGenesisRequest,
+) -> Result<(), AdapterError> {
+    let fence = state
+        .fence
+        .as_ref()
+        .ok_or(AdapterError::MigrationRequired)?;
+    if fence.next_commit_sequence != 2 || fence.next_outbox_sequence != 1 {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    if state.receipts.len() != 1
+        || !state.jobs.is_empty()
+        || !state.revision_heads.is_empty()
+        || !state.ordering_heads.is_empty()
+        || !state.events.is_empty()
+        || !state.projections.is_empty()
+        || !state.outbox.is_empty()
+        || !state.relations.is_empty()
+        || sorted_recovery_records(&state.owners) != sorted_recovery_records(&request.owner_records)
+    {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    Ok(())
+}
+
+fn genesis_state_is_absent(state: &GenesisState) -> bool {
+    state.owners.is_empty()
+        && state.jobs.is_empty()
+        && state.receipts.is_empty()
+        && state.revision_heads.is_empty()
+        && state.ordering_heads.is_empty()
+        && state.events.is_empty()
+        && state.projections.is_empty()
+        && state.outbox.is_empty()
+        && state.relations.is_empty()
+}
+
+fn sorted_recovery_records(records: &[RecoveryRecord]) -> Vec<RecoveryRecord> {
+    let mut sorted = records.to_vec();
+    sorted.sort_by_key(RecoveryRecord::record_key);
+    sorted
+}
+
+fn build_genesis_sql(owner_count: usize) -> String {
+    let mut sql = format!(
+        "{} {} {}",
+        schema::TX_GENESIS_BEGIN,
+        schema::TX_GENESIS_SCHEMA_GUARD,
+        schema::TX_GENESIS_EMPTY_GUARD
+    );
+    for index in 0..owner_count {
+        sql.push_str(&schema::indexed(schema::TX_GENESIS_CREATE_OWNER, index));
+    }
+    sql.push_str(schema::TX_GENESIS_FENCE_CAS);
+    sql.push_str(schema::TX_GENESIS_CREATE_RECEIPT);
+    sql.push_str(schema::TX_GENESIS_COMMIT);
+    sql
+}
+
+fn recovery_owner_id(key: &RecoveryRecordKey) -> Result<String, AdapterError> {
+    let bytes = eliot_store_api::canonical_json_bytes(key)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    Ok(eliot_store_api::sha256_hex(&bytes))
+}
+
+fn build_genesis_bindings(
+    config: &SurrealAdapterConfig,
+    request: &StoreGenesisRequest,
+    receipt: &WriteReceipt,
+) -> Result<Map<String, Value>, AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert(
+        "expected_generation".to_owned(),
+        json!(config.expected_schema_generation.as_str()),
+    );
+    bindings.insert(
+        "expected_state_fence".to_owned(),
+        json!(request.state_fence),
+    );
+    bindings.insert(
+        "fence_table".to_owned(),
+        json!(schema::table::CANONICAL_FENCE),
+    );
+    bindings.insert("fence_key".to_owned(), json!(schema::FENCE_KEY));
+    bindings.insert(
+        "fence".to_owned(),
+        json!({
+            "state_fence": request.state_fence,
+            "next_commit_sequence": 2_u64,
+            "next_outbox_sequence": 1_u64,
+        }),
+    );
+    bindings.insert(
+        "receipt_table".to_owned(),
+        json!(schema::table::WRITE_RECEIPT),
+    );
+    bindings.insert(
+        "receipt_operation_id".to_owned(),
+        json!(request.operation_id.to_string()),
+    );
+    bindings.insert(
+        "receipt".to_owned(),
+        json!({
+            "operation_id": receipt.operation_id.to_string(),
+            "idempotency_key": receipt.idempotency_key,
+            "body": receipt,
+        }),
+    );
+    for (index, owner) in request.owner_records.iter().enumerate() {
+        let suffix = index.to_string();
+        bindings.insert(
+            format!("owner_table{suffix}"),
+            json!(schema::table::RECOVERY_OWNER),
+        );
+        bindings.insert(
+            format!("owner_id{suffix}"),
+            json!(recovery_owner_id(&owner.record_key())?),
+        );
+        bindings.insert(format!("owner{suffix}"), json!(owner));
+    }
+    Ok(bindings)
+}
+
+fn genesis_receipt(
+    context: &eliot_store_api::RequestMeta,
+    request: &StoreGenesisRequest,
+    commit_sequence: u64,
+) -> Result<WriteReceipt, AdapterError> {
+    let manifest = genesis_manifest()?;
+    let mut receipt = WriteReceipt {
+        operation_id: request.operation_id.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+        canonical_request_hash: request.canonical_request_hash.clone(),
+        transition_class: TransitionClass::RecoverySchema,
+        status: WriteReceiptStatus::Committed,
+        commit_id: Some(CommitId::new("commit-genesis")?),
+        state_fence: request.state_fence.clone(),
+        ordering_sequences: Vec::new(),
+        revision_before_after: Vec::new(),
+        applied_command_ids: vec!["genesis-seed".to_owned()],
+        emitted_event_ids: Vec::new(),
+        projection_refs: Vec::new(),
+        outbox_refs: Vec::new(),
+        operation_manifest_digest: manifest.digest,
+        error_code: None,
+        resubmission: Resubmission::None,
+        committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
+        envelope: None,
+    };
+    receipt.envelope = Some(issue_genesis_receipt_envelope(
+        context,
+        request,
+        &receipt,
+        commit_sequence,
+    )?);
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+async fn reconcile_genesis_receipt(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    context: &eliot_store_api::RequestMeta,
+    request: &StoreGenesisRequest,
+) -> Result<WriteReceipt, AdapterError> {
+    let Ok(Some(receipt)) = read_receipt_by_operation(db, config, &request.operation_id).await
+    else {
+        return Err(AdapterError::Store(StoreError::MissingReceiptEnvelope));
+    };
+    if receipt.idempotency_key != request.idempotency_key
+        || receipt.canonical_request_hash != request.canonical_request_hash
+    {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    validate_genesis_receipt_envelope(context, request, &receipt)
+        .map_err(|_| AdapterError::Store(StoreError::MissingReceiptEnvelope))?;
+    Ok(receipt)
+}
+
+/// Reads or atomically seeds the provider's all-absent genesis state.
+pub(crate) async fn initialize_genesis(
+    adapter: &SurrealStoreAdapter,
+    context: &eliot_store_api::RequestMeta,
+    request: StoreGenesisRequest,
+) -> Result<WriteReceipt, AdapterError> {
+    request.validate_for_context(context)?;
+    let db = client(adapter).await?;
+    let _guard = adapter.write_lock.lock().await;
+    let state = read_genesis_state(db, &adapter.config).await?;
+    validate_genesis_schema_fence(&state, &adapter.config, &request)?;
+
+    if let Some(receipt) = state
+        .receipts
+        .iter()
+        .find(|receipt| receipt.operation_id == request.operation_id)
+    {
+        if receipt.idempotency_key != request.idempotency_key
+            || receipt.canonical_request_hash != request.canonical_request_hash
+        {
+            return Err(AdapterError::Store(StoreError::IdentityConflict));
+        }
+        validate_replayed_genesis_state(&state, &request)?;
+        validate_genesis_receipt_envelope(context, &request, receipt)?;
+        return Ok(receipt.clone());
+    }
+    if state
+        .receipts
+        .iter()
+        .any(|receipt| receipt.idempotency_key == request.idempotency_key)
+    {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    validate_fresh_genesis_state(&state)?;
+
+    let receipt = genesis_receipt(context, &request, 1)?;
+    let sql = build_genesis_sql(request.owner_records.len());
+    let bindings = build_genesis_bindings(&adapter.config, &request, &receipt)?;
+    let Ok(mut response) =
+        client::query(db, &adapter.config, "genesis.initialize", &sql, bindings).await
+    else {
+        return reconcile_genesis_receipt(db, &adapter.config, context, &request).await;
+    };
+    if !response.take_errors().is_empty() {
+        return reconcile_genesis_receipt(db, &adapter.config, context, &request).await;
+    }
+    reconcile_genesis_receipt(db, &adapter.config, context, &request).await
+}
+
 /// Reads the canonical fence and all revision heads at one provider boundary.
 pub(crate) async fn read_validation_snapshot(
     adapter: &SurrealStoreAdapter,
@@ -1735,6 +2255,255 @@ mod migration_tests {
             schema::SCHEMA_MIGRATION_V1_TO_V2_DDL,
             SchemaGeneration::new(schema::GENERATION_V2).expect("valid"),
         )
+    }
+
+    fn genesis_fixture() -> (eliot_store_api::RequestMeta, StoreGenesisRequest) {
+        let fence = StateFence::new(
+            eliot_contracts::AuthorityEpoch::genesis(),
+            eliot_contracts::ResourceGeneration::genesis(),
+        );
+        let payload = b"{\"seed\":true}".to_vec();
+        let owner = RecoveryRecord {
+            namespace: "owner".to_owned(),
+            key: "seed".to_owned(),
+            state_fence: fence.clone(),
+            revision: 1,
+            schema: "opaque.v1".to_owned(),
+            value_digest: eliot_store_api::sha256_hex(&payload),
+            payload,
+        };
+        let request = StoreGenesisRequest {
+            contract_version: CONTRACT_VERSION,
+            operation_id: OperationId::new("genesis-op").expect("operation id"),
+            idempotency_key: "genesis-key".to_owned(),
+            canonical_request_hash: String::new(),
+            state_fence: fence.clone(),
+            owner_records: vec![owner],
+        }
+        .with_computed_digest()
+        .expect("genesis digest");
+        let context = eliot_store_api::RequestMeta {
+            request_id: eliot_contracts::RequestId::new("genesis-request").expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("product").expect("product id"),
+            source_id: eliot_contracts::SourceId::new("source").expect("source id"),
+            state_fence: fence,
+            clock: eliot_contracts::ClockReading::default(),
+        };
+        (context, request)
+    }
+
+    fn genesis_state(request: &StoreGenesisRequest, receipt: Option<WriteReceipt>) -> GenesisState {
+        GenesisState {
+            schema: Some(schema_meta_record(&v2_baseline_migration(), "1000")),
+            fence: Some(FenceRecord {
+                state_fence: request.state_fence.clone(),
+                next_commit_sequence: receipt.as_ref().map_or(1, |_| 2),
+                next_outbox_sequence: 1,
+            }),
+            owners: if receipt.is_some() {
+                request.owner_records.clone()
+            } else {
+                Vec::new()
+            },
+            jobs: Vec::new(),
+            receipts: receipt.into_iter().collect(),
+            revision_heads: Vec::new(),
+            ordering_heads: Vec::new(),
+            events: Vec::new(),
+            projections: Vec::new(),
+            outbox: Vec::new(),
+            relations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn genesis_sql_guards_all_absent_state_and_advances_only_commit_sequence() {
+        let (context, request) = genesis_fixture();
+        let receipt = genesis_receipt(&context, &request, 1).expect("genesis receipt");
+        let sql = build_genesis_sql(request.owner_records.len());
+        assert!(schema::TX_GENESIS_SCHEMA_GUARD.contains("type::is_object($genesis_schema)"));
+        assert!(schema::TX_GENESIS_SCHEMA_GUARD.contains("type::is_object($genesis_fence)"));
+        assert!(!schema::TX_GENESIS_SCHEMA_GUARD.contains("array::len($genesis_schema"));
+        assert!(!schema::TX_GENESIS_SCHEMA_GUARD.contains("array::len($genesis_fence"));
+        assert!(sql.starts_with(schema::TX_GENESIS_BEGIN));
+        assert!(sql.contains(schema::TX_GENESIS_SCHEMA_GUARD));
+        assert!(sql.contains(schema::TX_GENESIS_EMPTY_GUARD));
+        assert!(sql.contains(&schema::indexed(schema::TX_GENESIS_CREATE_OWNER, 0)));
+        assert!(sql.contains(schema::TX_GENESIS_FENCE_CAS));
+        assert!(sql.contains(schema::TX_GENESIS_CREATE_RECEIPT));
+        assert!(sql.ends_with(schema::TX_GENESIS_COMMIT));
+        let bindings = build_genesis_bindings(
+            &SurrealAdapterConfig {
+                endpoint: "ws://127.0.0.1:18000/rpc".to_owned(),
+                namespace: "ns".to_owned(),
+                database: "db".to_owned(),
+                username: "user".to_owned(),
+                password: secrecy::SecretString::new("password".to_owned().into()),
+                provider_bind_address: "127.0.0.1:18000".to_owned(),
+                installation_id: "install".to_owned(),
+                installation_profile: "portable_dev".to_owned(),
+                runtime_state_roots_digest: "a".repeat(64),
+                provider_executable_path: "C:\\surreal.exe".to_owned(),
+                provider_artifact_digest: "b".repeat(64),
+                provider_arguments: Vec::new(),
+                store_data_root: "C:\\data".to_owned(),
+                store_work_root: "C:\\work".to_owned(),
+                store_temp_root: "C:\\temp".to_owned(),
+                connect_timeout_ms: 1000,
+                query_timeout_ms: 1000,
+                expected_provider_major: 3,
+                expected_schema_generation: SchemaGeneration::v2(),
+            },
+            &request,
+            &receipt,
+        )
+        .expect("genesis bindings");
+        assert_eq!(bindings.get("expected_generation"), Some(&json!("2.0.0")));
+        assert_eq!(
+            bindings
+                .get("fence")
+                .and_then(Value::as_object)
+                .and_then(|f| f.get("next_commit_sequence")),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            bindings
+                .get("fence")
+                .and_then(Value::as_object)
+                .and_then(|f| f.get("next_outbox_sequence")),
+            Some(&json!(1))
+        );
+    }
+
+    #[test]
+    fn genesis_replay_requires_exact_committed_state_and_is_immutable() {
+        let (context, request) = genesis_fixture();
+        let receipt = genesis_receipt(&context, &request, 1).expect("genesis receipt");
+        validate_genesis_receipt_envelope(&context, &request, &receipt).expect("valid envelope");
+        let replay_state = genesis_state(&request, Some(receipt.clone()));
+        validate_replayed_genesis_state(&replay_state, &request).expect("exact replay state");
+        assert_eq!(replay_state.receipts[0], receipt);
+
+        let mut stale_sequence = replay_state.clone();
+        stale_sequence
+            .fence
+            .as_mut()
+            .expect("fence")
+            .next_commit_sequence = 1;
+        assert_eq!(
+            validate_replayed_genesis_state(&stale_sequence, &request),
+            Err(AdapterError::Store(StoreError::IdentityConflict))
+        );
+
+        let mut substituted = replay_state.clone();
+        substituted.owners[0].key = "substituted".to_owned();
+        assert_eq!(
+            validate_replayed_genesis_state(&substituted, &request),
+            Err(AdapterError::Store(StoreError::IdentityConflict))
+        );
+    }
+
+    #[test]
+    fn genesis_fresh_state_rejects_partial_presence_and_sql_marks_unknown_outcome() {
+        let (_, request) = genesis_fixture();
+        let mut partial = genesis_state(&request, None);
+        partial.owners = request.owner_records.clone();
+        assert_eq!(
+            validate_fresh_genesis_state(&partial),
+            Err(AdapterError::Store(StoreError::IdentityConflict))
+        );
+        let stale = genesis_state(
+            &request,
+            Some(genesis_receipt(&genesis_fixture().0, &request, 1).expect("receipt")),
+        );
+        assert!(build_genesis_sql(1).contains("genesis_state_conflict"));
+        assert!(build_genesis_sql(1).contains("genesis_fence_conflict"));
+        assert_eq!(
+            AdapterError::Store(StoreError::MissingReceiptEnvelope).into_store_error(),
+            StoreError::MissingReceiptEnvelope
+        );
+        assert_eq!(stale.receipts.len(), 1);
+    }
+
+    #[test]
+    fn recovery_sql_is_one_transaction_with_requested_owner_bindings_and_sorted_output_helper() {
+        let (_, request) = genesis_fixture();
+        let recovery_request = StoreRecoveryRequest {
+            contract_version: CONTRACT_VERSION,
+            state_fence: request.state_fence,
+            records: vec![request.owner_records[0].record_key()],
+            include_receipts: true,
+            include_jobs: true,
+        };
+        let sql = build_recovery_sql(&recovery_request);
+        assert!(sql.starts_with(schema::TX_BEGIN));
+        assert!(sql.contains("recovery_namespace0"));
+        assert!(sql.contains(schema::READ_ALL_RECOVERY_JOBS));
+        assert!(sql.contains(schema::READ_ALL_RECEIPTS));
+        assert!(sql.ends_with(schema::TX_COMMIT));
+        let bindings = build_recovery_bindings(&recovery_request);
+        assert_eq!(bindings.get("recovery_namespace0"), Some(&json!("owner")));
+        assert_eq!(bindings.get("recovery_key0"), Some(&json!("seed")));
+    }
+
+    #[test]
+    fn recovery_result_requires_exact_requested_presence_and_sorts_deterministically() {
+        let (_, request) = genesis_fixture();
+        let mut second = request.owner_records[0].clone();
+        second.key = "a-seed".to_owned();
+        second.payload = b"{\"seed\":\"a\"}".to_vec();
+        second.value_digest = eliot_store_api::sha256_hex(&second.payload);
+        let first_key = request.owner_records[0].record_key();
+        let second_key = second.record_key();
+        let snapshot = build_recovery_snapshot(
+            RecoverySnapshotInput {
+                schema: Some(schema_meta_record(&v2_baseline_migration(), "1000")),
+                fence: Some(FenceRecord {
+                    state_fence: request.state_fence.clone(),
+                    next_commit_sequence: 2,
+                    next_outbox_sequence: 1,
+                }),
+                owner_records: vec![request.owner_records[0].clone(), second.clone()],
+                job_records: Vec::new(),
+                receipts: Vec::new(),
+                revision_heads: Vec::new(),
+                ordering_heads: Vec::new(),
+            },
+            &SchemaGeneration::v2(),
+            &request.state_fence,
+            &[first_key.clone(), second_key.clone()],
+        )
+        .expect("recovery snapshot");
+        assert_eq!(snapshot.owner_records[0].record_key(), second_key);
+        assert_eq!(snapshot.owner_records[1].record_key(), first_key);
+
+        let missing = build_recovery_snapshot(
+            RecoverySnapshotInput {
+                schema: Some(schema_meta_record(&v2_baseline_migration(), "1000")),
+                fence: Some(FenceRecord {
+                    state_fence: request.state_fence.clone(),
+                    next_commit_sequence: 2,
+                    next_outbox_sequence: 1,
+                }),
+                owner_records: vec![request.owner_records[0].clone()],
+                job_records: Vec::new(),
+                receipts: Vec::new(),
+                revision_heads: Vec::new(),
+                ordering_heads: Vec::new(),
+            },
+            &SchemaGeneration::v2(),
+            &request.state_fence,
+            &[first_key, second_key],
+        );
+        assert!(matches!(
+            missing,
+            Err(AdapterError::Store(StoreError::InvalidField {
+                field: "recovery.records",
+                ..
+            }))
+        ));
     }
 
     #[test]

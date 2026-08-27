@@ -36,8 +36,9 @@ use eliot_store_api::{
     CONTRACT_VERSION, CanonicalStoreClient, CanonicalValidationSnapshot, EffectClass,
     NamedOperationManifest, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreHealth,
-    TransitionClass, WriteReceipt,
+    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass,
+    WriteReceipt,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
@@ -236,6 +237,25 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         )
         .await
         .map_err(AdapterError::into_store_error)
+    }
+
+    async fn recovery(
+        &self,
+        request: StoreRecoveryRequest,
+    ) -> Result<StoreRecoverySnapshot, StoreError> {
+        apply::recovery(self, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn initialize_genesis(
+        &self,
+        context: &RequestMeta,
+        request: StoreGenesisRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        apply::initialize_genesis(self, context, request)
+            .await
+            .map_err(AdapterError::into_store_error)
     }
 
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
