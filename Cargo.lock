@@ -755,6 +755,9 @@ dependencies = [
  "eliot-receipts",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

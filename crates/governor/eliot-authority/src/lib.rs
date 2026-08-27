@@ -20,13 +20,15 @@ pub use break_glass::{
     BreakGlassAuthorization, BreakGlassAuthorizationId, BreakGlassPermit, BreakGlassState,
 };
 pub use effects::{
-    ActionContract, AuthorizedEffect, EffectAuthorizer, EffectOutcome, EffectReceipt,
-    ProposedEffect,
+    ActionContract, AuthorizedEffect, AuthorizedEffectRecoveryRecord,
+    EFFECT_AUTHORIZER_RECOVERY_SCHEMA, EFFECT_AUTHORIZER_RECOVERY_VERSION, EffectAuthorizer,
+    EffectAuthorizerRecoverySnapshot, EffectOutcome, EffectReceipt, ProposedEffect,
 };
 pub use grants::{
     AuthoritySet, CapabilityGrant, CapabilityIntroduction, EffectiveCapabilityPath,
-    EffectiveCapabilitySnapshot, GrantGraph, GrantId, GrantStatus, IntroductionId,
-    IntroductionStatus, LogicalTime, PrincipalRef, ReceiptObligation, SnapshotId,
+    EffectiveCapabilitySnapshot, GRANT_GRAPH_RECOVERY_SCHEMA, GRANT_GRAPH_RECOVERY_VERSION,
+    GrantGraph, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord, GrantStatus,
+    IntroductionId, IntroductionStatus, LogicalTime, PrincipalRef, ReceiptObligation, SnapshotId,
 };
 pub use leases::{ActionLease, CapabilityToken, LeaseId, TokenId};
 
