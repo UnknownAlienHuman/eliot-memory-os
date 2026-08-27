@@ -33,10 +33,16 @@ use eliot_protocol::{ProtocolVersion, ServerHello};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
+mod activation_projection;
 mod daemon_config;
 mod daemon_kernel_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+
+pub use activation_projection::AgentActivationResolver;
+
+#[cfg(test)]
+use activation_projection::map_activation_snapshot;
 
 pub use daemon_config::DaemonConfig;
 pub use daemon_kernel_client::DaemonKernelClient;
@@ -204,44 +210,6 @@ pub struct DaemonComposition {
     started: bool,
 }
 
-/// Read-only semantic-resolution boundary owned by eliotd.
-///
-/// The boundary accepts only a Kernel-issued correlation ticket. It does not
-/// accept caller-selected semantic IDs and does not issue transport sessions,
-/// fences, capabilities, or effects.
-pub trait AgentActivationResolver {
-    /// Resolves one exact ticket against the current Governor owner set.
-    fn resolve_agent_activation(
-        &self,
-        ticket: &AgentActivationResolutionTicket,
-        now: u64,
-    ) -> Result<AgentActivationResolutionDecision, DaemonError>;
-}
-
-fn map_activation_snapshot(
-    ticket: &AgentActivationResolutionTicket,
-    snapshot: eliot_governor::GovernorActivationSnapshot,
-) -> Result<AgentActivationResolutionDecision, DaemonError> {
-    AgentActivationResolutionDecision {
-        wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID.to_owned(),
-        wire_version: AgentActivationResolutionDecision::CONTRACT_VERSION,
-        ticket_id: ticket.ticket_id.clone(),
-        ticket_sha256: ticket.ticket_sha256.clone(),
-        state_fence: snapshot.state_fence,
-        principal_id: snapshot.principal_id,
-        session_id: snapshot.session_id,
-        task_id: snapshot.task_id.to_string(),
-        work_unit_id: snapshot.work_unit_id,
-        work_scope_id: snapshot.work_scope_id,
-        task_revision: snapshot.task_revision.to_string(),
-        plan_id: snapshot.plan_id,
-        plan_revision: snapshot.plan_revision,
-        decision_sha256: String::new(),
-    }
-    .with_computed_digest()
-    .map_err(|error| DaemonError::Lifecycle(error.to_string()))
-}
-
 impl DaemonComposition {
     /// Composes the daemon only from a Host-approved authenticated Kernel port.
     ///
@@ -363,7 +331,7 @@ impl DaemonComposition {
                 "semantic activation ticket fence does not match the Governor snapshot".to_owned(),
             ));
         }
-        map_activation_snapshot(ticket, snapshot)
+        activation_projection::map_activation_snapshot(ticket, snapshot)
     }
 
     /// Stops the one daemon owner and releases protected handles together.
