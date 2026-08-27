@@ -92,6 +92,10 @@ impl KernelComposition {
                         | "daemon_fatal"
                         | "agent_activation_claim"
                         | "agent_activation_submit"
+                        | "store_recovery"
+                        | "store_initialize_genesis"
+                        | "apply_prepared"
+                        | "receipt"
                 )
             {
                 if !probe_ready_state_admitted(
