@@ -88,6 +88,7 @@ mod installer_root;
 mod owned_directory_retirement;
 mod package_staging;
 mod process_job;
+mod protected_path;
 mod secret_store;
 mod supervision_authority_key;
 mod tcp_listener_owner;
@@ -133,6 +134,12 @@ pub use process_job::{
     SuspendedExistingJobChild, SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence,
     SuspendedValidationError, TerminatedExistingJobChild, TerminatedJobChild,
     ValidatedSuspendedExistingJobChild, ValidatedSuspendedJobChild, cancel_capture_thread_io,
+};
+pub use protected_path::{
+    ProtectedPathError, ProtectedPathLease, ProtectedPathStage, ProtectedRootLease,
+    canonical_windows_path, prepare_protected_directory, protected_program_data_path,
+    protected_program_data_root, read_protected_file, require_protected_program_data_path,
+    validate_protected_file,
 };
 pub use secret_store::{
     CredentialSecret, HostCredentialMutationCapability, InstallerSecretCreateDisposition,
@@ -267,80 +274,6 @@ impl std::fmt::Display for HostOwnerLeaseReleaseError {
 
 impl std::error::Error for HostOwnerLeaseReleaseError {}
 
-/// Bounded native operation used while retaining a protected path contour.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProtectedPathStage {
-    /// `SHGetKnownFolderPath` failed while resolving an OS-owned root.
-    KnownFolderPath,
-    /// `std::fs::canonicalize` failed while resolving an existing contour.
-    CanonicalizePath,
-    /// `std::fs::symlink_metadata` failed while rejecting reparse substitution.
-    SymlinkMetadata,
-    /// A directory or file handle could not be opened with create-file semantics.
-    CreateFileW,
-    /// Metadata could not be read from a retained file handle.
-    FileMetadata,
-    /// `GetFileInformationByHandle` failed for a retained handle.
-    GetFileInformationByHandle,
-    /// `GetFinalPathNameByHandleW` failed for a retained handle.
-    GetFinalPathNameByHandleW,
-}
-
-/// Protected `ProgramData` path policy error used by Host, installation and
-/// Watchdog durable state. The policy is intentionally shared so a caller
-/// cannot substitute a per-user or arbitrary working-directory root.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProtectedPathError {
-    /// `ProgramData` is missing, relative or cannot be canonicalized safely.
-    InvalidRoot,
-    /// The requested path is absolute, traverses a parent, or escapes the
-    /// canonical `ProgramData` contour.
-    InvalidPath,
-    /// A path component or target is a symlink/junction/reparse point.
-    ReparsePoint,
-    /// The protected service/admin ACL could not be applied or verified.
-    AclMismatch,
-    /// The filesystem operation failed before a safe classification existed.
-    Io,
-    /// A retained object no longer has its originally observed identity.
-    IdentityMismatch,
-    /// A bounded Windows operation failed with a safe raw status.
-    Win32 {
-        /// Exact semantic operation that failed.
-        stage: ProtectedPathStage,
-        /// Raw Windows status bit pattern from the provider boundary.
-        code: u32,
-    },
-    /// The protected file exceeded the caller's explicit bounded read limit.
-    SizeExceeded,
-    /// Durable protected storage is intentionally unavailable off Windows.
-    UnsupportedPlatform,
-}
-
-impl std::fmt::Display for ProtectedPathError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Self::Win32 { stage, code } = self {
-            return write!(
-                formatter,
-                "protected path {stage:?} failed with status {code:#010x}"
-            );
-        }
-        formatter.write_str(match self {
-            Self::InvalidRoot => "ProgramData protected root is invalid",
-            Self::InvalidPath => "path is outside the protected ProgramData contour",
-            Self::ReparsePoint => "protected path contains a reparse point",
-            Self::AclMismatch => "protected path ACL does not match service/admin policy",
-            Self::Io => "protected path I/O failed",
-            Self::IdentityMismatch => "protected path identity changed",
-            Self::Win32 { .. } => unreachable!(),
-            Self::SizeExceeded => "protected file exceeds its bounded read limit",
-            Self::UnsupportedPlatform => "protected ProgramData storage requires Windows",
-        })
-    }
-}
-
-impl std::error::Error for ProtectedPathError {}
-
 #[cfg(windows)]
 fn protected_path_io_error(
     stage: ProtectedPathStage,
@@ -361,21 +294,6 @@ fn protected_path_io_error(
     _error: &std::io::Error,
 ) -> ProtectedPathError {
     ProtectedPathError::Io
-}
-
-/// Returns the canonical `ProgramData` directory after rejecting reparse
-/// substitution in the root and its existing ancestors.
-///
-/// # Errors
-///
-/// Returns an error when the root is absent, relative, cannot be canonicalized,
-/// or contains a reparse point.
-pub fn protected_program_data_root() -> Result<PathBuf, ProtectedPathError> {
-    let raw = known_folder_path(KnownFolder::ProgramData)?;
-    reject_reparse_chain(&raw, true)?;
-    let canonical = canonical_windows_path(&raw)?;
-    validate_directory_no_reparse(&canonical)?;
-    Ok(canonical)
 }
 
 /// Resolves the current user's canonical `LocalAppData` root without applying an
@@ -644,7 +562,6 @@ fn observe_fixed_local_app_data_config(
 
 #[derive(Clone, Copy)]
 enum KnownFolder {
-    ProgramData,
     LocalAppData,
 }
 
@@ -662,12 +579,9 @@ fn known_folder_path(folder: KnownFolder) -> Result<PathBuf, ProtectedPathError>
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::S_OK;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{
-        FOLDERID_LocalAppData, FOLDERID_ProgramData, SHGetKnownFolderPath,
-    };
+    use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
 
     let folder_id = match folder {
-        KnownFolder::ProgramData => &FOLDERID_ProgramData,
         KnownFolder::LocalAppData => &FOLDERID_LocalAppData,
     };
     let mut path = std::ptr::null_mut();
@@ -726,425 +640,6 @@ fn known_folder_path(folder: KnownFolder) -> Result<PathBuf, ProtectedPathError>
 #[cfg(not(windows))]
 fn known_folder_path(_folder: KnownFolder) -> Result<PathBuf, ProtectedPathError> {
     Err(ProtectedPathError::UnsupportedPlatform)
-}
-
-/// Canonicalizes one existing path and converts Windows' internal verbatim
-/// result into the DOS/UNC form admitted at provider-neutral contract seams.
-///
-/// This conversion applies only after the OS resolves an existing path. It
-/// does not make a caller-supplied device or verbatim path contract-valid.
-///
-/// # Errors
-///
-/// Returns an error when canonicalization fails or the OS result is not an
-/// absolute DOS/UNC path.
-pub fn canonical_windows_path(path: &Path) -> Result<PathBuf, ProtectedPathError> {
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|error| protected_path_io_error(ProtectedPathStage::CanonicalizePath, &error))?;
-    #[cfg(windows)]
-    {
-        normalize_final_windows_path_text(&canonical.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(canonical)
-    }
-}
-
-/// Resolves a fixed relative path below the canonical `ProgramData` root.
-/// Missing leaf components are allowed so callers can create them under the
-/// protected parent; existing components are checked before the result is
-/// returned.
-///
-/// # Errors
-///
-/// Returns an error when the relative path is invalid or escapes the protected
-/// root, or when the root cannot be verified safely.
-pub fn protected_program_data_path(
-    relative: impl AsRef<Path>,
-) -> Result<PathBuf, ProtectedPathError> {
-    let relative = relative.as_ref();
-    if relative.as_os_str().is_empty()
-        || relative.is_absolute()
-        || relative.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
-    {
-        return Err(ProtectedPathError::InvalidPath);
-    }
-    let root = protected_program_data_root()?;
-    let path = root.join(relative);
-    ensure_protected_containment(&root, &path)?;
-    Ok(path)
-}
-
-/// Requires a caller-provided path to equal one fixed ProgramData-relative
-/// identity and to remain below the canonical root.  This is the boundary
-/// used by public Host/Watchdog open APIs to reject arbitrary roots.
-///
-/// # Errors
-///
-/// Returns an error when the supplied path differs from the fixed protected
-/// identity or cannot be proven to remain within the protected root.
-pub fn require_protected_program_data_path(
-    path: &Path,
-    relative: impl AsRef<Path>,
-) -> Result<PathBuf, ProtectedPathError> {
-    let expected = protected_program_data_path(relative)?;
-    if path != expected {
-        return Err(ProtectedPathError::InvalidPath);
-    }
-    ensure_protected_containment(&expected_root()?, path)?;
-    Ok(expected)
-}
-
-/// A retained no-follow lease for one protected `ProgramData` file.
-///
-/// The lease owns a no-delete-sharing handle for every existing directory
-/// component and for the final file.  Consequently, once this value has been
-/// acquired, a concurrent rename, junction substitution, or deletion cannot
-/// replace the object used by a path-based consumer such as redb.  Callers
-/// must retain this value for the complete lifetime of that consumer.
-pub struct ProtectedPathLease {
-    path: PathBuf,
-    identity: FileIdentity,
-    #[cfg(windows)]
-    _directories: Vec<std::fs::File>,
-    #[cfg(windows)]
-    file: std::fs::File,
-}
-
-/// Retained read-only lease for one existing directory below the OS-resolved
-/// `ProgramData` contour.
-///
-/// Unlike [`ProtectedPathLease`], acquisition never creates a sentinel and
-/// never writes an ACL. Root creation and ACL application remain explicit
-/// installation transaction effects.
-pub struct ProtectedRootLease {
-    path: PathBuf,
-    identity: FileIdentity,
-    #[cfg(windows)]
-    directories: Vec<std::fs::File>,
-}
-
-impl std::fmt::Debug for ProtectedRootLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ProtectedRootLease")
-            .field("path", &self.path)
-            .field("identity", &self.identity)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ProtectedRootLease {
-    /// Opens an existing absolute `ProgramData` descendant and retains a
-    /// no-follow, no-delete-sharing handle for its complete directory contour.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the path escapes `ProgramData`, contains a reparse
-    /// point, is not an existing directory, or cannot be retained read-only.
-    pub fn open_existing(path: &Path) -> Result<Self, ProtectedPathError> {
-        let root = expected_root()?;
-        ensure_protected_containment(&root, path)?;
-        let canonical = canonical_windows_path(path)?;
-        ensure_protected_containment(&root, &canonical)?;
-        let relative = canonical
-            .strip_prefix(&root)
-            .map_err(|_| ProtectedPathError::InvalidPath)?;
-        #[cfg(windows)]
-        {
-            let directories = pin_protected_directory_contour(&root, relative)?;
-            let retained = directories.last().ok_or(ProtectedPathError::InvalidPath)?;
-            let identity = file_identity_from_handle(retained).map_err(|error| {
-                protected_path_io_error(ProtectedPathStage::GetFileInformationByHandle, &error)
-            })?;
-            let observed = final_windows_path_from_handle(retained)?;
-            if !windows_paths_equal(&observed, &canonical) {
-                return Err(ProtectedPathError::IdentityMismatch);
-            }
-            Ok(Self {
-                path: observed,
-                identity,
-                directories,
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = relative;
-            Err(ProtectedPathError::UnsupportedPlatform)
-        }
-    }
-
-    /// Returns the OS-resolved DOS/UNC directory path.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the retained directory handle is unavailable,
-    /// cannot be resolved, or the adapter is unsupported on this platform.
-    pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
-        #[cfg(windows)]
-        {
-            let observed = final_windows_path_from_handle(
-                self.directories
-                    .last()
-                    .ok_or(ProtectedPathError::InvalidPath)?,
-            )?;
-            if !windows_paths_equal(&observed, &self.path) {
-                return Err(ProtectedPathError::IdentityMismatch);
-            }
-            Ok(observed)
-        }
-        #[cfg(not(windows))]
-        {
-            Err(ProtectedPathError::UnsupportedPlatform)
-        }
-    }
-
-    /// Returns the retained directory-object identity.
-    #[must_use]
-    pub const fn identity(&self) -> FileIdentity {
-        self.identity
-    }
-
-    /// Re-reads identity from the retained directory handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the retained handle is unavailable, cannot be
-    /// inspected, changed identity, or is unsupported on this platform.
-    pub fn verify_stable_identity(&self) -> Result<(), ProtectedPathError> {
-        #[cfg(windows)]
-        {
-            let retained = self
-                .directories
-                .last()
-                .ok_or(ProtectedPathError::InvalidPath)?;
-            let identity = file_identity_from_handle(retained).map_err(|error| {
-                protected_path_io_error(ProtectedPathStage::GetFileInformationByHandle, &error)
-            })?;
-            if identity != self.identity {
-                return Err(ProtectedPathError::IdentityMismatch);
-            }
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        {
-            Err(ProtectedPathError::UnsupportedPlatform)
-        }
-    }
-}
-
-impl std::fmt::Debug for ProtectedPathLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ProtectedPathLease")
-            .field("path", &self.path)
-            .field("identity", &self.identity)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ProtectedPathLease {
-    /// Opens or creates one protected `ProgramData` file and retains its
-    /// no-follow component handles.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an invalid path, reparse point, ACL mismatch,
-    /// filesystem failure, or unsupported platform.
-    pub fn open_or_create(relative: impl AsRef<Path>) -> Result<Self, ProtectedPathError> {
-        Self::open_relative(relative.as_ref(), true)
-    }
-
-    /// Opens one existing protected `ProgramData` file and retains its
-    /// no-follow component handles.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the protected file or its contour cannot be
-    /// opened and verified without following a reparse point.
-    pub fn open_existing(relative: impl AsRef<Path>) -> Result<Self, ProtectedPathError> {
-        Self::open_relative(relative.as_ref(), false)
-    }
-
-    /// Opens one existing absolute path only after canonicalizing it into the
-    /// exact protected `ProgramData` contour.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the path is outside the protected contour or the
-    /// retained file cannot be opened and verified safely.
-    pub fn open_existing_absolute(path: &Path) -> Result<Self, ProtectedPathError> {
-        let root = expected_root()?;
-        ensure_protected_containment(&root, path)?;
-        let canonical = canonical_windows_path(path)?;
-        ensure_protected_containment(&root, &canonical)?;
-        let relative = canonical
-            .strip_prefix(&root)
-            .map_err(|_| ProtectedPathError::InvalidPath)?;
-        Self::open_relative(relative, false)
-    }
-
-    /// Returns the exact path used to open the retained file.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Returns the identity observed from the retained no-follow file handle.
-    #[must_use]
-    pub const fn identity(&self) -> FileIdentity {
-        self.identity
-    }
-
-    /// Returns the DOS/UNC path resolved from the retained handle. Windows
-    /// verbatim prefixes are removed before the path crosses the contract seam.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the retained handle cannot be resolved or this
-    /// operation is unsupported on the current platform.
-    pub fn canonical_path(&self) -> Result<PathBuf, ProtectedPathError> {
-        #[cfg(windows)]
-        {
-            final_windows_path_from_handle(&self.file)
-        }
-        #[cfg(not(windows))]
-        {
-            Err(ProtectedPathError::UnsupportedPlatform)
-        }
-    }
-
-    /// Re-reads the identity from the retained handle and rejects any
-    /// impossible handle/object change.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the retained handle cannot be inspected, its
-    /// identity changed, or retained-handle verification is unavailable.
-    pub fn verify_stable_identity(&self) -> Result<(), ProtectedPathError> {
-        #[cfg(windows)]
-        {
-            let identity =
-                file_identity_from_handle(&self.file).map_err(|_| ProtectedPathError::Io)?;
-            if identity != self.identity {
-                return Err(ProtectedPathError::Io);
-            }
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        {
-            Err(ProtectedPathError::UnsupportedPlatform)
-        }
-    }
-
-    /// Opens the path again with no-follow/no-delete-sharing and compares its
-    /// identity to the retained lease.  This is the post-open proof required
-    /// for redb, which accepts a path rather than an already-open handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the path cannot be reopened without following a
-    /// reparse point or its identity differs from the retained handle.
-    pub fn verify_path_identity(&self) -> Result<(), ProtectedPathError> {
-        #[cfg(windows)]
-        {
-            let file = open_protected_file(&self.path, false)?;
-            let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
-            if identity != self.identity {
-                return Err(ProtectedPathError::Io);
-            }
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        {
-            Err(ProtectedPathError::UnsupportedPlatform)
-        }
-    }
-
-    /// Reads bounded bytes from the retained file handle.  No path is opened
-    /// during this operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when handle I/O fails, the file exceeds `limit`, or the
-    /// retained-handle implementation is unavailable.
-    pub fn read_bounded(&self, limit: u64) -> Result<Vec<u8>, ProtectedPathError> {
-        #[cfg(windows)]
-        {
-            let mut file = self.file.try_clone().map_err(|_| ProtectedPathError::Io)?;
-            file.seek(SeekFrom::Start(0))
-                .map_err(|_| ProtectedPathError::Io)?;
-            let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
-            if metadata.len() > limit {
-                return Err(ProtectedPathError::SizeExceeded);
-            }
-            let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
-            file.read_to_end(&mut bytes)
-                .map_err(|_| ProtectedPathError::Io)?;
-            if bytes.len() as u64 > limit {
-                return Err(ProtectedPathError::SizeExceeded);
-            }
-            Ok(bytes)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = limit;
-            Err(ProtectedPathError::UnsupportedPlatform)
-        }
-    }
-
-    fn open_relative(relative: &Path, create: bool) -> Result<Self, ProtectedPathError> {
-        let components = protected_components(relative)?;
-        let root = expected_root()?;
-        let path = root.join(relative);
-        ensure_protected_containment(&root, &path)?;
-        #[cfg(windows)]
-        {
-            Self::open_at_root(&root, relative, &components, create)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (create, path, components);
-            Err(ProtectedPathError::UnsupportedPlatform)
-        }
-    }
-
-    #[cfg(windows)]
-    fn open_at_root(
-        root: &Path,
-        relative: &Path,
-        components: &[std::ffi::OsString],
-        create: bool,
-    ) -> Result<Self, ProtectedPathError> {
-        let parent = components[..components.len() - 1].iter().fold(
-            PathBuf::new(),
-            |mut path, component| {
-                path.push(component);
-                path
-            },
-        );
-        let file_name = &components[components.len() - 1];
-        let directories = open_directory_contour(root, &parent, create)?;
-        let file_path = root.join(relative);
-        debug_assert_eq!(file_path, root.join(&parent).join(file_name));
-        let file = open_protected_file(&file_path, create)?;
-        protect_opened_handle(&file, false)?;
-        let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
-        Ok(Self {
-            path: file_path,
-            identity,
-            _directories: directories,
-            file,
-        })
-    }
 }
 
 /// Read-only retained lease for a file in the installer-provisioned System
@@ -1253,7 +748,7 @@ impl ProtectedRuntimePathLease {
             let directories = if parent.as_os_str().is_empty() {
                 vec![pin_directory(&root).map_err(|_| ProtectedPathError::Io)?]
             } else {
-                pin_protected_directory_contour(&root, &parent)?
+                protected_path::pin_protected_directory_contour(&root, &parent)?
             };
             let file = if exclusive {
                 open_runtime_read_file_exclusive(&canonical)?
@@ -2189,55 +1684,6 @@ fn read_same_handle_twice(
     Ok(first)
 }
 
-/// Creates and protects one `ProgramData` descendant directory.  Components
-/// are created one at a time while each parent no-follow handle is retained.
-///
-/// # Errors
-///
-/// Returns an error when the path escapes the protected root, contains a
-/// reparse point, cannot receive the protected ACL, or cannot be created.
-pub fn prepare_protected_directory(path: &Path) -> Result<(), ProtectedPathError> {
-    let root = expected_root()?;
-    ensure_protected_containment(&root, path)?;
-    let relative = path
-        .strip_prefix(&root)
-        .map_err(|_| ProtectedPathError::InvalidPath)?;
-    protected_components(relative)?;
-    #[cfg(windows)]
-    {
-        let _directories = open_directory_contour(&root, relative, true)?;
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        Err(ProtectedPathError::UnsupportedPlatform)
-    }
-}
-
-/// Validates and retains an existing protected file immediately before a
-/// path-based consumer opens it.  Production consumers should retain the
-/// returned lease instead of calling this convenience validator.
-///
-/// # Errors
-///
-/// Returns an error when the file is outside the protected root or its
-/// no-follow identity and ACL cannot be verified.
-pub fn validate_protected_file(path: &Path) -> Result<(), ProtectedPathError> {
-    let _lease = ProtectedPathLease::open_existing_absolute(path)?;
-    Ok(())
-}
-
-/// Reads one protected file through a retained no-follow handle.  The path is
-/// never reopened after the lease is acquired.
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be opened safely, handle I/O fails,
-/// or the file exceeds `limit`.
-pub fn read_protected_file(path: &Path, limit: u64) -> Result<Vec<u8>, ProtectedPathError> {
-    ProtectedPathLease::open_existing_absolute(path)?.read_bounded(limit)
-}
-
 fn protected_components(relative: &Path) -> Result<Vec<std::ffi::OsString>, ProtectedPathError> {
     if relative.as_os_str().is_empty() || relative.is_absolute() {
         return Err(ProtectedPathError::InvalidPath);
@@ -2326,254 +1772,6 @@ fn validate_directory_no_reparse(path: &Path) -> Result<(), ProtectedPathError> 
     }
     if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
         return Err(ProtectedPathError::ReparsePoint);
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn open_directory_contour(
-    root: &Path,
-    relative: &Path,
-    create: bool,
-) -> Result<Vec<std::fs::File>, ProtectedPathError> {
-    let components = if relative.as_os_str().is_empty() {
-        Vec::new()
-    } else {
-        protected_components(relative)?
-    };
-    let mut current = root.to_path_buf();
-    let mut directories = vec![pin_directory(root).map_err(|_| ProtectedPathError::Io)?];
-    for component in components {
-        current.push(component);
-        let directory = match open_protected_directory(&current) {
-            Ok(directory) => directory,
-            Err(ProtectedPathError::Io) if create => match std::fs::create_dir(&current) {
-                Ok(()) => open_protected_directory(&current)?,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    open_protected_directory(&current)?
-                }
-                Err(_) => return Err(ProtectedPathError::Io),
-            },
-            Err(error) => return Err(error),
-        };
-        directories.push(directory);
-    }
-    Ok(directories)
-}
-
-#[cfg(windows)]
-fn pin_protected_directory_contour(
-    root: &Path,
-    relative: &Path,
-) -> Result<Vec<std::fs::File>, ProtectedPathError> {
-    let components = protected_components(relative)?;
-    let mut current = root.to_path_buf();
-    let mut directories = vec![pin_protected_directory(root)?];
-    for component in components {
-        current.push(component);
-        directories.push(pin_protected_directory(&current)?);
-    }
-    Ok(directories)
-}
-
-#[cfg(windows)]
-fn pin_protected_directory(path: &Path) -> Result<std::fs::File, ProtectedPathError> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|error| protected_path_io_error(ProtectedPathStage::CreateFileW, &error))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| protected_path_io_error(ProtectedPathStage::FileMetadata, &error))?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(ProtectedPathError::ReparsePoint);
-    }
-    Ok(file)
-}
-
-#[cfg(windows)]
-fn open_protected_directory(path: &Path) -> Result<std::fs::File, ProtectedPathError> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    #[cfg(any(test, feature = "test-support"))]
-    use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
-    };
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    let access = FILE_GENERIC_READ | WRITE_DAC;
-    #[cfg(any(test, feature = "test-support"))]
-    let access = if test_protected_root().is_some() {
-        access | WRITE_OWNER
-    } else {
-        access
-    };
-    options.access_mode(access);
-    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-    options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
-    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(ProtectedPathError::ReparsePoint);
-    }
-    protect_opened_handle(&file, true)?;
-    Ok(file)
-}
-
-#[cfg(windows)]
-fn open_protected_file(path: &Path, create: bool) -> Result<std::fs::File, ProtectedPathError> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
-    };
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true);
-    options.access_mode(legacy_protected_file_access_mode());
-    // Deliberately omit FILE_SHARE_DELETE.  The retained handle is the
-    // substitution barrier for redb's path-based open.
-    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = if create {
-        options.create_new(true).open(path).or_else(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                let mut existing = std::fs::OpenOptions::new();
-                existing.read(true).write(true);
-                existing.access_mode(legacy_protected_file_access_mode());
-                existing.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-                existing.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-                existing.open(path)
-            } else {
-                Err(error)
-            }
-        })
-    } else {
-        options.open(path)
-    }
-    .map_err(|_| ProtectedPathError::Io)?;
-    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(ProtectedPathError::ReparsePoint);
-    }
-    if !metadata.is_file() {
-        return Err(ProtectedPathError::InvalidPath);
-    }
-    Ok(file)
-}
-
-#[cfg(windows)]
-fn legacy_protected_file_access_mode() -> u32 {
-    #[cfg(any(test, feature = "test-support"))]
-    use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, WRITE_DAC,
-    };
-    let access = FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC;
-    #[cfg(any(test, feature = "test-support"))]
-    let access = if test_protected_root().is_some() {
-        access | WRITE_OWNER
-    } else {
-        access
-    };
-    access
-}
-
-#[cfg(windows)]
-fn protect_opened_handle(file: &std::fs::File, directory: bool) -> Result<(), ProtectedPathError> {
-    use std::os::windows::fs::MetadataExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
-    };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-    #[cfg(any(test, feature = "test-support"))]
-    if test_protected_root().is_some() {
-        return protect_user_owned_opened_handle(file, directory, &current_process_sid()?);
-    }
-    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(ProtectedPathError::ReparsePoint);
-    }
-    if directory != metadata.is_dir() {
-        return Err(ProtectedPathError::InvalidPath);
-    }
-    let descriptor = OwnedSecurityDescriptor::for_protected_storage()
-        .map_err(|_| ProtectedPathError::AclMismatch)?;
-    let dacl = descriptor
-        .dacl()
-        .map_err(|_| ProtectedPathError::AclMismatch)?;
-    let security = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
-    let status = unsafe {
-        windows_sys::Win32::Security::Authorization::SetSecurityInfo(
-            file.as_raw_handle().cast(),
-            SE_FILE_OBJECT,
-            security,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            dacl,
-            std::ptr::null(),
-        )
-    };
-    if status != 0 {
-        return Err(ProtectedPathError::AclMismatch);
-    }
-    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    let status = unsafe {
-        GetSecurityInfo(
-            file.as_raw_handle().cast(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut descriptor,
-        )
-    };
-    if status != ERROR_SUCCESS || descriptor.is_null() {
-        if !descriptor.is_null() {
-            unsafe { LocalFree(descriptor.cast()) };
-        }
-        return Err(ProtectedPathError::AclMismatch);
-    }
-    let mut present = 0;
-    let mut actual_dacl = std::ptr::null_mut();
-    let mut defaulted = 0;
-    let dacl_matches = unsafe {
-        windows_sys::Win32::Security::GetSecurityDescriptorDacl(
-            descriptor,
-            &raw mut present,
-            &raw mut actual_dacl,
-            &raw mut defaulted,
-        ) != 0
-            && present != 0
-            && !actual_dacl.is_null()
-            && (*actual_dacl).AclSize == (*dacl).AclSize
-            && std::slice::from_raw_parts(
-                actual_dacl.cast::<u8>(),
-                usize::from((*actual_dacl).AclSize),
-            ) == std::slice::from_raw_parts(dacl.cast::<u8>(), usize::from((*dacl).AclSize))
-    };
-    let mut control: u16 = 0;
-    let mut revision: u32 = 0;
-    let protected = unsafe {
-        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
-            && control & SE_DACL_PROTECTED != 0
-    };
-    unsafe { LocalFree(descriptor.cast()) };
-    if !dacl_matches || !protected {
-        return Err(ProtectedPathError::AclMismatch);
     }
     Ok(())
 }
@@ -9515,7 +8713,7 @@ fn create_temporary(parent: &Path, bytes: &[u8]) -> Result<PathBuf, PortError> {
             Ok(()) => {
                 #[cfg(windows)]
                 {
-                    let _protected = open_protected_file(&path, false)
+                    let _protected = protected_path::open_protected_file(&path, false)
                         .map_err(|_| PortError::Provider(provider_failed()))?;
                 }
                 return Ok(path);
@@ -10734,7 +9932,7 @@ fn acquire_owned_runtime_receipt_publication_lock(
             .read(true)
             .write(true)
             .create(true)
-            .access_mode(legacy_protected_file_access_mode())
+            .access_mode(protected_path::legacy_protected_file_access_mode())
             // A live handle is the inter-process ownership token. No read,
             // write, or delete sharing is permitted until publication has
             // been classified through exact post-commit readback.
@@ -10750,7 +9948,7 @@ fn acquire_owned_runtime_receipt_publication_lock(
                 {
                     return Err(PortError::InvalidPath);
                 }
-                protect_opened_handle(&file, false)
+                protected_path::protect_opened_handle(&file, false)
                     .map_err(|_| PortError::Provider(provider_failed()))?;
                 return Ok(file);
             }
@@ -13966,7 +13164,7 @@ mod tests {
             directories.push(directory);
         }
         let file_path = root.join(relative);
-        let file = open_protected_file(&file_path, create)?;
+        let file = crate::protected_path::open_protected_file(&file_path, create)?;
         let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
         Ok(ProtectedPathLease {
             path: file_path,
@@ -17330,7 +16528,10 @@ mod tests {
         use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, GetAce};
         use windows_sys::Win32::Storage::FileSystem::{WRITE_DAC, WRITE_OWNER};
 
-        assert_ne!(legacy_protected_file_access_mode() & WRITE_DAC, 0);
+        assert_ne!(
+            crate::protected_path::legacy_protected_file_access_mode() & WRITE_DAC,
+            0
+        );
         for access in [
             runtime_file_access_mode(false),
             runtime_file_access_mode(true),
