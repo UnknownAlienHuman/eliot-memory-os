@@ -1836,7 +1836,9 @@ mod tests {
 
     #[test]
     fn descriptor_provider_argv_materializes_exactly_and_rejects_bind_substitution() {
-        let config = config();
+        let mut config = config();
+        config.schema_generation = SchemaGeneration::v2().as_str().to_owned();
+        config.approved_config_hash = launch_config_digest(&config).expect("v2 config digest");
         let adapter =
             materialize_adapter_config(&config, SecretString::new("materialization-secret".into()))
                 .expect("descriptor materializes adapter config");
