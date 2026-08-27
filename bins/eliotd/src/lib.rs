@@ -14,14 +14,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, OperationId, ProductId,
-    RequestId, RequestMetadata, ResourceGeneration, SourceId, StateFence, sha256_hex,
+    ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, ProductId, RequestId,
+    RequestMetadata, ResourceGeneration, SourceId, StateFence, sha256_hex,
 };
 use eliot_governor::{
     CompositionError, CompositionReadiness, GovernorComposition, GovernorLaunchConfig,
     KernelDurableJobPort, KernelGenerationPort, KernelGenerationSnapshot,
-    KernelGenerationSnapshotProvider, KernelPortError, KernelPortFuture,
-    KernelServiceObservationPort, KernelServiceRecovery, KernelTransitionPort, QueueLimits,
+    KernelGenerationSnapshotProvider, KernelPortError, KernelServiceObservationPort,
+    KernelServiceRecovery, QueueLimits,
 };
 use eliot_maintenance::MaintenanceJob;
 use eliot_platform_windows::{
@@ -35,13 +35,11 @@ use eliot_protocol::{
 };
 use eliot_receipts::RequestBinding;
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
-use eliot_store_api::{
-    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, StoreHealth, WriteReceipt,
-};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod kernel_recovery_client;
+mod kernel_transition_client;
 
 #[cfg(windows)]
 use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
@@ -866,66 +864,6 @@ fn kind_value(
 impl KernelGenerationSnapshotProvider for DaemonKernelClient {
     fn snapshot(&self) -> &KernelGenerationSnapshot {
         &self.snapshot
-    }
-}
-
-impl KernelTransitionPort for DaemonKernelClient {
-    fn apply_prepared<'a>(
-        &'a self,
-        request: &RequestMetadata,
-        transition: PreparedTransition,
-        expected_revision_heads: Vec<RevisionHeadExpectation>,
-        expected_ordering_heads: Vec<OrderingHeadExpectation>,
-    ) -> KernelPortFuture<'a, WriteReceipt> {
-        let request = request.clone();
-        Box::pin(async move {
-            if request.source_id.as_str() != SERVICE_NAME {
-                return Err(KernelPortError::Contract(
-                    "daemon transition source is not the fixed eliotd identity".to_owned(),
-                ));
-            }
-            let value = self
-                .transact_async(
-                    "apply_prepared",
-                    serde_json::json!({
-                        "transition": transition,
-                        "expected_revision_heads": expected_revision_heads,
-                        "expected_ordering_heads": expected_ordering_heads,
-                    }),
-                )
-                .await
-                .map_err(kernel_port_error)?;
-            let value = kind_value(&value, "write_receipt")?;
-            serde_json::from_value(value)
-                .map_err(|error| KernelPortError::Contract(error.to_string()))
-        })
-    }
-
-    fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
-        Box::pin(async move {
-            let value = self
-                .transact_async(
-                    "receipt",
-                    serde_json::json!({ "operation_id": operation_id }),
-                )
-                .await
-                .map_err(kernel_port_error)?;
-            let value = kind_value(&value, "receipt")?;
-            serde_json::from_value(value)
-                .map_err(|error| KernelPortError::Contract(error.to_string()))
-        })
-    }
-
-    fn health(&self) -> KernelPortFuture<'_, StoreHealth> {
-        Box::pin(async move {
-            let value = self
-                .transact_async("health", serde_json::json!({}))
-                .await
-                .map_err(kernel_port_error)?;
-            let value = kind_value(&value, "health")?;
-            serde_json::from_value(value)
-                .map_err(|error| KernelPortError::Contract(error.to_string()))
-        })
     }
 }
 
