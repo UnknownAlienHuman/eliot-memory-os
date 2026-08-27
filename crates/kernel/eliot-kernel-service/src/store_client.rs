@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, ProductId, RequestId, SourceId,
+    StateFence,
 };
 use eliot_ipc::{DeliveryOutcome, TransportError, TransportLimits};
 use eliot_protocol::{
@@ -24,9 +25,10 @@ use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGeneration
 use eliot_store_api::{
     CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, NamedReadOperation,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, ReadConsistency, RequestMeta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreHealth,
-    StoreRequest, StoreResponse, StoreWireError, WriteReceipt,
+    OrderingScopeId, PreparedTransition, ReadConsistency, RecoveryRecordKey, RequestMeta,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest,
+    StoreResponse, StoreWireError, WriteReceipt, validate_genesis_receipt_envelope,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -198,6 +200,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             StoreRequest::Apply { transition, .. } => {
                 Some(transition.identity.operation_id.clone())
             }
+            StoreRequest::InitializeGenesis { request, .. } => Some(request.operation_id.clone()),
             StoreRequest::Receipt { operation_id } => Some(operation_id.clone()),
             _ => None,
         };
@@ -307,6 +310,78 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             clock: ClockReading::default(),
         })
     }
+
+    fn validate_requirement_fence(&self, observed: &StateFence) -> Result<(), StoreError> {
+        if observed != &self.requirement.state_fence
+            || observed.resource_generation != self.requirement.store_generation
+            || observed.authority_epoch != self.requirement.authority_epoch()
+        {
+            return Err(StoreError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_recovery_snapshot(
+        &self,
+        request: &StoreRecoveryRequest,
+        snapshot: &StoreRecoverySnapshot,
+    ) -> Result<(), StoreError> {
+        snapshot.validate()?;
+        self.validate_requirement_fence(&request.state_fence)?;
+        self.validate_requirement_fence(&snapshot.state_fence)?;
+
+        let requested_keys = request.records.iter().cloned().collect::<BTreeSet<_>>();
+        let returned_keys = snapshot
+            .owner_records
+            .iter()
+            .map(eliot_store_api::RecoveryRecord::record_key)
+            .collect::<BTreeSet<RecoveryRecordKey>>();
+        if snapshot.owner_records.len() != request.records.len() || returned_keys != requested_keys
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        if !request.include_jobs && !snapshot.job_records.is_empty() {
+            return Err(StoreError::InvalidField {
+                field: "recovery.job_records",
+                reason: "jobs were not requested",
+            });
+        }
+        if !request.include_receipts && !snapshot.receipts.is_empty() {
+            return Err(StoreError::InvalidField {
+                field: "recovery.receipts",
+                reason: "receipts were not requested",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_genesis_receipt(
+        &self,
+        context: &RequestMeta,
+        request: &StoreGenesisRequest,
+        receipt: &WriteReceipt,
+    ) -> Result<(), StoreError> {
+        self.validate_requirement_fence(&context.state_fence)?;
+        self.validate_requirement_fence(&request.state_fence)?;
+        if receipt.operation_id != request.operation_id
+            || receipt.idempotency_key != request.idempotency_key
+            || receipt.canonical_request_hash != request.canonical_request_hash
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        self.validate_requirement_fence(&receipt.state_fence)?;
+        validate_genesis_receipt_envelope(context, request, receipt)
+    }
+
+    async fn reconcile_genesis(
+        &self,
+        context: &RequestMeta,
+        request: &StoreGenesisRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        let receipt = self.receipt_exact(request.operation_id.clone()).await?;
+        self.validate_genesis_receipt(context, request, &receipt)?;
+        Ok(receipt)
+    }
 }
 
 #[derive(Debug)]
@@ -391,6 +466,60 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 // receipt lookup remains bound to our admitted operation.
                 let _ = observed;
                 self.receipt_exact(operation_id).await
+            }
+            Err(error) => Err(error.into_store_error()),
+        }
+    }
+
+    async fn recovery(
+        &self,
+        request: StoreRecoveryRequest,
+    ) -> Result<StoreRecoverySnapshot, StoreError> {
+        request.validate()?;
+        self.validate_requirement_fence(&request.state_fence)?;
+        let response = self
+            .execute_raw(
+                StoreRequest::Recovery {
+                    request: request.clone(),
+                },
+                None,
+                "store-recovery",
+            )
+            .await
+            .map_err(RequestFailure::into_store_error)?;
+        let StoreResponse::Recovery { snapshot } = response else {
+            return Err(StoreError::InvalidReceipt);
+        };
+        self.validate_recovery_snapshot(&request, &snapshot)?;
+        Ok(snapshot)
+    }
+
+    async fn initialize_genesis(
+        &self,
+        context: &RequestMeta,
+        request: StoreGenesisRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        request.validate_for_context(context)?;
+        self.validate_requirement_fence(&context.state_fence)?;
+        self.validate_requirement_fence(&request.state_fence)?;
+        let operation_id = request.operation_id.clone();
+        let result = self
+            .execute_raw(
+                StoreRequest::InitializeGenesis {
+                    context: context.clone(),
+                    request: request.clone(),
+                },
+                Some(context),
+                &request.idempotency_key,
+            )
+            .await;
+        match result {
+            Ok(StoreResponse::Genesis { receipt }) if receipt.operation_id == operation_id => {
+                self.validate_genesis_receipt(context, &request, &receipt)?;
+                Ok(receipt)
+            }
+            Ok(_) | Err(RequestFailure::Unknown { .. }) => {
+                self.reconcile_genesis(context, &request).await
             }
             Err(error) => Err(error.into_store_error()),
         }
@@ -588,6 +717,12 @@ mod tests {
         pending: Option<Frame>,
         fault: SnapshotFault,
         validation_calls: usize,
+        recovery_response: Option<Box<StoreResponse>>,
+        genesis_response: Option<Box<StoreResponse>>,
+        reconciliation_receipt: Option<Box<WriteReceipt>>,
+        recovery_calls: usize,
+        genesis_calls: usize,
+        receipt_requests: Vec<OperationId>,
     }
 
     impl FakeEbpStoreTransport {
@@ -597,7 +732,28 @@ mod tests {
                 pending: None,
                 fault,
                 validation_calls: 0,
+                recovery_response: None,
+                genesis_response: None,
+                reconciliation_receipt: None,
+                recovery_calls: 0,
+                genesis_calls: 0,
+                receipt_requests: Vec::new(),
             }
+        }
+
+        fn with_recovery_response(mut self, response: StoreResponse) -> Self {
+            self.recovery_response = Some(Box::new(response));
+            self
+        }
+
+        fn with_genesis_response(mut self, response: StoreResponse) -> Self {
+            self.genesis_response = Some(Box::new(response));
+            self
+        }
+
+        fn with_reconciliation_receipt(mut self, receipt: WriteReceipt) -> Self {
+            self.reconciliation_receipt = Some(Box::new(receipt));
+            self
         }
 
         fn response(
@@ -759,6 +915,38 @@ mod tests {
                         ));
                     }
                 }
+                StoreRequest::Recovery { .. } => {
+                    self.recovery_calls += 1;
+                    let response = *self.recovery_response.take().ok_or_else(|| {
+                        StoreClientError::Contract("fake recovery response missing".to_owned())
+                    })?;
+                    self.pending = Some(Self::response(
+                        self.requirement.connection_id.as_str().to_owned(),
+                        request_id,
+                        response,
+                    ));
+                }
+                StoreRequest::InitializeGenesis { .. } => {
+                    self.genesis_calls += 1;
+                    let response = *self.genesis_response.take().ok_or_else(|| {
+                        StoreClientError::Contract("fake genesis response missing".to_owned())
+                    })?;
+                    self.pending = Some(Self::response(
+                        self.requirement.connection_id.as_str().to_owned(),
+                        request_id,
+                        response,
+                    ));
+                }
+                StoreRequest::Receipt { operation_id } => {
+                    self.receipt_requests.push(operation_id);
+                    self.pending = Some(Self::response(
+                        self.requirement.connection_id.as_str().to_owned(),
+                        request_id,
+                        StoreResponse::Receipt {
+                            receipt: self.reconciliation_receipt.as_deref().cloned(),
+                        },
+                    ));
+                }
                 _ => {
                     return Err(StoreClientError::Contract(
                         "fake transport received unexpected request".to_owned(),
@@ -796,6 +984,394 @@ mod tests {
             approved_config_hash: PlatformHandle::new("b".repeat(64)).expect("config"),
             timeout_ms: 30_000,
         }
+    }
+
+    fn context_for(fence: &StateFence, request_id: &str, source_id: &str) -> RequestMeta {
+        RequestMeta {
+            request_id: RequestId::new(request_id).expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product").expect("product"),
+            source_id: SourceId::new(source_id).expect("source"),
+            state_fence: fence.clone(),
+            clock: ClockReading::default(),
+        }
+    }
+
+    fn recovery_record(
+        fence: &StateFence,
+        namespace: &str,
+        key: &str,
+        payload: &[u8],
+    ) -> eliot_store_api::RecoveryRecord {
+        eliot_store_api::RecoveryRecord {
+            namespace: namespace.to_owned(),
+            key: key.to_owned(),
+            state_fence: fence.clone(),
+            revision: 1,
+            schema: eliot_store_api::OWNER_SNAPSHOT_SCHEMA.to_owned(),
+            payload: payload.to_vec(),
+            value_digest: eliot_store_api::sha256_hex(payload),
+        }
+    }
+
+    fn recovery_request(
+        fence: &StateFence,
+        records: Vec<RecoveryRecordKey>,
+        include_receipts: bool,
+        include_jobs: bool,
+    ) -> StoreRecoveryRequest {
+        StoreRecoveryRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence: fence.clone(),
+            records,
+            include_receipts,
+            include_jobs,
+        }
+    }
+
+    fn recovery_snapshot(
+        fence: &StateFence,
+        owner_records: Vec<eliot_store_api::RecoveryRecord>,
+        job_records: Vec<eliot_store_api::RecoveryRecord>,
+        receipts: Vec<WriteReceipt>,
+    ) -> StoreRecoverySnapshot {
+        let snapshot = StoreRecoverySnapshot {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence: fence.clone(),
+            validation_revision: 1,
+            canonical_scope: ScopeRevisionView {
+                scope_id: ScopeId::new("store").expect("scope"),
+                revision_heads: Vec::new(),
+                ordering_heads: Vec::new(),
+                state_fence: fence.clone(),
+            },
+            owner_records,
+            job_records,
+            receipts,
+        };
+        snapshot.validate().expect("recovery snapshot");
+        snapshot
+    }
+
+    fn genesis_request(
+        fence: &StateFence,
+        operation_id: &str,
+        idempotency_key: &str,
+    ) -> StoreGenesisRequest {
+        StoreGenesisRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            operation_id: OperationId::new(operation_id).expect("operation id"),
+            idempotency_key: idempotency_key.to_owned(),
+            canonical_request_hash: String::new(),
+            state_fence: fence.clone(),
+            owner_records: vec![recovery_record(
+                fence,
+                "owner",
+                "current",
+                br#"{"current_plan":null}"#,
+            )],
+        }
+        .with_computed_digest()
+        .expect("genesis request")
+    }
+
+    fn genesis_receipt(context: &RequestMeta, request: &StoreGenesisRequest) -> WriteReceipt {
+        let transition =
+            eliot_store_api::genesis_transition(context, request).expect("genesis transition");
+        let mut receipt = WriteReceipt {
+            operation_id: request.operation_id.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            canonical_request_hash: request.canonical_request_hash.clone(),
+            transition_class: eliot_store_api::TransitionClass::RecoverySchema,
+            status: eliot_store_api::WriteReceiptStatus::Committed,
+            commit_id: Some(eliot_store_api::CommitId::new("commit-genesis").expect("commit")),
+            state_fence: request.state_fence.clone(),
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: vec!["genesis-seed".to_owned()],
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            error_code: None,
+            resubmission: eliot_store_api::Resubmission::None,
+            committed_at: Some(format!("commit-sequence-{0:016}", 1)),
+            envelope: None,
+        };
+        assert_eq!(context.state_fence, transition.state_fence);
+        assert_eq!(context.state_fence, receipt.state_fence);
+        assert_eq!(receipt.operation_id, transition.identity.operation_id);
+        assert_eq!(receipt.idempotency_key, transition.identity.idempotency_key);
+        assert_eq!(
+            receipt.canonical_request_hash,
+            transition.identity.canonical_request_hash
+        );
+        assert_eq!(receipt.transition_class, transition.transition_class);
+        assert_eq!(
+            receipt.operation_manifest_digest,
+            transition.operation_manifest_digest
+        );
+        assert_eq!(
+            receipt.status,
+            eliot_store_api::WriteReceiptStatus::Committed
+        );
+        assert!(receipt.commit_id.is_some());
+        receipt.envelope = Some(
+            eliot_store_api::issue_genesis_receipt_envelope(context, request, &receipt, 1)
+                .expect("genesis envelope"),
+        );
+        receipt.validate().expect("genesis receipt");
+        receipt
+    }
+
+    #[tokio::test]
+    async fn recovery_client_accepts_exact_snapshot_and_enforces_request_ceilings() {
+        let requirement = requirement();
+        let fence = requirement.state_fence.clone();
+        let owner = recovery_record(&fence, "owner", "current", b"owner-state");
+        let request = recovery_request(&fence, vec![owner.record_key()], false, false);
+        let snapshot = recovery_snapshot(&fence, vec![owner], Vec::new(), Vec::new());
+        let transport = FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+            .with_recovery_response(StoreResponse::Recovery { snapshot });
+        let client = EbpCanonicalStoreClient::connect(transport, requirement)
+            .await
+            .expect("fake handshake and readiness");
+
+        let recovered = client.recovery(request).await.expect("recovery snapshot");
+        assert_eq!(recovered.owner_records.len(), 1);
+        assert!(recovered.job_records.is_empty());
+        assert!(recovered.receipts.is_empty());
+        let transport = client.transport.lock().await;
+        assert_eq!(transport.recovery_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_client_rejects_wrong_fence_key_and_excluded_jobs() {
+        let approved_requirement = requirement();
+        let wrong_fence = StateFence::new(
+            AuthorityEpoch::new(2).expect("epoch"),
+            ResourceGeneration::new(1).expect("generation"),
+        );
+        let owner = recovery_record(
+            &approved_requirement.state_fence,
+            "owner",
+            "current",
+            b"owner-state",
+        );
+        let wrong_fence_request =
+            recovery_request(&wrong_fence, vec![owner.record_key()], false, false);
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(approved_requirement.clone(), SnapshotFault::Valid),
+            approved_requirement.clone(),
+        )
+        .await
+        .expect("fake handshake and readiness");
+        assert_eq!(
+            client.recovery(wrong_fence_request).await,
+            Err(StoreError::FenceMismatch)
+        );
+        assert_eq!(client.transport.lock().await.recovery_calls, 0);
+
+        let requirement = requirement();
+        let fence = requirement.state_fence.clone();
+        let requested_owner = recovery_record(&fence, "owner", "current", b"owner-state");
+        let substituted_owner = recovery_record(&fence, "owner", "substituted", b"owner-state");
+        let request = recovery_request(&fence, vec![requested_owner.record_key()], false, false);
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_recovery_response(StoreResponse::Recovery {
+                    snapshot: recovery_snapshot(
+                        &fence,
+                        vec![substituted_owner],
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                }),
+            requirement.clone(),
+        )
+        .await
+        .expect("fake handshake and readiness");
+        assert!(client.recovery(request.clone()).await.is_err());
+
+        let job = recovery_record(&fence, "job", "one", b"job-state");
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_recovery_response(StoreResponse::Recovery {
+                    snapshot: recovery_snapshot(
+                        &fence,
+                        vec![requested_owner],
+                        vec![job],
+                        Vec::new(),
+                    ),
+                }),
+            requirement,
+        )
+        .await
+        .expect("fake handshake and readiness");
+        assert!(client.recovery(request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn genesis_client_accepts_direct_store_receipt() {
+        let requirement = requirement();
+        let context = context_for(&requirement.state_fence, "genesis-request", "source");
+        let request = genesis_request(&requirement.state_fence, "genesis-1", "genesis-retry-1");
+        let receipt = genesis_receipt(&context, &request);
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_genesis_response(StoreResponse::Genesis {
+                    receipt: receipt.clone(),
+                }),
+            requirement,
+        )
+        .await
+        .expect("fake handshake and readiness");
+
+        assert_eq!(
+            client
+                .initialize_genesis(&context, request)
+                .await
+                .expect("genesis receipt"),
+            receipt
+        );
+        let transport = client.transport.lock().await;
+        assert_eq!(transport.genesis_calls, 1);
+        assert!(transport.receipt_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn genesis_client_reconciles_unknown_and_wrong_response_by_admitted_operation() {
+        let first_requirement = requirement();
+        let context = context_for(&first_requirement.state_fence, "genesis-request", "source");
+        let request = genesis_request(
+            &first_requirement.state_fence,
+            "genesis-1",
+            "genesis-retry-1",
+        );
+        let receipt = genesis_receipt(&context, &request);
+        let peer_operation = OperationId::new("peer-operation").expect("peer operation");
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(first_requirement.clone(), SnapshotFault::Valid)
+                .with_genesis_response(StoreResponse::Unknown {
+                    operation_id: peer_operation,
+                    reason: "peer uncertainty".to_owned(),
+                })
+                .with_reconciliation_receipt(receipt.clone()),
+            first_requirement,
+        )
+        .await
+        .expect("fake handshake and readiness");
+        assert_eq!(
+            client
+                .initialize_genesis(&context, request.clone())
+                .await
+                .expect("reconciled receipt"),
+            receipt
+        );
+        assert_eq!(
+            client.transport.lock().await.receipt_requests,
+            vec![request.operation_id.clone()]
+        );
+
+        let requirement = requirement();
+        let context = context_for(&requirement.state_fence, "genesis-request", "source");
+        let request = genesis_request(&requirement.state_fence, "genesis-1", "genesis-retry-1");
+        let receipt = genesis_receipt(&context, &request);
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_genesis_response(StoreResponse::Transaction {
+                    receipt: receipt.clone(),
+                })
+                .with_reconciliation_receipt(receipt),
+            requirement,
+        )
+        .await
+        .expect("fake handshake and readiness");
+        assert!(client.initialize_genesis(&context, request).await.is_ok());
+        assert_eq!(client.transport.lock().await.receipt_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn genesis_client_rejects_substituted_operation_idempotency_and_envelope() {
+        let approved_requirement = requirement();
+        let context = context_for(
+            &approved_requirement.state_fence,
+            "genesis-request",
+            "source",
+        );
+        let request = genesis_request(
+            &approved_requirement.state_fence,
+            "genesis-1",
+            "genesis-retry-1",
+        );
+        let peer_request = genesis_request(
+            &approved_requirement.state_fence,
+            "peer-operation",
+            "peer-idem",
+        );
+        let peer_receipt = genesis_receipt(&context, &peer_request);
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(approved_requirement.clone(), SnapshotFault::Valid)
+                .with_genesis_response(StoreResponse::Genesis {
+                    receipt: peer_receipt.clone(),
+                })
+                .with_reconciliation_receipt(peer_receipt),
+            approved_requirement.clone(),
+        )
+        .await
+        .expect("fake handshake and readiness");
+        assert!(
+            client
+                .initialize_genesis(&context, request.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client.transport.lock().await.receipt_requests,
+            vec![request.operation_id.clone()]
+        );
+
+        let substituted_request = genesis_request(
+            &approved_requirement.state_fence,
+            request.operation_id.as_str(),
+            "substituted-idem",
+        );
+        let substituted_receipt = genesis_receipt(&context, &substituted_request);
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(approved_requirement.clone(), SnapshotFault::Valid)
+                .with_genesis_response(StoreResponse::Genesis {
+                    receipt: substituted_receipt,
+                }),
+            approved_requirement.clone(),
+        )
+        .await
+        .expect("fake handshake and readiness");
+        assert!(
+            client
+                .initialize_genesis(&context, request.clone())
+                .await
+                .is_err()
+        );
+        assert!(client.transport.lock().await.receipt_requests.is_empty());
+
+        let substituted_context = context_for(
+            &approved_requirement.state_fence,
+            "substituted-request",
+            "other-source",
+        );
+        let substituted_receipt = genesis_receipt(&substituted_context, &request);
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(approved_requirement, SnapshotFault::Valid)
+                .with_genesis_response(StoreResponse::Genesis {
+                    receipt: substituted_receipt,
+                }),
+            requirement(),
+        )
+        .await
+        .expect("fake handshake and readiness");
+        assert!(client.initialize_genesis(&context, request).await.is_err());
+        assert!(client.transport.lock().await.receipt_requests.is_empty());
     }
 
     #[tokio::test]
