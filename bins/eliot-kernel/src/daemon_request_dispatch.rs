@@ -12,6 +12,8 @@
 //! dispatch convention; the new Store carriers below are explicitly typed.
 
 use super::*;
+#[path = "store_receipt_dispatch.rs"]
+mod store_receipt_dispatch;
 use eliot_contracts::StateFence;
 use eliot_store_api::{
     OrderingHeadExpectation, PreparedTransition, RequestMeta, RevisionHeadExpectation, StoreError,
@@ -137,6 +139,7 @@ impl KernelComposition {
                 self.store_apply_operation(session, request_id.clone(), payload)
                     .await
             }
+            "receipt" => store_receipt_dispatch::dispatch(self, session, payload).await,
             "daemon_degraded" => {
                 let reason = payload
                     .get("reason")
