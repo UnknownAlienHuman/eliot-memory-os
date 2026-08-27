@@ -14,11 +14,14 @@ use eliot_store_api::{
     EventProjectionRelationIntents, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationId, OperationManifestDigest, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
     OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
-    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RequestMeta,
-    Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, SplitView, StateFence, StoreError, StoreHealth, StoreHealthStatus,
-    WriteReceipt, WriteReceiptStatus, canonical_json_bytes, issue_store_receipt_envelope,
-    sha256_hex, validate_store_receipt_envelope,
+    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RecoveryRecord,
+    RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView, StateFence,
+    StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
+    genesis_manifest, is_genesis_fence, issue_genesis_receipt_envelope,
+    issue_store_receipt_envelope, sha256_hex, validate_genesis_receipt_envelope,
+    validate_store_receipt_envelope,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -535,6 +538,153 @@ impl MemoryStore {
             manifest_digest: OperationManifestDigest::new("memory-reference-v1")?,
         })
     }
+
+    /// Reads one coherent, exact-fence recovery snapshot under one mutex.
+    /// Owner records retain request order; all other collections use their
+    /// deterministic `BTreeMap` order. Record payloads are never interpreted.
+    fn recovery_sync(
+        &self,
+        request: &StoreRecoveryRequest,
+    ) -> Result<StoreRecoverySnapshot, StoreError> {
+        request.validate()?;
+        let state = self.lock_state()?;
+        let state_fence = state.fences.clone().ok_or(StoreError::Unavailable)?;
+        if state_fence != request.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+
+        let owner_records = request
+            .records
+            .iter()
+            .map(|key| {
+                state
+                    .recovery_records
+                    .get(key)
+                    .cloned()
+                    .ok_or(StoreError::InvalidField {
+                        field: "recovery.records",
+                        reason: "requested record is missing",
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let job_records = if request.include_jobs {
+            state.recovery_jobs.values().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let receipts = if request.include_receipts {
+            state.receipts_by_operation.values().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let canonical_scope = ScopeRevisionView {
+            scope_id: ScopeId::new("store")?,
+            revision_heads: state.revision_heads.values().cloned().collect(),
+            ordering_heads: state.ordering_heads.values().cloned().collect(),
+            state_fence: state_fence.clone(),
+        };
+        let snapshot = StoreRecoverySnapshot {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence,
+            validation_revision: state.next_commit_sequence,
+            canonical_scope,
+            owner_records,
+            job_records,
+            receipts,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Atomically seeds the neutral store with opaque owner records. All
+    /// fallible validation and receipt construction happen before the single
+    /// commit section, so a rejected or malformed request cannot partially
+    /// change state.
+    fn initialize_genesis_sync(
+        &self,
+        context: &RequestMeta,
+        request: &StoreGenesisRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        request.validate_for_context(context)?;
+        let mut state = self.lock_state()?;
+
+        if let Some(receipt) = state
+            .receipts_by_operation
+            .get(request.operation_id.as_str())
+        {
+            if receipt.idempotency_key == request.idempotency_key
+                && receipt.canonical_request_hash == request.canonical_request_hash
+            {
+                if state.fences.as_ref() != Some(&request.state_fence)
+                    || receipt.state_fence != request.state_fence
+                {
+                    return Err(StoreError::FenceMismatch);
+                }
+                match state.receipts_by_idempotency.get(&request.idempotency_key) {
+                    Some((hash, operation))
+                        if hash == &request.canonical_request_hash
+                            && operation == request.operation_id.as_str() => {}
+                    _ => return Err(StoreError::InvalidReceipt),
+                }
+                receipt.validate()?;
+                validate_genesis_receipt_envelope(context, request, receipt)?;
+                return Ok(receipt.clone());
+            }
+            return Err(StoreError::IdentityConflict);
+        }
+        if let Some((existing_hash, existing_operation)) =
+            state.receipts_by_idempotency.get(&request.idempotency_key)
+        {
+            if existing_hash == &request.canonical_request_hash
+                && existing_operation == request.operation_id.as_str()
+            {
+                return Err(StoreError::InvalidReceipt);
+            }
+            return Err(StoreError::IdentityConflict);
+        }
+
+        if state
+            .fences
+            .as_ref()
+            .is_some_and(|fence| !is_genesis_fence(fence))
+        {
+            return Err(StoreError::FenceMismatch);
+        }
+        if !state.is_canonically_absent() {
+            return Err(StoreError::IdentityConflict);
+        }
+        if state.next_commit_sequence != 1 || state.next_outbox_sequence != 1 {
+            return Err(StoreError::IdentityConflict);
+        }
+
+        let commit_sequence = state.next_commit_sequence;
+        let next_commit_sequence =
+            checked_increment(commit_sequence, "commit.sequence", "sequence overflow")?;
+        let receipt = genesis_receipt(context, request, commit_sequence)?;
+
+        let owner_records = request
+            .owner_records
+            .iter()
+            .cloned()
+            .map(|record| (record.record_key(), record))
+            .collect::<Vec<(RecoveryRecordKey, RecoveryRecord)>>();
+        for (key, record) in owner_records {
+            state.recovery_records.insert(key, record);
+        }
+        state.fences = Some(request.state_fence.clone());
+        state.next_commit_sequence = next_commit_sequence;
+        state.receipts_by_idempotency.insert(
+            request.idempotency_key.clone(),
+            (
+                request.canonical_request_hash.clone(),
+                request.operation_id.to_string(),
+            ),
+        );
+        state
+            .receipts_by_operation
+            .insert(request.operation_id.to_string(), receipt.clone());
+        Ok(receipt)
+    }
 }
 
 impl CanonicalStoreClient for MemoryStore {
@@ -551,6 +701,21 @@ impl CanonicalStoreClient for MemoryStore {
             &expected_revision_heads,
             &expected_ordering_heads,
         )
+    }
+
+    async fn recovery(
+        &self,
+        request: StoreRecoveryRequest,
+    ) -> Result<StoreRecoverySnapshot, StoreError> {
+        self.recovery_sync(&request)
+    }
+
+    async fn initialize_genesis(
+        &self,
+        context: &RequestMeta,
+        request: StoreGenesisRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        self.initialize_genesis_sync(context, &request)
     }
 
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
@@ -594,9 +759,47 @@ impl CanonicalStoreClient for MemoryStore {
     }
 }
 
-#[derive(Clone, Debug)]
+fn genesis_receipt(
+    context: &RequestMeta,
+    request: &StoreGenesisRequest,
+    commit_sequence: u64,
+) -> Result<WriteReceipt, StoreError> {
+    let manifest = genesis_manifest()?;
+    let mut receipt = WriteReceipt {
+        operation_id: request.operation_id.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+        canonical_request_hash: request.canonical_request_hash.clone(),
+        transition_class: eliot_store_api::TransitionClass::RecoverySchema,
+        status: WriteReceiptStatus::Committed,
+        commit_id: Some(CommitId::new("commit-genesis")?),
+        state_fence: request.state_fence.clone(),
+        ordering_sequences: Vec::new(),
+        revision_before_after: Vec::new(),
+        applied_command_ids: vec!["genesis-seed".to_owned()],
+        emitted_event_ids: Vec::new(),
+        projection_refs: Vec::new(),
+        outbox_refs: Vec::new(),
+        operation_manifest_digest: manifest.digest,
+        error_code: None,
+        resubmission: Resubmission::None,
+        committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
+        envelope: None,
+    };
+    receipt.envelope = Some(issue_genesis_receipt_envelope(
+        context,
+        request,
+        &receipt,
+        commit_sequence,
+    )?);
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct MemoryState {
     fences: Option<StateFence>,
+    recovery_records: BTreeMap<RecoveryRecordKey, RecoveryRecord>,
+    recovery_jobs: BTreeMap<RecoveryRecordKey, RecoveryRecord>,
     revision_heads: BTreeMap<String, RevisionHead>,
     ordering_heads: BTreeMap<String, OrderingHead>,
     receipts_by_operation: BTreeMap<String, WriteReceipt>,
@@ -614,6 +817,8 @@ impl Default for MemoryState {
     fn default() -> Self {
         Self {
             fences: None,
+            recovery_records: BTreeMap::new(),
+            recovery_jobs: BTreeMap::new(),
             revision_heads: BTreeMap::new(),
             ordering_heads: BTreeMap::new(),
             receipts_by_operation: BTreeMap::new(),
@@ -630,6 +835,19 @@ impl Default for MemoryState {
 }
 
 impl MemoryState {
+    fn is_canonically_absent(&self) -> bool {
+        self.recovery_records.is_empty()
+            && self.recovery_jobs.is_empty()
+            && self.revision_heads.is_empty()
+            && self.ordering_heads.is_empty()
+            && self.receipts_by_operation.is_empty()
+            && self.receipts_by_idempotency.is_empty()
+            && self.projections.is_empty()
+            && self.outbox.is_empty()
+            && self.relations.is_empty()
+            && self.named_operations.is_empty()
+    }
+
     fn snapshot(&self) -> MemorySnapshot {
         MemorySnapshot {
             state_fence: self.fences.clone(),
@@ -848,9 +1066,13 @@ fn checked_increment(
 mod tests {
     use super::*;
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ProductId, RequestId, ResourceGeneration, SourceId,
+        AuthorityEpoch, ClockReading, ProductId, RequestId, ResourceGeneration, SessionId,
+        SourceId, TaskId,
     };
-    use eliot_store_api::{EffectClass, NamedOperationManifest, TransitionClass};
+    use eliot_store_api::{
+        EffectClass, NamedOperationManifest, StoreGenesisRequest, StoreRecoveryRequest,
+        TransitionClass,
+    };
 
     fn fence() -> StateFence {
         StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
@@ -891,6 +1113,55 @@ mod tests {
         Ok(store)
     }
 
+    fn recovery_record(
+        namespace: &str,
+        key: &str,
+        state_fence: &StateFence,
+        payload: &[u8],
+    ) -> RecoveryRecord {
+        RecoveryRecord {
+            namespace: namespace.to_owned(),
+            key: key.to_owned(),
+            state_fence: state_fence.clone(),
+            revision: 1,
+            schema: "opaque-owner-v1".to_owned(),
+            payload: payload.to_vec(),
+            value_digest: sha256_hex(payload),
+        }
+    }
+
+    fn genesis_request(
+        operation: &str,
+        idempotency_key: &str,
+        state_fence: &StateFence,
+        owner_records: Vec<RecoveryRecord>,
+    ) -> Result<StoreGenesisRequest, StoreError> {
+        Ok(StoreGenesisRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            operation_id: OperationId::new(operation).map_err(StoreError::Foundation)?,
+            idempotency_key: idempotency_key.to_owned(),
+            canonical_request_hash: String::new(),
+            state_fence: state_fence.clone(),
+            owner_records,
+        })
+        .and_then(StoreGenesisRequest::with_computed_digest)
+    }
+
+    fn recovery_request(
+        state_fence: &StateFence,
+        records: Vec<RecoveryRecordKey>,
+        include_receipts: bool,
+        include_jobs: bool,
+    ) -> StoreRecoveryRequest {
+        StoreRecoveryRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence: state_fence.clone(),
+            records,
+            include_receipts,
+            include_jobs,
+        }
+    }
+
     fn transition(
         operation: &str,
         state_fence: &StateFence,
@@ -922,6 +1193,334 @@ mod tests {
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: vec![],
         })
+    }
+
+    #[test]
+    fn genesis_seeds_opaque_records_and_recovery_is_exact() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let first_request = genesis_request(
+            "genesis-1",
+            "genesis-idem-1",
+            &state_fence,
+            vec![recovery_record(
+                "owner",
+                "current",
+                &state_fence,
+                br#"{"current_plan":null}"#,
+            )],
+        )?;
+        let first = store.initialize_genesis_sync(&metadata(&state_fence)?, &first_request)?;
+        assert_eq!(first.transition_class, TransitionClass::RecoverySchema);
+        assert_eq!(first.status, WriteReceiptStatus::Committed);
+        assert_eq!(first.operation_manifest_digest, genesis_manifest()?.digest);
+        assert!(first.revision_before_after.is_empty());
+        assert!(first.ordering_sequences.is_empty());
+        assert!(first.emitted_event_ids.is_empty());
+        assert!(first.projection_refs.is_empty());
+        assert!(first.outbox_refs.is_empty());
+        assert_eq!(first.applied_command_ids.len(), 1);
+        assert_eq!(store.lock_state()?.next_commit_sequence, 2);
+
+        let before_replay = store.lock_state()?.clone();
+        let replay = store.initialize_genesis_sync(&metadata(&state_fence)?, &first_request)?;
+        assert_eq!(first, replay);
+        assert_eq!(before_replay, store.lock_state()?.clone());
+
+        let key = RecoveryRecordKey::new("owner", "current")?;
+        let recovered =
+            store.recovery_sync(&recovery_request(&state_fence, vec![key], true, false))?;
+        assert_eq!(recovered.validation_revision, 2);
+        assert!(recovered.canonical_scope.revision_heads.is_empty());
+        assert!(recovered.canonical_scope.ordering_heads.is_empty());
+        assert_eq!(recovered.owner_records.len(), 1);
+        assert_eq!(
+            recovered.owner_records[0].payload,
+            br#"{"current_plan":null}"#
+        );
+        assert_eq!(recovered.receipts, vec![first]);
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_accepts_exact_precreated_genesis_fence() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        store.lock_state()?.fences = Some(state_fence.clone());
+        let request = genesis_request(
+            "genesis-precreated-fence",
+            "genesis-precreated-fence-idem",
+            &state_fence,
+            vec![recovery_record("owner", "one", &state_fence, b"one")],
+        )?;
+        let receipt = store.initialize_genesis_sync(&metadata(&state_fence)?, &request)?;
+        assert_eq!(
+            receipt.operation_manifest_digest,
+            genesis_manifest()?.digest
+        );
+        assert_eq!(store.lock_state()?.next_commit_sequence, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_rejects_task_and_session_context_without_writes() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let request = genesis_request(
+            "genesis-context",
+            "genesis-context-idem",
+            &state_fence,
+            vec![recovery_record("owner", "one", &state_fence, b"one")],
+        )?;
+        let before = store.lock_state()?.clone();
+        let mut task_context = metadata(&state_fence)?;
+        task_context.task_id = Some(TaskId::new("task-1").map_err(StoreError::Foundation)?);
+        assert!(matches!(
+            store.initialize_genesis_sync(&task_context, &request),
+            Err(StoreError::InvalidField {
+                field: "genesis.context",
+                ..
+            })
+        ));
+        let mut session_context = metadata(&state_fence)?;
+        session_context.session_id =
+            Some(SessionId::new("session-1").map_err(StoreError::Foundation)?);
+        assert!(matches!(
+            store.initialize_genesis_sync(&session_context, &request),
+            Err(StoreError::InvalidField {
+                field: "genesis.context",
+                ..
+            })
+        ));
+        assert_eq!(before, store.lock_state()?.clone());
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_replay_rejects_substituted_current_fence() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let request = genesis_request(
+            "genesis-replay-fence",
+            "genesis-replay-fence-idem",
+            &state_fence,
+            vec![recovery_record("owner", "one", &state_fence, b"one")],
+        )?;
+        let first = store.initialize_genesis_sync(&metadata(&state_fence)?, &request)?;
+        let substituted_fence = StateFence::new(
+            AuthorityEpoch::new(2).map_err(StoreError::Foundation)?,
+            ResourceGeneration::genesis(),
+        );
+        store.lock_state()?.fences = Some(substituted_fence);
+        let before = store.lock_state()?.clone();
+        assert_eq!(
+            store.initialize_genesis_sync(&metadata(&state_fence)?, &request),
+            Err(StoreError::FenceMismatch)
+        );
+        assert_ne!(before.fences, Some(state_fence));
+        assert_eq!(first.state_fence, fence());
+        assert_eq!(before, store.lock_state()?.clone());
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_identity_conflicts_and_rejections_are_atomic() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let request = genesis_request(
+            "genesis-conflict",
+            "genesis-conflict-idem",
+            &state_fence,
+            vec![recovery_record("owner", "one", &state_fence, b"one")],
+        )?;
+        store.initialize_genesis_sync(&metadata(&state_fence)?, &request)?;
+
+        let before = store.lock_state()?.clone();
+        let mut changed_hash = request.clone();
+        changed_hash.canonical_request_hash = "d".repeat(64);
+        assert_eq!(
+            store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_hash),
+            Err(StoreError::InvalidField {
+                field: "canonical_request_hash",
+                reason: "does not match canonical genesis request",
+            })
+        );
+        let mut changed_operation = request.clone();
+        changed_operation.operation_id =
+            OperationId::new("genesis-conflict-other").map_err(StoreError::Foundation)?;
+        changed_operation = changed_operation.with_computed_digest()?;
+        assert_eq!(
+            store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_operation),
+            Err(StoreError::IdentityConflict)
+        );
+        let mut changed_idempotency = request.clone();
+        changed_idempotency.idempotency_key = "genesis-conflict-other-idem".to_owned();
+        changed_idempotency = changed_idempotency.with_computed_digest()?;
+        assert_eq!(
+            store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_idempotency),
+            Err(StoreError::IdentityConflict)
+        );
+        assert_eq!(before, store.lock_state()?.clone());
+
+        let before_snapshot = store.snapshot()?;
+        let before_receipt = store.receipt_sync(&request.operation_id)?;
+        let recovery_key = RecoveryRecordKey::new("owner", "one")?;
+        let before_recovery = store.recovery_sync(&recovery_request(
+            &state_fence,
+            vec![recovery_key.clone()],
+            true,
+            false,
+        ))?;
+        let mut changed_owner_records = request.clone();
+        changed_owner_records.owner_records[0].key = "two".to_owned();
+        assert_eq!(
+            store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_owner_records,),
+            Err(StoreError::InvalidField {
+                field: "canonical_request_hash",
+                reason: "does not match canonical genesis request",
+            })
+        );
+        let after = store.lock_state()?.clone();
+        assert_eq!(before_snapshot, store.snapshot()?);
+        assert_eq!(before_receipt, store.receipt_sync(&request.operation_id)?);
+        assert_eq!(
+            before_recovery,
+            store.recovery_sync(&recovery_request(
+                &state_fence,
+                vec![recovery_key],
+                true,
+                false,
+            ))?
+        );
+        assert_eq!(before.fences, after.fences);
+        assert_eq!(before.receipts_by_operation, after.receipts_by_operation);
+        assert_eq!(before.recovery_records, after.recovery_records);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_flags_missing_records_and_fences_fail_closed() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let request = genesis_request(
+            "genesis-recovery-errors",
+            "genesis-recovery-errors-idem",
+            &state_fence,
+            vec![recovery_record("owner", "one", &state_fence, b"one")],
+        )?;
+        store.initialize_genesis_sync(&metadata(&state_fence)?, &request)?;
+        let before = store.lock_state()?.clone();
+        assert!(
+            store
+                .recovery_sync(&recovery_request(
+                    &state_fence,
+                    vec![RecoveryRecordKey::new("owner", "missing")?],
+                    false,
+                    false,
+                ))
+                .is_err()
+        );
+        let mut duplicate = recovery_request(
+            &state_fence,
+            vec![RecoveryRecordKey::new("owner", "one")?],
+            false,
+            false,
+        );
+        duplicate.records.push(duplicate.records[0].clone());
+        assert_eq!(
+            store.recovery_sync(&duplicate),
+            Err(StoreError::Duplicate {
+                field: "recovery.records"
+            })
+        );
+        assert_eq!(before, store.lock_state()?.clone());
+
+        let other_fence = StateFence::new(
+            AuthorityEpoch::new(2).map_err(StoreError::Foundation)?,
+            ResourceGeneration::genesis(),
+        );
+        let mut stale = recovery_request(
+            &state_fence,
+            vec![RecoveryRecordKey::new("owner", "one")?],
+            false,
+            false,
+        );
+        stale.state_fence = other_fence;
+        assert_eq!(store.recovery_sync(&stale), Err(StoreError::FenceMismatch));
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_rejects_partial_or_invalid_state_without_writes() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let request = genesis_request(
+            "genesis-partial",
+            "genesis-partial-idem",
+            &state_fence,
+            vec![recovery_record("owner", "one", &state_fence, b"one")],
+        )?;
+        let store = store()?;
+        store.lock_state()?.recovery_records.insert(
+            RecoveryRecordKey::new("owner", "partial")?,
+            recovery_record("owner", "partial", &state_fence, b"partial"),
+        );
+        let before = store.lock_state()?.clone();
+        assert_eq!(
+            store.initialize_genesis_sync(&metadata(&state_fence)?, &request),
+            Err(StoreError::IdentityConflict)
+        );
+        assert_eq!(before, store.lock_state()?.clone());
+
+        let invalid = StoreGenesisRequest {
+            owner_records: vec![RecoveryRecord {
+                payload: Vec::new(),
+                value_digest: sha256_hex(b""),
+                ..recovery_record("owner", "invalid", &state_fence, b"valid")
+            }],
+            ..request
+        }
+        .with_computed_digest()?;
+        let before_invalid = store.lock_state()?.clone();
+        assert_eq!(
+            store.initialize_genesis_sync(&metadata(&state_fence)?, &invalid),
+            Err(StoreError::Empty {
+                field: "recovery.payload"
+            })
+        );
+        assert_eq!(before_invalid, store.lock_state()?.clone());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_jobs_and_receipts_are_included_only_when_requested() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let request = genesis_request(
+            "genesis-flags",
+            "genesis-flags-idem",
+            &state_fence,
+            vec![recovery_record("owner", "one", &state_fence, b"one")],
+        )?;
+        store.initialize_genesis_sync(&metadata(&state_fence)?, &request)?;
+        let job = recovery_record("job", "one", &state_fence, b"job");
+        store
+            .lock_state()?
+            .recovery_jobs
+            .insert(job.record_key(), job);
+        let key = RecoveryRecordKey::new("owner", "one")?;
+        let omitted = store.recovery_sync(&recovery_request(
+            &state_fence,
+            vec![key.clone()],
+            false,
+            false,
+        ))?;
+        assert!(omitted.receipts.is_empty());
+        assert!(omitted.job_records.is_empty());
+        let included =
+            store.recovery_sync(&recovery_request(&state_fence, vec![key], true, true))?;
+        assert_eq!(included.receipts.len(), 1);
+        assert_eq!(included.job_records.len(), 1);
+        Ok(())
     }
 
     #[test]

@@ -18,7 +18,8 @@ use thiserror::Error;
 use crate::{
     CanonicalValidationSnapshot, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, StoreError, StoreHealth, WriteReceipt,
+    RevisionHeadExpectation, RevisionKey, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
 };
 use schemars::JsonSchema;
 
@@ -33,6 +34,8 @@ pub const CAPABILITY_RECEIPT: &str = "store.receipt";
 pub const CAPABILITY_REVISION_HEADS: &str = "store.revision_heads";
 pub const CAPABILITY_ORDERING_HEADS: &str = "store.ordering_heads";
 pub const CAPABILITY_VALIDATION_SNAPSHOT: &str = "store.validation_snapshot";
+pub const CAPABILITY_RECOVERY: &str = "store.recovery";
+pub const CAPABILITY_INITIALIZE_GENESIS: &str = "store.initialize_genesis";
 
 /// Capabilities advertised by the canonical store process.
 pub const CAPABILITIES: &[&str] = &[
@@ -140,6 +143,13 @@ pub enum StoreRequest {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     },
+    Recovery {
+        request: StoreRecoveryRequest,
+    },
+    InitializeGenesis {
+        context: RequestMeta,
+        request: StoreGenesisRequest,
+    },
     Receipt {
         operation_id: OperationId,
     },
@@ -160,6 +170,15 @@ impl StoreRequest {
                 Ok(())
             }
             Self::Named { request } => request.validate(),
+            Self::Recovery { request } => request.validate(),
+            Self::InitializeGenesis { context, request } => {
+                context.validate().map_err(StoreError::Foundation)?;
+                request.validate()?;
+                if context.state_fence != request.state_fence {
+                    return Err(StoreError::FenceMismatch);
+                }
+                Ok(())
+            }
             Self::Apply {
                 context,
                 transition,
@@ -209,6 +228,8 @@ impl StoreRequest {
             Self::RevisionHeads { .. } => CAPABILITY_REVISION_HEADS,
             Self::OrderingHeads { .. } => CAPABILITY_ORDERING_HEADS,
             Self::ValidationSnapshot => CAPABILITY_VALIDATION_SNAPSHOT,
+            Self::Recovery { .. } => CAPABILITY_RECOVERY,
+            Self::InitializeGenesis { .. } => CAPABILITY_INITIALIZE_GENESIS,
         }
     }
 
@@ -232,6 +253,29 @@ impl StoreRequest {
                 Err(StoreWireError::Identity(
                     "named request fence does not match request identity".to_owned(),
                 ))
+            }
+            Self::Recovery { request } if request.state_fence != identity.request.state_fence => {
+                Err(StoreWireError::Identity(
+                    "recovery request fence does not match request identity".to_owned(),
+                ))
+            }
+            Self::InitializeGenesis { context, request } => {
+                if context != &identity.request.metadata {
+                    return Err(StoreWireError::Identity(
+                        "genesis context does not match request identity metadata".to_owned(),
+                    ));
+                }
+                if request.idempotency_key != identity.idempotency_key {
+                    return Err(StoreWireError::Identity(
+                        "genesis idempotency key does not match request identity".to_owned(),
+                    ));
+                }
+                if request.state_fence != identity.request.state_fence {
+                    return Err(StoreWireError::Identity(
+                        "genesis request fence does not match request identity".to_owned(),
+                    ));
+                }
+                Ok(())
             }
             Self::Apply {
                 context,
@@ -303,6 +347,12 @@ pub enum StoreResponse {
     },
     ValidationSnapshot {
         snapshot: CanonicalValidationSnapshot,
+    },
+    Recovery {
+        snapshot: StoreRecoverySnapshot,
+    },
+    Genesis {
+        receipt: WriteReceipt,
     },
     /// Explicitly unknown/rejected reconciliation outcome; never a success.
     Unknown {
@@ -396,6 +446,20 @@ impl StoreResponse {
             }
             Self::ValidationSnapshot { snapshot } => {
                 snapshot.validate().map_err(StoreWireError::Store)
+            }
+            Self::Recovery { snapshot } => snapshot.validate().map_err(StoreWireError::Store),
+            Self::Genesis { receipt } => {
+                if receipt.transition_class != crate::TransitionClass::RecoverySchema {
+                    return Err(StoreWireError::Store(StoreError::InvalidField {
+                        field: "transition_class",
+                        reason: "genesis receipt must use RecoverySchema",
+                    }));
+                }
+                receipt.validate().map_err(StoreWireError::Store)?;
+                receipt
+                    .require_reconciliation_envelope()
+                    .map(|_| ())
+                    .map_err(StoreWireError::Store)
             }
             Self::Unknown { reason, .. } => validate_text(reason, "unknown.reason"),
             Self::Error { error } => validate_text(error, "error"),

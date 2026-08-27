@@ -10,7 +10,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{ArtifactId, ContractId, TransactionSequence};
+use eliot_contracts::{
+    ArtifactId, AuthorityEpoch, ContractId, ResourceGeneration, TransactionSequence,
+};
 pub use eliot_contracts::{
     ContractError, ContractVersion, ErrorCode, OperationId, RequestMetadata, StateFence,
     canonical_json_bytes, sha256_hex,
@@ -33,11 +35,11 @@ use thiserror::Error;
 mod wire;
 
 pub use wire::{
-    CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_HEALTH, CAPABILITY_NAMED_READ,
-    CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT, CAPABILITY_REVISION_HEADS,
-    CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ReadinessReceipt, ReadinessStatus, StoreRequest,
-    StoreResponse, StoreWireError, decode_request_frame, decode_response_frame, request_frame,
-    response_frame,
+    CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
+    CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
+    CAPABILITY_RECOVERY, CAPABILITY_REVISION_HEADS, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS,
+    ReadinessReceipt, ReadinessStatus, StoreRequest, StoreResponse, StoreWireError,
+    decode_request_frame, decode_response_frame, request_frame, response_frame,
 };
 
 /// Stable identity of this contract surface.
@@ -45,8 +47,334 @@ pub const CONTRACT_NAME: &str = "eliot.storage.store-api";
 /// Current wire revision of this contract surface.
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
+/// Versioned schema for store recovery packets.
+pub const RECOVERY_PACKET_SCHEMA: &str = "eliot.storage.recovery.v1";
+/// Versioned schema for opaque Governor owner snapshots.
+pub const OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.owner.snapshot.v1";
+/// Maximum number of owner records in one recovery/genesis operation.
+pub const MAX_RECOVERY_OWNER_RECORDS: usize = 16;
+/// Maximum exact payload size of one recovered record.
+pub const MAX_RECOVERY_RECORD_BYTES: usize = 512 * 1024;
+/// Maximum canonical JSON packet size for recovery contracts.
+pub const MAX_RECOVERY_PACKET_BYTES: usize = 3 * 1024 * 1024;
+/// Maximum number of replayable receipts in one recovery snapshot.
+pub const MAX_RECOVERY_RECEIPTS: usize = 256;
+/// Maximum number of durable jobs in one recovery snapshot.
+pub const MAX_RECOVERY_JOBS: usize = 256;
+/// Fixed neutral receipt scope placeholder for genesis envelopes. This is
+/// required by the universal receipt core only; it is not a Governor
+/// semantic `WorkScope` and is never persisted or advanced as a store head.
+pub const GENESIS_RECEIPT_SCOPE_ID: &str = "store";
+/// Fixed neutral ordering placeholder for genesis envelopes. It is never
+/// persisted or advanced as a revision/order head.
+pub const GENESIS_RECEIPT_ORDERING_SCOPE: &str = "store";
+/// Stable neutral manifest name used for every provider's genesis receipt.
+pub const GENESIS_MANIFEST_NAME: &str = "eliot.storage.genesis";
+
 /// Compatibility spelling used by the store boundary.
 pub type RequestMeta = RequestMetadata;
+
+/// Deterministic address of one opaque store recovery record.
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryRecordKey {
+    pub namespace: String,
+    pub key: String,
+}
+
+impl RecoveryRecordKey {
+    /// Constructs and validates one recovery record address.
+    pub fn new(namespace: impl Into<String>, key: impl Into<String>) -> Result<Self, StoreError> {
+        let record = Self {
+            namespace: namespace.into(),
+            key: key.into(),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Validates the non-semantic address fields.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(&self.namespace, "recovery.namespace")?;
+        validate_text(&self.key, "recovery.key")
+    }
+}
+
+/// One opaque, fenced, content-addressed recovery record.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryRecord {
+    pub namespace: String,
+    pub key: String,
+    pub state_fence: StateFence,
+    /// Durable outer revision of this record, not an inner payload revision.
+    pub revision: u64,
+    pub schema: String,
+    /// Exact canonical payload bytes; the store does not interpret them.
+    pub payload: Vec<u8>,
+    pub value_digest: String,
+}
+
+impl RecoveryRecord {
+    /// Returns the deterministic record address.
+    #[must_use]
+    pub fn record_key(&self) -> RecoveryRecordKey {
+        RecoveryRecordKey {
+            namespace: self.namespace.clone(),
+            key: self.key.clone(),
+        }
+    }
+
+    /// Validates one record without assigning meaning to its namespace/key/schema.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.record_key().validate()?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if self.revision == 0 {
+            return Err(StoreError::InvalidField {
+                field: "recovery.revision",
+                reason: "must be non-zero",
+            });
+        }
+        validate_text(&self.schema, "recovery.schema")?;
+        if self.payload.is_empty() {
+            return Err(StoreError::Empty {
+                field: "recovery.payload",
+            });
+        }
+        if self.payload.len() > MAX_RECOVERY_RECORD_BYTES {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        validate_digest(&self.value_digest, "recovery.value_digest")?;
+        if sha256_hex(&self.payload) != self.value_digest {
+            return Err(StoreError::InvalidField {
+                field: "recovery.value_digest",
+                reason: "does not match payload",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_for_fence(&self, expected: &StateFence) -> Result<(), StoreError> {
+        self.validate()?;
+        ensure_same_fence(expected, &self.state_fence)
+    }
+}
+
+/// Request for one same-fence recovery observation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRecoveryRequest {
+    pub contract_version: ContractVersion,
+    pub state_fence: StateFence,
+    pub records: Vec<RecoveryRecordKey>,
+    pub include_receipts: bool,
+    pub include_jobs: bool,
+}
+
+impl StoreRecoveryRequest {
+    /// Validates bounded deterministic selection state and packet size.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_recovery_contract_version(self.contract_version)?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if self.records.len() > MAX_RECOVERY_OWNER_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        for record in &self.records {
+            record.validate()?;
+        }
+        unique(self.records.iter().cloned(), "recovery.records")?;
+        validate_recovery_packet_size(self)
+    }
+}
+
+/// Same-fence store recovery result containing opaque owner/job records and
+/// canonical replay evidence. The store never interprets record payloads.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRecoverySnapshot {
+    pub contract_version: ContractVersion,
+    pub state_fence: StateFence,
+    pub validation_revision: u64,
+    pub canonical_scope: ScopeRevisionView,
+    pub owner_records: Vec<RecoveryRecord>,
+    pub job_records: Vec<RecoveryRecord>,
+    pub receipts: Vec<WriteReceipt>,
+}
+
+impl StoreRecoverySnapshot {
+    /// Validates one complete, bounded, same-fence recovery snapshot.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_recovery_contract_version(self.contract_version)?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if self.validation_revision == 0 {
+            return Err(StoreError::InvalidField {
+                field: "recovery.validation_revision",
+                reason: "must be non-zero",
+            });
+        }
+        self.canonical_scope.validate()?;
+        ensure_same_fence(&self.state_fence, &self.canonical_scope.state_fence)?;
+        if self.owner_records.len() > MAX_RECOVERY_OWNER_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        if self.job_records.len() > MAX_RECOVERY_JOBS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        if self.receipts.len() > MAX_RECOVERY_RECEIPTS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+
+        let mut record_keys = BTreeSet::new();
+        for record in self.owner_records.iter().chain(self.job_records.iter()) {
+            record.validate_for_fence(&self.state_fence)?;
+            if !record_keys.insert(record.record_key()) {
+                return Err(StoreError::Duplicate {
+                    field: "recovery.record_keys",
+                });
+            }
+        }
+        let mut receipt_operations = BTreeSet::new();
+        for receipt in &self.receipts {
+            receipt.validate()?;
+            ensure_same_fence(&self.state_fence, &receipt.state_fence)?;
+            if !receipt_operations.insert(receipt.operation_id.clone()) {
+                return Err(StoreError::Duplicate {
+                    field: "recovery.receipts",
+                });
+            }
+        }
+        validate_recovery_packet_size(self)
+    }
+}
+
+/// Atomic all-absent genesis seed request. The seed must contain at least one
+/// opaque owner record, while owner keys and payload schemas remain
+/// intentionally semantic-neutral at this Store layer.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreGenesisRequest {
+    pub contract_version: ContractVersion,
+    pub operation_id: OperationId,
+    pub idempotency_key: String,
+    pub canonical_request_hash: String,
+    pub state_fence: StateFence,
+    pub owner_records: Vec<RecoveryRecord>,
+}
+
+impl StoreGenesisRequest {
+    /// Returns the deterministic bytes covered by `canonical_request_hash`.
+    ///
+    /// The digest field is cleared before canonicalization so the digest does
+    /// not recursively include itself.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        let mut unsigned = self.clone();
+        unsigned.canonical_request_hash.clear();
+        canonical_json_bytes(&unsigned)
+            .map_err(|error| StoreError::Serialization(error.to_string()))
+    }
+
+    /// Computes the canonical request hash over every genesis request field
+    /// except `canonical_request_hash` itself.
+    pub fn compute_digest(&self) -> Result<String, StoreError> {
+        Ok(sha256_hex(&self.canonical_unsigned_bytes()?))
+    }
+
+    /// Populates the canonical request hash for an explicitly constructed
+    /// genesis request.
+    pub fn with_computed_digest(mut self) -> Result<Self, StoreError> {
+        self.canonical_request_hash = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates an atomic, bounded, same-fence genesis seed request.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_recovery_contract_version(self.contract_version)?;
+        validate_text(&self.idempotency_key, "idempotency_key")?;
+        validate_digest(&self.canonical_request_hash, "canonical_request_hash")?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if !is_genesis_fence(&self.state_fence) {
+            return Err(StoreError::FenceMismatch);
+        }
+        if self.owner_records.is_empty() {
+            return Err(StoreError::Empty {
+                field: "genesis.owner_records",
+            });
+        }
+        if self.owner_records.len() > MAX_RECOVERY_OWNER_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        let mut record_keys = BTreeSet::new();
+        for record in &self.owner_records {
+            record.validate_for_fence(&self.state_fence)?;
+            if !record_keys.insert(record.record_key()) {
+                return Err(StoreError::Duplicate {
+                    field: "genesis.owner_records",
+                });
+            }
+        }
+
+        if self.canonical_request_hash != self.compute_digest()? {
+            return Err(StoreError::InvalidField {
+                field: "canonical_request_hash",
+                reason: "does not match canonical genesis request",
+            });
+        }
+        validate_recovery_packet_size(self)
+    }
+
+    /// Validates this seed against the caller context's empty task/session
+    /// semantics and exact genesis fence.
+    pub fn validate_for_context(&self, context: &RequestMeta) -> Result<(), StoreError> {
+        context.validate().map_err(StoreError::Foundation)?;
+        self.validate()?;
+        if context.task_id.is_some() || context.session_id.is_some() {
+            return Err(StoreError::InvalidField {
+                field: "genesis.context",
+                reason: "genesis context must not carry task or session identity",
+            });
+        }
+        ensure_same_fence(&context.state_fence, &self.state_fence)
+    }
+}
+
+fn validate_recovery_contract_version(version: ContractVersion) -> Result<(), StoreError> {
+    if version != CONTRACT_VERSION {
+        return Err(StoreError::InvalidField {
+            field: "contract_version",
+            reason: "does not match the store API contract",
+        });
+    }
+    Ok(())
+}
+
+fn validate_recovery_packet_size<T: Serialize>(value: &T) -> Result<(), StoreError> {
+    let bytes = canonical_json_bytes(value)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if bytes.len() > MAX_RECOVERY_PACKET_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    Ok(())
+}
+
+/// Returns whether a fence is the only accepted empty-genesis fence.
+#[must_use]
+pub fn is_genesis_fence(fence: &StateFence) -> bool {
+    fence.authority_epoch == AuthorityEpoch::genesis()
+        && fence.resource_generation == ResourceGeneration::genesis()
+        && fence.task_revision.is_none()
+        && fence.policy_revision.is_none()
+        && fence.integration_revision.is_none()
+}
 
 macro_rules! opaque_id {
     ($(#[$meta:meta])* $name:ident, $field:literal) => {
@@ -739,6 +1067,58 @@ impl PreparedTransition {
     }
 }
 
+/// Builds the one provider-independent manifest admitted for Store genesis.
+/// The digest is derived from the complete manifest shape and is shared by
+/// every adapter; no provider name or zero digest is accepted as a substitute.
+pub fn genesis_manifest() -> Result<NamedOperationManifest, StoreError> {
+    NamedOperationManifest::new(
+        GENESIS_MANIFEST_NAME,
+        CONTRACT_VERSION,
+        vec![TransitionClass::RecoverySchema],
+        EffectClass::ReversibleMutation,
+        3_145_728,
+        3_145_728,
+        1_000,
+    )
+}
+
+/// Derives the canonical neutral transition used to issue and validate every
+/// genesis receipt. The fixed scope/order values exist only because the
+/// universal `ReceiptCore` requires them: they are not a Governor `WorkScope`
+/// and must never be persisted or advanced as a revision/order head.
+pub fn genesis_transition(
+    context: &RequestMeta,
+    request: &StoreGenesisRequest,
+) -> Result<PreparedTransition, StoreError> {
+    request.validate_for_context(context)?;
+    let manifest = genesis_manifest()?;
+    let transition = PreparedTransition {
+        identity: OperationIdentity {
+            operation_id: request.operation_id.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            canonical_request_hash: request.canonical_request_hash.clone(),
+        },
+        state_fence: request.state_fence.clone(),
+        scope_id: ScopeId::new(GENESIS_RECEIPT_SCOPE_ID)?,
+        task_id: None,
+        ordering_scopes: vec![OrderingScopeId::new(GENESIS_RECEIPT_ORDERING_SCOPE)?],
+        transition_class: TransitionClass::RecoverySchema,
+        requested_effect_ceiling: EffectClass::ReversibleMutation,
+        admission_contract_set_digest: manifest.digest.as_str().to_owned(),
+        operation_manifest_digest: manifest.digest.clone(),
+        named_operations: Vec::new(),
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: Vec::new(),
+    };
+    transition.validate_against_manifest(&manifest)?;
+    Ok(transition)
+}
+
 /// Projection publication status, with explicit lag and split-view states.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1085,6 +1465,57 @@ pub fn issue_store_receipt_envelope(
     .map_err(StoreError::Receipt)
 }
 
+/// Issues the canonical Store-owned envelope for a genesis receipt. Adapter
+/// implementations supply only durable commit identity/sequence fields; the
+/// manifest, transition class, neutral `ReceiptCore` scope and authority
+/// binding all come from [`genesis_transition`].
+pub fn issue_genesis_receipt_envelope(
+    context: &RequestMeta,
+    request: &StoreGenesisRequest,
+    receipt: &WriteReceipt,
+    commit_sequence: u64,
+) -> Result<ReceiptEnvelope, StoreError> {
+    let transition = genesis_transition(context, request)?;
+    validate_genesis_receipt_shape(receipt)?;
+    receipt.validate()?;
+    issue_store_receipt_envelope(context, &transition, receipt, commit_sequence)
+}
+
+/// Validates a recovered genesis receipt against the canonical neutral
+/// transition and its exact Store-owned envelope.
+pub fn validate_genesis_receipt_envelope(
+    context: &RequestMeta,
+    request: &StoreGenesisRequest,
+    receipt: &WriteReceipt,
+) -> Result<(), StoreError> {
+    let transition = genesis_transition(context, request)?;
+    validate_genesis_receipt_shape(receipt)?;
+    receipt.validate()?;
+    validate_store_receipt_envelope(context, &transition, receipt)
+}
+
+fn validate_genesis_receipt_shape(receipt: &WriteReceipt) -> Result<(), StoreError> {
+    if receipt.transition_class != TransitionClass::RecoverySchema {
+        return Err(StoreError::InvalidField {
+            field: "transition_class",
+            reason: "genesis receipt must use RecoverySchema",
+        });
+    }
+    if receipt.ordering_sequences.is_empty()
+        && receipt.revision_before_after.is_empty()
+        && receipt.emitted_event_ids.is_empty()
+        && receipt.projection_refs.is_empty()
+        && receipt.outbox_refs.is_empty()
+    {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidField {
+            field: "genesis.receipt",
+            reason: "genesis receipt must not imply revision/order or side effects",
+        })
+    }
+}
+
 fn validate_receipt_inputs(
     context: &RequestMeta,
     transition: &PreparedTransition,
@@ -1395,6 +1826,27 @@ pub trait CanonicalStoreClient: Send + Sync {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError>;
 
+    /// Reads one bounded, same-fence recovery snapshot. Wave 1 keeps the
+    /// provider/state implementation out of this neutral contract crate.
+    async fn recovery(
+        &self,
+        request: StoreRecoveryRequest,
+    ) -> Result<StoreRecoverySnapshot, StoreError> {
+        request.validate()?;
+        Err(StoreError::Unavailable)
+    }
+
+    /// Atomically seeds an all-absent store genesis state. Wave 1 only
+    /// defines the contract; adapters may opt in when state support lands.
+    async fn initialize_genesis(
+        &self,
+        context: &RequestMeta,
+        request: StoreGenesisRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        request.validate_for_context(context)?;
+        Err(StoreError::Unavailable)
+    }
+
     /// Resolves a final receipt by operation identity.
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError>;
     /// Reads revision heads by stable key.
@@ -1576,6 +2028,425 @@ mod tests {
         let mut unknown = serde_json::to_value(valid)?;
         unknown["unknown"] = serde_json::json!(true);
         assert!(serde_json::from_value::<CanonicalValidationSnapshot>(unknown).is_err());
+        Ok(())
+    }
+
+    fn recovery_record(key: &str, payload: &[u8]) -> RecoveryRecord {
+        RecoveryRecord {
+            namespace: "owner".to_owned(),
+            key: key.to_owned(),
+            state_fence: fence(),
+            revision: 1,
+            schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+            payload: payload.to_vec(),
+            value_digest: sha256_hex(payload),
+        }
+    }
+
+    fn recovery_snapshot(records: Vec<RecoveryRecord>) -> StoreRecoverySnapshot {
+        StoreRecoverySnapshot {
+            contract_version: CONTRACT_VERSION,
+            state_fence: fence(),
+            validation_revision: 1,
+            canonical_scope: ScopeRevisionView {
+                scope_id: ScopeId::new("governor").expect("scope"),
+                revision_heads: Vec::new(),
+                ordering_heads: Vec::new(),
+                state_fence: fence(),
+            },
+            owner_records: records,
+            job_records: Vec::new(),
+            receipts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recovery_record_rejects_unknown_fields_digest_case_and_revision() {
+        let valid = recovery_record("one", b"canonical-owner");
+        let mut unknown = serde_json::to_value(&valid).expect("serialize");
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RecoveryRecord>(unknown).is_err());
+
+        let mut digest = valid.clone();
+        digest.value_digest = digest.value_digest.to_uppercase();
+        assert!(digest.validate().is_err());
+        digest.value_digest = sha256_hex(b"different");
+        assert!(digest.validate().is_err());
+
+        let mut zero_revision = valid;
+        zero_revision.revision = 0;
+        assert!(matches!(
+            zero_revision.validate(),
+            Err(StoreError::InvalidField {
+                field: "recovery.revision",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recovery_snapshot_rejects_duplicate_and_mixed_fence_records() {
+        let record = recovery_record("one", b"payload");
+        let duplicate = recovery_snapshot(vec![record.clone(), record]);
+        assert!(matches!(
+            duplicate.validate(),
+            Err(StoreError::Duplicate {
+                field: "recovery.record_keys"
+            })
+        ));
+
+        let mut stale = recovery_record("one", b"payload");
+        stale.state_fence = StateFence::new(
+            AuthorityEpoch::new(2).expect("epoch"),
+            ResourceGeneration::genesis(),
+        );
+        assert_eq!(
+            recovery_snapshot(vec![stale]).validate(),
+            Err(StoreError::FenceMismatch)
+        );
+    }
+
+    #[test]
+    fn recovery_bounds_count_record_bytes_and_total_packet() {
+        let too_many = recovery_snapshot(
+            (0..=MAX_RECOVERY_OWNER_RECORDS)
+                .map(|index| recovery_record(&index.to_string(), b"payload"))
+                .collect(),
+        );
+        assert_eq!(too_many.validate(), Err(StoreError::PayloadTooLarge));
+
+        let too_large = recovery_record("large", &vec![b'x'; MAX_RECOVERY_RECORD_BYTES + 1]);
+        assert_eq!(too_large.validate(), Err(StoreError::PayloadTooLarge));
+
+        let packet = recovery_snapshot(
+            (0..7)
+                .map(|index| {
+                    recovery_record(&index.to_string(), &vec![b'x'; MAX_RECOVERY_RECORD_BYTES])
+                })
+                .collect(),
+        );
+        assert_eq!(packet.validate(), Err(StoreError::PayloadTooLarge));
+    }
+
+    #[test]
+    fn recovery_wire_variants_round_trip_and_deny_unknown_fields() {
+        let request = StoreRequest::Recovery {
+            request: StoreRecoveryRequest {
+                contract_version: CONTRACT_VERSION,
+                state_fence: fence(),
+                records: vec![RecoveryRecordKey::new("owner", "one").expect("key")],
+                include_receipts: true,
+                include_jobs: true,
+            },
+        };
+        let encoded = serde_json::to_value(&request).expect("encode request");
+        assert_eq!(
+            serde_json::from_value::<StoreRequest>(encoded.clone()).expect("decode request"),
+            request
+        );
+        let mut unknown = encoded;
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<StoreRequest>(unknown).is_err());
+
+        let response = StoreResponse::Recovery {
+            snapshot: recovery_snapshot(vec![recovery_record("one", b"payload")]),
+        };
+        let encoded = serde_json::to_value(&response).expect("encode response");
+        assert_eq!(
+            serde_json::from_value::<StoreResponse>(encoded).expect("decode response"),
+            response
+        );
+    }
+
+    fn genesis_request() -> Result<StoreGenesisRequest, StoreError> {
+        StoreGenesisRequest {
+            contract_version: CONTRACT_VERSION,
+            operation_id: OperationId::new("genesis-1").map_err(StoreError::Foundation)?,
+            idempotency_key: "genesis-retry-1".to_owned(),
+            canonical_request_hash: String::new(),
+            state_fence: fence(),
+            owner_records: vec![recovery_record("current", br#"{"current_plan":null}"#)],
+        }
+        .with_computed_digest()
+    }
+
+    fn genesis_context() -> Result<RequestMeta, StoreError> {
+        Ok(RequestMeta {
+            request_id: eliot_contracts::RequestId::new("genesis-request")
+                .map_err(StoreError::Foundation)?,
+            session_id: None,
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("product")
+                .map_err(StoreError::Foundation)?,
+            source_id: eliot_contracts::SourceId::new("source").map_err(StoreError::Foundation)?,
+            state_fence: fence(),
+            clock: eliot_contracts::ClockReading::default(),
+        })
+    }
+
+    fn genesis_receipt(
+        context: &RequestMeta,
+        request: &StoreGenesisRequest,
+        commit_sequence: u64,
+    ) -> Result<WriteReceipt, StoreError> {
+        let transition = genesis_transition(context, request)?;
+        let mut receipt = WriteReceipt {
+            operation_id: request.operation_id.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            canonical_request_hash: request.canonical_request_hash.clone(),
+            transition_class: TransitionClass::RecoverySchema,
+            status: WriteReceiptStatus::Committed,
+            commit_id: Some(CommitId::new("commit-genesis")?),
+            state_fence: request.state_fence.clone(),
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: vec!["genesis-seed".to_owned()],
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: transition.operation_manifest_digest,
+            error_code: None,
+            resubmission: Resubmission::None,
+            committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
+            envelope: None,
+        };
+        receipt.envelope = Some(issue_genesis_receipt_envelope(
+            context,
+            request,
+            &receipt,
+            commit_sequence,
+        )?);
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    #[test]
+    fn genesis_requires_a_nonempty_opaque_owner_seed() -> Result<(), StoreError> {
+        let request = genesis_request()?;
+        request.validate()?;
+
+        let mut empty = request;
+        empty.owner_records.clear();
+        assert!(matches!(
+            empty.validate(),
+            Err(StoreError::Empty {
+                field: "genesis.owner_records"
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_derivation_is_deterministic_and_uses_a_real_manifest_digest()
+    -> Result<(), StoreError> {
+        let context = genesis_context()?;
+        let request = genesis_request()?;
+        assert_eq!(request.canonical_request_hash, request.compute_digest()?);
+        let first = genesis_transition(&context, &request)?;
+        let second = genesis_transition(&context, &request)?;
+        assert_eq!(first, second);
+        assert_eq!(first.transition_class, TransitionClass::RecoverySchema);
+        assert_eq!(
+            first.requested_effect_ceiling,
+            EffectClass::ReversibleMutation
+        );
+        assert_eq!(
+            first.admission_contract_set_digest,
+            first.operation_manifest_digest.as_str()
+        );
+        assert_ne!(first.operation_manifest_digest.as_str(), "0".repeat(64));
+        assert_ne!(
+            first.operation_manifest_digest.as_str(),
+            "memory-genesis-v1"
+        );
+        assert!(genesis_manifest()?.validate().is_ok());
+        assert!(first.named_operations.is_empty());
+        assert!(first.event_projection_relation_intents.event_ids.is_empty());
+        assert!(
+            first
+                .event_projection_relation_intents
+                .projection_kinds
+                .is_empty()
+        );
+        assert!(
+            first
+                .event_projection_relation_intents
+                .relation_kinds
+                .is_empty()
+        );
+        assert!(first.required_proof_and_approval_refs.is_empty());
+        assert_eq!(first.security, SecurityContext::default());
+        assert_eq!(first.scope_id.as_str(), GENESIS_RECEIPT_SCOPE_ID);
+        assert_eq!(
+            first.ordering_scopes[0].as_str(),
+            GENESIS_RECEIPT_ORDERING_SCOPE
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_rejects_stale_digest_after_owner_record_mutations() -> Result<(), StoreError> {
+        let request = genesis_request()?;
+
+        let mut payload = request.clone();
+        payload.owner_records[0].payload = br#"{"current_plan":"changed"}"#.to_vec();
+        payload.owner_records[0].value_digest = sha256_hex(&payload.owner_records[0].payload);
+        assert_eq!(
+            payload.validate(),
+            Err(StoreError::InvalidField {
+                field: "canonical_request_hash",
+                reason: "does not match canonical genesis request",
+            })
+        );
+
+        let mut key = request.clone();
+        key.owner_records[0].key = "other".to_owned();
+        assert_eq!(
+            key.validate(),
+            Err(StoreError::InvalidField {
+                field: "canonical_request_hash",
+                reason: "does not match canonical genesis request",
+            })
+        );
+
+        let mut schema = request;
+        schema.owner_records[0].schema = "opaque-owner-v2".to_owned();
+        assert_eq!(
+            schema.validate(),
+            Err(StoreError::InvalidField {
+                field: "canonical_request_hash",
+                reason: "does not match canonical genesis request",
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_rejects_task_session_and_semantic_or_stale_fences()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = genesis_request()?;
+        let mut context = genesis_context()?;
+
+        context.task_id = Some(eliot_contracts::TaskId::new("task")?);
+        assert!(matches!(
+            request.validate_for_context(&context),
+            Err(StoreError::InvalidField {
+                field: "genesis.context",
+                ..
+            })
+        ));
+
+        context.task_id = None;
+        context.session_id = Some(eliot_contracts::SessionId::new("session")?);
+        assert!(matches!(
+            request.validate_for_context(&context),
+            Err(StoreError::InvalidField {
+                field: "genesis.context",
+                ..
+            })
+        ));
+
+        let mut stale = request.clone();
+        stale.state_fence = StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::genesis());
+        assert_eq!(stale.validate(), Err(StoreError::FenceMismatch));
+
+        let mut semantic = request;
+        semantic.state_fence.task_revision = Some(eliot_contracts::TaskRevision::new(1)?);
+        assert_eq!(semantic.validate(), Err(StoreError::FenceMismatch));
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_envelope_is_shared_fenced_and_has_no_head_deltas() -> Result<(), StoreError> {
+        let context = genesis_context()?;
+        let request = genesis_request()?;
+        let receipt = genesis_receipt(&context, &request, 1)?;
+        assert!(receipt.ordering_sequences.is_empty());
+        assert!(receipt.revision_before_after.is_empty());
+        assert!(receipt.emitted_event_ids.is_empty());
+        assert!(receipt.projection_refs.is_empty());
+        assert!(receipt.outbox_refs.is_empty());
+        validate_genesis_receipt_envelope(&context, &request, &receipt)?;
+
+        let mut substituted = receipt;
+        substituted
+            .envelope
+            .as_mut()
+            .ok_or(StoreError::MissingReceiptEnvelope)?
+            .core
+            .operation
+            .operation_id = OperationId::new("substituted").map_err(StoreError::Foundation)?;
+        assert!(validate_genesis_receipt_envelope(&context, &request, &substituted).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_and_genesis_caps_are_not_advertised_before_provider_support() {
+        assert!(!CAPABILITIES.contains(&CAPABILITY_RECOVERY));
+        assert!(!CAPABILITIES.contains(&CAPABILITY_INITIALIZE_GENESIS));
+    }
+
+    #[test]
+    fn genesis_identity_mismatch_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let request = genesis_request()?;
+        let metadata = RequestMeta {
+            request_id: eliot_contracts::RequestId::new("request-1")?,
+            session_id: None,
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("product")?,
+            source_id: eliot_contracts::SourceId::new("source")?,
+            state_fence: fence(),
+            clock: eliot_contracts::ClockReading::default(),
+        };
+        let identity = eliot_protocol::RequestIdentity {
+            request: eliot_receipts::RequestBinding {
+                metadata: metadata.clone(),
+                state_fence: fence(),
+            },
+            idempotency_key: "different-retry".to_owned(),
+            deadline_unix_ms: 1,
+            cancellation_id: "cancel-1".to_owned(),
+        };
+        let wire_request = StoreRequest::InitializeGenesis {
+            context: metadata.clone(),
+            request,
+        };
+        assert!(matches!(
+            wire_request.validate_for_identity(&metadata.request_id, &identity),
+            Err(StoreWireError::Identity(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_response_rejects_non_recovery_transition_class() -> Result<(), StoreError> {
+        let receipt = WriteReceipt {
+            operation_id: OperationId::new("genesis-1").map_err(StoreError::Foundation)?,
+            idempotency_key: "genesis-retry-1".to_owned(),
+            canonical_request_hash: "a".repeat(64),
+            transition_class: TransitionClass::CaptureCandidate,
+            status: WriteReceiptStatus::Rejected,
+            commit_id: None,
+            state_fence: fence(),
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: Vec::new(),
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: OperationManifestDigest::new("manifest")?,
+            error_code: Some(ErrorCode::Conflict),
+            resubmission: Resubmission::None,
+            committed_at: None,
+            envelope: None,
+        };
+        assert!(matches!(
+            StoreResponse::Genesis { receipt }.validate(),
+            Err(StoreWireError::Store(StoreError::InvalidField {
+                field: "transition_class",
+                ..
+            }))
+        ));
         Ok(())
     }
 }
