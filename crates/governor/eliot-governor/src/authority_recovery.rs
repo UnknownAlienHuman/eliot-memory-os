@@ -113,6 +113,8 @@ impl AuthorityOwnerSnapshot {
 /// Authority owner retaining only restored, pure authority state.
 #[derive(Clone, Debug)]
 pub struct AuthorityOwner {
+    /// Exact Governor recovery fence retained with the restored authority state.
+    state_fence: StateFence,
     /// Effect-level authorizer restored from its complete typed snapshot.
     pub effects: EffectAuthorizer,
     /// Grant graph lineage restored from its complete typed snapshot.
@@ -129,6 +131,29 @@ impl AuthorityOwner {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let effects = EffectAuthorizer::from_snapshot(snapshot.effect_authorizer.clone())
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        Ok(Self { effects, grants })
+        Ok(Self {
+            state_fence: snapshot.state_fence.clone(),
+            effects,
+            grants,
+        })
+    }
+
+    /// Returns the exact fence retained by this authority owner.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Emits the complete deterministic typed authority recovery payload.
+    pub fn snapshot(&self) -> Result<AuthorityOwnerSnapshot, CompositionError> {
+        let grant_graph = self
+            .grants
+            .recovery_snapshot()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let effect_authorizer = self
+            .effects
+            .snapshot()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        AuthorityOwnerSnapshot::new(self.state_fence.clone(), grant_graph, effect_authorizer)
     }
 }
