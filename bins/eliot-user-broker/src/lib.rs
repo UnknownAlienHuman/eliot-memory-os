@@ -26,118 +26,22 @@ use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::RequestIdentity;
 use eliot_user_broker_core::{
     AuthorityPort, BrokerError, BrokerSnapshot, DurableRegistrationPort, HeartbeatReceipt,
-    HeartbeatRequest, LaunchGrant, LaunchRequest, OperatorArtifact, PortError, ProcessPort,
-    ProcessStartOutcome, RegistrationReceipt, RegistrationRequest, RequiredProvider, UserBroker,
+    HeartbeatRequest, LaunchGrant, LaunchRequest, PortError, ProcessPort, ProcessStartOutcome,
+    RegistrationReceipt, RequiredProvider, UserBroker,
 };
-use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod kernel_authority_port;
+mod protected_launch_config;
 use kernel_authority_port::KernelAuthorityPort;
+use protected_launch_config::BrokerLaunchConfig;
 
 pub const SERVICE_NAME: &str = "eliot-user-broker";
 pub const PROTOCOL_VERSION: &str = "eliot.user-broker.v1";
-const LAUNCH_CONFIG_RELATIVE_PATH: &str = "Eliot/user-broker/launch.json";
 const SNAPSHOT_RELATIVE_DIRECTORY: &str = "Eliot/user-broker";
 const SNAPSHOT_LIMIT: u64 = 16 * 1024 * 1024;
-
-/// Installation-owned launch declaration.  It is loaded through a retained
-/// protected handle; stdin never supplies any of these identities or keys.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrokerLaunchConfig {
-    pub registration: RegistrationRequest,
-    pub request_identity: RequestIdentity,
-    pub operator_artifact: OperatorArtifactConfig,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OperatorArtifactConfig {
-    pub image_id: String,
-    pub executable: String,
-    pub artifact_digest: String,
-}
-
-fn artifact_digest() -> Result<String, CompositionError> {
-    let executable = std::env::current_exe().map_err(CompositionError::Durable)?;
-    let bytes = fs::read(executable).map_err(CompositionError::Durable)?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
-}
-
-fn validate_launch_config(config: &BrokerLaunchConfig) -> Result<(), CompositionError> {
-    config
-        .registration
-        .validate()
-        .map_err(|error| CompositionError::Launch(error.to_string()))?;
-    config
-        .request_identity
-        .validate()
-        .map_err(|error| CompositionError::Launch(error.to_string()))?;
-    let expected_pid = std::process::id().to_string();
-    if config.registration.broker_process_id != expected_pid {
-        return Err(CompositionError::Launch(
-            "protected broker process identity does not match current process".to_owned(),
-        ));
-    }
-    if !config
-        .registration
-        .broker_artifact_digest
-        .eq_ignore_ascii_case(&artifact_digest()?)
-    {
-        return Err(CompositionError::Launch(
-            "protected broker artifact digest does not match current executable".to_owned(),
-        ));
-    }
-    OperatorArtifact {
-        image_id: config.operator_artifact.image_id.clone(),
-        executable: config.operator_artifact.executable.clone(),
-        artifact_digest: config.operator_artifact.artifact_digest.clone(),
-    }
-    .validate()
-    .map_err(|error| CompositionError::Launch(error.to_string()))?;
-    #[cfg(windows)]
-    {
-        let identity = eliot_platform_windows::current_process_named_pipe_expectation()
-            .map_err(|error| CompositionError::Launch(error.to_string()))?;
-        if config.registration.windows_sid != identity.expected_sid()
-            || config.registration.interactive_session_id
-                != identity.expected_session_id().to_string()
-        {
-            return Err(CompositionError::Launch(
-                "protected broker SID/session does not match current token".to_owned(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Loads the protected installation launch declaration and returns its retained
-/// no-follow/reparse-safe file lease to the composition owner.
-fn load_protected_launch_config()
--> Result<(BrokerLaunchConfig, ProtectedPathLease), CompositionError> {
-    #[cfg(not(windows))]
-    {
-        Err(CompositionError::Kernel(
-            "Windows protected broker launch configuration".to_owned(),
-        ))
-    }
-    #[cfg(windows)]
-    {
-        let path = eliot_platform_windows::protected_program_data_path(LAUNCH_CONFIG_RELATIVE_PATH)
-            .map_err(|error| CompositionError::Protected(error.to_string()))?;
-        let lease = ProtectedPathLease::open_existing_absolute(&path)
-            .map_err(|error| CompositionError::Protected(error.to_string()))?;
-        let bytes = lease
-            .read_bounded(64 * 1024)
-            .map_err(|error| CompositionError::Protected(error.to_string()))?;
-        let config = serde_json::from_slice(&bytes).map_err(CompositionError::Encoding)?;
-        validate_launch_config(&config)?;
-        Ok((config, lease))
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerConfig {
@@ -660,7 +564,8 @@ impl BrokerComposition {
     /// front door. The binary never substitutes a local authority/process
     /// provider when this composition is unavailable.
     pub fn start_with_kernel(config: BrokerConfig) -> Result<Self, CompositionError> {
-        let (launch_config, launch_lease) = load_protected_launch_config()?;
+        let (launch_config, launch_lease) =
+            protected_launch_config::load_protected_launch_config()?;
         let client = eliot_cli::kernel_client::KernelClient::load()
             .map_err(|error| CompositionError::Kernel(error.to_string()))?;
         let client = Arc::new(Mutex::new(client));
