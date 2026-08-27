@@ -95,17 +95,34 @@ impl KernelTransitionPort for DaemonKernelClient {
     }
 
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
+        let state_fence = self.kernel_binding.state_fence.clone();
         Box::pin(async move {
             let value = self
                 .transact_async(
                     "receipt",
-                    serde_json::json!({ "operation_id": operation_id }),
+                    serde_json::json!({
+                        "operation_id": operation_id.clone(),
+                        "state_fence": state_fence.clone(),
+                    }),
                 )
                 .await
                 .map_err(kernel_port_error)?;
             let value = kind_value(&value, "receipt")?;
-            serde_json::from_value(value)
-                .map_err(|error| KernelPortError::Contract(error.to_string()))
+            let Some(receipt) = serde_json::from_value::<Option<WriteReceipt>>(value)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?
+            else {
+                return Ok(None);
+            };
+            receipt
+                .validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if receipt.operation_id != operation_id || receipt.state_fence != state_fence {
+                return Err(KernelPortError::Contract(
+                    "daemon receipt does not match the requested operation and active state fence"
+                        .to_owned(),
+                ));
+            }
+            Ok(Some(receipt))
         })
     }
 
