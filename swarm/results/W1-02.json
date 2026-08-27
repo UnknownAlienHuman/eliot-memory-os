@@ -12,19 +12,19 @@
     "historical_baseline": 1371,
     "historical_baseline_status": "CONTRACT_CHALLENGE_UNKNOWN_BASELINE",
     "historical_baseline_note": "1371 is non-binding because its source methodology is unavailable and was not reproduced; current count is independently generated.",
-    "current_row_count": 751,
+    "current_row_count": 766,
     "classification_counts": {
-      "Designed": 118,
+      "Designed": 122,
       "Unimplemented": 119,
-      "Unknown": 514
+      "Unknown": 525
     },
     "anchor_uncertainty": {
-      "unknown_normative_anchor_count": 744,
-      "unknown_work_item_anchor_count": 721,
+      "unknown_normative_anchor_count": 759,
+      "unknown_work_item_anchor_count": 736,
       "note": "UNKNOWN anchors are explicit evidence gaps: the source span contains no validated normative/work identifier; they are not inferred from the historical 1371 baseline."
     },
-    "source_file_count": 581,
-    "source_digest_aggregate": "38fea75ebf0c40e7a008c88b00a03ca8f38a82502e17c0718a0320ad6c41686b",
+    "source_file_count": 584,
+    "source_digest_aggregate": "018fbab4e02cee45959a6472598d39710e5ac44b6a5fe28d1bcc2e91f3f871af",
     "normative_pair_sha256": "041c9bb09db91b8bd8b8c073270c6220cf534b746fcf7faadf705094218b99b1",
     "normative_pair_paths": [
       "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -65,11 +65,11 @@
       "source_files": [
         {
           "path": "bins/eliot-agent-bridge/src/lib.rs",
-          "sha256": "c1a62517fb3a015fd7df06dafb9b81f5654acfd113a4830429156c6ebcfe264c"
+          "sha256": "0ee791bc856e0c47501358536e908fcdf445d078e954d811c0ace8e995d585f1"
         },
         {
           "path": "bins/eliot-agent-bridge/src/main.rs",
-          "sha256": "74e8fc1bd15d3add94edadd8aa4d36f839335c88e044339fd5a2273d22209f27"
+          "sha256": "dc9780e999c7e9a1dd0564d5ad5368c89e4028b9f23b7a60881a7a3b93e821c3"
         },
         {
           "path": "bins/eliot-doctor/src/lib.rs",
@@ -89,15 +89,15 @@
         },
         {
           "path": "bins/eliot-host/src/credential_control.rs",
-          "sha256": "b86e2660202a888861b88890a5e7b6aad9ddce67a7135168dd08cef5ab714919"
+          "sha256": "767cc792b21aef6aadf1d15ad3d86bc9496909f58ef2bb0720c53b849235256f"
         },
         {
           "path": "bins/eliot-host/src/host_activation_durable.rs",
-          "sha256": "b1b736173bbf8343b6bec9d7328dd6adcc47bcfe3c13a912b6737bd8cc9ff34c"
+          "sha256": "470bb47efe51fdeb7a31e4837ce7bd775240012e75c95e4c544198ea1edceaf3"
         },
         {
           "path": "bins/eliot-host/src/host_composition_phase_b.rs",
-          "sha256": "a8fab931d089c07ab2a5363085bf566ffd6d13b25923d090006ece82dc68074f"
+          "sha256": "4a4d9ea284c225088afd6982a6faf754d18c38e7d0e155898897c0e7e19b1299"
         },
         {
           "path": "bins/eliot-host/src/host_composition_store_recovery.rs",
@@ -105,7 +105,7 @@
         },
         {
           "path": "bins/eliot-host/src/host_composition_validation.rs",
-          "sha256": "d4834156dc5f7e31d54ee8c5d80ffd61708832889e979de90059aa1428eb3433"
+          "sha256": "781b34a899e1662ca1f1abec69055ee7108e4126c2df75aefb141ed8e711084d"
         },
         {
           "path": "bins/eliot-host/src/host_epoch_reopen.rs",
@@ -117,7 +117,7 @@
         },
         {
           "path": "bins/eliot-host/src/journal_tests.rs",
-          "sha256": "f6edd3bd90e3fee75ccb0dbdeb69061d81517feacc00a8ca795dcd074e5b85cb"
+          "sha256": "f599c52e3a941593099160c4944a91352098515fbac58fc0bbf5f229b6943ee8"
         },
         {
           "path": "bins/eliot-host/src/kernel_activation_driver.rs",
@@ -137,15 +137,15 @@
         },
         {
           "path": "bins/eliot-host/src/lib.rs",
-          "sha256": "cbbf0858c4d2290b46eb7478e96645ed8f160a68ee49ae5958b760a0609223f4"
+          "sha256": "47a62b81ca12f94291cedaf57ff8cd55461878946ac7e358804ba1578f7ede36"
         },
         {
           "path": "bins/eliot-host/src/main.rs",
-          "sha256": "b688c736de98edb0b08f88b26422e17aaed0551879d47afcc35ae3086046c966"
+          "sha256": "bbf5b80d99acf5a084723f43944f7291d5f94688505ebdc0025077c506d77843"
         },
         {
           "path": "bins/eliot-host/src/phase_b_materialization.rs",
-          "sha256": "f2d897d792df81c84b66508c8a31ad498761bac5276178babe0956c16ffebc2b"
+          "sha256": "8e1d93f4de4bcec4921346cb5c734cf025019c7567b523bda4b5744d06693f6d"
         },
         {
           "path": "bins/eliot-host/src/phase_b_previous_authority.rs",
@@ -157,7 +157,7 @@
         },
         {
           "path": "bins/eliot-host/src/phase_b_projection.rs",
-          "sha256": "f786ea035a22732390ead3792a74a46f3a4a655891de8c21a8c2cbe64de0f28b"
+          "sha256": "e55459db15ac9a1872e93f807d5d010ef1095f489077e569825977744ccf17ef"
         },
         {
           "path": "bins/eliot-host/src/readiness_gate.rs",
@@ -205,11 +205,19 @@
         },
         {
           "path": "bins/eliot-kernel/src/lib.rs",
-          "sha256": "e6b0bb892234da44818184824a12c2404a5712791dea0d86b93914c6162656cd"
+          "sha256": "3794ffe8a3b417fe85e9fd53ab2a60953dd4bbba42933f81ead4c1c8dff12607"
         },
         {
           "path": "bins/eliot-kernel/src/main.rs",
-          "sha256": "55b01604e174b320fd787a5a0562d9b154b717c76b3643b79d34579ee75584b6"
+          "sha256": "29f097bd75bb1b98338acd8d70bbb0d2d646e8a1a5aec57811b0605310db2356"
+        },
+        {
+          "path": "bins/eliot-kernel/src/r13_os_harness.rs",
+          "sha256": "8f018c672b086ed7b36f0300ae74f3e5e41a45fecad254cfe4798f3273d0c49a"
+        },
+        {
+          "path": "bins/eliot-kernel/src/r13_two_token_harness.rs",
+          "sha256": "67d6f9070465150c80e9623a34a38c0ee79aa6020c0ecfaa595550bddb62ab5e"
         },
         {
           "path": "bins/eliot-mod-research/src/lib.rs",
@@ -237,7 +245,7 @@
         },
         {
           "path": "bins/eliot-store-surreal/src/lib.rs",
-          "sha256": "1f9cb634cd6ed7dada5fdf4fe76b52df851c32b70928ab90b9e38ec57b8d6be8"
+          "sha256": "0029fb6ff009a8b3f510f3eceaa6e99a5db7e77a9b6592d722739b4bde8cb70c"
         },
         {
           "path": "bins/eliot-store-surreal/src/main.rs",
@@ -273,7 +281,7 @@
         },
         {
           "path": "bins/eliot-watchdog/src/lib.rs",
-          "sha256": "79fc1a37b0c884d70055f1bcc9bdcc862cb1cc31ae161e93712dc352b9ddbafa"
+          "sha256": "a0d92929cac4cc5aade88a15147df0ba7d75f43ec5a7de91083e2e94b7c4b83b"
         },
         {
           "path": "bins/eliot-watchdog/src/main.rs",
@@ -281,7 +289,7 @@
         },
         {
           "path": "bins/eliot-watchdog/src/registry_fixture.rs",
-          "sha256": "6635b131afa5def88564c1d2ddbb202313e84cd798c63090425cdd8204e3583d"
+          "sha256": "96c813e1200819a88ddf8c8c14d0147e7f29470ff769596d335f80707fc69041"
         },
         {
           "path": "bins/eliot/src/bootstrap_draft.rs",
@@ -289,11 +297,11 @@
         },
         {
           "path": "bins/eliot/src/main.rs",
-          "sha256": "d73d1f4126b77756bccfaa50ea33fd22171ccaddf1ff1a9988c7bc79a27aabcf"
+          "sha256": "d336d7dc0221d67e247ae84928d45a8f4e7ccae379a0cce67627b543cf0edecc"
         },
         {
           "path": "bins/eliot/src/source_bundle_materializer.rs",
-          "sha256": "45753169124719f5da1978ce9dbbc490cb6411428a950a13abda701ed017eba4"
+          "sha256": "b655d8916fba0b9bc5a25b8086ab0476fcce539a2c44ca09bcd68e70102bdbd3"
         },
         {
           "path": "bins/eliot/tests/bootstrap_brief.rs",
@@ -301,15 +309,15 @@
         },
         {
           "path": "bins/eliot/tests/system_snapshot.rs",
-          "sha256": "616110899c1dc7d5eadebfb620882f1b7fd6bf9943820e84c6dcea17aaaf7d8f"
+          "sha256": "f971581504dc2077494f9846de0f92a542efbff6eb89ab0418a37e0ef7d7b900"
         },
         {
           "path": "bins/eliotd/src/lib.rs",
-          "sha256": "bf576885dfba103ccc5c020a3a39bc30ded2ae641f3503c12c90846721c9aad6"
+          "sha256": "6c6cbf6b74ec10d5ab52ba5702d5a94a4b8277b64ebd7f3d93db38542ffc37b0"
         },
         {
           "path": "bins/eliotd/src/main.rs",
-          "sha256": "0c35eca979aa9ebec84e45b4f4218e1b8e2c7a82c406f1129d4a6f5c78f6620b"
+          "sha256": "8e08fdb4767cb7494c12f846cd62068f898ac7536978f9b5974f5968d3111004"
         },
         {
           "path": "crates/agent/eliot-agent-acp/src/lib.rs",
@@ -1585,7 +1593,7 @@
         },
         {
           "path": "crates/foundation/eliot-protocol/src/lib.rs",
-          "sha256": "7a3d1c5a9f5b1839d71622448da3399087db26dfccf23004930b6019db84e0cb"
+          "sha256": "a2015209dda212d9c464d944369a2e8b03ee6081fcea3e49fde80f00072f48b9"
         },
         {
           "path": "crates/foundation/eliot-receipts/src/lib.rs",
@@ -1649,11 +1657,11 @@
         },
         {
           "path": "crates/governor/eliot-authority/src/effects.rs",
-          "sha256": "5dd558ac5fb8946461b2f4c78fe631f4d793b2660cfc11fdd9f7df0f2100df20"
+          "sha256": "13830e32bdca817119b39b997a8453e4cd4220ae49887ae37633d1acd9d48196"
         },
         {
           "path": "crates/governor/eliot-authority/src/grants.rs",
-          "sha256": "6707534513211a527c5861b26a0c6d9317c9cc5c5e8b59a1b81b6e3a02dd0c01"
+          "sha256": "271634cfa4ff8924e51bcc14732fcb3790db948cf1a69e1f02cabc359d16e210"
         },
         {
           "path": "crates/governor/eliot-authority/src/leases.rs",
@@ -1661,7 +1669,7 @@
         },
         {
           "path": "crates/governor/eliot-authority/src/lib.rs",
-          "sha256": "a8794b51854bea20f79c64451684a50a2ba1a99b69d4307972b601e73a293397"
+          "sha256": "9cb37d51986904a2f6d4fa78c8dcf521dd0df7e8a4fa8da4f5bc13731bf942a2"
         },
         {
           "path": "crates/governor/eliot-authority/tests/model.rs",
@@ -1669,7 +1677,7 @@
         },
         {
           "path": "crates/governor/eliot-budget/src/lib.rs",
-          "sha256": "7b8dd60414b40b926bdd4908405e29c8dc1e46afcd6c127953511cee25750054"
+          "sha256": "8bb51604c7e41b3285248480f739fe4a8b13d203f93fbae532f899510f208b5f"
         },
         {
           "path": "crates/governor/eliot-canonical/src/lib.rs",
@@ -1685,7 +1693,7 @@
         },
         {
           "path": "crates/governor/eliot-coordination/src/lib.rs",
-          "sha256": "f0f00b7e21937a0119dfb8cbe4b58d8cc079d245cc07d9227fea1f7830766743"
+          "sha256": "20b267ea94fa968a74210b95a9ddc69817066471a877e9790c1f96849c90adf4"
         },
         {
           "path": "crates/governor/eliot-finish/src/lib.rs",
@@ -1693,7 +1701,7 @@
         },
         {
           "path": "crates/governor/eliot-governor/src/composition.rs",
-          "sha256": "dbd535dcb708a629e52a647bd63a9268228aa6568bba441ef79716c0f5f8471d"
+          "sha256": "f94441bf95710471835f0f7a64c68a3c2c3efe2cf24d99990526900795252c3e"
         },
         {
           "path": "crates/governor/eliot-governor/src/lib.rs",
@@ -1733,7 +1741,7 @@
         },
         {
           "path": "crates/governor/eliot-workscope/src/lib.rs",
-          "sha256": "9c8c4582eb509590ae0804995ad5a611044878bc30d0ccc3be308d2f4f42a628"
+          "sha256": "0eaf637e703aada215d634a394565937e20bdc7acd2d55a4d10cddcbd4275dca"
         },
         {
           "path": "crates/instrument/eliot-artifact/src/binding.rs",
@@ -1928,12 +1936,16 @@
           "sha256": "2c40d30a22e466d4d9864ec2845394d92a92527696cc1b40c667beb525f544e2"
         },
         {
+          "path": "crates/kernel/eliot-installation/src/agent_bridge_profile.rs",
+          "sha256": "6d1eb4da979380e292dd07f58eaa4e3cdc9acb55b6c077b03e055e4625aa234b"
+        },
+        {
           "path": "crates/kernel/eliot-installation/src/credential_provision.rs",
-          "sha256": "21507759c97c31f511f1192be78e893f51077b74865b7cdddd44303cad9dbf9f"
+          "sha256": "a68095fd24b5bfada8cd12c2a0b1c5770c02938c11d37fbdbfc8de74daa7eef4"
         },
         {
           "path": "crates/kernel/eliot-installation/src/lib.rs",
-          "sha256": "c4a0eb2c1e5260f5a6c9434950dc9f4555d9cb79d5d7f61709286d314e1f2ec1"
+          "sha256": "58d8ca17bb47d251ad32b74072a1f84392c97009e80b6d6a7131323a010684b7"
         },
         {
           "path": "crates/kernel/eliot-installation/src/package.rs",
@@ -1941,11 +1953,11 @@
         },
         {
           "path": "crates/kernel/eliot-installation/src/package_planner.rs",
-          "sha256": "96770a1809fc720be3254b988ddbda8b5fe25a3e10b9ab99105701a2ba904bc8"
+          "sha256": "d1efa41cce4f7fa290f8a4af410031239b5a7aa3e571b0191b28d494826555a7"
         },
         {
           "path": "crates/kernel/eliot-installation/src/plan.rs",
-          "sha256": "12cc7c3d41114a10a57f8dc54c811411db18ee6b3ece3c9eeaecd92fea4780a0"
+          "sha256": "08c6bd93a6516fd7423794cc7ca1058e769e072693490402e155dc20e9d1fade"
         },
         {
           "path": "crates/kernel/eliot-installation/src/profile_roots.rs",
@@ -1953,11 +1965,11 @@
         },
         {
           "path": "crates/kernel/eliot-installation/src/redb_state.rs",
-          "sha256": "0ff1309e008f44c54f164f1e5ec3d36102cff69b490d95a7fad51b2a1d18255f"
+          "sha256": "c73bcf49e9e43a2b8400209366a5fd962f5a74d61748b020c260603e3c37c0b3"
         },
         {
           "path": "crates/kernel/eliot-installation/src/registry_wire.rs",
-          "sha256": "232b660bc8a44cd09c4dca0c4117cd4ddb0c72e1b5578bc371686709479d6f42"
+          "sha256": "5bd2db903860ccf8a0fb0849b14dc2dec1cda86d67fda409a53906d46fded12a"
         },
         {
           "path": "crates/kernel/eliot-installation/src/scm_approval.rs",
@@ -1969,15 +1981,15 @@
         },
         {
           "path": "crates/kernel/eliot-installation/src/tests.rs",
-          "sha256": "79553b298de9add5321b2e7204b6628a567798ad076758628424c6dcd26b73d6"
+          "sha256": "fc150766b7fbdf54a50acdfd8773d91fb7fd9b0dad3c528d415fafea2447a9e1"
         },
         {
           "path": "crates/kernel/eliot-installation/src/transaction.rs",
-          "sha256": "d93d9ef15ae2c49b83a1b6b9e4bf82f96a28f61651ab5d24f388fc65663490ca"
+          "sha256": "d001105912d89c7375519c69e6ac7269cda2a0c32de574624f249cd825bb4aa7"
         },
         {
           "path": "crates/kernel/eliot-ipc/src/lib.rs",
-          "sha256": "0c025953ae655ba268133ffa56a31390e06a2f0d615b6e30935187c37745569a"
+          "sha256": "e92bc80148e7d4f1a2cf31a1e4cf18e6444d75bea5945f3967cd7fc680180d02"
         },
         {
           "path": "crates/kernel/eliot-kernel-core/src/authority.rs",
@@ -2025,11 +2037,11 @@
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/protocol.rs",
-          "sha256": "57f6362cd2add8aa0686ed3c1ef8376dfd07ef84ac8afa62d51336e910ce1266"
+          "sha256": "9cb39299f30acb7bae9a80a9f019be1a463b4ad9503fa9887e567f0c5f81f1f2"
         },
         {
           "path": "crates/kernel/eliot-kernel-service/src/store_client.rs",
-          "sha256": "ddc8e3eeb7e0b0f531b52653036515b824fe54b86b36419f805a08aa770bff9a"
+          "sha256": "da6b4de68c7b1cb4919910c9a9a5df781c4b7ef37a273803a2f4458c251ea7f1"
         },
         {
           "path": "crates/kernel/eliot-kernel-service/tests/pulse4_store_rebind.rs",
@@ -2069,7 +2081,7 @@
         },
         {
           "path": "crates/kernel/eliot-platform-windows/src/lib.rs",
-          "sha256": "b4991bb956e5260ae4150aa278a312136ea6c28b4e514fb7d63a0752fc7e04c8"
+          "sha256": "f355974e1a4e34ab56daa7ab0ec8639601238469d77481447c266d3c8b01eacf"
         },
         {
           "path": "crates/kernel/eliot-platform-windows/src/owned_directory_retirement.rs",
@@ -2077,7 +2089,7 @@
         },
         {
           "path": "crates/kernel/eliot-platform-windows/src/package_staging.rs",
-          "sha256": "e9eaac94f241874a1bc22119838d65aaff72a98c98185d0b0a811a9c054dee00"
+          "sha256": "5d176a0e3f39b0bb4101ffabea992b970048985b860530fe235eb4f897e4ce74"
         },
         {
           "path": "crates/kernel/eliot-platform-windows/src/supervision_authority_key.rs",
@@ -2109,7 +2121,7 @@
         },
         {
           "path": "crates/meta/eliot-runtime-status/src/lib.rs",
-          "sha256": "752bba5a9237ac4134331589a105923388fe9517d70d47ef29841dc46fc0de0a"
+          "sha256": "e5d8c44507a839ea0c493900f11bb7d348c38aca05daaa5730056c21a6d9083e"
         },
         {
           "path": "crates/modules/eliot-native-worker-core/src/lib.rs",
@@ -2225,19 +2237,19 @@
         },
         {
           "path": "crates/storage/eliot-store-api/src/lib.rs",
-          "sha256": "66124b52b02665c73dbf78499825690036070c8b7757a7c2ada99b6d28c984fd"
+          "sha256": "8a0daefbf5e0e53cbb6f4c5c0d2b450308af5df473b1c96aa2361055a554fead"
         },
         {
           "path": "crates/storage/eliot-store-api/src/wire.rs",
-          "sha256": "cdbf66d9ddceda5c7c77609a49937df25026b7d2e021c038968491d6a381c07a"
+          "sha256": "1990a73a7db03999f09bd8201b766affd69bc15fb731b92776b09ebbc7483e2e"
         },
         {
           "path": "crates/storage/eliot-store-memory/src/lib.rs",
-          "sha256": "8edd211eb61a46fa56c04a83b73d864c96a12a5c80e5c499ca9a7a1913fb8a37"
+          "sha256": "e543db7f007077304b6db18cd22a4fc2182897b893997cfe447bdd7e6940107e"
         },
         {
           "path": "crates/storage/eliot-store-surreal-adapter/src/apply.rs",
-          "sha256": "c11e86afc7198e6745830dbf3c8b821f1e5b852209cd4a9b95eba810e846166b"
+          "sha256": "f0a35112afcbe19a89bff87a8a824dc61cf0a4e567ddc01422e9f399aafc6eca"
         },
         {
           "path": "crates/storage/eliot-store-surreal-adapter/src/client.rs",
@@ -2245,7 +2257,7 @@
         },
         {
           "path": "crates/storage/eliot-store-surreal-adapter/src/config.rs",
-          "sha256": "170397657ac0daa0876e8d5ce4d563b5cea8577aa4c796d245eb18c1e0800b85"
+          "sha256": "bd5b7d37854598c8488f3f204e8ab49a3a8784b6cf336eeb10ad92c31b2f0c08"
         },
         {
           "path": "crates/storage/eliot-store-surreal-adapter/src/error.rs",
@@ -2257,7 +2269,7 @@
         },
         {
           "path": "crates/storage/eliot-store-surreal-adapter/src/lib.rs",
-          "sha256": "069a6cc0ef785654797548ab38da22644b9bdbd08a38fc3117c8f8c194b8288e"
+          "sha256": "702550820a0ac18373d5bca925231eff6242d3d62740e10afeb6d6ea21e7a5be"
         },
         {
           "path": "crates/storage/eliot-store-surreal-adapter/src/plan.rs",
@@ -2265,11 +2277,11 @@
         },
         {
           "path": "crates/storage/eliot-store-surreal-adapter/src/readiness.rs",
-          "sha256": "56de372ea2a7e4d1bce8c6f0759e0bfaab62eb8784b1dbb84ff074fc7d853f76"
+          "sha256": "9829770d30543f174bfca31df2d6efcd96cddf5b1f0df13663535543024c71f9"
         },
         {
           "path": "crates/storage/eliot-store-surreal-adapter/src/schema.rs",
-          "sha256": "80819ef7ff8abfbf41802514430d547c58d00af4cbefc4584eebc1c8aca5c1e6"
+          "sha256": "4f01112cf1e09279540b763ece12fe10ff37d957b4e246f8b11e262548a69a41"
         },
         {
           "path": "crates/supervision/eliot-watchdog-core/src/lib.rs",
@@ -2388,7 +2400,7 @@
           "sha256": "0b9cb7808d1a6ef940c7c095f06de336ea78beb58b9f6191235f7b0698a21eee"
         }
       ],
-      "source_manifest_sha256": "38fea75ebf0c40e7a008c88b00a03ca8f38a82502e17c0718a0320ad6c41686b",
+      "source_manifest_sha256": "018fbab4e02cee45959a6472598d39710e5ac44b6a5fe28d1bcc2e91f3f871af",
       "normative_pair": [
         {
           "path": "docs/normative/ELIOT_ARCHITECTURE.md",
@@ -2410,10 +2422,10 @@
       "artifact_hashes": [
         {
           "path": "swarm/inventory/refusals.csv",
-          "sha256": "f34657cda59fb86c7bf95419b37f547c62715b8cfceb6396961aa3f0319e8693"
+          "sha256": "78d06a8e997caf23eab69140c981b31079d2fddbf6c1044ab64fe03557a8580a"
         }
       ],
-      "content_digest": "cc5441db05000b60ef4e0f72e90e78284f874efcacdda929e0c7c5c90d09f8a9"
+      "content_digest": "7f6e3891b15f0fcb40c2d1a1c0165bf38101a4d69b2d3555edf9c54a6bb96109"
     },
     "disposition": "challenged",
     "artifacts": [

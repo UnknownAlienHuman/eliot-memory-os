@@ -8,7 +8,7 @@
       {
         "path": "docs/conformance.toml",
         "role": "generated projection",
-        "sha256": "552A97B9953B0C277B9748B995768C2D130E6AFDC3728D3F2C249FDD28F7FC72"
+        "sha256": "6675C3B3B397766A2479F651953B31030E0BBDBFD927780BE2E04A64F7B60979"
       },
       {
         "path": "swarm/results/W1-04-implementation.json",
@@ -65,22 +65,22 @@
       },
       {
         "path": "swarm/inventory/modules.json",
-        "sha256": "56141B90C62040694222C691FEDCDF44235107DD4915B1958F7288E5DA6DC0BB",
+        "sha256": "542E6B871920660CBCA05FA3E99CFDA064BDC20C5C77445DE9FA1395691933F1",
         "role": "current module ownership inventory"
       },
       {
         "path": "swarm/inventory/refusals.csv",
-        "sha256": "F34657CDA59FB86C7BF95419B37F547C62715B8CFCEB6396961AA3F0319E8693",
+        "sha256": "78D06A8E997CAF23EAB69140C981B31079D2FDDBF6C1044AB64FE03557A8580A",
         "role": "current refusal-site inventory"
       },
       {
         "path": ".codebase-memory/artifact.json",
-        "sha256": "D12D06F32E8FD7BBC4D1300737F5A05FDADBCB793828F82E871A89A4C68EFB72",
+        "sha256": "0D1BD25C61B535853F6F08F30CEB70A7F4600575B9343D91CAB042A73E6030BB",
         "role": "code graph identity and counts"
       },
       {
         "path": ".codebase-memory/graph.db.zst",
-        "sha256": "FA906F525CB78020437E09D65D33E9B874F9D25F2BD7543E28954FD3354CBDF2",
+        "sha256": "B3B1371BB941DFC0DF4F50198E27D562DDE29CBD38F4DEA0C3E983009154FEA3",
         "role": "persisted code graph database"
       },
       {
@@ -122,22 +122,22 @@
       {
         "path": "swarm/inventory/modules.json",
         "role": "current module ownership inventory",
-        "sha256": "56141B90C62040694222C691FEDCDF44235107DD4915B1958F7288E5DA6DC0BB"
+        "sha256": "542E6B871920660CBCA05FA3E99CFDA064BDC20C5C77445DE9FA1395691933F1"
       },
       {
         "path": "swarm/inventory/refusals.csv",
         "role": "current refusal-site inventory",
-        "sha256": "F34657CDA59FB86C7BF95419B37F547C62715B8CFCEB6396961AA3F0319E8693"
+        "sha256": "78D06A8E997CAF23EAB69140C981B31079D2FDDBF6C1044AB64FE03557A8580A"
       },
       {
         "path": ".codebase-memory/artifact.json",
         "role": "code graph identity and counts",
-        "sha256": "D12D06F32E8FD7BBC4D1300737F5A05FDADBCB793828F82E871A89A4C68EFB72"
+        "sha256": "0D1BD25C61B535853F6F08F30CEB70A7F4600575B9343D91CAB042A73E6030BB"
       },
       {
         "path": ".codebase-memory/graph.db.zst",
         "role": "persisted code graph database",
-        "sha256": "FA906F525CB78020437E09D65D33E9B874F9D25F2BD7543E28954FD3354CBDF2"
+        "sha256": "B3B1371BB941DFC0DF4F50198E27D562DDE29CBD38F4DEA0C3E983009154FEA3"
       },
       {
         "path": "scripts/gen-conformance.ps1",
@@ -167,10 +167,10 @@
       "authority": "site-local production rustdoc binding plus current module ownership; no Appendix H owner inference",
       "graph": {
         "schema_version": 2,
-        "project": "eliot-memory-os-v15-current",
-        "commit": "8af3984b9a3059fe1b8950337f432065cc7a85f4",
-        "nodes": 58637,
-        "edges": 278304
+        "project": "eliot-memory-os-10641bc-persist",
+        "commit": "10641bc43ef989d975012bc4f8b553f0cd816134",
+        "nodes": 60559,
+        "edges": 289645
       }
     },
     "result_envelope_contract_path": "swarm/challenges/W1-RESULT-ENVELOPE-CONTRACT.md",

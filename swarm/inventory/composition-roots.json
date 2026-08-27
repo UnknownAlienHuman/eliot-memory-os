@@ -4,13 +4,13 @@
   "source": {
     "command": "cargo metadata --no-deps --format-version 1",
     "target_kind": "bin",
-    "target_count": 22,
-    "target_set_digest": "b7779a409a5f9d10e158da2263cf8c31e866691a8cc8b51057249c295e7193bf"
+    "target_count": 23,
+    "target_set_digest": "7eef7da7e53bdd254dacdbe7ed73dde77338293201b7f1d54ba9206e2d5b94d6"
   },
   "summary": {
-    "useful_work": 16,
-    "typed_refusal": 5,
-    "idle_only": 1,
+    "useful_work": 19,
+    "typed_refusal": 4,
+    "idle_only": 0,
     "unknown": 0
   },
   "invariants": {
@@ -25,13 +25,13 @@
       "occurrences": [
         {
           "path": "crates/governor/eliot-governor/src/composition.rs",
-          "line": 1292,
+          "line": 1564,
           "text": "    pub async fn commit_canonical(",
           "kind": "definition",
           "line_sha256": "d91f722c5d7a74b150746dca2cdef3edb6aaad5bf7b8acb6cfd4a39b4ff05563"
         }
       ],
-      "census_digest": "3c556d9f5c3347f7e1fc3b6a71a3dd963e515266edca5916280e0686f950d6cd"
+      "census_digest": "c8c58e5d787cb52c6061b3a8b5793c6fa3a62af2961b69fbb865a3ffc41ec119"
     }
   },
   "records": [
@@ -52,7 +52,7 @@
       },
       "main": {
         "path": "bins/eliot/src/main.rs",
-        "line": 324,
+        "line": 332,
         "symbol": "main",
         "text": "fn main() -> Result<()> {",
         "line_sha256": "70809f3aec2f7aaf5d863c69927041d60278ef28812f606deb6abc3e325817bd"
@@ -63,14 +63,14 @@
         "call_chain": [
           {
             "path": "bins/eliot/src/main.rs",
-            "line": 338,
+            "line": 346,
             "symbol": "run",
             "text": "fn run() -> Result<i32> {",
             "line_sha256": "483976cf58b13f44c45cf4e65bec0b6a63ad775bc0b5a70228f6f4ba183ef0a4"
           },
           {
             "path": "bins/eliot/src/main.rs",
-            "line": 341,
+            "line": 349,
             "symbol": "run",
             "text": "    match cli.command {",
             "line_sha256": "77154ea8e1c4b833ddf5ba92f87ffdbc9f8e6c200ff988101134154af5888599"
@@ -88,8 +88,8 @@
           "refusal_scope": null,
           "witness": {
             "ordered_anchor_lines": [
-              "bins/eliot/src/main.rs:338",
-              "bins/eliot/src/main.rs:341"
+              "bins/eliot/src/main.rs:346",
+              "bins/eliot/src/main.rs:349"
             ],
             "ordered_anchor_symbols": [
               "run",
@@ -103,12 +103,12 @@
       },
       "witness": {
         "catalogue": "W1-07-v1",
-        "source_digest": "d73d1f4126b77756bccfaa50ea33fd22171ccaddf1ff1a9988c7bc79a27aabcf",
+        "source_digest": "d336d7dc0221d67e247ae84928d45a8f4e7ccae379a0cce67627b543cf0edecc",
         "anchor_digest": "c745ed87043a9ec81370f43d1fdba2db6c4c5c69cb027e5984f56fd8391218ac"
       }
     },
     {
-      "stable_id": "CR-63e5bffea1b5c60159d6f094",
+      "stable_id": "CR-80bda19b193de3c32cbc63ed",
       "target": "eliot-agent-bridge",
       "package": "eliot-agent-bridge",
       "manifest": {
@@ -120,92 +120,83 @@
           "text": "name = \"eliot-agent-bridge\"",
           "line_sha256": "f9ffe2388471a0757bbae4391779e95b49dd59dd299192e1c709a4ca4e1e9ba6"
         },
-        "digest": "e5bebe72c73888fccb8ab59d42beae4d443f08b08801234e5ce8af6003a4529d"
+        "digest": "81508a7026015b55e345c3ef6053be18ae50564a9f83bc6cf3ad7dacf0e98000"
       },
       "main": {
         "path": "bins/eliot-agent-bridge/src/main.rs",
-        "line": 48,
+        "line": 41,
         "symbol": "main",
         "text": "fn main() {",
         "line_sha256": "72879bbc234f8df8bd94097117f9ba7d265ace4300293bda24393c13c66bdeb9"
       },
-      "classification": "typed_refusal",
+      "classification": "useful_work",
       "operational_scope": "product_ingress",
       "composition_root": {
         "call_chain": [
           {
             "path": "bins/eliot-agent-bridge/src/main.rs",
             "line": 65,
-            "symbol": "kernel_ports",
-            "text": "    let (host_activation, mcp_forwarding) = match kernel_ports() {",
-            "line_sha256": "c93e56ad79152ca2bd14231eded93e71e9dfdc08fb2cd5a1637459d9de05c743"
+            "symbol": "kernel_ports_with_declaration",
+            "text": "        match kernel_ports_with_declaration(&config.client_declaration) {",
+            "line_sha256": "6d61dfd191561454816d054b3ab65f321e15466823bb23d6348a1fe1cf63e164"
           },
           {
             "path": "bins/eliot-agent-bridge/src/lib.rs",
-            "line": 451,
-            "symbol": "kernel_ports",
-            "text": "pub fn kernel_ports() -> Result<KernelPorts, RuntimeBuildError> {",
-            "line_sha256": "37fe21b276d5436722915ed658ecfbd84f38abee8de07a378598304cacb8bfca"
-          },
-          {
-            "path": "bins/eliot-agent-bridge/src/lib.rs",
-            "line": 457,
-            "symbol": "kernel_ports",
-            "text": "    Err(RuntimeBuildError::KernelAdmissionRequired(",
-            "line_sha256": "c4850d7289e793cff988ff4b04ffa6b76368ecdc11b0d3e4fbcd4197efe4531c"
+            "line": 623,
+            "symbol": "kernel_ports_with_declaration",
+            "text": "pub fn kernel_ports_with_declaration(",
+            "line_sha256": "c5557962495ac0415011f74b4234b8daaf5d42666bdf16239ebbdc47067b18b1"
           },
           {
             "path": "bins/eliot-agent-bridge/src/main.rs",
-            "line": 155,
-            "symbol": "main",
-            "text": "        std::process::exit(PROVIDER_PORT_EXIT);",
-            "line_sha256": "aa92a5df5a97aefe8d885be3b44ca888bb648188b2ca103262f1b80311f55449"
+            "line": 72,
+            "symbol": "BridgeRunner::new",
+            "text": "    let mut runner = match BridgeRunner::new(",
+            "line_sha256": "35d3f02b209fa6ab5ff2e1bbdd674bda3abe40386499a3720fd7249570f59713"
           },
           {
             "path": "bins/eliot-agent-bridge/src/main.rs",
-            "line": 93,
+            "line": 85,
             "symbol": "main",
             "text": "    for line in io::stdin().lock().lines() {",
             "line_sha256": "86cd6dd185ea1cf06d0db4988ad8f374c341107bf1a8abddabc1b6fc993150a7"
           }
         ],
-        "gate_condition": "Kernel admission must provide both bridge ports before stdin is consumed",
-        "effect_boundary": "Attach/forward frames are downstream of kernel_ports; no effect is reached when the provider rejects",
-        "falsifier": "kernel_ports has a reachable Ok branch that supplies admitted ports and main enters the request loop",
+        "gate_condition": "valid profile/client declaration and authenticated Kernel front-door admission",
+        "effect_boundary": "BridgeRunner attach/forward processing over stdin using the admitted Kernel ports",
+        "falsifier": "a valid declaration and admitted ports cannot reach BridgeRunner construction or the stdin request loop",
         "predicate": {
-          "kind": "pre_effect_typed_refusal",
-          "expected_classification": "typed_refusal",
-          "reachable_effect": false,
-          "pre_effect_refusal": true,
+          "kind": "reachable_effect",
+          "expected_classification": "useful_work",
+          "reachable_effect": true,
+          "pre_effect_refusal": false,
           "partial_capability": false,
           "refusal_scope": null,
           "witness": {
             "ordered_anchor_lines": [
               "bins/eliot-agent-bridge/src/main.rs:65",
-              "bins/eliot-agent-bridge/src/lib.rs:451",
-              "bins/eliot-agent-bridge/src/lib.rs:457",
-              "bins/eliot-agent-bridge/src/main.rs:155",
-              "bins/eliot-agent-bridge/src/main.rs:93"
+              "bins/eliot-agent-bridge/src/lib.rs:623",
+              "bins/eliot-agent-bridge/src/main.rs:72",
+              "bins/eliot-agent-bridge/src/main.rs:85"
             ],
             "ordered_anchor_symbols": [
-              "kernel_ports",
-              "kernel_ports",
-              "kernel_ports",
-              "main",
+              "kernel_ports_with_declaration",
+              "kernel_ports_with_declaration",
+              "BridgeRunner::new",
               "main"
             ],
             "required_source_fragments": [
-              "pub fn kernel_ports()",
-              "Err(RuntimeBuildError::KernelAdmissionRequired(",
-              "std::process::exit(PROVIDER_PORT_EXIT);"
+              "kernel_ports_with_declaration(&config.client_declaration)",
+              "BridgeRunner::new(",
+              "for line in io::stdin().lock().lines()"
             ]
           }
         }
       },
       "witness": {
         "catalogue": "W1-07-v1",
-        "source_digest": "74e8fc1bd15d3add94edadd8aa4d36f839335c88e044339fd5a2273d22209f27",
-        "anchor_digest": "13aee977741be448fe4a2134d590dea26ca852df051859b352d2730d959248b5"
+        "source_digest": "dc9780e999c7e9a1dd0564d5ad5368c89e4028b9f23b7a60881a7a3b93e821c3",
+        "anchor_digest": "b272670057e0f93211428b7aa04ec195287a49d993569629b0090fd49e31cf67"
       }
     },
     {
@@ -640,7 +631,7 @@
       },
       "witness": {
         "catalogue": "W1-07-v1",
-        "source_digest": "b688c736de98edb0b08f88b26422e17aaed0551879d47afcc35ae3086046c966",
+        "source_digest": "bbf5b80d99acf5a084723f43944f7291d5f94688505ebdc0025077c506d77843",
         "anchor_digest": "6e4c615198c6240b0ac2506cf47c436e759a4e7e37b72c6b3c702d7bf067bd54"
       }
     },
@@ -657,11 +648,11 @@
           "text": "name = \"eliot-kernel\"",
           "line_sha256": "d57bc524a21497d6ce54f3cec578ffc737a72b88916079b1d9ab269f477080d1"
         },
-        "digest": "2925a7d941389baabdd6379710109befbd869db4d504745b9a1ef65fa3a7367b"
+        "digest": "7fdb9058228a87dd095bb8368024c77348b82f6b15b79c2d0bb3e7c3cbb65541"
       },
       "main": {
         "path": "bins/eliot-kernel/src/main.rs",
-        "line": 189,
+        "line": 190,
         "symbol": "main",
         "text": "async fn main() {",
         "line_sha256": "b74000e48647e5a6716bfa026af78175e69258488b7650174036c05ead8dbe85"
@@ -672,14 +663,14 @@
         "call_chain": [
           {
             "path": "bins/eliot-kernel/src/main.rs",
-            "line": 190,
+            "line": 191,
             "symbol": "parse_launch_options",
             "text": "    let options = match parse_launch_options(std::env::args_os().skip(1)) {",
             "line_sha256": "6072b18406d4204a768cea93eb606086159d912c474f8991306e3dd91920d327"
           },
           {
             "path": "bins/eliot-kernel/src/main.rs",
-            "line": 212,
+            "line": 213,
             "symbol": "KernelConfig::new",
             "text": "        KernelConfig::new(options.work_root.clone()).require_descriptor_supervision_authority();",
             "line_sha256": "0753c2a3f08f5b2d81ae60821fe384012434af960a2b009cf78d2f8f6fe27113"
@@ -697,8 +688,8 @@
           "refusal_scope": null,
           "witness": {
             "ordered_anchor_lines": [
-              "bins/eliot-kernel/src/main.rs:190",
-              "bins/eliot-kernel/src/main.rs:212"
+              "bins/eliot-kernel/src/main.rs:191",
+              "bins/eliot-kernel/src/main.rs:213"
             ],
             "ordered_anchor_symbols": [
               "parse_launch_options",
@@ -713,7 +704,7 @@
       },
       "witness": {
         "catalogue": "W1-07-v1",
-        "source_digest": "55b01604e174b320fd787a5a0562d9b154b717c76b3643b79d34579ee75584b6",
+        "source_digest": "29f097bd75bb1b98338acd8d70bbb0d2d646e8a1a5aec57811b0605310db2356",
         "anchor_digest": "71cd9b7e76568aeda7fa1cc27cd1b96b03e4a916b84bd26f57fe52a5afc1b6d9"
       }
     },
@@ -1171,6 +1162,69 @@
         "catalogue": "W1-07-v1",
         "source_digest": "02ae75131948fa83cc68524a686a9a27c3b49726231d6d7a5afd0c7274c2d48e",
         "anchor_digest": "b34b4ff1325edad7789533666148b5e924d742e3f925f4f17aa879fa4d0a2b28"
+      }
+    },
+    {
+      "stable_id": "CR-4af2226b73bfb2b4d044e0ca",
+      "target": "eliot-r13-two-token-harness",
+      "package": "eliot-kernel",
+      "manifest": {
+        "path": "bins/eliot-kernel/Cargo.toml",
+        "package_name": "eliot-kernel",
+        "anchor": {
+          "line": 2,
+          "symbol": "package.name",
+          "text": "name = \"eliot-kernel\"",
+          "line_sha256": "d57bc524a21497d6ce54f3cec578ffc737a72b88916079b1d9ab269f477080d1"
+        },
+        "digest": "7fdb9058228a87dd095bb8368024c77348b82f6b15b79c2d0bb3e7c3cbb65541"
+      },
+      "main": {
+        "path": "bins/eliot-kernel/src/r13_two_token_harness.rs",
+        "line": 3,
+        "symbol": "main",
+        "text": "fn main() {",
+        "line_sha256": "72879bbc234f8df8bd94097117f9ba7d265ace4300293bda24393c13c66bdeb9"
+      },
+      "classification": "useful_work",
+      "operational_scope": "test_only",
+      "composition_root": {
+        "call_chain": [
+          {
+            "path": "bins/eliot-kernel/src/r13_two_token_harness.rs",
+            "line": 4,
+            "symbol": "eliot_kernel::r13_os_harness::run",
+            "text": "    std::process::exit(eliot_kernel::r13_os_harness::run());",
+            "line_sha256": "efc45cbf842d98c6acba2e326a5707fb57a4dbd25e221c8c2df6438726050c8c"
+          }
+        ],
+        "gate_condition": "r13-os-harness feature enabled and explicit approved harness arguments supplied; off-feature or incomplete arguments refuse before mutation",
+        "effect_boundary": "bounded Windows SCM/service and named-pipe harness evidence under the pre-provisioned harness root; no normal Kernel startup path",
+        "falsifier": "the bin is runnable without r13-os-harness and explicit harness arguments, or its main reaches any effect without the exact r13_os_harness::run() call",
+        "predicate": {
+          "kind": "reachable_effect",
+          "expected_classification": "useful_work",
+          "reachable_effect": true,
+          "pre_effect_refusal": false,
+          "partial_capability": false,
+          "refusal_scope": null,
+          "witness": {
+            "ordered_anchor_lines": [
+              "bins/eliot-kernel/src/r13_two_token_harness.rs:4"
+            ],
+            "ordered_anchor_symbols": [
+              "eliot_kernel::r13_os_harness::run"
+            ],
+            "required_source_fragments": [
+              "eliot_kernel::r13_os_harness::run()"
+            ]
+          }
+        }
+      },
+      "witness": {
+        "catalogue": "W1-07-v1",
+        "source_digest": "67d6f9070465150c80e9623a34a38c0ee79aa6020c0ecfaa595550bddb62ab5e",
+        "anchor_digest": "147dd921395997b10a4cf762a995e3f9a04667f4ce11b9a35425f00f50c3a401"
       }
     },
     {
@@ -1688,7 +1742,7 @@
       }
     },
     {
-      "stable_id": "CR-671096e1f1a583d973ef39ad",
+      "stable_id": "CR-10fdc51bbc128cdbb3d6ee01",
       "target": "eliotd",
       "package": "eliotd",
       "manifest": {
@@ -1709,7 +1763,7 @@
         "text": "fn main() {",
         "line_sha256": "72879bbc234f8df8bd94097117f9ba7d265ace4300293bda24393c13c66bdeb9"
       },
-      "classification": "idle_only",
+      "classification": "useful_work",
       "operational_scope": "product_daemon",
       "composition_root": {
         "call_chain": [
@@ -1724,45 +1778,45 @@
             "path": "bins/eliotd/src/main.rs",
             "line": 158,
             "symbol": "run_loop",
-            "text": "async fn run_loop(kernel: Arc<DaemonKernelClient>) -> Result<(), String> {",
-            "line_sha256": "7fa8c97b3dd405882062ce599d0bdd52607d153bc13d596976b1dc9b9aeaf17e"
+            "text": "async fn run_loop(",
+            "line_sha256": "e8fb6143ad6a258720d7e176caec48750cbf3fa440c1e176004f8d8a0dabd559"
           },
           {
             "path": "bins/eliotd/src/main.rs",
-            "line": 160,
+            "line": 163,
             "symbol": "run_loop",
             "text": "        tokio::select! {",
             "line_sha256": "2e78da77bf8835ee566136b6d1b9de81cfc106fc67e50f093e5d667a61c2f522"
           },
           {
             "path": "bins/eliotd/src/main.rs",
-            "line": 161,
-            "symbol": "run_loop",
-            "text": "            signal = tokio::signal::ctrl_c() => {",
-            "line_sha256": "f7cb07d1979da53955ce17eb1c59d5c300bdfe339c256a2cea5ae63285c50e21"
+            "line": 170,
+            "symbol": "claim_agent_activation_ticket",
+            "text": "                    .claim_agent_activation_ticket()",
+            "line_sha256": "7d2e182fed7bb2b744ab5382697a4d1ff024d22b78fd2a9f9e86286981477e44"
           },
           {
             "path": "bins/eliotd/src/main.rs",
-            "line": 165,
+            "line": 181,
+            "symbol": "submit_agent_activation_decision",
+            "text": "                        && let Err(error) = kernel.submit_agent_activation_decision(&decision).await",
+            "line_sha256": "1465ab98830176991110fcedf9789ba2fb8e5a61bb229d3efe7da5b19a7a5d83"
+          },
+          {
+            "path": "bins/eliotd/src/main.rs",
+            "line": 190,
             "symbol": "run_loop",
             "text": "            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {",
             "line_sha256": "5a587a1652048926dca8ee1689f258ac55528e894ac00ee80ea7b9d6790ac727"
-          },
-          {
-            "path": "bins/eliotd/src/main.rs",
-            "line": 166,
-            "symbol": "run_loop",
-            "text": "                KernelTransitionPort::health(&*kernel)",
-            "line_sha256": "c027d27c764475c88e93b9fba4eb0d0627ea09940b55ac317f53e3731ffacb5d"
           }
         ],
-        "gate_condition": "valid descriptor and Kernel connection; no task/submission ingress is wired",
-        "effect_boundary": "health heartbeat and shutdown observation only",
-        "falsifier": "run_loop gains a reachable task/admission/submission input path beyond ctrl_c and health",
+        "gate_condition": "valid protected descriptor, Kernel connection, and an available activation ticket or health interval",
+        "effect_boundary": "daemon activation-decision submission and Kernel health heartbeat after authenticated startup",
+        "falsifier": "a valid descriptor and admitted Kernel connection can no longer reach activation-ticket claim or activation-decision submission",
         "predicate": {
-          "kind": "idle_only",
-          "expected_classification": "idle_only",
-          "reachable_effect": false,
+          "kind": "reachable_effect",
+          "expected_classification": "useful_work",
+          "reachable_effect": true,
           "pre_effect_refusal": false,
           "partial_capability": false,
           "refusal_scope": null,
@@ -1770,32 +1824,31 @@
             "ordered_anchor_lines": [
               "bins/eliotd/src/main.rs:61",
               "bins/eliotd/src/main.rs:158",
-              "bins/eliotd/src/main.rs:160",
-              "bins/eliotd/src/main.rs:161",
-              "bins/eliotd/src/main.rs:165",
-              "bins/eliotd/src/main.rs:166"
+              "bins/eliotd/src/main.rs:163",
+              "bins/eliotd/src/main.rs:170",
+              "bins/eliotd/src/main.rs:181",
+              "bins/eliotd/src/main.rs:190"
             ],
             "ordered_anchor_symbols": [
               "run",
               "run_loop",
               "run_loop",
-              "run_loop",
-              "run_loop",
+              "claim_agent_activation_ticket",
+              "submit_agent_activation_decision",
               "run_loop"
             ],
             "required_source_fragments": [
               "tokio::select!",
-              "tokio::signal::ctrl_c()",
-              "tokio::time::sleep",
-              "KernelTransitionPort::health"
+              "claim_agent_activation_ticket()",
+              "submit_agent_activation_decision("
             ]
           }
         }
       },
       "witness": {
         "catalogue": "W1-07-v1",
-        "source_digest": "0c35eca979aa9ebec84e45b4f4218e1b8e2c7a82c406f1129d4a6f5c78f6620b",
-        "anchor_digest": "71758c4bb79cc0dd1dcd95f668a5ab381ad1f089d897f114911a8d57db581609"
+        "source_digest": "8e08fdb4767cb7494c12f846cd62068f898ac7536978f9b5974f5968d3111004",
+        "anchor_digest": "ebd25157cd7ab511a8d3840970f710a6078264d272549c5fefa627e551c902ef"
       }
     }
   ]

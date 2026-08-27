@@ -394,7 +394,7 @@ impl EffectiveCapabilitySnapshot {
     }
 }
 
-/// `ELIOT_ARCH_OWNER`: ARCH-AUTH-01
+/// ELIOT_ARCH_OWNER: ARCH-AUTH-01
 /// Pure grant-lineage evaluator.
 #[derive(Clone, Debug)]
 pub struct GrantGraph {

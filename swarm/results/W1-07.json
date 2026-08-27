@@ -12,7 +12,7 @@
     "artifacts": [
       {
         "path": "swarm/inventory/composition-roots.json",
-        "sha256": "7db20543f7abc6307abd6304e4d454ff6dd45421fa94976020db7c778a2cb517",
+        "sha256": "760196fa558ced75f5aea8905f5d72c37e6cab6d604fd383e1f985bbebe65834",
         "kind": "inventory"
       }
     ],
@@ -41,7 +41,7 @@
     "evidence_lineage": [
       {
         "path": "swarm/inventory/composition-roots.json",
-        "sha256": "7db20543f7abc6307abd6304e4d454ff6dd45421fa94976020db7c778a2cb517",
+        "sha256": "760196fa558ced75f5aea8905f5d72c37e6cab6d604fd383e1f985bbebe65834",
         "role": "generated composition-root registry"
       }
     ],
@@ -51,23 +51,23 @@
       "generator": "scripts/gen-composition-roots.ps1",
       "verifier": "scripts/verify-composition-roots.ps1",
       "schema_version": "eliot-composition-root-registry-v2",
-      "cargo_metadata_target_count": 22,
-      "target_set_digest": "b7779a409a5f9d10e158da2263cf8c31e866691a8cc8b51057249c295e7193bf",
-      "registry_sha256": "7db20543f7abc6307abd6304e4d454ff6dd45421fa94976020db7c778a2cb517"
+      "cargo_metadata_target_count": 23,
+      "target_set_digest": "7eef7da7e53bdd254dacdbe7ed73dde77338293201b7f1d54ba9206e2d5b94d6",
+      "registry_sha256": "760196fa558ced75f5aea8905f5d72c37e6cab6d604fd383e1f985bbebe65834"
     },
     "classification": {
-      "useful_work": 16,
-      "typed_refusal": 5,
-      "idle_only": 1,
+      "useful_work": 19,
+      "typed_refusal": 4,
+      "idle_only": 0,
       "unknown": 0
     },
     "recovery_program_5_1": [
       {
         "target": "eliot-agent-bridge",
-        "classification": "typed_refusal",
-        "anchor": "bins/eliot-agent-bridge/src/main.rs:65, bins/eliot-agent-bridge/src/lib.rs:451, bins/eliot-agent-bridge/src/lib.rs:457, bins/eliot-agent-bridge/src/main.rs:155, bins/eliot-agent-bridge/src/main.rs:93",
-        "finding": "kernel_ports reaches KernelClient::load/probe and unconditionally returns KernelAdmissionRequired before stdin loop",
-        "falsifier": "kernel_ports has a reachable Ok branch that supplies admitted ports and main enters the request loop"
+        "classification": "useful_work",
+        "anchor": "bins/eliot-agent-bridge/src/main.rs:65, bins/eliot-agent-bridge/src/lib.rs:623, bins/eliot-agent-bridge/src/main.rs:72, bins/eliot-agent-bridge/src/main.rs:85",
+        "finding": "kernel_ports_with_declaration reaches authenticated front-door transport, then main constructs BridgeRunner and enters the stdin request loop",
+        "falsifier": "a valid declaration and admitted ports cannot reach BridgeRunner construction or the stdin request loop"
       },
       {
         "target": "eliot-dreamer",
@@ -85,10 +85,10 @@
       },
       {
         "target": "eliotd",
-        "classification": "idle_only",
-        "anchor": "bins/eliotd/src/main.rs:61, bins/eliotd/src/main.rs:158, bins/eliotd/src/main.rs:160, bins/eliotd/src/main.rs:161, bins/eliotd/src/main.rs:165, bins/eliotd/src/main.rs:166",
-        "finding": "run_loop selects only ctrl_c and five-second Kernel health; no task/submission ingress is wired",
-        "falsifier": "run_loop gains a reachable task/admission/submission input path beyond ctrl_c and health"
+        "classification": "useful_work",
+        "anchor": "bins/eliotd/src/main.rs:61, bins/eliotd/src/main.rs:158, bins/eliotd/src/main.rs:163, bins/eliotd/src/main.rs:170, bins/eliotd/src/main.rs:181, bins/eliotd/src/main.rs:190",
+        "finding": "run_loop selects ctrl_c, activation-ticket claim/decision submission, and five-second Kernel health",
+        "falsifier": "a valid descriptor and admitted Kernel connection can no longer reach activation-ticket claim or activation-decision submission"
       }
     ],
     "additional_findings": [
@@ -129,6 +129,7 @@
       "eliot-notify",
       "eliot-opencode-bootstrap",
       "eliot-process-guardian",
+      "eliot-r13-two-token-harness",
       "eliot-runtime-compiler",
       "eliot-store-surreal",
       "eliot-testd",
@@ -142,10 +143,12 @@
       "result": "PASS",
       "commands": [
         "pwsh -NoProfile -File scripts/gen-composition-roots.ps1 -Check",
+        "pwsh -NoProfile -File scripts/gen-composition-roots.ps1 -SelfTest",
         "pwsh -NoProfile -File scripts/verify-composition-roots.ps1 -SelfTest",
         "pwsh -NoProfile -File scripts/verify-composition-roots.ps1"
       ],
       "self_tests": [
+        "generator predicate and determinism self-test passed",
         "synthetic tamper rejected",
         "synthetic missing target rejected",
         "synthetic duplicate target rejected",
@@ -158,7 +161,7 @@
     },
     "integration_disposition": {
       "accepted_findings": [
-        "Current cargo metadata census is 22 binary targets, not the historical 21.",
+        "Current cargo metadata census is 23 binary targets, not the historical 21.",
         "Every target has a checked manifest/main/call-chain witness, gate condition, effect boundary and falsifier.",
         "The registry-wide canonical commit invariant records one workspace-Rust definition and zero callers."
       ],

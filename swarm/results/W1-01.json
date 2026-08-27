@@ -4,7 +4,7 @@
   "work_item_id": "W1-01",
   "structured_result": {
     "schema_version": "eliot-work-result-v2",
-    "source_revision": "content:a78a2c3af5b044bbc4fca3e7a510caa41545ef59608acf7aadab656fba5faa89",
+    "source_revision": "content:f7c816fa8e05c2dfad378c4a7c215cf71bab7b3ee45eea7a0ee85a90300e5389",
     "disposition": "challenged",
     "discriminator_before": "Prior W1-01 evidence used a result envelope that was not source-compatible and accepted incomplete nested metadata.",
     "discriminator_after": "The result is an exact v1.3 evidence-only wrapper generated from code, with content-bound non-self artifact and witness hashes plus independent add/remove/tamper checks.",
@@ -36,17 +36,17 @@
       },
       {
         "path": "swarm/inventory/modules.json",
-        "sha256": "56141b90c62040694222c691fedcdf44235107dd4915b1958f7288e5da6dc0bb"
+        "sha256": "542e6b871920660cbca05fa3e99cfda064bdc20c5c77445de9fa1395691933f1"
       }
     ],
     "inventory_summary": {
       "members_total": 126,
-      "total_source_stu": 7475584,
-      "total_test_count": 3368,
-      "zero_test_packages": 43,
-      "unreachable_from_bins": 41,
-      "document_digest": "695f494e1b10be127e389814f748742987d2a5937b8533e54a4ea1fadc9a64b4",
-      "inputs_digest": "a78a2c3af5b044bbc4fca3e7a510caa41545ef59608acf7aadab656fba5faa89"
+      "total_source_stu": 7808032,
+      "total_test_count": 3575,
+      "zero_test_packages": 42,
+      "unreachable_from_bins": 40,
+      "document_digest": "3d512a353824c1692f2418dbb19a886a7386fa8491a52f466c5b5fe82659d415",
+      "inputs_digest": "f7c816fa8e05c2dfad378c4a7c215cf71bab7b3ee45eea7a0ee85a90300e5389"
     },
     "evidence": [
       "cargo metadata --locked --format-version 1 -> 126 workspace packages",
@@ -82,7 +82,7 @@
       },
       "inventory": {
         "path": "swarm/inventory/modules.json",
-        "sha256": "56141b90c62040694222c691fedcdf44235107dd4915b1958f7288e5da6dc0bb"
+        "sha256": "542e6b871920660cbca05fa3e99cfda064bdc20c5c77445de9fa1395691933f1"
       }
     },
     "external_review": {
