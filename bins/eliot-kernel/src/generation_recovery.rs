@@ -1,3 +1,13 @@
+//! Kernel ORS generation recovery and cutover persistence.
+//!
+//! Owns bounded reconstruction of the generation router from committed ORS
+//! cutovers and the persist-then-publish closure that synchronizes the Kernel
+//! service epoch and daemon handshake generation/state fence.
+//!
+//! Architecture: A13.2 Kernel и failure domains; A13.3 Module supervision и Doctor; A13.6 Operational Recovery State; ARCH-RES-01 Fail locally, recover globally; ARCH-RES-03 Restore/migration cannot resurrect invalid state; ARCH-RES-04 Degradation is visible and local
+//! Implementation: I4.5 Generation vector and State Fence; I14.14 Module hot replacement; I14.21 Unknown commit recovery; P.4 Operational Recovery State boundary; I2.2 Когда capability становится отдельным crate; I2.23 Capability-family topology and crate extraction decisions
+//! Forbidden authority: must not interpret semantic content, become a second generation authority, publish an uncommitted route, or bypass the ORS cutover record, authority epoch, and handshake fence.
+
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
