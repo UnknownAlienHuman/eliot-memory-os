@@ -15,25 +15,29 @@ use crate::plan::{
 };
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 use crate::{client, schema};
+#[cfg(test)]
+use eliot_store_api::OperationId;
 use eliot_store_api::{
-    CONTRACT_VERSION, CommitId, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, RecoveryRecord, RecoveryRecordKey, Resubmission, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StateFence, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
-    StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus, genesis_manifest,
-    is_genesis_fence, issue_genesis_receipt_envelope, validate_genesis_receipt_envelope,
-    validate_store_receipt_envelope,
+    CONTRACT_VERSION, CommitId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    RecoveryRecord, RecoveryRecordKey, Resubmission, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, ScopeId, ScopeRevisionView, StateFence, StoreError, StoreGenesisRequest,
+    StoreHealth, StoreHealthStatus, StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, genesis_manifest, is_genesis_fence,
+    issue_genesis_receipt_envelope, validate_genesis_receipt_envelope,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
 mod read_boundary;
+mod receipt_reconciliation;
 #[cfg(test)]
 use read_boundary::{READ_VALIDATION_SNAPSHOT, build_validation_snapshot};
 pub(crate) use read_boundary::{
     execute_named, read_ordering_heads, read_revision_heads, read_scope_view,
     read_validation_snapshot,
 };
+pub(crate) use receipt_reconciliation::read_receipt;
+use receipt_reconciliation::{read_fence, read_idempotency, read_receipt_by_operation};
 
 /// The durable canonical fence singleton.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
@@ -900,106 +904,6 @@ fn validate_transition(
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
     Ok(())
-}
-
-/// Resolves a durable receipt by operation identity; the reconciliation read.
-pub(crate) async fn read_receipt(
-    adapter: &SurrealStoreAdapter,
-    operation_id: OperationId,
-) -> Result<Option<WriteReceipt>, AdapterError> {
-    let db = client(adapter).await?;
-    ensure_ready(adapter, db).await?;
-    read_receipt_by_operation(db, &adapter.config, &operation_id).await
-}
-
-async fn read_receipt_by_operation(
-    db: &client::RpcTransport,
-    config: &SurrealAdapterConfig,
-    operation_id: &OperationId,
-) -> Result<Option<WriteReceipt>, AdapterError> {
-    let mut bindings = Map::new();
-    bindings.insert("table".to_owned(), json!(schema::table::WRITE_RECEIPT));
-    bindings.insert("key".to_owned(), json!(operation_id.to_string()));
-    let mut response = client::query(
-        db,
-        config,
-        "read.receipt_by_operation",
-        schema::READ_RECEIPT_BY_OPERATION,
-        bindings,
-    )
-    .await?;
-    let receipt = take_optional::<WriteReceipt>(&mut response, 0)?;
-    if let Some(receipt) = &receipt {
-        receipt.validate()?;
-        receipt.require_reconciliation_envelope()?;
-    }
-    Ok(receipt)
-}
-
-async fn read_idempotency(
-    db: &client::RpcTransport,
-    config: &SurrealAdapterConfig,
-    ctx: &eliot_store_api::RequestMeta,
-    transition: &eliot_store_api::PreparedTransition,
-) -> Result<Idempotency, AdapterError> {
-    let mut bindings = Map::new();
-    bindings.insert(
-        "operation_id".to_owned(),
-        json!(transition.identity.operation_id.to_string()),
-    );
-    bindings.insert(
-        "idempotency_key".to_owned(),
-        json!(transition.identity.idempotency_key),
-    );
-    let mut response = client::query(
-        db,
-        config,
-        "read.receipt_idempotency",
-        schema::READ_RECEIPT_IDEMPOTENCY,
-        bindings,
-    )
-    .await?;
-    let by_operation = take_vec::<WriteReceipt>(&mut response, 0)?;
-    let by_idempotency = take_vec::<WriteReceipt>(&mut response, 1)?;
-
-    if let Some(receipt) = by_operation.into_iter().next() {
-        receipt.validate()?;
-        return if receipt.idempotency_key == transition.identity.idempotency_key
-            && receipt.canonical_request_hash == transition.identity.canonical_request_hash
-        {
-            validate_store_receipt_envelope(ctx, transition, &receipt)?;
-            Ok(Idempotency::Replay(receipt))
-        } else {
-            Ok(Idempotency::Conflict)
-        };
-    }
-    if let Some(receipt) = by_idempotency.into_iter().next() {
-        receipt.validate()?;
-        return if receipt.canonical_request_hash == transition.identity.canonical_request_hash
-            && receipt.operation_id == transition.identity.operation_id
-        {
-            validate_store_receipt_envelope(ctx, transition, &receipt)?;
-            Ok(Idempotency::Replay(receipt))
-        } else {
-            Ok(Idempotency::Conflict)
-        };
-    }
-    Ok(Idempotency::None)
-}
-
-async fn read_fence(
-    db: &client::RpcTransport,
-    config: &SurrealAdapterConfig,
-) -> Result<Option<FenceRecord>, AdapterError> {
-    let mut response = client::query(
-        db,
-        config,
-        "read.canonical_fence",
-        schema::READ_FENCE,
-        Map::new(),
-    )
-    .await?;
-    take_optional::<FenceRecord>(&mut response, 0)
 }
 
 fn build_recovery_sql(request: &StoreRecoveryRequest) -> String {
