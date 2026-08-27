@@ -11,6 +11,10 @@
 pub mod r13_os_harness;
 
 mod front_door_session;
+mod generation_recovery;
+use generation_recovery::OrsGenerationCoordinator;
+#[cfg(test)]
+use generation_recovery::update_handshake_policy;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
 use std::fmt;
@@ -94,13 +98,13 @@ use eliot_protocol::{
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 use eliot_runtime_contracts::{
-    Ed25519SupervisionLeaseSigner, GenerationCutoverRecord as RuntimeGenerationCutoverRecord,
-    GenerationCutoverState, HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState,
-    ProvisionedSupervisionAuthority, SupervisionGenerationBinding, SupervisionLease,
-    SupervisionLeaseActiveStateBinding, SupervisionLeaseError, SupervisionLeaseIncarnationBinding,
-    SupervisionLeasePredecessorIdentity, SupervisionLeasePredecessorProof, SupervisionLeaseSigner,
-    SupervisionLeaseTerminalDisposition, SupervisionLeaseVerificationContext,
-    SupervisionLeaseVerifier, SupervisionSealedKeyReference, SupervisionTrustAnchor,
+    Ed25519SupervisionLeaseSigner, HealthVector, LeaseState, ModuleGeneration,
+    ModuleGenerationState, ProvisionedSupervisionAuthority, SupervisionGenerationBinding,
+    SupervisionLease, SupervisionLeaseActiveStateBinding, SupervisionLeaseError,
+    SupervisionLeaseIncarnationBinding, SupervisionLeasePredecessorIdentity,
+    SupervisionLeasePredecessorProof, SupervisionLeaseSigner, SupervisionLeaseTerminalDisposition,
+    SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionSealedKeyReference,
+    SupervisionTrustAnchor,
 };
 use eliot_store_api::{
     CanonicalValidationSnapshot, RevisionHead, StateFence as StoreStateFence, StoreHealth,
@@ -117,7 +121,7 @@ use eliot_platform_windows::{
     observe_named_pipe_peer_process, observe_named_pipe_peer_process_in_job,
 };
 
-use front_door_session::{IpcImplementation, update_handshake_policy};
+use front_door_session::IpcImplementation;
 
 /// Stable Kernel process identity and wire revision.
 pub const SERVICE_NAME: &str = "eliot-kernel";
@@ -3221,116 +3225,6 @@ fn is_store_rebind_latest_committed(
     Ok(latest.commit_order == record.commit_order
         && latest.operation_id == record.operation_id
         && latest.request_digest == record.request_digest)
-}
-
-/// The sole semantic bridge between ORS cutover evidence and the in-memory
-/// route table.  ORS owns the durable linearization point; this type owns no
-/// mutable store escape and publishes only after that point succeeds.
-struct OrsGenerationCoordinator {
-    ors: Arc<RedbRecoveryStore>,
-}
-
-impl OrsGenerationCoordinator {
-    fn new(ors: Arc<RedbRecoveryStore>) -> Self {
-        Self { ors }
-    }
-
-    fn recover(
-        &self,
-        generations: &mut GenerationRouter,
-        service: &mut KernelService,
-        policy: &mut ServerHandshakePolicy,
-    ) -> Result<(), String> {
-        // A staged candidate is evidence of an interrupted attempt.  Mark it
-        // forward-only before rebuilding routes; never activate staged data.
-        let _ = self
-            .ors
-            .reconcile_staged_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
-            .map_err(|error| error.to_string())?;
-        let snapshots = self
-            .ors
-            .latest_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
-            .map_err(|error| error.to_string())?;
-        if snapshots.is_empty() {
-            return Ok(());
-        }
-
-        let epoch_value = snapshots
-            .iter()
-            .map(|snapshot| snapshot.record().new_epoch.value())
-            .max()
-            .ok_or_else(|| "committed cutover projection was empty".to_owned())?;
-        let epoch = AuthorityEpoch::new(epoch_value).map_err(|error| error.to_string())?;
-        for snapshot in &snapshots {
-            let record = snapshot.record();
-            if record.state != GenerationCutoverState::Committed
-                || record.new_epoch.value() > epoch_value
-            {
-                return Err("ORS route projection has invalid committed epochs".to_owned());
-            }
-        }
-        // Synchronization is a bounded direct fast-forward.  It rejects a
-        // corrupt/oversized durable epoch before any route becomes visible.
-        service
-            .synchronize_authority_epoch(epoch)
-            .map_err(|error| error.to_string())?;
-        let mut recovered = GenerationRouter::at_epoch(epoch).map_err(|error| error.to_string())?;
-        for snapshot in &snapshots {
-            let record = snapshot.record();
-            let scope =
-                RouteScope::new(record.route_scope.clone()).map_err(|error| error.to_string())?;
-            let route = GenerationRoute::new(scope, record.new_generation, epoch)
-                .map_err(|error| error.to_string())?;
-            recovered
-                .register(route)
-                .map_err(|error| error.to_string())?;
-        }
-        update_handshake_policy(policy, &recovered)?;
-        *generations = recovered;
-        Ok(())
-    }
-
-    fn persist_and_publish(
-        &self,
-        decision: &eliot_kernel_core::CutoverDecision,
-        generations: &mut GenerationRouter,
-        service: &mut KernelService,
-        policy: &mut ServerHandshakePolicy,
-    ) -> Result<(), String> {
-        let mut candidate = generations.clone();
-        candidate
-            .cutover(decision)
-            .map_err(|error| error.to_string())?;
-        let staged = RuntimeGenerationCutoverRecord {
-            cutover_id: decision.cutover_id().to_owned(),
-            route_scope: decision.route_scope().as_str().to_owned(),
-            old_generation: decision.old_generation(),
-            new_generation: decision.new_generation(),
-            old_epoch: decision.old_epoch(),
-            new_epoch: decision.new_epoch(),
-            state: GenerationCutoverState::Armed,
-        };
-        self.ors
-            .stage_generation_cutover(staged.clone())
-            .map_err(|error| error.to_string())?;
-        let committed = self
-            .ors
-            .commit_generation_cutover_state(staged)
-            .map_err(|error| error.to_string())?;
-        if committed.record().state != GenerationCutoverState::Committed {
-            return Err("ORS did not return a committed cutover".to_owned());
-        }
-
-        // No in-memory publication occurs before the durable cutover.  Any
-        // failure below is surfaced to the composition, which poisons the
-        // gateway rather than claiming a partially published transition.
-        service
-            .synchronize_authority_epoch(decision.new_epoch())
-            .map_err(|error| error.to_string())?;
-        update_handshake_policy(policy, &candidate)?;
-        *generations = candidate;
-        Ok(())
-    }
 }
 
 #[cfg(windows)]

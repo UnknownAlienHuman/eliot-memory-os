@@ -35,49 +35,6 @@ impl IpcImplementation {
     }
 }
 
-pub(super) fn update_handshake_policy(
-    policy: &mut ServerHandshakePolicy,
-    generations: &GenerationRouter,
-) -> Result<(), String> {
-    let daemon = RouteScope::new("daemon").map_err(|error| error.to_string())?;
-    if let Ok(route) = generations.route(&daemon) {
-        // The Kernel artifact belongs to the Kernel-owned handshake domain and
-        // must survive every route publication.  `begin_agent_bridge` reads
-        // this exact value when it constructs the server-first challenge; a
-        // rebuilt snapshot that drops it would fence an otherwise valid bridge
-        // after the first generation update.
-        let artifact_digest = policy.config_snapshot.get("artifact_digest").cloned();
-        let protected_snapshot_digest = policy
-            .config_snapshot
-            .get("protected_snapshot_digest")
-            .cloned();
-        if let Some(protected_snapshot_digest) = protected_snapshot_digest.as_ref() {
-            let Some(value) = protected_snapshot_digest.as_str() else {
-                return Err("Kernel protected snapshot digest must be a JSON string".to_owned());
-            };
-            if !is_lower_sha256(value) {
-                return Err("Kernel protected snapshot digest must be lowercase SHA-256".to_owned());
-            }
-        }
-        policy.module_generation.generation = route.active_generation();
-        policy.module_generation.state_fence =
-            StateFence::new(route.authority_epoch(), route.active_generation());
-        policy.config_snapshot = serde_json::json!({
-            "service": SERVICE_NAME,
-            "protocol": PROTOCOL_VERSION,
-            "generation": route.active_generation().value(),
-            "authority_epoch": route.authority_epoch().value(),
-        });
-        if let Some(artifact_digest) = artifact_digest {
-            policy.config_snapshot["artifact_digest"] = artifact_digest;
-        }
-        if let Some(protected_snapshot_digest) = protected_snapshot_digest {
-            policy.config_snapshot["protected_snapshot_digest"] = protected_snapshot_digest;
-        }
-    }
-    Ok(())
-}
-
 impl KernelComposition {
     /// Returns the selected local IPC name for diagnostics and ready output.
     ///
