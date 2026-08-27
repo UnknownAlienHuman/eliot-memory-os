@@ -27,14 +27,15 @@ use eliot_protocol::RequestIdentity;
 use eliot_user_broker_core::{
     AuthorityPort, BrokerError, BrokerSnapshot, DurableRegistrationPort, HeartbeatReceipt,
     HeartbeatRequest, LaunchGrant, LaunchRequest, OperatorArtifact, PortError, ProcessPort,
-    ProcessStartOutcome, RegistrationFenceReceipt, RegistrationFenceRequest, RegistrationGrant,
-    RegistrationReceipt, RegistrationRequest, RequiredProvider, UserBroker,
+    ProcessStartOutcome, RegistrationReceipt, RegistrationRequest, RequiredProvider, UserBroker,
 };
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+mod kernel_authority_port;
+use kernel_authority_port::KernelAuthorityPort;
 
 pub const SERVICE_NAME: &str = "eliot-user-broker";
 pub const PROTOCOL_VERSION: &str = "eliot.user-broker.v1";
@@ -190,99 +191,6 @@ pub enum CompositionError {
 }
 
 type SharedKernelClient = Arc<Mutex<eliot_cli::kernel_client::KernelClient>>;
-
-fn kernel_port_error(error: eliot_cli::kernel_client::KernelClientError) -> PortError {
-    match error {
-        eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(_) => PortError::Unavailable,
-        eliot_cli::kernel_client::KernelClientError::UnknownOutcome(_) => PortError::Unknown,
-        eliot_cli::kernel_client::KernelClientError::MissingRequestIdentity => {
-            PortError::Invalid("missing authenticated RequestIdentity".to_owned())
-        }
-        eliot_cli::kernel_client::KernelClientError::Configuration(detail)
-        | eliot_cli::kernel_client::KernelClientError::Rejected(detail) => {
-            PortError::Invalid(detail)
-        }
-    }
-}
-
-fn kernel_call(
-    client: &SharedKernelClient,
-    operation: &str,
-    payload: Value,
-) -> Result<Value, PortError> {
-    let mut client = client.lock().map_err(|_| PortError::Unknown)?;
-    client
-        .transact_json(operation, payload)
-        .map_err(kernel_port_error)
-}
-
-struct KernelAuthorityPort {
-    client: SharedKernelClient,
-}
-
-impl AuthorityPort for KernelAuthorityPort {
-    fn register(&mut self, request: &RegistrationRequest) -> Result<RegistrationGrant, PortError> {
-        serde_json::from_value(kernel_call(
-            &self.client,
-            "eliot.user-broker.register",
-            serde_json::to_value(request).map_err(|error| PortError::Invalid(error.to_string()))?,
-        )?)
-        .map_err(|error| PortError::Invalid(format!("decode registration grant: {error}")))
-    }
-
-    fn heartbeat(
-        &mut self,
-        receipt: &RegistrationReceipt,
-        observed_at: u64,
-    ) -> Result<RegistrationGrant, PortError> {
-        kernel_call(
-            &self.client,
-            "eliot.user-broker.heartbeat",
-            serde_json::json!({
-                "registration": receipt,
-                "observed_at": observed_at,
-            }),
-        )
-        .and_then(|value| {
-            serde_json::from_value(value)
-                .map_err(|error| PortError::Invalid(format!("decode heartbeat grant: {error}")))
-        })
-    }
-
-    fn authorize_launch(
-        &mut self,
-        receipt: &RegistrationReceipt,
-        request: &LaunchRequest,
-    ) -> Result<LaunchGrant, PortError> {
-        kernel_call(
-            &self.client,
-            "eliot.user-broker.authorize-launch",
-            serde_json::json!({
-                "registration": receipt,
-                "request": request,
-            }),
-        )
-        .and_then(|value| {
-            serde_json::from_value(value)
-                .map_err(|error| PortError::Invalid(format!("decode launch grant: {error}")))
-        })
-    }
-
-    fn fence(
-        &mut self,
-        request: &RegistrationFenceRequest,
-    ) -> Result<RegistrationFenceReceipt, PortError> {
-        kernel_call(
-            &self.client,
-            "eliot.user-broker.fence",
-            serde_json::to_value(request).map_err(|error| PortError::Invalid(error.to_string()))?,
-        )
-        .and_then(|value| {
-            serde_json::from_value(value)
-                .map_err(|error| PortError::Invalid(format!("decode fence receipt: {error}")))
-        })
-    }
-}
 
 /// Retains observation-only process evidence without granting any additional
 /// authority to the broker or its callers.
