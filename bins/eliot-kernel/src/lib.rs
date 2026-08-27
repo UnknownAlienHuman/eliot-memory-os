@@ -48,9 +48,16 @@ mod front_door_listener;
 mod front_door_session;
 mod generation_recovery;
 mod health_view;
+mod runtime_identity;
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]
 use generation_recovery::update_handshake_policy;
+use runtime_identity::stable_owner_principal_digest;
+#[cfg(windows)]
+use runtime_identity::{
+    eliotd_launch_attempt_identity, eliotd_operation_id, fresh_eliotd_launch_descriptor,
+    observed_session_principal_binding,
+};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -186,88 +193,6 @@ const ELIOTD_MAX_RECOVERY_ATTEMPTS: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct KernelStoreRebindProductionBoundary;
-
-#[cfg(windows)]
-fn observed_session_principal_binding() -> Result<String, KernelBuildError> {
-    let expectation = current_process_named_pipe_expectation()
-        .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
-    Ok(format!(
-        "sid={};session={}",
-        expectation.expected_sid(),
-        expectation.expected_session_id()
-    ))
-}
-
-#[cfg(windows)]
-fn eliotd_launch_attempt_identity(
-    launch: &EliotdLaunchDescriptor,
-    kernel_process_id: u32,
-    kernel_start_time_100ns: u64,
-    kernel_image_path: &str,
-) -> Result<String, KernelBuildError> {
-    #[derive(Serialize)]
-    struct AttemptBinding<'a> {
-        authority_epoch: u64,
-        generation: u64,
-        launch_nonce: &'a str,
-        kernel_process_id: u32,
-        kernel_start_time_100ns: u64,
-        kernel_image_path: &'a str,
-    }
-
-    let bytes = serde_json::to_vec(&AttemptBinding {
-        authority_epoch: launch.authority_epoch.value(),
-        generation: launch.generation.value(),
-        launch_nonce: launch.launch_nonce.as_str(),
-        kernel_process_id,
-        kernel_start_time_100ns,
-        kernel_image_path,
-    })
-    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-    Ok(sha256_hex(&bytes))
-}
-
-#[cfg(windows)]
-fn eliotd_operation_id(
-    generation: Generation,
-    launch_attempt_identity: &str,
-) -> Result<eliot_process::OperationId, KernelBuildError> {
-    let short = launch_attempt_identity.get(..16).ok_or_else(|| {
-        KernelBuildError::Service("eliotd launch attempt identity is malformed".to_owned())
-    })?;
-    eliot_process::OperationId::new(format!("eliotd-launch-{}-{short}", generation.get()))
-        .map_err(|error| KernelBuildError::Service(error.to_string()))
-}
-
-#[cfg(windows)]
-fn fresh_eliotd_launch_descriptor(
-    previous: &EliotdLaunchDescriptor,
-    recovery_attempt: u64,
-) -> Result<EliotdLaunchDescriptor, KernelBuildError> {
-    previous
-        .validate()
-        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-    let nonce_material = format!(
-        "{}:{}:{}:{}",
-        previous.descriptor_sha256,
-        previous.launch_nonce.as_str(),
-        recovery_attempt,
-        unix_ms(),
-    );
-    let launch_nonce =
-        PlatformHandle::new(format!("eliotd:{}", sha256_hex(nonce_material.as_bytes())))
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-    let mut next = previous.clone();
-    next.launch_nonce = launch_nonce.clone();
-    if next.arguments.len() != 8 {
-        return Err(KernelBuildError::Service(
-            "eliotd launch descriptor has a non-canonical argv contour".to_owned(),
-        ));
-    }
-    next.arguments[5] = launch_nonce;
-    next.with_computed_digest()
-        .map_err(|error| KernelBuildError::Service(error.to_string()))
-}
 
 const fn probe_ready_state_admitted(state: KernelServiceState) -> bool {
     matches!(
@@ -1395,20 +1320,6 @@ fn caller_binding(
     let session_binding = ProcessSessionBinding::new(&session.connection_id, session.session_epoch)
         .map_err(|_| TransportError::SessionFenced)?;
     Ok((owner, session_binding))
-}
-
-fn stable_owner_principal_digest(
-    stable_sid: &str,
-    module_id: &str,
-    authority_epoch: u64,
-    generation: Generation,
-) -> String {
-    let mut principal = Sha256::new();
-    principal.update(stable_sid.as_bytes());
-    principal.update(module_id.as_bytes());
-    principal.update(authority_epoch.to_le_bytes());
-    principal.update(generation.get().to_le_bytes());
-    format!("{:x}", Sha256::digest(principal.finalize()))
 }
 
 #[cfg(windows)]
@@ -5425,7 +5336,7 @@ fn is_lower_sha256(value: &str) -> bool {
 }
 
 #[allow(dead_code)]
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(bytes);
     let mut output = String::with_capacity(64);
