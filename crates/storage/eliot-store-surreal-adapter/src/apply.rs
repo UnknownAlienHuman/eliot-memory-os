@@ -29,7 +29,7 @@ use eliot_store_api::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
-const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * FROM ONLY schema_meta:current; SELECT VALUE body FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
+const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * FROM ONLY schema_meta:current; SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
 
 /// The durable canonical fence singleton.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
@@ -1001,7 +1001,7 @@ async fn read_fence(
 fn build_recovery_sql(request: &StoreRecoveryRequest) -> String {
     let mut sql = String::from(schema::TX_BEGIN);
     sql.push_str(schema::READ_SCHEMA_META);
-    sql.push_str("SELECT VALUE body FROM ONLY canonical_fence:current;");
+    sql.push_str("SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current;");
     for index in 0..request.records.len() {
         sql.push_str(&schema::indexed(schema::READ_RECOVERY_OWNER_BY_KEY, index));
     }
@@ -2975,15 +2975,17 @@ mod migration_tests {
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         };
-        let mut value = serde_json::to_value(&fence).expect("serialize");
-        if let Value::Object(map) = &mut value {
-            map.insert("extra_fence_field".to_owned(), json!("boom"));
+        for extra_field in ["extra_fence_field", "id"] {
+            let mut value = serde_json::to_value(&fence).expect("serialize");
+            if let Value::Object(map) = &mut value {
+                map.insert(extra_field.to_owned(), json!("boom"));
+            }
+            let result: Result<FenceRecord, _> = serde_json::from_value(value);
+            assert!(
+                result.is_err(),
+                "deny_unknown_fields must reject extra fence field {extra_field}"
+            );
         }
-        let result: Result<FenceRecord, _> = serde_json::from_value(value);
-        assert!(
-            result.is_err(),
-            "deny_unknown_fields must reject extra fence field"
-        );
     }
 
     #[test]
@@ -3068,6 +3070,37 @@ mod migration_tests {
         assert!(READ_VALIDATION_SNAPSHOT.contains("canonical_fence:current"));
         assert!(READ_VALIDATION_SNAPSHOT.contains("SELECT VALUE body FROM revision_head"));
         assert!(READ_VALIDATION_SNAPSHOT.ends_with("COMMIT TRANSACTION;"));
+    }
+
+    #[test]
+    fn canonical_fence_record_reads_use_explicit_flat_projection() {
+        let (_, request) = genesis_fixture();
+        let recovery_request = StoreRecoveryRequest {
+            contract_version: CONTRACT_VERSION,
+            state_fence: request.state_fence,
+            records: vec![request.owner_records[0].record_key()],
+            include_receipts: true,
+            include_jobs: true,
+        };
+        let expected_projection = "SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current";
+        let recovery_sql = build_recovery_sql(&recovery_request);
+        for (name, query) in [
+            ("validation", READ_VALIDATION_SNAPSHOT),
+            ("read_fence", schema::READ_FENCE),
+            ("genesis_read", schema::READ_GENESIS_SCHEMA_AND_STATE),
+            ("genesis_guard", schema::TX_GENESIS_SCHEMA_GUARD),
+            ("recovery", recovery_sql.as_str()),
+        ] {
+            assert!(query.contains(expected_projection), "{name} projection");
+            assert!(
+                !query.contains("SELECT VALUE body FROM ONLY canonical_fence:current"),
+                "{name} must not read the legacy body field"
+            );
+            assert!(
+                !query.contains("SELECT * FROM ONLY canonical_fence:current"),
+                "{name} must not admit the SurrealDB id field"
+            );
+        }
     }
 
     #[test]
