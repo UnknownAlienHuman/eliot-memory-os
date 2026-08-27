@@ -14,8 +14,8 @@
 use super::*;
 use eliot_contracts::StateFence;
 use eliot_store_api::{
-    RequestMeta, StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
-    WriteReceipt,
+    OrderingHeadExpectation, PreparedTransition, RequestMeta, RevisionHeadExpectation, StoreError,
+    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
 };
 use serde::Deserialize;
 
@@ -30,6 +30,15 @@ struct StoreRecoveryOperation {
 struct StoreInitializeGenesisOperation {
     context: RequestMeta,
     request: StoreGenesisRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreApplyOperation {
+    context: RequestMeta,
+    transition: PreparedTransition,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
 }
 
 impl KernelComposition {
@@ -122,6 +131,10 @@ impl KernelComposition {
             "store_recovery" => self.store_recovery_operation(session, payload).await,
             "store_initialize_genesis" => {
                 self.store_initialize_genesis_operation(session, payload)
+                    .await
+            }
+            "apply_prepared" => {
+                self.store_apply_operation(session, request_id.clone(), payload)
                     .await
             }
             "daemon_degraded" => {
@@ -305,6 +318,80 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    async fn store_apply_operation(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: StoreApplyOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        if operation.context.request_id != request_id {
+            return Err(TransportError::SessionFenced);
+        }
+        operation
+            .context
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if let Err(error) = operation.transition.validate() {
+            return Ok(Self::store_error_response_text(
+                "write_receipt",
+                &error.to_string(),
+            ));
+        }
+        validate_store_session_fence(session, &operation.context.state_fence)?;
+        if operation.transition.state_fence != operation.context.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        for head in &operation.expected_revision_heads {
+            if let Err(error) = head.validate() {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    &error.to_string(),
+                ));
+            }
+            if head.state_fence != operation.context.state_fence {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        for head in &operation.expected_ordering_heads {
+            if let Err(error) = head.validate() {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    &error.to_string(),
+                ));
+            }
+            if head.state_fence != operation.context.state_fence {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        let gateway = self.retained_store_gateway()?;
+        match gateway
+            .apply(
+                &operation.context,
+                operation.transition,
+                operation.expected_revision_heads,
+                operation.expected_ordering_heads,
+            )
+            .await
+        {
+            Ok(receipt) => Ok(store_apply_response(&receipt)),
+            Err(error) => Ok(Self::store_error_response_text("write_receipt", &error)),
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn store_apply_operation(
+        &self,
+        _session: &Session,
+        _request_id: RequestId,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _ = payload;
+        Err(TransportError::SessionFenced)
+    }
+
+    #[cfg(windows)]
     fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
         self.canonical_store_gateway
             .lock()
@@ -355,6 +442,14 @@ fn store_genesis_response(receipt: &WriteReceipt) -> serde_json::Value {
     serde_json::json!({
         "status": "known",
         "value": { "kind": "store_initialize_genesis", "value": receipt },
+        "recovery": null,
+    })
+}
+
+fn store_apply_response(receipt: &WriteReceipt) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": { "kind": "write_receipt", "value": receipt },
         "recovery": null,
     })
 }
