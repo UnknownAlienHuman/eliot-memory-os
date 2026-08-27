@@ -18,6 +18,7 @@ pub mod r13_os_harness;
 mod daemon_request_dispatch;
 mod front_door_session;
 mod generation_recovery;
+mod health_view;
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]
 use generation_recovery::update_handshake_policy;
@@ -6654,71 +6655,6 @@ impl KernelComposition {
         })
     }
 
-    fn daemon_health_response(health: &StoreHealth) -> serde_json::Value {
-        serde_json::json!({
-            "status": "known",
-            "value": {
-                "kind": "health",
-                "value": health,
-            },
-            "recovery": null,
-        })
-    }
-
-    fn daemon_snapshot(&self) -> Result<serde_json::Value, TransportError> {
-        let policy = self
-            .front_door_policy
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let kernel_artifact_digest = policy
-            .config_snapshot
-            .get("artifact_digest")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(TransportError::SessionFenced)?;
-        let protected_snapshot_digest = policy
-            .config_snapshot
-            .get("protected_snapshot_digest")
-            .and_then(serde_json::Value::as_str);
-        if let Some(value) = protected_snapshot_digest {
-            if !is_lower_sha256(value) {
-                return Err(TransportError::SessionFenced);
-            }
-        } else if self.daemon_launch.is_some() {
-            return Err(TransportError::SessionFenced);
-        }
-        let mut snapshot = serde_json::json!({
-            "service": SERVICE_NAME,
-            "protocol": PROTOCOL_VERSION,
-            "generation": policy.module_generation.generation.value(),
-            "authority_epoch": policy.module_generation.state_fence.authority_epoch.value(),
-            // This is the Kernel peer artifact domain. The daemon child
-            // artifact remains in module_generation.artifact_id and ClientHello.
-            "artifact_digest": kernel_artifact_digest,
-        });
-        if let Some(protected_snapshot_digest) = protected_snapshot_digest {
-            snapshot["protected_snapshot_digest"] =
-                serde_json::Value::String(protected_snapshot_digest.to_owned());
-        }
-        Ok(snapshot)
-    }
-
-    #[cfg(windows)]
-    async fn daemon_health(&self) -> Result<eliot_store_api::StoreHealth, KernelServiceError> {
-        let gateway = self
-            .canonical_store_gateway
-            .lock()
-            .map_err(|_| KernelServiceError::Platform("store gateway lock poisoned".to_owned()))?
-            .clone()
-            .ok_or(KernelServiceError::ReadinessNotProven)?;
-        gateway.health().await.map_err(KernelServiceError::Platform)
-    }
-
-    #[cfg(not(windows))]
-    async fn daemon_health(&self) -> Result<eliot_store_api::StoreHealth, KernelServiceError> {
-        Err(KernelServiceError::ReadinessNotProven)
-    }
-
     fn retain_process_path_proof(
         &self,
         admission: &ProcessExecutionAdmissionRequest,
@@ -8262,15 +8198,6 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         Ok(())
-    }
-
-    /// Returns the current Kernel service lifecycle state.
-    pub fn service_state(&self) -> Result<KernelServiceState, KernelServiceError> {
-        Ok(self
-            .service
-            .lock()
-            .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?
-            .state())
     }
 
     /// Completes the bounded cooperative-then-forced shutdown sequence.
