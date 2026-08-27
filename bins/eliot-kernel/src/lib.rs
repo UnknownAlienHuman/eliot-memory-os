@@ -43,12 +43,14 @@ use eliot_kernel_core::{
 pub mod r13_os_harness;
 
 mod daemon_request_dispatch;
+mod daemon_session_guard;
 mod frame_dispatch;
 mod front_door_listener;
 mod front_door_session;
 mod generation_recovery;
 mod health_view;
 mod runtime_identity;
+use daemon_session_guard::caller_binding;
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]
 use generation_recovery::update_handshake_policy;
@@ -1289,37 +1291,6 @@ fn load_agent_bridge_declaration(
         .validate_client_declaration(&declaration)
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;
     Ok(declaration)
-}
-
-fn caller_binding(
-    session: &Session,
-) -> Result<(ProcessOwnerBinding, ProcessSessionBinding), TransportError> {
-    session
-        .peer
-        .validate()
-        .map_err(|_| TransportError::PeerIdentityUnavailable)?;
-    let generation = Generation::new(session.module_generation.generation.value())
-        .map_err(|_| TransportError::SessionFenced)?;
-    let stable_sid = match &session.peer {
-        PeerIdentity::Authenticated { user_identity, .. } => user_identity,
-        PeerIdentity::Unavailable { .. } => return Err(TransportError::PeerIdentityUnavailable),
-    };
-    let principal_digest = stable_owner_principal_digest(
-        stable_sid,
-        session.module_generation.module_id.as_str(),
-        session.authority_epoch,
-        generation,
-    );
-    let owner = ProcessOwnerBinding::new(
-        session.module_generation.module_id.as_str(),
-        principal_digest,
-        session.authority_epoch,
-        generation,
-    )
-    .map_err(|_| TransportError::SessionFenced)?;
-    let session_binding = ProcessSessionBinding::new(&session.connection_id, session.session_epoch)
-        .map_err(|_| TransportError::SessionFenced)?;
-    Ok((owner, session_binding))
 }
 
 #[cfg(windows)]
@@ -3859,28 +3830,6 @@ impl KernelComposition {
                 .retain(|ticket_id| live_ticket_ids.contains(ticket_id));
         }
         self.agent_activation_changed.notify_waiters();
-    }
-
-    #[cfg(windows)]
-    fn require_current_daemon_session(&self, session: &Session) -> Result<(), TransportError> {
-        if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER {
-            return Ok(());
-        }
-        let Some(launch) = self
-            .active_daemon_launch()
-            .map_err(|_| TransportError::SessionFenced)?
-        else {
-            return Ok(());
-        };
-        let policy = self
-            .front_door_policy
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        if session.accepts_bound(&policy.module_generation, launch.launch_nonce.as_str()) {
-            Ok(())
-        } else {
-            Err(TransportError::SessionFenced)
-        }
     }
 
     #[cfg(test)]
