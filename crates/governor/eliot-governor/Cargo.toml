@@ -8,6 +8,7 @@ description = "Production Governor orchestration and readiness owner"
 
 [dependencies]
 eliot-authority.workspace = true
+eliot-budget.workspace = true
 eliot-canonical.workspace = true
 eliot-change-monitor.workspace = true
 eliot-config.workspace = true

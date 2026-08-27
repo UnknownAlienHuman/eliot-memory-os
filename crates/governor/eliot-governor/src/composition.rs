@@ -15,6 +15,7 @@ use crate::{
     ServiceObservation,
 };
 use eliot_authority::{EffectAuthorizer, GrantGraph};
+use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_contracts::{
@@ -629,16 +630,88 @@ pub struct ConfigOwnerSnapshot {
     pub config_digest: String,
 }
 
-/// Budget owner payload containing every durable reservation identity.
+/// Versioned semantic recovery state for the budget owner.
+///
+/// `Unconfigured` is the explicit genesis state. It carries no envelope,
+/// authority, quota, reservation, or fabricated ledger. A configured owner
+/// can only be admitted from the complete typed budget-ledger snapshot.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetOwnerSnapshot {
+    /// Closed snapshot schema identity.
+    pub schema: String,
+    /// Closed snapshot schema version.
+    pub version: u16,
     /// Exact owner fence.
     pub state_fence: StateFence,
-    /// Durable budget revision.
+    /// Durable semantic owner revision.
     pub revision: u64,
-    /// Reserved canonical operation identities.
-    pub reserved_operations: Vec<OperationId>,
+    /// Explicitly configured or unconfigured budget state.
+    pub state: BudgetOwnerState,
+}
+
+/// The only admitted budget-owner states during recovery.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub enum BudgetOwnerState {
+    /// Genesis has no budget policy or authority yet.
+    Unconfigured,
+    /// A complete, typed ledger restored from durable state.
+    Configured {
+        /// Full deterministic budget ledger recovery state.
+        ledger: Box<BudgetLedgerRecoverySnapshot>,
+    },
+}
+
+const BUDGET_OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.budget-owner.v1";
+const BUDGET_OWNER_SNAPSHOT_VERSION: u16 = 1;
+
+impl BudgetOwnerSnapshot {
+    #[cfg(test)]
+    fn unconfigured(state_fence: StateFence, revision: u64) -> Self {
+        Self {
+            schema: BUDGET_OWNER_SNAPSHOT_SCHEMA.to_owned(),
+            version: BUDGET_OWNER_SNAPSHOT_VERSION,
+            state_fence,
+            revision,
+            state: BudgetOwnerState::Unconfigured,
+        }
+    }
+
+    fn restore(
+        &self,
+        expected_fence: &StateFence,
+    ) -> Result<Option<BudgetLedger>, CompositionError> {
+        self.state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.schema != BUDGET_OWNER_SNAPSHOT_SCHEMA
+            || self.version != BUDGET_OWNER_SNAPSHOT_VERSION
+            || self.state_fence != *expected_fence
+            || self.revision == 0
+        {
+            return Err(CompositionError::Recovery(
+                "budget snapshot has an invalid schema, stale fence, or zero revision".to_owned(),
+            ));
+        }
+        match &self.state {
+            BudgetOwnerState::Unconfigured => Ok(None),
+            BudgetOwnerState::Configured { ledger } => {
+                if ledger.authority.state_fence != self.state_fence {
+                    return Err(CompositionError::Recovery(
+                        "configured budget ledger has a stale nested authority fence".to_owned(),
+                    ));
+                }
+                BudgetLedger::from_snapshot((**ledger).clone())
+                    .map(Some)
+                    .map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "configured budget ledger failed semantic restore: {error:?}"
+                        ))
+                    })
+            }
+        }
+    }
 }
 
 /// Problem projection payload containing its durable revision map.
@@ -972,7 +1045,8 @@ impl ConfigOwner {
 #[derive(Clone, Debug)]
 pub struct BudgetOwner {
     state_fence: StateFence,
-    reserved_operations: BTreeSet<OperationId>,
+    revision: u64,
+    ledger: Option<BudgetLedger>,
 }
 
 impl BudgetOwner {
@@ -982,10 +1056,39 @@ impl BudgetOwner {
         &self.state_fence
     }
 
-    /// Returns the number of durable reservations observed by this owner.
+    /// Returns the durable semantic owner revision.
     #[must_use]
-    pub fn reservation_count(&self) -> usize {
-        self.reserved_operations.len()
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the exact configured ledger, or `None` for explicit genesis
+    /// `Unconfigured` state. No transition is exposed here.
+    #[must_use]
+    pub fn ledger(&self) -> Option<&BudgetLedger> {
+        self.ledger.as_ref()
+    }
+
+    /// Emits the same deterministic semantic recovery snapshot admitted for
+    /// this owner.
+    pub fn snapshot(&self) -> Result<BudgetOwnerSnapshot, CompositionError> {
+        let state = match &self.ledger {
+            Some(ledger) => BudgetOwnerState::Configured {
+                ledger: Box::new(ledger.snapshot().map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "configured budget ledger snapshot failed: {error:?}"
+                    ))
+                })?),
+            },
+            None => BudgetOwnerState::Unconfigured,
+        };
+        Ok(BudgetOwnerSnapshot {
+            schema: BUDGET_OWNER_SNAPSHOT_SCHEMA.to_owned(),
+            version: BUDGET_OWNER_SNAPSHOT_VERSION,
+            state_fence: self.state_fence.clone(),
+            revision: self.revision,
+            state,
+        })
     }
 }
 
@@ -1178,23 +1281,16 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         let authority_snapshot: AuthorityOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Authority)?;
         let authority = AuthorityOwner::from_snapshot(&authority_snapshot, state_fence)?;
+        let budget_read_revision = recovery.owner_read(RecoveryOwner::Budget)?.revision;
         let budget_snapshot: BudgetOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Budget)?;
-        if &budget_snapshot.state_fence != state_fence || budget_snapshot.revision == 0 {
+        if budget_snapshot.revision != budget_read_revision {
             return Err(CompositionError::Recovery(
-                "budget snapshot has a stale fence or zero revision".to_owned(),
+                "budget snapshot revision does not match its Kernel named-read revision".to_owned(),
             ));
         }
-        let reserved_operation_count = budget_snapshot.reserved_operations.len();
-        let reserved_operations = budget_snapshot
-            .reserved_operations
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        if reserved_operations.len() != reserved_operation_count {
-            return Err(CompositionError::Recovery(
-                "budget snapshot contains duplicate operation identities".to_owned(),
-            ));
-        }
+        let budget_revision = budget_snapshot.revision;
+        let budget_ledger = budget_snapshot.restore(state_fence)?;
         let config_snapshot: ConfigOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Config)?;
         if &config_snapshot.state_fence != state_fence
@@ -1300,7 +1396,8 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             authority,
             budget: BudgetOwner {
                 state_fence: state_fence.clone(),
-                reserved_operations,
+                revision: budget_revision,
+                ledger: budget_ledger,
             },
             config: ConfigOwner {
                 state_fence: state_fence.clone(),
@@ -1805,10 +1902,13 @@ mod tests {
 
     use super::*;
     use crate::{STARTUP_ORDER, ServiceId};
-    use eliot_contracts::{ClockReading, SessionId, TaskId};
+    use eliot_budget::{BudgetEnvelope, BudgetLedger, ProviderToolAttribution, QuotaState};
+    use eliot_config::Applicability;
+    use eliot_contracts::{ClockReading, ContractId, SessionId, TaskId};
     use eliot_coordination::{
         RegisterSession as CoordinationRegisterSession, WorkItem, WorkLeaseRequest, WorkState,
     };
+    use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
     use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
     use eliot_session::{RegisterSession, SessionCommand, SessionCommandContext};
     use eliot_store_api::ScopeId;
@@ -2037,11 +2137,9 @@ mod tests {
                 grant_count: 0,
                 authorized_effect_count: 0,
             }),
-            RecoveryOwner::Budget => serde_json::to_value(BudgetOwnerSnapshot {
-                state_fence: state_fence.clone(),
-                revision: 1,
-                reserved_operations: Vec::new(),
-            }),
+            RecoveryOwner::Budget => {
+                serde_json::to_value(BudgetOwnerSnapshot::unconfigured(state_fence.clone(), 1))
+            }
             RecoveryOwner::Config => serde_json::to_value(ConfigOwnerSnapshot {
                 state_fence: state_fence.clone(),
                 revision: 1,
@@ -2901,5 +2999,124 @@ mod tests {
                     if message.contains("owner task payload is not canonical JSON")
             ));
         }
+    }
+
+    fn configured_budget_snapshot(fence: &StateFence) -> BudgetOwnerSnapshot {
+        let authority = AuthorityBinding {
+            authority_id: ContractId::new("authority:budget").expect("authority id"),
+            authority_owner: "budget-owner".to_owned(),
+            authority_epoch: fence.authority_epoch,
+            state_fence: fence.clone(),
+            allowed_effect: EffectClass::ExternalEffect,
+            proof_ceiling: ProofCeiling::ObservedExternalEffect,
+        };
+        let ledger = BudgetLedger::new(
+            BudgetEnvelope {
+                envelope_id: "budget:configured".to_owned(),
+                policy_snapshot_id: "policy:budget".to_owned(),
+                applicability: Applicability::Applicable,
+                automation_policy_ref: "automation:budget".to_owned(),
+                cost_authority_ref: "authority:budget".to_owned(),
+                provider_tool: ProviderToolAttribution {
+                    provider_ref: "provider:test".to_owned(),
+                    tool_ref: "tool:test".to_owned(),
+                },
+                max_cost_micros: Some(1_000),
+                quota_windows: vec![eliot_budget::QuotaWindow {
+                    window_id: "requests".to_owned(),
+                    state: QuotaState::Known { remaining: 10 },
+                    source_ref: "meter:test".to_owned(),
+                    confidence_ref: "observed".to_owned(),
+                    observed_at_unix_ms: 1,
+                    reset_at_unix_ms: Some(2),
+                }],
+            },
+            authority,
+        )
+        .expect("configured ledger");
+        BudgetOwnerSnapshot {
+            schema: BUDGET_OWNER_SNAPSHOT_SCHEMA.to_owned(),
+            version: BUDGET_OWNER_SNAPSHOT_VERSION,
+            state_fence: fence.clone(),
+            revision: 2,
+            state: BudgetOwnerState::Configured {
+                ledger: Box::new(ledger.snapshot().expect("ledger snapshot")),
+            },
+        }
+    }
+
+    #[test]
+    fn configured_budget_owner_roundtrips_exact_typed_ledger() {
+        let observed = snapshot();
+        let fence = observed.state_fence();
+        let owner_snapshot = configured_budget_snapshot(&fence);
+        let ledger = owner_snapshot
+            .restore(&fence)
+            .expect("restore configured owner")
+            .expect("configured ledger");
+        assert_eq!(
+            ledger.snapshot().expect("restored ledger snapshot"),
+            match &owner_snapshot.state {
+                BudgetOwnerState::Configured { ledger } => (**ledger).clone(),
+                BudgetOwnerState::Unconfigured => panic!("configured fixture"),
+            }
+        );
+        let owner = BudgetOwner {
+            state_fence: observed.state_fence().clone(),
+            revision: owner_snapshot.revision,
+            ledger: Some(ledger),
+        };
+        assert_eq!(owner.snapshot().expect("owner snapshot"), owner_snapshot);
+    }
+
+    #[test]
+    fn budget_owner_recovery_rejects_fence_schema_and_unknown_field_substitution() {
+        let observed = snapshot();
+        let fence = observed.state_fence();
+        let valid = configured_budget_snapshot(&fence);
+
+        let mut stale_outer = valid.clone();
+        stale_outer.state_fence.resource_generation =
+            ResourceGeneration::new(2).expect("generation");
+        assert!(stale_outer.restore(&fence).is_err());
+
+        let mut stale_nested = valid.clone();
+        if let BudgetOwnerState::Configured { ledger } = &mut stale_nested.state {
+            ledger.authority.state_fence.resource_generation =
+                ResourceGeneration::new(2).expect("generation");
+        }
+        assert!(stale_nested.restore(&fence).is_err());
+
+        let mut zero_revision = valid.clone();
+        zero_revision.revision = 0;
+        assert!(zero_revision.restore(&fence).is_err());
+
+        let mut wrong_schema = valid.clone();
+        wrong_schema.schema.push_str("-substituted");
+        assert!(wrong_schema.restore(&fence).is_err());
+        let mut wrong_version = valid.clone();
+        wrong_version.version = 2;
+        assert!(wrong_version.restore(&fence).is_err());
+
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let mut fake = fake_kernel(observed.clone());
+        let mut substituted_revision =
+            serde_json::to_value(BudgetOwnerSnapshot::unconfigured(observed.state_fence(), 1))
+                .expect("budget json");
+        substituted_revision["revision"] = serde_json::json!(2);
+        let payload = canonical_json_bytes(&substituted_revision).expect("budget bytes");
+        fake.payloads.insert(RecoveryOwner::Budget, payload);
+        assert!(
+            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default()).is_err()
+        );
+
+        let encoded = serde_json::to_value(valid).expect("budget json");
+        let mut unknown_top = encoded.clone();
+        unknown_top["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<BudgetOwnerSnapshot>(unknown_top).is_err());
+        let mut unknown_state = encoded;
+        unknown_state["state"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<BudgetOwnerSnapshot>(unknown_state).is_err());
     }
 }

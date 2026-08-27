@@ -1152,6 +1152,7 @@ name = "eliot-governor"
 version = "0.1.0"
 dependencies = [
  "eliot-authority",
+ "eliot-budget",
  "eliot-canonical",
  "eliot-change-monitor",
  "eliot-config",
