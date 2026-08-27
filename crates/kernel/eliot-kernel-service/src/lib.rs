@@ -19,6 +19,8 @@ use std::pin::Pin;
 mod lifecycle;
 mod protocol;
 mod store_client;
+#[cfg(windows)]
+mod store_gateway;
 
 pub use eliot_process::ProcessExecutionAdmissionRequest;
 pub use eliot_protocol::{
@@ -44,6 +46,8 @@ pub use protocol::{
     semantic_store_config_hash_from_json,
 };
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
+#[cfg(windows)]
+pub use store_gateway::KernelStoreGateway;
 
 /// Boxed future for provider-neutral Kernel process operations.
 pub type ProcessExecutionFuture<'a> =
