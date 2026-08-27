@@ -17,14 +17,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{AuthorityEpoch, sha256_hex};
+#[cfg(test)]
 use eliot_installation::{
-    ApprovedGenerationRegistry, CandidateManifest, InstallationProfile, PendingActivationState,
-    RedbInstallationRegistry, RuntimeStateRoots, ValidatedRuntimeRootLeases,
-    WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider, phase_b_scm_selector,
+    ApprovedGenerationRegistry, InstallerServiceRegistrationApproval, InstallerServiceRole,
+    PendingActivationState, phase_b_scm_selector,
+};
+use eliot_installation::{
+    CandidateManifest, InstallationProfile, RedbInstallationRegistry, RuntimeStateRoots,
+    ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
     verify_file_digest, verify_file_digest_with_lease,
 };
-#[cfg(test)]
-use eliot_installation::{InstallerServiceRegistrationApproval, InstallerServiceRole};
 use eliot_ors::{SupervisionLeaseSnapshot, read_current_supervision_lease_read_only};
 #[cfg(test)]
 use eliot_platform_windows::WindowsAdapterError;
@@ -61,6 +63,7 @@ const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
 const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
+mod runtime_manifest_selection;
 mod scm_launch;
 mod service_registration_projection;
 mod supervision_lease_load;
@@ -74,6 +77,11 @@ pub(crate) use service_registration_projection::{
     validate_bound_service_registrations,
 };
 
+#[cfg(test)]
+use runtime_manifest_selection::manifest_matches_bootstrap;
+use runtime_manifest_selection::{
+    approved_host_artifact_path, read_registry_for_bootstrap, select_runtime_manifest,
+};
 pub use scm_launch::{
     ApprovedHostRegistration, ValidatedWatchdogScmLaunch, WatchdogScmLaunchError,
     parse_watchdog_process_argv, parse_watchdog_scm_argv, validate_watchdog_scm_bootstrap,
@@ -2149,140 +2157,6 @@ fn load_runtime_binding(
             _root_leases: Arc::new(leases),
         },
     ))
-}
-
-fn select_runtime_manifest(
-    registry: &ApprovedGenerationRegistry,
-    bootstrap: &ServiceBootstrapArguments,
-) -> Result<CandidateManifest, SpoolError> {
-    let matching_generations = registry
-        .generations()
-        .iter()
-        .filter(|generation| manifest_matches_bootstrap(&generation.manifest, bootstrap))
-        .collect::<Vec<_>>();
-    if matching_generations.len() > 1 {
-        return Err(SpoolError::InvalidLease(
-            "multiple approved generations match the SCM bootstrap".to_owned(),
-        ));
-    }
-    let active_match = registry
-        .active()
-        .filter(|active| manifest_matches_bootstrap(&active.manifest, bootstrap));
-    if let Some(pending) = registry.pending_activation() {
-        if !matches!(pending.state, PendingActivationState::Pending) {
-            return Err(SpoolError::InvalidLease(
-                "pending activation is recovery-required".to_owned(),
-            ));
-        }
-        let pending_match = manifest_matches_bootstrap(&pending.manifest, bootstrap);
-        match (active_match, pending_match) {
-            // A running active contour must remain selectable while a staged
-            // upgrade is present. The pending record is not an implicit
-            // override of the SCM command line.
-            (Some(active), false) => {
-                let Some(matching) = matching_generations.first() else {
-                    return Err(SpoolError::InvalidLease(
-                        "active generation has no approved projection".to_owned(),
-                    ));
-                };
-                if matching.manifest != active.manifest {
-                    return Err(SpoolError::InvalidLease(
-                        "active generation projection was substituted".to_owned(),
-                    ));
-                }
-                Ok(active.manifest.clone())
-            }
-            // A pending contour is valid during first install (no active) or
-            // when the SCM registration explicitly selects the upgrade.
-            (None, true) => {
-                let Some(matching) = matching_generations.first() else {
-                    return Err(SpoolError::InvalidLease(
-                        "pending activation has no approved generation projection".to_owned(),
-                    ));
-                };
-                if matching.manifest != pending.manifest {
-                    return Err(SpoolError::InvalidLease(
-                        "pending activation projection was substituted".to_owned(),
-                    ));
-                }
-                Ok(pending.manifest.clone())
-            }
-            (Some(_), true) => Err(SpoolError::InvalidLease(
-                "active and pending generations both match the SCM bootstrap".to_owned(),
-            )),
-            (None, false) => Err(SpoolError::InvalidLease(
-                "pending activation does not match the SCM bootstrap".to_owned(),
-            )),
-        }
-    } else {
-        let Some(active) = active_match.or_else(|| registry.active()) else {
-            return Err(SpoolError::InvalidLease(
-                "no active or matching pending approved generation".to_owned(),
-            ));
-        };
-        if !manifest_matches_bootstrap(&active.manifest, bootstrap) {
-            return Err(SpoolError::InvalidLease(
-                "active approved generation does not match the SCM bootstrap".to_owned(),
-            ));
-        }
-        let Some(matching) = matching_generations.first() else {
-            return Err(SpoolError::InvalidLease(
-                "active approved generation has no approved projection".to_owned(),
-            ));
-        };
-        if matching.manifest != active.manifest {
-            return Err(SpoolError::InvalidLease(
-                "active approved generation projection was substituted".to_owned(),
-            ));
-        }
-        Ok(active.manifest.clone())
-    }
-}
-
-fn manifest_matches_bootstrap(
-    manifest: &CandidateManifest,
-    bootstrap: &ServiceBootstrapArguments,
-) -> bool {
-    let launch = &manifest.runtime_launch;
-    let expected_descriptor_digest = phase_b_scm_selector(&launch.authority_descriptor_digest).ok();
-    bootstrap.host_state_root().is_some_and(|host_state_root| {
-        windows_paths_equal(
-            host_state_root,
-            Path::new(launch.runtime_state_roots.host_state_root.as_str()),
-        )
-    }) && bootstrap.config_descriptor_path() == Path::new(launch.authority_descriptor_path.as_str())
-        && expected_descriptor_digest
-            .as_ref()
-            .is_some_and(|expected| bootstrap.config_descriptor_digest() == expected.as_str())
-        && bootstrap.installation_id() == launch.installation_epoch.installation.as_str()
-        && bootstrap.transaction_plan_generation() == launch.authority_generation.value()
-}
-
-fn approved_host_artifact_path(manifest: &CandidateManifest) -> Result<PathBuf, SpoolError> {
-    let (path, _) = manifest
-        .runtime_launch
-        .host_artifact_binding()
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    Ok(PathBuf::from(path.as_str()))
-}
-
-pub(crate) fn read_registry_for_bootstrap(
-    bootstrap: &ServiceBootstrapArguments,
-) -> Result<(ApprovedGenerationRegistry, CandidateManifest), SpoolError> {
-    let host_state_root = bootstrap.host_state_root().ok_or_else(|| {
-        SpoolError::InvalidLease(
-            "Watchdog SCM bootstrap omitted the installer-approved Host state root".to_owned(),
-        )
-    })?;
-    let registry = RedbInstallationRegistry::inspect_existing_at(
-        ProtectedRootLease::open_existing(host_state_root).map_err(|error| {
-            SpoolError::InvalidLease(format!("Host state root open failed: {error}"))
-        })?,
-    )
-    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
-    .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
-    let manifest = select_runtime_manifest(&registry, bootstrap)?;
-    Ok((registry, manifest))
 }
 
 /// Performs a read-only SCM readback for the exact Host sibling selected by
