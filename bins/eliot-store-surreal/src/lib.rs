@@ -36,7 +36,8 @@ use eliot_store_api::{
     CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, NamedReadRequest,
     NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
     PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey,
-    StoreError, StoreHealth, WriteReceipt, decode_request_frame,
+    StoreError, StoreGenesisRequest, StoreHealth, StoreRecoverySnapshot, WriteReceipt,
+    decode_request_frame,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -337,6 +338,34 @@ fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
         },
         AdapterError::Store(error) => StoreCompositionError::Store(error),
         other => StoreCompositionError::Store(other.into_store_error()),
+    }
+}
+
+const UNKNOWN_GENESIS_REASON: &str =
+    "genesis receipt envelope is missing; reconcile by exact operation identity";
+
+fn map_recovery_dispatch_result(result: Result<StoreRecoverySnapshot, StoreError>) -> Response {
+    match result {
+        Ok(snapshot) => Response::Recovery { snapshot },
+        Err(error) => Response::Error {
+            error: error.to_string(),
+        },
+    }
+}
+
+fn map_genesis_dispatch_result(
+    request: StoreGenesisRequest,
+    result: Result<WriteReceipt, StoreError>,
+) -> Response {
+    match result {
+        Ok(receipt) => Response::Genesis { receipt },
+        Err(StoreError::MissingReceiptEnvelope) => Response::Unknown {
+            operation_id: request.operation_id,
+            reason: UNKNOWN_GENESIS_REASON.to_owned(),
+        },
+        Err(error) => Response::Error {
+            error: error.to_string(),
+        },
     }
 }
 
@@ -1211,6 +1240,18 @@ impl StoreDispatchBackend for StoreComposition {
                     error: error.to_string(),
                 },
             },
+            Request::Recovery { request } => map_recovery_dispatch_result(
+                CanonicalStoreClient::recovery(&self.store, request).await,
+            ),
+            Request::InitializeGenesis { context, request } => {
+                let result = CanonicalStoreClient::initialize_genesis(
+                    &self.store,
+                    &context,
+                    request.clone(),
+                )
+                .await;
+                map_genesis_dispatch_result(request, result)
+            }
         }
     }
 }
@@ -1845,6 +1886,61 @@ mod tests {
             observed_generation: Some("0.9.0".to_owned()),
         };
         assert!(require_semantic_ready_for_pipe(&partial, "1.0.0").is_err());
+    }
+
+    #[test]
+    fn recovery_dispatch_default_unavailable_is_error() {
+        assert_eq!(
+            map_recovery_dispatch_result(Err(StoreError::Unavailable)),
+            Response::Error {
+                error: "store unavailable".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn genesis_dispatch_default_unavailable_is_error() {
+        let request = StoreGenesisRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            operation_id: OperationId::new("genesis-dispatch").expect("operation id"),
+            idempotency_key: "genesis-retry".to_owned(),
+            canonical_request_hash: String::new(),
+            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            owner_records: Vec::new(),
+        };
+        assert_eq!(
+            map_genesis_dispatch_result(request, Err(StoreError::Unavailable)),
+            Response::Error {
+                error: "store unavailable".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_and_genesis_capabilities_remain_unadvertised() {
+        assert!(!CAPABILITIES.contains(&eliot_store_api::CAPABILITY_RECOVERY));
+        assert!(!CAPABILITIES.contains(&eliot_store_api::CAPABILITY_INITIALIZE_GENESIS));
+    }
+
+    #[test]
+    fn genesis_missing_receipt_envelope_is_unknown_with_exact_operation() {
+        let operation_id = OperationId::new("genesis-unknown").expect("operation id");
+        let request = StoreGenesisRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            operation_id: operation_id.clone(),
+            idempotency_key: "genesis-retry".to_owned(),
+            canonical_request_hash: String::new(),
+            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            owner_records: Vec::new(),
+        };
+        assert_eq!(
+            map_genesis_dispatch_result(request, Err(StoreError::MissingReceiptEnvelope)),
+            Response::Unknown {
+                operation_id,
+                reason: UNKNOWN_GENESIS_REASON.to_owned(),
+            }
+        );
+        assert!(UNKNOWN_GENESIS_REASON.len() <= 256);
     }
 
     #[test]
