@@ -2,30 +2,30 @@ use crate::blob_store::verify_canonical_memory_child_set;
 use crate::surreal_server::{ReadySurrealServer, SurrealServerSupervisor};
 use crate::{
     BlobStore, CanonicalAutonomyRunView, CanonicalLifecycleView, CanonicalRecord,
-    CanonicalReplayView, CanonicalSleepView, DbClientSet, MAX_CANONICAL_RECORDS, NamedSurqlOp,
-    SleepCandidatesResponse, StoreError, SurqlTemplateRegistry,
+    CanonicalSleepView, DbClientSet, MAX_CANONICAL_RECORDS, NamedSurqlOp, SleepCandidatesResponse,
+    StoreError, SurqlTemplateRegistry,
 };
+
+mod replay_view;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use eliot_types::{
     AutonomyRunContract, AutonomyRunTransitionReceipt, BlobReachabilityRef, BlobReferenceSnapshot,
     BlobRetentionClass, BlobRetentionRef, CanonicalMemoryL2Page, CanonicalMemoryManifest,
-    CanonicalMemorySegment, CanonicalMemorySegmentRef, CanonicalMetaMetricEvidence,
-    CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, ClaimId,
+    CanonicalMemorySegment, CanonicalMemorySegmentRef, CanonicalTraceCompletenessContract, ClaimId,
     CognitiveProjectionReadState, CueBindingPage, CueIndexRow, CueRecordSource,
-    CurrentStateRequest, CurrentStateResponse, EpistemicStatus, ExperimentalMetaPolicyCandidate,
-    FetchAtomsL2Request, FetchAtomsL2Response, GraphHealthResponse, HarnessExperimentRecord,
-    InjectionReceipt, L0CollapsedDuplicateTrace, L0FeatureScore, L0RankTrace, L0SuppressionTrace,
-    LifecycleStatus, MemoryConfidence, MemoryGrantOfferRecord, MemoryHandlePreview,
-    MemoryInfluenceTrace, MemoryRevision, MemoryStateTransition, MemoryTrajectoryCorrectness,
-    MemoryWriteEnvelope, MetaIsolationRejectionRecord, MetaPolicyExecutionAction,
-    MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
-    ObservabilityWriteEnvelope, ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId,
-    ProjectSequence, RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun,
-    SealedReplayCaseRecord, SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SessionId,
-    SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
-    TaintClass, TaskContract, TaskId, ToolObservation, TruncationInfo, VerificationId,
-    VerificationRun, Visibility, WriteId, WriteReceipt, WriteStatus, cue_binding_page_id,
+    CurrentStateRequest, CurrentStateResponse, EpistemicStatus, FetchAtomsL2Request,
+    FetchAtomsL2Response, GraphHealthResponse, InjectionReceipt, L0CollapsedDuplicateTrace,
+    L0FeatureScore, L0RankTrace, L0SuppressionTrace, LifecycleStatus, MemoryConfidence,
+    MemoryGrantOfferRecord, MemoryHandlePreview, MemoryInfluenceTrace, MemoryRevision,
+    MemoryStateTransition, MemoryTrajectoryCorrectness, MemoryWriteEnvelope,
+    MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, MinorityPressureRecord,
+    ObservabilityKind, ObservabilityWriteEnvelope, ObservabilityWriteReceipt,
+    ObservabilityWriteStatus, ProjectId, ProjectSequence, RecallL0Request, RecallL0Response,
+    SessionId, SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun,
+    SurrealServerConfig, TaintClass, TaskContract, TaskId, ToolObservation, TruncationInfo,
+    VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt, WriteStatus,
+    cue_binding_page_id,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -2107,21 +2107,6 @@ pub struct CanonicalClaimCard {
     pub memory_revision: MemoryRevision,
     pub project_sequence: ProjectSequence,
     pub write_id: WriteId,
-}
-
-struct ReplayIntegrityRecords {
-    trace_contracts: Vec<CanonicalRecord<CanonicalTraceCompletenessContract>>,
-    sealed_sets: Vec<CanonicalRecord<SealedReplaySetRecord>>,
-    sealed_cases: Vec<CanonicalRecord<SealedReplayCaseRecord>>,
-    sealed_snapshots: Vec<CanonicalRecord<SealedReplayInputSnapshotRecord>>,
-    sealed_executions: Vec<CanonicalRecord<CanonicalReplayExecutionRecord>>,
-}
-
-struct MetaIntegrityRecords {
-    metrics: Vec<CanonicalRecord<CanonicalMetaMetricEvidence>>,
-    isolation_rejections: Vec<CanonicalRecord<MetaIsolationRejectionRecord>>,
-    policy_candidates: Vec<CanonicalRecord<ExperimentalMetaPolicyCandidate>>,
-    policy_executions: Vec<CanonicalRecord<MetaPolicyExecutionReceipt>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -4206,20 +4191,6 @@ impl CanonicalStore {
         decode_value(NamedSurqlOp::CanonicalRecordsBySubjectRef, value)
     }
 
-    pub async fn canonical_records_by_kind<T>(
-        &self,
-        project_id: ProjectId,
-        task_id: Option<TaskId>,
-        receipt_kinds: &[&str],
-        limit: u16,
-    ) -> Result<Vec<CanonicalRecord<T>>, StoreError>
-    where
-        T: DeserializeOwned,
-    {
-        self.canonical_records(project_id, task_id, receipt_kinds, None, limit)
-            .await
-    }
-
     pub async fn ul_artifact_by_id<T>(
         &self,
         project_id: ProjectId,
@@ -4829,134 +4800,6 @@ impl CanonicalStore {
         })
     }
 
-    pub async fn replay_view(
-        &self,
-        project_id: ProjectId,
-        task_id: Option<TaskId>,
-        limit: u16,
-    ) -> Result<CanonicalReplayView, StoreError> {
-        let integrity = self
-            .replay_integrity_records(project_id, task_id, limit)
-            .await?;
-        let meta = self
-            .meta_integrity_records(project_id, task_id, limit)
-            .await?;
-        let replay_runs = self
-            .canonical_records::<ReplayRun>(project_id, task_id, &["replay_run"], None, limit)
-            .await?;
-        let replay_audits = self
-            .canonical_records::<ReplayAudit>(project_id, task_id, &["replay_audit"], None, limit)
-            .await?;
-        let mut harness_experiments = self
-            .canonical_records::<HarnessExperimentRecord>(
-                project_id,
-                task_id,
-                &["harness_experiment", "harness_disposition"],
-                None,
-                limit,
-            )
-            .await?;
-        for record in &mut harness_experiments {
-            if record.receipt_kind == "harness_disposition" {
-                record.receipt_body.disposition_receipt = Some(record.canonical_receipt.clone());
-            }
-        }
-        Ok(CanonicalReplayView {
-            trace_contracts: integrity.trace_contracts,
-            sealed_sets: integrity.sealed_sets,
-            sealed_cases: integrity.sealed_cases,
-            sealed_snapshots: integrity.sealed_snapshots,
-            sealed_executions: integrity.sealed_executions,
-            replay_runs,
-            replay_audits,
-            harness_experiments,
-            meta_metrics: meta.metrics,
-            isolation_rejections: meta.isolation_rejections,
-            policy_candidates: meta.policy_candidates,
-            policy_executions: meta.policy_executions,
-        })
-    }
-
-    async fn replay_integrity_records(
-        &self,
-        project_id: ProjectId,
-        task_id: Option<TaskId>,
-        limit: u16,
-    ) -> Result<ReplayIntegrityRecords, StoreError> {
-        let trace_contracts = self
-            .canonical_records(
-                project_id,
-                task_id,
-                &["trace_completeness_contract"],
-                None,
-                limit,
-            )
-            .await?;
-        let sealed_sets = self
-            .canonical_records(project_id, task_id, &["replay_set"], None, limit)
-            .await?;
-        let sealed_cases = self
-            .canonical_records(project_id, task_id, &["replay_case"], None, limit)
-            .await?;
-        let sealed_snapshots = self
-            .canonical_records(project_id, task_id, &["replay_input_snapshot"], None, limit)
-            .await?;
-        let sealed_executions = self
-            .canonical_records(project_id, task_id, &["sealed_replay_run"], None, limit)
-            .await?;
-        Ok(ReplayIntegrityRecords {
-            trace_contracts,
-            sealed_sets,
-            sealed_cases,
-            sealed_snapshots,
-            sealed_executions,
-        })
-    }
-
-    async fn meta_integrity_records(
-        &self,
-        project_id: ProjectId,
-        task_id: Option<TaskId>,
-        limit: u16,
-    ) -> Result<MetaIntegrityRecords, StoreError> {
-        let metrics = self
-            .canonical_records(project_id, task_id, &["meta_metric_evidence"], None, limit)
-            .await?;
-        let isolation_rejections = self
-            .canonical_records(
-                project_id,
-                task_id,
-                &["meta_isolation_rejection"],
-                None,
-                limit,
-            )
-            .await?;
-        let policy_candidates = self
-            .canonical_records(
-                project_id,
-                task_id,
-                &["experimental_policy_candidate"],
-                None,
-                limit,
-            )
-            .await?;
-        let policy_executions = self
-            .canonical_records(
-                project_id,
-                task_id,
-                &["meta_policy_promotion", "meta_policy_rollback"],
-                None,
-                limit,
-            )
-            .await?;
-        Ok(MetaIntegrityRecords {
-            metrics,
-            isolation_rejections,
-            policy_candidates,
-            policy_executions,
-        })
-    }
-
     pub async fn autonomy_run_view(
         &self,
         project_id: ProjectId,
@@ -5127,35 +4970,6 @@ impl CanonicalStore {
             .execute_value(NamedSurqlOp::BlobReferenceScan, json!({ "limit": limit }))
             .await?;
         build_blob_reference_snapshot(&self.config, scope, limit, &value)
-    }
-
-    async fn canonical_records<T>(
-        &self,
-        project_id: ProjectId,
-        task_id: Option<TaskId>,
-        receipt_kinds: &[&str],
-        subject_ref: Option<&str>,
-        limit: u16,
-    ) -> Result<Vec<CanonicalRecord<T>>, StoreError>
-    where
-        T: DeserializeOwned,
-    {
-        let has_subject_ref = subject_ref.is_some();
-        let subject_ref_fragments = subject_ref.map_or_else(Vec::new, string_fragments);
-        let value = self
-            .execute_value(
-                NamedSurqlOp::CanonicalRecords,
-                json!({
-                    "project_id": project_id,
-                    "task_id": task_id,
-                    "receipt_kinds": receipt_kinds,
-                    "has_subject_ref": has_subject_ref,
-                    "subject_ref_fragments": subject_ref_fragments,
-                    "limit": limit.clamp(1, MAX_CANONICAL_RECORDS),
-                }),
-            )
-            .await?;
-        decode_value(NamedSurqlOp::CanonicalRecords, value)
     }
 
     async fn execute_value(&self, op: NamedSurqlOp, vars: Value) -> Result<Value, StoreError> {
