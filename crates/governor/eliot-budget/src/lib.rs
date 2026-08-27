@@ -1075,6 +1075,7 @@ impl BudgetLedger {
 
     fn restore(snapshot: BudgetLedgerRecoverySnapshot) -> Result<Self, BudgetError> {
         snapshot.envelope.validate()?;
+        validate_snapshot_quota_states(&snapshot)?;
         text(
             &snapshot.authority.authority_owner,
             "authority.authority_owner",
@@ -1172,8 +1173,29 @@ impl BudgetLedger {
         {
             return Err(BudgetError::PoisonedState);
         }
+        validate_exhaustion_dispositions(&ledger)?;
         Ok(ledger)
     }
+}
+
+fn validate_snapshot_quota_states(
+    snapshot: &BudgetLedgerRecoverySnapshot,
+) -> Result<(), BudgetError> {
+    if snapshot.reservations.is_empty() {
+        return Ok(());
+    }
+    for window in &snapshot.envelope.quota_windows {
+        match window.state {
+            QuotaState::Known { .. } => {}
+            QuotaState::Exhausted => {
+                return Err(BudgetError::QuotaExhausted(window.window_id.clone()));
+            }
+            QuotaState::Unknown | QuotaState::NotExposed | QuotaState::Stale => {
+                return Err(BudgetError::QuotaUnavailable(window.window_id.clone()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reservation_sequence(
@@ -1322,6 +1344,63 @@ fn validate_receipt_state(
                 return Err(BudgetError::InvalidLifecycleTransition);
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_exhaustion_dispositions(ledger: &BudgetLedger) -> Result<(), BudgetError> {
+    let expected = if ledger.reservations.len() == 1 {
+        Some(ledger.exhaustion_disposition()?)
+    } else {
+        None
+    };
+    for receipt in ledger.reservations.values() {
+        validate_exhaustion_shape(ledger, &receipt.exhaustion_disposition)?;
+        // A receipt stores the disposition observed at its own last
+        // transition. Later transitions on another reservation do not rewrite
+        // it, and transition history is not retained in this snapshot. The
+        // final aggregate is therefore an exact expected value only when the
+        // snapshot contains one reservation; multi-reservation snapshots use
+        // the canonical shape check above and preserve the opaque historical
+        // value.
+        if expected
+            .as_ref()
+            .is_some_and(|value| &receipt.exhaustion_disposition != value)
+        {
+            return Err(BudgetError::InvalidLifecycleTransition);
+        }
+    }
+    Ok(())
+}
+
+fn validate_exhaustion_shape(
+    ledger: &BudgetLedger,
+    disposition: &ExhaustionDisposition,
+) -> Result<(), BudgetError> {
+    let window_ids = match disposition {
+        ExhaustionDisposition::WithinEnvelope | ExhaustionDisposition::CostExceeded => {
+            return Ok(());
+        }
+        ExhaustionDisposition::QuotaExceeded { window_ids }
+        | ExhaustionDisposition::CostAndQuotaExceeded { window_ids } => window_ids,
+    };
+    if window_ids.is_empty() {
+        return Err(BudgetError::InvalidLifecycleTransition);
+    }
+    let mut previous_index = None;
+    for window_id in window_ids {
+        let Some(index) = ledger
+            .envelope
+            .quota_windows
+            .iter()
+            .position(|window| &window.window_id == window_id)
+        else {
+            return Err(BudgetError::InvalidLifecycleTransition);
+        };
+        if previous_index.is_some_and(|previous| previous >= index) {
+            return Err(BudgetError::InvalidLifecycleTransition);
+        }
+        previous_index = Some(index);
     }
     Ok(())
 }
@@ -1562,6 +1641,26 @@ mod tests {
         }
     }
 
+    fn refund_observation(
+        key: &str,
+        authority: &AuthorityBinding,
+        cost_micros: u64,
+    ) -> RefundObservation {
+        RefundObservation {
+            observation_id: format!("refund-{key}"),
+            provider_tool: route(),
+            operation: operation(key, authority),
+            provider_receipt_ref: receipt_ref_with_disposition_and_operation(
+                &format!("refund-receipt-{key}"),
+                authority,
+                ReceiptDispositionKind::Success,
+                operation(key, authority),
+            ),
+            cost_micros: ObservedAmount::Known(cost_micros),
+            status: TrialStatus::Succeeded,
+        }
+    }
+
     fn stage_and_activate(ledger: &mut BudgetLedger, key: &str, authority: &AuthorityBinding) {
         ledger
             .reserve(request(key, authority, Some(5), Some(1)))
@@ -1615,7 +1714,6 @@ mod tests {
             QuotaState::Unknown,
             QuotaState::NotExposed,
             QuotaState::Stale,
-            QuotaState::Exhausted,
         ] {
             let auth = authority();
             let mut ledger =
@@ -2284,6 +2382,205 @@ mod tests {
         assert_eq!(
             BudgetLedger::from_snapshot(snapshot).expect("restore"),
             staged_reconciled
+        );
+    }
+
+    #[test]
+    fn recovery_snapshot_roundtrips_expired_state() {
+        let auth = authority();
+        let mut expired = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        expired
+            .reserve(request("expired", &auth, Some(5), Some(2)))
+            .expect("staged");
+        expired.expire("expired", &auth).expect("expired");
+        let snapshot = expired.snapshot().expect("snapshot");
+        assert_eq!(
+            BudgetLedger::from_snapshot(snapshot).expect("restore"),
+            expired
+        );
+    }
+
+    #[test]
+    fn recovery_snapshot_rejects_tampered_exhaustion_disposition_for_each_state() {
+        let auth = authority();
+        let assert_tampered = |ledger: BudgetLedger, state: ReservationState| {
+            let mut snapshot = ledger.snapshot().expect("snapshot");
+            assert_eq!(snapshot.reservations[0].receipt.state, state);
+            assert_eq!(
+                snapshot.reservations[0].receipt.exhaustion_disposition,
+                ExhaustionDisposition::WithinEnvelope
+            );
+            snapshot.reservations[0].receipt.exhaustion_disposition =
+                ExhaustionDisposition::CostExceeded;
+            assert!(BudgetLedger::from_snapshot(snapshot).is_err());
+        };
+
+        let mut active = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        stage_and_activate(&mut active, "active-disposition", &auth);
+        assert_tampered(active, ReservationState::Active);
+
+        let mut reconciling = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        stage_and_activate(&mut reconciling, "reconciling-disposition", &auth);
+        reconciling
+            .begin_reconciliation("reconciling-disposition", &auth)
+            .expect("reconciling");
+        assert_tampered(reconciling, ReservationState::Reconciling);
+
+        let mut released = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        stage_and_activate(&mut released, "released-disposition", &auth);
+        released
+            .release_without_execution("released-disposition", &auth)
+            .expect("released");
+        assert_tampered(released, ReservationState::Released);
+
+        let mut expired = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        expired
+            .reserve(request("expired-disposition", &auth, Some(5), Some(2)))
+            .expect("staged");
+        expired
+            .expire("expired-disposition", &auth)
+            .expect("expired");
+        assert_tampered(expired, ReservationState::Expired);
+    }
+
+    #[test]
+    fn recovery_snapshot_preserves_older_receipt_disposition_after_later_overrun() {
+        let auth = authority();
+        let mut ledger = BudgetLedger::new(
+            envelope(Some(5), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        stage_and_activate(&mut ledger, "older", &auth);
+        ledger
+            .reserve(request("newer", &auth, Some(0), Some(0)))
+            .expect("zero-cost reservation");
+        ledger
+            .activate(
+                "newer",
+                &auth,
+                receipt_ref("admission-newer", &auth),
+                receipt_ref("activation-newer", &auth),
+            )
+            .expect("newer active");
+
+        let mut observed = usage("older", &auth, TrialStatus::Failed);
+        observed.cost_micros = ObservedAmount::Known(6);
+        observed.quota_units = ObservedAmount::Known(0);
+        let older = ledger
+            .commit("older", &auth, &observed)
+            .expect("overrun recorded");
+        assert_eq!(
+            older.exhaustion_disposition,
+            ExhaustionDisposition::CostExceeded
+        );
+        assert_eq!(
+            ledger
+                .reservations
+                .get("newer")
+                .expect("newer receipt")
+                .exhaustion_disposition,
+            ExhaustionDisposition::WithinEnvelope
+        );
+        assert_eq!(
+            ledger
+                .exhaustion_disposition()
+                .expect("current disposition"),
+            ExhaustionDisposition::CostExceeded
+        );
+
+        let snapshot = ledger.snapshot().expect("snapshot");
+        assert_eq!(
+            BudgetLedger::from_snapshot(snapshot).expect("restore"),
+            ledger
+        );
+    }
+
+    #[test]
+    fn recovery_snapshot_roundtrips_multiple_large_fully_refunded_usages() {
+        let auth = authority();
+        let mut ledger = BudgetLedger::new(
+            envelope(None, QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        for key in ["large-a", "large-b"] {
+            stage_and_activate(&mut ledger, key, &auth);
+            let mut observed = usage(key, &auth, TrialStatus::Failed);
+            observed.cost_micros = ObservedAmount::Known(u64::MAX);
+            observed.quota_units = ObservedAmount::Known(0);
+            ledger.commit(key, &auth, &observed).expect("large usage");
+            ledger
+                .apply_refund(key, &auth, &refund_observation(key, &auth, u64::MAX))
+                .expect("full refund");
+        }
+        assert_eq!(ledger.committed_cost_micros, 0);
+        let snapshot = ledger.snapshot().expect("snapshot");
+        assert_eq!(
+            BudgetLedger::from_snapshot(snapshot).expect("restore"),
+            ledger
+        );
+    }
+
+    #[test]
+    fn recovery_snapshot_rejects_non_known_quota_with_reservations() {
+        for (state, exhausted) in [
+            (QuotaState::Unknown, false),
+            (QuotaState::NotExposed, false),
+            (QuotaState::Stale, false),
+            (QuotaState::Exhausted, true),
+        ] {
+            let auth = authority();
+            let mut ledger = BudgetLedger::new(
+                envelope(Some(100), QuotaState::Known { remaining: 100 }),
+                auth.clone(),
+            )
+            .expect("valid ledger");
+            ledger
+                .reserve(request("quota-state", &auth, Some(5), Some(2)))
+                .expect("staged");
+            let mut snapshot = ledger.snapshot().expect("snapshot");
+            snapshot.envelope.quota_windows[0].state = state;
+            if exhausted {
+                assert!(matches!(
+                    BudgetLedger::from_snapshot(snapshot),
+                    Err(BudgetError::QuotaExhausted(window)) if window == "credits"
+                ));
+            } else {
+                assert!(matches!(
+                    BudgetLedger::from_snapshot(snapshot),
+                    Err(BudgetError::QuotaUnavailable(window)) if window == "credits"
+                ));
+            }
+        }
+
+        let auth = authority();
+        let empty = BudgetLedger::new(envelope(Some(100), QuotaState::Unknown), auth)
+            .expect("empty ledger with unavailable quota");
+        let snapshot = empty.snapshot().expect("empty snapshot");
+        assert_eq!(
+            BudgetLedger::from_snapshot(snapshot).expect("restore"),
+            empty
         );
     }
 
