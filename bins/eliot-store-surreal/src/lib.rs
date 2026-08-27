@@ -40,10 +40,12 @@ use eliot_store_api::{
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
 };
+#[cfg(test)]
+use eliot_store_surreal_adapter::SchemaGeneration;
 use eliot_store_surreal_adapter::{
-    AdapterError, CompiledMigration, MigrationReceipt, PINNED_SURREALDB_MAJOR, SchemaGeneration,
-    SemanticReadiness, SurrealAdapterConfig, SurrealStoreAdapter,
+    AdapterError, CompiledMigration, MigrationReceipt, SemanticReadiness, SurrealStoreAdapter,
 };
+#[cfg(test)]
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -66,6 +68,9 @@ pub use request_dispatch::dispatch;
 use request_dispatch::map_genesis_dispatch_result;
 #[cfg(test)]
 use request_dispatch::map_recovery_dispatch_result;
+mod adapter_materialization;
+pub use adapter_materialization::materialize_adapter_config;
+use adapter_materialization::resolve_credential;
 
 pub const SERVICE_NAME: &str = "eliot-store-surreal";
 pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
@@ -880,73 +885,6 @@ pub fn validate_request_frame(
         return Err(format!("capability is not admitted: {capability}"));
     }
     Ok(request)
-}
-
-/// Purely materializes the credential-bearing adapter configuration from an
-/// already digest-bound Store launch projection. Provider argv is copied from
-/// the validated runtime descriptor and then revalidated byte-for-byte against
-/// the Store coordinates and roots; it is never reconstructed at spawn time.
-pub fn materialize_adapter_config(
-    config: &StoreLaunchConfig,
-    password: SecretString,
-) -> Result<SurrealAdapterConfig, String> {
-    config.validate()?;
-    let schema_generation = SchemaGeneration::new(config.schema_generation.as_str())
-        .map_err(|error| error.to_string())?;
-    let launch = &config.runtime_launch;
-    let roots = &launch.runtime_state_roots;
-    let adapter = SurrealAdapterConfig {
-        endpoint: config.endpoint.clone(),
-        provider_bind_address: config.provider_bind_address.clone(),
-        namespace: config.namespace.clone(),
-        database: config.database.clone(),
-        username: config.username.clone(),
-        password,
-        installation_id: launch.installation_epoch.installation.as_str().to_owned(),
-        installation_profile: match launch.profile {
-            InstallationProfile::SystemService => "system_service",
-            InstallationProfile::UserMode => "user_mode",
-            InstallationProfile::PortableDev => "portable_dev",
-        }
-        .to_owned(),
-        runtime_state_roots_digest: roots.roots_digest.as_str().to_owned(),
-        provider_executable_path: launch.canonical_store_executable_path.as_str().to_owned(),
-        provider_artifact_digest: launch.canonical_store_artifact_digest.as_str().to_owned(),
-        provider_arguments: launch
-            .canonical_store_arguments
-            .iter()
-            .map(|argument| argument.as_str().to_owned())
-            .collect(),
-        store_data_root: roots.store_data_root.as_str().to_owned(),
-        store_work_root: roots.store_work_root.as_str().to_owned(),
-        store_temp_root: roots.store_temp_root.as_str().to_owned(),
-        connect_timeout_ms: config.connect_timeout_ms,
-        query_timeout_ms: config.query_timeout_ms,
-        expected_provider_major: PINNED_SURREALDB_MAJOR,
-        expected_schema_generation: schema_generation,
-    };
-    adapter.validate().map_err(|error| error.to_string())?;
-    Ok(adapter)
-}
-
-fn resolve_credential(
-    platform: &WindowsPlatform,
-    credential_ref: &str,
-) -> Result<SecretString, String> {
-    let credential = platform
-        .read_credential(credential_ref)
-        .map_err(|error| format!("read configured credential reference: {error}"))?;
-    let password = String::from_utf8(credential.expose().to_vec())
-        .map_err(|_| "configured credential is not UTF-8".to_owned())?;
-    non_empty_secret(&password, "configured credential")
-}
-
-fn non_empty_secret(value: &str, source: &str) -> Result<SecretString, String> {
-    let value = value.trim().to_owned();
-    if value.is_empty() {
-        return Err(format!("{source} is empty"));
-    }
-    Ok(SecretString::new(value.into()))
 }
 
 #[cfg(test)]
