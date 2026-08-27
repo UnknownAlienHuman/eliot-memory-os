@@ -18,11 +18,10 @@ use eliot_contracts::{
     RequestId, RequestMetadata, ResourceGeneration, SourceId, StateFence, sha256_hex,
 };
 use eliot_governor::{
-    CompositionError, CompositionReadiness, GovernorComposition, GovernorGenesisRequest,
-    GovernorLaunchConfig, KernelDurableJobPort, KernelGenerationPort, KernelGenerationSnapshot,
-    KernelGenerationSnapshotProvider, KernelNamedReadReply, KernelNamedReadRequest,
-    KernelPortError, KernelPortFuture, KernelRecoveryPort, KernelServiceObservationPort,
-    KernelServiceRecovery, KernelTransitionPort, QueueLimits,
+    CompositionError, CompositionReadiness, GovernorComposition, GovernorLaunchConfig,
+    KernelDurableJobPort, KernelGenerationPort, KernelGenerationSnapshot,
+    KernelGenerationSnapshotProvider, KernelPortError, KernelPortFuture,
+    KernelServiceObservationPort, KernelServiceRecovery, KernelTransitionPort, QueueLimits,
 };
 use eliot_maintenance::MaintenanceJob;
 use eliot_platform_windows::{
@@ -37,11 +36,12 @@ use eliot_protocol::{
 use eliot_receipts::RequestBinding;
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
-    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, ScopeRevisionView,
-    StoreHealth, WriteReceipt,
+    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, StoreHealth, WriteReceipt,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod kernel_recovery_client;
 
 #[cfg(windows)]
 use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
@@ -891,77 +891,6 @@ impl KernelTransitionPort for DaemonKernelClient {
             serde_json::from_value(value)
                 .map_err(|error| KernelPortError::Contract(error.to_string()))
         })
-    }
-}
-
-impl KernelRecoveryPort for DaemonKernelClient {
-    fn named_read(
-        &self,
-        request: KernelNamedReadRequest,
-    ) -> Result<Option<KernelNamedReadReply>, KernelPortError> {
-        let value =
-            self.request_blocking("named_read", serde_json::json!({ "request": request }))?;
-        let value = kind_value(&value, "named_read")?;
-        serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
-    }
-
-    fn initialize_governor_genesis(
-        &self,
-        request: &GovernorGenesisRequest,
-    ) -> Result<(), KernelPortError> {
-        let _ = self.request_blocking(
-            "initialize_governor_genesis",
-            serde_json::json!({ "request": request }),
-        )?;
-        Ok(())
-    }
-
-    fn canonical_scope(
-        &self,
-        state_fence: &StateFence,
-        protected_snapshot_digest: &str,
-    ) -> Result<ScopeRevisionView, KernelPortError> {
-        let value = self.request_blocking(
-            "canonical_scope",
-            serde_json::json!({
-                "state_fence": state_fence,
-                "protected_snapshot_digest": protected_snapshot_digest,
-            }),
-        )?;
-        let value = kind_value(&value, "canonical_scope")?;
-        serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
-    }
-
-    fn receipts(
-        &self,
-        state_fence: &StateFence,
-        protected_snapshot_digest: &str,
-    ) -> Result<Vec<WriteReceipt>, KernelPortError> {
-        let value = self.request_blocking(
-            "receipts",
-            serde_json::json!({
-                "state_fence": state_fence,
-                "protected_snapshot_digest": protected_snapshot_digest,
-            }),
-        )?;
-        let value = kind_value(&value, "receipts")?;
-        serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
-    }
-
-    fn durable_jobs(
-        &self,
-        state_fence: &StateFence,
-        protected_snapshot_digest: &str,
-    ) -> Result<Vec<MaintenanceJob>, KernelPortError> {
-        let value = self.request_blocking(
-            "durable_jobs",
-            serde_json::json!({
-                "state_fence": state_fence,
-                "protected_snapshot_digest": protected_snapshot_digest,
-            }),
-        )?;
-        let value = kind_value(&value, "durable_jobs")?;
-        serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
     }
 }
 
