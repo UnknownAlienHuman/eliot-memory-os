@@ -17,13 +17,15 @@ use redb::{Database, TableDefinition};
 #[cfg(test)]
 use crate::InstallationTransactionStore;
 use crate::approved_generation_registry::PendingActivationTerminalDisposition;
+#[cfg(feature = "test-support")]
+use crate::validate_approval_against_manifest;
 use crate::{
     ActivationCommitFence, ActivationCommitReceipt, ActivePhaseBRebind, ActivePhaseBRebindIntent,
     ActivePhaseBRebindReceipt, ActivePhaseBRebindRecovery, AgentBridgeStagePrepared,
     HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
     InstallationError, PendingActivation, WindowsPathIdentity, activation_terminal_digest,
-    candidate_manifest_digest, valid_installation_key, validate_approval_against_manifest,
+    candidate_manifest_digest, valid_installation_key,
 };
 
 pub(super) const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
