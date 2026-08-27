@@ -11,9 +11,12 @@ eliot-authority.workspace = true
 eliot-config.workspace = true
 eliot-evaluation-contracts.workspace = true
 eliot-receipts.workspace = true
+schemars.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 eliot-contracts.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

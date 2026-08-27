@@ -15,9 +15,12 @@ use eliot_receipts::{
     AuthorityBinding, OperationBinding, ReceiptDispositionKind, ReceiptEnvelope, ReceiptError,
     ReceiptIdentity, ReceiptKind,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// An observed amount with absence and epistemic state kept distinct from zero.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ObservedAmount {
     /// The provider or tool reported the exact amount, including an exact zero.
     Known(u64),
@@ -44,7 +47,8 @@ impl ObservedAmount {
 }
 
 /// A quota observation, preserving unavailable state rather than treating it as zero.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
 pub enum QuotaState {
     /// A measured remaining amount is available.
     Known { remaining: u64 },
@@ -59,7 +63,8 @@ pub enum QuotaState {
 }
 
 /// One simultaneous quota window, such as credits, requests, or concurrency.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuotaWindow {
     pub window_id: String,
     pub state: QuotaState,
@@ -77,7 +82,8 @@ pub struct QuotaWindow {
 ///
 /// G-17 does not own route selection. A different attribution therefore needs a
 /// newly admitted envelope rather than being accepted as an implicit fallback.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderToolAttribution {
     pub provider_ref: String,
     pub tool_ref: String,
@@ -98,7 +104,8 @@ impl ProviderToolAttribution {
 ///
 /// `PLAN_GAP`: the accepted G-17 bundle names receipt and authority references
 /// but does not yet name a dedicated typed budget/cost grant contract.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptLocator {
     identity: ReceiptIdentity,
     receipt_kind: ReceiptKind,
@@ -163,6 +170,7 @@ impl ReceiptLocator {
         provider_tool: &ProviderToolAttribution,
         expected_kind: ReceiptKind,
     ) -> Result<(), BudgetError> {
+        self.validate_base()?;
         if self.authority.state_fence != authority.state_fence {
             return Err(BudgetError::FenceMismatch);
         }
@@ -176,6 +184,21 @@ impl ReceiptLocator {
             return Err(BudgetError::ReceiptReferenceConflict);
         }
         Ok(())
+    }
+
+    fn validate_base(&self) -> Result<(), BudgetError> {
+        text(&self.identity.canonical_sha256, "receipt.canonical_sha256")?;
+        if self.identity.canonical_sha256.len() != 64
+            || self
+                .identity
+                .canonical_sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        {
+            return Err(BudgetError::InvalidField("receipt.canonical_sha256"));
+        }
+        self.provider_tool.validate()?;
+        validate_operation_authority(&self.operation, &self.authority)
     }
 
     fn validate_observation_for(
@@ -193,7 +216,8 @@ impl ReceiptLocator {
 }
 
 /// The immutable limits and authority references for one budget scope.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetEnvelope {
     pub envelope_id: String,
     pub policy_snapshot_id: String,
@@ -246,7 +270,8 @@ impl BudgetEnvelope {
 }
 
 /// Provider/tool-measured usage bound to one canonical operation and receipt.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeasuredUsage {
     pub provider_tool: ProviderToolAttribution,
     pub operation: OperationBinding,
@@ -258,7 +283,8 @@ pub struct MeasuredUsage {
 
 /// A provider/tool-observed refund. A raw amount without this provenance cannot
 /// change the ledger.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefundObservation {
     pub observation_id: String,
     pub provider_tool: ProviderToolAttribution,
@@ -269,7 +295,8 @@ pub struct RefundObservation {
 }
 
 /// Reservation lifecycle. Unknown external outcomes are never terminal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReservationState {
     StagedInactive,
     Active,
@@ -289,7 +316,8 @@ impl ReservationState {
 
 /// Post-transition capacity disposition after measured usage replaces the
 /// current reservation while every other held reservation remains accounted.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
 pub enum ExhaustionDisposition {
     WithinEnvelope,
     CostExceeded,
@@ -309,7 +337,8 @@ pub struct ReservationRequest {
 }
 
 /// Immutable view returned by every reservation transition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReservationReceipt {
     pub reservation_id: String,
     pub envelope_id: String,
@@ -389,7 +418,7 @@ impl From<ReceiptError> for BudgetError {
 }
 
 /// Pure mutable owner of reservations and measured budget state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BudgetLedger {
     envelope: BudgetEnvelope,
     authority: AuthorityBinding,
@@ -399,6 +428,33 @@ pub struct BudgetLedger {
     reserved_quota_units: u64,
     committed_cost_micros: u64,
     committed_quota_units: u64,
+}
+
+pub const BUDGET_LEDGER_RECOVERY_SCHEMA: &str = "eliot.budget.ledger-recovery";
+pub const BUDGET_LEDGER_RECOVERY_VERSION: u16 = 1;
+
+/// Complete durable budget state in deterministic wire form.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetLedgerRecoverySnapshot {
+    pub schema: String,
+    pub version: u16,
+    pub envelope: BudgetEnvelope,
+    pub authority: AuthorityBinding,
+    pub reservations: Vec<BudgetReservationRecoveryRecord>,
+    pub next_reservation: u64,
+    pub reserved_cost_micros: u64,
+    pub reserved_quota_units: u64,
+    pub committed_cost_micros: u64,
+    pub committed_quota_units: u64,
+}
+
+/// One deterministic map entry from the budget ledger.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetReservationRecoveryRecord {
+    pub idempotency_key: String,
+    pub receipt: ReservationReceipt,
 }
 
 impl BudgetLedger {
@@ -951,6 +1007,325 @@ impl BudgetLedger {
     }
 }
 
+impl BudgetLedgerRecoverySnapshot {
+    /// Validates the wire shape and the complete ledger state without creating
+    /// defaults or invoking any external authority.
+    pub fn validate(&self) -> Result<(), BudgetError> {
+        self.validate_wire()?;
+        BudgetLedger::restore(self.clone()).map(|_| ())
+    }
+
+    fn validate_wire(&self) -> Result<(), BudgetError> {
+        if self.schema != BUDGET_LEDGER_RECOVERY_SCHEMA {
+            return Err(BudgetError::InvalidField("budget_recovery.schema"));
+        }
+        if self.version != BUDGET_LEDGER_RECOVERY_VERSION {
+            return Err(BudgetError::InvalidField("budget_recovery.version"));
+        }
+        if self.next_reservation == 0 {
+            return Err(BudgetError::InvalidField("next_reservation"));
+        }
+        let mut previous = None;
+        for record in &self.reservations {
+            text(&record.idempotency_key, "idempotency_key")?;
+            if let Some(previous) = previous
+                && previous >= record.idempotency_key.as_str()
+            {
+                return Err(BudgetError::InvalidField("budget_recovery.reservations"));
+            }
+            previous = Some(record.idempotency_key.as_str());
+        }
+        Ok(())
+    }
+}
+
+impl BudgetLedger {
+    /// Captures every mutable ledger field in deterministic map order.
+    pub fn snapshot(&self) -> Result<BudgetLedgerRecoverySnapshot, BudgetError> {
+        let snapshot = BudgetLedgerRecoverySnapshot {
+            schema: BUDGET_LEDGER_RECOVERY_SCHEMA.to_owned(),
+            version: BUDGET_LEDGER_RECOVERY_VERSION,
+            envelope: self.envelope.clone(),
+            authority: self.authority.clone(),
+            reservations: self
+                .reservations
+                .iter()
+                .map(
+                    |(idempotency_key, receipt)| BudgetReservationRecoveryRecord {
+                        idempotency_key: idempotency_key.clone(),
+                        receipt: receipt.clone(),
+                    },
+                )
+                .collect(),
+            next_reservation: self.next_reservation,
+            reserved_cost_micros: self.reserved_cost_micros,
+            reserved_quota_units: self.reserved_quota_units,
+            committed_cost_micros: self.committed_cost_micros,
+            committed_quota_units: self.committed_quota_units,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Restores the exact configured ledger after full semantic validation.
+    pub fn from_snapshot(snapshot: BudgetLedgerRecoverySnapshot) -> Result<Self, BudgetError> {
+        snapshot.validate_wire()?;
+        Self::restore(snapshot)
+    }
+
+    fn restore(snapshot: BudgetLedgerRecoverySnapshot) -> Result<Self, BudgetError> {
+        snapshot.envelope.validate()?;
+        text(
+            &snapshot.authority.authority_owner,
+            "authority.authority_owner",
+        )?;
+        snapshot
+            .authority
+            .state_fence
+            .validate()
+            .map_err(|_| BudgetError::FenceMismatch)?;
+        if snapshot.authority.authority_epoch != snapshot.authority.state_fence.authority_epoch {
+            return Err(BudgetError::EpochMismatch);
+        }
+
+        let mut reservations = BTreeMap::new();
+        let mut seen_sequences = BTreeSet::new();
+        let reservation_count = snapshot.reservations.len();
+        for record in snapshot.reservations {
+            let key = record.idempotency_key;
+            let receipt = record.receipt;
+            if receipt.idempotency_key != key {
+                return Err(BudgetError::IdempotencyConflict);
+            }
+            validate_receipt_identity(&snapshot.envelope, &snapshot.authority, &receipt)?;
+            let sequence = reservation_sequence(&snapshot.envelope.envelope_id, &receipt)?;
+            if !seen_sequences.insert(sequence) || sequence >= snapshot.next_reservation {
+                return Err(BudgetError::InvalidField("reservation_id"));
+            }
+            if reservations.insert(key, receipt).is_some() {
+                return Err(BudgetError::IdempotencyConflict);
+            }
+        }
+
+        let expected_next = u64::try_from(reservation_count)
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or(BudgetError::PoisonedState)?;
+        if snapshot.next_reservation != expected_next
+            || seen_sequences
+                .iter()
+                .copied()
+                .enumerate()
+                .any(|(index, sequence)| {
+                    u64::try_from(index)
+                        .ok()
+                        .and_then(|value| value.checked_add(1))
+                        != Some(sequence)
+                })
+        {
+            return Err(BudgetError::InvalidField("reservation_id"));
+        }
+
+        let mut ledger = Self {
+            envelope: snapshot.envelope,
+            authority: snapshot.authority,
+            reservations,
+            next_reservation: snapshot.next_reservation,
+            reserved_cost_micros: 0,
+            reserved_quota_units: 0,
+            committed_cost_micros: 0,
+            committed_quota_units: 0,
+        };
+
+        for receipt in ledger.reservations.values() {
+            validate_receipt_state(&ledger, receipt)?;
+            if receipt.state.holds_capacity() {
+                if receipt.estimated_quota_units.is_none() {
+                    return Err(BudgetError::MissingEstimate("estimated_quota_units"));
+                }
+                ledger.reserved_cost_micros =
+                    add_optional(ledger.reserved_cost_micros, receipt.estimated_cost_micros)?;
+                ledger.reserved_quota_units =
+                    add_optional(ledger.reserved_quota_units, receipt.estimated_quota_units)?;
+            }
+            if let Some(usage) = &receipt.committed_usage {
+                ledger.committed_cost_micros = add_optional(
+                    ledger.committed_cost_micros,
+                    usage.cost_micros.measured("usage.cost_micros")?,
+                )?;
+                ledger.committed_quota_units = add_optional(
+                    ledger.committed_quota_units,
+                    usage.quota_units.measured("usage.quota_units")?,
+                )?;
+                let refunded = receipt.refunded_cost_micros()?.unwrap_or(0);
+                ledger.committed_cost_micros = ledger
+                    .committed_cost_micros
+                    .checked_sub(refunded)
+                    .ok_or(BudgetError::PoisonedState)?;
+            }
+        }
+
+        if ledger.reserved_cost_micros != snapshot.reserved_cost_micros
+            || ledger.reserved_quota_units != snapshot.reserved_quota_units
+            || ledger.committed_cost_micros != snapshot.committed_cost_micros
+            || ledger.committed_quota_units != snapshot.committed_quota_units
+        {
+            return Err(BudgetError::PoisonedState);
+        }
+        Ok(ledger)
+    }
+}
+
+fn reservation_sequence(
+    envelope_id: &str,
+    receipt: &ReservationReceipt,
+) -> Result<u64, BudgetError> {
+    let prefix = format!("{envelope_id}-");
+    let sequence = receipt
+        .reservation_id
+        .strip_prefix(&prefix)
+        .ok_or(BudgetError::InvalidField("reservation_id"))?
+        .parse::<u64>()
+        .map_err(|_| BudgetError::InvalidField("reservation_id"))?;
+    let suffix = receipt
+        .reservation_id
+        .strip_prefix(&prefix)
+        .ok_or(BudgetError::InvalidField("reservation_id"))?;
+    if sequence == 0 || suffix != sequence.to_string() {
+        return Err(BudgetError::InvalidField("reservation_id"));
+    }
+    Ok(sequence)
+}
+
+fn validate_receipt_identity(
+    envelope: &BudgetEnvelope,
+    authority: &AuthorityBinding,
+    receipt: &ReservationReceipt,
+) -> Result<(), BudgetError> {
+    text(&receipt.reservation_id, "reservation_id")?;
+    text(&receipt.envelope_id, "receipt.envelope_id")?;
+    text(&receipt.idempotency_key, "idempotency_key")?;
+    if receipt.envelope_id != envelope.envelope_id {
+        return Err(BudgetError::UnknownEnvelope(receipt.envelope_id.clone()));
+    }
+    if &receipt.authority != authority {
+        return Err(BudgetError::FenceMismatch);
+    }
+    if receipt.provider_tool != envelope.provider_tool {
+        return Err(BudgetError::UnauthorizedFallback);
+    }
+    if receipt.operation.idempotency_key != receipt.idempotency_key {
+        return Err(BudgetError::IdempotencyConflict);
+    }
+    if receipt.estimated_quota_units.is_none()
+        || (envelope.max_cost_micros.is_some() && receipt.estimated_cost_micros.is_none())
+    {
+        return Err(BudgetError::MissingEstimate(
+            if receipt.estimated_quota_units.is_none() {
+                "estimated_quota_units"
+            } else {
+                "estimated_cost_micros"
+            },
+        ));
+    }
+    validate_operation_authority(&receipt.operation, authority)
+}
+
+fn validate_receipt_state(
+    ledger: &BudgetLedger,
+    receipt: &ReservationReceipt,
+) -> Result<(), BudgetError> {
+    let refs_present = receipt.canonical_admission_receipt_ref.is_some()
+        || receipt.activation_receipt_ref.is_some();
+    if receipt.canonical_admission_receipt_ref.is_some() != receipt.activation_receipt_ref.is_some()
+    {
+        return Err(BudgetError::ReceiptReferenceConflict);
+    }
+    if let (Some(admission), Some(activation)) = (
+        &receipt.canonical_admission_receipt_ref,
+        &receipt.activation_receipt_ref,
+    ) {
+        if admission == activation {
+            return Err(BudgetError::ReceiptReferenceConflict);
+        }
+        admission.validate_for(
+            &ledger.authority,
+            &ledger.envelope.provider_tool,
+            ReceiptKind::Operation,
+        )?;
+        activation.validate_for(
+            &ledger.authority,
+            &ledger.envelope.provider_tool,
+            ReceiptKind::Operation,
+        )?;
+        if admission.disposition != ReceiptDispositionKind::Success
+            || activation.disposition != ReceiptDispositionKind::Success
+        {
+            return Err(BudgetError::ReceiptReferenceConflict);
+        }
+    }
+
+    match receipt.state {
+        ReservationState::StagedInactive => {
+            if refs_present
+                || receipt.committed_usage.is_some()
+                || !receipt.refund_observations.is_empty()
+                || receipt.disposition != ReceiptDispositionKind::Unknown
+                || receipt.exhaustion_disposition != ExhaustionDisposition::WithinEnvelope
+            {
+                return Err(BudgetError::InvalidLifecycleTransition);
+            }
+        }
+        ReservationState::Active | ReservationState::Reconciling => {
+            if receipt.committed_usage.is_some()
+                || !receipt.refund_observations.is_empty()
+                || receipt.disposition != ReceiptDispositionKind::Unknown
+            {
+                return Err(BudgetError::InvalidLifecycleTransition);
+            }
+            if receipt.state == ReservationState::Active && !refs_present {
+                return Err(BudgetError::ReceiptReferenceConflict);
+            }
+        }
+        ReservationState::Released => {
+            if let Some(usage) = &receipt.committed_usage {
+                ledger.validate_usage(&receipt.idempotency_key, usage)?;
+                if receipt.disposition != disposition_for_status(usage.status)? {
+                    return Err(BudgetError::ReceiptReferenceConflict);
+                }
+                // A reservation may reach reconciliation from either staged
+                // or active state, so terminal usage may have no activation
+                // locators.
+                let mut observation_ids = BTreeSet::new();
+                let mut provider_receipt_refs = Vec::new();
+                for observation in &receipt.refund_observations {
+                    if !observation_ids.insert(&observation.observation_id)
+                        || provider_receipt_refs.contains(&&observation.provider_receipt_ref)
+                    {
+                        return Err(BudgetError::IdempotencyConflict);
+                    }
+                    provider_receipt_refs.push(&observation.provider_receipt_ref);
+                    ledger.validate_refund(&receipt.idempotency_key, observation)?;
+                }
+                let _ = receipt.refunded_cost_micros()?;
+            } else if receipt.disposition != ReceiptDispositionKind::Cancelled
+                || !receipt.refund_observations.is_empty()
+            {
+                return Err(BudgetError::InvalidLifecycleTransition);
+            }
+        }
+        ReservationState::Expired => {
+            if receipt.committed_usage.is_some()
+                || receipt.disposition != ReceiptDispositionKind::Cancelled
+                || !receipt.refund_observations.is_empty()
+            {
+                return Err(BudgetError::InvalidLifecycleTransition);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn same_request(receipt: &ReservationReceipt, request: &ReservationRequest) -> bool {
     receipt.envelope_id == request.envelope_id
         && receipt.operation == request.operation
@@ -964,6 +1339,9 @@ fn validate_operation_authority(
     operation: &OperationBinding,
     authority: &AuthorityBinding,
 ) -> Result<(), BudgetError> {
+    text(&operation.idempotency_key, "operation.idempotency_key")?;
+    text(&operation.operation_kind, "operation.operation_kind")?;
+    text(&authority.authority_owner, "authority.authority_owner")?;
     operation
         .state_fence
         .validate()
@@ -1779,5 +2157,300 @@ mod tests {
             .map(|worker| worker.join().expect("worker completed"))
             .collect();
         assert!(ids.iter().all(|id| id == &ids[0]));
+    }
+
+    #[test]
+    fn recovery_snapshot_empty_roundtrip_requires_explicit_configuration() {
+        let auth = authority();
+        let ledger = BudgetLedger::new(
+            envelope(Some(20), QuotaState::Known { remaining: 20 }),
+            auth,
+        )
+        .expect("valid ledger");
+        let snapshot = ledger.snapshot().expect("snapshot");
+        assert!(snapshot.reservations.is_empty());
+        assert_eq!(snapshot.next_reservation, 1);
+        assert_eq!(
+            BudgetLedger::from_snapshot(snapshot).expect("restore"),
+            ledger
+        );
+
+        let mut invalid = ledger.snapshot().expect("snapshot");
+        invalid.next_reservation = 0;
+        assert!(BudgetLedger::from_snapshot(invalid).is_err());
+        let mut invalid = ledger.snapshot().expect("snapshot");
+        invalid.reserved_cost_micros = 1;
+        assert!(BudgetLedger::from_snapshot(invalid).is_err());
+        let mut invalid = ledger.snapshot().expect("snapshot");
+        invalid.envelope.envelope_id.clear();
+        assert!(BudgetLedger::from_snapshot(invalid).is_err());
+        let mut invalid = ledger.snapshot().expect("snapshot");
+        invalid.authority.authority_owner.clear();
+        assert!(BudgetLedger::from_snapshot(invalid).is_err());
+    }
+
+    #[test]
+    fn recovery_snapshot_roundtrips_staged_and_terminal_refunded_state() {
+        let auth = authority();
+        let mut staged = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        staged
+            .reserve(request("staged", &auth, Some(5), Some(2)))
+            .expect("staged");
+        let snapshot = staged.snapshot().expect("snapshot");
+        assert_eq!(
+            BudgetLedger::from_snapshot(snapshot).expect("restore"),
+            staged
+        );
+
+        let mut terminal = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        stage_and_activate(&mut terminal, "terminal", &auth);
+        terminal
+            .commit(
+                "terminal",
+                &auth,
+                &MeasuredUsage {
+                    cost_micros: ObservedAmount::Known(10),
+                    quota_units: ObservedAmount::Known(4),
+                    ..usage("terminal", &auth, TrialStatus::Failed)
+                },
+            )
+            .expect("committed");
+        terminal
+            .apply_refund(
+                "terminal",
+                &auth,
+                &RefundObservation {
+                    observation_id: "refund-snapshot".to_owned(),
+                    provider_tool: route(),
+                    operation: operation("terminal", &auth),
+                    provider_receipt_ref: receipt_ref_with_disposition_and_operation(
+                        "refund-snapshot-receipt",
+                        &auth,
+                        ReceiptDispositionKind::Success,
+                        operation("terminal", &auth),
+                    ),
+                    cost_micros: ObservedAmount::Known(3),
+                    status: TrialStatus::Succeeded,
+                },
+            )
+            .expect("refund");
+        let snapshot = terminal.snapshot().expect("snapshot");
+        assert_eq!(snapshot.committed_cost_micros, 7);
+        assert_eq!(snapshot.committed_quota_units, 4);
+        assert_eq!(
+            BudgetLedger::from_snapshot(snapshot).expect("restore"),
+            terminal
+        );
+
+        let mut active_release = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        stage_and_activate(&mut active_release, "active-release", &auth);
+        active_release
+            .release_without_execution("active-release", &auth)
+            .expect("released without execution");
+        let snapshot = active_release.snapshot().expect("snapshot");
+        assert_eq!(
+            BudgetLedger::from_snapshot(snapshot).expect("restore"),
+            active_release
+        );
+
+        let mut staged_reconciled = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        staged_reconciled
+            .reserve(request("staged-reconcile", &auth, Some(5), Some(2)))
+            .expect("staged");
+        staged_reconciled
+            .begin_reconciliation("staged-reconcile", &auth)
+            .expect("reconciling");
+        let observed = usage("staged-reconcile", &auth, TrialStatus::Succeeded);
+        staged_reconciled
+            .reconcile_usage("staged-reconcile", &auth, &observed)
+            .expect("reconciled");
+        let snapshot = staged_reconciled.snapshot().expect("snapshot");
+        assert_eq!(
+            BudgetLedger::from_snapshot(snapshot).expect("restore"),
+            staged_reconciled
+        );
+    }
+
+    #[test]
+    fn recovery_snapshot_rejects_totals_bindings_sequences_and_unknown_fields() {
+        let auth = authority();
+        let mut ledger = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        stage_and_activate(&mut ledger, "bound", &auth);
+        ledger
+            .reserve(request("second", &auth, Some(1), Some(1)))
+            .expect("second reservation");
+        let baseline = ledger.snapshot().expect("snapshot");
+
+        for mutate in [
+            |snapshot: &mut BudgetLedgerRecoverySnapshot| snapshot.reserved_quota_units = 9,
+            |snapshot: &mut BudgetLedgerRecoverySnapshot| snapshot.committed_cost_micros = 9,
+            |snapshot: &mut BudgetLedgerRecoverySnapshot| {
+                snapshot.reservations[0].idempotency_key = "substituted".to_owned();
+            },
+            |snapshot: &mut BudgetLedgerRecoverySnapshot| {
+                snapshot.reservations[0].receipt.envelope_id = "other".to_owned();
+            },
+            |snapshot: &mut BudgetLedgerRecoverySnapshot| {
+                snapshot.reservations[0].receipt.reservation_id = "budget:test-99".to_owned();
+            },
+            |snapshot: &mut BudgetLedgerRecoverySnapshot| {
+                snapshot.authority.authority_owner = "substituted-owner".to_owned();
+            },
+        ] {
+            let mut mutated = baseline.clone();
+            mutate(&mut mutated);
+            assert!(BudgetLedger::from_snapshot(mutated).is_err());
+        }
+
+        let mut reversed = baseline.clone();
+        reversed.reservations.reverse();
+        assert!(BudgetLedger::from_snapshot(reversed).is_err());
+
+        let value = serde_json::to_value(&baseline).expect("serialize");
+        let mut unknown = value.clone();
+        unknown
+            .as_object_mut()
+            .expect("object")
+            .insert("unexpected".to_owned(), serde_json::Value::Null);
+        assert!(serde_json::from_value::<BudgetLedgerRecoverySnapshot>(unknown).is_err());
+        let mut nested = value;
+        nested["envelope"]
+            .as_object_mut()
+            .expect("envelope object")
+            .insert("unexpected".to_owned(), serde_json::Value::Null);
+        assert!(serde_json::from_value::<BudgetLedgerRecoverySnapshot>(nested).is_err());
+    }
+
+    #[test]
+    fn recovery_snapshot_rejects_gaps_leading_zeroes_and_duplicate_refunds() {
+        let auth = authority();
+        let mut ledger = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        stage_and_activate(&mut ledger, "refund-sequence", &auth);
+        ledger
+            .commit(
+                "refund-sequence",
+                &auth,
+                &MeasuredUsage {
+                    cost_micros: ObservedAmount::Known(10),
+                    ..usage("refund-sequence", &auth, TrialStatus::Failed)
+                },
+            )
+            .expect("committed");
+        let refund = RefundObservation {
+            observation_id: "duplicate-refund".to_owned(),
+            provider_tool: route(),
+            operation: operation("refund-sequence", &auth),
+            provider_receipt_ref: receipt_ref_with_disposition_and_operation(
+                "duplicate-refund-receipt",
+                &auth,
+                ReceiptDispositionKind::Success,
+                operation("refund-sequence", &auth),
+            ),
+            cost_micros: ObservedAmount::Known(1),
+            status: TrialStatus::Succeeded,
+        };
+        ledger
+            .apply_refund("refund-sequence", &auth, &refund)
+            .expect("refund");
+        ledger
+            .reserve(request("second-sequence", &auth, Some(2), Some(1)))
+            .expect("second staged reservation");
+        let baseline = ledger.snapshot().expect("snapshot");
+
+        let mut duplicate_id = baseline.clone();
+        duplicate_id.reservations[0]
+            .receipt
+            .refund_observations
+            .push(RefundObservation {
+                observation_id: refund.observation_id.clone(),
+                provider_receipt_ref: receipt_ref_with_disposition_and_operation(
+                    "different-refund-receipt",
+                    &auth,
+                    ReceiptDispositionKind::Success,
+                    operation("refund-sequence", &auth),
+                ),
+                ..refund.clone()
+            });
+        assert!(BudgetLedger::from_snapshot(duplicate_id).is_err());
+
+        let mut duplicate_receipt = baseline.clone();
+        duplicate_receipt.reservations[0]
+            .receipt
+            .refund_observations
+            .push(RefundObservation {
+                observation_id: "different-refund".to_owned(),
+                ..refund
+            });
+        assert!(BudgetLedger::from_snapshot(duplicate_receipt).is_err());
+
+        let mut leading_zero = baseline.clone();
+        leading_zero.reservations[0].receipt.reservation_id = "budget:test-01".to_owned();
+        assert!(BudgetLedger::from_snapshot(leading_zero).is_err());
+
+        let mut gap = baseline.clone();
+        gap.reservations[1].receipt.reservation_id = "budget:test-3".to_owned();
+        assert!(BudgetLedger::from_snapshot(gap).is_err());
+
+        let mut mismatched_operation_key = baseline;
+        mismatched_operation_key.reservations[0]
+            .receipt
+            .operation
+            .idempotency_key = "other-operation".to_owned();
+        assert!(BudgetLedger::from_snapshot(mismatched_operation_key).is_err());
+    }
+
+    #[test]
+    fn recovery_snapshot_bytes_are_stable_and_ordered() {
+        use eliot_contracts::canonical_json_bytes;
+
+        let auth = authority();
+        let mut ledger = BudgetLedger::new(
+            envelope(Some(100), QuotaState::Known { remaining: 100 }),
+            auth.clone(),
+        )
+        .expect("valid ledger");
+        ledger
+            .reserve(request("z-key", &auth, Some(2), Some(1)))
+            .expect("z");
+        ledger
+            .reserve(request("a-key", &auth, Some(2), Some(1)))
+            .expect("a");
+        let first = ledger.snapshot().expect("snapshot");
+        let second = ledger.snapshot().expect("snapshot");
+        assert_eq!(first, second);
+        assert_eq!(
+            canonical_json_bytes(&first).expect("canonical bytes"),
+            canonical_json_bytes(&second).expect("canonical bytes")
+        );
+        assert!(
+            first
+                .reservations
+                .windows(2)
+                .all(|window| window[0].idempotency_key < window[1].idempotency_key)
+        );
     }
 }
