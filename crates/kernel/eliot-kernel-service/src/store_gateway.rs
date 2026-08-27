@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eliot_contracts::{RequestMetadata, StateFence};
+use eliot_contracts::{OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_store_api::{
@@ -25,6 +25,9 @@ use eliot_store_api::{
 use crate::{EbpCanonicalStoreClient, KernelService};
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
+
+#[path = "store_receipt_gateway.rs"]
+mod store_receipt_gateway;
 
 /// The in-flight synchronization state for one canonical Store gateway.
 #[derive(Default)]
@@ -257,6 +260,16 @@ impl KernelStoreGateway {
             return Err("Store recovery snapshot fence does not match request".to_owned());
         }
         Ok(snapshot)
+    }
+
+    /// Reads one Store receipt by exact operation identity through the active
+    /// Kernel generation route.
+    pub async fn receipt(
+        &self,
+        state_fence: &StateFence,
+        operation_id: OperationId,
+    ) -> Result<Option<WriteReceipt>, String> {
+        store_receipt_gateway::receipt(self, state_fence, operation_id).await
     }
 
     /// Seeds the Store's all-absent genesis state under the active Kernel
