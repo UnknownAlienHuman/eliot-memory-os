@@ -1218,6 +1218,7 @@ impl GenerationPackagePlanner {
                 "generation": authority_generation.value(),
                 "authority_epoch": authority_epoch.value(),
                 "artifact_digest": kernel_digest.as_str(),
+                "protected_snapshot_digest": protected_snapshot_digest.as_str(),
             });
             let expected_kernel_snapshot_digest = hex_digest(
                 &serde_json::to_vec(&expected_kernel_snapshot).map_err(|error| {

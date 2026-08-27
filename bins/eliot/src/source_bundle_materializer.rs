@@ -593,6 +593,7 @@ fn protected_snapshot_digest_from_governor_bytes(
 fn bridge_source_plan(
     input: &CanarySourceBundleMaterializeInput,
     kernel_artifact_sha256: &str,
+    protected_snapshot_digest: &str,
 ) -> Result<Option<Box<AgentBridgeSourceMaterializationPlan>>, MaterializeError> {
     match (
         input.agent_bridge_exe.as_ref(),
@@ -617,6 +618,7 @@ fn bridge_source_plan(
                 &retained,
                 approved_user_sid,
                 kernel_artifact_sha256,
+                protected_snapshot_digest,
             )
             .map_err(|error| MaterializeError::Contract(error.to_string()))?;
             Ok(Some(Box::new(plan)))
@@ -642,7 +644,17 @@ pub(crate) fn bridge_source_plan_for_receipt(
         .ok_or_else(|| {
             InstallationError::IncompleteObservation("kernel receipt role missing".to_owned())
         })?;
-    bridge_source_plan(input, kernel_sha256).map_err(InstallationError::from)
+    let protected_snapshot_digest = sha256_hex(
+        format!(
+            "governor-protected:{}:{}:{}",
+            input.installation_epoch.installation.as_str(),
+            input.generation.as_str(),
+            kernel_sha256,
+        )
+        .as_bytes(),
+    );
+    bridge_source_plan(input, kernel_sha256, &protected_snapshot_digest)
+        .map_err(InstallationError::from)
 }
 
 #[allow(
@@ -683,9 +695,9 @@ fn build_typed_bundle(
     let store_bridge = by_name("eliot-store-surreal.exe")?;
     let canonical_store = by_name("surreal.exe")?;
     let eliotd = by_name("eliotd.exe")?;
-    bridge_source_plan(input, &kernel.sha256)?;
     let governor = governor_bytes(&input.generation, &input.installation_epoch, &kernel.sha256)?;
     let protected_snapshot_digest = protected_snapshot_digest_from_governor_bytes(&governor)?;
+    bridge_source_plan(input, &kernel.sha256, protected_snapshot_digest.as_str())?;
     let governor_sha256 = sha256_hex(&governor);
     let template_facts = vec![
         package_digest("eliot-host.exe", host.size, &host.sha256)?,
@@ -1965,13 +1977,16 @@ mod tests {
         let anchor = TempDir::new().unwrap();
         let staging = TempDir::new().unwrap();
         let mut input = test_input(&source_parent, &anchor, &staging);
-        assert_eq!(bridge_source_plan(&input, &"a".repeat(64)).unwrap(), None);
+        assert_eq!(
+            bridge_source_plan(&input, &"a".repeat(64), &"b".repeat(64)).unwrap(),
+            None
+        );
 
         input.agent_bridge_exe = Some(source_parent.path().join("eliot-agent-bridge.exe"));
-        assert!(bridge_source_plan(&input, &"a".repeat(64)).is_err());
+        assert!(bridge_source_plan(&input, &"a".repeat(64), &"b".repeat(64)).is_err());
         input.agent_bridge_exe = None;
         input.agent_bridge_account = Some("ELIOT-ACCOUNT-DOES-NOT-EXIST-9D7C".to_owned());
-        assert!(bridge_source_plan(&input, &"a".repeat(64)).is_err());
+        assert!(bridge_source_plan(&input, &"a".repeat(64), &"b".repeat(64)).is_err());
     }
 
     #[cfg(windows)]
@@ -1985,10 +2000,17 @@ mod tests {
         fs::write(&bridge, b"bridge-source").unwrap();
         input.agent_bridge_exe = Some(bridge);
         input.agent_bridge_account = Some("NT AUTHORITY\\LocalService".to_owned());
-        let source = bridge_source_plan(&input, &"a".repeat(64)).unwrap();
+        let source = bridge_source_plan(&input, &"a".repeat(64), &"b".repeat(64)).unwrap();
         let source = source.expect("paired bridge source");
         assert_ne!(source.source_executable_sha256.as_str(), "a".repeat(64));
-        assert!(bridge_source_plan(&input, source.source_executable_sha256.as_str()).is_err());
+        assert!(
+            bridge_source_plan(
+                &input,
+                source.source_executable_sha256.as_str(),
+                &"b".repeat(64),
+            )
+            .is_err()
+        );
     }
 
     #[cfg(windows)]

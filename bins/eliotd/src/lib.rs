@@ -367,6 +367,7 @@ struct KernelSnapshotWire {
     generation: u64,
     authority_epoch: u64,
     artifact_digest: String,
+    protected_snapshot_digest: String,
 }
 
 impl DaemonKernelClient {
@@ -569,12 +570,7 @@ impl DaemonKernelClient {
     #[cfg(windows)]
     async fn snapshot_request(&self) -> Result<KernelGenerationSnapshot, KernelClientError> {
         let value = self
-            .transact_async(
-                "snapshot",
-                serde_json::json!({
-                    "protected_snapshot_digest": self.launch.protected_snapshot_digest,
-                }),
-            )
+            .transact_async("snapshot", serde_json::json!({}))
             .await?;
         let wire: KernelSnapshotWire = serde_json::from_value(value)
             .map_err(|error| KernelClientError::Contract(error.to_string()))?;
@@ -586,7 +582,7 @@ impl DaemonKernelClient {
             authority_epoch: AuthorityEpoch::new(wire.authority_epoch)
                 .map_err(|error| KernelClientError::Contract(error.to_string()))?,
             artifact_digest: wire.artifact_digest,
-            protected_snapshot_digest: self.launch.protected_snapshot_digest.clone(),
+            protected_snapshot_digest: wire.protected_snapshot_digest,
             principal: self.launch.kernel.principal.clone(),
         };
         snapshot
@@ -1118,6 +1114,8 @@ fn validate_server_hello(
         || snapshot.generation != launch.kernel.generation.value()
         || snapshot.authority_epoch != launch.kernel.authority_epoch.value()
         || snapshot.artifact_digest != launch.kernel.artifact_digest
+        || snapshot.protected_snapshot_digest != launch.protected_snapshot_digest
+        || snapshot.protected_snapshot_digest != launch.kernel.protected_snapshot_digest
     {
         return Err(KernelClientError::Contract(
             "Kernel ServerHello generation snapshot mismatch".to_owned(),
@@ -1621,6 +1619,7 @@ mod tests {
                 "generation": launch.kernel.generation.value(),
                 "authority_epoch": launch.kernel.authority_epoch.value(),
                 "artifact_digest": launch.kernel.artifact_digest,
+                "protected_snapshot_digest": launch.protected_snapshot_digest,
             }),
             heartbeat_ms: 1_000,
             control_channel: KERNEL_PIPE_NAME.to_owned(),
@@ -1628,6 +1627,28 @@ mod tests {
             authority_epoch: launch.kernel.authority_epoch,
         };
         validate_server_hello(&launch, &config.kernel_binding, &hello)?;
+
+        let valid_snapshot = hello.config_snapshot.clone();
+        let Some(snapshot) = hello.config_snapshot.as_object_mut() else {
+            return Err("snapshot object expected".into());
+        };
+        snapshot.remove("protected_snapshot_digest");
+        assert!(validate_server_hello(&launch, &config.kernel_binding, &hello).is_err());
+
+        hello.config_snapshot = valid_snapshot.clone();
+        hello.config_snapshot["protected_snapshot_digest"] =
+            serde_json::Value::String("A".repeat(64));
+        assert!(validate_server_hello(&launch, &config.kernel_binding, &hello).is_err());
+
+        hello.config_snapshot = valid_snapshot.clone();
+        hello.config_snapshot["protected_snapshot_digest"] =
+            serde_json::Value::String("c".repeat(64));
+        assert!(validate_server_hello(&launch, &config.kernel_binding, &hello).is_err());
+
+        hello.config_snapshot = valid_snapshot;
+        let mut local_mismatch = launch.clone();
+        local_mismatch.protected_snapshot_digest = "c".repeat(64);
+        assert!(validate_server_hello(&local_mismatch, &config.kernel_binding, &hello).is_err());
 
         hello.session_principal_binding = "local-user".to_owned();
         assert!(validate_server_hello(&launch, &config.kernel_binding, &hello).is_err());

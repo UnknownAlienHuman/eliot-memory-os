@@ -285,17 +285,29 @@ impl AgentBridgeSourceMaterializationFactory {
 
 /// Builds the bridge source plan from the retained bridge artifact and the
 /// independently observed Kernel executable.  The producer owns every static
-/// bridge/module value; callers provide only the OS-resolved account SID and
-/// the observed Kernel artifact digest.  In particular, no CLI generation,
-/// fence, profile id, or configuration digest is accepted as authority.
+/// bridge/module value; callers provide only the OS-resolved account SID, the
+/// observed Kernel artifact digest, and the Host-approved protected snapshot
+/// identity.  In particular, no CLI generation, fence, profile id, or
+/// configuration-file digest is accepted as authority.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded profile constructor keeps immutable bridge and Kernel bindings together"
+)]
 pub fn agent_bridge_source_plan_from_observed_kernel(
     source: &RetainedAgentBridgeSource,
     approved_user_sid: String,
     kernel_artifact_sha256: &str,
+    protected_snapshot_digest: &str,
 ) -> Result<AgentBridgeSourceMaterializationPlan, InstallationError> {
     source.verify()?;
     if !is_lowercase_sha256(kernel_artifact_sha256) || kernel_artifact_sha256 == source.sha256() {
         return Err(InstallationError::IdentityConflict);
+    }
+    if !is_lowercase_sha256(protected_snapshot_digest) {
+        return Err(InstallationError::InvalidField {
+            field: "agent_bridge.protected_snapshot_digest".to_owned(),
+            reason: "must be a lowercase SHA-256 digest".to_owned(),
+        });
     }
     let module_id = ContractId::new(AGENT_BRIDGE_MODULE_ID).map_err(|error| {
         InstallationError::InvalidField {
@@ -347,6 +359,7 @@ pub fn agent_bridge_source_plan_from_observed_kernel(
         "generation": AGENT_BRIDGE_AUTHORITY_EPOCH,
         "authority_epoch": AGENT_BRIDGE_AUTHORITY_EPOCH,
         "artifact_digest": kernel_artifact_sha256,
+        "protected_snapshot_digest": protected_snapshot_digest,
     });
     let kernel_snapshot_sha256 =
         sha256_hex(&serde_json::to_vec(&kernel_snapshot).map_err(|error| {

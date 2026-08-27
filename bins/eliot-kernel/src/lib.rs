@@ -3609,6 +3609,18 @@ fn update_handshake_policy(
         // rebuilt snapshot that drops it would fence an otherwise valid bridge
         // after the first generation update.
         let artifact_digest = policy.config_snapshot.get("artifact_digest").cloned();
+        let protected_snapshot_digest = policy
+            .config_snapshot
+            .get("protected_snapshot_digest")
+            .cloned();
+        if let Some(protected_snapshot_digest) = protected_snapshot_digest.as_ref() {
+            let Some(value) = protected_snapshot_digest.as_str() else {
+                return Err("Kernel protected snapshot digest must be a JSON string".to_owned());
+            };
+            if !is_lower_sha256(value) {
+                return Err("Kernel protected snapshot digest must be lowercase SHA-256".to_owned());
+            }
+        }
         policy.module_generation.generation = route.active_generation();
         policy.module_generation.state_fence =
             StateFence::new(route.authority_epoch(), route.active_generation());
@@ -3620,6 +3632,9 @@ fn update_handshake_policy(
         });
         if let Some(artifact_digest) = artifact_digest {
             policy.config_snapshot["artifact_digest"] = artifact_digest;
+        }
+        if let Some(protected_snapshot_digest) = protected_snapshot_digest {
+            policy.config_snapshot["protected_snapshot_digest"] = protected_snapshot_digest;
         }
     }
     Ok(())
@@ -4380,6 +4395,19 @@ impl KernelComposition {
         let session_principal_binding = observed_session_principal_binding()?;
         #[cfg(not(windows))]
         let session_principal_binding = "unsupported-non-windows-principal".to_owned();
+        let mut config_snapshot = serde_json::json!({
+            "service": SERVICE_NAME,
+            "protocol": PROTOCOL_VERSION,
+            "generation": generation.value(),
+            "authority_epoch": authority_epoch.value(),
+            "artifact_digest": kernel_artifact_sha256
+                .as_deref()
+                .unwrap_or("eliot-kernel-standalone"),
+        });
+        if let Some(launch) = daemon_launch.as_ref() {
+            config_snapshot["protected_snapshot_digest"] =
+                serde_json::Value::String(launch.protected_snapshot_digest.as_str().to_owned());
+        }
         let front_door_policy = ServerHandshakePolicy {
             protocol_range: eliot_protocol::ProtocolRange {
                 minimum: eliot_protocol::ProtocolVersion::CURRENT,
@@ -4397,15 +4425,7 @@ impl KernelComposition {
             session_principal_binding,
             control_channel: ipc.name().to_owned(),
             heartbeat_ms: 1_000,
-            config_snapshot: serde_json::json!({
-                "service": SERVICE_NAME,
-                "protocol": PROTOCOL_VERSION,
-                "generation": generation.value(),
-                "authority_epoch": authority_epoch.value(),
-                "artifact_digest": kernel_artifact_sha256
-                    .as_deref()
-                    .unwrap_or("eliot-kernel-standalone"),
-            }),
+            config_snapshot,
             max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
                 .map_err(|_| KernelBuildError::Core("maximum frame exceeds u32".to_owned()))?,
         };
@@ -7659,7 +7679,18 @@ impl KernelComposition {
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .ok_or(TransportError::SessionFenced)?;
-        Ok(serde_json::json!({
+        let protected_snapshot_digest = policy
+            .config_snapshot
+            .get("protected_snapshot_digest")
+            .and_then(serde_json::Value::as_str);
+        if let Some(value) = protected_snapshot_digest {
+            if !is_lower_sha256(value) {
+                return Err(TransportError::SessionFenced);
+            }
+        } else if self.daemon_launch.is_some() {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut snapshot = serde_json::json!({
             "service": SERVICE_NAME,
             "protocol": PROTOCOL_VERSION,
             "generation": policy.module_generation.generation.value(),
@@ -7667,7 +7698,12 @@ impl KernelComposition {
             // This is the Kernel peer artifact domain. The daemon child
             // artifact remains in module_generation.artifact_id and ClientHello.
             "artifact_digest": kernel_artifact_digest,
-        }))
+        });
+        if let Some(protected_snapshot_digest) = protected_snapshot_digest {
+            snapshot["protected_snapshot_digest"] =
+                serde_json::Value::String(protected_snapshot_digest.to_owned());
+        }
+        Ok(snapshot)
     }
 
     #[cfg(windows)]
@@ -10214,6 +10250,9 @@ mod tests {
             .lock()
             .expect("front-door policy lock")
             .clone();
+        let expected_protected = "e".repeat(64);
+        policy.config_snapshot["protected_snapshot_digest"] =
+            serde_json::Value::String(expected_protected.clone());
 
         for _ in 0..2 {
             update_handshake_policy(&mut policy, &generations).expect("policy update");
@@ -10225,6 +10264,80 @@ mod tests {
                 Some(expected_artifact.as_str()),
                 "begin_agent_bridge must retain the exact artifact prerequisite after policy updates"
             );
+            assert_eq!(
+                policy
+                    .config_snapshot
+                    .get("protected_snapshot_digest")
+                    .and_then(serde_json::Value::as_str),
+                Some(expected_protected.as_str()),
+                "handshake updates must retain the Host-approved protected snapshot identity"
+            );
+        }
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_snapshot_exposes_only_a_canonical_protected_digest() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-protected-snapshot-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let protected = "f".repeat(64);
+        {
+            let mut policy = kernel
+                .front_door_policy
+                .lock()
+                .expect("front-door policy lock");
+            policy.config_snapshot["protected_snapshot_digest"] =
+                serde_json::Value::String(protected.clone());
+        }
+        let snapshot = kernel.daemon_snapshot().expect("daemon snapshot");
+        assert_eq!(snapshot["protected_snapshot_digest"], protected);
+
+        {
+            let mut policy = kernel
+                .front_door_policy
+                .lock()
+                .expect("front-door policy lock");
+            policy.config_snapshot["protected_snapshot_digest"] =
+                serde_json::Value::String("F".repeat(64));
+        }
+        assert!(kernel.daemon_snapshot().is_err());
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handshake_policy_update_rejects_invalid_protected_digest_without_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-protected-policy-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let generations = kernel
+            .generations
+            .lock()
+            .expect("generation router lock")
+            .clone();
+        let baseline = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy lock")
+            .clone();
+
+        for value in [serde_json::json!(null), serde_json::json!("A".repeat(64))] {
+            let mut policy = baseline.clone();
+            policy.config_snapshot["protected_snapshot_digest"] = value;
+            let before = policy.clone();
+            assert!(update_handshake_policy(&mut policy, &generations).is_err());
+            assert_eq!(policy, before);
         }
 
         drop(kernel);
