@@ -24,6 +24,7 @@ mod launch_artifact;
 mod launch_options;
 mod runtime_control;
 mod scm_launch;
+mod store_kernel_launch_sequence;
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 #[cfg(windows)]
@@ -40,6 +41,9 @@ pub use runtime_control::{
     HostRuntimeControlResponse, HostStoreRecoveryReceipt,
 };
 pub use scm_launch::{ValidatedHostScmLaunch, validate_host_scm_bootstrap};
+pub use store_kernel_launch_sequence::StoreLivenessEvidence;
+#[cfg(windows)]
+use store_kernel_launch_sequence::{StoreKernelLaunchError, launch_store_then_kernel};
 
 use std::ffi::OsString;
 use std::io;
@@ -192,65 +196,6 @@ pub enum HostError {
     OwnerLeaseHeld,
     #[error("Host owner lease recovery is required: {0}")]
     OwnerLeaseRecovery(String),
-}
-
-#[derive(Debug, Error, Eq, PartialEq)]
-pub enum StoreLivenessEvidence {
-    #[error("dead")]
-    Dead,
-    #[error("unknown: {0}")]
-    Unknown(String),
-}
-
-#[cfg(windows)]
-enum StoreKernelLaunchError<S> {
-    Launch(HostError),
-    StoreNotLive { evidence: StoreLivenessEvidence },
-    CleanupRequired { store: S, reason: String },
-    Kernel { error: HostError },
-}
-
-#[cfg(windows)]
-fn launch_store_then_kernel<S, K, LF, OF, KF, CF>(
-    launch_store: LF,
-    observe_store: OF,
-    launch_kernel: KF,
-    cleanup_store: CF,
-) -> Result<(S, K), StoreKernelLaunchError<S>>
-where
-    LF: FnOnce() -> Result<S, HostError>,
-    OF: FnOnce(&S) -> Result<(), StoreLivenessEvidence>,
-    KF: FnOnce() -> Result<K, HostError>,
-    CF: FnOnce(S) -> Result<(), Box<(S, String)>>,
-{
-    let store = launch_store().map_err(StoreKernelLaunchError::Launch)?;
-    if let Err(evidence) = observe_store(&store) {
-        return match cleanup_store(store) {
-            Ok(()) => Err(StoreKernelLaunchError::StoreNotLive { evidence }),
-            Err(boxed) => {
-                let (store, reason) = *boxed;
-                Err(StoreKernelLaunchError::CleanupRequired { store, reason })
-            }
-        };
-    }
-    let kernel = match launch_kernel() {
-        Ok(kernel) => kernel,
-        Err(error) => {
-            return match cleanup_store(store) {
-                Ok(()) => Err(StoreKernelLaunchError::Kernel { error }),
-                Err(boxed) => {
-                    let (store, reason) = *boxed;
-                    Err(StoreKernelLaunchError::CleanupRequired {
-                        store,
-                        reason: format!(
-                            "Kernel launch failed ({error}); Store cleanup is unknown: {reason}"
-                        ),
-                    })
-                }
-            };
-        }
-    };
-    Ok((store, kernel))
 }
 
 #[cfg(windows)]
