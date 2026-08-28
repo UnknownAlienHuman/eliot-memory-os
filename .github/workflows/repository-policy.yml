@@ -26,14 +26,14 @@ jobs:
           pattern='^(work|fix|docs|chore|refactor|test)/[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$'
           legacy='cognitive-micromodules-wave-01'
 
-          if [[ "$HEAD_BRANCH" != "$legacy" && ! "$HEAD_BRANCH" =~ $pattern ]]; then
+          if [[ "$HEAD_BRANCH" != 'main' && "$HEAD_BRANCH" != "$legacy" && ! "$HEAD_BRANCH" =~ $pattern ]]; then
             echo "Branch '$HEAD_BRANCH' is not issue-numbered."
             echo "Use <work|fix|docs|chore|refactor|test>/<issue>-<slug>."
             exit 1
           fi
 
           git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor origin/main HEAD; then
+          if [[ "$HEAD_BRANCH" != 'main' ]] && ! git merge-base --is-ancestor origin/main HEAD; then
             echo "Current origin/main is not an ancestor of this branch."
             echo "Refresh from main before additional mutation or integration."
             exit 1
