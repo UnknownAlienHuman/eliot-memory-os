@@ -45,4 +45,4 @@ allowed_path_scope = [
 ]
 no_unrelated_repairs = true
 retire_after_pr_disposition = true
-reason = "The candidate was refreshed from final repository-cleanup main through merged PR #34; it remains a bounded draft contour, not a general development branch."
+reason = "The candidate must contain current main as an ancestor before mutation or integration; administrative refresh merges do not change the cognitive prototype payload."
