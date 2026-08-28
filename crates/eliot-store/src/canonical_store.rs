@@ -9,6 +9,7 @@ use crate::{
 mod capacity;
 mod recall_ranking;
 mod replay_view;
+use crate::canonical_activation_graph_models::{RawActivationGraphRows, RawActivationRelation};
 pub use crate::canonical_cognitive_projection::{
     CognitiveProjectionBacklog, CognitiveProjectionFamily, CognitiveProjectionFamilyCounts,
     CognitiveProjectionFamilyState, CognitiveProjectionIntentReceipt, CognitiveProjectionLease,
@@ -1469,30 +1470,6 @@ pub struct CanonicalClaimCard {
     pub memory_revision: MemoryRevision,
     pub project_sequence: ProjectSequence,
     pub write_id: WriteId,
-}
-
-#[derive(serde::Deserialize)]
-struct RawActivationRelation {
-    from_ref: String,
-    to_ref: String,
-}
-
-#[derive(serde::Deserialize)]
-struct RawActivationGraphRows {
-    #[serde(default)]
-    co_change: Vec<eliot_types::CoChangeEdge>,
-    #[serde(default)]
-    card_covers: Vec<RawActivationRelation>,
-    #[serde(default)]
-    capsule_covers: Vec<RawActivationRelation>,
-    #[serde(default)]
-    concept_implemented_by: Vec<RawActivationRelation>,
-    #[serde(default)]
-    concept_depends_on: Vec<RawActivationRelation>,
-    #[serde(default)]
-    supports: Vec<RawActivationRelation>,
-    #[serde(default)]
-    verified_by: Vec<RawActivationRelation>,
 }
 
 impl CanonicalStore {
