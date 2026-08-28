@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.memory.curation_contracts"
+crate = "eliot-memory-curation-contracts"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 19
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless_contract"
+hot_path = false
+lifecycle_owner = "smart.memory.curation_contracts"
+loc_soft_ceiling = 10000
+primary_responsibility = "Own versioned read-only screening and protection contracts used between canonical memory projections and candidate-only curation handlers."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["canonical memory projection handles", "StateFence", "bounded scan metadata"]
+outputs = ["CurationScreenRequest", "CurationScreenResult", "CurationFinding", "ProtectionReason", "ScreenCoverage"]
+depends_on = ["eliot-contracts", "eliot-evidence"]
+consumers = ["eliot-memory-curation-screen", "eliot-dreamer-curation"]
+non_goals = ["archive/suppress/forget records", "own lifecycle enums", "emit Dreamer semantic candidates", "persist a screen"]
+invariants = ["screen results are read-only and fenced", "protected/minority/counterexample/audit material stays explicit", "coverage and truncation are visible", "no action implies authority"]
+failure_behavior = "Return incomplete/unsupported screen status with exact omissions; never infer a safe mutation."
+proof_surface = ["schema round-trip", "protection-role compatibility", "bounded coverage fixtures", "no-action authority tests"]
+replacement_boundary = "screening protocol; screen algorithm and Dreamer handlers remain independent"
+split_trigger = "screen request/result versions diverge from finding/protection vocabulary"
+rust_contract_dependencies = ["eliot-contracts", "eliot-evidence"]
+
+[[donor]]
+path = "crates/smart/eliot-memory-curation/src/lib.rs"
+disposition = "extract_contracts_only"
+scope = "PreviewRequest/CurationPreview protection and coverage shapes; reject duplicate lifecycle/action ownership"
+
+[[donor]]
+path = "ELIOT Implementation English edition 2026-08-28"
+disposition = "authoritative_contract"
+scope = "CurationCandidateSet input screening, preservation and reversible candidate boundary"
+
+[agent_task]
+objective = "Define the shared curation-screen boundary before the screen and facade are implemented."
+write_scope = ["crates/smart/eliot-memory-curation-contracts/**"]
+deliverables = ["screen/protection/coverage types", "validation and schemas", "compatibility fixtures"]
+acceptance = ["no lifecycle or canonical action", "truncation and protected records survive serialization", "no Dreamer/provider types leak into canonical projection contracts"]
+forbidden = ["canonical writes", "lifecycle ownership", "provider/model SDKs", "storage/vendor types", "generic utility score as proof"]
+stop_condition = "Stop if a contract field requires deciding archive/suppress/forget; expose evidence and leave action disposition outside Smart."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["schema proof", "old curation donor migration fixtures", "screen/facade edge proof"]
+workspace_admission = "forbidden until src/lib.rs, package proof and both consumer edges pass"
