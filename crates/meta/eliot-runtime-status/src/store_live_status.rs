@@ -1,14 +1,14 @@
 //! Store live status — read-only Store liveness observation/projection.
 //!
-//! Architecture (verified): contract -> pure core -> ports; Store liveness
-//! is evidence only and does not confer lifecycle, SCM, or readiness authority.
-//! Read-only Store liveness bound to the exact committed `StoreRebind`,
+//! Architecture (verified): A13.2 Kernel/failure-domain health/unavailable guarantees, module lifecycle;
+//! contract -> pure core -> ports; Store liveness is evidence only and does not confer lifecycle, SCM,
+//! or readiness authority. Read-only Store liveness bound to the exact committed `StoreRebind`,
 //! active-manifest authority/config/artifact, current supervision lease freshness,
 //! and independent handle/TCP ownership observation.
 //!
-//! Implementation (verified): bounded `FunctionalCapabilityCell`; I16.1
-//! projections-not-truth; fail-closed on missing, mismatched, or stale evidence.
-//! No Kernel/Watchdog/eliotd/ORS lifecycle or canonical write authority.
+//! Implementation (verified): bounded `FunctionalCapabilityCell`; I16.1 reports/projections are not truth;
+//! fail-closed on missing, mismatched, or stale evidence. No Kernel/Watchdog/eliotd/ORS lifecycle or
+//! canonical write authority.
 //!
 //! Explicitly read-only with no lifecycle, SCM, write, or semantic authority.
 
