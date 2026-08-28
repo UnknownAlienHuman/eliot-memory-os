@@ -11,6 +11,7 @@ mod canonical_secret_report;
 mod capacity;
 mod recall_ranking;
 mod replay_view;
+mod ul_artifact_loaders;
 use crate::canonical_activation_graph_models::{RawActivationGraphRows, RawActivationRelation};
 pub use crate::canonical_cognitive_projection::{
     CognitiveProjectionBacklog, CognitiveProjectionFamily, CognitiveProjectionFamilyCounts,
@@ -3381,44 +3382,6 @@ impl CanonicalStore {
             .await
     }
 
-    pub async fn load_ul_artifacts<T>(
-        &self,
-        project_id: ProjectId,
-        receipt_kinds: &[&str],
-        page_size: u16,
-    ) -> Result<Vec<CanonicalRecord<T>>, StoreError>
-    where
-        T: DeserializeOwned,
-    {
-        let page_size = page_size.clamp(1, crate::UL_ARTIFACT_PAGE_SIZE);
-        let mut records = Vec::new();
-        loop {
-            let value = self
-                .execute_value(
-                    NamedSurqlOp::LoadUlArtifacts,
-                    json!({
-                        "project_id": project_id,
-                        "receipt_kinds": receipt_kinds,
-                        "start": records.len(),
-                        "limit": page_size,
-                    }),
-                )
-                .await?;
-            let page: Vec<CanonicalRecord<T>> = decode_value(NamedSurqlOp::LoadUlArtifacts, value)?;
-            if records.len().saturating_add(page.len()) > crate::MAX_CURRENT_UL_ARTIFACTS {
-                return Err(StoreError::Decode(format!(
-                    "current UL projection exceeds the explicit {}-artifact safety bound",
-                    crate::MAX_CURRENT_UL_ARTIFACTS
-                )));
-            }
-            let complete = page.len() < usize::from(page_size);
-            records.extend(page);
-            if complete {
-                return Ok(records);
-            }
-        }
-    }
-
     pub async fn replace_ul_reverse_dependencies(
         &self,
         project_id: ProjectId,
@@ -3467,46 +3430,6 @@ impl CanonicalStore {
         Ok(())
     }
 
-    pub async fn load_ul_reverse_dependents(
-        &self,
-        project_id: ProjectId,
-        dependencies: &[eliot_types::UlDependencyRef],
-    ) -> Result<Vec<eliot_types::UlReverseDependencyRow>, StoreError> {
-        let expected = dependencies.iter().cloned().collect::<BTreeSet<_>>();
-        if expected.is_empty() {
-            return Ok(Vec::new());
-        }
-        let dependency_kinds = expected
-            .iter()
-            .map(|dependency| dependency.kind)
-            .collect::<BTreeSet<_>>();
-        let dependency_keys = expected
-            .iter()
-            .map(|dependency| dependency.key.clone())
-            .collect::<BTreeSet<_>>();
-        let value = self
-            .execute_value(
-                NamedSurqlOp::LoadUlReverseDependents,
-                json!({
-                    "project_id": project_id,
-                    "dependency_kinds": dependency_kinds,
-                    "dependency_keys": dependency_keys,
-                }),
-            )
-            .await?;
-        let mut rows: Vec<eliot_types::UlReverseDependencyRow> =
-            decode_value(NamedSurqlOp::LoadUlReverseDependents, value)?;
-        rows.retain(|row| expected.contains(&row.dependency));
-        rows.sort_by(|left, right| {
-            left.target_kind
-                .cmp(&right.target_kind)
-                .then_with(|| left.target_id.cmp(&right.target_id))
-                .then_with(|| left.dependency.cmp(&right.dependency))
-        });
-        rows.dedup();
-        Ok(rows)
-    }
-
     pub async fn mark_ul_artifact_dirty(
         &self,
         state: &eliot_types::UlArtifactDirtyState,
@@ -3532,20 +3455,6 @@ impl CanonicalStore {
         let _: eliot_types::UlArtifactDirtyState =
             decode_value(NamedSurqlOp::UpsertUlArtifactDirty, value)?;
         Ok(())
-    }
-
-    pub async fn load_ul_dirty_artifacts(
-        &self,
-        project_id: ProjectId,
-        limit: u16,
-    ) -> Result<Vec<eliot_types::UlArtifactDirtyState>, StoreError> {
-        let value = self
-            .execute_value(
-                NamedSurqlOp::LoadUlArtifactDirty,
-                json!({ "project_id": project_id, "limit": limit.clamp(1, 512) }),
-            )
-            .await?;
-        decode_value(NamedSurqlOp::LoadUlArtifactDirty, value)
     }
 
     pub async fn clear_ul_artifact_dirty(
