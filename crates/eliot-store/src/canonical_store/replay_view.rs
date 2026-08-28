@@ -15,14 +15,14 @@
 
 use super::CanonicalStore;
 use super::{decode_value, string_fragments};
+use crate::canonical_meta_integrity_records::MetaIntegrityRecords;
 use crate::{
     CanonicalRecord, CanonicalReplayView, MAX_CANONICAL_RECORDS, NamedSurqlOp, StoreError,
 };
 use eliot_types::{
-    CanonicalMetaMetricEvidence, CanonicalReplayExecutionRecord,
-    CanonicalTraceCompletenessContract, ExperimentalMetaPolicyCandidate, HarnessExperimentRecord,
-    MetaIsolationRejectionRecord, MetaPolicyExecutionReceipt, ProjectId, ReplayAudit, ReplayRun,
-    SealedReplayCaseRecord, SealedReplayInputSnapshotRecord, SealedReplaySetRecord, TaskId,
+    CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, HarnessExperimentRecord,
+    ProjectId, ReplayAudit, ReplayRun, SealedReplayCaseRecord, SealedReplayInputSnapshotRecord,
+    SealedReplaySetRecord, TaskId,
 };
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -33,13 +33,6 @@ struct ReplayIntegrityRecords {
     sealed_cases: Vec<CanonicalRecord<SealedReplayCaseRecord>>,
     sealed_snapshots: Vec<CanonicalRecord<SealedReplayInputSnapshotRecord>>,
     sealed_executions: Vec<CanonicalRecord<CanonicalReplayExecutionRecord>>,
-}
-
-struct MetaIntegrityRecords {
-    metrics: Vec<CanonicalRecord<CanonicalMetaMetricEvidence>>,
-    isolation_rejections: Vec<CanonicalRecord<MetaIsolationRejectionRecord>>,
-    policy_candidates: Vec<CanonicalRecord<ExperimentalMetaPolicyCandidate>>,
-    policy_executions: Vec<CanonicalRecord<MetaPolicyExecutionReceipt>>,
 }
 
 impl CanonicalStore {
