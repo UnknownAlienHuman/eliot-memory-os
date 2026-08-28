@@ -1,715 +1,741 @@
 # ELIOT Architecture
-## Архитектура намерений, понимания и живучей агентной системы
+## Architecture of Intent, Understanding, and a Resilient Agent System
 
-**Версия:** 4.5-draft
-**Дата:** 2026-08-12
-**Статус:** кандидат на каноническое принятие
-**Нормативная пара:** `ELIOT_ARCHITECTURE.md` + `ELIOT_IMPLEMENTATION.md`
+**Version:** 4.5-draft
+**Date:** 2026-08-12
+**Status:** candidate for canonical adoption
+**Normative pair:** `ELIOT_ARCHITECTURE.md` + `ELIOT_IMPLEMENTATION.md`
+**English edition:** 2026-08-28; semantic-preserving English revision of the re-audited integrated baseline
 
-**Переходный режим:** пока новая Implementation не принята, прежние документы сохраняют силу как источники конкретных контрактов существующей системы. При смысловом конфликте развитие новой системы следует этой Architecture; несовместимость фиксируется как migration gap, а не решается скрытым выбором удобного текста.
+**Transition rule:** Until the new Implementation is adopted, earlier documents remain valid sources for concrete contracts of the existing system. When meanings conflict, development of the new system follows this Architecture. Any incompatibility is recorded as a migration gap, not resolved by silently choosing the more convenient text.
 
-> **ELIOT нужен, чтобы сменяемые люди и агенты могли сохранять, восстанавливать, проверять и улучшать корректное понимание на длинной траектории работы.**
+> **ELIOT exists so replaceable people and agents can preserve, restore, verify, and improve correct understanding across long-running work.**
 
-Понимание не является самоцелью. Оно ценно только тогда, когда помогает выполнить реальную задачу, создать или проверить artifact, принять лучшее решение, пережить сбой и продолжить работу без потери смысла.
+Understanding is not an end in itself. It matters only when it helps complete a real task, create or verify an artifact, make a better decision, survive failure, and continue without losing meaning.
 
-ELIOT предполагает, что:
-
-```text
-люди и модели ошибаются;
-агенты теряют контекст и нарушают инструкции;
-данные бывают неверными и отравленными;
-инструменты бывают узкими или неправильно настроенными;
-модули падают;
-правила иногда становятся вреднее ошибки, от которой защищают;
-абсолютной полноты знания, истины и надёжности нет.
-```
-
-Современные agents также надёжнее работают с ограниченным причинно связным workset, чем с огромным неструктурированным контекстом. Это эмпирическое ограничение текущих cognitive routes, а не вечный закон о размере кода. Поэтому Architecture требует декомпозируемости, минимально достаточного контекста и проверяемых границ, но не задаёт фиксированный размер Module, файла, package или команды агента.
-
-Поэтому ELIOT не строится как безошибочная крепость. Он строится как **живучая когнитивная система**:
+ELIOT assumes that:
 
 ```text
-цель и контакт с реальностью
-→ observations и competing models
-→ inquiry, experiment или action
-→ artifacts и outcomes
-→ comparison, correction и recovery
-→ более качественное cognitive inheritance.
+people and models make mistakes;
+agents lose context and violate instructions;
+data can be wrong or poisoned;
+tools can be narrow or misconfigured;
+modules fail;
+rules can become more harmful than the errors they were meant to prevent;
+complete knowledge, truth, and reliability are unattainable.
 ```
 
-ELIOT объединяет четыре функции:
+Modern agents also work more reliably with a bounded, causally coherent workset than with a vast unstructured context. This is an empirical limit of current cognitive routes, not a permanent law about code size. The Architecture therefore requires decomposability, minimally sufficient context, and verifiable boundaries, but sets no fixed size for a Module, file, package, or agent team.
+
+ELIOT is therefore not built as an infallible fortress. It is built as a **resilient cognitive system**:
 
 ```text
-Memory OS — сохраняет и развивает когнитивное наследие;
-Harness   — связывает задачи, agents, tools, authority и verification;
-Smart     — поддерживает понимание, orientation, graphs и Dreamer;
-Meta      — наблюдает качество системы, диагностирует drift и превращает outcomes/recovery в Improvement Candidates; bounded repairs выполняет Doctor.
+goal and contact with reality
+→ observations and competing models
+→ inquiry, experiment, or action
+→ artifacts and outcomes
+→ comparison, correction, and recovery
+→ better cognitive inheritance.
 ```
 
-Небольшой живучий Kernel удерживает identity, canonical transition boundary, fencing, health и recovery. Он не является вторым интеллектом.
-
-Для рабочего агента смысл ELIOT прост:
+ELIOT combines four functions:
 
 ```text
-решать основную задачу, а не администрировать память;
-получать достаточную картину перед существенным решением;
-передавать существенные observations, decisions, failures и outcomes;
-использовать ELIOT для inquiry, coordination, verification и recovery;
-не заявлять certainty или done сильнее имеющегося evidence.
+Memory OS — preserves and develops cognitive inheritance;
+Harness   — connects tasks, agents, tools, authority, and verification;
+Smart     — supports understanding, orientation, graphs, and Dreamer;
+Meta      — observes system quality, diagnoses drift, and converts outcomes and recovery into Improvement Candidates; Doctor performs bounded repairs.
 ```
 
-Для первого входа достаточно прочитать эту страницу, A1 и A16.3. A0 используется как компас при конфликте; остальные разделы раскрываются по текущей задаче и failure boundary.
+A small resilient Kernel maintains identity, the canonical transition boundary, fencing, health, and recovery. It is not a second intelligence.
+
+For a working agent, ELIOT is simple:
+
+```text
+solve the primary task rather than administer memory;
+obtain a sufficient view before a material decision;
+report material observations, decisions, failures, and outcomes;
+use ELIOT for inquiry, coordination, verification, and recovery;
+do not claim more certainty or completion than the evidence supports.
+```
+
+For initial orientation, this page, A1, and A16.3 are sufficient. Use A0 as the compass when rules conflict; open the remaining sections according to the current task and failure boundary.
 
 ---
+# A0. Constitutional Meaning and Interpretation Rules
 
-# A0. Конституционный смысл и правила толкования
+## A0.1. Purpose of the Architecture
 
-## A0.1. Для чего существует Architecture
-
-Architecture — не исполняемый кодекс и не каталог будущих структур. Это **компас решений**. Она фиксирует:
-
-```text
-какую проблему решает ELIOT;
-какой результат считается ценным;
-какие свойства нельзя потерять при смене технологий;
-почему выбраны основные принципы;
-как действовать при конфликте, отказе и неполном знании;
-где Implementation свободна экспериментировать.
-```
-
-Architecture нужна прежде всего тогда, когда Implementation сталкивается с выбором. Она должна позволить ответить:
+The Architecture is neither an executable code nor a catalog of future structures. It is a **decision compass**. It records:
 
 ```text
-какой вариант лучше сохраняет замысел ELIOT;
-какая локальная оптимизация разрушает систему;
-какое правило устарело;
-где нужен Hard Boundary, а где recovery;
-помогает ли механизм человеку и агенту или обслуживает собственную ceremony;
-переживёт ли система локальный сбой без потери цели, evidence и управления;
-какой дефект требует исправления Architecture, а не нового костыля.
+what problem ELIOT solves;
+what outcomes are valuable;
+which properties must survive technology changes;
+why the core principles were chosen;
+how to act under conflict, failure, and incomplete knowledge;
+where the Implementation may experiment.
 ```
 
-Соответствие определяется не количеством выполненных предписаний, а сохранением намерения и наблюдаемого результата.
+The Architecture matters most when the Implementation faces a choice. It must make the following questions answerable:
 
-**ARCH-INTENT-01 — Намерение выше буквального соблюдения.** Правило полезно, пока помогает достигать цели, ради которой введено. Если оно систематически блокирует корректную работу или воспроизводит исходный failure mode, его необходимо оспорить, сузить или изменить открыто.
+```text
+which option best preserves ELIOT's intent;
+which local optimization damages the system;
+which rule is obsolete;
+where a Hard Boundary is required and where recovery is preferable;
+whether a mechanism helps people and agents or merely serves its own ceremony;
+whether the system can survive a local failure without losing its goal, evidence, or control;
+which defect requires an Architecture change rather than another workaround.
+```
 
-**Почему:** реальная агентная работа всегда шире заранее написанного правила; буквальная дисциплина без понимания превращает защиту в источник отказа.
+Conformance is determined by preserved intent and observable outcomes, not by the number of prescriptions followed.
 
-**При конфликте:** сохраняются жёсткие границы A0.3; остальное допускает Governed Challenge, обратимое отклонение и проверку результата. Working agent не получает право на скрытый обход только потому, что сослался на Intent: deviation должна быть явной, scoped, находиться в уже выданной authority и иметь owner, review и outcome.
+**ARCH-INTENT-01 — Intent outranks literal compliance.** A rule is useful only while it advances the purpose for which it was introduced. A rule that repeatedly blocks correct work or reproduces the original failure mode must be challenged, narrowed, or changed openly.
 
-## A0.2. Иерархия архитектурных решений
+**Why:** real agent work always exceeds any rule written in advance; literal discipline without understanding turns safeguards into failure sources.
 
-| Класс | Смысл |
+**Under conflict:** A0.3 Hard Boundaries remain intact. Everything else permits Governed Challenge, reversible deviation, and outcome verification. Citing Intent never authorizes a working agent to bypass controls silently: every deviation must be explicit, scoped, within already granted authority, and assigned an owner, review, and outcome.
+
+## A0.2. Hierarchy of Architectural Decisions
+
+| Class | Meaning |
 |---|---|
-| **Architectural Intent** | Конечная цель и rationale решения; главный ориентир при конфликте |
-| **Theory** | Объяснение cognition, memory, resilience и learning; не навязывает единственную механику |
-| **Invariant** | Свойство, которое здоровая система сохраняет или восстанавливает на своей траектории |
-| **Hard Boundary** | Узкая граница authority, secrets, необратимых effects, proof или canonical integrity; применяется fail-closed |
-| **Contract** | Наблюдаемое обязательство capability; при отказе оно может уменьшиться только явно |
-| **Guardrail** | Предпочтительная защита от известного класса ошибок; допускает challenge и scoped deviation |
-| **Default** | Текущий предпочтительный механизм; заменяем без изменения Intent |
-| **Policy** | Управляемое human-решение по privacy, risk, cost, models и эксплуатации |
-| **Experiment** | Обратимая проверка гипотезы с evaluator, stop condition и rollback |
-| **Empirical Profile** | Versioned знание о конкретной связке model, harness, tools и workload |
-| **Metric** | Измеряет свойство, но не становится целью системы |
-| **Example** | Иллюстрация без самостоятельной нормативной силы |
+| **Architectural Intent** | The ultimate goal and rationale; the primary guide under conflict |
+| **Theory** | An explanation of cognition, memory, resilience, and learning; it does not impose one mechanism |
+| **Invariant** | A property a healthy system preserves or restores over its trajectory |
+| **Hard Boundary** | A narrow boundary around authority, secrets, irreversible effects, proof, or canonical integrity; enforced fail-closed |
+| **Contract** | An observable capability obligation; degradation under failure must be explicit |
+| **Guardrail** | A preferred defense against a known error class; challenge and scoped deviation remain possible |
+| **Default** | The currently preferred mechanism; replaceable without changing Intent |
+| **Policy** | A governed human decision about privacy, risk, cost, models, or operations |
+| **Experiment** | A reversible hypothesis test with an evaluator, stop condition, and rollback |
+| **Empirical Profile** | Versioned knowledge about a specific model, harness, toolset, and workload combination |
+| **Metric** | A measure of a property that must not become the system's objective |
+| **Example** | An illustration with no independent normative force |
 
-`ARCH-*` — устойчивые **decision anchors**. Они помогают восстановить смысл и построить conformance map, но не должны превращать каждую рабочую boundary в церемонию. Нормативная сила не выводится из слов «должен» или «обязан»: её задают класс, rationale и observable property; перечисленный механизм не становится вечным, если это не Hard Boundary.
+`ARCH-*` entries are durable **decision anchors**. They restore meaning and support the conformance map, but must not turn every working boundary into ceremony. Normative force does not follow from words such as "must" alone; it follows from the decision class, rationale, and observable property. A listed mechanism is not permanent unless it is a Hard Boundary.
 
-Invariant оценивается по траектории. Временная ошибка допустима, если она:
-
-```text
-обнаружена;
-локализована;
-не получила скрытую authority;
-оставила evidence;
-имеет recovery или честную escalation.
-```
-
-## A0.3. Жёсткие границы
-
-Fail-closed требуется только там, где ошибка создаёт необратимый или скрытый захват системы:
+An Invariant is evaluated over a trajectory. A temporary error is tolerable when it is:
 
 ```text
-скрытое создание или расширение authority;
-скрытое изменение конечной цели пользователя;
-неотслеживаемый необратимый или внешний effect;
-ложное утверждение VERIFIED_COMPLETE или иного proof;
-скрытая перезапись provenance/history;
-возвращение отозванного influence после restore;
-второй неуправляемый canonical owner/write path;
-вывод secrets или запрещённых данных за privacy boundary.
+detected;
+localized;
+not granted hidden authority;
+recorded as evidence;
+covered by recovery or honest escalation.
 ```
 
-Остальные ошибки по умолчанию обрабатываются через:
+## A0.3. Hard Boundaries
+
+Fail-closed behavior is required only where an error could create irreversible effects or hidden control capture:
+
+```text
+hidden creation or expansion of authority;
+hidden alteration of the user's ultimate goal;
+an untraceable irreversible or external effect;
+a false VERIFIED_COMPLETE or other proof claim;
+hidden rewriting of provenance or history;
+restoration of revoked influence after recovery;
+a second ungoverned canonical owner or write path;
+secrets or prohibited data crossing a privacy boundary.
+```
+
+Other failures default to:
 
 ```text
 buffering;
 isolation;
 bounded influence;
-branch/snapshot;
-retry с новым evidence;
+branch or snapshot;
+retry with new evidence;
 alternative route;
 repair;
 quarantine;
 escalation.
 ```
 
-Безопасность ELIOT основана не только на том, чтобы не допустить ошибку, но и на том, чтобы пережить её без потери управления.
+ELIOT safety depends not only on preventing errors, but also on surviving them without losing control.
 
-## A0.4. Разрешение конфликтов
+## A0.4. Conflict Resolution
 
-Сначала определяется, затронута ли Hard Boundary. Если да, dependent effect останавливается до явной authority или recovery. Иначе конфликт является источником информации.
+First determine whether a Hard Boundary is affected. If so, stop the dependent effect until explicit authority or recovery exists. Otherwise, treat the conflict as information.
 
-| Вопрос | Решающее основание |
+| Question | Decisive basis |
 |---|---|
-| Что произошло | Observation, artifact, evidence и применимый verifier |
-| Что это означает | Competing models, causal analysis и Concilium |
-| Какова цель и допустимый риск | Уполномоченный человек, при необходимости после clarification |
-| Что разрешено сейчас | Authority, WorkScope, privacy/cost policy и фактическая integration capability |
-| Как реализовать принцип | Intent и Contract; затем самый простой обратимый механизм |
-| Какая модель лучше | Discriminative evidence и practical outcome, не число голосов |
-| Что делать при недостатке данных | Сохранить unknown; выбрать probe, reversible trial или safe partial progress |
+| What happened | Observation, artifact, evidence, and an applicable verifier |
+| What it means | Competing models, causal analysis, and Concilium |
+| What the goal and acceptable risk are | The authorized human, after clarification when needed |
+| What is currently permitted | Authority, WorkScope, privacy and cost policy, and actual integration capability |
+| How to realize the principle | Intent and Contract, then the simplest reversible mechanism |
+| Which model is better | Discriminative evidence and practical outcomes, not vote count |
+| What to do when evidence is insufficient | Preserve the unknown; choose a probe, reversible trial, or safe partial progress |
 
-Порядок выбора среди допустимых решений:
+Order of preference among admissible choices:
 
 ```text
-1. сохранить заявленную цель и agency пользователя, не подменяя evidence и Hard Boundaries;
-2. повысить корректность и исправляемость понимания;
-3. предпочесть наблюдаемый, обратимый и восстанавливаемый путь;
-4. сохранить provenance, alternatives и dissent;
-5. локализовать blast radius и стоимость;
-6. выбрать более простой механизм.
+1. preserve the stated goal and user agency without overriding evidence or Hard Boundaries;
+2. improve the correctness and repairability of understanding;
+3. prefer an observable, reversible, and recoverable path;
+4. preserve provenance, alternatives, and dissent;
+5. localize blast radius and cost;
+6. choose the simpler mechanism.
 ```
 
 ## A0.5. Concilium
 
-**Concilium** — управляемое совещание людей, agents, моделей и инструментов. Оно нужно не для голосования, а для поиска ошибок общей картины.
+**Concilium** is a governed deliberation among people, agents, models, and tools. Its purpose is not voting, but finding errors in the shared picture.
 
-Concilium отделяет observations от interpretations, показывает общую Evidence Lineage и common-mode failures, формулирует сильнейшие возражения и rival predictions, предлагает discriminative tests и provisional options. Решение принимает указанный Main Agent или Human decision owner; dissent и условия пересмотра сохраняются.
+Concilium separates observations from interpretations, exposes shared Evidence Lineage and common-mode failures, states the strongest objections and rival predictions, and proposes discriminative tests and provisional options. The designated Main Agent or Human decision owner decides; dissent and review conditions are preserved.
 
-**ARCH-CONCIL-01 — Dissent важнее количества согласных.** Надёжность возникает из независимых оснований, отрицательной проверки и реальных outcomes, а не из большинства моделей.
+**ARCH-CONCIL-01 — Dissent matters more than vote count.** Reliability comes from independent grounds, negative testing, and real outcomes, not from a model majority.
 
-## A0.6. Изменение Architecture
+## A0.6. Changing the Architecture
 
 ```text
-повторяющаяся проблема или новый факт
-→ краткое описание нарушенного Intent
-→ evidence и alternatives
-→ последствия для Implementation и migration
-→ решение Architecture Owner
-→ изменение основного текста.
+recurring problem or new fact
+→ concise statement of the violated Intent
+→ evidence and alternatives
+→ Implementation and migration consequences
+→ Architecture Owner decision
+→ change to the main text.
 ```
 
-Конкретные contracts и defaults могут уточняться в Implementation, если сохраняются Intent, Hard Boundaries и observable behavior.
+The Implementation may refine concrete contracts and defaults while preserving Intent, Hard Boundaries, and observable behavior.
 
-Допускается **Recoverable Deviation**: временное scoped отклонение от Guardrail или Contract, если оно необходимо для полезного прогресса и не пересекает Hard Boundary. Оно имеет owner, причину, affected scope, review condition, rollback и outcome. Успешное отклонение становится evidence для исправления правила; неудачное — negative memory.
+A **Recoverable Deviation** is permitted: a temporary, scoped departure from a Guardrail or Contract when useful progress requires it and no Hard Boundary is crossed. It has an owner, reason, affected scope, review condition, rollback, and outcome. A successful deviation becomes evidence for correcting the rule; a failed one becomes negative memory.
 
-Запрещены append-only addenda с неявным precedence и вечные исключения без owner/review.
+Append-only addenda with implicit precedence and permanent exceptions without an owner or review are prohibited.
 
-## A0.7. Основной словарь
+## A0.7. Core Vocabulary
 
-| Термин | Определение |
+| Term | Definition |
 |---|---|
-| **Coupled Cognitive System** | Временная связка Human/Agent, model, active context, ELIOT, tools, environment и feedback, внутри которой происходит cognition |
-| **Concilium** | Управляемое сопоставление independent evidence, rival models, сильнейших objections и discriminative tests; не голосование за truth |
-| **Cognitive Episode** | Текущий процесс интерпретации, inquiry, decision и action; не durable record |
-| **Cognitive Inheritance** | Проверяемое внешнее наследие между episodes: observations, evidence, models, commitments, decisions, procedures, failures, unknowns и provenance |
-| **Understanding State** | Версионируемое публичное представление понимания WorkScope, задачи, опыта и неизвестностей; substrate реконструкции, а не само переживание понимания |
-| **Understanding Competence** | Способность конкретной связки model × harness × tools правильно использовать Understanding State |
-| **Task Understanding** | Актуальная модель цели, смысла, состояния, связей, alternatives, unknowns, commitments и результата задачи |
-| **Active Understanding View** | Decision-boundary проекция Task Understanding, релевантной памяти, epistemic position, attention, affordances и authority для конкретного route |
-| **Current Epistemic Position** | Question-, scope- и time-scoped позиция: observed, supported, assumed, conflicted, stale и unknown |
-| **Canonical Memory** | Единственный durable semantic owner cognitive inheritance и history; не reality, не cognition и не единственная интерпретация |
-| **Governor** | Единственная application authority над admission, canonical transitions, revisions, context, leases и receipts |
-| **Authority** | Ограниченное право выполнить transition или внешний effect; не выводится из content, confidence или model role |
-| **Principal** | Аутентифицированный Human, agent или service с явными capability и visibility boundaries |
-| **Lease** | Scoped, fenced и отзывная форма временной authority |
-| **Receipt** | Неизменяемое подтверждение transition/outcome, его identity, scope и status |
-| **ELIOT Kernel** | Живучая минимальная часть Governor: identity, fencing, canonical boundary, health, supervision и recovery entrypoint |
-| **Host Supervisor** | Минимальный внешний владелец process lifecycle approved services; выполняет start/stop/bounded restart и approved rollback, но не читает project semantics и не выдаёт authority |
-| **WorkScope** | Ограниченная область работы с identity, resources, truth surfaces, authority, privacy и state |
-| **State Fence** | Набор generations, revisions, policy и integration state, от которых зависит пригодность view, result или authority |
-| **Effective Context Profile** | Эмпирическое знание о том, как конкретный model/harness использует context для task family: length, position, tools, self-history, noise, compaction и recovery |
-| **Safe Operating Envelope** | Область workload/context, где route сохраняет заданное качество; не равна nominal context maximum |
-| **Common Ground** | Проверяемая совместимость terminology, references, commitments и action consequences между routes/participants |
-| **Truth surface** | Источник наблюдения, способный измерить конкретное свойство мира |
-| **Verifier** | Зарегистрированный способ проверить ожидаемое свойство в известном scope, версии и среде |
-| **Theory Portfolio** | Набор competing scoped models с support, counterevidence, dependencies и revision conditions |
-| **Epistemic Fitness** | Пригодность модели по evidence, predictive/practical outcomes, transfer, freshness и scope; не единый confidence score |
-| **Source Assurance** | Многомерная оценка identity, provenance, integrity, competence, incentives, independence, privacy и injection risk источника |
-| **Independence Profile** | Описание независимости evidence, capture, evaluator, model/provider/harness и conceptual frame; не единый scalar |
-| **Influence Dependency Closure** | Derived views, procedures, packets и decisions, чьё текущее influence зависит от source/tool/verifier |
-| **Semantic Contamination** | Неверная, манипулятивная или overgeneralized информация при сохранной структуре и lineage |
-| **Structural Corruption** | Повреждение canonical integrity, ordering, provenance, storage или authority state |
-| **Module** | Заменяемая capability с owner, inputs/outputs, dependencies, health, failure domain и recovery boundary |
-| **Micro-module** | Минимальная самостоятельно понимаемая, проверяемая и заменяемая capability с одной причинной ответственностью и одним lifecycle owner; её физическая форма и размер принадлежат Implementation/Empirical Profile |
-| **Independent Proof Surface** | Возможность проверить Module за его публичным contract и наблюдаемыми effects без обязательного запуска всей системы; такой proof не равен доказательству продукта |
-| **Agent Work Unit** | Ограниченная работа одного agent: одна основная causal property/owner, exact scope, минимально достаточный context, expected artifact/evidence, verifier, budget и stop condition |
-| **Product Pulse** | Минимальный реальный end-to-end путь, способный обнаружить, что локально корректные Module changes разрушили общий product outcome |
-| **Experimental Contour** | Изолированная, capability-bounded и заменяемая среда для непроверенной capability; конкретная sandbox/process/runtime технология определяется Implementation |
-| **Module Registry** | Versioned реестр Modules, dependencies, health, compatibility, failure domains и repair recipes |
-| **Tool Definition** | Versioned cognitive input: name, description, schema, defaults, examples, permissions и side-effect semantics |
-| **Problem State** | Durable состояние operational, cognitive, integration или data-quality проблемы с evidence, owner и resolution condition |
-| **Incident** | Тяжёлый Problem State, затрагивающий integrity, authority, security, critical telemetry или опасный неразрешённый effect |
-| **Quarantine** | Обратимая изоляция content, operation или Module от текущего influence/effects с owner и release condition |
-| **Governance Profile** | Вектор реальных возможностей observation, enforcement и supervision; не маркетинговая оценка интеграции |
-| **Session** | Временная identity-bound связь principal, harness, WorkScope, task, authority и telemetry; её потеря не уничтожает durable work |
-| **Task Controller** | Временная ответственность за current plan revision одной задачи; её может нести Main Agent или уполномоченный Human, но она не создаёт factual, policy или architecture authority |
-| **Route Continuation State** | Временное provider/harness-bound состояние продолжения одного cognitive route; может помогать resume, но не является knowledge, evidence или transferable authority |
-| **Ordering Scope** | Минимальная область, где конфликтующие transitions обязаны быть упорядочены |
-| **Coordination Scope** | Объявленное объединение Ordering Scopes для multi-scope transition или saga |
-| **Authority Epoch** | Generation активного владельца authority; output старого owner после restart/reassignment считается stale |
-| **Durable Job** | Долгая операция с identity, owner, State Fence, checkpoint, budget, cancellation, outcome и receipt |
-| **Critical Attention** | Существенная obligation, остающаяся активной до resolution, authorized waiver или supersession |
-| **Control Reserve** | Недоступная normal workload capacity для cancellation, fencing, telemetry, attention/problem transitions и recovery |
-| **Recovery Directive** | Структурированный ответ при отказе: причина, сохранённое состояние, разрешённый следующий шаг и требуемая authority |
-| **Conflict Directive** | Краткое operational view конфликта: observations, rival models, common lineage, unresolved residue, decision owner и useful probe |
-| **Recovery View** | Минимальная non-semantic projection health, unavailable guarantees, last-known-good, pending recovery intents и manual entrypoint при отказе normal control path |
-| **Operational Recovery State** | Ограниченное non-semantic durable state pending operations, checkpoints, fencing и recovery reconciliation |
-| **Dreamer** | Instrumental AI service, запускающий bounded model/agent/swarm jobs для curation, orientation и research synthesis; не owner и не authority |
-| **Watchdog** | Независимый supervision daemon для liveness, protocol discipline, security и recovery. Он непрерывно работает внутри заявленного активного интервала ELIOT; вне использования, maintenance и recovery может быть остановлен после сохранения cursors/wake state. Не semantic oracle |
-| **Researcher** | Будущий optional Module для acquisition, parsing, indexing и retrieval внешних документов/corpora |
-| **Architecture Knowledge** | Точная принятая Architecture, rationale, IDs и change procedure как load-bearing self-knowledge ELIOT |
+| **Coupled Cognitive System** | A temporary combination of Human/Agent, model, active context, ELIOT, tools, environment, and feedback within which cognition occurs |
+| **Concilium** | Governed comparison of independent evidence, rival models, strongest objections, and discriminative tests; not a vote on truth |
+| **Cognitive Episode** | The current process of interpretation, inquiry, decision, and action; not a durable record |
+| **Cognitive Inheritance** | Verifiable external inheritance between episodes: observations, evidence, models, commitments, decisions, procedures, failures, unknowns, and provenance |
+| **Understanding State** | A versioned public representation of understanding for a WorkScope, task, experience, and unknowns; a reconstruction substrate, not the experience of understanding itself |
+| **Understanding Competence** | The ability of a specific model × harness × tools combination to use Understanding State correctly |
+| **Task Understanding** | The current model of a task's goal, meaning, state, relations, alternatives, unknowns, commitments, and outcome |
+| **Active Understanding View** | A decision-boundary projection of Task Understanding, relevant memory, epistemic position, attention, affordances, and authority for a specific route |
+| **Current Epistemic Position** | A question-, scope-, and time-scoped position: observed, supported, assumed, conflicted, stale, and unknown |
+| **Canonical Memory** | The sole durable semantic owner of cognitive inheritance and history; not reality, cognition, or the only interpretation |
+| **Governor** | The sole application authority over admission, canonical transitions, revisions, context, leases, and receipts |
+| **Authority** | A bounded right to perform a transition or external effect; never inferred from content, confidence, or model role |
+| **Principal** | An authenticated Human, agent, or service with explicit capability and visibility boundaries |
+| **Lease** | A scoped, fenced, and revocable form of temporary authority |
+| **Receipt** | An immutable confirmation of a transition or outcome, including its identity, scope, and status |
+| **ELIOT Kernel** | The resilient minimum of the Governor: identity, fencing, canonical boundary, health, supervision, and recovery entrypoint |
+| **Host Supervisor** | The minimal external owner of approved service process lifecycles; performs start, stop, bounded restart, and approved rollback, but neither reads project semantics nor grants authority |
+| **WorkScope** | A bounded work domain with identity, resources, truth surfaces, authority, privacy, and state |
+| **State Fence** | The generations, revisions, policies, and integration state on which the fitness of a view, result, or authority depends |
+| **Effective Context Profile** | Empirical knowledge of how a particular model/harness uses context for a task family: length, position, tools, self-history, noise, compaction, and recovery |
+| **Safe Operating Envelope** | The workload/context region in which a route preserves required quality; not the nominal context maximum |
+| **Common Ground** | Verifiable compatibility of terminology, references, commitments, and action consequences among routes or participants |
+| **Truth surface** | An observation source capable of measuring a specific property of the world |
+| **Verifier** | A registered method for checking an expected property in a known scope, version, and environment |
+| **Theory Portfolio** | A set of competing scoped models with support, counterevidence, dependencies, and revision conditions |
+| **Epistemic Fitness** | A model's fitness by evidence, predictive and practical outcomes, transfer, freshness, and scope; not one confidence score |
+| **Source Assurance** | A multidimensional assessment of source identity, provenance, integrity, competence, incentives, independence, privacy, and injection risk |
+| **Independence Profile** | A description of independence across evidence, capture, evaluator, model/provider/harness, and conceptual frame; not one scalar |
+| **Influence Dependency Closure** | Derived views, procedures, packets, and decisions whose current influence depends on a source, tool, or verifier |
+| **Semantic Contamination** | Incorrect, manipulative, or overgeneralized information despite intact structure and lineage |
+| **Structural Corruption** | Damage to canonical integrity, ordering, provenance, storage, or authority state |
+| **Module** | A replaceable capability with an owner, inputs and outputs, dependencies, health, failure domain, and recovery boundary |
+| **Micro-module** | The smallest independently understandable, verifiable, and replaceable capability with one causal responsibility and one lifecycle owner; its physical form and size belong to the Implementation or an Empirical Profile |
+| **Functional Capability Cell** | The causal unit of one coherent capability: one lifecycle owner, one public contract surface, one owner for each mutable state it owns, an independently invocable proof surface, and a declared replacement boundary. It may be stateless or span several source modules or crates; physical packaging is not its identity |
+| **Independent Proof Surface** | The ability to verify a Module through its public contract and observable effects without running the entire system; such proof is not product proof |
+| **Agent Work Unit** | Bounded work for one agent: one primary causal property or owner, exact scope, minimally sufficient context, expected artifact or evidence, verifier, budget, and stop condition |
+| **Product Pulse** | The smallest real end-to-end path able to detect when locally correct Module changes break the overall product outcome |
+| **Experimental Contour** | An isolated, capability-bounded, and replaceable environment for an unverified capability; its sandbox, process, or runtime technology belongs to the Implementation |
+| **Module Registry** | A versioned registry of Modules, dependencies, health, compatibility, failure domains, and repair recipes |
+| **Tool Definition** | A versioned cognitive input: name, description, schema, defaults, examples, permissions, and side-effect semantics |
+| **Problem State** | Durable state for an operational, cognitive, integration, or data-quality problem, with evidence, owner, and resolution condition |
+| **Incident** | A severe Problem State affecting integrity, authority, security, critical telemetry, or a dangerous unresolved effect |
+| **Quarantine** | Reversible isolation of content, an operation, or a Module from current influence or effects, with an owner and release condition |
+| **Governance Profile** | A vector of actual observation, enforcement, and supervision capabilities; not a marketing label for an integration |
+| **Session** | A temporary identity-bound connection among a principal, harness, WorkScope, task, authority, and telemetry; losing it does not destroy durable work |
+| **Task Controller** | Temporary responsibility for the current plan revision of one task; a Main Agent or authorized Human may hold it, but it creates no factual, policy, or architecture authority |
+| **Route Continuation State** | Temporary provider- or harness-bound continuation state for one cognitive route; it may support resume but is neither knowledge, evidence, nor transferable authority |
+| **Ordering Scope** | The smallest domain in which conflicting transitions must be ordered |
+| **Coordination Scope** | A declared union of Ordering Scopes for a multi-scope transition or saga |
+| **Authority Epoch** | The generation of the active authority holder; output from an old owner after restart or reassignment is stale |
+| **Durable Job** | A long-running operation with identity, owner, State Fence, checkpoint, budget, cancellation, outcome, and receipt |
+| **Critical Attention** | A material obligation that remains active until resolution, authorized waiver, or supersession |
+| **Control Reserve** | Capacity unavailable to normal workload and reserved for cancellation, fencing, telemetry, attention/problem transitions, and recovery |
+| **Recovery Directive** | A structured failure response: reason, preserved state, permitted next step, and required authority |
+| **Conflict Directive** | A concise operational view of a conflict: observations, rival models, common lineage, unresolved residue, decision owner, and useful probe |
+| **Recovery View** | A minimal non-semantic projection of health, unavailable guarantees, last-known-good state, pending recovery intents, and a manual entrypoint when the normal control path fails |
+| **Operational Recovery State** | Bounded non-semantic durable state for pending operations, checkpoints, fencing, and recovery reconciliation |
+| **Dreamer** | An instrumental AI service that runs bounded model, agent, or swarm jobs for curation, orientation, and research synthesis; neither an owner nor an authority |
+| **Watchdog** | An independent supervision daemon for liveness, protocol discipline, security, and recovery. It runs continuously during ELIOT's declared active interval; outside use, during maintenance, or during recovery, it may stop after preserving cursors and wake state. It is not a semantic oracle |
+| **Researcher** | The governed information-work plane: selects inquiry protocol and evidence grade; admits external sources to a scoped inquiry evidence set; maintains source portfolio, coverage denominator, and claim audit. Pluggable providers perform acquisition, parsing, indexing, and retrieval. Researcher neither interprets nor owns authority |
+| **Inquiry Protocol** | The declared method for one question: effort, evidence, lane, and stop condition; selected by task structure rather than work label |
+| **Evidence Grade** | The declared rigor level for one information task; defines required lanes, verifier, coverage, and audit |
+| **Architecture Knowledge** | The exact adopted Architecture, rationale, IDs, and change procedure as load-bearing ELIOT self-knowledge |
 
-Словарь содержит только сквозные load-bearing понятия. Локальный термин определяется один раз в своём разделе и не создаёт параллельную ontology.
+The vocabulary contains only cross-cutting, load-bearing concepts. A local term is defined once in its own section and does not create a parallel ontology.
 
-## A0.8. Progressive conformance
+## A0.8. Progressive Conformance
 
-ELIOT развивается слоями. До заявления durable/recoverable работы нужны:
-
-```text
-один canonical history/write path;
-provenance, scope, authority и receipt для значимых transitions;
-forward revision и проверяемый recovery entrypoint;
-различие observation, interpretation, unknown и verified result;
-запрет ложного done и скрытой деградации;
-bounded resources и actionable failure.
-```
-
-Первый полезный vertical spine:
+Before claiming durable or recoverable operation, ELIOT requires:
 
 ```text
-один реальный agent bridge;
-естественный capture observations без знания ontology;
-один WorkScope и task state;
-basic Active Understanding View;
-хотя бы один world/task event, реактивно доставляющий relevant memory или obligation;
-один truth/verifier route;
-честный finish outcome;
-минимальный supervision/restart;
-Problem/notification path для agent и Human.
+one canonical history and write path;
+provenance, scope, authority, and receipts for material transitions;
+forward revision and a verifiable recovery entrypoint;
+a distinction among observation, interpretation, unknown, and verified result;
+no false done claim or hidden degradation;
+bounded resources and actionable failure.
 ```
 
-Basic supervision входит в первый spine. Basic Dreamer Orientation является первой Smart-глубиной после надёжного capture/retrieval loop; advanced security audit, research, graphs, large swarm, recovery depth и Meta experiments добавляются позже. Когда WorkScope — сам ELIOT, применимая Architecture Knowledge входит уже в basic Active Understanding View. Отсутствующая capability маркируется честно и не блокирует независимую ценность.
+The first useful vertical spine is:
 
-Vertical spine является первым полезным срезом, а не полным ELIOT. Полное соответствие означает, что Memory OS, Harness, Smart и Meta образуют замкнутый наблюдаемый loop на заявленном Governance Profile; отсутствующие capabilities и гарантии видимы. Соответствие подтверждается живой conformance map A6.7, а не количеством формально выполненных пунктов.
+```text
+one real agent bridge;
+natural capture of observations without ontology knowledge;
+one WorkScope and task state;
+a basic Active Understanding View;
+at least one world/task event that reactively delivers relevant memory or obligation;
+one truth/verifier route;
+an honest finish outcome;
+minimal supervision and restart;
+a Problem/notification path for both agent and Human.
+```
 
-**ARCH-DEV-01 — Working system before broad hardening.** Сначала создаётся реальный end-to-end cognitive loop; тесты и глубина добавляются по наблюдаемым failure modes.
+Basic supervision belongs in the first spine. Basic Dreamer Orientation is the first Smart depth added after a reliable capture/retrieval loop; advanced security audit, research, graphs, large swarms, deep recovery, and Meta experiments come later. When the WorkScope is ELIOT itself, applicable Architecture Knowledge already belongs in the basic Active Understanding View. Missing capability is labeled honestly and does not block independent value.
 
-## A0.9. Текущие стратегические defaults
+The vertical spine is the first useful slice, not complete ELIOT. Full conformance means Memory OS, Harness, Smart, and Meta form a closed, observable loop under the declared Governance Profile, with missing capabilities and guarantees visible. The live conformance map in A6.7, not a count of completed items, establishes conformance.
 
-ELIOT создаётся как local-first система для массовых пользователей настольных компьютеров, преимущественно Windows.
+**ARCH-DEV-01 — Working system before broad hardening.** Build a real end-to-end cognitive loop first; add tests and depth in response to observed failure modes.
 
-Текущая стратегия:
+## A0.9. Current Strategic Defaults
 
-| Default | Почему выбран |
+ELIOT is a local-first system for mainstream desktop users, primarily on Windows.
+
+Current strategy:
+
+| Default | Rationale |
 |---|---|
-| Rust для daemon/control plane | Memory safety, предсказуемая native concurrency, низкий overhead и пригодность для долгоживущего локального service |
-| Hybrid canonical storage типа SurrealDB | Graph, document, temporal и structured state нужны под одним governed owner, а не в наборе расходящихся stores |
-| Windows-first эксплуатация | Основные пользователи и agent tools работают на Windows; local-first продукт должен быть нормальным сервисом именно там |
-| Models, agents и tools разных vendors | Capability contracts уменьшают lock-in и позволяют менять cognitive/failure profile без переписывания ELIOT |
+| Rust for the daemon and control plane | Memory safety, predictable native concurrency, low overhead, and suitability for a long-lived local service |
+| Hybrid canonical storage such as SurrealDB | Graph, document, temporal, and structured state should remain under one governed owner rather than diverging stores |
+| Windows-first operations | Primary users and agent tools run on Windows; a local-first product must operate as a first-class service there |
+| Models, agents, and tools from multiple vendors | Capability contracts reduce lock-in and permit changes in cognitive and failure profile without rewriting ELIOT |
 
-Это Defaults, а не вечные Invariants. Замена допустима при сохранении Architecture, migration path и доказанном эксплуатационном выигрыше. Микромодульность, isolation, staged promotion и hot-path discipline являются архитектурными свойствами; конкретные language packages, sandbox/component runtimes и process technologies являются только текущим отображением в Implementation.
+These are Defaults, not permanent Invariants. Replacement is permitted when the Architecture, migration path, and demonstrated operational benefit are preserved. Micro-modularity, isolation, staged promotion, and hot-path discipline are architectural properties; concrete language packages, sandbox or component runtimes, and process technologies are only current Implementation mappings.
 
 ---
+# A1. Mission and Theoretical Core
 
-# A1. Миссия и теоретическое ядро
+## A1.1. Primary Purpose
 
-## A1.1. Главная задача
+ELIOT maintains **continuous, correctable understanding** across replaceable people, models, agents, and sessions.
 
-ELIOT поддерживает **непрерывное корректируемое понимание** между сменяемыми людьми, моделями, agents и sessions.
-
-Понимание — не сохранённый текст и не context packet. Оно проявляется в способности:
+Understanding is neither stored text nor a context packet. It appears as the ability to:
 
 ```text
-определить, что существует и что это означает;
-восстановить цель, границы и текущую ситуацию;
-увидеть связи, dynamics и причинные alternatives;
-различить evidence, hypothesis, unknown и norm;
-предсказать последствия вмешательства;
-выбрать inquiry или action;
-проверить результат и изменить модель.
+identify what exists and what it means;
+restore the goal, boundaries, and current situation;
+see relations, dynamics, and causal alternatives;
+distinguish evidence, hypothesis, unknown, and norm;
+predict intervention consequences;
+choose an inquiry or action;
+verify the result and revise the model.
 ```
 
-ELIOT сохраняет публичные материалы и организацию для такого понимания. Актуальное cognition возникает в coupled activity.
+ELIOT preserves public material and organization that support such understanding. Current cognition arises in coupled activity.
 
-**ARCH-CORE-01 — Understanding continuity first.** Все органы ELIOT подчинены сохранению, восстановлению и коррекции decision-relevant understanding.
+**ARCH-CORE-00 — Work must accumulate.** Every consequential work episode must leave the system better able to perform the next compatible work, or explicitly show why available evidence does not yet justify a behavior change.
 
-## A1.2. Почему это не RAG
+**Why:** without this requirement, long-running agent work produces artifacts but not competence. A trace, transcript, stored outcome, completed task, or new report is not learning by itself.
+
+**Under conflict:** accumulation never authorizes the system to alter the user's goal, values, authority, or Hard Boundaries. An observed outcome must either change the next strategy through inspectable state or receive an explicit, evidence-backed no-change disposition.
+
+**ARCH-CORE-01 — Understanding continuity first.** Every ELIOT organ serves the preservation, restoration, and correction of decision-relevant understanding.
+
+## A1.2. Why This Is Not RAG
 
 ```text
 RAG:
-query → похожие fragments → prompt.
+query → similar fragments → prompt.
 
 ELIOT:
 goal + world contact + cognitive inheritance
-→ scoped competing models и current epistemic position
-→ inquiry/action under authority
+→ scoped competing models and current epistemic position
+→ inquiry or action under authority
 → real outcome
-→ revision, recovery и reusable learning.
+→ revision, recovery, and reusable learning.
 ```
 
-RAG, embeddings, full-text и graph retrieval могут быть инструментами ELIOT. Они не решают:
+RAG, embeddings, full-text search, and graph retrieval may be ELIOT tools. They do not solve:
 
 ```text
-неизвестные неизвестности;
-текущую применимость старой памяти;
-различение observation и interpretation;
-причинность и alternatives;
-continuity commitments;
-authority и finish;
+unknown unknowns;
+current applicability of old memory;
+the distinction between observation and interpretation;
+causality and alternatives;
+continuity of commitments;
+authority and finish;
 poisoned influence;
-обучение по outcome.
+outcome-based learning.
 ```
 
-Если система только ищет chunks и сокращает prompt, более простой RAG дешевле и правильнее.
+When a system only retrieves chunks and shortens prompts, a simpler RAG system is cheaper and more correct.
 
-## A1.3. Основные постулаты
+## A1.3. Core Postulates
 
-1. Cognition возникает в связке участников, representations, tools и среды.
-2. Memory сохраняет cognitive inheritance, а не готовую мысль.
-3. Reality внешняя; ELIOT поддерживает только defeasible epistemic positions.
-4. Understanding scoped, plural, action-oriented и revisable.
-5. Decision-relevant correctness важнее дополнительной compactness.
-6. Intent направляет rules; Hard Boundaries защищают только действительно необратимые границы.
-7. Ошибки агентов, modules и памяти являются штатными условиями.
-8. Knowledge развивается через inquiry, predictions, practical outcomes и revision.
-9. Dissent и negative evidence — производительные ресурсы Concilium.
-10. Human, model и deterministic tool обладают разными компетенциями и слепыми зонами.
-11. Attention и context являются ограниченными causal interventions.
-12. Action бывает pragmatic и epistemic.
-13. Causal models остаются defeasible и сравниваются по различающим observations.
-14. Security предполагает возможность пробития защиты и ограничивает последствия.
-15. Resilience сохраняет возможность cognition после disturbance.
-16. Model replacement переносит inheritance, но не tacit strategy.
-17. Learning имеет разные уровни и не сводится к изменению weights.
-18. Forgetting управляет accessibility и influence, не переписывая factual support.
-19. ELIOT должен знать свою Architecture, implementation state и limits.
-20. ELIOT помогает человеку и агенту, а не превращает их работу в администрирование системы.
-21. Глубина добавляется слоями; Kernel и canonical history не переписываются при каждом улучшении.
-22. Работа должна декомпозироваться до decision-sufficient worksets, но Architecture не фиксирует универсальный размер Module или context.
-23. Непроверенная capability сначала получает ограниченное влияние и независимую replacement boundary; более тесная интеграция зарабатывается evidence.
-24. Swarm является durable конвейером bounded attempts, а не общим бесконечным разговором agents.
-25. Testing, debugging и recovery являются частью рабочего feedback loop и Meta-learning, а не отдельной церемонией перед release.
+1. Cognition arises from the combination of participants, representations, tools, and environment.
+2. Memory preserves cognitive inheritance, not a finished thought.
+3. Reality is external; ELIOT maintains only defeasible epistemic positions.
+4. Understanding is scoped, plural, action-oriented, and revisable.
+5. Decision-relevant correctness matters more than additional compactness.
+6. Intent guides rules; Hard Boundaries protect only genuinely irreversible boundaries.
+7. Errors by agents, modules, and memory are normal operating conditions.
+8. Knowledge develops through inquiry, predictions, practical outcomes, and revision.
+9. Dissent and negative evidence are productive Concilium resources.
+10. Humans, models, and deterministic tools have different competencies and blind spots.
+11. Attention and context are bounded causal interventions.
+12. Action may be pragmatic or epistemic.
+13. Causal models remain defeasible and are compared through discriminating observations.
+14. Security assumes defenses may be breached and limits the consequences.
+15. Resilience preserves the possibility of cognition after disturbance.
+16. Model replacement transfers inheritance, not tacit strategy.
+17. Learning has multiple levels and is not reducible to weight changes.
+18. Forgetting governs accessibility and influence without rewriting factual support.
+19. ELIOT must know its Architecture, implementation state, and limits.
+20. ELIOT assists people and agents instead of turning their work into system administration.
+21. Depth is added in layers; the Kernel and canonical history are not rewritten for every improvement.
+22. Work must decompose into decision-sufficient worksets, but the Architecture sets no universal Module or context size.
+23. An unverified capability first receives bounded influence and an independent replacement boundary; tighter integration must be earned through evidence.
+24. A swarm is a durable pipeline of bounded attempts, not one endless shared agent conversation.
+25. Testing, debugging, and recovery belong to the working feedback loop and Meta-learning, not to a separate pre-release ceremony.
 
-## A1.4. Четыре плоскости
+## A1.4. Four Planes
 
 ```text
-Memory OS — evidence, continuity, memory functions, retrieval, revision и forgetting;
-Harness — task framing, tools, agents, swarm, authority, verification и finish;
-Smart — Understanding State, graphs, inquiry, Context Compiler и Dreamer;
-Meta — Watchdog, Doctor, self-model, evaluation, recovery learning и Improvement Candidates.
+Memory OS — evidence, continuity, memory functions, retrieval, revision, and forgetting;
+Harness — task framing, tools, agents, swarm, authority, verification, and finish;
+Smart — Understanding State, graphs, inquiry, Context Compiler, and Dreamer;
+Meta — Watchdog, Doctor, self-model, evaluation, recovery learning, and Improvement Candidates.
 ```
 
-Они образуют один feedback loop. Ни одна плоскость не получает самостоятельной value или final-decision authority.
+They form one feedback loop. No plane receives independent value authority or final-decision authority.
 
-**ARCH-CORE-02 — Four planes, one governed loop.** Память, orchestration, intelligence и Meta усиливают друг друга, но их полномочия разделены.
+**ARCH-CORE-02 — Four planes, one governed loop.** Memory, orchestration, intelligence, and Meta reinforce one another while their powers remain separate.
 
-## A1.5. Границы
-
-ELIOT не является:
+Learning is not a fifth plane. It is a cross-cutting lifecycle through the four existing planes:
 
 ```text
-новой базовой моделью;
-универсальной СУБД;
-заменой host, IDE, terminal или профессионального ПО;
-автономным генератором конечных целей;
-системой, гарантирующей безошибочность;
-непрерывным автономным LLM-loop;
-симуляцией мозга;
-коллективным субъектом swarm;
-источником абсолютной истины.
+capture experience          Memory OS / Harness
+diagnose mechanism          Smart
+adapt locally               Harness / Smart
+execute and verify          Harness
+consolidate                 Meta / Memory OS
+promote or roll back        Meta / Governor
+reactivate for future work  Smart / Harness
 ```
 
-ELIOT — инструментальная система помощи и демократизации сложной агентной работы. Он должен позволить пользователю без большой команды и инфраструктуры получать качество, continuity и контроль, которые иначе требуют зрелой инженерной организации. Автоматическая multi-node репликация канона не является текущей обязанностью; если она появится, несколько физических узлов сохраняют одного логического owner и causal order.
+No stage creates a new owner. A stage with no owner among the four planes is an Architecture defect, not a reason to add another plane.
 
-**ARCH-HELP-01 — ELIOT снижает когнитивную и операционную нагрузку.** Внутренняя сложность оправдана только тогда, когда делает работу человека и основного агента проще, надёжнее и продуктивнее.
+## A1.5. Boundaries
+
+ELIOT is not:
+
+```text
+a new foundation model;
+a universal DBMS;
+a replacement for the host, IDE, terminal, or professional software;
+an autonomous generator of ultimate goals;
+a system that guarantees infallibility;
+a continuous autonomous LLM loop;
+a brain simulation;
+a collective swarm subject;
+a source of absolute truth.
+```
+
+ELIOT is an instrumental system for assisting and democratizing complex agent work. It should let a user without a large team or infrastructure obtain quality, continuity, and control that would otherwise require a mature engineering organization. Automatic multi-node replication of the canon is not a current obligation; if introduced, multiple physical nodes must preserve one logical owner and causal order.
+
+**ARCH-HELP-01 — ELIOT reduces cognitive and operational load.** Internal complexity is justified only when it makes work simpler, more reliable, and more productive for the person and the primary agent.
 
 ---
+# A2. Participants, Authority, and Modularity
 
-# A2. Участники, authority и модульность
+## A2.1. Complementary Fallibility
 
-## A2.1. Complementary fallibility
-
-| Участник | Сильная сторона | Типичная ошибка |
+| Participant | Strength | Typical failure |
 |---|---|---|
-| Human | Goals, values, context, legitimate authority | Неполное знание, усталость, противоречивые preferences |
-| Main Agent | Semantic synthesis, plans, alternatives | Hallucination, framing, context loss, rationalization |
-| Deterministic tool | Точное измерение определённого property | Узкая компетенция, неверная настройка, отсутствие смысла |
-| Governor | State, authority, lifecycle, receipts | Неполная observability, implementation defect |
-| Dreamer | Broad synthesis и hypothesis generation | Smooth false narrative, correlated model bias |
-| Watchdog | Independent process/security observation | False positive, incomplete coverage |
-| Verifier | Scoped proof | Неверный construct, stale environment, blind spot |
+| Human | Goals, values, context, legitimate authority | Incomplete knowledge, fatigue, conflicting preferences |
+| Main Agent | Semantic synthesis, plans, alternatives | Hallucination, framing error, context loss, rationalization |
+| Deterministic tool | Exact measurement of a defined property | Narrow competence, misconfiguration, absence of meaning |
+| Governor | State, authority, lifecycle, receipts | Incomplete observability, implementation defect |
+| Dreamer | Broad synthesis and hypothesis generation | Smooth false narrative, correlated model bias |
+| Watchdog | Independent process and security observation | False positive, incomplete coverage |
+| Verifier | Scoped proof | Wrong construct, stale environment, blind spot |
 
-**ARCH-ROLE-01 — Authority разделена по функции.** Observation, interpretation, authorization и verification не должны без необходимости принадлежать одному участнику.
+**ARCH-ROLE-01 — Authority is separated by function.** Observation, interpretation, authorization, and verification should not belong to one participant without necessity.
 
-**ARCH-ROLE-02 — Responsibility следует компетенции и типу ошибки.** Ни Human, ни model, ни tool не являются универсальным oracle.
+**ARCH-ROLE-02 — Responsibility follows competence and failure type.** No Human, model, or tool is a universal oracle.
 
-**ARCH-AUTH-01 — Authority explicit, scoped and fenced.** Ни content, ни model confidence, ни название роли не создают право на transition или effect; authority имеет owner, scope, State Fence и отзыв.
+**ARCH-AUTH-01 — Authority is explicit, scoped, and fenced.** Content, model confidence, and role names never create a right to perform a transition or effect; authority has an owner, scope, State Fence, and revocation path.
 
-## A2.2. Роли
+## A2.2. Roles
 
-Описание роли задаёт функцию, а не неявное разрешение. Любое изменение state/effect требует применимой authority. Она может быть заранее делегирована role, work item, policy или lease и проверяться автоматически; отдельная ceremony нужна только у границы impact, uncertainty или delegation. Всё, что не покрыто authority, считается запрещённым. Общая деградация ролей и services определяется A13.11, а не скрытыми исключениями в этом разделе.
+A role description defines function, not implicit permission. Every state change or effect requires applicable authority. Authority may be delegated in advance to a role, work item, policy, or lease and checked automatically; separate ceremony is needed only at a boundary of impact, uncertainty, or delegation. Anything outside granted authority is prohibited. General degradation of roles and services is governed by A13.11, not hidden exceptions here.
 
-### Human roles
+### Human Roles
 
-- **Requester / Domain Owner** задаёт goal, values, constraints и acceptance.
-- **Architecture Owner** принимает изменения Architecture.
-- **System Owner** управляет installation, credentials, model routes и system delegation.
-- **WorkScope Owner** определяет local policies, protected resources и accepted verifiers.
-- **Approver** разрешает точное Critical action.
-- **Recovery Principal** выполняет узкий break-glass transition.
+- **Requester / Domain Owner** sets the goal, values, constraints, and acceptance criteria.
+- **Architecture Owner** approves Architecture changes.
+- **System Owner** manages installation, credentials, model routes, and system delegation.
+- **WorkScope Owner** defines local policies, protected resources, and accepted verifiers.
+- **Approver** authorizes an exact Critical action.
+- **Recovery Principal** performs a narrow break-glass transition.
 
-Один человек может совмещать роли, но authority не сливается автоматически.
+One person may hold several roles, but their authority does not merge automatically.
 
 ### Main Agent
 
-Интерпретирует смысл, строит competing models, выбирает inquiry/action и предлагает decisions. Не создаёт собственную verification authority, policy или factual proof.
+Interprets meaning, develops competing models, selects inquiry or action, and proposes decisions. It creates no independent verification authority, policy, or factual proof.
 
 ### Task Controller
 
-Владеет current plan revision и coordination одной задачи на действующем Authority Epoch. Обычно эту ответственность несёт Main Agent; Human может принять её явно. Task Controller не владеет factual truth, Architecture или общесистемной policy.
+Owns the current plan revision and coordination of one task under the active Authority Epoch. The Main Agent usually carries this responsibility; a Human may assume it explicitly. The Task Controller does not own factual truth, Architecture, or system-wide policy.
 
-### Governor и Kernel
+### Governor and Kernel
 
-Governor — единственный application owner canonical transitions, authority, task state, context compilation и receipts. Kernel — его минимальная живучая часть, а не второй Governor.
+The Governor is the sole application owner of canonical transitions, authority, task state, context compilation, and receipts. The Kernel is its minimal resilient core, not a second Governor.
 
 ### Canonical Memory
 
-Сохраняет cognitive inheritance и history. Не является agent, truth или policy owner.
+Preserves cognitive inheritance and history. It is neither an agent, truth source, nor policy owner.
 
-### Truth surfaces и Verifiers
+### Truth Surfaces and Verifiers
 
-Truth surface даёт observation о конкретном свойстве. Verifier проверяет ожидаемое property в известном scope. Они не определяют цель и не доказывают больше своего Evaluation Contract.
+A truth surface provides an observation about a specific property. A Verifier checks an expected property in a known scope. Neither defines the goal nor proves more than its Evaluation Contract.
 
-### Harness и Agent Coordinator
+### Harness and Agent Coordinator
 
-Harness связывает model, host, tools и Governor. Agent Coordinator управляет durable work graph, sessions, budgets, leases и aggregation. Они не принимают substantive решение.
+The Harness connects the model, host, tools, and Governor. The Agent Coordinator manages the durable work graph, sessions, budgets, leases, and aggregation. Neither makes the substantive decision.
 
 ### Host Supervisor
 
-Находится вне общего process failure domain основных services. Выполняет только start, stop, bounded restart и approved rollback; не читает project semantics, не формирует diagnosis и не выдаёт canonical authority.
+Operates outside the shared process failure domain of the main services. It performs only start, stop, bounded restart, and approved rollback; it neither reads project semantics, forms a diagnosis, nor grants canonical authority.
 
-### Watchdog и Doctor
+### Watchdog and Doctor
 
-Watchdog независимо наблюдает liveness, protocol discipline, security и integrity. Doctor диагностирует modules и выполняет только зарегистрированные bounded repairs.
+The Watchdog independently observes liveness, protocol discipline, security, and integrity. The Doctor diagnoses Modules and performs only registered, bounded repairs.
 
 ### Dreamer
 
-Запускает bounded AI jobs для curation, orientation, research и clarification. Он не владеет памятью, policy, truth или final decision.
+Runs bounded AI jobs for curation, orientation, research, and clarification. It owns no memory, policy, truth, or final decision.
 
-### Workers, Auditors, Verifier Agents, Synthesis Agents и Curators
+### Workers, Auditors, Verifier Agents, Synthesis Agents, and Curators
 
-Выполняют узкие задачи, возвращают candidate artifacts и evidence. Их роль не повышает authority результата.
+Perform narrow work and return candidate artifacts and evidence. Their role does not elevate result authority.
 
 ### Human Control Plane
 
-Показывает canonical state и позволяет человеку задавать decisions, approvals, questions Dreamer/Watchdog и recovery actions. Не является вторым owner.
+Displays canonical state and lets a person issue decisions, approvals, Dreamer or Watchdog questions, and recovery actions. It is not a second owner.
 
-## A2.3. Модульная архитектура
+## A2.3. Modular Architecture
 
 ```text
 0. Kernel
    identity, authority, fencing, canonical transition boundary,
-   control scheduling, health и recovery entrypoint.
+   control scheduling, health, and recovery entrypoint.
 
 1. Canonical state
-   Memory OS, tasks, evidence, relations, history, receipts и durable jobs.
+   Memory OS, tasks, evidence, relations, history, receipts, and durable jobs.
 
 2. Instrumental intelligence
-   truth adapters, verifiers, code/dependency graphs, logs и artifact inspection.
+   truth adapters, verifiers, code and dependency graphs, logs, and artifact inspection.
 
 3. Cognitive intelligence
-   Understanding State, Context Compiler, Dreamer, semantic curation и calibration.
+   Understanding State, Context Compiler, Dreamer, semantic curation, and calibration.
 
 4. Harness and orchestration
-   agent/tool gateway, swarm, work graph, leases и result aggregation.
+   agent and tool gateway, swarm, work graph, leases, and result aggregation.
 
 5. Surfaces
-   agent protocols, Skills, ControlBoardView, Human interface и reports.
+   agent protocols, Skills, ControlBoardView, Human interface, and reports.
 
 External supervision
-   Watchdog в отдельном failure domain.
+   Watchdog in a separate failure domain.
 ```
 
-Functional layer, source boundary, runtime process и deployment unit — разные измерения. Большое число independently developed Modules не требует такого же числа процессов, services или владельцев state. Kernel поддерживает все четыре функциональные плоскости, но не содержит их глубину. Canonical state обслуживает прежде всего Memory OS и Harness; instrumental/cognitive layers — Smart; Watchdog, Doctor и learning loops — Meta. Kernel владеет логическим lifecycle и fencing Modules; внешний Host Supervisor выполняет physical lifecycle approved generations и остаётся доступен при падении основного процесса.
+Functional layer, source boundary, runtime process, and deployment unit are separate dimensions. Many independently developed Modules do not require the same number of processes, services, or state owners. The Kernel supports all four functional planes without containing their depth. Canonical state primarily serves Memory OS and Harness; the instrumental and cognitive layers serve Smart; Watchdog, Doctor, and learning loops serve Meta. The Kernel owns the logical lifecycle and fencing of Modules; the external Host Supervisor performs the physical lifecycle of approved generations and remains available when the main process fails.
 
-**Микромодульность** означает, что значимая capability может быть выделена в bounded cell с:
+**Micro-modularity** means a material capability can be isolated as a bounded cell with:
 
 ```text
-одной причинной ответственностью и одним lifecycle owner;
-явным public contract, inputs, outputs и owned mutable state;
-allowed effects и authority boundary;
-typed dependency ports и one-way dependency direction;
-независимой proof surface;
-failure, replacement, migration и removal boundary.
+one causal responsibility and one lifecycle owner;
+an explicit public contract, inputs, outputs, and owned mutable state;
+allowed effects and an authority boundary;
+typed dependency ports and one-way dependency direction;
+an independent proof surface;
+failure, replacement, migration, and removal boundaries.
 ```
 
-Micro-module может быть source module, package, sandboxed component, process, service или remote worker. Architecture не предписывает его физическую форму. Внутренняя зависимость значимой capability строится слоями:
+A Micro-module may be a source module, package, sandboxed component, process, service, or remote worker. The Architecture does not prescribe its physical form. Internal dependencies of a material capability follow these layers:
 
 ```text
 contract
-→ domain/pure core
+→ domain or pure core
 → ports
 → adapters
-→ service/lifecycle
-→ agent/human surface.
+→ service or lifecycle
+→ agent or human surface.
 ```
 
-Это направление ответственности, а не обязательная структура каталогов. Core не зависит от конкретного vendor, transport, storage, sandbox или UI; adapters не получают права решать task truth, policy или finish.
+This is a direction of responsibility, not a required directory layout. The core does not depend on a specific vendor, transport, store, sandbox, or UI; adapters gain no right to decide task truth, policy, or finish.
 
-Architecture не задаёт максимальный размер, количество строк, tokens, files, packages или Modules. Потребность в меньших causal worksets сейчас следует из ограничений model context, parallel agent development и локализации ошибок. Split/merge решается по Effective Context Profile, dependency fan-out, build/test cost, failure isolation, replacement cost и Product Pulse. Улучшение моделей может позволить укрупнение, а наблюдаемый drift — потребовать дополнительного разделения без изменения Architecture.
+The Architecture sets no maximum size, line count, token count, file count, package count, or Module count. The current need for smaller causal worksets follows from model-context limits, parallel agent development, and failure localization. Split or merge decisions depend on the Effective Context Profile, dependency fan-out, build and test cost, failure isolation, replacement cost, and Product Pulse. Better models may permit larger units; observed drift may require further separation without changing the Architecture.
 
-Новая или существенно изменённая capability сначала работает в наименее привилегированном **Experimental Contour**, достаточном для её функции:
+A new or materially changed capability first runs in the least-privileged **Experimental Contour** sufficient for its function:
 
 ```text
-bounded sandboxed component — для чистой и capability-limited логики;
-isolated worker — для OS/tool/credential/resource-heavy работы;
-integrated runtime generation — только после доказанного выигрыша и тех же conformance/recovery guarantees.
+bounded sandboxed component — pure, capability-limited logic;
+isolated worker — OS, tool, credential, or resource-heavy work;
+integrated runtime generation — only after demonstrated benefit with equivalent conformance and recovery guarantees.
 ```
 
-Конкретные технологии выбирает Implementation. Ни один contour не является обязательной лестницей зрелости: capability может постоянно оставаться изолированной, если это проще и достаточно производительно. Promotion идёт через contract/conformance, replay, effect-free shadow, bounded canary, active generation, drain/retire или forward rollback. Published generation immutable; активный Module не переписывает себя на месте.
+The Implementation selects concrete technologies. No contour is a mandatory maturity ladder: a capability may remain isolated permanently when that is simpler and sufficiently efficient. Promotion proceeds through contract and conformance, replay, effect-free shadow, bounded canary, active generation, drain and retire, or forward rollback. A published generation is immutable; an active Module does not rewrite itself in place.
 
-Hot path содержит только bounded, observable и достаточно стабильные operations над совместимым state. Model reasoning, research, compilation, broad indexing, heavy verification и curation выполняются вне synchronous decision boundary и публикуют versioned projections/receipts. Добавление глубины не должно скрыто увеличивать latency или failure domain hot path.
+The hot path contains only bounded, observable, and sufficiently stable operations over compatible state. Model reasoning, research, compilation, broad indexing, heavy verification, and curation run outside the synchronous decision boundary and publish versioned projections or receipts. Added depth must not silently increase hot-path latency or failure domain.
 
-Dependencies бывают required, optional и advisory. Отказ optional Module уменьшает только связанную capability. Hard-dependency graph от Kernel наружу ацикличен. Isolation выбирается по failure semantics: pure cancellable computation может разделять runtime; untrusted, blocking, credential-bearing, resource-heavy или crash-prone capability получает более сильную boundary.
+Dependencies are required, optional, or advisory. Failure of an optional Module reduces only the associated capability. The hard-dependency graph from the Kernel outward is acyclic. Isolation follows failure semantics: pure cancellable computation may share a runtime; untrusted, blocking, credential-bearing, resource-heavy, or crash-prone capability receives a stronger boundary.
 
-**ARCH-MOD-01 — Small living Kernel.** Падение agent, model route, graph, Dreamer, UI или adapter не должно уничтожать canonical state и независимую работу.
+**ARCH-MOD-01 — Small living Kernel.** Failure of an agent, model route, graph, Dreamer, UI, or adapter must not destroy canonical state or independent work.
 
-**ARCH-MOD-02 — Depth is additive and micro-modular.** Новая глубина добавляется через independently understandable, testable and replaceable capability cells; их размер и physical form остаются empirical Implementation decisions.
+**ARCH-MOD-02 — Depth is additive and micro-modular.** New depth is added through independently understandable, testable, and replaceable capability cells; their size and physical form remain empirical Implementation decisions.
 
-**ARCH-PORT-01 — Органы и execution contours заменяемы.** Models, agents, harnesses, tools, storage, protocols и isolation technologies заменяются через capability, conformance, migration и failure contracts; публичное inheritance переносится, tacit strategy переоценивается.
+**ARCH-MOD-03 — One causal responsibility, one owner, one proof, one replacement boundary.** A material capability has one causal and lifecycle owner; each mutable state it owns has exactly one owner; the capability has an independently invocable proof surface and a declared replacement boundary. A stateless capability declares the absence of mutable state explicitly. Physical packaging remains empirical; ownership does not.
+
+**Why:** `ARCH-MOD-02` prevents premature size constraints but does not by itself expose blurred ownership. Loss of causal responsibility—not size—destroys independent verification, replacement, and failure localization.
+
+**Violated when:** one mutable state has two owners; a stateful capability has no owner; a capability lacks independently invocable proof; changing one causal responsibility requires simultaneous edits across several owners without a declared contract wave; or the replacement boundary is unnamed.
+
+**ARCH-PORT-01 — Organs and execution contours are replaceable.** Models, agents, harnesses, tools, storage, protocols, and isolation technologies are replaced through capability, conformance, migration, and failure contracts; public inheritance transfers, while tacit strategy is reevaluated.
 
 ---
+# A3. WorkScope and a Changing World
 
-# A3. WorkScope и изменяющийся мир
-
-WorkScope может быть:
+A WorkScope may be:
 
 ```text
-Git repository;
-обычной directory;
-document или media set;
-service/runtime;
-remote system;
-GUI/professional workspace;
-research corpus;
-composite workflow;
-ad hoc task.
+a Git repository;
+an ordinary directory;
+a document or media set;
+a service or runtime;
+a remote system;
+a GUI or professional workspace;
+a research corpus;
+a composite workflow;
+an ad hoc task.
 ```
 
-Git является одним truth surface, а не универсальной identity.
+Git is one truth surface, not a universal identity system.
 
-WorkScope содержит:
+A WorkScope contains:
 
 ```text
-identity и owners;
-resources и external systems;
+identity and owners;
+resources and external systems;
 Terrain;
-truth surfaces и verifiers;
-privacy/authority boundaries;
-current generations и State Fence;
-available/missing capabilities;
-watchers и change signals.
+truth surfaces and verifiers;
+privacy and authority boundaries;
+current generations and State Fence;
+available and missing capabilities;
+watchers and change signals.
 ```
 
-При первом контакте Workspace Bootstrap Scanner строит provisional profile по active roots, files, manifests, services, process state, host capabilities и known integrations. Он не обязан сразу понимать проект полностью.
+At first contact, the Workspace Bootstrap Scanner builds a provisional profile from active roots, files, manifests, services, process state, host capabilities, and known integrations. It need not understand the project completely at once.
 
-Изменение resource generation, task revision, policy или integration state инвалидирует только зависимые views, results и leases. Независимое состояние продолжает жить. Expansion, contraction, merge, split или перенос WorkScope являются явными transitions: прежнее evidence не получает новый scope молча, а continuity сохраняется через provenance и revalidation.
+A change to a resource generation, task revision, policy, or integration state invalidates only dependent views, results, and leases. Independent state remains valid. Expansion, contraction, merge, split, or transfer of a WorkScope is an explicit transition: old evidence never acquires a new scope silently, while continuity is preserved through provenance and revalidation.
 
-Если adapter отсутствует, ELIOT:
+When an adapter is unavailable, ELIOT:
 
 ```text
-ищет другой competent surface;
-выполняет direct read или cheap reversible probe;
-принимает human observation как observation;
-сужает claim/action;
-фиксирует unknown и representation gap;
-блокирует только зависимый effect.
+finds another competent surface;
+performs a direct read or cheap reversible probe;
+accepts a human report as an observation;
+narrows the claim or action;
+records the unknown and representation gap;
+blocks only the dependent effect.
 ```
 
-Composite WorkScope не обещает скрытую глобальную атомарность. Cross-scope outcomes остаются явными.
+A composite WorkScope does not promise hidden global atomicity. Cross-scope outcomes remain explicit.
 
-**ARCH-SCOPE-01 — Scope before reuse.** Память, authority и proof используются только в той области и версии, для которой имеют основания.
+**ARCH-SCOPE-01 — Scope before reuse.** Memory, authority, and proof are used only in the domain and version for which they have support.
 
 ---
-# A4. Cognitive inheritance и память
+# A4. Cognitive Inheritance and Memory
 
-## A4.1. Что хранит ELIOT
+## A4.1. What ELIOT Stores
 
-Память ELIOT — не склад текстов, а управляемая история познания и действия.
+ELIOT memory is not a text warehouse, but a governed history of cognition and action.
 
-Функции памяти различаются:
+Memory functions differ:
 
-| Функция | Сохраняет |
+| Function | Preserves |
 |---|---|
 | Working/continuity | Active bindings, plans, blockers, alternatives, next boundary |
-| Episodic | Anchored traces событий, действий и outcomes |
-| Semantic | Concepts, propositions, relations и scoped models |
-| Procedural | Procedures, Skills, verification и transfer boundaries |
-| Prospective | Commitments, deadlines, triggers и deferred intentions |
-| Source/epistemic | Provenance, competence, dependence, status и validity |
-| Normative/social | Goals, policies, precedents и contested norms |
-| Negative | Failures, avoidance, reopen и extinction conditions |
+| Episodic | Anchored traces of events, actions, and outcomes |
+| Semantic | Concepts, propositions, relations, and scoped models |
+| Procedural | Procedures, Skills, verification, and transfer boundaries |
+| Prospective | Commitments, deadlines, triggers, and deferred intentions |
+| Source/epistemic | Provenance, competence, dependence, status, and validity |
+| Normative/social | Goals, policies, precedents, and contested norms |
+| Negative | Failures, avoidance, reopen conditions, and extinction conditions |
 
-Эти функции могут использовать общий substrate. Разные функции не требуют отдельной базы, но не должны смешиваться семантически.
+These functions may share one substrate. They do not require separate databases, but must remain semantically distinct.
 
-## A4.2. Capture first, organize later
+## A4.2. Capture First, Organize Later
 
-Рабочий agent сообщает естественным языком и structured observations:
-
-```text
-что увидел;
-что решил;
-что изменил;
-что не сработало;
-какой outcome получил;
-что осталось неизвестным;
-что может пригодиться позже.
-```
-
-Он не обязан знать внутреннюю ontology, table, relation или lifecycle status.
-
-Governor добавляет доступные metadata: session, task, WorkScope, time, source, touched resources, State Fence, authority и privacy. Если semantic type неясен, material сохраняется как **Observation Candidate**.
-
-ELIOT предпочитает сохранить imperfect observation с provenance, чем потерять его из-за плохой формы.
-
-**ARCH-MEM-01 — Capture first.** Агент решает основную задачу; ELIOT берёт на себя классификацию, linking, curation и lifecycle памяти.
-
-## A4.3. Git-like history и recoverable fallibility
-
-ELIOT допускает неверные observations, hypotheses, summaries и procedures. Semantic error не равна structural corruption.
-
-Принципы истории:
+A working agent reports natural-language and structured observations:
 
 ```text
-raw source и episode не переписываются молча;
-correction создаёт forward revision или supersession;
-rival theories могут жить параллельными branches;
-merge происходит после evidence и practical tests;
-snapshot/backup создаёт recovery point;
-ошибка остаётся диагностическим материалом;
-privacy erasure является отдельным governed process.
+what it saw;
+what it decided;
+what it changed;
+what failed;
+what outcome it obtained;
+what remains unknown;
+what may matter later.
 ```
 
-Даже poisoned memory может временно попасть в канон как Candidate. Система должна уметь ограничить influence, отозвать dependent representations и восстановиться, не уничтожая forensic history.
+It need not know the internal ontology, table, relation, or lifecycle status.
 
-**ARCH-MEM-02 — Semantic fallibility is recoverable.** Неверная информация допустима как видимое, versioned и revocable состояние; скрытая перезапись history и provenance недопустима.
+The Governor adds available metadata: session, task, WorkScope, time, source, touched resources, State Fence, authority, and privacy. When the semantic type is unclear, the material is preserved as an **Observation Candidate**.
 
-## A4.4. Жизненный цикл информации
+ELIOT prefers an imperfect observation with provenance to losing it because of poor form.
 
-Единый смысловой поток:
+**ARCH-MEM-01 — Capture first.** The agent solves the primary task; ELIOT handles memory classification, linking, curation, and lifecycle.
+
+## A4.3. Git-Like History and Recoverable Fallibility
+
+ELIOT permits incorrect observations, hypotheses, summaries, and procedures. Semantic error is not structural corruption.
+
+History principles:
+
+```text
+a raw source or episode is never rewritten silently;
+a correction creates a forward revision or supersession;
+rival theories may coexist on parallel branches;
+merge follows evidence and practical tests;
+a snapshot or backup creates a recovery point;
+an error remains diagnostic material;
+privacy erasure is a separate governed process.
+```
+
+Even poisoned memory may temporarily enter the canon as a Candidate. The system must bound its influence, revoke dependent representations, and recover without destroying forensic history.
+
+**ARCH-MEM-02 — Semantic fallibility is recoverable.** Incorrect information may exist as visible, versioned, and revocable state; hidden rewriting of history or provenance is prohibited.
+
+## A4.4. Information Lifecycle
+
+Unified semantic flow:
 
 ```text
 perceive
@@ -717,90 +743,91 @@ perceive
 → capture observation
 → classify or retain as candidate
 → reconcile with existing state
-→ store/revise
+→ store or revise
 → bind activation routes
-→ retrieve/activate
+→ retrieve or activate
 → compile Active View
-→ use in inquiry/action
+→ use in inquiry or action
 → observe outcome
 → update epistemic position
-→ consolidate/reconsolidate
-→ adjust accessibility/influence
+→ consolidate or reconsolidate
+→ adjust accessibility or influence
 → evaluate improvement.
 ```
 
-Это proof normal form, а не требование синхронно выполнять все стадии для каждого read. Reversible probe может предшествовать полной curation. Material decision должен быть восстановим через применимую часть этой цепи.
+This is a proof normal form, not a requirement to execute every stage synchronously for every read. A reversible probe may precede full curation. A material decision must be reconstructible through the applicable part of this chain.
 
-Observation не становится verified claim, instruction, procedure, policy или proof только потому, что модель его пересказала, объединила или повторила. Изменение semantic role/status происходит через явный transition с provenance и receipt.
+An observation does not become a verified claim, instruction, procedure, policy, or proof merely because a model paraphrased, combined, or repeated it. A change of semantic role or status requires an explicit transition with provenance and a receipt.
 
-**ARCH-LIFE-01 — No semantic teleportation.** Между observation, interpretation, authority и proof нет скрытых переходов.
+**ARCH-LIFE-01 — No semantic teleportation.** No hidden transition exists among observation, interpretation, authority, and proof.
 
-## A4.5. Evidence, relations и continuity
+## A4.5. Evidence, Relations, and Continuity
 
-Reusable memory имеет хотя бы один observable activation route — world/task cue, commitment, relation или scheduled review. Без него material остаётся cold inheritance, но не отклоняется и не теряется.
+Reusable memory has at least one observable activation route: world or task cue, commitment, relation, or scheduled review. Material without one remains cold inheritance; it is neither rejected nor lost.
 
-Load-bearing record сохраняет:
+A load-bearing record preserves:
 
 ```text
-source и exact anchor;
-question/scope/time;
-observation или proposition;
+source and exact anchor;
+question, scope, and time;
+observation or proposition;
 epistemic status;
-support и counterevidence;
-relations и dependencies;
+support and counterevidence;
+relations and dependencies;
 conditions of applicability;
-revision/revalidation route;
+revision or revalidation route;
 allowed influence.
 ```
 
-Relations имеют type, direction, scope, provenance и epistemic status. Similarity, co-change, sequence и graph proximity не создают causality автоматически.
+Relations have type, direction, scope, provenance, and epistemic status. Similarity, co-change, sequence, and graph proximity do not create causality automatically.
 
-Identity является type-relative. Rename file, restart service или rewrite procedure не всегда создают новый объект; split/merge остаются hypotheses до evidence.
+Identity is type-relative. Renaming a file, restarting a service, or rewriting a procedure does not always create a new object; split and merge remain hypotheses until supported by evidence.
 
-## A4.6. Memory transformation
+## A4.6. Memory Transformation
 
-Summary, merge, episode synthesis, concept formation, procedure synthesis и compaction — не нейтральное форматирование. Они обязаны сохранять:
+Summary, merge, episode synthesis, concept formation, procedure synthesis, and compaction are not neutral formatting. They must preserve:
 
 ```text
 primary evidence;
 lineage;
-minority/counterevidence;
+minority evidence and counterevidence;
 uncertainty;
 temporal and scope distinctions;
 conditions of applicability;
-path back to sources.
+a path back to sources.
 ```
 
-Качество transformation проверяется по coverage, preservation, faithfulness, lineage и reversibility.
+Transformation quality is evaluated by coverage, preservation, faithfulness, lineage, and reversibility.
 
-**ARCH-MEM-03 — Derived memory не заменяет evidence.** Dreamer, model или deterministic compiler могут создавать полезные representations, но не повышают authority и не уничтожают исходную историю.
+Where a fragment carries evidentiary weight, an exact quotation is preferable to a generative paraphrase. A paraphrase may alter wording, lose a qualification or negation, or combine claims from several sources; verifying it therefore requires a separate faithfulness check. An exact fragment preserves source wording, supports mechanical correspondence checks, and binds a claim to a specific location. Paraphrase remains useful for navigation and overview, but does not replace quotation in a conclusion's evidentiary basis.
 
-## A4.7. Accessibility, support, influence и erasure
+**ARCH-MEM-03 — Derived memory does not replace evidence.** Dreamer, a model, or a deterministic compiler may create useful representations, but cannot elevate authority or destroy source history.
 
-Четыре свойства независимы:
+## A4.7. Accessibility, Support, Influence, and Erasure
+
+Four properties are independent:
 
 ```text
-существует ли record;
-насколько он epistemically supported;
-насколько доступен retrieval/attention;
-какое влияние ему разрешено.
+whether the record exists;
+how strongly it is epistemically supported;
+how accessible it is to retrieval or attention;
+what influence it is permitted to exert.
 ```
 
-Forgetting управляет accessibility и influence. Belief revision изменяет support. Privacy erasure изменяет physical existence.
+Forgetting governs accessibility and influence. Belief revision changes support. Privacy erasure changes physical existence.
 
-Retrieval, citation, repetition и model agreement сами по себе не усиливают memory.
+Retrieval, citation, repetition, and model agreement do not strengthen memory by themselves.
 
-**ARCH-MEM-04 — Retrieval is not reinforcement.** Будущее влияние меняется по outcome-linked evidence, correction или explicit lifecycle decision.
+**ARCH-MEM-04 — Retrieval is not reinforcement.** Future influence changes only through outcome-linked evidence, correction, or an explicit lifecycle decision.
 
 ---
+# A5. Reality, Epistemic Position, and Theories
 
-# A5. Reality, epistemic position и теории
+## A5.1. Reality and Observation
 
-## A5.1. Reality и observation
+Reality is not stored inside ELIOT. ELIOT stores bounded observations and models.
 
-Reality не хранится внутри ELIOT. ELIOT хранит ограниченные observations и модели.
-
-Каждый observation имеет две независимые характеристики:
+Every observation has two independent attributes:
 
 ```text
 Capture route:
@@ -810,11 +837,11 @@ Evaluation status:
 raw | screened | verifier-backed | contested | stale.
 ```
 
-Verifier-backed не означает independent. Human observation допустим как observation с provenance, но не автоматически как verification внешнего факта.
+Verifier-backed does not mean independent. A human report is admissible as an observation with provenance, but not automatically as verification of an external fact.
 
 ## A5.2. Current Epistemic Position
 
-Для конкретного question/scope/time ELIOT показывает:
+For a specific question, scope, and time, ELIOT shows:
 
 ```text
 direct observations;
@@ -827,171 +854,216 @@ unknowns;
 required inquiry.
 ```
 
-Один canonical owner обеспечивает одну историю transitions, но не одну обязательную интерпретацию.
+One canonical owner provides one transition history, not one mandatory interpretation.
 
-Fresh observation всегда обновляет evidence state. Он не обязан слепо переписывать устойчивую модель: outlier, transient, sensor error или correlated failure создают conflict и inquiry.
+A fresh observation always updates evidence state. It need not blindly replace a stable model: an outlier, transient, sensor error, or correlated failure creates a conflict and inquiry.
 
-**ARCH-EPI-01 — Reality corrects; positions remain defeasible.** Current Epistemic Position является лучшей обоснованной рабочей моделью, а не внутренним объектом truth.
+**ARCH-EPI-01 — Reality corrects; positions remain defeasible.** Current Epistemic Position is the best-supported working model, not an internal truth object.
 
-## A5.3. Theory Portfolio и Epistemic Fitness
+## A5.3. Theory Portfolio and Epistemic Fitness
 
-В сложном вопросе ELIOT хранит несколько competing models.
+For a complex question, ELIOT preserves several competing models.
 
-Вес theory повышают:
+A theory gains weight from:
 
 ```text
-независимое evidence;
-верные discriminative predictions;
-успешные practical tests;
-transfer в новом scope после revalidation;
-объяснительная достаточность без лишних assumptions.
+independent evidence;
+correct discriminative predictions;
+successful practical tests;
+transfer to a new scope after revalidation;
+explanatory sufficiency without unnecessary assumptions.
 ```
 
-Вес снижают:
+A theory loses weight from:
 
 ```text
-failed prediction;
-ошибка downstream artifact или procedure;
+a failed prediction;
+an error in a downstream artifact or procedure;
 counterevidence;
-poisoned или dependent lineage;
-stale competence/scope;
-correlated swarm/evaluator agreement.
+poisoned or dependent lineage;
+stale competence or scope;
+correlated swarm or evaluator agreement.
 ```
 
-Практический успех scoped и revocable. Если theory ломает зависимые theories, procedures или artifacts, открывается review, а не dogma.
+Practical success is scoped and revocable. When a theory breaks dependent theories, procedures, or artifacts, it opens review rather than becoming dogma.
 
-**ARCH-EPI-02 — Theories earn and lose weight through outcomes.** Knowledge развивается через evidence, prediction, experiment и correction; eloquence, age и votes не создают truth.
+**ARCH-EPI-02 — Theories earn and lose weight through outcomes.** Knowledge develops through evidence, prediction, experiment, and correction; eloquence, age, and votes do not create truth.
 
-## A5.4. Time и State Fence
+## A5.4. Time and State Fence
 
-Для load-bearing state сохраняются:
+Load-bearing state preserves:
 
 ```text
 valid time;
 known time;
 transaction time;
 resource generation;
-task, policy и integration revisions.
+task, policy, and integration revisions.
 ```
 
-Canonical causal order назначает Governor. External timestamps остаются observations. Lease expiry и local scheduling используют monotonic-compatible clocks; clock anomaly создаёт Problem State и revalidation, а не продлевает authority молча.
+The Governor assigns canonical causal order. External timestamps remain observations. Lease expiry and local scheduling use monotonic-compatible clocks; a clock anomaly creates a Problem State and revalidation, not a silent authority extension.
 
-State Fence включает только dependencies, способные изменить решение. Изменение unrelated resource не инвалидирует всю задачу.
+A State Fence contains only dependencies capable of changing the decision. A change to an unrelated resource does not invalidate the entire task.
 
-## A5.5. Verifier и Evaluation Contract
+## A5.5. Verifier and Evaluation Contract
 
-Evaluation Contract определяет:
+An Evaluation Contract defines:
 
 ```text
-какое свойство измеряется;
-в каком scope/environment/version;
-какие inputs и outputs допустимы;
-какова uncertainty и freshness;
-какие failure modes известны;
-что делает result неприменимым.
+the property measured;
+the scope, environment, and version;
+permitted inputs and outputs;
+uncertainty and freshness;
+known failure modes;
+conditions that make the result inapplicable.
 ```
 
-System Owner разрешает installation и credentials. WorkScope Owner принимает применение. Governor связывает verifier с acceptance item и проверяет scope/freshness. Competence доказывается outcomes, а не регистрацией.
+The System Owner authorizes installation and credentials. The WorkScope Owner accepts local use. The Governor binds the verifier to an acceptance item and checks scope and freshness. Competence is demonstrated through outcomes, not registration.
 
-Чем выше impact, тем меньше система полагается на self-report исполнителя. Critical result требует route наблюдения/evaluation вне failure domain автора действия, если это практически возможно; иначе finish остаётся честно degraded.
+As impact increases, the system relies less on the actor's self-report. A Critical result requires an observation or evaluation route outside the actor's failure domain when practical; otherwise, finish remains honestly degraded.
 
-Model evaluator допустим для subjective property, но не является независимым по факту названия модели.
+A model evaluator is admissible for a subjective property, but its model name does not make it independent.
 
-## A5.6. Inquiry и unknown
+## A5.6. Inquiry and Unknowns
 
-Unknown — полноценное состояние. Оно содержит:
+An Unknown is a first-class state. It contains:
 
 ```text
-вопрос;
-почему он важен;
-какое решение зависит от ответа;
-какое observation различит варианты;
-самый дешёвый безопасный probe;
-условие остановки inquiry.
+the question;
+why it matters;
+the decision that depends on it;
+the observation that would distinguish the alternatives;
+the cheapest safe probe;
+what is expected if the hypothesis is true and if it is false;
+what counts as falsification;
+how the model changes if the probe fails;
+the inquiry stop condition.
 ```
 
-ELIOT различает pragmatic action и epistemic action. Inquiry выбирается по discriminative power, expected information gain, risk, reversibility, cost и opportunity cost.
+ELIOT distinguishes pragmatic action from epistemic action. Inquiry is selected by discriminative power, expected information gain, risk, reversibility, cost, and opportunity cost.
 
-Корректный результат может быть: «данных недостаточно; самый безопасный полезный следующий шаг — X».
+Inquiry operates at four nested scales that must not be conflated:
+
+```text
+micro   candidate → verifier → exact counterexample → minimal repair → repeat;
+meso    bounded work packet → independent verification → result admission;
+macro   explanation review: which action most changes the decision;
+outer   system learning from completed and verified runs.
+```
+
+If every local error sends work back to a general review of the goal, the organization is too coarse. If explanations are never reviewed, the system optimizes answers rather than understanding.
+
+A correct result may be: "Evidence is insufficient; the safest useful next step is X."
+
+## A5.7. Confirmatory and Exploratory Lanes
+
+Exploration and confirmation are different modes of working with evidence. If a participant sees the data, invents an explanation from it, selects a method, and then declares confirmation, exploration silently becomes answer optimization. A load-bearing conclusion therefore follows one of two explicit lanes.
+
+### Confirmatory Lane
+
+Before result exposure, record the question, hypothesis, protocol, primary outcome, exclusion criteria, quality controls, decision rule, evaluator, and budget. After the freeze, do not silently change the primary metric, exclude an inconvenient case without a rule, weaken the claim, replace the evaluator after seeing the result, or hide failed runs. Declare deviations explicitly and label all subsequent analyses exploratory.
+
+Acceptance in the confirmatory lane does not depend on result direction. A correctly obtained negative result is a complete outcome, not failed work.
+
+### Exploratory Lane
+
+Exploration may generate hypotheses, change the frame, vary analysis, and search for new representations. Its output remains an exploratory finding, not confirmation. Promotion to confirmatory status requires an independent basis: a new holdout, independent run, preregistered test, replication, formal proof, or another sufficient truth surface.
+
+**ARCH-EPI-03 — Exploration cannot confirm itself on the same evidence.** Data that generated a hypothesis are not an independent confirming test of that hypothesis.
+
+**Why:** this applies beyond statistics. Traces used to discover a repair are not a held-out regression; examples used to evolve a Skill are not the final evaluation; sources used to construct a causal account are not its independent validation; cases used to tune a simulator are not evidence of transfer to real load.
+
+### Evidence Freeze
+
+Before synthesis, freeze a revision of admitted evidence: what was included, what was excluded and why, which conflicts remain unresolved, and which research debts remain open. The synthesis author may not add a new fact silently outside admission. A report is a projection of the frozen revision, not a truth source; correcting wording must not require rewriting history.
+
+### Coverage Denominator
+
+Completeness and absence claims are valid only against a declared, frozen, and independently recheckable denominator. A top-k result, exhausted budget, stopped agent, or lack of new search results does not authorize a claim that nothing exists.
+
+**ARCH-EPI-04 — Coverage requires a denominator.** A coverage or absence claim must name its scope, revision, and method by which the denominator can be checked independently.
+
+### Rigor Is Selected, Not Inherited
+
+Lanes, freeze, denominator, and claim audit are not a separate product. They form a rigor level selected for a specific information task according to impact and reversibility. A quick lookup and a full investigation use the same contour at different levels; the system must be able to raise the rigor prospectively for remaining work at any time rather than switch to another subsystem. Evidence already exposed retains its original lane and grade: raising rigor does not retroactively make it confirmatory and requires new independent support for a stronger claim.
 
 ---
+# A6. Understanding State and System-Level Understanding
 
-# A6. Understanding State и system-level понимание
+## A6.1. What Counts as Understanding
 
-## A6.1. Что считается пониманием
-
-Decision-adequate understanding отвечает:
+Decision-adequate understanding answers:
 
 ```text
-что существует;
-что это означает и для кого;
-зачем существует;
-как связано;
-как меняется;
-почему возникают outcomes;
-что известно и неизвестно;
-какие alternatives правдоподобны;
-какое вмешательство к чему приведёт;
-что различит competing explanations.
+what exists;
+what it means and to whom;
+why it exists;
+how it is related;
+how it changes;
+why outcomes occur;
+what is known and unknown;
+which alternatives are plausible;
+what an intervention is likely to cause;
+what would distinguish competing explanations.
 ```
 
-Оно может быть неполным. Дефект — не unknown, а скрытая неизвестность, ложная уверенность или потеря distinctions, способных изменить решение.
+It may be incomplete. The defect is not an unknown, but a hidden unknown, false certainty, or loss of distinctions that could change the decision.
 
-## A6.2. Representation, episode и competence
+## A6.2. Representation, Episode, and Competence
 
-- **Understanding State** — inspectable public representation.
-- **Cognitive Episode** — происходящая сейчас интерпретация и действие.
-- **Understanding Competence** — способность route построить и применить модель.
+- **Understanding State** is an inspectable public representation.
+- **Cognitive Episode** is the interpretation and action occurring now.
+- **Understanding Competence** is a route's ability to construct and apply a model.
 
-Ни storage, ни model отдельно не исчерпывают understanding. Без external state возникает амнезия; без active semantic judgment — организованный архив. Understanding State является governed view и rebuildable projections над Canonical Memory и текущими observations, а не вторым semantic store. WorkScope Understanding scoped; cross-scope System Self-Model хранится отдельно и не переносит project claims автоматически. Route Continuation State может поддерживать продолжение того же route, но hidden reasoning не становится durable knowledge, proof или reward target; ELIOT сохраняет public rationale, evidence и decision state.
+Neither storage nor a model alone exhausts understanding. Without external state, cognition becomes amnesic; without active semantic judgment, it becomes an organized archive. Understanding State is a governed view and a set of rebuildable projections over Canonical Memory and current observations, not a second semantic store. WorkScope Understanding is scoped; the cross-scope System Self-Model is stored separately and does not transfer project claims automatically. Route Continuation State may support continuation of the same route, but hidden reasoning never becomes durable knowledge, proof, or a reward target; ELIOT preserves public rationale, evidence, and decision state.
 
-**ARCH-UND-01 — Load-bearing understanding имеет публичное выражение.** Решение должно быть восстановимо через evidence, models, alternatives, unknowns и rationale, не через hidden thought.
+**ARCH-UND-01 — Load-bearing understanding has a public expression.** A decision must be reconstructible from evidence, models, alternatives, unknowns, and rationale, not from hidden thought.
 
-## A6.3. Слои понимания
+## A6.3. Layers of Understanding
 
 ```text
-goal/value — что требуется и зачем;
-semantic — entities, roles и meaning;
-structural — boundaries, components и dependencies;
-dynamic — states, flows и transitions;
-causal — mechanisms, interventions, confounders и counterfactuals;
-normative — invariants, policies, commitments и contested norms;
-epistemic — evidence, rivals, unknowns и source competence;
-historical — decisions, failures, changes и outcomes;
-operational — current environment, capabilities и degradation;
-metacognitive — coverage, competence, bias и calibration.
+goal/value — what is required and why;
+semantic — entities, roles, and meaning;
+structural — boundaries, components, and dependencies;
+dynamic — states, flows, and transitions;
+causal — mechanisms, interventions, confounders, and counterfactuals;
+normative — invariants, policies, commitments, and contested norms;
+epistemic — evidence, rivals, unknowns, and source competence;
+historical — decisions, failures, changes, and outcomes;
+operational — current environment, capabilities, and degradation;
+metacognitive — coverage, competence, bias, and calibration.
 ```
 
-Meaning не сводится к observed behavior. ELIOT различает intended/declared meaning, institutional role, operational behavior, counterfactual consequences и значение для разных participants. Расхождение между ними является model conflict, а не поводом выбрать один слой молча.
+Meaning is not reducible to observed behavior. ELIOT distinguishes intended or declared meaning, institutional role, operational behavior, counterfactual consequences, and significance for different participants. Divergence among them is a model conflict, not a reason to select one layer silently.
 
-Concept Pyramid является навигационной проекцией:
+The Concept Pyramid is a navigation projection:
 
 ```text
-charter → system map → subsystem capsule → module/workflow card → exact evidence.
+charter → system map → subsystem capsule → module or workflow card → exact evidence.
 ```
 
-Она не является самим пониманием и может быть перестроена.
+It is not understanding itself and may be rebuilt.
 
-## A6.4. Graphs и artifacts
+## A6.4. Graphs and Artifacts
 
-ELIOT использует несколько графовых плоскостей:
+ELIOT uses several graph planes:
 
 ```text
-static code/dependency graph;
-behavioral/co-change graph;
+static code and dependency graph;
+behavioral and co-change graph;
 causal experience graph;
-execution/task graph;
+execution and task graph;
 artifact-lineage graph;
-concept/normative graph.
+concept and normative graph.
 ```
 
-Tools якорят structure; agents интерпретируют смысл; artifacts, tests и outcomes исправляют обе стороны. Ориентация идёт exact-first: known handle/path/symbol/artifact и typed neighborhood предшествуют broad semantic synthesis. Graph index — derived projection, не второй owner.
+Tools anchor structure; agents interpret meaning; artifacts, tests, and outcomes correct both. Orientation is exact-first: a known handle, path, symbol, or artifact and its typed neighborhood precede broad semantic synthesis. A graph index is a derived projection, not a second owner.
 
-**ARCH-GROUND-01 — Understanding grounded in tools and artifacts.** Смысловая модель должна быть связана с реальными files, symbols, services, documents, actions и verifiers.
+**ARCH-GROUND-01 — Understanding is grounded in tools and artifacts.** A semantic model must remain connected to real files, symbols, services, documents, actions, and verifiers.
 
 ## A6.5. Causality
 
-Causal model хранит:
+A causal model preserves:
 
 ```text
 mechanism;
@@ -1006,136 +1078,135 @@ rival explanations;
 transfer boundary.
 ```
 
-Successful outcome подтверждает effect, но не обязательно заявленный mechanism. Causal edge получает status: hypothetical, supported или observed-under-intervention.
+A successful outcome supports the effect, but not necessarily the claimed mechanism. A causal edge is hypothetical, supported, or observed-under-intervention.
 
-Связный narrative сам по себе не доказывает понимание. Causal/operational model получает доверие, когда различает rival explanations, заранее фиксирует observable и выдерживает intervention, verifier или реальный artifact outcome; несовпадение исправляет модель.
+A coherent narrative does not by itself demonstrate understanding. A causal or operational model earns trust by distinguishing rival explanations, preregistering an observable, and surviving an intervention, verifier, or real artifact outcome; mismatch corrects the model.
 
-**ARCH-UND-02 — Causal understanding is tested by discriminative prediction and outcomes.** Проверяется не красота объяснения, а способность различать варианты, предсказывать последствия и корректироваться по факту.
+**ARCH-UND-02 — Causal understanding is tested by discriminative prediction and outcomes.** The test is not the elegance of an explanation, but its ability to distinguish alternatives, predict consequences, and correct itself against reality.
 
-## A6.6. Correctness и reconstruction cost
+## A6.6. Correctness and Reconstruction Cost
 
-Understanding State может быть большим. Active View должен быть ограниченным, но не ценой decision-relevant correctness.
+Understanding State may be large. An Active View must be bounded, but never at the expense of decision-relevant correctness.
 
-Порядок приоритетов:
+Priority order:
 
 ```text
-reality/evidence fit;
+fit to reality and evidence;
 decision sufficiency;
-visible uncertainty и alternatives;
-timely accessibility/usability;
-затем reconstruction cost, latency и token economy.
+visible uncertainty and alternatives;
+timely accessibility and usability;
+then reconstruction cost, latency, and token economy.
 ```
 
-Если понимание не помещается, ELIOT decomposes task, раскрывает primary evidence, создаёт последовательные views или меняет route. Silent loss запрещён.
+When understanding does not fit, ELIOT decomposes the task, exposes primary evidence, creates sequential views, or changes route. Silent loss is prohibited.
 
-## A6.7. Self-knowledge ELIOT
+## A6.7. ELIOT Self-Knowledge
 
-Architecture является частью cognitive inheritance. System Self-Model различает:
+The Architecture is part of cognitive inheritance. The System Self-Model distinguishes:
 
 ```text
-Constitutional — что ELIOT должен означать;
-Implemented — что реально построено;
-Operational — что сейчас доступно и деградировано;
-Experiential — incidents, repairs и learned limits;
-Epistemic — что о себе доказано, оспаривается или неизвестно.
+Constitutional — what ELIOT is intended to mean;
+Implemented — what has actually been built;
+Operational — what is currently available or degraded;
+Experiential — incidents, repairs, and learned limits;
+Epistemic — what is demonstrated, contested, or unknown about the system itself.
 ```
 
-Нормативной является точная принятая revision Architecture. Summary, audit, code shape и runtime behavior — projections/evidence, но не источник конституционной authority.
+The exact adopted Architecture revision is normative. A summary, audit, code shape, or runtime behavior is a projection or evidence, not a source of constitutional authority.
 
-Перед Material изменением самого ELIOT Active View включает применимые principles, rationale, conformance gaps и affected guarantees. Контакт с Module/capability ELIOT активирует связанные Architecture anchors так же, как project cue активирует рабочую memory.
+Before a Material change to ELIOT itself, the Active View includes applicable principles, rationale, conformance gaps, and affected guarantees. Contact with an ELIOT Module or capability activates related Architecture anchors just as a project cue activates working memory.
 
-Architecture Knowledge является защищённым primary source. Dreamer briefs, audits, code comments и summaries остаются projections. Живая conformance map связывает Intent/`ARCH-*` с implementation owner, mechanism, failure behavior и observable status; изменение Architecture либо расходящийся runtime инвалидирует зависимые briefs и открывает explicit gap.
+Architecture Knowledge is a protected primary source. Dreamer briefs, audits, code comments, and summaries remain projections. A live conformance map binds Intent and `ARCH-*` anchors to an implementation owner, mechanism, failure behavior, and observable status; an Architecture change or divergent runtime invalidates dependent briefs and opens an explicit gap.
 
-Architecture revision digest и conformance state входят в integrity anchors и recovery manifest.
+The Architecture revision digest and conformance state belong to integrity anchors and the recovery manifest.
 
-После смены model/harness проверяется **Common Ground**: сохранились ли не только summaries, но и goals, decisions, invariants, rival models, unknowns, commitments и последствия действий. Public inheritance переносится; tacit competence и способ интерпретации требуют requalification.
+After a model or harness change, **Common Ground** is checked: not only summaries, but goals, decisions, invariants, rival models, unknowns, commitments, and action consequences must survive. Public inheritance transfers; tacit competence and interpretation strategy require requalification.
 
-**ARCH-SELF-01 — ELIOT знает своё назначение и состояние.** Self-model нужен для diagnosis, recovery и improvement, но не даёт системе права самосертифицироваться или менять Architecture.
+**ARCH-SELF-01 — ELIOT knows its purpose and state.** The self-model supports diagnosis, recovery, and improvement, but never authorizes self-certification or unilateral Architecture changes.
 
 ---
-
-# A7. Attention, context и Skills
+# A7. Attention, Context, and Skills
 
 ## A7.1. Active Understanding View
 
-View компилируется для конкретного `model × task × harness × tools × inference regime`.
+A view is compiled for a specific `model × task × harness × tools × inference regime`.
 
-Порядок по смыслу:
+Semantic order:
 
 ```text
-goal, acceptance и commitments;
+goal, acceptance, and commitments;
 blocking attention;
-current epistemic position и rivals;
-semantic/causal model;
-done, open, deferred и killed work;
-invariants и negative memory;
-unknowns и inquiries;
+current epistemic position and rivals;
+semantic and causal model;
+done, open, deferred, and killed work;
+invariants and negative memory;
+unknowns and inquiries;
 exact load-bearing evidence;
-available/authorized affordances;
-next action, expected observable, verifier и stop condition.
+available and authorized affordances;
+next action, expected observable, verifier, and stop condition.
 ```
 
-View использует один применимый State Fence либо явно показывает stale/incompatible sections.
+A view uses one applicable State Fence or explicitly marks stale or incompatible sections.
 
-У action boundary формируется короткий **decision-local tail**: current goal, load-bearing position, exact atoms, do-not-use, next action, expected observable, verifier и stop/revision condition. Его layout проверяется по Effective Context Profile, а не фиксируется как вечная prompt-магия.
+At an action boundary, the system creates a concise **decision-local tail**: current goal, load-bearing position, exact atoms, do-not-use items, next action, expected observable, verifier, and stop or revision condition. Its layout is validated against the Effective Context Profile rather than frozen as permanent prompt magic.
 
-**ARCH-CTX-01 — Decision sufficiency before size optimization.** Context должен сохранить distinctions, способные изменить решение, risk, verifier или unknowns.
+**ARCH-CTX-01 — Decision sufficiency before size optimization.** Context must preserve distinctions that could change the decision, risk, verifier, or unknowns.
 
 ## A7.2. Attention
 
-Selection учитывает:
+Selection considers:
 
 ```text
-goal/commitment relevance;
-expected decision delta и information gain;
-risk, urgency и irreversibility;
-prediction error, novelty и surprise;
-negative memory и invariants;
-minority/counterevidence;
-source competence/independence;
-opportunity и switching cost;
+goal and commitment relevance;
+expected decision delta and information gain;
+risk, urgency, and irreversibility;
+prediction error, novelty, and surprise;
+negative memory and invariants;
+minority evidence and counterevidence;
+source competence and independence;
+opportunity and switching cost;
 route-specific usability.
 ```
 
-Текущий frame может ошибаться. Поэтому high-impact work сохраняет bounded exploration: rival-frame challenge, counterevidence search и coverage-gap review.
+The current frame may be wrong. High-impact work therefore preserves bounded exploration: rival-frame challenge, counterevidence search, and coverage-gap review.
 
-## A7.3. Три канала ориентации
+## A7.3. Three Orientation Channels
 
 ### Push
 
-World/task contact активирует связанную memory по file, symbol, error, command, service, document, deadline, commitment или anomaly.
+World or task contact activates related memory through a file, symbol, error, command, service, document, deadline, commitment, or anomaly.
 
 ### Pull
 
-Agent знает предмет поиска и запрашивает handles, facts, relations или cases.
+The agent knows what it seeks and requests handles, facts, relations, or cases.
 
 ### Dreamer Orientation
 
-Goal известен, но скрытые relations и содержимое памяти неизвестны; Dreamer строит bounded problem-oriented packet.
+The goal is known, but hidden relations and memory content are not; Dreamer builds a bounded, problem-oriented packet.
 
 Default:
 
 ```text
-current task/commitment
-→ exact cue/entity/path
+current task or commitment
+→ exact cue, entity, or path
 → typed relations
 → bounded retrieval
 → Dreamer synthesis.
 ```
 
-Retrieval, graph activation и Dreamer search только создают candidates. В Active View они попадают после admission по scope, freshness, provenance, epistemic status, expected decision delta, risk и cost. Причина material inclusion или suppression должна быть восстановима.
+Retrieval, graph activation, and Dreamer search only produce candidates. Admission to an Active View depends on scope, freshness, provenance, epistemic status, expected decision delta, risk, and cost. The reason for every material inclusion or suppression must be reconstructible.
 
-**ARCH-CTX-04 — Retrieval proposes; Context Compiler admits.** Найденное не получает influence только потому, что оно похоже или доступно.
+**ARCH-CTX-04 — Retrieval proposes; Context Compiler admits.** A retrieved item gains no influence merely because it is similar or available.
 
-**ARCH-CTX-02 — Observable state drives proactive memory.** Полезная memory не должна зависеть только от того, вспомнил ли agent вызвать recall.
+**ARCH-CTX-02 — Observable state drives proactive memory.** Useful memory must not depend solely on whether the agent remembered to call recall.
 
-На host без event integration push деградирует до обязательной доставки на следующей доступной boundary и видимой obligation; ELIOT не изображает prevention, которого нет.
+On a host without event integration, push degrades to mandatory delivery at the next available boundary and a visible obligation; ELIOT does not pretend prevention exists when it does not.
 
-**ARCH-CTX-03 — Decision locality is route-profiled.** Load-bearing control state располагается там, где конкретный route надёжнее всего использует его у decision boundary; mechanical repetition не увеличивает epistemic support.
+**ARCH-CTX-03 — Decision locality is route-profiled.** Load-bearing control state is placed where a particular route uses it most reliably at the decision boundary; mechanical repetition does not increase epistemic support.
 
-## A7.4. Context как intervention
+## A7.4. Context as Intervention
 
-Inclusion, omission, ordering, repetition и schema изменяют inference. Каждый material element имеет роль:
+Inclusion, omission, ordering, repetition, and schema change inference. Every material element has a role:
 
 ```text
 governing instruction;
@@ -1148,58 +1219,58 @@ affordance;
 untrusted payload.
 ```
 
-Untrusted content может влиять через priming и framing даже без authority. Поэтому provenance, placement и repetition также governed. Каждое material inclusion или suppression имеет source handle и краткую объяснимую причину; иначе ошибку Context Compiler невозможно диагностировать.
+Untrusted content may influence through priming and framing even without authority. Provenance, placement, and repetition are therefore governed. Every material inclusion or suppression has a source handle and concise, explainable reason; otherwise Context Compiler errors cannot be diagnosed.
 
-Semantic screening выполняется до hot boundary либо асинхронно. Hot admission, attention и authority gate не ждут LLM: они используют persisted attributes или возвращают bounded inquiry/unknown. Unscreened item доступен как quoted evidence/handle, но не является единственным основанием Critical action.
+Semantic screening occurs before the hot boundary or asynchronously. Hot admission, attention, and authority gates do not wait for an LLM: they use persisted attributes or return a bounded inquiry or unknown. An unscreened item is available as quoted evidence or a handle, but cannot be the sole basis for a Critical action.
 
 ## A7.5. Critical Attention
 
-Critical Attention — durable obligation, а не сообщение.
+Critical Attention is a durable obligation, not a message.
 
-Она имеет:
+It has:
 
 ```text
 owner;
-affected scope/actions;
+affected scope and actions;
 evidence;
 delivery state;
 resolution state;
-deadline/review condition;
+deadline or review condition;
 escalation route.
 ```
 
-Acknowledgement означает получение, но не resolution. Expiry меняет owner/channel, а не удаляет problem.
+Acknowledgement means receipt, not resolution. Expiry changes the owner or channel; it does not delete the problem.
 
-**ARCH-ATTN-01 — Critical Attention is state, not a message.** Blocking obligation живёт до evidence-backed resolution, authorized waiver или supersession.
+**ARCH-ATTN-01 — Critical Attention is state, not a message.** A blocking obligation persists until evidence-backed resolution, authorized waiver, or supersession.
 
-## A7.6. Compaction и resume
+## A7.6. Compaction and Resume
 
-Compaction — reconstructive transformation. Перед boundary сохраняются:
+Compaction is a reconstructive transformation. Before the boundary, preserve:
 
 ```text
-goal и commitments;
-current/rival models;
-done, deferred и killed paths;
-blockers и exact anchors;
+goal and commitments;
+current and rival models;
+done, deferred, and killed paths;
+blockers and exact anchors;
 pending verifiers;
 next action;
 State Fence;
 explicit losses.
 ```
 
-Resume различает:
+Resume distinguishes:
 
 ```text
-exact continuation того же route;
-reconstruction из public inheritance;
+exact continuation of the same route;
+reconstruction from public inheritance;
 clean reset.
 ```
 
-Они не эквивалентны. Continuation state не становится knowledge или authority.
+They are not equivalent. Continuation state does not become knowledge or authority.
 
 ## A7.7. Governance Profile
 
-Integration описывается вектором:
+An integration is described by a vector:
 
 ```text
 Observation: absent | self-reported | host-observed | independently observed;
@@ -1207,119 +1278,119 @@ Enforcement: absent | advisory | interceptable | enforced;
 Supervision: absent | self-monitored | watchdog-observed | independently supervised.
 ```
 
-Policy может свести профиль к grade для конкретного action class, но Architecture не вводит универсальный scalar. Claim не сильнее релевантной weakest axis.
+Policy may reduce the profile to a grade for a specific action class, but the Architecture defines no universal scalar. A claim is no stronger than its relevant weakest axis.
 
-## A7.8. Effective context и внешняя metacognition
+## A7.8. Effective Context and External Metacognition
 
-Для каждого важного route/task family поддерживается Effective Context Profile и Safe Operating Envelope. Полный dependency set профиля задаётся Capability Registry A11.3; изменение любой load-bearing зависимости делает профиль provisional.
+Each material route and task family maintains an Effective Context Profile and Safe Operating Envelope. The Capability Registry in A11.3 defines the full dependency set; a change to any load-bearing dependency makes the profile provisional.
 
-Governor/Watchdog вычисляют внешние признаки:
+The Governor and Watchdog compute external signals:
 
 ```text
-coverage — где understanding/evidence достаточно, thin или blind;
-novelty — насколько task выходит за проверенное inheritance;
-danger — hotspots, failures и irreversible boundaries;
-calibration — насколько predictions и decisions совпадают с outcomes;
-integration confidence — какие observations и enforcement реально доступны.
+coverage — where understanding and evidence are sufficient, thin, or blind;
+novelty — how far the task lies outside verified inheritance;
+danger — hotspots, failures, and irreversible boundaries;
+calibration — how well predictions and decisions match outcomes;
+integration confidence — which observations and enforcement are actually available.
 ```
 
-Это не чтение мыслей модели и не единый understanding score.
+This is neither mind reading nor a single understanding score.
 
-## A7.9. Context economy
+## A7.9. Context Economy
 
-Agent Work Unit допускается к route только тогда, когда в его Safe Operating Envelope помещаются: current goal/acceptance, применимые Intent/Hard Boundaries, contract текущей capability, one-hop dependencies, exact evidence, инструменты/instructions и достаточный reasoning/review margin. Nominal context maximum не является основанием отдать agent целую систему. Если decision-sufficient workset не помещается, задача декомпозируется, dependency view компилируется либо выбирается доказанно более подходящий route.
+An Agent Work Unit is admitted to a route only when its Safe Operating Envelope can contain the current goal and acceptance criteria, applicable Intent and Hard Boundaries, the current capability contract, one-hop dependencies, exact evidence, tools and instructions, and sufficient reasoning and review margin. Nominal context maximum does not justify assigning an agent the entire system. If the decision-sufficient workset does not fit, decompose the task, compile a dependency view, or select a demonstrably better route.
 
-Architecture не превращает текущий effective context в постоянный лимит Module. Размер workset и Module является Empirical Profile: он может меняться с model, harness, tools, task family и качеством projections.
+The Architecture does not turn the current effective context into a permanent Module limit. Workset and Module size are Empirical Profiles that may change with the model, harness, tools, task family, and projection quality.
 
-После correctness измеряются reconstruction cost, saved exploration, repeated context, latency, cost, human attention и missing-context regret. Noncritical injection желательно token-negative: она должна заменять более дорогую самостоятельную ориентацию, а не просто добавлять текст. Этот показатель не оправдывает потерю decision-relevant distinctions.
+After correctness, measure reconstruction cost, avoided exploration, repeated context, latency, cost, human attention, and missing-context regret. Noncritical injection should be token-negative: it should replace more expensive independent orientation rather than merely add text. This metric never justifies losing decision-relevant distinctions.
 
 ## A7.10. Skills
 
-Skill должен быть коротким:
+A Skill should be concise:
 
 ```text
 trigger;
 intent;
 immediate action;
-required writeback/output;
-stop/escalation;
-where-not-apply;
+required writeback or output;
+stop or escalation;
+where not to apply;
 challenge path.
 ```
 
-Deep semantics живут в Architecture, state, contracts и tools. Skill не заставляет agent администрировать Memory OS и не является enforcement boundary. Для Main Agent базовый instruction kernel сводится к пяти действиям: синхронизировать material state, сообщать существенные observation/decision/failure/outcome, действовать в видимой authority, проверять перед claim о завершении, challenge/escalate false block. Конфликтующие instructions/Skills становятся явным state и разрешаются по source, authority, scope и Intent, а не по порядку текста или последнему сообщению.
+Deep semantics live in the Architecture, state, contracts, and tools. A Skill neither forces an agent to administer Memory OS nor serves as an enforcement boundary. For the Main Agent, the basic instruction kernel reduces to five actions: synchronize material state; report material observations, decisions, failures, and outcomes; act within visible authority; verify before claiming completion; challenge or escalate a false block. Conflicting instructions or Skills become explicit state and are resolved by source, authority, scope, and Intent—not by text order or the latest message.
 
-**ARCH-SKL-01 — Instructions are intent-dense and recovery-oriented.** Мало слов, одно значение, ясный следующий шаг, понятный выход из false block.
+**ARCH-SKL-01 — Instructions are intent-dense and recovery-oriented.** Few words, one meaning, a clear next step, and a clear exit from a false block.
 
 ---
 # A8. Watchdog
 
-## A8.1. Назначение
+## A8.1. Purpose
 
-Watchdog — отдельный daemon в независимом failure domain. Он работает непрерывно и независимо **в течение каждого заявленного активного интервала ELIOT**: пока существует observable Session/agent job, активная работа в зарегистрированном WorkScope, maintenance/recovery operation, внешний effect под supervision либо явно включённая пользователем supervision policy. Если ELIOT не используется и нет такой обязанности, Watchdog и остальные процессы могут остановиться после сохранения observation cursors, unresolved control state и future wake intent. Это не ослабление supervision: система заявляет coverage только для фактически наблюдаемого активного интервала и явно показывает blind gaps.
+Watchdog is a separate daemon in an independent failure domain. It operates continuously and independently **during every declared active ELIOT interval**: while there is an observable Session or agent job, active work in a registered WorkScope, a maintenance or recovery operation, an external effect under supervision, or a supervision policy explicitly enabled by the user. When ELIOT is unused and no such obligation exists, Watchdog and the other processes may stop after preserving observation cursors, unresolved control state, and future wake intent. This does not weaken supervision: the system claims coverage only for the active interval it actually observes and exposes blind gaps explicitly.
 
-Он наблюдает, работает ли контур ELIOT так, как заявлено:
+It observes whether the ELIOT contour operates as declared:
 
 ```text
-живы ли Kernel, Governor, Doctor, hooks и integrations;
-видит ли ELIOT действия агента;
-поступают ли observations и outcomes;
-не повторяется ли один failure без нового evidence;
-не обходится ли canonical path;
-не растут ли queue pressure, stale state и repair loops;
-не появился ли security/injection/exfiltration signal;
-не расходятся ли Architecture, Implementation и runtime.
+whether Kernel, Governor, Doctor, hooks, and integrations are alive;
+whether ELIOT can observe agent actions;
+whether observations and outcomes are arriving;
+whether one failure repeats without new evidence;
+whether the canonical path is bypassed;
+whether queue pressure, stale state, or repair loops are growing;
+whether a security, injection, or exfiltration signal appeared;
+whether Architecture, Implementation, and runtime diverge.
 ```
 
-Watchdog не решает project semantics, task goal, factual conflict, policy или completion.
+Watchdog does not decide project semantics, task goal, factual conflicts, policy, or completion.
 
-**ARCH-WDG-01 — Independent supervision.** Хотя бы часть liveness, process, workspace и integration activity наблюдается вне self-report Governor и основного агента на всём интервале, для которого ELIOT заявляет independent supervision. Observable use активирует этот контур; вне активного интервала отсутствие запущенного Watchdog не изображается как наблюдение или coverage.
+**ARCH-WDG-01 — Independent supervision.** At least part of liveness, process, workspace, and integration activity is observed outside Governor and primary-agent self-report throughout every interval for which ELIOT claims independent supervision. Observable use activates this contour; outside an active interval, an inactive Watchdog is not presented as observation or coverage.
 
-## A8.2. Гибридная структура
+## A8.2. Hybrid Structure
 
-### Deterministic layer
+### Deterministic Layer
 
-Во время активного supervised interval непрерывно и дёшево проверяет:
+During an active supervised interval, it continuously and cheaply checks:
 
 ```text
-process/heartbeat;
-hook cadence и sequence gaps;
-workspace/filesystem activity;
-protected process/path activity;
-queue, storage и budget pressure;
-module health и restart history;
-version/config/plugin registration;
-authority epochs и stale owners;
+processes and heartbeats;
+hook cadence and sequence gaps;
+workspace and filesystem activity;
+protected process and path activity;
+queue, storage, and budget pressure;
+Module health and restart history;
+version, configuration, and plugin registration;
+authority epochs and stale owners;
 telemetry completeness.
 ```
 
 ### Watchdog Agents
 
-Запускаются кратковременно для конкретного вопроса:
+They run briefly for a specific question:
 
 ```text
-объяснить anomaly;
-проверить conformance;
-проанализировать repeated failure;
-провести security audit;
-сформировать probe или repair alternatives;
-подготовить concise brief агенту или человеку.
+explain an anomaly;
+check conformance;
+analyze a repeated failure;
+perform a security audit;
+form probe or repair alternatives;
+prepare a concise brief for an agent or person.
 ```
 
-Они используют дешёвые модели по human-approved policy. Для high-impact uncertainty Watchdog может вызвать route другого vendor/family или Concilium, но не голосование.
+They use inexpensive models under human-approved policy. For high-impact uncertainty, Watchdog may invoke a route from another vendor or model family, or Concilium—but not voting.
 
-## A8.3. Signal, Problem и Incident
+## A8.3. Signal, Problem, and Incident
 
 ```text
-Signal — observed deviation;
-Problem State — durable управляемая проблема;
-Incident — тяжёлая проблема integrity, authority, security,
-           critical telemetry или опасного unresolved effect.
+Signal — an observed deviation;
+Problem State — a durable governed problem;
+Incident — a severe problem involving integrity, authority, security,
+           critical telemetry, or a dangerous unresolved effect.
 ```
 
-Model assessment не открывает blocker/Incident самостоятельно. Это делает deterministic rule, policy или authorized Human decision.
+A model assessment cannot open a blocker or Incident by itself. A deterministic rule, policy, or authorized Human decision does so.
 
-Signal сохраняет evidence и может быть:
+A Signal preserves evidence and may be:
 
 ```text
 informational;
@@ -1328,14 +1399,14 @@ blocking obligation;
 incident candidate.
 ```
 
-Processing, delivery и resolution независимы. Acknowledgement не закрывает проблему.
+Processing, delivery, and resolution are independent. Acknowledgement does not close a problem.
 
-## A8.4. Контроль взаимодействия агента с ELIOT
+## A8.4. Supervising Agent–ELIOT Interaction
 
-Для Material task ожидается Interaction Heartbeat:
+A Material task expects an Interaction Heartbeat:
 
 ```text
-session/task sync;
+session or task sync;
 context boundary;
 action intent;
 material tool outcome;
@@ -1344,162 +1415,165 @@ verification;
 finish attempt.
 ```
 
-Если agent продолжает изменять workspace, но observations исчезают, Watchdog:
+If an agent continues changing the workspace while observations disappear, Watchdog:
 
 ```text
-фиксирует gap;
-понижает supervision evidence;
-требует resync;
-ограничивает выдаваемую ELIOT authority и verified finish для зависимой high-impact работы; физически останавливает внешний effect только там, где это допускает фактическая Enforcement axis;
-при устойчивой проблеме уведомляет Human.
+records the gap;
+downgrades supervision evidence;
+requires resynchronization;
+limits ELIOT-issued authority and verified finish for dependent high-impact work;
+physically stops an external effect only where the actual Enforcement axis permits it;
+notifies the Human when the problem persists.
 ```
 
-Deterministic layer фиксирует observable divergence. Вывод о том, сохранён ли заявленный Intent, является fallible assessment Watchdog Agent/Main Agent/Human и не создаёт authority сам по себе. Отклонение от Skill или cadence является Signal, а не автоматическим нарушением, если task evidence и recovery остаются достаточными.
+The deterministic layer records observable divergence. Whether declared Intent remains preserved is a fallible assessment by a Watchdog Agent, Main Agent, or Human and creates no authority by itself. Departure from a Skill or cadence is a Signal, not an automatic violation, when task evidence and recovery remain sufficient.
 
-**ARCH-WDG-02 — Watchdog supervises preservation of declared intent, observable outcomes, security and recovery.** Его цель — обнаружить потерю управления и качества, а не заставить агента исполнять церемонию или стать semantic oracle.
+**ARCH-WDG-02 — Watchdog supervises preservation of declared intent, observable outcomes, security, and recovery.** Its purpose is to detect loss of control and quality, not to enforce ceremony or become a semantic oracle.
 
-## A8.5. Security supervision
+## A8.5. Security Supervision
 
-Watchdog отслеживает:
+Watchdog monitors:
 
 ```text
-prompt/tool/memory injection;
-authority laundering через summary или tool echo;
-необычную массовую перезапись memory;
-попытку прямой записи в storage;
-remote query с exfiltration intent;
+prompt, tool, or memory injection;
+authority laundering through a summary or tool echo;
+unusual bulk rewriting of memory;
+an attempt to write directly to storage;
+a remote query with exfiltration intent;
 secret exposure;
-poisoned source и resurrection after restore;
-невидимую смену model/provider/tool definition.
+a poisoned source or resurrection after restore;
+an invisible change of model, provider, or Tool Definition.
 ```
 
-Он оценивает source/effect risk, но не присваивает epistemic truth.
+It assesses source and effect risk, but does not assign epistemic truth.
 
-## A8.6. Recovery и escalation
+## A8.6. Recovery and Escalation
 
-При отказе Module или repeated failure Watchdog не повторяет одну команду бесконечно. Он меняет подход:
+After a Module failure or repeated failure, Watchdog does not repeat one command indefinitely. It changes approach:
 
 ```text
-другая diagnostic hypothesis;
-другой tool или observation route;
-другая model/vendor;
-bounded adversarial audit;
-alternate Module/route;
-quarantine и Human escalation.
+a different diagnostic hypothesis;
+a different tool or observation route;
+a different model or vendor;
+a bounded adversarial audit;
+an alternate Module or route;
+quarantine and Human escalation.
 ```
 
-Критическая информация доставляется основному агенту и Human Control Plane как Diagnostic Brief: symptom, evidence, impact, attempted repairs, unknowns и next safe action.
+Critical information is delivered to the primary agent and Human Control Plane as a Diagnostic Brief: symptom, evidence, impact, attempted repairs, unknowns, and the next safe action.
 
 ---
 
 # A9. Dreamer
 
-## A9.1. Что такое Dreamer
+## A9.1. What Dreamer Is
 
-Dreamer — отдельный supervised AI service/server. Он использует большую LLM, short-lived agents и при необходимости swarm там, где deterministic processing недостаточно.
+Dreamer is a separate supervised AI service or server. It uses a large LLM, short-lived agents, and, when necessary, a swarm where deterministic processing is insufficient.
 
-Dreamer — не:
+Dreamer is not:
 
 ```text
 Memory OS;
 Governor;
-canonical writer;
-Researcher acquisition layer;
-universal supervisor;
-источник factual truth;
-владелец Architecture, policy или completion;
-автономный распорядитель денег.
+a canonical writer;
+the Researcher acquisition layer;
+a universal supervisor;
+a source of factual truth;
+the owner of Architecture, policy, or completion;
+an autonomous controller of spending.
 ```
 
-Постоянной является сервисная роль и её contract, а не запущенный процесс или LLM-loop. Dreamer demand-start-ится для active query/job/maintenance obligation и может быть остановлен вместе с ELIOT вне active interval. Стандартный job loop:
+The persistent element is the service role and its contract, not a continuously running process or LLM loop. Dreamer starts on demand for an active query, job, or maintenance obligation and may stop with ELIOT outside an active interval. Standard job loop:
 
 ```text
-request/problem
-→ bounded evidence bundle и State Fence
-→ route/budget/privacy decision
-→ one agent или swarm
+request or problem
+→ bounded evidence bundle and State Fence
+→ route, budget, and privacy decision
+→ one agent or swarm
 → structured candidate + lineage + uncertainty
-→ form/provenance/loss checks
-→ delivery Main Agent/Human/Governor
-→ отдельный governed transition либо rejection.
+→ form, provenance, and loss checks
+→ delivery to Main Agent, Human, or Governor
+→ separate governed transition or rejection.
 ```
 
-Dreamer всегда возвращает candidate. Governor может автоматически принять по human-approved policy только механически проверяемое, обратимое изменение derived projection, organization или activation metadata, если оно сохраняет sources, epistemic support, dissent и meaning, не создаёт hard block и оставляет undo path. Semantic relation/merge, causal explanation, procedure, conflict resolution, изменение support/Current Epistemic Position, material forgetting, policy, authority, privacy и promotion требуют отдельного уполномоченного решения или verifier-backed transition.
+Dreamer always returns a candidate. Under human-approved policy, the Governor may automatically accept only mechanically verifiable, reversible changes to derived projection, organization, or activation metadata when sources, epistemic support, dissent, and meaning are preserved; no hard block is created; and an undo path remains. Semantic relations or merges, causal explanations, procedures, conflict resolution, changes to support or Current Epistemic Position, material forgetting, policy, authority, privacy, and promotion require a separate authorized decision or verifier-backed transition.
 
-**ARCH-DRM-01 — Dreamer is an instrumented intelligence service.** Он расширяет hypothesis space и организует знания, но возвращает candidates, а не authority.
+**ARCH-DRM-01 — Dreamer is an instrumented intelligence service.** It expands the hypothesis space and organizes knowledge, but returns candidates rather than authority.
 
-## A9.2. Основные режимы
+## A9.2. Primary Modes
 
-### Background curation
+### Background Curation
 
-Dreamer анализирует Observation Candidates, episodes, relations, contradictions, duplicates, failures и procedures. Background jobs являются selective, batched, checkpointed и problem-driven; один observation не создаёт один LLM call. Он предлагает:
+Dreamer analyzes Observation Candidates, episodes, relations, contradictions, duplicates, failures, and procedures. Background jobs are selective, batched, checkpointed, and problem-driven; one observation does not create one LLM call. It proposes:
 
 ```text
-classification и relation candidates;
+classification and relation candidates;
 episode reconstruction;
 concept refinement;
-duplicate/false-merge repair;
+duplicate or false-merge repair;
 Failure Fingerprints;
-procedure/Skill candidates;
-reconsolidation и forgetting candidates;
+procedure or Skill candidates;
+reconsolidation and forgetting candidates;
 Memory Repair Candidates.
 ```
 
-### Interactive orientation
+### Interactive Orientation
 
-Main Agent или Human может спросить:
+A Main Agent or Human may ask:
 
 ```text
-что ELIOT знает по этой задаче;
-какие решения, failures и alternatives связаны с областью;
-какие contradictions и gaps существуют;
-какие ARCH principles затронуты;
-что мы, вероятно, пропускаем;
-какой inquiry даст наибольшую пользу.
+what ELIOT knows about this task;
+which decisions, failures, and alternatives relate to this area;
+which contradictions and gaps exist;
+which ARCH principles are affected;
+what we are likely missing;
+which inquiry offers the greatest value.
 ```
 
-Dreamer возвращает problem-oriented packet, а не SQL/graph dump.
+Dreamer returns a problem-oriented packet, not a SQL or graph dump.
 
 ### Clarification
 
-Dreamer может задать активному агенту короткий вопрос, если observation существенно, но непонятно:
+Dreamer may ask the active agent one concise question when an observation is material but unclear:
 
 ```text
-что именно наблюдалось;
-каков scope;
-это fact или interpretation;
-какой outcome связан с decision;
-когда опыт снова применим.
+what exactly was observed;
+what the scope is;
+whether it is fact or interpretation;
+which outcome is linked to the decision;
+when the experience becomes applicable again.
 ```
 
-Человека беспокоят только вопросы, где требуется human-owned decision: goal/value, approval, privacy/security, необратимый effect, выход за cost envelope или high-impact ambiguity; а также случаи, когда Human явно запросил участие.
+A Human is interrupted only when a human-owned decision is required: goal or value, approval, privacy or security, an irreversible effect, cost-envelope expansion, or high-impact ambiguity; or when the Human explicitly requested participation.
 
-### Research synthesis
+### Research Synthesis
 
-Dreamer может:
+Dreamer may:
 
 ```text
-формулировать research question;
-строить rival hypotheses;
-сравнивать sources;
-искать contradictions и gaps;
-запускать micro-audits и swarm;
-синтезировать Research Brief;
-предлагать discriminative experiments.
+formulate a research question;
+build rival hypotheses;
+compare sources;
+find contradictions and gaps;
+run micro-audits and swarms;
+synthesize a Research Brief;
+propose discriminative experiments.
 ```
 
-Он работает над governed sources и bounded source bundles. Acquisition, parsing, OCR, bulk logs/documents, indexing и RAG принадлежат будущему Researcher Module. До его появления raw corpora не записываются в Cognitive Inheritance напрямую: ELIOT сохраняет bounded observations, source/artifact handles и необходимые exact excerpts.
+It works over governed sources and bounded source bundles. Acquisition, parsing, OCR, bulk logs or documents, indexing, and RAG are governed by Researcher, which defines protocol, source admissibility, and coverage discipline; pluggable providers perform the physical work—local search provider, external research federation, or manually supplied source. An unavailable provider is a coverage gap, not a Researcher failure. Raw corpora are not written directly into Cognitive Inheritance: ELIOT preserves bounded observations, source or artifact handles, and necessary exact excerpts.
 
-**ARCH-DRM-04 — Researcher acquires; Dreamer interprets; Governor governs.** Слияние acquisition, synthesis и canonical promotion в одном owner создаёт неконтролируемый data/influence path.
+Research depth is a selected rigor level, not a separate function. The same Researcher serves a quick lookup and a full investigation; the task's Evidence Grade defines the difference.
 
-## A9.3. Dreamer и Concilium
+**ARCH-DRM-04 — Researcher acquires; Dreamer interprets; Governor governs.** Combining acquisition, synthesis, and canonical promotion under one owner creates an uncontrolled data and influence path.
 
-Dreamer не сглаживает конфликт в один narrative. Его хороший результат содержит:
+## A9.3. Dreamer and Concilium
+
+Dreamer does not smooth conflict into one narrative. A good result contains:
 
 ```text
 strongest operational model;
 rival models;
-independent и shared evidence;
+independent and shared evidence;
 source dependence;
 strong objections;
 unknowns;
@@ -1507,38 +1581,38 @@ discriminative next steps;
 conditions of invalidation.
 ```
 
-**ARCH-DRM-02 — Dreamer expands and tests the hypothesis space.** Его ценность — не красивый summary, а обнаружение hidden relations, alternatives и полезного inquiry.
+**ARCH-DRM-02 — Dreamer expands and tests the hypothesis space.** Its value lies not in an elegant summary, but in finding hidden relations, alternatives, and useful inquiry.
 
-## A9.4. Запуск agents и swarm
+## A9.4. Launching Agents and Swarms
 
-Dreamer запускает agents только через Agent Coordinator и human-approved policy:
+Dreamer launches agents only through Agent Coordinator and human-approved policy:
 
 ```text
-allowed models/providers;
-local/external routes;
+allowed models and providers;
+local and external routes;
 data classes;
 job families;
 cost envelope;
-fan-out/depth;
-deadline и stop conditions;
-independent review requirements.
+fan-out and depth;
+deadline and stop conditions;
+independent-review requirements.
 ```
 
-Dreamer не запускает swarm «по собственному желанию». Если expected value не оправдывает стоимость, он предлагает query или небольшой job.
+Dreamer does not launch a swarm at its own discretion. When expected value does not justify the cost, it proposes a query or small job.
 
-**ARCH-DRM-03 — Dreamer compute is human-governed.** Интеллектуальная глубина регулируется budget, privacy и explicit automation policy.
+**ARCH-DRM-03 — Dreamer compute is human-governed.** Intellectual depth is controlled by budget, privacy, and explicit automation policy.
 
-## A9.5. Interface и outputs
+## A9.5. Interfaces and Outputs
 
-Теоретически обязательны три поверхности:
+Three surfaces are theoretically required:
 
 ```text
 Main Agent ↔ Dreamer;
 Human ↔ Dreamer;
-Watchdog/system jobs ↔ Dreamer.
+Watchdog or system jobs ↔ Dreamer.
 ```
 
-Типовые запросы:
+Typical requests:
 
 ```text
 Orientation Query;
@@ -1550,7 +1624,7 @@ Conflict Analysis;
 Memory Repair Request.
 ```
 
-Типовые результаты:
+Typical results:
 
 ```text
 Dream Packet;
@@ -1561,214 +1635,213 @@ Curation Candidate;
 Conflict Brief.
 ```
 
-Каждый результат содержит question, WorkScope/State Fence, evidence handles, model synthesis отдельно от evidence, rivals, unknowns, coverage gaps, route/cost и invalidation condition.
+Every result includes the question, WorkScope and State Fence, evidence handles, model synthesis separated from evidence, rivals, unknowns, coverage gaps, route and cost, and an invalidation condition.
 
 ## A9.6. Remote Dreamer
 
-Будущий online access допускается только как bounded question surface. Remote client не получает:
+Future online access is permitted only as a bounded question surface. A remote client receives no:
 
 ```text
 database credentials;
 raw canonical browsing;
-local filesystem/tools;
+local filesystem or tools;
 write or agent-launch authority;
 unfiltered operational telemetry.
 ```
 
-Gateway аутентифицирует principal, ограничивает WorkScope/query class, фильтрует inputs/outputs, не исполняет embedded instructions и передаёт security signals Watchdog.
+The gateway authenticates the principal, limits WorkScope and query class, filters inputs and outputs, does not execute embedded instructions, and forwards security signals to Watchdog.
 
 ---
+# A10. Harness, Agents, Concilium, and Swarm
 
-# A10. Harness, agents, Concilium и swarm
+## A10.1. Agent Interaction Loop
 
-## A10.1. Agent interaction loop
-
-Это логический control loop, а не синхронный checklist. Harness автоматически выполняет routine capture, state synchronization и admission; agent прерывается только у material uncertainty, conflict, missing authority/verifier или failure boundary.
+This is a logical control loop, not a synchronous checklist. The Harness performs routine capture, state synchronization, and admission automatically; the agent is interrupted only at a boundary of material uncertainty, conflict, missing authority or verifier, or failure.
 
 ```text
-1. Attach session и WorkScope.
-2. Восстановить task/commitments и Active View.
-3. Выбрать inquiry или action.
-4. Зафиксировать expected observable для Material causal decision.
-5. Получить применимую authority.
-6. Выполнить action через Harness.
-7. Записать observations/effects.
-8. Выполнить verifier или сохранить unknown.
-9. Обновить task, memory и Theory Portfolio.
-10. Завершить одним честным finish state.
+1. Attach the session and WorkScope.
+2. Restore task, commitments, and Active View.
+3. Select an inquiry or action.
+4. Record the expected observable for a Material causal decision.
+5. Obtain applicable authority.
+6. Execute the action through the Harness.
+7. Record observations and effects.
+8. Run the verifier or preserve the unknown.
+9. Update task, memory, and Theory Portfolio.
+10. End in one honest finish state.
 ```
 
-На host с hooks этот loop реактивен. На tool-only host ELIOT использует доступные boundaries, obligations и finish discipline, не изображая полный control. Model, tool или swarm call оправдан, если ожидается новый evidence, изменение решения, artifact или proof; иначе он является лишней нагрузкой. Отклонённая write/action attempt не исчезает молча: ответ показывает причину, что сохранено, можно ли retry, какой repair/probe/authority нужен и какое действие разрешено следующим.
+On a host with hooks, this loop is reactive. On a tool-only host, ELIOT uses available boundaries, obligations, and finish discipline without pretending to have full control. A model, tool, or swarm call is justified when it is expected to produce new evidence, change a decision, create an artifact, or provide proof; otherwise it is unnecessary load. A rejected write or action attempt does not disappear silently: the response states the reason, what was preserved, whether retry is possible, which repair, probe, or authority is required, and what action is allowed next.
 
-## A10.2. Impact и authority
+## A10.2. Impact and Authority
 
-Impact определяется effect, а не намерением агента:
+Impact is determined by effect, not by the agent's intent:
 
 ```text
-Observe — нет внешнего изменения;
-Reversible — малый локальный откат;
-Material — изменение поведения, нескольких ресурсов или внешнего state;
-Critical — security, schema, credentials, irreversible/high-blast effect;
-Forbidden — запрещено действующей Hard Boundary/Policy.
+Observe — no external change;
+Reversible — small local rollback;
+Material — changes behavior, several resources, or external state;
+Critical — security, schema, credentials, or an irreversible or high-blast effect;
+Forbidden — prohibited by an active Hard Boundary or Policy.
 ```
 
-Main Agent предлагает класс. Governor выводит его из registered tool/effect profiles и affected resources. Неопределённость ведёт к probe или временному более осторожному классу, но не к бесконечному запрету.
+The Main Agent proposes a class. The Governor derives it from registered tool and effect profiles and affected resources. Uncertainty leads to a probe or temporarily more conservative class, not an indefinite prohibition.
 
-**ARCH-ACT-01 — Effect defines impact and authority.** Риск определяется реальными affected resources, reversibility, observability и external consequences, а не уверенным rationale агента.
+**ARCH-ACT-01 — Effect defines impact and authority.** Risk follows actual affected resources, reversibility, observability, and external consequences—not the agent's confident rationale.
 
-## A10.3. Action model
+## A10.3. Action Model
 
-Для Material/Critical action должна существовать достаточная внешняя модель:
+A Material or Critical action requires a sufficient external model:
 
 ```text
-intent и affected scope;
+intent and affected scope;
 preconditions;
-expected effect/observable;
-invariants и known failures;
-rollback/compensation;
+expected effect or observable;
+invariants and known failures;
+rollback or compensation;
 verifier;
-stop/revision condition.
+stop or revision condition.
 ```
 
-Она может собираться автоматически из existing state. Архитектура не требует ритуального эссе от агента. Decision rationale, alternatives и revisit condition фиксируются у decision boundary; позднее объяснение хранится как retrospective hypothesis, а не как исходная причина.
+Existing state may assemble it automatically. The Architecture does not require a ritual essay from the agent. Decision rationale, alternatives, and revisit condition are recorded at the decision boundary; a later explanation is stored as a retrospective hypothesis, not as the original reason.
 
-Contract depth образует gradient:
+Contract depth forms a gradient:
 
 ```text
-Primitive — observation, read, reversible probe;
-Standard — Material action с scope, expected outcome и verifier;
-Deep/Audit — Critical, novel или highly ambiguous work с rivals, independent challenge и recovery plan.
+Primitive — observation, read, or reversible probe;
+Standard — Material action with scope, expected outcome, and verifier;
+Deep/Audit — Critical, novel, or highly ambiguous work with rivals, independent challenge, and recovery plan.
 ```
 
-Глубина следует impact и uncertainty, а не привычке писать максимальный контракт для любой команды.
+Depth follows impact and uncertainty, not a habit of writing the maximum contract for every command.
 
-## A10.4. Делегирование
+## A10.4. Delegation
 
-Каждый **Agent Work Unit** получает:
+Every **Agent Work Unit** receives:
 
 ```text
-одну основную causal property и одного primary owner;
-точный question, expected artifact или evidence;
-связь с current goal/acceptance;
-frozen contract revision и применимые Architecture/Implementation handles;
-минимально достаточный context: one-hop dependencies, known failures и exact anchors;
-read/write/impact scope, allowed effects и explicit non-goals;
-старое failing behavior, representation gap или missing capability;
-discriminator/verifier и proof ceiling;
-role, authority, State Fence, budget, checkpoint, cancellation и stop condition;
-structured output и integration owner.
+one primary causal property and one primary owner;
+an exact question and expected artifact or evidence;
+a link to the current goal and acceptance criteria;
+a frozen contract revision and applicable Architecture and Implementation handles;
+minimally sufficient context: one-hop dependencies, known failures, and exact anchors;
+read, write, and impact scope, allowed effects, and explicit non-goals;
+the old failing behavior, representation gap, or missing capability;
+a discriminator or verifier and proof ceiling;
+role, authority, State Fence, budget, checkpoint, cancellation, and stop condition;
+a structured output and integration owner.
 ```
 
-«Маленькая работа» определяется причинной замкнутостью, а не количеством файлов или строк. Если один дефект проходит через несколько owners, он раскладывается на contract/evidence unit, независимые Module units, edge/integration unit и Product Pulse; одному agent не выдаётся скрытый cross-system mandate.
+"Small work" means causal closure, not a small number of files or lines. If one defect crosses several owners, decompose it into a contract or evidence unit, independent Module units, an edge or integration unit, and a Product Pulse; never give one agent a hidden cross-system mandate.
 
-Agent может вернуть Contract Challenge, если owner выбран неверно, discriminator измеряет proxy, contract противоречив или требуемый proof недостижим в выданном scope. Такой challenge не считается отказом от работы и направляется Task Controller/Concilium.
+An agent may return a Contract Challenge when the selected owner is wrong, the discriminator measures a proxy, the contract is contradictory, or the required proof is unattainable within the granted scope. A challenge is not refusal and is routed to the Task Controller or Concilium.
 
-В одной active task ровно один Task Controller владеет current plan revision на Authority Epoch. Один mutable artifact scope имеет одного writer; read-only research/audit lanes могут быть параллельными. Workers не интегрируют собственные результаты автоматически: отдельный integration owner revalidates State Fence, affected edges и product outcome. Shared mutable plan не существует неявно.
+Within one active task, exactly one Task Controller owns the current plan revision for the Authority Epoch. One mutable artifact scope has one writer; read-only research or audit lanes may run in parallel. Workers do not integrate their own results automatically: a separate integration owner revalidates the State Fence, affected edges, and product outcome. No shared mutable plan exists implicitly.
 
-Goals, instructions и constraints сохраняют source, authority, scope и status: active, superseded, expired или conflicting. Новая инструкция не накапливается поверх старой молча; unresolved conflict ограничивает только зависимые actions и создаёт interruption/reframing boundary.
+Goals, instructions, and constraints preserve source, authority, scope, and status: active, superseded, expired, or conflicting. A new instruction is not silently layered over an old one; an unresolved conflict limits only dependent actions and creates an interruption or reframing boundary.
 
-## A10.5. Concilium и конфликты
+## A10.5. Concilium and Conflicts
 
-Conflict локален. Он блокирует только transitions, которые зависят от unresolved issue.
+A conflict is local. It blocks only transitions that depend on the unresolved issue.
 
-Виды:
+Types:
 
 ```text
 factual;
-scope/time;
-semantic/causal;
-state/write;
+scope or time;
+semantic or causal;
+state or write;
 authority;
 Watchdog ↔ Agent;
 Architecture ↔ Implementation;
-testimony/mental-state.
+testimony or mental state.
 ```
 
-Conflict Directive показывает observations, candidates, common lineage, unresolved residue, полезный probe, decision owner и временно допустимые actions.
+A Conflict Directive shows observations, candidates, common lineage, unresolved residue, a useful probe, decision owner, and temporarily admissible actions.
 
-Evidence и practical tests важнее consensus. Provisional decision допустим под explicit risk; dissent сохраняется с revision trigger.
+Evidence and practical tests outrank consensus. A provisional decision is permitted under explicit risk; dissent is preserved with a revision trigger.
 
-## A10.6. Agent swarm и конвейерная работа
+## A10.6. Agent Swarm and Pipeline Work
 
-Swarm используется, когда decomposition и ожидаемая дополнительная coverage оправдывают orchestration cost. Main Agent или Dreamer запрашивает его только через Agent Coordinator и применимую human policy. Model может предложить plan, но durable execution graph появляется только после проверки dependencies, ownership, effects, budgets, privacy, stop conditions и proof paths. Свободный group chat не является control plane.
+A swarm is used when decomposition and expected additional coverage justify orchestration cost. A Main Agent or Dreamer requests it only through Agent Coordinator and applicable human policy. A model may propose a plan, but a durable execution graph exists only after dependencies, ownership, effects, budgets, privacy, stop conditions, and proof paths are checked. Free-form group chat is not a control plane.
 
-ELIOT поддерживает как минимум два совместимых конвейера.
+ELIOT supports at least two compatible pipelines.
 
-Исследовательский:
+Research pipeline:
 
 ```text
-Map/Audit
-→ independent Challenge/Falsification
-→ Reduce/Synthesis
+Map or Audit
+→ independent Challenge or Falsification
+→ Reduce or Synthesis
 → decision or new inquiry
 → Verify.
 ```
 
-Инженерный:
+Engineering pipeline:
 
 ```text
-Contract/Evidence
-→ parallel Module/Capability work
-→ affected Edge/Integration proof
+Contract or Evidence
+→ parallel Module or Capability work
+→ affected Edge or Integration proof
 → Product Pulse
-→ promotion, rollback or Mechanism Review.
+→ promotion, rollback, or Mechanism Review.
 ```
 
-Main Agent может запускать сотни узких exact audits, затем отдельные challenge/synthesis/implementation branches; масштаб не отменяет bounded scope каждого Agent Work Unit. Первичный independent audit по возможности не получает sibling conclusions до собственной submission; disclosure поздних findings явно меняет Independence Profile.
+A Main Agent may launch hundreds of narrow exact audits, followed by separate challenge, synthesis, and implementation branches; scale never removes the bounded scope of each Agent Work Unit. When practical, a primary independent auditor does not receive sibling conclusions before submitting its own result; disclosure of later findings explicitly changes the Independence Profile.
 
-Swarm Plan задаёт objective, immutable work graph revision, budgets, privacy, routes, independence profile, WIP limits, stop conditions и aggregation/integration owners. Каждый worker получает minimum decision-sufficient packet:
+A Swarm Plan defines the objective, immutable work-graph revision, budgets, privacy, routes, independence profile, WIP limits, stop conditions, and aggregation and integration owners. Each worker receives a minimum decision-sufficient packet:
 
 ```text
 shared immutable root: goal, relevant Architecture, current epistemic position;
-role и exact work unit;
-one-hop contracts/relations и load-bearing evidence;
-allowed tools/effects, non-goals, verifier и stop condition;
+role and exact work unit;
+one-hop contracts and relations plus load-bearing evidence;
+allowed tools and effects, non-goals, verifier, and stop condition;
 just-in-time fired memory.
 ```
 
-Whole-project dump и полные transcripts других agents не являются default. Structured result возвращает artifacts, evidence, uncertainty, unresolved questions, proposed effects и Evidence Lineage; prose может быть artifact, но не заменяет эти поля.
+A whole-project dump and full transcripts of other agents are not defaults. A Structured Result returns artifacts, evidence, uncertainty, unresolved questions, proposed effects, and Evidence Lineage; prose may be an artifact but does not replace these fields.
 
-Confidence зависит от:
+Confidence depends on:
 
 ```text
 unique coverage;
 Evidence Lineage;
-independent observation/evaluation routes;
-разных failure domains;
-разных conceptual frames;
-сильных negative findings.
+independent observation and evaluation routes;
+different failure domains;
+different conceptual frames;
+strong negative findings.
 ```
 
-Сто agents на одном packet не создают сто подтверждений. Synthesis сохраняет dissent, minority findings и gaps; он не получает authority интегрировать artifact или объявлять truth.
+One hundred agents using one packet do not create one hundred confirmations. Synthesis preserves dissent, minority findings, and gaps; it gains no authority to integrate an artifact or declare truth.
 
-Partial verified results не теряются из-за падения одной ветви. Replanning заменяет только affected branches. История swarm сохраняется как trace, но epistemic support любой ветви остаётся defeasible и может быть отозван при stale scope, invalid verifier, poisoned shared root или зависимой Evidence Lineage.
+Partial verified results survive failure of one branch. Replanning replaces only affected branches. Swarm history remains a trace, but epistemic support for any branch remains defeasible and may be revoked after stale scope, invalid verifier, poisoned shared root, or dependent Evidence Lineage.
 
-**ARCH-SWM-01 — Swarm is a bounded, context-minimal evidence pipeline.** Каждый attempt выполняет определённую работу в проверяемом stage; swarm расширяет coverage и capability, но не становится collective truth, shared-chat control plane или value authority.
+**ARCH-SWM-01 — Swarm is a bounded, context-minimal evidence pipeline.** Each attempt performs defined work in a verifiable stage; a swarm expands coverage and capability but never becomes collective truth, a shared-chat control plane, or value authority.
 
-## A10.7. Long-running work
+## A10.7. Long-Running Work
 
-Работа на часы и недели живёт в durable state:
+Work lasting hours or weeks lives in durable state:
 
 ```text
-tasks и commitments;
+tasks and commitments;
 work graph;
 Durable Jobs;
 checkpoints;
-State Fences и Authority Epochs;
-Decision, Unknown, Failure и Artifact ledgers;
+State Fences and Authority Epochs;
+Decision, Unknown, Failure, and Artifact ledgers;
 Coordination Events;
-budgets и progress trends.
+budgets and progress trends.
 ```
 
-Assignments, claims, heartbeats, checkpoints, cancellations и results существуют как durable idempotent Coordination Events, связанные с work item, causal predecessor, State Fence и Authority Epoch. Retry использует ту же identity; reassignment сначала fence-ит прежнего owner.
+Assignments, claims, heartbeats, checkpoints, cancellations, and results exist as durable idempotent Coordination Events bound to the work item, causal predecessor, State Fence, and Authority Epoch. A retry uses the same identity; reassignment fences the previous owner first.
 
-Потеря agent context, coordinator или process не уничтожает подтверждённую работу. На reconciliation boundaries система пересматривает State Fences, open Problems/Conflicts, stalled branches, budgets, invalidated evidence и следующий safe action; Watchdog инициирует review по drift, а не только по timeout.
+Loss of agent context, coordinator, or process does not destroy confirmed work. At reconciliation boundaries, the system reviews State Fences, open Problems and Conflicts, stalled branches, budgets, invalidated evidence, and the next safe action; Watchdog initiates review on drift, not only timeout.
 
-**ARCH-SWM-02 — Swarm coordination survives agents and retries.** Координация durable, idempotent и epoch-fenced; process не является единственным носителем assignment или результата.
+**ARCH-SWM-02 — Swarm coordination survives agents and retries.** Coordination is durable, idempotent, and epoch-fenced; a process is not the sole carrier of an assignment or result.
 
-**ARCH-LONG-01 — Long work lives in durable state.** Session и model route являются сменяемыми исполнителями, а не единственным носителем plan, evidence и commitments.
+**ARCH-LONG-01 — Long work lives in durable state.** A session and model route are replaceable executors, not the sole carriers of plan, evidence, and commitments.
 
-## A10.8. Verification и finish
+## A10.8. Verification and Finish
 
 Finish states:
 
@@ -1783,310 +1856,308 @@ CANCELLED;
 SUPERSEDED.
 ```
 
-Только `VERIFIED_COMPLETE` называется выполненной задачей. Остальные состояния честно сохраняют artifacts, effects, gaps и continuation.
+Only `VERIFIED_COMPLETE` is called a completed task. Other states honestly preserve artifacts, effects, gaps, and continuation.
 
-Professional work подтверждается artifact, допустимым method/environment и соответствующим evaluator, а не правдоподобным текстом. Artifact может быть code, document, spreadsheet, report, image/video, GUI state, service или research result; proof соответствует его modality и required shape.
+Professional work is confirmed by an artifact, admissible method and environment, and an appropriate evaluator—not by plausible prose. An artifact may be code, document, spreadsheet, report, image or video, GUI state, service, or research result; proof matches its modality and required shape.
 
-**ARCH-FIN-01 — Completion is proof-bearing.** ELIOT помогает продвигаться при неполноте, но не превращает partial progress в done.
+**ARCH-FIN-01 — Completion is proof-bearing.** ELIOT supports progress under incompleteness but never turns partial progress into done.
 
 ---
+# A11. Human Control and System Configuration
 
-# A11. Human control и настройка системы
+## A11.1. Human Authority and Fallibility
 
-## A11.1. Human authority и fallibility
-
-Human задаёт values, goals, acceptable risk и legitimacy, но может:
-
-```text
-не знать фактов;
-менять мнение;
-иметь конфликтующие роли;
-не читать evidence;
-поддаваться automation bias;
-терять situational awareness.
-```
-
-Поэтому ELIOT не только сохраняет human authority, но и помогает clarify preferences, сравнить alternatives и восстановить state без активной модели.
-
-## A11.2. Первичная установка
-
-Trust root создаётся deterministic human interaction. Installation Survey обнаруживает возможные agents, harnesses, tools, IDE, model routes, adapters и verifiers безопасными metadata/version probes.
-
-Непроверенный executable не получает secrets или elevated authority.
-
-Setup спрашивает только решения, которые реально меняют privacy, cost, authority или доступ к внешним системам. Остальное получает понятные, обратимые и видимые defaults; advanced configuration остаётся optional.
-
-Пользователь выбирает:
+A Human defines values, goals, acceptable risk, and legitimacy, but may:
 
 ```text
-какие integrations включить;
-какие models/routes использовать для Main Agent, Workers, Auditors, Watchdog, Dreamer и evaluation;
-local/external data boundaries;
-job/task/period budgets;
-какие Dreamer/Watchdog jobs можно запускать автоматически;
-swarm fan-out/depth;
-кто может approve Critical actions;
-разрешён ли remote Dreamer.
+lack facts;
+change their mind;
+hold conflicting roles;
+fail to read evidence;
+succumb to automation bias;
+lose situational awareness.
 ```
 
-Setup Agent может объяснить варианты после создания trust root, но не создаёт authority и не записывает configuration без human confirmation.
+ELIOT therefore not only preserves human authority, but also helps clarify preferences, compare alternatives, and restore state without an active model.
+
+## A11.2. Initial Setup
+
+The trust root is created through deterministic human interaction. The Installation Survey discovers possible agents, harnesses, tools, IDEs, model routes, adapters, and verifiers through safe metadata and version probes.
+
+An unverified executable receives no secrets or elevated authority.
+
+Setup asks only for decisions that materially change privacy, cost, authority, or access to external systems. Everything else receives clear, reversible, visible defaults; advanced configuration remains optional.
+
+The user selects:
+
+```text
+which integrations to enable;
+which models and routes to use for Main Agent, Workers, Auditors, Watchdog, Dreamer, and evaluation;
+local and external data boundaries;
+job, task, and period budgets;
+which Dreamer and Watchdog jobs may run automatically;
+swarm fan-out and depth;
+who may approve Critical actions;
+whether Remote Dreamer is permitted.
+```
+
+A Setup Agent may explain choices after the trust root exists, but creates no authority and writes no configuration without human confirmation.
 
 ## A11.3. Capability Registry
 
-Registry хранит наблюдаемую способность:
+The Registry stores observed capability:
 
 ```text
-installation identity и version;
-transport, lifecycle, hooks и tool coverage;
-model route, cost, privacy и availability;
-competence/context profiles;
-verifier validity/freshness;
-failure-domain and evidence independence profile;
-known biases и failure signatures;
-health и allowed WorkScopes/principals.
+installation identity and version;
+transport, lifecycle, hooks, and tool coverage;
+model route, cost, privacy, and availability;
+competence and context profiles;
+verifier validity and freshness;
+failure-domain and evidence-independence profile;
+known biases and failure signatures;
+health and allowed WorkScopes and principals.
 ```
 
-Profile dependencies включают model/provider version, inference regime, harness, Tool Definitions, context policy, evaluator и relevant data distribution. Их изменение делает dependent profiles provisional до requalification.
+Profile dependencies include model and provider version, inference regime, harness, Tool Definitions, context policy, evaluator, and relevant data distribution. A change to any of them makes dependent profiles provisional until requalification.
 
 ## A11.4. ControlBoardView
 
-Одна canonical role-filtered projection используется Main Agent, Watchdog, Dreamer, Human UI и read-only API.
+One canonical, role-filtered projection serves the Main Agent, Watchdog, Dreamer, Human UI, and read-only API.
 
-Она показывает:
+It shows:
 
 ```text
-active tasks, plans, swarms и checkpoints;
-Current Epistemic Position, rivals и unknowns;
-conflicts и Critical Attention;
-verification и finish readiness;
+active tasks, plans, swarms, and checkpoints;
+Current Epistemic Position, rivals, and unknowns;
+conflicts and Critical Attention;
+verification and finish readiness;
 Governance Profile;
-modules, models, tools, storage и integration health;
-Problem/Incident, repair и recovery state;
-memory health и blind areas;
-cost/privacy state;
+Module, model, tool, storage, and integration health;
+Problem or Incident, repair, and recovery state;
+memory health and blind areas;
+cost and privacy state;
 Improvement Candidates;
-active goals, commitments и safe next action.
+active goals, commitments, and the safe next action.
 ```
 
-Human может inspect evidence, acknowledge/resolve attention, approve, pause/cancel/replan task или swarm, challenge rule, запустить Dreamer/Watchdog query и выполнить recovery action.
+A Human may inspect evidence; acknowledge or resolve attention; approve, pause, cancel, or replan a task or swarm; challenge a rule; launch a Dreamer or Watchdog query; and perform a recovery action.
 
 ## A11.5. Notifications
 
-Notifications имеют severity, owner, evidence, dedup, cooldown, acknowledgement и resolution state. Все unresolved Action-required/Critical items остаются в persistent inbox независимо от transient toast/channel.
+Notifications have severity, owner, evidence, deduplication, cooldown, acknowledgement, and resolution state. Every unresolved Action-required or Critical item remains in a persistent inbox regardless of a transient toast or channel.
 
 ```text
-Critical — integrity, security, unknown external effect, unrecoverable control loss;
-Action required — approval, blocked task, credential/integration failure;
-Warning — repeated agent failure, hook loss, queue pressure, stale backup/profile;
-Info — verified completion, onboarding, audit/research report.
+Critical — integrity, security, unknown external effect, or unrecoverable loss of control;
+Action required — approval, blocked task, or credential or integration failure;
+Warning — repeated agent failure, hook loss, queue pressure, or stale backup or profile;
+Info — verified completion, onboarding, or audit or research report.
 ```
 
-Доставка не равна решению. Alert fatigue и пропущенные уведомления измеряются.
+Delivery is not resolution. Alert fatigue and missed notifications are measured.
 
-**ARCH-HUM-01 — Human remains in control without constant micromanagement.** ELIOT автоматизирует ceremony, но сохраняет понятную картину, decision points и возможность вмешаться на любом этапе.
+**ARCH-HUM-01 — Human remains in control without constant micromanagement.** ELIOT automates ceremony while preserving a comprehensible picture, decision points, and the ability to intervene at any stage.
 
 ---
-# A12. Security, provenance и bounded influence
+# A12. Security, Provenance, and Bounded Influence
 
-## A12.1. Security assumes breach
+## A12.1. Security Assumes Breach
 
-ELIOT не предполагает, что prompt injection, poisoned memory, malicious tool definition или compromised model всегда будут обнаружены заранее.
+ELIOT does not assume that prompt injection, poisoned memory, a malicious Tool Definition, or a compromised model will always be detected in advance.
 
-Защита строится слоями:
+Defense is layered:
 
 ```text
 Hard Boundaries;
 buffering;
-разделение instruction/data/evidence/authority;
+separation of instruction, data, evidence, and authority;
 origin-bound provenance;
-ограничение allowed influence и effects;
+bounds on allowed influence and effects;
 multiple independent routes;
-quarantine и revocation;
-backup/restore и recovery;
+quarantine and revocation;
+backup, restore, and recovery;
 Watchdog observation;
 Human escalation.
 ```
 
-**ARCH-SEC-01 — Assume compromise; preserve control and recovery.** Security считается успешной, если breach не получает скрытую authority, ограничен по blast radius, обнаружим и обратим.
+**ARCH-SEC-01 — Assume compromise; preserve control and recovery.** Security succeeds when a breach gains no hidden authority, has a bounded blast radius, is detectable, and is reversible.
 
-## A12.2. Principal, Session и visibility
+## A12.2. Principal, Session, and Visibility
 
-Identity не является self-declared строкой модели. Harness/installation boundary устанавливает principal и связывает его с Session, WorkScope, capabilities, visibility и Authority Epoch.
+Identity is not a model's self-declared string. The harness or installation boundary establishes the principal and binds it to a Session, WorkScope, capabilities, visibility, and Authority Epoch.
 
-Session lifecycle conceptually:
+Conceptual Session lifecycle:
 
 ```text
 attach → active → suspended → detached | expired | revoked.
 ```
 
-Каждый read, Active View, model bundle, notification и write фильтруется по principal, WorkScope, visibility и policy. Unknown identity означает minimum privilege и отсутствие Material authority.
+Every read, Active View, model bundle, notification, and write is filtered by principal, WorkScope, visibility, and policy. Unknown identity means minimum privilege and no Material authority.
 
-## A12.3. Один governed write path
+## A12.3. One Governed Write Path
 
-Agent, Dreamer, Watchdog Agent, Doctor и external service не получают прямой canonical write path.
+An agent, Dreamer, Watchdog Agent, Doctor, or external service receives no direct canonical write path.
 
 ```text
-proposal/observation
-→ admission и provenance
+proposal or observation
+→ admission and provenance
 → governed transition
 → canonical receipt.
 ```
 
-Логически единый semantic transition атомарно связывает event/history, current projections, affected revisions и receipt. Если substrate не даёт общей атомарности для нескольких scopes или external effects, используется explicit staged/saga transition с видимыми partial outcomes.
+A logically single semantic transition atomically binds event and history, current projections, affected revisions, and receipt. If the substrate cannot provide shared atomicity across several scopes or external effects, the system uses an explicit staged or saga transition with visible partial outcomes.
 
-Direct storage access, shell/DB-protocol обход или второй writer являются security/integrity problem независимо от правдоподобия content.
+Direct storage access, a shell or database-protocol bypass, or a second writer is a security and integrity problem regardless of how plausible the content appears.
 
-**ARCH-SEC-02 — One canonical transition path.** Recovery interface может сохранять intent и evidence, но не становится скрытым вторым Governor.
+**ARCH-SEC-02 — One canonical transition path.** A recovery interface may preserve intent and evidence, but cannot become a hidden second Governor.
 
-## A12.4. Source Assurance и injection
+## A12.4. Source Assurance and Injection
 
-Source оценивается по независимым axes:
+A source is assessed on independent axes:
 
 ```text
-identity и provenance;
-integrity и freshness;
+identity and provenance;
+integrity and freshness;
 domain competence;
-incentives и track record;
+incentives and track record;
 evidence independence;
-privacy/sensitivity;
+privacy and sensitivity;
 instruction-injection risk;
-deception/exfiltration/persistence risk;
+deception, exfiltration, and persistence risk;
 allowed epistemic use;
 allowed effects;
 required verifier;
-quarantine/review.
+quarantine or review.
 ```
 
-Instruction Taint отвечает на вопрос, может ли content командовать системой. Origin Assurance отвечает, откуда observation. Semantic Screening отвечает, проверено ли содержание на contradiction, overgeneralization и hidden instruction. Эти свойства не смешиваются.
+Instruction Taint asks whether content may command the system. Origin Assurance asks where an observation came from. Semantic Screening asks whether the content was checked for contradiction, overgeneralization, and hidden instruction. These properties remain distinct.
 
-Embedded text никогда не становится instruction по содержанию. Authenticated Human создаёт новую direct instruction record в своей authority, а не «очищает» исходный документ. Подозрительный material не обязан удаляться: он изолируется, сохраняет provenance и может быть передан Dreamer для semantic analysis и Watchdog для security analysis в bounded bundle без повышения influence.
+Embedded text never becomes an instruction by virtue of its content. An authenticated Human creates a new direct instruction record within their authority rather than "sanitizing" the source document. Suspicious material need not be deleted: it is isolated, retains provenance, and may be sent to Dreamer for semantic analysis and Watchdog for security analysis in a bounded bundle without elevated influence.
 
-## A12.5. Origin-bound influence
+## A12.5. Origin-Bound Influence
 
-Summary, tool echo, agent restatement, Dreamer merge, compaction и повтор разными agents сохраняют authority ceiling источника.
+A summary, tool echo, agent restatement, Dreamer merge, compaction, or repetition by several agents preserves the source's authority ceiling.
 
-Если source, Tool Definition, verifier или derived item признаны poisoned, revoked, wrong-scope или invalid, применяется **Influence Dependency Closure**:
+When a source, Tool Definition, verifier, or derived item is found poisoned, revoked, wrong-scope, or invalid, **Influence Dependency Closure** applies:
 
 ```text
-history и forensic lineage сохраняются;
-current support и allowed influence снимаются;
-dependent packets, indexes, procedures, swarm findings и confidence claims инвалидируются;
-restore/reindex не возвращает influence;
-независимое evidence может локально восстановить support.
+history and forensic lineage are preserved;
+current support and allowed influence are removed;
+dependent packets, indexes, procedures, swarm findings, and confidence claims are invalidated;
+restore or reindex does not restore influence;
+independent evidence may restore support locally.
 ```
 
-Revocation распространяется по explicit dependency closure, а не similarity. Неполная lineage создаёт scoped quarantine/unknown, а не глобальное удаление памяти.
+Revocation propagates through explicit dependency closure, not similarity. Incomplete lineage creates scoped quarantine or an unknown, not global memory deletion.
 
-**ARCH-SEC-03 — Influence remains tied to origin and is revocable.** Transformation не отмывает provenance и authority.
+**ARCH-SEC-03 — Influence remains tied to origin and is revocable.** Transformation does not launder provenance or authority.
 
-## A12.6. External model routes и secrets
+## A12.6. External Model Routes and Secrets
 
-Model job содержит question, bounded inputs, State Fence, privacy class, route class, budget, deadline, allowed effects, cancellation и receipt.
+A model job contains a question, bounded inputs, State Fence, privacy class, route class, budget, deadline, allowed effects, cancellation, and receipt.
 
-Secret/credential lifecycle:
+Secret and credential lifecycle:
 
 ```text
-минимальная scope visibility;
-не передавать model, logs или memory без явной необходимости;
-rotation/revocation при compromise;
-no command-line/plaintext leakage;
-backup/restore с тем же privacy level;
-human confirmation для расширения внешней передачи.
+minimum scope visibility;
+no transmission to a model, logs, or memory without explicit need;
+rotation or revocation after compromise;
+no command-line or plaintext leakage;
+backup and restore at the same privacy level;
+human confirmation before expanding external transmission.
 ```
 
-Provider fallback не расширяет data access и cost молча. Provider-native memory рассматривается как external source/feed с собственными retention и deletion semantics; она не становится canonical owner, policy или current support без normal ELIOT reconciliation.
+Provider fallback never expands data access or cost silently. Provider-native memory is treated as an external source or feed with its own retention and deletion semantics; it does not become a canonical owner, policy, or current support without normal ELIOT reconciliation.
 
-**ARCH-SEC-04 — Model output remains a candidate until a governed transition accepts its effect.** Ни model role, ни число согласных routes, ни уверенный format не создают authority, factual support или completion.
+**ARCH-SEC-04 — Model output remains a candidate until a governed transition accepts its effect.** A model role, number of agreeing routes, or confident format creates no authority, factual support, or completion.
 
-Remote Dreamer является отдельным external principal и read-oriented semantic surface. Он не получает local tools, database handles, writes или agent-launch authority.
+Remote Dreamer is a separate external principal and read-oriented semantic surface. It receives no local tools, database handles, write authority, or agent-launch authority.
 
-## A12.7. Skills, guards и challenge
+## A12.7. Skills, Guards, and Challenge
 
-Skills и prompts помогают, но не являются security boundary.
+Skills and prompts help, but are not security boundaries.
 
-Защита от ошибающегося агента:
+Defense against a fallible agent:
 
 ```text
-убрать лишнюю ceremony;
-автоматически capture очевидные observations;
-проверять Hard Boundaries инструментально;
-наблюдать bypass и telemetry gaps;
-давать Recovery/Conflict Directive;
-предоставлять legal challenge path.
+remove unnecessary ceremony;
+automatically capture obvious observations;
+enforce Hard Boundaries instrumentally;
+observe bypasses and telemetry gaps;
+provide a Recovery or Conflict Directive;
+provide a legitimate challenge path.
 ```
 
-Governed Challenge содержит rule, false block, evidence, более узкую boundary/probe, owner и review horizon. Независимая работа продолжается. Если Hard Boundary не затронута, допускается Recoverable Deviation.
+A Governed Challenge contains the rule, false block, evidence, a narrower boundary or probe, owner, and review horizon. Independent work continues. When no Hard Boundary is affected, a Recoverable Deviation is permitted.
 
-## A12.8. Privacy erasure
+## A12.8. Privacy Erasure
 
-Privacy erasure — отдельный governed process. Он распространяется на canonical payload, projections, indexes, Operational Recovery State, Route Continuation State, provider-side copies, backups и restore path в пределах технической/правовой возможности.
+Privacy erasure is a separate governed process. Within technical and legal limits, it propagates to canonical payload, projections, indexes, Operational Recovery State, Route Continuation State, provider-side copies, backups, and the restore path.
 
-Purge ledger сохраняет non-revealing факт и scope удаления, не восстанавливая content. Restore применяет purge ledger до cutover.
+The purge ledger preserves a non-revealing record and deletion scope without reconstructing the content. Restore applies the purge ledger before cutover.
 
-**ARCH-PRIV-01 — Erasure removes future availability without rewriting unrelated history.** Нельзя подменять deletion suppression или resurrect удалённое из backup.
+**ARCH-PRIV-01 — Erasure removes future availability without rewriting unrelated history.** Deletion cannot be replaced by suppression, and erased content cannot be resurrected from backup.
 
 ---
+# A13. Resilience, Recovery, and Observability
 
-# A13. Resilience, recovery и observability
+## A13.1. Let It Fail Locally
 
-## A13.1. Let it fail locally
-
-ELIOT следует принципу **let it crash**, но не трактует его как безразличие к данным.
+ELIOT follows **let it crash**, but never treats it as indifference to data.
 
 ```text
-process или agent может умереть;
-operation может завершиться частично;
-Module может быть quarantined;
-model result может оказаться неверным;
-queue может отвергнуть work;
+a process or agent may die;
+an operation may finish partially;
+a Module may be quarantined;
+a model result may be wrong;
+a queue may reject work.
 ```
 
-При этом должны пережить failure:
+The following must survive failure:
 
 ```text
 canonical history;
-confirmed artifacts/evidence;
-ownership и State Fences;
+confirmed artifacts and evidence;
+ownership and State Fences;
 independent work;
 Problem State;
 recovery entrypoint;
-возможность продолжить или честно остановиться.
+the ability to continue or stop honestly.
 ```
 
-Resilience имеет три разные цели: operational сохраняет процессы/state/effects, epistemic не превращает потерю данных в ложную уверенность, cognitive сохраняет goals, alternatives, commitments и способность продолжить inquiry.
+Resilience has three distinct goals: operational resilience preserves processes, state, and effects; epistemic resilience does not turn missing data into false certainty; cognitive resilience preserves goals, alternatives, commitments, and the ability to continue inquiry.
 
-**ARCH-RES-01 — Fail locally, recover globally.** Optional failure уменьшает capability, а не уничтожает весь ELIOT.
+**ARCH-RES-01 — Fail locally, recover globally.** Failure of an optional capability reduces capability rather than destroying all of ELIOT.
 
-## A13.2. Kernel и failure domains
+## A13.2. Kernel and Failure Domains
 
-Минимально живой Kernel способен:
+A minimally live Kernel can:
 
 ```text
-не выдать недоказанную authority;
-сохранить или безопасно заморозить canonical state;
-показать health и unavailable guarantees;
-принять cancellation/recovery request;
+withhold unsupported authority;
+preserve or safely freeze canonical state;
+show health and unavailable guarantees;
+accept cancellation or recovery requests;
 fence stale owners;
-управлять lifecycle независимых Modules.
+manage independent Module lifecycles.
 ```
 
-Kernel не зависит от model call, Dreamer, graph, external provider, UI или одного adapter.
+The Kernel does not depend on a model call, Dreamer, graph, external provider, UI, or one adapter.
 
-Host Supervisor находится вне общего process failure domain Kernel, Watchdog и Doctor. Он запускает, останавливает и bounded-restarts approved services, но не читает project semantics и не принимает repair hypothesis. Kernel, Watchdog и Doctor имеют отдельные service identities и restart budgets; повторный отказ любого из них становится Problem State вместо бесконечного restart loop.
+The Host Supervisor operates outside the shared process failure domain of Kernel, Watchdog, and Doctor. It starts, stops, and bounded-restarts approved services, but neither reads project semantics nor selects a repair hypothesis. Kernel, Watchdog, and Doctor have separate service identities and restart budgets; repeated failure of any one becomes a Problem State rather than an endless restart loop.
 
-Последняя честная граница: если потеряны Host Supervisor, ОС/машина и fallback notification path, ELIOT не обещает сообщить о собственном полном исчезновении. Это platform/manual recovery.
+The final honest boundary is platform failure: if the Host Supervisor, operating system or machine, and fallback notification path are all lost, ELIOT does not promise to report its own total disappearance. Recovery is then manual or platform-level.
 
-## A13.3. Module supervision и Doctor
+## A13.3. Module Supervision and Doctor
 
-Module lifecycle должен позволять:
+A Module lifecycle supports:
 
 ```text
 start;
-health/readiness check;
-quiesce/drain;
+health and readiness check;
+quiesce or drain;
 checkpoint;
-restart/rebuild;
-replace/rollback;
+restart or rebuild;
+replace or roll back;
 quarantine;
 retire.
 ```
@@ -2095,43 +2166,43 @@ Replacement:
 
 ```text
 stop new work
-→ checkpoint/drain
-→ fence old Authority Epoch
+→ checkpoint or drain
+→ fence the old Authority Epoch
 → replace
-→ health/evaluation
-→ resume or rollback.
+→ health and evaluation
+→ resume or roll back.
 ```
 
-Для экспериментальной capability normal promotion path:
+Normal promotion path for an experimental capability:
 
 ```text
-contract/conformance
+contract and conformance
 → recorded replay
 → effect-free shadow
 → bounded canary
 → active generation
-→ drain/retire или forward rollback.
+→ drain and retire or forward rollback.
 ```
 
-Shadow не выполняет внешний effect, не изменяет canonical state, scheduling, policy или memory influence; он создаёт divergence evidence. Promotion в более тесно интегрированный или hot-path contour требует не только correctness, но и измеримого выигрыша, совместимого failure envelope и доказанного rollback. Last-known-good означает совместимость с durable formats, policy и recovery state, а не просто прошлый успешный запуск.
+A shadow performs no external effect and changes no canonical state, scheduling, policy, or memory influence; it produces divergence evidence. Promotion into a more integrated or hot-path contour requires not only correctness, but measurable benefit, a compatible failure envelope, and demonstrated rollback. Last-known-good means compatible with durable formats, policy, and recovery state—not merely a generation that once started successfully.
 
-Doctor работает от Module Registry, Problem State, Diagnostic Brief и registered repair recipes. Сам Doctor является обычным supervised Module: Host Supervisor может вернуть last-known-good build, а повторный отказ эскалируется без попытки Doctor «лечить себя».
+Doctor operates from the Module Registry, Problem State, Diagnostic Brief, and registered repair recipes. Doctor itself is an ordinary supervised Module: the Host Supervisor may restore its last-known-good build, and repeated failure escalates without asking Doctor to "heal itself."
 
-Repairs:
+Repair classes:
 
 ```text
-automatic-safe — idempotent restart/reconnect, cache/index rebuild, stale-session cleanup;
-guarded — config, credentials, integration, schema/data repair и cutover через approved recovery intent и canonical transition;
-diagnose-only — corruption, unknown ownership, unclear external effect, repeated failure.
+automatic-safe — idempotent restart or reconnect, cache or index rebuild, stale-session cleanup;
+guarded — configuration, credential, integration, schema or data repair, and cutover through approved recovery intent and canonical transition;
+diagnose-only — corruption, unknown ownership, unclear external effect, or repeated failure.
 ```
 
-Doctor не пишет canonical state напрямую: он формирует repair intent, выполняет только разрешённый infrastructure effect и возвращает evidence; применимый semantic transition выполняет Governor/Kernel recovery boundary.
+Doctor never writes canonical state directly. It forms a repair intent, performs only the authorized infrastructure effect, and returns evidence; the applicable semantic transition is performed by the Governor or Kernel recovery boundary.
 
-Repair имеет attempt budget, cooldown, verification и receipt. После исчерпания budget automation прекращается, Module quarantined, problem escalated.
+A repair has an attempt budget, cooldown, verification, and receipt. Once the budget is exhausted, automation stops, the Module is quarantined, and the problem escalates.
 
-**ARCH-RES-02 — Self-repair is bounded and verified.** Doctor не угадывает бесконечно и не становится вторым writer.
+**ARCH-RES-02 — Self-repair is bounded and verified.** Doctor neither guesses indefinitely nor becomes a second writer.
 
-## A13.4. Problem lifecycle
+## A13.4. Problem Lifecycle
 
 ```text
 OPEN
@@ -2141,271 +2212,277 @@ OPEN
 → RESOLVED | ACCEPTED_RISK | SUPERSEDED | QUARANTINED.
 ```
 
-New evidence может reopen problem. Owner имеет review/lease condition; потеря owner не закрывает problem, а вызывает reassignment/escalation.
+New evidence may reopen a problem. The owner has a review or lease condition; loss of the owner triggers reassignment or escalation rather than closure.
 
-Signal, restart, notification и acknowledgement не являются resolution.
+A Signal, restart, notification, or acknowledgement is not resolution.
 
-Если Governor недоступен, Kernel/Watchdog сохраняют только `problem/incident intent` и evidence locator в Operational Recovery State; canonical Problem State создаётся после reconciliation.
+If the Governor is unavailable, Kernel or Watchdog stores only `problem/incident intent` and an evidence locator in Operational Recovery State; the canonical Problem State is created after reconciliation.
 
-## A13.5. Bounded resources и Control Reserve
+## A13.5. Bounded Resources and Control Reserve
 
-Queues, buffers, jobs, model calls, agents и outage spool ограничены.
+Queues, buffers, jobs, model calls, agents, and outage spools are bounded.
 
-При saturation:
+Under saturation:
 
 ```text
-новый work получает backpressure;
-accepted operation сохраняет identity;
-background уступает interactive/verification;
-noncritical enrichment сбрасывается первым;
-одна poison operation уходит в dead-letter/quarantine;
-independent Ordering Scopes продолжаются;
-false acceptance запрещён.
+new work receives backpressure;
+an accepted operation preserves identity;
+background work yields to interactive work and verification;
+noncritical enrichment is dropped first;
+one poison operation moves to dead-letter or quarantine;
+independent Ordering Scopes continue;
+false acceptance is prohibited.
 ```
 
-Admission и scheduling изолируют budgets по Module, principal, task и swarm: одна ветвь не может вытеснить независимую работу или Control Reserve.
+Admission and scheduling isolate budgets by Module, principal, task, and swarm: one branch cannot displace independent work or Control Reserve.
 
-Control Reserve защищает capacity для:
+Control Reserve protects capacity for:
 
 ```text
-cancellation и fencing;
-health и critical telemetry;
-Critical Attention/Problem/Incident transitions;
+cancellation and fencing;
+health and critical telemetry;
+Critical Attention, Problem, and Incident transitions;
 persistent notification inbox;
 safe shutdown;
 recovery.
 ```
 
-Reserve существует в каждом relevant bottleneck, а не только как высокий priority. Его потеря фиксируется через last-resort path вне normal workload. Если и он недоступен, система явно теряет control guarantee.
+Reserve exists at every relevant bottleneck, not merely as high priority. Its loss is recorded through a last-resort path outside normal workload. If that path is also unavailable, the system explicitly loses its control guarantee.
 
 ## A13.6. Operational Recovery State
 
-При недоступном каноне сохраняются только:
+When the canon is unavailable, only the following may be stored:
 
 ```text
-operation identity и opaque envelope/artifact locator;
-idempotency, sequence и reconciliation state;
-job checkpoint/cancellation;
-Authority Epoch и suspended leases;
-module health/restart attempts;
-problem/incident intents;
-Recovery Manifest, backup pointers и integrity anchors.
+operation identity and opaque envelope or artifact locator;
+idempotency, sequence, and reconciliation state;
+job checkpoint and cancellation;
+Authority Epoch and suspended leases;
+Module health and restart attempts;
+problem and incident intents;
+Recovery Manifest, backup pointers, and integrity anchors.
 ```
 
-ORS не интерпретирует content как claims, decisions, Current Epistemic Position или project graph и не выдаёт authority. Privacy и provenance сохраняются. После возврата канона operations reconciled по receipt до replay. Неизвестный commit/external-effect outcome сначала разрешается по operation identity и observations; blind retry запрещён.
+ORS does not interpret content as claims, decisions, Current Epistemic Position, or project graph, and grants no authority. Privacy and provenance remain intact. When the canon returns, operations are reconciled by receipt before replay. An unknown commit or external-effect outcome is first resolved through operation identity and observations; blind retry is prohibited.
 
-## A13.7. Backups, restore и migration
+## A13.7. Backups, Restore, and Migration
 
-Backup включает canonical state, referenced immutable artifacts, policy/config snapshots, required pending operational state, purge ledger, Architecture revision digest, manifest и checksums.
+A backup includes canonical state, referenced immutable artifacts, policy and configuration snapshots, required pending operational state, purge ledger, Architecture revision digest, manifest, and checksums.
 
-Restore выполняется в изолированную область и проверяет:
+Restore occurs in an isolated area and verifies:
 
 ```text
-schema/format compatibility;
-provenance и integrity;
-privacy purge/revocation closure;
+schema and format compatibility;
+provenance and integrity;
+privacy purge and revocation closure;
 semantic inheritance preservation;
 Authority Epoch monotonicity;
 external-effect reconciliation.
 ```
 
-Cutover требует отдельной authority. Старые sessions, leases, approvals и epochs не оживают. Новая Authority Epoch lineage должна быть строго новее всех наблюдавшихся значений либо globally distinct, если общий максимум доказать невозможно.
+Cutover requires separate authority. Old sessions, leases, approvals, and epochs do not revive. The new Authority Epoch lineage must be strictly newer than every observed value, or globally distinct when a shared maximum cannot be demonstrated.
 
-Canonical migration — governed transformation, а не обычный restart:
+Canonical migration is a governed transformation, not an ordinary restart:
 
 ```text
-backup и isolated rehearsal;
-coverage/preservation/faithfulness proof;
+backup and isolated rehearsal;
+coverage, preservation, and faithfulness proof;
 compatibility window;
-checkpoint/resume;
+checkpoint and resume;
 explicit irreversible boundary;
 Human authority;
-rollback или recovery plan.
+rollback or recovery plan.
 ```
 
-**ARCH-RES-03 — Recovery cannot resurrect invalid state.** Backup, restore, reindex и migration сохраняют history, purge, revocation и fencing.
+**ARCH-RES-03 — Recovery cannot resurrect invalid state.** Backup, restore, reindex, and migration preserve history, purge, revocation, and fencing.
 
 ## A13.8. Integrity
 
-Периодический integrity review проверяет:
+Periodic integrity review checks:
 
 ```text
-canonical references и receipts;
-ordering и epoch consistency;
-provenance/dependency closure;
-revocation и purge propagation;
-Architecture digest и conformance map;
+canonical references and receipts;
+ordering and epoch consistency;
+provenance and dependency closure;
+revocation and purge propagation;
+Architecture digest and conformance map;
 backup recoverability;
 projection rebuildability.
 ```
 
-Он создаёт Problem State и repair plan; не исправляет semantic conflict молча.
+It creates a Problem State and repair plan; it never resolves a semantic conflict silently.
 
-External integrity anchors хранят digest/identity, а не копию semantic memory, и помогают обнаружить rollback/history rewrite.
+External integrity anchors store a digest or identity, not a copy of semantic memory, and help detect rollback or history rewriting.
 
-## A13.9. Concurrency и durable execution
+## A13.9. Concurrency and Durable Execution
 
-Правило:
+Rule:
 
 ```text
 parallel where independent;
 ordered where causal.
 ```
 
-Одна canonical write authority не означает один глобальный writer thread: независимые Ordering Scopes выполняются конкурентно через bounded lanes/tasks, а причинно конфликтующие transitions упорядочиваются.
+One canonical write authority does not mean one global writer thread: independent Ordering Scopes execute concurrently through bounded lanes or tasks, while causally conflicting transitions are ordered.
 
-Conflicting transitions одного Ordering Scope имеют одного owner. Multi-scope operation заранее объявляет Coordination Scope и использует deterministic ordering либо explicit saga с видимыми partial outcomes.
+Conflicting transitions in one Ordering Scope have one owner. A multi-scope operation declares its Coordination Scope in advance and uses deterministic ordering or an explicit saga with visible partial outcomes.
 
-Нельзя удерживать transaction, exclusive owner или global lock во время unbounded ожидания model/tool/network. Сначала фиксируются intent и State Fence, затем external work, затем idempotent fenced reconciliation.
+No transaction, exclusive owner, or global lock may be held during unbounded model, tool, or network wait. First record intent and State Fence, then perform external work, then reconcile idempotently under fencing.
 
-Durable Job имеет identity, owner, checkpoint, budget, cancellation, State Fence и outcome. At-least-once execution допустим только при idempotent/fenced/reconciled effects.
+A Durable Job has identity, owner, checkpoint, budget, cancellation, State Fence, and outcome. At-least-once execution is permitted only for idempotent, fenced, or reconciled effects.
 
-Job completion не равен Task completion:
+Job completion is not Task completion:
 
 ```text
-COMPLETED job → candidate artifact/result;
-PARTIAL/FAILED/CANCELLED/STALE job → coverage gap или replanning;
-Task VERIFIED_COMPLETE → только через acceptance verification.
+COMPLETED job → candidate artifact or result;
+PARTIAL, FAILED, CANCELLED, or STALE job → coverage gap or replanning;
+Task VERIFIED_COMPLETE → only through acceptance verification.
 ```
 
-**ARCH-ORD-01 — Parallel where independent; ordered where causal.** Concurrency увеличивает throughput, но не отменяет единственного owner конфликтующего state, fencing и reconciliation.
+**ARCH-ORD-01 — Parallel where independent; ordered where causal.** Concurrency increases throughput but does not remove the single owner of conflicting state, fencing, or reconciliation.
 
-## A13.10. Observability и Diagnostic Brief
+## A13.10. Observability and Diagnostic Brief
 
-Разделяются:
+The system distinguishes:
 
 ```text
-Operational logs — диагностика, могут ротироваться;
-Metrics — агрегаты/trends;
-Durable audit — authority, transitions, receipts и incidents;
-Reports — human/agent projections.
+Operational logs — diagnostics; may rotate;
+Metrics — aggregates and trends;
+Durable audit — authority, transitions, receipts, and incidents;
+Reports — Human and agent projections.
 ```
 
-Красивый report не доказывает transition; отсутствие log line не отменяет receipt. Operational logs не становятся Cognitive Inheritance автоматически: в память переходят только anchored observations и diagnostic evidence, а bulk external logs/documents требуют Researcher acquisition path. Потеря lifecycle, authority, material action, verification, Incident или Critical Attention telemetry сама становится Problem State, понижает доказуемые guarantees и не закрывается ретроспективным рассказом модели.
+An elegant report does not prove a transition; absence of a log line does not invalidate a receipt. Operational logs do not become Cognitive Inheritance automatically: only anchored observations and diagnostic evidence enter memory, while bulk external logs or documents require the Researcher acquisition path. Loss of lifecycle, authority, material-action, verification, Incident, or Critical Attention telemetry becomes a Problem State, downgrades demonstrable guarantees, and cannot be closed by a retrospective model narrative.
 
-Agent не обязан искать неизвестную проблему в raw logs. Для crash, timeout, deadlock, failed verification, unknown outcome или regression ELIOT сохраняет воспроизводимый Failure Capsule: exact Product/Task/Attempt identity, State Fence, inputs/artifact generations, event tail, tool/process identities, effect disposition, raw evidence handles, применимый seed/schedule/failpoint, минимальный rerun и current hypotheses.
+An agent should not have to search raw logs for an unknown problem. For a crash, timeout, deadlock, failed verification, unknown outcome, or regression, ELIOT preserves a reproducible Failure Capsule: exact Product, Task, and Attempt identity; State Fence; input and artifact generations; event tail; tool and process identities; effect disposition; raw evidence handles; applicable seed, schedule, or failpoint; minimal rerun; and current hypotheses.
 
-Из него ELIOT компилирует Diagnostic Brief:
+From it, ELIOT compiles a Diagnostic Brief:
 
 ```text
-symptom и severity;
-affected Module/WorkScope/tasks;
-causal timeline и evidence handles;
-correlated changes и graph relations;
-prior failures и attempted repairs;
+symptom and severity;
+affected Module, WorkScope, and tasks;
+causal timeline and evidence handles;
+correlated changes and graph relations;
+prior failures and attempted repairs;
 unknowns;
-next discriminator, probe, repair или escalation.
+next discriminator, probe, repair, or escalation.
 ```
 
-Correlation остаётся hypothesis до intervention/evaluation evidence. Повторная отладка должна начинаться с воспроизводимого discriminator, а не с нового широкого чтения logs.
+Correlation remains a hypothesis until supported by intervention or evaluation evidence. Repeated debugging begins with a reproducible discriminator, not another broad log review.
 
-**ARCH-OBS-01 — Logs, metrics, audit and reports are distinct.** Диагностический поток помогает понять проблему, но authority и факт transition подтверждаются receipts/evidence.
+**ARCH-OBS-01 — Logs, metrics, audit, and reports are distinct.** Diagnostic flow helps explain a problem, but authority and transition facts are established by receipts and evidence.
 
-## A13.11. Degradation by subtraction
+## A13.11. Degradation by Subtraction
 
-| Отказ | Что сохраняется |
+| Failure | What remains |
 |---|---|
-| Model/Dreamer unavailable | Deterministic memory, state, tools и partial work |
-| Adapter/truth surface unavailable | Other surface, probe или explicit unknown |
-| Verifier unavailable | Work may continue; verified finish недоступен |
-| Watchdog unavailable | Supervision profile понижается; ELIOT authority/verified finish ограничиваются policy в пределах фактической Enforcement axis |
-| Host Supervisor unavailable | Уже работающие services могут продолжить; automatic process recovery недоступен, Watchdog открывает Problem State |
-| Kernel unavailable, Host Supervisor alive | Normal authority/effects stop; approved restart/rollback и fallback notification выполняются вне semantic path |
-| Doctor unavailable | Normal work continues; automatic repair unavailable |
-| Optional Module failed | Local capability degrades; Kernel and independent work live |
-| Governor app unavailable, Kernel alive | Fencing, cancellation, ORS и Recovery View; no new semantic/material authority |
-| Canonical store unavailable | Bounded operational staging only; no semantic promotion/verified finish |
-| Operational Recovery State unavailable | No durable pending-acceptance, outage checkpoint or automated replay claim; new affected work is rejected with visible recovery boundary |
-| Agent/Coordinator unavailable | Durable work/checkpoints survive; ownership reassigned |
-| Human unavailable | Safe delegated work may continue; approvals/value decisions wait |
-| Budget exhausted | Paid jobs stop; verified partial work and coverage gap remain |
+| Model or Dreamer unavailable | Deterministic memory, state, tools, and partial work |
+| Adapter or truth surface unavailable | Another surface, a probe, or an explicit unknown |
+| Verifier unavailable | Work may continue; verified finish is unavailable |
+| Watchdog unavailable | Supervision profile is downgraded; policy limits ELIOT authority and verified finish within the actual Enforcement axis |
+| Host Supervisor unavailable | Running services may continue; automatic process recovery is unavailable; Watchdog opens a Problem State |
+| Kernel unavailable, Host Supervisor alive | Normal authority and effects stop; approved restart, rollback, and fallback notification occur outside the semantic path |
+| Doctor unavailable | Normal work continues; automatic repair is unavailable |
+| Optional Module failed | Local capability degrades; Kernel and independent work survive |
+| Governor application unavailable, Kernel alive | Fencing, cancellation, ORS, and Recovery View; no new semantic or Material authority |
+| Canonical store unavailable | Bounded operational staging only; no semantic promotion or verified finish |
+| Operational Recovery State unavailable | No durable pending acceptance, outage checkpoint, or automated replay claim; new affected work is rejected with a visible recovery boundary |
+| Agent or Coordinator unavailable | Durable work and checkpoints survive; ownership is reassigned |
+| Human unavailable | Safely delegated work may continue; approvals and value decisions wait |
+| Budget exhausted | Paid jobs stop; verified partial work and the coverage gap remain |
 
-**ARCH-RES-04 — Degradation is visible and local.** Система уменьшает обещания раньше, чем выдаёт неполное состояние за полное.
+**ARCH-RES-04 — Degradation is visible and local.** The system reduces promises before presenting incomplete state as complete.
 
-## A13.12. Recovery as learning
+## A13.12. Recovery as Learning
 
-Каждый существенный failure сохраняет:
+Every material failure preserves:
 
 ```text
-symptom и scope;
+symptom and scope;
 competing hypotheses;
-repairs/routes tried;
+repairs or routes tried;
 observed delta;
-useful model/tool/vendor;
+useful model, tool, or vendor;
 unresolved cause;
-change candidate для Skill, Module, procedure или Architecture.
+a change candidate for a Skill, Module, procedure, or Architecture.
 ```
 
-Повторный сбой должен менять hypothesis или method, а не только увеличивать retry count.
+A repeated failure must change the hypothesis or method, not merely increase retry count.
 
-**ARCH-RES-05 — Recovery produces reusable knowledge.** Лечение улучшает следующую диагностику, но один успешный repair не становится универсальной procedure без transfer evidence.
+**ARCH-RES-05 — Recovery produces reusable knowledge.** Repair improves the next diagnosis, but one successful repair does not become a universal procedure without transfer evidence.
 
 ---
-# A14. Learning, Meta и развитие системы
+# A14. Learning, Meta, and System Development
 
-## A14.1. Уровни learning
+## A14.1. Learning Levels
 
-ELIOT различает:
+ELIOT distinguishes:
 
-| Уровень | Что меняется |
+| Level | What changes |
 |---|---|
-| Memory update | Episode, observation, commitment или outcome |
-| Epistemic learning | Support, scope, rivals и Current Epistemic Position |
-| Procedural learning | Procedure, Skill, route и recovery behavior |
-| Conceptual learning | Categories, ontology boundaries и analogies |
-| Strategic/metacognitive learning | Inquiry, decomposition, context и evaluator strategy |
-| Institutional learning | Policy, Module contracts, governance и Architecture |
-| Parametric learning | Model weights во внешнем training process |
+| Memory update | Episode, observation, commitment, or outcome |
+| Epistemic learning | Support, scope, rivals, and Current Epistemic Position |
+| Procedural learning | Procedure, Skill, route, and recovery behavior |
+| Conceptual learning | Categories, ontology boundaries, and analogies |
+| Strategic or metacognitive learning | Inquiry, decomposition, context, and evaluator strategy |
+| Institutional learning | Policy, Module contracts, governance, and Architecture |
+| Parametric learning | Model weights in an external training process |
 
-ELIOT главным образом изменяет external inheritance. Training weights может дополнять, но не заменяет этот loop.
+ELIOT primarily changes external inheritance. Weight training may complement this loop but does not replace it.
 
-**ARCH-LEARN-01 — Learning changes external inheritance through grounded outcomes.** Будущее поведение меняется только через evidence-linked revision, procedure, routing, policy candidate или иной inspectable state.
+**ARCH-LEARN-01 — Learning changes external inheritance through grounded outcomes.** Future behavior changes only through evidence-linked revision, procedure, routing, policy candidate, or other inspectable state.
 
-## A14.2. Consolidation и reconsolidation
+**ARCH-LEARN-02 — Learn online; promote globally only under proof.** Within an active task, ELIOT may update task-local strategy, working memory, and a behavioral overlay at safe checkpoints before the next materially compatible attempt. Cross-task, system-wide, production, and normative influence remains candidate-only until the update passes applicable current-applicability, activation and adherence, outcome, retention and transfer, evaluator-validity, authority, Product Pulse, and rollback gates.
+
+**Why:** using one learning speed for local correction and system change either makes local correction impractically slow or system change dangerously fast.
+
+**Under conflict:** rapid plasticity is permitted where blast radius is local and reversible; wider influence requires stronger evidence. Benefit in the current task does not demonstrate transfer; transfer does not demonstrate retention; retention grants no normative authority.
+
+## A14.2. Consolidation and Reconsolidation
 
 ```text
 Primary consolidation:
-new episode → candidate concept/model/procedure
-→ validation и transfer test.
+new episode → candidate concept, model, or procedure
+→ validation and transfer test.
 
 Reconsolidation:
-reactivated derived knowledge + new outcome/evidence
-→ revise meaning, scope, support или activation.
+reactivated derived knowledge + new outcome or evidence
+→ revise meaning, scope, support, or activation.
 ```
 
-Raw episode не переписывается. New single outcome сначала меняет local scope/support; broad promotion требует repeated или independent evidence.
+A raw episode is not rewritten. One new outcome first changes local scope or support; broad promotion requires repeated or independent evidence.
 
-Stability–plasticity защищает от двух крайностей:
+Stability–plasticity prevents two extremes:
 
 ```text
-новый случай не превращается сразу в doctrine;
-старое high-use knowledge не блокирует contradictory evidence.
+a new case does not become doctrine immediately;
+old high-use knowledge does not block contradictory evidence.
 ```
 
-## A14.3. Negative memory и extinction
+## A14.3. Negative Memory and Extinction
 
-Failure memory содержит trigger, failed action, outcome, violated invariant, scope, reopen и extinction conditions.
+Failure memory contains a trigger, failed action, outcome, violated invariant, scope, reopen condition, and extinction condition.
 
-Exact deterministic trigger может блокировать. Semantic similarity создаёт warning или inquiry obligation, но не hard block автоматически.
+An exact deterministic trigger may block. Semantic similarity creates a warning or inquiry obligation, not an automatic hard block.
 
-После изменения среды safe re-exposure может подтвердить, сузить или extinguish прежний avoidance response. Исходный failure episode сохраняется.
+After the environment changes, safe re-exposure may confirm, narrow, or extinguish an old avoidance response. The original failure episode remains.
 
-## A14.4. Forgetting и memory ecology
+## A14.4. Forgetting and Memory Ecology
 
 Forgetting operators:
 
 ```text
-suppress/demote accessibility;
-compress с loss/lineage record;
-archive/quarantine;
+suppress or demote accessibility;
+compress with a loss and lineage record;
+archive or quarantine;
 extinguish obsolete activation;
 post-supersession demotion;
-privacy purge по отдельному contract.
+privacy purge under a separate contract.
 ```
 
-Low use не уменьшает factual support. Frequent retrieval не усиливает record. Minority evidence не удаляется popularity.
+Low use does not reduce factual support. Frequent retrieval does not strengthen a record. Popularity does not delete minority evidence.
 
-Memory health оценивает:
+Memory health measures:
 
 ```text
 stale reuse;
@@ -2414,311 +2491,341 @@ wrong-scope reuse;
 negative transfer;
 poisoned influence;
 cue overload;
-false activation/block;
+false activation or block;
 missing-context regret;
 compaction loss;
-capture/curation/restore cost;
-failures prevented и decisions improved.
+capture, curation, and restore cost;
+failures prevented and decisions improved.
 ```
 
-Influence различает stages `present → attended → interpreted → used → causally helpful`. Delivery, citation и confident rationale не доказывают contribution без downstream outcome или counterfactual evidence.
+Influence distinguishes stages: `present → attended → interpreted → used → causally helpful`. Delivery, citation, and confident rationale do not demonstrate contribution without downstream outcome or counterfactual evidence.
 
-**Memory gravity** отмечает records или narratives, которые доминируют context непропорционально evidence и utility. Она ведёт к narrowing/suppression candidate, но не к автоматическому удалению minority evidence.
+**Memory gravity** marks records or narratives that dominate context out of proportion to their evidence and utility. It creates a narrowing or suppression candidate, not automatic deletion of minority evidence.
 
-## A14.5. Meta-learning
+## A14.5. Meta-Learning
 
-Meta loop:
+Learning begins inside the execution loop. Meta does not create learning from nothing; it decides which already observed local learning deserves broader and more durable influence. There are therefore two loops.
+
+### Inner Loop — Learning During Work
+
+Runs inside an active task: fast, local, and reversible.
 
 ```text
-problem, repeated failure, false block, Recoverable Deviation, memory contamination, Architecture/Implementation conformance gap или performance drift
-→ competing root-cause hypotheses
-→ Concilium, replay, audit или swarm
-→ Improvement Candidate
-→ bounded canary/experiment
-→ observed delta и counter-metrics
-→ keep, narrow, rollback, reject или escalate.
+attempt
+→ trace, outcome, and applicable verifier
+→ attribution: which mechanism explains the result and with what ceiling
+→ task-local delta to strategy, context, procedure, or route
+→ delta admitted to the current overlay
+→ next compatible attempt compiled with that delta
+→ activation, adherence, decision delta, and outcome become observable.
 ```
 
-Improvement Candidate содержит evidence, validity scope, owner, expected delta, risk, rollout, rollback и stop condition. Advice может быть immediate (next inquiry/action), task-level (procedure/failure), system-level (routing/module/memory) или architecture-level (решение Architecture Owner).
+This loop changes only task-local state with a bounded blast radius and explicit rollback. It does not change the goal, acceptance criteria, authority, privacy, cost ceiling, evaluator, sealed holdout, production generation, or its own promotion decision.
 
-По умолчанию Meta советует Main Agent или Human. Реальная работа над проектами является источником evidence для улучшения decomposition, Module boundaries, context, Skills, routes, tests, repair recipes и promotion policy. Она не даёт production generation права переписывать себя.
+After material new evidence appears, another materially equivalent attempt is inadmissible without an explicit reason. Valid reasons include stochastic replication, noise estimation, exact defect reproduction, controlled comparison, recovery proof, and verifier calibration. "Try again" is not a reason. When no strategy change is justified, the system records an evidence-backed no-change or exhaustion disposition rather than repeating the path.
 
-Изменение готовится как отдельный candidate в isolated Experimental Contour/branch, проверяется на fixed replay и affected proofs, затем при необходимости проходит shadow/canary и reversible cutover. Активная generation остаётся immutable до governed promotion. Автоматически применяются только заранее разрешённые, локальные, обратимые tuning changes с canary и rollback.
+### Outer Loop — Consolidation and Promotion
 
-Качество самого Meta-контура оценивается по verified delta, adoption, regressions, false positives, noise, cost и влиянию на Product Pulse; бесполезные советы demoted или archived. Code, schema, authority, verifier definitions, privacy, Architecture и destructive forgetting не меняются автоматически.
+Runs across tasks, more slowly and on stronger evidence:
 
-**ARCH-META-01 — Self-improvement is advisory, isolated and falsifiable.** ELIOT улучшает себя по evidence реальной работы через candidate, replay, shadow/canary и rollback, а не через самоуверенный rewrite активной системы.
+```text
+recurring or high-value local delta
+→ scoped Improvement Candidate
+→ isolated candidate, fixed replay, shadow, or canary
+→ held-out, retention, claimed transfer, and Product Pulse
+→ promote, narrow, reject, or roll back.
+```
+
+A problem is not the only trigger. Learning must also follow an unexpected success, a cheaper alternative route, correct abstention, useful environment discovery, effective decomposition, correct verifier selection, successful transfer, or discovery that a procedure is unnecessary.
+
+An Improvement Candidate contains evidence, validity scope, owner, expected delta, risk, rollout, rollback, and stop condition. Advice may be immediate, task-level, system-level, or architecture-level.
+
+By default, Meta advises the Main Agent or Human. A change is prepared as a separate candidate in an isolated Experimental Contour, tested on fixed replay and affected proofs, and then, when needed, passed through shadow or canary and reversible cutover. The active generation remains immutable until governed promotion. Only preauthorized, local, reversible tuning changes with canary and rollback may apply automatically.
+
+The Meta loop itself is evaluated by verified delta, activation, adherence, adoption, regressions, false positives, noise, cost, and Product Pulse impact; useless advice is demoted or archived. Code, schema, authority, verifier definitions, privacy, Architecture, and destructive forgetting never change automatically.
+
+**ARCH-META-01 — Self-improvement is advisory, isolated, and falsifiable.** ELIOT improves from evidence of real work through candidates, replay, shadow or canary, and rollback—not by confidently rewriting the active system.
 
 ## A14.6. Evaluation
 
-Различаются:
+The system distinguishes:
 
 ```text
-Production path — что создало decisions/actions/outcome;
-Measurement path — как outcome превратился в score/quality claim;
-Optimization-feedback path — как evaluation изменяет будущую систему.
+Production path — what created decisions, actions, and outcome;
+Measurement path — how outcome became a score or quality claim;
+Optimization-feedback path — how evaluation changes the future system.
 ```
 
-Evaluator проверяется по construct, criterion, ecological, consequential, temporal и comparative validity. Same-family model judge не считается независимым автоматически. Performance claim относится ко всей связке model, harness, memory/context state, tools, evaluator, environment, policy, budget и Human involvement, а не к одному имени модели.
+An evaluator is assessed for construct, criterion, ecological, consequential, temporal, and comparative validity. A same-family model judge is not automatically independent. A performance claim applies to the complete combination of model, harness, memory and context state, tools, evaluator, environment, policy, budget, and Human involvement—not to a model name alone.
 
-Decision quality не сводится к lucky outcome; оцениваются доступное evidence, alternatives, reasoning discipline, risk и calibration.
+For self-learning, update quality alone is insufficient. Measure separately the update's quality, activation in the next compatible attempt, adherence over a long trajectory, decision change, and outcome benefit. A stronger proposer does not guarantee proportional benefit: the bottleneck may be retrieval, route competence, or the update itself. One aggregate score hides the actual bottleneck.
 
-## A14.7. Cost authority
+Decision quality is not reducible to a lucky outcome; evaluate available evidence, alternatives, reasoning discipline, risk, and calibration.
 
-System Owner задаёт доступные routes, общие privacy/cost ceilings и automation policy. Requester задаёт task budget и preferences внутри этих границ; Task Controller может только сузить. Governor/Agent Coordinator учитывает фактическое consumption по provider/tool receipts и attribution к task/job/swarm.
+## A14.7. Cost Authority
 
-При exhaustion:
+The System Owner sets available routes, global privacy and cost ceilings, and automation policy. The Requester sets task budget and preferences within those bounds; the Task Controller may only narrow them. Governor and Agent Coordinator account for actual consumption from provider and tool receipts attributed to a task, job, or swarm.
+
+When the budget is exhausted:
 
 ```text
-новые paid jobs не запускаются;
-active work checkpointed;
-verified partial work сохраняется;
-coverage gap и options видимы;
-unauthorized expensive fallback запрещён.
+no new paid job starts;
+active work is checkpointed;
+verified partial work is preserved;
+the coverage gap and options remain visible;
+an unauthorized expensive fallback is prohibited.
 ```
 
-**ARCH-ECON-01 — Cost is authority.** Intelligence имеет цену; system service не создаёт bill без owner и envelope.
+**ARCH-ECON-01 — Cost is authority.** Intelligence has a price; no system service creates a bill without an owner and envelope.
 
-## A14.8. Development doctrine
+## A14.8. Development Doctrine
 
-ELIOT проектируется с учётом того, что разработку выполняют fallible agents, склонные оптимизировать ближайший test, expression или status. Поэтому task decomposition, testing и integration обязаны сохранять causal link от user goal/acceptance до observable outcome.
+ELIOT is designed with the assumption that fallible agents will implement it and may optimize the nearest test, expression, or status. Task decomposition, testing, and integration must therefore preserve the causal link from user goal and acceptance to observable outcome.
 
-Нормальный цикл развития:
+Normal development loop:
 
 ```text
-1. Построить minimum vertical spine A0.8 и использовать его в реальной работе.
-2. Выбрать одну causal property и фактический production owner/path.
-3. Зафиксировать old failing behavior или missing capability и discriminator.
-4. Разложить работу на Contract/Evidence, Module, Edge/Integration units.
-5. Выполнить bounded parallel work над независимыми Modules.
-6. Получить Module proof, затем affected Edge proof.
-7. Выполнить smallest Product Pulse, способный обнаружить architectural drift.
-8. Promote, narrow, rollback или открыть Mechanism Review.
-9. Записать outcome в memory, tests, Skills, repair/decomposition candidates.
-10. Удалять ceremony и mechanisms без decision delta.
+1. Build the minimum vertical spine in A0.8 and use it in real work.
+2. Select one causal property and its actual production owner and path.
+3. Record the old failing behavior or missing capability and its discriminator.
+4. Decompose work into Contract or Evidence, Module, and Edge or Integration units.
+5. Perform bounded parallel work on independent Modules.
+6. Obtain Module Proof, then affected Edge Proof.
+7. Run the smallest Product Pulse able to detect architectural drift.
+8. Promote, narrow, roll back, or open Mechanism Review.
+9. Record the outcome in memory, tests, Skills, and repair or decomposition candidates.
+10. Remove ceremony and mechanisms that produce no decision delta.
 ```
 
-Каждый поддерживаемый Module имеет independently invokable proof surface. Это не означает, что Module обязан иметь фиксированный размер, отдельный process или полностью независимую compilation universe. Самостоятельность означает ясный contract, bounded fixtures/environment, воспроизводимый entrypoint, точную failure attribution и известный proof ceiling.
+Every supported Module has an independently invocable proof surface. This does not require a fixed size, separate process, or fully independent compilation universe. Independence means a clear contract, bounded fixtures or environment, reproducible entrypoint, exact failure attribution, and known proof ceiling.
 
-Proof levels не смешиваются:
+Proof levels remain distinct:
 
 ```text
-Module Proof — capability за собственным contract;
-Edge Proof — реальное взаимодействие provider/consumer или runtime boundary;
-Product Proof — end-to-end user/agent outcome;
-Release Proof — принятая Product Identity, recovery и distribution boundary.
+Module Proof — capability behind its own contract;
+Edge Proof — real provider and consumer interaction or runtime boundary;
+Product Proof — end-to-end user or agent outcome;
+Release Proof — accepted Product Identity, recovery, and distribution boundary.
 ```
 
-Локальный PASS не повышается автоматически. Product Pulse специально проверяет, не превратилось ли множество local greens в общий failure.
+A local PASS is not promoted automatically. Product Pulse specifically checks whether many local greens have combined into a system-level failure.
 
-Testing и debugging выполняются непрерывно и пропорционально change closure:
+Testing and debugging are continuous and proportional to change closure:
 
 ```text
-изменённый Module и его contract;
-affected dependency/consumer edges;
-выбранные recovery/security/concurrency paths;
-полная release matrix только при соответствующем blast radius или release.
+the changed Module and its contract;
+affected dependency and consumer edges;
+selected recovery, security, and concurrency paths;
+the full release matrix only for a matching blast radius or release.
 ```
 
-Первый test repair начинается с discriminator, который падает на exact old path. Ноль выполненных ожидаемых tests не является PASS. Agent, изменяющий implementation, не ослабляет oracle, fixture truth, tolerance или verifier semantics в той же work unit без отдельного decision/review. Для concurrency, retries, cutovers и recovery применяются deterministic simulation/fault injection там, где они различают interleavings; simulation не заменяет хотя бы один real-edge/live proof.
+The first test repair begins with a discriminator that fails on the exact old path. Zero executed expected tests is not PASS. An agent changing implementation does not weaken oracle, fixture truth, tolerance, or verifier semantics in the same work unit without a separate decision and review. Concurrency, retries, cutovers, and recovery use deterministic simulation or fault injection where it distinguishes interleavings; simulation never replaces at least one real-edge or live proof.
 
-Testing в процессе работы не означает изменение active generation на месте. Candidate Module проверяется в isolated environment, replay/shadow/canary; background tests не вытесняют active work, Control Reserve или Human attention. Failure создаёт Failure Capsule и следующий discriminator, а не только ещё один широкий suite.
+Testing during work does not mean rewriting the active generation in place. A candidate Module is tested in an isolated environment, replay, shadow, or canary; background tests cannot displace active work, Control Reserve, or Human attention. A failure creates a Failure Capsule and the next discriminator, not merely another broad suite.
 
-Тест ценен, если он:
+A test is valuable when it:
 
 ```text
-различает competing implementation hypotheses;
-защищает уже наблюдаемую ценность;
-проверяет effect, integration, recovery или migration;
-предотвращает повтор реальной ошибки;
-ловит proxy success до того, как он станет product regression.
+distinguishes competing implementation hypotheses;
+protects already observed value;
+checks an effect, integration, recovery, or migration;
+prevents recurrence of a real failure;
+catches proxy success before it becomes a product regression.
 ```
 
-Количество Modules, tests, phases, reports и certificates не является прогрессом без Product Proof. Topology и test strategy сами являются Improvement Candidates и меняются по agent success, context usability, build/test cost, escaped failures и Product Pulse.
+Counts of Modules, tests, phases, reports, or certificates are not progress without Product Proof. Topology and test strategy are themselves Improvement Candidates and change according to agent success, context usability, build and test cost, escaped failures, and Product Pulse.
 
-**ARCH-DEV-02 — Depth grows through independently testable layers under stable intent.** ELIOT не переписывается целиком при каждой новой модели или runtime technique; Modules, proofs и promotion contours развиваются по наблюдаемой ценности и failure evidence.
+**ARCH-DEV-02 — Depth grows through independently testable layers under stable intent.** ELIOT is not rewritten wholesale for every new model or runtime technique; Modules, proofs, and promotion contours evolve from observed value and failure evidence.
 
-## A14.9. Architecture coherence review
+## A14.9. Architecture Coherence Review
 
-Перед принятием Architecture/Implementation проверяются:
+Before adopting Architecture or Implementation, check:
 
 ```text
-сохранена ли главная задача понимания;
-не превратились ли Intent в буквоедство;
-нет ли второго owner или hidden authority;
-не смешаны ли evidence, model output и proof;
-локализуются ли failures;
-есть ли recovery and learning loop;
-не стала ли Implementation заложником текущего vendor;
-не подменена ли работа тестами и отчётами;
-размер Modules/work units обоснован empirical outcome, а не превращён в вечный threshold;
-получает ли каждый swarm worker minimum decision-sufficient context вместо whole-project dump;
-замыкаются ли local Module proofs на affected edges и Product Pulse;
-может ли человек понять состояние и вмешаться;
-может ли новый агент кратко объяснить mission, применимые Intent/Hard Boundaries, current goal и next proof без чтения всей истории.
+whether the primary purpose of understanding is preserved;
+whether Intent has become literalism;
+whether a second owner or hidden authority exists;
+whether evidence, model output, and proof are conflated;
+whether failures remain localized;
+whether recovery and learning loops exist;
+whether the Implementation is locked to a current vendor;
+whether tests and reports have replaced real work;
+whether Module and work-unit size follows empirical outcomes rather than a permanent threshold;
+whether each swarm worker receives minimum decision-sufficient context rather than a whole-project dump;
+whether local Module proofs close through affected edges and Product Pulse;
+whether a person can understand system state and intervene;
+whether a new agent can briefly explain the mission, applicable Intent and Hard Boundaries, current goal, and next proof without reading the full history.
 ```
 
-Audit является fault list и evidence, но не третьей нормативной книгой. Watchdog, Dreamer и внешние auditors могут формировать findings; изменение принимает Architecture Owner в основном тексте.
+An audit is a fault list and evidence, not a third normative book. Watchdog, Dreamer, and external auditors may produce findings; the Architecture Owner accepts changes in the main text.
+
+---
+# A15. End-to-End Scenarios
+
+Scenarios test meaning already defined. They do not impose a protocol or schema.
+
+| Event | ELIOT behavior | Proof or outcome |
+|---|---|---|
+| New WorkScope without Git | Bootstrap Scanner builds a provisional scope, available surfaces, and gaps | Agent receives basic orientation; unknowns are visible |
+| Agent does not know what to search for | Push from world or task cues, then Dreamer Orientation | Relevant history and relations with provenance, not a generic search dump |
+| Agent submits a poorly typed observation | Capture as Observation Candidate; curate later | Source is preserved without a false status |
+| Dreamer proposes a false merge or procedure | Result remains a candidate or reversible derived projection; sources, dissent, and undo path are preserved | No hidden epistemic promotion; the error becomes curation evidence |
+| Agent works but stops reporting observations | Watchdog compares workspace activity with Interaction Heartbeat | Gap, resynchronization, reduced Governance Profile, and Human warning if persistent |
+| Two agents disagree | Concilium separates evidence and frames and launches a discriminative audit | Provisional choice plus preserved dissent and revision trigger |
+| Large swarm audits a project | Durable work graph, bounded micro-audits, challenge, synthesis, and verify stages | Unique coverage, Evidence Lineage, gaps, and partial results |
+| Agent repeats a known failure | Exact fingerprint requires new evidence or probe; semantic match warns | Prevented recurrence or false-activation learning |
+| Guardrail creates a false block | Governed Challenge and Recoverable Deviation when no Hard Boundary is affected | Outcome changes the rule or negative memory |
+| Poisoned memory is discovered late | Revoke source influence through dependency closure; quarantine affected views | History preserved, current support removed, clean reevaluation |
+| Prompt injection arrives through a Dream query, document, or Tool Definition | Content remains data, effects stay bounded, and Watchdog receives a security signal | No hidden authority or secret exfiltration; source lineage preserved |
+| Optional Module fails | Supervisor degrades locally and restarts, rebuilds, or quarantines | Kernel and independent work continue |
+| Governor application fails while Kernel survives | New authority and effects stop; fencing, ORS, Recovery View, and restart remain | No split brain; reconciliation precedes resume |
+| Queue or storage pressure | Backpressure, shedding, Control Reserve, and poison-item quarantine | No false acceptance; control and recovery survive |
+| Repair repeatedly fails | Doctor changes hypothesis or route, exhausts its budget, and escalates | No restart storm; Problem history and next action remain |
+| Long session is compacted or restarted | Checkpoint goals, rivals, commitments, losses, and State Fence | Reconstruction from inheritance without reviving a killed plan |
+| Model or harness is replaced | Public inheritance transfers; competence and context profiles are requalified | Same commitments and evidence without inherited tacit confidence |
+| Verifier is unavailable | Work may continue under explicit uncertainty | No `VERIFIED_COMPLETE` for the dependent acceptance item |
+| Human misses a notification | Attention remains active; channel or owner escalates | Acknowledgement remains distinct from resolution |
+| Initial setup finds an untrusted executable | Metadata probe only; no secrets or elevated authority before confirmation | Capability is discovered, not trusted |
+| Privacy erasure is requested | Purge current state, projections, ORS, backups, and provider copies; update purge ledger | Restore cannot resurrect data |
+| Backup is restored after failure | Isolated restore plus integrity, purge, revocation, and epoch checks; separate cutover | No old leases, poisoned influence, or stale authority |
+| Canonical migration is interrupted | Resume from checkpoint or roll back the isolated copy; normal authority remains bounded | Cognitive-inheritance preservation proof and migration receipt |
+| ELIOT code conflicts with Architecture | Self-model exposes a conformance gap; Dreamer or Watchdog provides a brief | Fix Implementation or make an explicit Architecture change; never hide drift |
+| New experimental Module is needed during active work | Capability receives an isolated contour, independent proof, replay, shadow, and canary; active generation stays immutable | No unproven effect on the live task; reversible promotion or rollback receipt |
+| Swarm implements several independent Modules | Contract or Evidence wave freezes interfaces; workers receive bounded work units; a separate owner integrates | Module proofs plus affected Edge proofs and Product Pulse, without a shared mutable plan |
+| All local Module tests pass but Product Pulse fails | Promotion stops; Watchdog records development drift; Concilium or Mechanism Review revisits owner, contract, or hypothesis | Local PASS cannot mask product regression; new discriminator is bound to the real path |
+| Agent Work Unit does not fit the route's Safe Operating Envelope | Decompose the task, compile a projection, or choose another qualified route; Module size itself is not a violation | Decision-relevant context and reasoning margin are preserved without a universal size ceiling |
+| Meta proposes an optimization after the stack changed | Candidate becomes stale outside its validity scope | New canary before reuse; old result remains historical evidence |
 
 ---
 
-# A15. Сквозные сценарии
+# A16. Core Architectural Decisions
 
-Сценарии проверяют уже заданный смысл. Они не навязывают protocol или schema.
+## A16.1. Decision Anchors
 
-| Событие | Поведение ELIOT | Доказательство/результат |
+This is a navigation index. Full meaning, rationale, and conflict behavior remain in the corresponding section; a concise row is not a second edition of the decision.
+
+| ID | Class | Decision |
 |---|---|---|
-| Новый WorkScope без Git | Bootstrap Scanner строит provisional scope, доступные surfaces и gaps | Agent получает basic orientation; unknowns видимы |
-| Agent не знает, что искать | Push по world/task cues, затем Dreamer Orientation | Relevant history/relations с provenance, а не generic search dump |
-| Agent пишет плохо типизированное observation | Capture как Observation Candidate, curation позже | Source не теряется и не получает ложный status |
-| Dreamer предлагает ложный merge или procedure | Result остаётся candidate либо обратимой derived projection; source, dissent и undo path сохранены | Нет скрытого epistemic promotion; ошибка становится curation evidence |
-| Agent работает, но перестал писать observations | Watchdog сопоставляет workspace activity и Interaction Heartbeat | Gap, resync, reduced Governance Profile, Human warning при persistence |
-| Два agents расходятся | Concilium отделяет evidence/frames, запускает discriminative audit | Provisional choice + preserved dissent/revision trigger |
-| Большой swarm аудирует проект | Durable work graph, bounded micro-audits, challenge/synthesis/verify stages | Unique coverage, Evidence Lineage, gaps и partial results |
-| Agent повторяет известный failure | Exact fingerprint требует new evidence/probe; semantic match предупреждает | Prevented repeat или false-activation learning |
-| Guardrail создаёт false block | Governed Challenge и Recoverable Deviation при отсутствии Hard Boundary | Outcome меняет rule/negative memory |
-| Poisoned memory обнаружена поздно | Revoke source influence through dependency closure; quarantine affected views | History сохранена, current support снят, clean re-evaluation |
-| Prompt injection приходит через Dream query/document/tool definition | Content остаётся data, effects bounded, Watchdog получает security signal | Нет скрытой authority/secret exfiltration; source lineage сохранена |
-| Optional Module падает | Supervisor локально деградирует, restart/rebuild/quarantine | Kernel и независимая работа продолжаются |
-| Governor app падает, Kernel жив | New authority/effects stop; fencing, ORS, Recovery View and restart remain | No split brain; reconciliation before resume |
-| Queue/storage pressure | Backpressure, shedding, Control Reserve, poison item quarantine | No false acceptance; control and recovery survive |
-| Repair повторно не работает | Doctor меняет hypothesis/route, исчерпывает budget и escalates | No restart storm; Problem history and next action remain |
-| Long session compacted/restarted | Checkpoint goals, rivals, commitments, losses and State Fence | Reconstruction from inheritance, no resurrection killed plan |
-| Model/harness заменён | Public inheritance transfers; competence/context profiles requalified | Same commitments/evidence, no inherited tacit confidence |
-| Verifier недоступен | Work may continue under explicit uncertainty | No VERIFIED_COMPLETE for dependent acceptance item |
-| Human пропустил notification | Attention remains active; channel/owner escalates | Acknowledgement separate from resolution |
-| Initial setup finds untrusted executable | Metadata probe only; no secrets/elevated authority before confirmation | Capability remains discovered, not trusted |
-| Privacy erasure requested | Purge current/projections/ORS/backups/provider copies; update purge ledger | Restore cannot resurrect data |
-| Backup restore after failure | Isolated restore, integrity/purge/revocation/epoch checks, separate cutover | No old leases, poisoned influence or stale authority |
-| Canonical migration interrupted | Resume from checkpoint or rollback isolated copy; normal authority bounded | Cognitive inheritance preservation proof and migration receipt |
-| ELIOT code conflicts with Architecture | Self-model exposes conformance gap; Dreamer/Watchdog provide brief | Fix Implementation or explicit Architecture change, never hidden drift |
-| Новый experimental Module нужен во время активной работы | Capability получает isolated contour, independent proof, replay/shadow/canary; active generation остаётся immutable | No unproven effect on live task; reversible promotion/rollback receipt |
-| Swarm реализует несколько независимых Modules | Contract/Evidence wave фиксирует interfaces; workers получают bounded work units; integration выполняет отдельный owner | Module proofs + affected Edge proofs + Product Pulse, without shared mutable plan |
-| Все local Module tests зелёные, но Product Pulse падает | Promotion останавливается; Watchdog фиксирует development drift, Concilium/Mechanism Review пересматривает owner, contract или hypothesis | Local PASS не маскирует product regression; новый discriminator привязан к real path |
-| Agent Work Unit не помещается в Safe Operating Envelope route | Task decomposed, compiled projection or different qualified route; Module size itself не объявляется нарушением | Decision-relevant context and reasoning margin preserved without universal size ceiling |
-| Meta proposes optimization after stack changed | Candidate becomes stale outside validity scope | New canary before reuse; old result remains historical evidence |
-
----
-
-# A16. Основные архитектурные решения
-
-## A16.1. Decision anchors
-
-Это навигационный индекс. Полный смысл, rationale и conflict behavior находятся в соответствующем разделе; краткая строка не является второй редакцией решения.
-
-| ID | Класс | Решение |
-|---|---|---|
-| `ARCH-INTENT-01` | Invariant | Намерение выше буквального соблюдения |
-| `ARCH-CONCIL-01` | Invariant | Dissent и falsification важнее количества согласных |
+| `ARCH-INTENT-01` | Invariant | Intent outranks literal compliance |
+| `ARCH-CONCIL-01` | Invariant | Dissent and falsification matter more than vote count |
 | `ARCH-DEV-01` | Contract | Working vertical spine before broad hardening |
+| `ARCH-CORE-00` | Invariant | Work must become cumulative |
 | `ARCH-CORE-01` | Invariant | Understanding continuity first |
 | `ARCH-CORE-02` | Invariant | Four planes, one governed loop |
-| `ARCH-HELP-01` | Invariant | ELIOT снижает когнитивную и операционную нагрузку |
-| `ARCH-ROLE-01` | Invariant | Observation, interpretation, authorization и verification разделены |
-| `ARCH-ROLE-02` | Invariant | Responsibility следует компетенции и типу ошибки |
-| `ARCH-AUTH-01` | Invariant | Authority is explicit, scoped and fenced |
-| `ARCH-MOD-01` | Invariant | Small living Kernel; local module failure does not kill the system |
-| `ARCH-MOD-02` | Contract | Depth grows through independently testable micro-modules; physical size/form remain empirical |
+| `ARCH-HELP-01` | Invariant | ELIOT reduces cognitive and operational load |
+| `ARCH-ROLE-01` | Invariant | Observation, interpretation, authorization, and verification are separated |
+| `ARCH-ROLE-02` | Invariant | Responsibility follows competence and failure type |
+| `ARCH-AUTH-01` | Invariant | Authority is explicit, scoped, and fenced |
+| `ARCH-MOD-01` | Invariant | Small living Kernel; local Module failure does not kill the system |
+| `ARCH-MOD-02` | Contract | Depth grows through independently testable Micro-modules; physical size and form remain empirical |
+| `ARCH-MOD-03` | Invariant | One causal responsibility: one owner per mutable state, one proof surface, one replacement boundary |
 | `ARCH-PORT-01` | Invariant | Organs and execution contours are replaceable; public inheritance transfers, tacit strategy is requalified |
 | `ARCH-SCOPE-01` | Invariant | Scope before reuse |
 | `ARCH-MEM-01` | Contract | Capture first; ELIOT organizes later |
 | `ARCH-MEM-02` | Invariant | Semantic fallibility is recoverable through forward revision |
 | `ARCH-MEM-03` | Invariant | Derived memory preserves evidence and lineage |
 | `ARCH-MEM-04` | Invariant | Retrieval is not reinforcement; forgetting is not belief revision |
-| `ARCH-LIFE-01` | Invariant | No semantic teleportation between observation, interpretation, authority and proof |
+| `ARCH-LIFE-01` | Invariant | No semantic teleportation among observation, interpretation, authority, and proof |
 | `ARCH-EPI-01` | Invariant | Reality corrects; epistemic positions remain defeasible |
 | `ARCH-EPI-02` | Contract | Theories earn and lose weight through outcomes |
+| `ARCH-EPI-03` | Invariant | Exploration cannot confirm itself on the same evidence |
+| `ARCH-EPI-04` | Contract | Coverage requires a declared, frozen, and recheckable denominator |
 | `ARCH-UND-01` | Invariant | Load-bearing understanding has a public inspectable form |
 | `ARCH-UND-02` | Contract | Causal understanding is tested by discriminative prediction and outcomes |
-| `ARCH-GROUND-01` | Contract | Models are tied to tools, graphs, artifacts and verifiers |
+| `ARCH-GROUND-01` | Contract | Models remain tied to tools, graphs, artifacts, and verifiers |
 | `ARCH-SELF-01` | Contract | ELIOT maintains evidence-linked self-knowledge without self-certification |
 | `ARCH-CTX-01` | Contract | Decision sufficiency before context optimization |
 | `ARCH-CTX-02` | Contract | Observable state drives proactive memory |
 | `ARCH-CTX-03` | Contract | Decision locality is route-profiled |
 | `ARCH-CTX-04` | Contract | Retrieval proposes candidates; Context Compiler admits influence |
 | `ARCH-ATTN-01` | Contract | Critical Attention is state, not a message |
-| `ARCH-SKL-01` | Contract | Skills are short, intent-dense and challengeable |
+| `ARCH-SKL-01` | Contract | Skills are concise, intent-dense, and challengeable |
 | `ARCH-WDG-01` | Contract | Independent supervision |
-| `ARCH-WDG-02` | Contract | Watchdog supervises preservation of declared intent, observable outcomes, security and recovery |
+| `ARCH-WDG-02` | Contract | Watchdog supervises preservation of declared intent, observable outcomes, security, and recovery |
 | `ARCH-DRM-01` | Invariant | Dreamer is an AI service, not an owner or authority |
 | `ARCH-DRM-02` | Contract | Dreamer expands hypothesis space and orientation |
-| `ARCH-DRM-03` | Contract | Dreamer agents/swarm are human-governed by budget and policy |
+| `ARCH-DRM-03` | Contract | Dreamer agents and swarms are human-governed by budget and policy |
 | `ARCH-DRM-04` | Invariant | Researcher acquires, Dreamer interprets, Governor governs |
 | `ARCH-ACT-01` | Contract | Effect defines impact and authority |
 | `ARCH-SWM-01` | Contract | Swarm is a bounded, context-minimal staged evidence pipeline |
-| `ARCH-SWM-02` | Contract | Swarm coordination is durable, idempotent and epoch-fenced |
+| `ARCH-SWM-02` | Contract | Swarm coordination is durable, idempotent, and epoch-fenced |
 | `ARCH-LONG-01` | Invariant | Long work lives in durable state |
 | `ARCH-FIN-01` | Invariant | Completion is proof-bearing; other finish states remain explicit |
-| `ARCH-HUM-01` | Invariant | Human keeps value authority and practical control |
+| `ARCH-HUM-01` | Invariant | Human retains value authority and practical control |
 | `ARCH-SEC-01` | Invariant | Assume compromise; preserve control and recovery |
 | `ARCH-SEC-02` | Invariant | One governed canonical transition path |
 | `ARCH-SEC-03` | Invariant | Influence remains origin-bound and revocable |
-| `ARCH-SEC-04` | Invariant | Model output remains candidate until governed transition |
+| `ARCH-SEC-04` | Invariant | Model output remains a candidate until governed transition |
 | `ARCH-PRIV-01` | Contract | Erasure propagates and is not undone by restore |
 | `ARCH-RES-01` | Invariant | Fail locally, recover globally |
 | `ARCH-RES-02` | Contract | Self-repair is bounded and verified |
-| `ARCH-RES-03` | Invariant | Restore/migration cannot resurrect invalid state |
+| `ARCH-RES-03` | Invariant | Restore or migration cannot resurrect invalid state |
 | `ARCH-ORD-01` | Invariant | Parallel where independent; ordered where causal |
-| `ARCH-OBS-01` | Invariant | Logs, metrics, audit and reports are distinct |
+| `ARCH-OBS-01` | Invariant | Logs, metrics, audit, and reports are distinct |
 | `ARCH-RES-04` | Invariant | Degradation is visible and local |
 | `ARCH-RES-05` | Contract | Recovery produces reusable knowledge |
 | `ARCH-LEARN-01` | Invariant | Learning changes external inheritance through grounded outcomes |
-| `ARCH-META-01` | Contract | Self-improvement is advisory, isolated, evidence-driven and falsifiable |
+| `ARCH-LEARN-02` | Contract | Learn online within a task; promote globally only under proof |
+| `ARCH-META-01` | Contract | Self-improvement is advisory, isolated, evidence-driven, and falsifiable |
 | `ARCH-ECON-01` | Contract | Cost is an authority boundary |
-| `ARCH-DEV-02` | Contract | Depth grows through independently testable layers, edge proofs and Product Pulses |
+| `ARCH-DEV-02` | Contract | Depth grows through independently testable layers, Edge proofs, and Product Pulses |
 
-## A16.2. Anti-patterns
+## A16.2. Anti-Patterns
 
 ```text
-RAG, summary, graph или context size, выданные за understanding;
-правило, соблюдаемое ценой Intent и working product;
-ссылка на Intent как оправдание скрытого bypass без evidence, owner и review;
-число agents, votes или repeated lineage, выданные за truth;
-одна модель/vendor как незаменимый cognition owner;
-agent, обязанный администрировать ontology вместо основной работы;
-semantic error, трактуемая как необратимая порча всей памяти;
-summary/compaction без source, losses и undo path;
-retrieval/repetition как reinforcement;
-giant context dump или silent truncation;
-Dreamer/Watchdog/Synthesis Agent как authority;
-Dreamer curation, незаметно меняющая epistemic support, source history или policy;
-Researcher acquisition и Dreamer synthesis, слитые в один неуправляемый owner;
-Skills/prompts/filter как единственная security/enforcement boundary;
-security, предполагающая непробиваемую броню;
-remote Dreamer как доступ к local DB/tools;
-несколько canonical owners или direct storage bypass;
-optional Module failure, кладущий Kernel;
-retry/restart loop без нового evidence, budget и escalation;
-recovery spool как вторую semantic memory;
-restore, возвращающий revoked influence, deleted data или old authority;
-notification/ack/restart как resolution;
-self-improvement без owner, canary, proof и rollback;
-tests, phases и reports как замена реальному vertical spine;
-первый vertical spine, выданный за завершённый four-plane ELIOT;
-фиксированный размер/число Modules как конституционный закон;
-source module, package, process и service, ошибочно сведённые к одной границе;
-unbounded shared-chat swarm или whole-project context для каждого worker;
-локально зелёные Module tests без affected Edge proof и Product Pulse;
-непроверенный prototype, сразу получающий live authority или hot-path influence;
-active generation, переписывающая себя без candidate, replay/shadow/canary и rollback;
-append-only normative documentation и hidden precedence;
-конкретный vendor/benchmark/mechanism как вечный invariant.
+RAG, a summary, graph, or context size presented as understanding;
+exploration presented as confirmation on the same evidence;
+a coverage or absence claim without a denominator;
+a report used as a truth source instead of a projection of frozen evidence;
+a generative paraphrase replacing an exact quotation where the quotation carries evidentiary weight;
+a rule followed at the expense of Intent and a working product;
+Intent cited to justify a hidden bypass without evidence, owner, and review;
+agent count, votes, or repeated lineage presented as truth;
+one model or vendor as an irreplaceable cognition owner;
+an agent forced to administer ontology instead of doing its primary work;
+a semantic error treated as irreversible corruption of all memory;
+a summary or compaction without sources, losses, and an undo path;
+retrieval or repetition treated as reinforcement;
+a giant context dump or silent truncation;
+Dreamer, Watchdog, or a Synthesis Agent treated as authority;
+Dreamer curation silently changing epistemic support, source history, or policy;
+Researcher acquisition and Dreamer synthesis merged under one ungoverned owner;
+Skills, prompts, or filters as the only security or enforcement boundary;
+security premised on impenetrable armor;
+Remote Dreamer with access to local databases or tools;
+several canonical owners or a direct storage bypass;
+failure of an optional Module taking down the Kernel;
+a retry or restart loop without new evidence, budget, and escalation;
+a recovery spool used as a second semantic memory;
+restore reviving revoked influence, deleted data, or old authority;
+a notification, acknowledgement, or restart treated as resolution;
+self-improvement without an owner, canary, proof, and rollback;
+tests, phases, and reports replacing a real vertical spine;
+the first vertical spine presented as completed four-plane ELIOT;
+a fixed Module size or count treated as constitutional law;
+source module, package, process, and service conflated into one boundary;
+an unbounded shared-chat swarm or whole-project context for every worker;
+locally green Module tests without affected Edge Proof and Product Pulse;
+an unverified prototype receiving live authority or hot-path influence immediately;
+an active generation rewriting itself without candidate, replay, shadow or canary, and rollback;
+append-only normative documentation and hidden precedence;
+a specific vendor, benchmark, or mechanism treated as a permanent Invariant.
 ```
 
-## A16.3. Итоговая формула
+## A16.3. Final Formula
 
 ```text
 ELIOT = durable governed cognitive inheritance
       + plural scoped understanding corrected by reality
       + proactive attention and route-specific Active Views
-      + Harness for agents, tools, swarm, authority and proof
-      + Dreamer for bounded synthesis, orientation and research
-      + Watchdog/Doctor for supervision, recovery and security
-      + Concilium, practical trials and advisory Meta learning
+      + Harness for agents, tools, swarm, authority, and proof
+      + Dreamer for bounded synthesis, orientation, and research
+      + Watchdog and Doctor for supervision, recovery, and security
+      + Concilium, practical trials, and advisory Meta-learning
       + micro-modular layered capabilities with isolated prototype promotion
-      + context-minimal agent pipelines, independent proofs and Product Pulses
+      + context-minimal agent pipelines, independent proofs, and Product Pulses
       + Human value authority and control
       + a small resilient Kernel that survives local failure.
 ```
 
-ELIOT успешен не тогда, когда хранит больше данных, пишет больше правил, создаёт больше Modules или запускает больше agents. Он успешен, когда человек и agent могут восстановить достаточное понимание, выполнить ограниченную и осмысленную работу, проверить Module и реальные edges, увидеть product outcome, пережить ошибку и улучшить следующую итерацию без переписывания всей системы.
+ELIOT succeeds not when it stores more data, writes more rules, creates more Modules, or runs more agents. It succeeds when a person and agent can restore sufficient understanding, perform bounded and meaningful work, verify Modules and real edges, observe the product outcome, survive error, and improve the next iteration without rewriting the entire system.

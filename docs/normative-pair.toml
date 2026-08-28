@@ -1,0 +1,24 @@
+schema_version = "eliot-normative-pair-v1"
+status = "accepted"
+adopted_at = "2026-08-28"
+decision_ref = "github:UnknownAlienHuman/eliot-memory-os#25"
+
+pair_key_algorithm = "sha256-domain-separated-v1"
+pair_key_input = "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes"
+pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+
+architecture_path = "docs/architecture/ELIOT_ARCHITECTURE.md"
+architecture_revision = "4.5-draft"
+architecture_edition = "2026-08-28"
+architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+
+implementation_path = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+implementation_revision = "0.29-draft"
+implementation_edition = "2026-08-28"
+implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+
+architecture_publication_alias = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+implementation_publication_alias = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+
+supersedes_architecture_sha256 = "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
+supersedes_implementation_sha256 = "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"

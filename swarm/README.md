@@ -23,9 +23,21 @@ the local task-program amendment v1.2 in
 `decisions/W1-06-PROGRAM-REVISION-v1.2.md`; it does not rewrite the original
 bootstrap evidence.
 
-The canonical normative files remain in
-`C:\Development\Rust\docs\ELIOT Arhitecture`. `docs/normative/` is a pinned,
-CI-verifiable projection only.
+## Current normative authority
+
+On 2026-08-28 the Architecture Owner adopted the new English pair:
+
+- [`docs/architecture/ELIOT_ARCHITECTURE.md`](../docs/architecture/ELIOT_ARCHITECTURE.md),
+  SHA-256 `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A`;
+- [`docs/architecture/ELIOT_IMPLEMENTATION.md`](../docs/architecture/ELIOT_IMPLEMENTATION.md),
+  SHA-256 `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063`.
+
+The authority receipt is
+[`docs/normative-pair.toml`](../docs/normative-pair.toml). The frozen hashes
+above remain the exact identity of this historical recovery baseline. Existing
+results, gates, and generated projections are not rewritten to impersonate the
+new pair; any work resumed from them must recompile its current brief and rule
+bindings before promotion.
 
 ## Current execution boundary
 
