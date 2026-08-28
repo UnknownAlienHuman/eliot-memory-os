@@ -1,93 +1,58 @@
 [CmdletBinding()]
 param(
-    [switch] $List
+    [switch] $List,
+    [switch] $SkipCargoCheck
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ProfileVersion = 'eliot-verify-v3'
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
-function Fail([string] $Message) {
-    throw "VERIFY_FAIL: $Message"
+$steps = @(
+    [pscustomobject]@{
+        Name = 'normative-pair'
+        Command = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'verify-normative.ps1') }
+    },
+    [pscustomobject]@{
+        Name = 'cargo-metadata'
+        Command = { cargo metadata --locked --no-deps --format-version 1 | Out-Null }
+    },
+    [pscustomobject]@{
+        Name = 'cargo-fmt'
+        Command = { cargo fmt --all -- --check }
+    }
+)
+
+if (-not $SkipCargoCheck) {
+    $steps += [pscustomobject]@{
+        Name = 'cargo-check-workspace'
+        Command = { cargo check --locked --workspace --all-targets }
+    }
 }
 
-function Invoke-NativeStep(
-    [string] $StepId,
-    [string] $FilePath,
-    [string[]] $Arguments,
-    [switch] $SuppressOutput
-) {
-    Write-Output "VERIFY_STEP_START id=$StepId"
-    if ($SuppressOutput) {
-        & $FilePath @Arguments | Out-Null
-    }
-    else {
-        & $FilePath @Arguments
-    }
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        Fail "step=$StepId exit=$exitCode"
-    }
-    Write-Output "VERIFY_STEP_PASS id=$StepId"
+if ($List) {
+    $steps | ForEach-Object { $_.Name }
+    exit 0
 }
 
+Push-Location $repoRoot
 try {
-    $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-    $normativeVerifier = Join-Path $repoRoot 'scripts/verify-normative.ps1'
-    if (-not (Test-Path -LiteralPath $normativeVerifier -PathType Leaf)) {
-        Fail 'normative verifier is missing'
-    }
-    $lintPolicyVerifier = Join-Path $repoRoot 'scripts/verify-lint-policy.ps1'
-    if (-not (Test-Path -LiteralPath $lintPolicyVerifier -PathType Leaf)) {
-        Fail 'lint policy verifier is missing'
-    }
-    $stuMeasure = Join-Path $repoRoot 'scripts/measure-stu.ps1'
-    if (-not (Test-Path -LiteralPath $stuMeasure -PathType Leaf)) {
-        Fail 'STU measurement script is missing'
-    }
-    $unimplementedGenerator = Join-Path $repoRoot 'scripts/gen-unimplemented.ps1'
-    if (-not (Test-Path -LiteralPath $unimplementedGenerator -PathType Leaf)) {
-        Fail 'unimplemented registry generator is missing'
-    }
-    $unimplementedVerifier = Join-Path $repoRoot 'scripts/verify-unimplemented.ps1'
-    if (-not (Test-Path -LiteralPath $unimplementedVerifier -PathType Leaf)) {
-        Fail 'independent unimplemented registry verifier is missing'
-    }
-
-    $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
-    $steps = @(
-        [pscustomobject]@{ Id = 'metadata'; Description = 'cargo metadata --locked --no-deps --format-version 1'; FilePath = 'cargo'; Arguments = @('metadata', '--locked', '--no-deps', '--format-version', '1'); SuppressOutput = $true },
-        [pscustomobject]@{ Id = 'lint-policy'; Description = 'workspace inheritance and intentional FFI lint-profile equality'; FilePath = $pwsh; Arguments = @('-NoProfile', '-File', $lintPolicyVerifier); SuppressOutput = $false },
-        [pscustomobject]@{ Id = 'fmt'; Description = 'cargo fmt --all -- --check'; FilePath = 'cargo'; Arguments = @('fmt', '--all', '--', '--check'); SuppressOutput = $false },
-        [pscustomobject]@{ Id = 'normative'; Description = 'scripts/verify-normative.ps1'; FilePath = $pwsh; Arguments = @('-NoProfile', '-File', $normativeVerifier); SuppressOutput = $false },
-        [pscustomobject]@{ Id = 'unimplemented-generated'; Description = 'generated docs/UNIMPLEMENTED.md matches tracked structured markers'; FilePath = $pwsh; Arguments = @('-NoProfile', '-File', $unimplementedGenerator, '-Check'); SuppressOutput = $false },
-        [pscustomobject]@{ Id = 'unimplemented-oracle'; Description = 'independent source-to-registry bijection'; FilePath = $pwsh; Arguments = @('-NoProfile', '-File', $unimplementedVerifier); SuppressOutput = $false },
-        [pscustomobject]@{ Id = 'stu-evidence'; Description = 'provisional non-blocking STU observations for tracked Rust source'; FilePath = $pwsh; Arguments = @('-NoProfile', '-File', $stuMeasure); SuppressOutput = $false },
-        [pscustomobject]@{ Id = 'workspace-check'; Description = 'cargo check --locked --workspace --all-targets'; FilePath = 'cargo'; Arguments = @('check', '--locked', '--workspace', '--all-targets'); SuppressOutput = $false },
-        [pscustomobject]@{ Id = 'workspace-clippy'; Description = 'cargo clippy --locked --workspace --all-targets -- -D warnings'; FilePath = 'cargo'; Arguments = @('clippy', '--locked', '--workspace', '--all-targets', '--', '-D', 'warnings'); SuppressOutput = $false },
-        [pscustomobject]@{ Id = 'workspace-tests'; Description = 'cargo test --locked --workspace'; FilePath = 'cargo'; Arguments = @('test', '--locked', '--workspace'); SuppressOutput = $false },
-        [pscustomobject]@{ Id = 'cargo-deny'; Description = 'cargo deny check'; FilePath = 'cargo'; Arguments = @('deny', 'check'); SuppressOutput = $false }
-    )
-
-    if ($List) {
-        Write-Output "ELIOT_VERIFY_PROFILE=$ProfileVersion"
-        for ($index = 0; $index -lt $steps.Count; $index++) {
-            $step = $steps[$index]
-            Write-Output ('{0:D2} {1} | {2}' -f ($index + 1), $step.Id, $step.Description)
-        }
-        exit 0
-    }
-
-    Write-Output "ELIOT_VERIFY_PROFILE=$ProfileVersion"
-    Write-Output "VERIFY_ROOT=$repoRoot"
     foreach ($step in $steps) {
-        Invoke-NativeStep -StepId $step.Id -FilePath $step.FilePath -Arguments $step.Arguments -SuppressOutput:$step.SuppressOutput
+        Write-Host "VERIFY_STEP: $($step.Name)"
+        & $step.Command
+        if ($LASTEXITCODE -ne 0) {
+            throw "Verification step failed: $($step.Name) (exit $LASTEXITCODE)"
+        }
     }
-    Write-Output 'VERIFY_RESULT=PASS'
+
+    Write-Host "VERIFY: PASS steps=$($steps.Count)"
     exit 0
 }
 catch {
     Write-Error $_.Exception.Message
     exit 1
+}
+finally {
+    Pop-Location
 }

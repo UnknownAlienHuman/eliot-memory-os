@@ -2,20 +2,23 @@ set shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
 
 default: quick
 
+normative:
+    pwsh -NoProfile -File scripts/verify-normative.ps1
+
 metadata:
-    cargo metadata --no-deps --format-version 1 | Out-Null
+    cargo metadata --locked --no-deps --format-version 1 | Out-Null
 
 fmt-check:
     cargo fmt --all -- --check
 
 check:
-    cargo check --workspace --all-targets
+    cargo check --locked --workspace --all-targets
 
 clippy:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --locked --workspace --all-targets -- -D warnings
 
 test:
-    cargo test --workspace
+    cargo test --locked --workspace
 
 operator-check:
     dotnet build apps/Eliot.Operator/Eliot.Operator.csproj --configuration Release
@@ -28,23 +31,10 @@ claude-package:
 sync-skills:
     cargo run --quiet -p eliot-app -- host skill-sync
 
-quick: metadata fmt-check check
+quick: normative metadata fmt-check check
 
 verify:
     pwsh -NoProfile -File scripts/verify.ps1
 
 verify-list:
     pwsh -NoProfile -File scripts/verify.ps1 -List
-
-verify-w1:
-    pwsh -NoProfile -File scripts/verify-w1.ps1
-
-verify-w1-list:
-    pwsh -NoProfile -File scripts/verify-w1.ps1 -List
-
-unimplemented:
-    pwsh -NoProfile -File scripts/gen-unimplemented.ps1
-
-unimplemented-check:
-    pwsh -NoProfile -File scripts/gen-unimplemented.ps1 -Check
-    pwsh -NoProfile -File scripts/verify-unimplemented.ps1

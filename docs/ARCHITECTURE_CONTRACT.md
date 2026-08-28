@@ -1,59 +1,55 @@
 # Architecture authority
 
-This file is a navigation contract, not a third normative architecture book.
+This file is the repository authority and navigation contract. It is not a
+third normative book.
 
-ELIOT has one normative pair. Its canonical location is outside the checkout so
-that source cutovers and generated host packages cannot silently replace it:
+## Accepted normative pair
 
-`C:\Development\Rust\docs\ELIOT Arhitecture`
+On 2026-08-28 the Architecture Owner adopted the exact English pair below as
+ELIOT's sole current normative pair.
 
-| Authority | Canonical file | Revision | SHA-256 |
-|---|---|---|---|
-| Intent, theory, invariants, and hard boundaries | `ELIOT_ARCHITECTURE.md` | `4.5-draft` | `58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8` |
-| Target owners, contracts, defaults, failure behavior, and migration | `ELIOT_IMPLEMENTATION.md` | `0.29-draft` | `C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B` |
+| Authority | Canonical repository file | Revision | Edition | SHA-256 |
+|---|---|---|---|---|
+| Intent, theory, invariants, and Hard Boundaries | [`docs/architecture/ELIOT_ARCHITECTURE.md`](architecture/ELIOT_ARCHITECTURE.md) | `4.5-draft` | `2026-08-28` | `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A` |
+| Target owners, contracts, defaults, failure behavior, and migration | [`docs/architecture/ELIOT_IMPLEMENTATION.md`](architecture/ELIOT_IMPLEMENTATION.md) | `0.29-draft` | `2026-08-28` | `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063` |
 
-Read the canonical `README.md` and `INDEX.md` in that directory for bounded
-routing into the pair. Architecture prevails over Implementation when their
-meaning conflicts. Neither document proves that a target mechanism exists or is
-running.
+The machine-bindable adoption receipt is
+[`docs/normative-pair.toml`](normative-pair.toml). Its pair key is
+`sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b`.
+Only the two document digests form the normative pair. The receipt, indexes,
+registries, issues, tests, audits, and generated projections are evidence or
+navigation and cannot become a third normative source.
 
-## Published English final edition
+Architecture prevails over Implementation on semantic conflict. Adoption does
+not promote a target mechanism to current implementation support. Product status
+remains `NOT_ACCEPTED / UNVERIFIED` until exact Product Proof exists.
 
-The repository publishes the supplied 2026-08-28 English final files without
-changing their distribution bytes:
+## Repository location and branch authority
 
-| Edition artifact | Internal revision | SHA-256 |
-|---|---|---|
-| [`ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md`](architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md) | `4.5-draft`; English edition `2026-08-28` | `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A` |
-| [`ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md`](architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md) | `0.29-draft`; English edition `2026-08-28` | `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063` |
+The canonical files above live on `main`. A copy in another branch, worktree,
+package, report, prompt, or agent memory has no current authority. Agents must
+resolve current work through `AGENTS.md`, `WORKFLOW.md`, and
+`workstreams/ACTIVE.toml` before using documentation.
 
-These are dated edition artifacts, not a silent byte-level replacement of the
-canonical pair above. In particular, the English Implementation has a distinct
-section topology and references retained/generated publication projections that
-are not part of this two-file delivery. The dated English filename is not the
-byte-identical canonical “published versioned copy” described inside the
-Implementation, and this delivery does not create such a copy. Use
-[`docs/architecture/README.md`](architecture/README.md) and
+There are no checked-in dated aliases or predecessor books. The superseded pair
+had these digests:
+
+- Architecture: `58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8`;
+- Implementation: `C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B`.
+
+Those bytes and their historical audits remain available through Git history
+and issue/PR records only. They must not be restored into the active checkout or
+combined with current sections as one contract. Any compiler, Rule Catalogue,
+conformance map, brief, or runtime handshake still bound to the predecessor is
+`STALE` until regenerated and verified against `docs/normative-pair.toml`.
+
+Use [`docs/architecture/README.md`](architecture/README.md) and
 [`docs/architecture/INDEX.md`](architecture/INDEX.md) for bounded routing.
 
 ## Current-system truth
 
 Current source files, Cargo manifests and lockfile, generated metadata, compiler
-diagnostics, tests, installed artifact hashes, and live runtime observations are
-the evidence for the current product identity. Databases, reports, code graphs,
-agent memory, and prose are evidence layers and may be stale.
-
-The normative pair remains draft/target. Until an exact, scoped Product Proof is
-accepted, the honest product status is `NOT_ACCEPTED / UNVERIFIED`. A green
-workspace build does not promote D0 or D1 by itself.
-
-## Repository documents
-
-Files under `docs/architecture/`, milestone worklogs, `UL_PROGRESS.md`, and old
-completion reports are historical or bounded evidence tied to their recorded
-source identities. They are not competing current authorities and their PASS or
-CERTIFIED labels must not be transferred to current bytes.
-
-Copies of the normative books inside this repository or a generated host package
-are non-canonical. Any projection must retain the canonical revisions and hashes
-above and must be regenerated when the pair changes.
+diagnostics, tests, installed artifact hashes, store identity, and live runtime
+observations are evidence for current support. Prose, reports, graphs, branch
+names, successful builds, and test counts cannot by themselves establish
+runtime health, D0/D1 acceptance, or `CURRENT_VERIFIED`.

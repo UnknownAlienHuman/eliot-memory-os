@@ -1,93 +1,33 @@
-# ELIOT: индекс документации
+# ELIOT normative documentation
 
-> **Статус:** каноническая точка входа; только навигация, не третья нормативная книга.
->
-> **Канонический каталог:** `C:\Development\Rust\docs\ELIOT Arhitecture`. Копии внутри проекта или на GitHub не являются источником документации.
+> Canonical navigation entrypoint. This file is not a third normative book.
 
-Читайте этот файл первым. Для точного поиска по сущностям, потокам и предметам используйте [INDEX.md](./INDEX.md). Не загружайте обе книги целиком.
+ELIOT has one accepted normative pair on `main`:
 
-## Нормативная пара и границы утверждений
+| Role | Canonical file | Revision / edition | SHA-256 |
+|---|---|---|---|
+| Intent, theory, invariants, Hard Boundaries | [ELIOT Architecture](./ELIOT_ARCHITECTURE.md) | `4.5-draft` / `2026-08-28` | `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A` |
+| Owners, contracts, defaults, failure behavior, migration | [ELIOT Implementation](./ELIOT_IMPLEMENTATION.md) | `0.29-draft` / `2026-08-28` | `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063` |
 
-| Вопрос | Источник |
-|---|---|
-| Intent, Theory, Invariants, Hard Boundaries, смысл решений | [ELIOT Architecture](./ELIOT_ARCHITECTURE.md), `4.5-draft` |
-| Целевые owners, contracts, defaults, failure behavior, migration | [ELIOT Implementation](./ELIOT_IMPLEMENTATION.md), `0.29-draft` |
-| Что реально существует и работает сейчас | точные source/build/runtime/store evidence, не проза |
+Machine identity and adoption status are in
+[`../normative-pair.toml`](../normative-pair.toml); authority and branch rules
+are in [`../ARCHITECTURE_CONTRACT.md`](../ARCHITECTURE_CONTRACT.md). There are
+no alternate dated copies or predecessor books in the active checkout.
 
-При смысловом конфликте Architecture выше Implementation. Каноничность каталога не меняет статусы ревизий: Architecture — кандидат на принятие; Implementation — `TARGET`; code/runtime/data conformance неизвестно; product — `NOT_ACCEPTED / UNVERIFIED`.
+Use [INDEX.md](./INDEX.md) to route by entity, flow, or question. Do not load
+both books in full for ordinary work.
 
-## English final edition — 2026-08-28
+## Minimal reading routes
 
-Репозиторий также публикует неизменённые байты датированной English-final
-редакции:
+- Mission and first orientation: Architecture introduction, `A1`, `A16.3`.
+- Interpretation or rule conflict: `A0`.
+- Core/Kernel/recovery: applicable `A2`, `A12–A13`; Implementation `I1`, `I2`,
+  `I5`, `I14–I16`.
+- Module or agent work: one `FunctionalCapabilityCell`, its exact contract and
+  evidence handles, then the affected Edge Proof and Product Pulse.
+- Current support claims: Implementation `I0.5` plus exact current
+  source/build/runtime/store evidence.
 
-| Книга | Edition artifact | SHA-256 |
-|---|---|---|
-| Architecture | [`ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md`](./ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md) | `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A` |
-| Implementation | [`ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md`](./ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md) | `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063` |
-
-Обе книги сохраняют внутренние labels `4.5-draft` / `0.29-draft`, но English
-Implementation имеет отдельную section topology: добавлены `I7.29`, `I10.23`,
-`I11.12`, `I21.1–I21.13`, а часть детальных приложений вынесена в
-publication projections. Поэтому edition-файлы не подменяют canonical hashes и
-`docs/normative`; датированный English filename также не является
-byte-identical canonical “published versioned copy”, описанной внутри
-Implementation. Точные English-маршруты приведены в [INDEX.md](./INDEX.md).
-
-## Минимальный вход
-
-- Общее понимание: введение Architecture, `A1`, `A16.3`.
-- Конфликт или толкование правила: `A0`.
-- Реализация: `Краткое решение`, `Как читать эту книгу`, `I0`, затем только маршрут задачи ниже.
-- Любое утверждение о текущей системе: документ + отдельное актуальное evidence.
-
-## Протокол экономного чтения
-
-1. Выберите один маршрут ниже.
-2. Найдите заголовок, не сканируя сначала весь текст:
-
-   ```powershell
-   rg -n -i -g 'ELIOT_*.md' '^#{1,3} .*PATTERN' .
-   ```
-
-3. Прочитайте минимальный numbered section и только его прямые ссылки.
-4. Если заголовка недостаточно, ограничьте поиск первых совпадений:
-
-   ```powershell
-   rg -n -i -m 20 -g 'ELIOT_*.md' 'PATTERN' .
-   ```
-
-5. Расширяйте контекст только при незакрытой зависимости, конфликте или failure boundary.
-
-## Маршруты
-
-| Задача | Минимальный маршрут |
-|---|---|
-| Смысл, authority, конфликт решений | `A0`, нужный `A*`, `A16`; `I0.3–I0.5` |
-| Текущая поддержка и статус продукта | `I0.2`, `I0.5`, `I0.13`, `Document status`; затем exact evidence |
-| Первый vertical spine | `I0`, `I1.1–I1.8`, `I2.1–I2.5`, `I5.1–I5.7`, `I7`, `I14`, `I17–I18` |
-| Kernel и recovery | `A8`, `A12–A13`; `I1`, `I2.3–I2.5`, `I5.5–I5.23`, `I14–I16`, Appendices `A–D/P` |
-| Process Module или bridge | `A2`, `A13`; `I2.1–I2.25`, `I6.4–I6.5`, `I7.1–I7.5`, `I10`, `I14.14`, `I18` |
-| Instrument, verifier, code understanding | `A5–A6`, `A10.8`, `A14.6`; `I2.9–I2.25`, `I10.8–I10.10`, `I12.9–I12.10`, `I16.17`, `I17–I18`, Appendices `J/P` |
-| Agent/runtime/swarm integration | `A7`, `A10`, `A12`; `I3`, `I7`, `I10.15–I10.18`, `I10.21`, `I13–I14`, `I16`, `I18.11`, `I18.16–I18.18`, `I18.43` |
-| Negotiated decomposition, live peer delivery и anchored review | `A10`; `I10.15`, `I10.18`, `I10.21`, `I12.10`, `I12.31`, `I14.20`, `I18.11`, `I18.18`, `I18.43` |
-| Memory, Understanding, Dreamer | `A4–A7`, `A9`, `A14`; `I9`, `I12–I13`, `I16` |
-| Security и provenance | `A12`; `I5`, `I10.21`, `I12.10`, `I15`, `I18.18`, применимые proof-разделы `I18` |
-| Professional/multimodal workflow | `I4`, `I10.13`, `I10.20–I10.22`, `I12.35`, `I18.47` |
-| Migration, release, future boundaries | `I0.8–I0.9`, `I18–I20`, Appendices `G–P` |
-
-## Карта верхнего уровня
-
-- Architecture `A0–A3`: толкование; миссия; роли/authority/modules; WorkScope.
-- Architecture `A4–A7`: memory; reality/evidence; understanding; context/skills.
-- Architecture `A8–A11`: Watchdog; Dreamer; Harness/agents/swarm; Human control.
-- Architecture `A12–A16`: security; resilience; learning/Meta; scenarios; decision anchors.
-- Implementation `I0–I4`: status/change; processes; Rust/workspace; installation; WorkScope/bootstrap.
-- Implementation `I5–I9`: storage; contracts; agent interaction; Watchdog; Dreamer.
-- Implementation `I10–I14`: integrations; Human plane; understanding/memory; conflict/attention; queues/degradation.
-- Implementation `I15–I20`: security; observability; development order; testing/grounding; migration; future replacements.
-- Appendices `A–P`: lifecycle/protocols, config/reason codes, backlog/conformance, research gates, dependencies/commands, legacy evidence pointers, storage profile, empirical profiles и Rust interfaces. Открывать только по точной необходимости.
-
-## Правило поддержки индекса
-
-Обновляйте этот файл только при изменении canonical location, имён/версий книг, top-level `A*`/`I*`, статуса или рабочих маршрутов. Не копируйте сюда contracts, schemas, audit history и текущие runtime claims.
+Architecture outranks Implementation on semantic conflict. Canonical
+Documentation does not prove that code exists, is installed, running, or
+accepted. The honest product status remains `NOT_ACCEPTED / UNVERIFIED`.

@@ -1,0 +1,33 @@
+schema = "eliot.active-workstreams.v1"
+authority_branch = "main"
+updated_at = "2026-08-28"
+workflow = "WORKFLOW.md"
+agent_rules = "AGENTS.md"
+
+[branch_policy]
+new_branch_pattern = "^(work|fix|docs|chore|refactor|test)/[0-9]+-[a-z0-9]+(?:-[a-z0-9]+)*$"
+standard_branch_requires_open_issue = true
+requires_current_main_ancestor = true
+one_issue_one_branch_one_pr = true
+nonstandard_branch_requires_explicit_exception = true
+merged_or_closed_branch_is_retired = true
+
+[[workstream]]
+id = "core-daemons"
+status = "active"
+branch_strategy = "fresh_per_issue_from_current_main"
+issue_refs = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+integration_issue_refs = [11]
+brief = "workstreams/core-daemons/AGENTS.md"
+inventory = "workstreams/core-daemons/inventory.json"
+excluded_capabilities = ["dreamer"]
+
+[[exception_branch]]
+branch = "cognitive-micromodules-wave-01"
+workstream_id = "cognitive-micromodules-wave-01"
+status = "active_pr_stale_base"
+pr = 26
+mutation_allowed = false
+refresh_from_current_main_required = true
+retire_after_pr_disposition = true
+reason = "Preserve the existing candidate without allowing agents to continue work on an obsolete base."

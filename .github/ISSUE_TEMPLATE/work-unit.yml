@@ -1,0 +1,69 @@
+name: Bounded work unit
+description: One causal change, one owner, one branch, one PR.
+title: "[work] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Work starts from current `main`. The issue owns the causal change; the branch is disposable execution state.
+
+  - type: input
+    id: workstream
+    attributes:
+      label: Workstream
+      description: Name the active programme or state why this is an independent bounded change.
+      placeholder: core-daemons / cognitive-micromodules / independent
+    validations:
+      required: true
+
+  - type: textarea
+    id: causal_property
+    attributes:
+      label: Causal property and actual owner
+      description: State one observable property, the FunctionalCapabilityCell or owner, and the user/system consequence.
+    validations:
+      required: true
+
+  - type: textarea
+    id: old_path
+    attributes:
+      label: Old failing behavior or missing capability
+      description: Give the exact discriminator that fails before the change. Do not use a report/test count as the product property.
+    validations:
+      required: true
+
+  - type: textarea
+    id: paths
+    attributes:
+      label: Mutable path scope and writer
+      description: List the primary paths and identify the single integration/writer owner.
+    validations:
+      required: true
+
+  - type: textarea
+    id: contracts
+    attributes:
+      label: Applicable contracts, dependencies, and non-goals
+      description: Link exact Architecture/Implementation handles, one-hop edges, and what this work must not change.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proof
+    attributes:
+      label: Proof and stop condition
+      description: Module proof, affected Edge Proof, Product Pulse or not-applicable reason, proof ceiling, and stop/escalation condition.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I will fetch/prune, fast-forward `main`, and create a fresh issue-numbered branch from exact `origin/main`.
+          required: true
+        - label: I will not continue work in an old branch unless `workstreams/ACTIVE.toml` explicitly lists it as a mutable exception.
+          required: true
+        - label: Investigation output will remain in this issue/PR or CI artifacts, not as a dated report/research dump in the checkout.
+          required: true
