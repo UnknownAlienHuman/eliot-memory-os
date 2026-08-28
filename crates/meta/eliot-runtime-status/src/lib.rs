@@ -52,6 +52,10 @@ pub use watchdog_live::{
 };
 use watchdog_live::{inspect_watchdog_live, watchdog_gap};
 
+mod readiness_projection;
+pub use readiness_projection::ReadinessContour;
+use readiness_projection::inspect_readiness_from_host_state;
+
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
@@ -128,12 +132,6 @@ pub struct ServiceContours {
     pub watchdog: ComponentState,
     pub host_service_registration: ServiceRegistrationState,
     pub watchdog_service_registration: ServiceRegistrationState,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ReadinessContour {
-    pub proof_status: ComponentState,
-    pub age_gap: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1721,10 +1719,6 @@ pub fn collect_status(
     )
 }
 
-fn readiness_gap() -> String {
-    "readiness identity is durable, but KernelReadinessObservationRecord.observed_at is an opaque PlatformHandle; a typed Host-authored timestamp or bounded readiness lease is required before freshness can be proven".to_owned()
-}
-
 // Journal inspection is kept as one ordered no-fallback boundary so retained
 // root/file leases remain alive through replay and projection.
 #[allow(clippy::too_many_lines)]
@@ -2314,131 +2308,6 @@ fn inspect_host_journal_retained(
         },
         Some(host_state),
     )
-}
-
-// Readiness projection deliberately keeps every identity comparison adjacent;
-// freshness remains Unknown until the durable wire carries a typed time lease.
-#[allow(clippy::too_many_lines)]
-fn inspect_readiness_from_host_state(
-    host_state: Option<&eliot_host_state::HostState>,
-    deadline: Instant,
-) -> ReadinessContour {
-    if Instant::now() >= deadline {
-        return ReadinessContour {
-            proof_status: ComponentState::Unknown {
-                reason: "deadline exceeded before readiness inspection".to_owned(),
-                gap: "bounded deadline".to_owned(),
-            },
-            age_gap: "bounded deadline".to_owned(),
-        };
-    }
-    let Some(host_state) = host_state else {
-        return ReadinessContour {
-            proof_status: ComponentState::Unknown {
-                reason: "no HostState for readiness; Host journal is not validated".to_owned(),
-                gap: readiness_gap(),
-            },
-            age_gap: readiness_gap(),
-        };
-    };
-    let Some(kernel) = host_state.kernel.as_ref() else {
-        return ReadinessContour {
-            proof_status: ComponentState::Unknown {
-                reason: "no active Kernel record for readiness".to_owned(),
-                gap: readiness_gap(),
-            },
-            age_gap: readiness_gap(),
-        };
-    };
-    if kernel.state != eliot_runtime_contracts::KernelActivationState::Active
-        || kernel.one_time_nonce.state() != eliot_host_state::NonceState::Consumed
-        || host_state.prior_kernel_unknown
-    {
-        return ReadinessContour {
-            proof_status: ComponentState::Unknown {
-                reason: format!(
-                    "Kernel not Active Consumed for readiness: state {:?} nonce {:?} prior_unknown {}",
-                    kernel.state,
-                    kernel.one_time_nonce.state(),
-                    host_state.prior_kernel_unknown
-                ),
-                gap: readiness_gap(),
-            },
-            age_gap: readiness_gap(),
-        };
-    }
-    if host_state.readiness_observations.is_empty() {
-        return ReadinessContour {
-            proof_status: ComponentState::Unknown {
-                reason: "no KernelReadinessObservationRecord is present".to_owned(),
-                gap: readiness_gap(),
-            },
-            age_gap: readiness_gap(),
-        };
-    }
-    let mut seen_requests = std::collections::HashSet::new();
-    let mut seen_receipts = std::collections::HashSet::new();
-    let mut duplicate = false;
-    for observation in &host_state.readiness_observations {
-        let request = observation.probe_request_digest.as_str().to_owned();
-        let receipt = observation.ready_receipt_digest.as_str().to_owned();
-        if !seen_requests.insert(request) || !seen_receipts.insert(receipt) {
-            duplicate = true;
-        }
-    }
-    if duplicate {
-        return ReadinessContour {
-            proof_status: ComponentState::Unknown {
-                reason:
-                    "readiness observation digests are duplicated; freshness requires fresh digests"
-                        .to_owned(),
-                gap: readiness_gap(),
-            },
-            age_gap: readiness_gap(),
-        };
-    }
-    let Some(observed) = host_state.readiness_observations.last() else {
-        return ReadinessContour {
-            proof_status: ComponentState::Unknown {
-                reason: "no KernelReadinessObservationRecord is present".to_owned(),
-                gap: readiness_gap(),
-            },
-            age_gap: readiness_gap(),
-        };
-    };
-    let active_checksum = match eliot_host_state::record_checksum(
-        &eliot_host_state::HostStateRecord::Kernel(kernel.clone()),
-    ) {
-        Ok(checksum) => checksum,
-        Err(error) => {
-            return ReadinessContour {
-                proof_status: ComponentState::Unknown {
-                    reason: format!("active Kernel checksum failed: {error}"),
-                    gap: readiness_gap(),
-                },
-                age_gap: readiness_gap(),
-            };
-        }
-    };
-    if observed.validate_against(kernel, &active_checksum).is_err() {
-        return ReadinessContour {
-            proof_status: ComponentState::Unknown {
-                reason: "readiness observation is not bound to the exact active Kernel checksum/process/Job/authority"
-                    .to_owned(),
-                gap: "substituted readiness observation".to_owned(),
-            },
-            age_gap: "substituted readiness observation".to_owned(),
-        };
-    }
-    let gap = readiness_gap();
-    ReadinessContour {
-        proof_status: ComponentState::Unknown {
-            reason: "exact readiness identity is present, but observed_at is opaque and cannot prove freshness"
-                .to_owned(),
-            gap: gap.clone(),
-        },
-        age_gap: gap,
-    }
 }
 
 fn unknown_ors(reason: impl Into<String>) -> OrsContour {
