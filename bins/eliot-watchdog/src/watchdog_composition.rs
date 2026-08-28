@@ -3,7 +3,7 @@
 //! Responsibility/Forbidden ownership: bounded Watchdog runtime composition and admitted heartbeat only; no Kernel effect, Host identity, Store canonical state, unbounded restart, default, retry, or mint authority.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use eliot_runtime::{ChildClass, Runtime, ShutdownOutcome, SupervisionStrategy, TaskFailure};
@@ -21,40 +21,10 @@ use crate::admission_gap_reason;
 use crate::kernel_gap_reason;
 use crate::report_gap_nonfatal;
 
-/// Readiness data emitted by the process entrypoint.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct WatchdogReadiness {
-    pub service: &'static str,
-    pub protocol: &'static str,
-    pub authority_state: WatchdogAuthorityState,
-    pub coverage_claimed: bool,
-    pub kernel_epoch: u64,
-    pub watchdog_epoch: u64,
-    pub tick_interval_ms: u128,
-}
+mod authority_state;
 
-/// Separates SCM/process liveness from admitted heartbeat authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[repr(u8)]
-pub enum WatchdogAuthorityState {
-    /// The SCM sibling is alive and records gap-only evidence, but no current
-    /// Host-issued lease has been admitted for heartbeat authority.
-    RunningNoAuthority = 0,
-    /// Exact Host identity and a current signed lease were admitted and the
-    /// Kernel accepted the corresponding heartbeat.
-    AdmittedHeartbeat = 1,
-}
-
-impl WatchdogAuthorityState {
-    fn from_atomic(value: u8) -> Self {
-        if value == Self::AdmittedHeartbeat as u8 {
-            Self::AdmittedHeartbeat
-        } else {
-            Self::RunningNoAuthority
-        }
-    }
-}
+use authority_state::WatchdogAuthorityStateCell;
+pub use authority_state::{WatchdogAuthorityState, WatchdogReadiness};
 
 /// Runtime-owned watchdog composition.
 pub struct WatchdogComposition {
@@ -62,7 +32,7 @@ pub struct WatchdogComposition {
     admission: Arc<dyn WatchdogAdmissionSource>,
     kernel_epoch: u64,
     watchdog_epoch: u64,
-    authority_state: Arc<AtomicU8>,
+    authority_state: WatchdogAuthorityStateCell,
     config: WatchdogConfig,
     task: eliot_runtime::SupervisedHandle,
     shutdown_requested: Arc<AtomicBool>,
@@ -143,9 +113,7 @@ impl WatchdogComposition {
             .map_or(0, |value| value.watchdog_epoch().value());
         let task_admission = admission.clone();
         let task_host = host;
-        let authority_state = Arc::new(AtomicU8::new(
-            WatchdogAuthorityState::RunningNoAuthority as u8,
-        ));
+        let authority_state = WatchdogAuthorityStateCell::new();
         let task_authority_state = authority_state.clone();
         let interval = config.tick_interval;
         let task = match runtime.supervisor(SupervisionStrategy::OneForOne).spawn(
@@ -170,10 +138,8 @@ impl WatchdogComposition {
                         let admission = match admission.reload() {
                             Ok(admission) => admission,
                             Err(error) => {
-                                authority_state.store(
-                                    WatchdogAuthorityState::RunningNoAuthority as u8,
-                                    Ordering::Release,
-                                );
+                                authority_state
+                                    .transition_to(WatchdogAuthorityState::RunningNoAuthority);
                                 if let Some(reason) = host_gap {
                                     report_gap_nonfatal(kernel.as_ref(), reason).await;
                                 }
@@ -183,10 +149,8 @@ impl WatchdogComposition {
                             }
                         };
                         if let Some(reason) = host_gap {
-                            authority_state.store(
-                                WatchdogAuthorityState::RunningNoAuthority as u8,
-                                Ordering::Release,
-                            );
+                            authority_state
+                                .transition_to(WatchdogAuthorityState::RunningNoAuthority);
                             // Observation/spool failure is nonfatal. The
                             // Watchdog remains alive and will retry on the
                             // next bounded tick; no restart-budget path is
@@ -207,15 +171,11 @@ impl WatchdogComposition {
                             continue;
                         }
                         match kernel.supervise(admission.lease()).await {
-                            Ok(()) => authority_state.store(
-                                WatchdogAuthorityState::AdmittedHeartbeat as u8,
-                                Ordering::Release,
-                            ),
+                            Ok(()) => authority_state
+                                .transition_to(WatchdogAuthorityState::AdmittedHeartbeat),
                             Err(error) => {
-                                authority_state.store(
-                                    WatchdogAuthorityState::RunningNoAuthority as u8,
-                                    Ordering::Release,
-                                );
+                                authority_state
+                                    .transition_to(WatchdogAuthorityState::RunningNoAuthority);
                                 report_gap_nonfatal(kernel.as_ref(), kernel_gap_reason(&error))
                                     .await;
                             }
@@ -243,13 +203,12 @@ impl WatchdogComposition {
 
     #[must_use]
     pub fn readiness(&self) -> WatchdogReadiness {
-        let authority_state =
-            WatchdogAuthorityState::from_atomic(self.authority_state.load(Ordering::Acquire));
+        let authority_state = self.authority_state.load();
         WatchdogReadiness {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
             authority_state,
-            coverage_claimed: matches!(authority_state, WatchdogAuthorityState::AdmittedHeartbeat),
+            coverage_claimed: authority_state.coverage_claimed(),
             kernel_epoch: self.kernel_epoch,
             watchdog_epoch: self.watchdog_epoch,
             tick_interval_ms: self.config.tick_interval.as_millis(),
