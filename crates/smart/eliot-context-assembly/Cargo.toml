@@ -1,0 +1,26 @@
+[package]
+name = "eliot-context-assembly"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Role-preserving Active Understanding View and decision-local-tail assembly"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.context.assembly"
+source_layer = "C1"
+runtime_layer = "R5"
+runtime_bundle = "eliotd"
+agent_order = 10
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-context-contracts = { path = "../eliot-context-contracts" }
+eliot-context-admission = { path = "../eliot-context-admission" }

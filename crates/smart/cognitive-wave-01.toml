@@ -1,0 +1,190 @@
+schema_version = 2
+wave_id = "cognitive-micromodules-wave-01"
+status = "PROTOTYPE_ASSIGNMENT_READY"
+base_commit = "7d7f03259cc3d3d90b2fe1af7a6175b13808ece2"
+normative_architecture = "ELIOT Architecture 4.5-draft / English edition 2026-08-28"
+normative_implementation = "ELIOT Implementation 0.29-draft / English edition 2026-08-28"
+purpose = "Prepare function-bounded cognitive crates and one-agent assignments without writing Rust implementation code."
+integration_owner = "cognitive-wave-01-integrator"
+workspace_rule = "Prototype Cargo manifests are intentionally absent from the root workspace until implementation, package proof, affected edge proof and current-main integration review exist."
+agent_rule = "One agent receives exactly one active module.toml plus its immediate provider/consumer contracts and donor anchors."
+loc_rule = "10000 LOC is a soft review ceiling; causal cohesion, one owner, one proof surface and one replacement boundary decide topology."
+old_branch_rule = "cognitive-crates-prototypes-01 is superseded as an assignment source; reuse only revalidated boundary ideas, never its stale effective indexes or empty crates."
+product_pulse_id = "D3A_COGNITIVE_ORIENTATION_PULSE_01"
+product_pulse = "From one admitted observation/evidence snapshot and an observed cue, produce deterministic classification, cue activation, Current Epistemic Position, a Decision-Safety-Floor-preserving Active Understanding View, and a candidate-only DreamPacket with rivals, unknowns and probes; no cognitive crate mutates canonical state or performs an external effect."
+product_pulse_gate = "Orders 15-17 are assigned only after order 14 closes this pulse; no advanced handler is admitted to the workspace or runtime earlier."
+
+[global_boundaries]
+forbidden = ["second canonical or operational state owner", "Dreamer source acquisition or Researcher denominator ownership", "provider/model SDK in cognitive cores", "job scheduling, process supervision or route reservation", "truth/support/authority/policy/finish/effect promotion", "unbounded hot-path work", "similarity as exact applicability or proof", "active generation self-modification"]
+required = ["one causal responsibility", "explicit statelessness or rebuildable projection state", "typed provider/consumer ports", "independent proof surface", "local visible degradation", "replacement/removal boundary"]
+
+[[stage]]
+id = "CAPTURE_AND_CUES"
+orders = [1, 5]
+gate = "shared contracts and normalization symmetry before projection/activation"
+
+[[stage]]
+id = "EPISTEMIC_AND_CONTEXT"
+orders = [6, 10]
+gate = "Current Epistemic Position before candidate admission; admission before assembly"
+
+[[stage]]
+id = "DREAMER_ORIENTATION_FOUNDATION"
+orders = [11, 14]
+gate = "contracts -> bundle -> common validation -> Orientation Product Pulse"
+
+[[stage]]
+id = "POST_ORIENTATION_HANDLERS"
+orders = [15, 17]
+gate = "assign only after the Orientation Product Pulse passes"
+
+[[assignment]]
+order = 1
+crate = "eliot-observation-classifier"
+functional_cell = "smart.observation.classifier"
+manifest = "crates/smart/eliot-observation-classifier/module.toml"
+depends_on = []
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 2
+crate = "eliot-cue-contracts"
+functional_cell = "smart.cue.contracts"
+manifest = "crates/smart/eliot-cue-contracts/module.toml"
+depends_on = []
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 3
+crate = "eliot-cue-normalizer"
+functional_cell = "smart.cue.normalizer"
+manifest = "crates/smart/eliot-cue-normalizer/module.toml"
+depends_on = ["eliot-cue-contracts"]
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 4
+crate = "eliot-cue-index"
+functional_cell = "smart.cue.index"
+manifest = "crates/smart/eliot-cue-index/module.toml"
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer"]
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 5
+crate = "eliot-cue-activation"
+functional_cell = "smart.cue.activation"
+manifest = "crates/smart/eliot-cue-activation/module.toml"
+depends_on = ["eliot-cue-contracts"]
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 6
+crate = "eliot-epistemic"
+functional_cell = "smart.epistemic.position"
+manifest = "crates/smart/eliot-epistemic/module.toml"
+depends_on = []
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 7
+crate = "eliot-context-contracts"
+functional_cell = "smart.context.contracts"
+manifest = "crates/smart/eliot-context-contracts/module.toml"
+depends_on = []
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 8
+crate = "eliot-context-candidates"
+functional_cell = "smart.context.candidates"
+manifest = "crates/smart/eliot-context-candidates/module.toml"
+depends_on = ["eliot-cue-contracts", "eliot-epistemic", "eliot-context-contracts"]
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 9
+crate = "eliot-context-admission"
+functional_cell = "smart.context.admission"
+manifest = "crates/smart/eliot-context-admission/module.toml"
+depends_on = ["eliot-context-contracts"]
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 10
+crate = "eliot-context-assembly"
+functional_cell = "smart.context.assembly"
+manifest = "crates/smart/eliot-context-assembly/module.toml"
+depends_on = ["eliot-context-contracts", "eliot-context-admission"]
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 11
+crate = "eliot-dreamer-contracts"
+functional_cell = "smart.dreamer.contracts"
+manifest = "crates/smart/eliot-dreamer-contracts/module.toml"
+depends_on = []
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 12
+crate = "eliot-dreamer-bundle"
+functional_cell = "smart.dreamer.bundle"
+manifest = "crates/smart/eliot-dreamer-bundle/module.toml"
+depends_on = ["eliot-context-contracts", "eliot-dreamer-contracts"]
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 13
+crate = "eliot-dreamer-candidate-validation"
+functional_cell = "smart.dreamer.candidate_validation"
+manifest = "crates/smart/eliot-dreamer-candidate-validation/module.toml"
+depends_on = ["eliot-dreamer-contracts"]
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 14
+crate = "eliot-dreamer-orientation"
+functional_cell = "smart.dreamer.orientation"
+manifest = "crates/smart/eliot-dreamer-orientation/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse_role = "primary"
+
+[[assignment]]
+order = 15
+crate = "eliot-memory-curation-screen"
+functional_cell = "smart.memory.curation_screen"
+manifest = "crates/smart/eliot-memory-curation-screen/module.toml"
+depends_on = ["eliot-dreamer-contracts"]
+product_pulse_role = "post_pulse"
+
+[[assignment]]
+order = 16
+crate = "eliot-dreamer-clarification"
+functional_cell = "smart.dreamer.clarification"
+manifest = "crates/smart/eliot-dreamer-clarification/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+product_pulse_role = "post_pulse"
+
+[[assignment]]
+order = 17
+crate = "eliot-dreamer-curation"
+functional_cell = "smart.dreamer.curation"
+manifest = "crates/smart/eliot-dreamer-curation/module.toml"
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", "eliot-memory-curation-screen"]
+product_pulse_role = "post_pulse"
+
+[[deferred]]
+next_order = 18
+capability = "Dreamer ArchitectureBrief and ImplementationBrief"
+activation = "after Orientation pulse and exact accepted-source projection contract"
+
+[[deferred]]
+next_order = 19
+capability = "Dreamer Research synthesis"
+activation = "after ResearchPack, Evidence Grade, evidence freeze and coverage-denominator edge contracts are implemented by Researcher"
+
+[[deferred]]
+next_order = 20
+capability = "Dreamer development diagnosis, maintenance, orchestration and configuration handlers"
+activation = "after system-experience projection, Problem/ImprovementCandidate and Agent Coordinator edges are current and the first pulse is useful"

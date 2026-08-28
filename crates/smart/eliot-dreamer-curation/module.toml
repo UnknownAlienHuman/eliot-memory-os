@@ -1,0 +1,56 @@
+schema_version = 2
+module_id = "smart.dreamer.curation"
+crate = "eliot-dreamer-curation"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 17
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.curation"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Convert a validated Curation draft and optional deterministic screen into lineage-preserving classification/relation/episode/concept/procedure/failure/merge/split/reconsolidation/accessibility/repair candidates."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput class=Curation", "DreamInputBundle", "ValidatedDreamDraft", "optional CurationScreenResult"]
+outputs = ["CurationCandidateSet", "per-candidate preservation report", "coverage/uncertainty/rollback manifest"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", "eliot-memory-curation-screen"]
+consumers = ["Governor candidate disposition path", "maintenance review"]
+non_goals = ["canonical write", "lifecycle/support/influence transition", "automatic merge/split", "background scheduling"]
+invariants = ["original records remain intact", "every semantic transformation retains source/counterevidence/uncertainty", "merge/split/repair has verifier or replay plus rollback", "candidate type never grants promotion authority"]
+failure_behavior = "Reject the affected candidate or whole batch according to atomicity profile; retain sources and emit exact preservation failures."
+proof_surface = ["false merge and minority-loss cases", "procedure without applicability/verifier", "rollback-required transformations", "screen/model disagreement preservation"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core/src/lib.rs"
+disposition = "extract_and_expand"
+scope = "candidate generation and preservation report"
+
+[[donor]]
+path = "crates/smart/eliot-memory-curation/src/lib.rs"
+disposition = "reuse_screen_evidence_only"
+scope = "protected/candidate finding patterns, not state or duplicate enums"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.3 and I9.6-I9.8"
+disposition = "authoritative_contract"
+scope = "curation job, candidate kinds and transformation validation"
+
+[agent_task]
+objective = "Implement one candidate-only curation handler after the Orientation pulse passes."
+write_scope = ["crates/smart/eliot-dreamer-curation/**"]
+deliverables = ["typed handler for all current curation candidate kinds", "preservation/rollback manifest", "adversarial transformation tests"]
+acceptance = ["no canonical or lifecycle effect", "every candidate is independently rejectable and traceable", "screen disagreement is visible rather than overwritten"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if Orientation Product Pulse is not green or if a candidate lacks reversible lineage; do not compensate by adding more handler crates."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

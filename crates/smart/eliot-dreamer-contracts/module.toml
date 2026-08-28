@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.dreamer.contracts"
+crate = "eliot-dreamer-contracts"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 11
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C0"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.contracts"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Own the provider-neutral schemas common to Dreamer Orientation, Clarification, Curation, and later job classes without granting admission or authority."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["foundation identities, fences, evidence and budget handles"]
+outputs = ["DreamJobInput and JobClass", "DreamInputBundle", "ModelDraft envelopes", "candidate/result/preservation contracts"]
+depends_on = []
+consumers = ["eliot-dreamer-bundle", "eliot-dreamer-candidate-validation", "eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-curation"]
+non_goals = ["model/provider SDK", "job admission", "route selection", "candidate validation or synthesis"]
+invariants = ["every output is candidate-only", "resolved evidence sections are distinguishable from model synthesis", "scope/fence/privacy/budget are explicit", "no field can mint truth, authority, finish, or canonical write"]
+failure_behavior = "Incompatible or unknown job/result schema is rejected explicitly; no generic untyped model text fallback."
+proof_surface = ["schema roundtrip", "candidate-only negative compile/fixture checks", "all I9 job-class discriminants represented", "compatibility fixtures"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core/src/lib.rs"
+disposition = "extract_and_expand"
+scope = "job/candidate/budget contract shapes"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.3-I9.7"
+disposition = "authoritative_contract"
+scope = "job classes, DreamPacket, CurationCandidate and transformation report"
+
+[agent_task]
+objective = "Create the stable Dreamer contract hub before any handler or runtime work."
+write_scope = ["crates/smart/eliot-dreamer-contracts/**"]
+deliverables = ["provider-neutral schemas", "candidate-only status vocabulary", "compatibility fixtures"]
+acceptance = ["all current I9 job families can be represented without handler logic", "no vendor or orchestration types", "model text cannot occupy resolved evidence fields"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if a requested field belongs to Governor admission, Agent Coordinator lifecycle, or provider adapter internals."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

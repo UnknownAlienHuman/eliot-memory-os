@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.cue.index"
+crate = "eliot-cue-index"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 4
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "rebuildable_projection"
+hot_path = false
+lifecycle_owner = "smart.cue.index"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Compile canonical cue bindings and outbox deltas into an immutable, revision-fenced per-scope CueSnapshot."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["normalized cue bindings", "canonical record handles and lifecycle metadata", "projection revision and invalidation events"]
+outputs = ["CueSnapshot", "ProjectionPublicationCandidate", "invalidation/coverage report"]
+depends_on = ["eliot-cue-contracts", "eliot-cue-normalizer"]
+consumers = ["eliot-cue-activation", "R5 hot mirror publisher"]
+non_goals = ["matching", "spreading activation", "canonical memory ownership", "session delivery deduplication"]
+invariants = ["projection is fully rebuildable", "payloads never become a second memory store", "stale or split-view snapshots are never published CURRENT", "invalidation preserves provenance and exact target handles"]
+failure_behavior = "Keep the prior compatible snapshot or publish STALE/FAILED with a rebuild handle; never expose a partial snapshot as current."
+proof_surface = ["full-versus-delta equality", "outbox replay/idempotency", "scope isolation", "stale/split-view publication cases"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-cues/src/lib.rs"
+disposition = "extract_and_harden"
+scope = "CueRecord, CueSnapshot and invalidation behavior"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I5.8 and I12.7"
+disposition = "authoritative_contract"
+scope = "projection publication and immutable hot mirror"
+
+[agent_task]
+objective = "Extract projection construction/invalidation from matching and make full rebuild the reference path."
+write_scope = ["crates/smart/eliot-cue-index/**"]
+deliverables = ["snapshot compiler", "delta application", "publication/coverage evidence"]
+acceptance = ["full and delta snapshots are semantically equal at one fence", "no target payload is stored", "failed publication leaves a visible stale state"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if the implementation needs canonical write authority or mutates a live snapshot in place."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

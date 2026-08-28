@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.dreamer.bundle"
+crate = "eliot-dreamer-bundle"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 12
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.bundle"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Assemble and validate a bounded, fence-coherent Dreamer input bundle from handles already admitted and disclosed by Governor."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput", "Governor-resolved handle material", "privacy/disclosure decision", "bundle budget"]
+outputs = ["DreamInputBundle", "source coverage and omission manifest", "bundle validation report"]
+depends_on = ["eliot-context-contracts", "eliot-dreamer-contracts"]
+consumers = ["eliot-dreamer-candidate-validation", "Dreamer runtime adapter"]
+non_goals = ["source acquisition", "handle admission", "model call", "job scheduling or route selection"]
+invariants = ["only requested/admitted handles enter the bundle", "one State Fence and disclosure closure govern the bundle", "omission is reversible by handle", "architecture and implementation sources remain authority-separated"]
+failure_behavior = "Return an incomplete/denied bundle with exact missing or forbidden handles; never fetch wider material or silently cross privacy boundaries."
+proof_surface = ["invented/unadmitted handle rejection", "mixed-fence and mixed-scope cases", "budget/omission reversibility", "Architecture/Implementation section separation"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core/src/lib.rs"
+disposition = "extract_and_harden"
+scope = "DreamJobInput validation and handle closure"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.4 and I9.13-I9.14"
+disposition = "authoritative_contract"
+scope = "bounded bundle, remote and Researcher boundaries"
+
+[agent_task]
+objective = "Build the pure bundle assembler; leave admission, expansion I/O, and route execution to their owners."
+write_scope = ["crates/smart/eliot-dreamer-bundle/**"]
+deliverables = ["bundle assembler", "coverage/omission manifest", "privacy/fence adversarial tests"]
+acceptance = ["no hidden reads or external calls", "all bytes have admitted lineage", "missing sources lower coverage rather than being invented"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if the requested bundle cannot fit while preserving required evidence and separation; return a narrower/decomposed job requirement."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

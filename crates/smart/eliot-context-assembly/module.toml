@@ -1,0 +1,56 @@
+schema_version = 2
+module_id = "smart.context.assembly"
+crate = "eliot-context-assembly"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 10
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.context.assembly"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Render one already admitted context set into bounded semantic sections, exact omission/expansion manifests, and the decision-local tail without re-running admission."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["AdmittedContextSet", "ContextRecipe layout policy", "bounded renderer profile"]
+outputs = ["ActiveUnderstandingView", "DecisionLocalTail", "BoundaryMetadataEnvelope", "final PacketQualityScorecard"]
+depends_on = ["eliot-context-contracts", "eliot-context-admission"]
+consumers = ["agent packet surface", "eliot-dreamer-bundle"]
+non_goals = ["candidate ranking", "retrieval", "model synthesis", "canonical persistence"]
+invariants = ["semantic units are never cut into false fragments", "exact handles remain expandable", "rendering cannot strengthen support or authority", "known omissions and failed quality dimensions remain visible"]
+failure_behavior = "Return a typed incomplete view with preserved exact handles or no view; never recompute admission or hide truncation."
+proof_surface = ["role-order and boundary preservation", "reversible omission", "no double compilation", "stable digest and final scorecard cases"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-understanding/src/lib.rs"
+disposition = "merge_rendering_only"
+scope = "role-preserving sections, manifest and expansion handles; remove nested ContextCompiler call"
+
+[[donor]]
+path = "crates/smart/eliot-context/src/lib.rs"
+disposition = "extract"
+scope = "compiled result and quality semantics"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I7.11, I12.13 and I12.17"
+disposition = "authoritative_contract"
+scope = "decision-local tail, boundary metadata and resume-safe omissions"
+
+[agent_task]
+objective = "Replace the duplicated understanding compiler with one thin assembly owner over admitted input."
+write_scope = ["crates/smart/eliot-context-assembly/**"]
+deliverables = ["section assembler", "decision-local tail renderer", "omission/boundary manifest and tests"]
+acceptance = ["admission executes exactly once upstream", "no silent truncation", "all rendered claims retain exact source handles and ceiling"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if assembly needs to choose new candidates or reinterpret evidence; return a ContractChallenge to admission/candidate owners."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

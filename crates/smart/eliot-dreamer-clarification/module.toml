@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.dreamer.clarification"
+crate = "eliot-dreamer-clarification"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 16
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.clarification"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Select and render one concise discriminative clarification question, why it matters, and the safe fallback if unanswered."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput class=Clarification", "ValidatedDreamDraft", "active-agent/Human-boundary projection"]
+outputs = ["ClarificationCandidate", "delivery-target recommendation", "safe fallback and expiry"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+consumers = ["agent mailbox compiler", "Human attention proposal"]
+non_goals = ["notification delivery", "attention ownership", "task decision", "inventing an answer"]
+invariants = ["exactly one question", "question changes a material classification/scope/outcome/reuse decision", "Human interruption is proposed only at a Human-owned boundary", "absence preserves the unknown and declared fallback"]
+failure_behavior = "Return no-question/inconclusive with the original ambiguity; never generate a questionnaire or silently assume an answer."
+proof_surface = ["one-question cardinality", "task-local versus Human routing", "unanswered fallback", "repeated ambiguity deduplication input"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core/src/lib.rs"
+disposition = "reuse_contract_only"
+scope = "Clarification candidate kind and bounded text validation"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.3 and I9.11-I9.12"
+disposition = "authoritative_contract"
+scope = "question content and routing boundary"
+
+[agent_task]
+objective = "Implement clarification as one narrow handler, leaving mailbox/attention delivery to their owners."
+write_scope = ["crates/smart/eliot-dreamer-clarification/**"]
+deliverables = ["question selector/renderer", "routing recommendation", "cardinality and boundary tests"]
+acceptance = ["one concise question only", "no state mutation or delivery side effect", "safe fallback remains explicit"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if selecting a question requires deciding the underlying fact; preserve competing questions and return no selection."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

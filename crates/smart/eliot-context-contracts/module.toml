@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.context.contracts"
+crate = "eliot-context-contracts"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 7
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C0"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.context.contracts"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Own the minimal public types shared by candidate collection, admission, assembly, and Dreamer bundle construction."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["Architecture Context/Attention vocabulary", "foundation identities and evidence labels"]
+outputs = ["ContextAtom and role contracts", "ContextRecipe and section budgets", "Admission/quality/omission/selection-integrity contracts"]
+depends_on = []
+consumers = ["eliot-context-candidates", "eliot-context-admission", "eliot-context-assembly", "eliot-dreamer-bundle"]
+non_goals = ["candidate retrieval", "ranking", "rendering", "recipe learning or promotion"]
+invariants = ["Decision Safety Floor roles are representable", "whole units and exact handles are first-class", "quality is a vector rather than a scalar", "boundary/provenance metadata cannot be optional for material atoms"]
+failure_behavior = "Schema or compatibility failure is explicit and prevents dependent compilation; no fallback to untyped text packets."
+proof_surface = ["schema roundtrip and compatibility", "required-role completeness", "selection-stage append-only shape", "consumer compile fixtures"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-context/src/lib.rs"
+disposition = "extract_and_rewrite"
+scope = "ContextRole, atom, recipe, admission and scorecard shapes"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I7.11 and I12.13"
+disposition = "authoritative_contract"
+scope = "Decision Safety Floor, whole units and selection integrity"
+
+[agent_task]
+objective = "Build the stable context contract hub with no compiler algorithm or mutable state."
+write_scope = ["crates/smart/eliot-context-contracts/**"]
+deliverables = ["public schemas", "typed reason/disposition vocabulary", "compatibility fixtures"]
+acceptance = ["no vendor/store/model types", "all load-bearing roles and omission handles are explicit", "no scalar readiness field can override failed dimensions"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if a field encodes one temporary ranking formula or runtime implementation detail."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

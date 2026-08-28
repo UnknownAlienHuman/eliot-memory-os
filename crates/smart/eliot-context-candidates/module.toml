@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.context.candidates"
+crate = "eliot-context-candidates"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 8
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.context.candidates"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Map task frame, attention, epistemic position, cue activation, negative memory, exact evidence, and authorized affordances into whole context candidates with lineage."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["TaskFrame projection", "Critical Attention/Conflict handles", "CurrentEpistemicPosition", "CueActivationResult", "negative-memory and affordance projections"]
+outputs = ["ContextCandidateSet", "candidate coverage manifest", "missing-input/unknown list"]
+depends_on = ["eliot-cue-contracts", "eliot-epistemic", "eliot-context-contracts"]
+consumers = ["eliot-context-admission"]
+non_goals = ["store queries", "ranking/admission", "rendering", "semantic synthesis"]
+invariants = ["every material candidate has source handles and one compatible fence", "candidate role is explicit", "retrieval/activation only proposes influence", "duplicate identity never merges conflicting material silently"]
+failure_behavior = "Return an incomplete candidate set with exact missing providers; never invent filler atoms or silently cross scopes."
+proof_surface = ["missing-provider cases", "duplicate/conflicting candidate identity", "cross-fence rejection", "role and lineage completeness"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-context/src/lib.rs"
+disposition = "new_boundary_from_existing_inputs"
+scope = "ContextInput and atom validation only"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.13"
+disposition = "authoritative_contract"
+scope = "context pipeline before admission"
+
+[agent_task]
+objective = "Create the missing explicit boundary between retrieval/projections and Context Compiler admission."
+write_scope = ["crates/smart/eliot-context-candidates/**"]
+deliverables = ["candidate builder", "coverage manifest", "typed provider ports and tests"]
+acceptance = ["no hidden I/O", "all candidates remain proposals", "missing material becomes a visible gap"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if a provider cannot supply a compatible immutable projection; return the provider/fence gap instead of querying it directly."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

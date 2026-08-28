@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.cue.normalizer"
+crate = "eliot-cue-normalizer"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 3
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.cue.normalizer"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Normalize observed cue material into canonical identity plus policy-correct comparison keys used identically by writers and readers."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["ObservedCue", "WorkScope path/case policy", "tool or adapter normalization profile"]
+outputs = ["NormalizedCue", "normalization evidence", "typed unsupported/ambiguous result"]
+depends_on = ["eliot-cue-contracts"]
+consumers = ["eliot-cue-index", "eliot-cue-activation", "Governor observation capture"]
+non_goals = ["store writes", "record ranking", "activation", "semantic similarity"]
+invariants = ["write-side and read-side normalization are one implementation", "canonical path preserves case and Git spelling", "volatile command/error noise is excluded only by a versioned profile", "cross-scope values never collide silently"]
+failure_behavior = "Return unsupported or ambiguous normalization with the original admissible observation handle; do not guess a reusable key."
+proof_surface = ["capture/fire symmetry property tests", "Windows case-policy fixtures", "Git spelling preservation", "stable error/command signature fuzz cases"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-cues/src/lib.rs"
+disposition = "rewrite_not_copy"
+scope = "normalization framework; reject unconditional lowercasing of canonical paths"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.6"
+disposition = "authoritative_contract"
+scope = "canonical and comparison-key semantics"
+
+[agent_task]
+objective = "Implement the one shared normalization path and explicitly correct the legacy destructive lowercasing behavior."
+write_scope = ["crates/smart/eliot-cue-normalizer/**"]
+deliverables = ["pure normalization profiles", "canonical/comparison key output", "property and fuzz tests"]
+acceptance = ["same input/profile yields identical capture and fire keys", "canonical path bytes are preserved", "volatile noise removal is versioned and testable"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if adapter-specific parsing would leak into the public contract; introduce a narrow port instead."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

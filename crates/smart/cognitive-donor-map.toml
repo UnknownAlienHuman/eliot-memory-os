@@ -1,0 +1,59 @@
+schema_version = 1
+map_id = "cognitive-donor-map-2026-08-28"
+current_main_commit = "7d7f03259cc3d3d90b2fe1af7a6175b13808ece2"
+superseded_prototype_branch_commit = "b35e4a489d45d81f172ef7d5b44bea165438cb1c"
+rule = "Code or contract is reused only when it has one current causal owner, a pure or reconstructible boundary, current documentation fit and an independently invocable proof path."
+
+[[donor]]
+path = "crates/smart/eliot-context"
+disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
+targets = ["eliot-context-contracts", "eliot-context-admission", "eliot-context-assembly"]
+rationale = "Good pure compiler and scorecard; missing explicit candidate boundary and currently mixes contract, ranking and assembly."
+
+[[donor]]
+path = "crates/smart/eliot-cues"
+disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
+targets = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-index", "eliot-cue-activation"]
+rationale = "Good deterministic base; rewrite path normalization to preserve canonical case and separate snapshot construction from hot evaluation."
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core"
+disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
+targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-candidate-validation", "eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-curation"]
+rationale = "Good candidate-only invariant and validation core; outdated job surface and too many responsibilities in one generator."
+
+[[donor]]
+path = "crates/smart/eliot-epistemic"
+disposition = "RETAIN_AND_HARDEN_IN_PLACE"
+targets = ["eliot-epistemic"]
+rationale = "Already one coherent stateless resolver; add missing assumption, verifier competence and Investigation semantics instead of splitting by noun."
+
+[[donor]]
+path = "crates/smart/eliot-memory-curation"
+disposition = "PARTIAL_REUSE"
+targets = ["eliot-memory-curation-screen", "eliot-dreamer-curation"]
+rationale = "Keep bounded read-only screen/protection logic; remove duplicate domain enums and never carry lifecycle/action ownership."
+
+[[donor]]
+path = "crates/smart/eliot-understanding"
+disposition = "MERGE_RENDERING_INTO_CONTEXT_ASSEMBLY"
+targets = ["eliot-context-assembly"]
+rationale = "Keep role-preserving sections and omission manifest; delete the second ContextCompiler invocation and separate facade owner."
+
+[[donor]]
+path = "crates/smart/eliot-memory"
+disposition = "RETIRE_AS_COGNITIVE_STATE_OWNER_AFTER_EDGE_MIGRATION"
+targets = ["eliot-observation-classifier"]
+rationale = "Reject Arc<Mutex> canonical memory, status, influence and retrieval ownership; salvage only pure classification heuristics after contract revalidation."
+
+[[donor]]
+path = "crates/smart/eliot-system-experience"
+disposition = "RETIRE_AS_STATE_OWNER_DEFER_QUERY_PROJECTION"
+targets = []
+rationale = "Reject a second canonical owner; later retain bounded query/filter/projection ideas over Governor/store-owned self-scope evidence."
+
+[[donor]]
+path = "branch:cognitive-crates-prototypes-01"
+disposition = "SUPERSEDE_DO_NOT_ASSIGN"
+targets = []
+rationale = "Branch is 187 commits behind main and contains hundreds of manifest-only or empty noun-level crates; reuse only individually revalidated boundary hypotheses."

@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.dreamer.orientation"
+crate = "eliot-dreamer-orientation"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 14
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.orientation"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Convert a validated Orientation draft into a DreamPacket that separates Governor-resolved evidence from model synthesis, rivals, hidden relations, gaps, and probes."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput class=Orientation", "DreamInputBundle", "ValidatedDreamDraft", "Governor-resolved epistemic handles"]
+outputs = ["DreamPacket candidate", "orientation coverage/quality report", "invalidation conditions"]
+depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+consumers = ["Main Agent/Human Dreamer surface", "D3a orientation Product Pulse"]
+non_goals = ["source acquisition", "epistemic resolution", "canonical write", "task action/finish decision"]
+invariants = ["resolved/evidence sections are populated only from Governor inputs", "rival models and dissent are not smoothed away", "every synthesis claim keeps source and uncertainty", "result is always candidate-only"]
+failure_behavior = "Return partial/no packet with exact coverage and route failure; basic deterministic orientation remains available outside Dreamer."
+proof_surface = ["model attempt to populate confirmed sections", "rival/unknown preservation", "source-lineage and invalidation checks", "end-to-end D3a orientation pulse"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core/src/lib.rs"
+disposition = "extract_and_rewrite"
+scope = "CandidateGenerator and DreamPacket skeleton"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.3-I9.5"
+disposition = "authoritative_contract"
+scope = "Orientation questions and packet separation"
+
+[agent_task]
+objective = "Implement the first useful Dreamer handler and close the smallest grounded D3a orientation path."
+write_scope = ["crates/smart/eliot-dreamer-orientation/**"]
+deliverables = ["orientation handler", "DreamPacket builder", "first Product Pulse fixtures"]
+acceptance = ["no model-authored confirmation", "packet preserves rivals/unknowns/probes", "failure does not affect Memory OS/Harness"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop advanced handlers if the D3a Product Pulse fails; open a Mechanism Review instead of adding more crates."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

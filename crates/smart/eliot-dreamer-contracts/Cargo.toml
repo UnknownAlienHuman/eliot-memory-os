@@ -1,0 +1,25 @@
+[package]
+name = "eliot-dreamer-contracts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Candidate-only Dreamer job, bundle, handler result, and preservation contracts"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "NOT_IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.dreamer.contracts"
+source_layer = "C0"
+runtime_layer = "R6"
+runtime_bundle = "eliot-dreamer"
+agent_order = 11
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }

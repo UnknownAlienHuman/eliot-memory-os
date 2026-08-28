@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.cue.activation"
+crate = "eliot-cue-activation"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 5
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.cue.activation"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Evaluate observed normalized cues against one immutable snapshot and return bounded direct and relation-derived activation with a complete trace."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["CueSnapshot", "NormalizedCue set", "revision/time", "versioned activation profile"]
+outputs = ["CueActivationResult", "ActivationTrace", "overflow/expansion handle request"]
+depends_on = ["eliot-cue-contracts"]
+consumers = ["eliot-context-candidates", "reactive context delivery"]
+non_goals = ["snapshot mutation", "semantic ranking by model", "hard blocking from similarity", "canonical retrieval"]
+invariants = ["exact matches precede prefix/signature", "negative memory and invariants keep declared priority", "depth/fan-out/result count are bounded", "activation uses max accumulation rather than popularity sum"]
+failure_behavior = "Return direct matches plus an explicit partial/overflow trace, or STALE_PROJECTION; never silently widen traversal."
+proof_surface = ["exact-before-broad fixtures", "bounded fan-out/depth", "max-accumulation diamond graph", "stale snapshot and session-dedup edge cases"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-cues/src/lib.rs"
+disposition = "extract_and_harden"
+scope = "CueRuntime::fire and activation trace"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.7 and I12.15"
+disposition = "authoritative_contract"
+scope = "exact-first and bounded spreading rules"
+
+[agent_task]
+objective = "Extract the hot evaluator from projection ownership and make every membership decision reconstructible."
+write_scope = ["crates/smart/eliot-cue-activation/**"]
+deliverables = ["pure matcher", "bounded activation engine", "trace and overflow contract tests"]
+acceptance = ["no mutation or I/O", "bounded work for adversarial graphs", "semantic spread alone never creates a block or proof"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if a requested feature requires an unbounded graph traversal or model call on the hot path."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"

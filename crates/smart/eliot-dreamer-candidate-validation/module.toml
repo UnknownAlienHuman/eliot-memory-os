@@ -1,0 +1,51 @@
+schema_version = 2
+module_id = "smart.dreamer.candidate_validation"
+crate = "eliot-dreamer-candidate-validation"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 13
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.candidate_validation"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal responsibility, proof and replacement boundary decide split/merge"
+primary_responsibility = "Validate one structured model draft against its job and bundle before a specialized handler may emit candidate artifacts."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["DreamJobInput", "DreamInputBundle", "structured ModelDraft"]
+outputs = ["ValidatedDreamDraft", "CandidateRejectionReport", "PreservationReport"]
+depends_on = ["eliot-dreamer-contracts"]
+consumers = ["eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-curation"]
+non_goals = ["model invocation", "handler-specific synthesis", "canonical promotion", "verifier or evaluator execution"]
+invariants = ["every material statement cites an admitted handle", "model output cannot declare confirmation or current epistemic state", "transformations preserve counterevidence, uncertainty and rollback", "output and source budgets are enforced"]
+failure_behavior = "Reject the candidate draft with exact violations while leaving all source state unchanged; optionally retain diagnostic evidence through Governor."
+proof_surface = ["invented handle", "unsupported confirmation/promotion", "false merge with lost minority evidence", "output/source budget exhaustion", "scope/fence mismatch"]
+replacement_boundary = "crate implementation behind the declared public contract; no runtime authority follows from package ownership"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface, or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-core/src/lib.rs"
+disposition = "extract_and_harden"
+scope = "DraftItem/ModelDraft validation and candidate budget checks"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I9.7"
+disposition = "authoritative_contract"
+scope = "coverage, preservation, faithfulness, lineage, reversibility and source ceiling"
+
+[agent_task]
+objective = "Centralize candidate safety checks once so specialized handlers remain small and cannot invent promotion semantics."
+write_scope = ["crates/smart/eliot-dreamer-candidate-validation/**"]
+deliverables = ["common validator", "structured rejection report", "preservation and authority-ceiling tests"]
+acceptance = ["no handler can bypass the common validation contract", "source state is never mutated", "rejected drafts remain non-influential"]
+forbidden = ["canonical writes", "authority, policy, truth, finish or effect decisions", "provider/model SDKs", "storage/vendor types in public contracts", "unbounded synchronous work", "silent truncation", "weakening another owner's verifier or oracle"]
+stop_condition = "Stop if validation requires judging task truth; preserve the uncertainty and route to an applicable verifier or owner."
+integration_owner = "cognitive-wave-01-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["package-local shape/behavior proof", "declared consumer/provider contract fixtures", "affected Product Pulse when listed"]
+workspace_admission = "forbidden until src/lib.rs, package proof, affected edge proof, current-main rebase and integration-owner review"
