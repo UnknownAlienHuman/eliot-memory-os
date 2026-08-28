@@ -26,10 +26,12 @@ use eliot_store_api::{OperationId, StoreGenesisRequest, validate_genesis_receipt
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
+mod empty_migration;
 mod genesis;
 mod read_boundary;
 mod receipt_reconciliation;
 mod schema_contract;
+use empty_migration::handle_empty_migration;
 pub(crate) use genesis::initialize_genesis;
 #[cfg(test)]
 use genesis::{
@@ -46,10 +48,11 @@ pub(crate) use receipt_reconciliation::read_receipt;
 use receipt_reconciliation::{read_fence, read_idempotency, read_receipt_by_operation};
 #[cfg(test)]
 use schema_contract::SchemaMigrationIdentity;
+#[cfg(test)]
+use schema_contract::schema_meta_record;
 use schema_contract::{
-    FenceRecord, MigrationPreflight, SchemaMetaRecord, schema_meta_record,
-    schema_meta_record_for_v1_to_v2, v1_identity, validate_fence_record,
-    validate_schema_meta_record, validate_v1_pin,
+    FenceRecord, MigrationPreflight, SchemaMetaRecord, schema_meta_record_for_v1_to_v2,
+    v1_identity, validate_fence_record, validate_schema_meta_record, validate_v1_pin,
 };
 
 fn is_admitted_migration(migration: &CompiledMigration) -> bool {
@@ -84,46 +87,6 @@ fn is_admitted_migration(migration: &CompiledMigration) -> bool {
 
 fn is_guard_conflict(error: &str) -> bool {
     error.contains("schema_predecessor_mismatch") || error.contains("schema_fence_guard_mismatch")
-}
-
-fn build_empty_sql(statements: &str) -> String {
-    format!(
-        "{} {} {} {} {}",
-        schema::TX_BEGIN,
-        statements.trim(),
-        schema::TX_CREATE_FENCE,
-        schema::TX_CREATE_SCHEMA_META,
-        schema::TX_COMMIT
-    )
-}
-
-fn build_empty_bindings(
-    migration: &CompiledMigration,
-    updated_at: &str,
-    state_fence: &StateFence,
-) -> Map<String, Value> {
-    let record = schema_meta_record(migration, updated_at);
-    let mut m = Map::new();
-    m.insert(
-        "schema_meta_table".to_owned(),
-        json!(schema::table::SCHEMA_META),
-    );
-    m.insert("schema_meta_key".to_owned(), json!(schema::SCHEMA_META_KEY));
-    m.insert("schema_meta_record".to_owned(), json!(record));
-    m.insert(
-        "fence_table".to_owned(),
-        json!(schema::table::CANONICAL_FENCE),
-    );
-    m.insert("fence_key".to_owned(), json!(schema::FENCE_KEY));
-    m.insert(
-        "fence".to_owned(),
-        json!({
-            "state_fence": state_fence,
-            "next_commit_sequence": 1_u64,
-            "next_outbox_sequence": 1_u64,
-        }),
-    );
-    m
 }
 
 fn build_forward_sql() -> String {
@@ -415,42 +378,6 @@ pub(crate) async fn ensure_ready(
         SemanticReadiness::MigrationRequired { .. } | SemanticReadiness::Unavailable => {
             Err(AdapterError::MigrationRequired)
         }
-    }
-}
-
-async fn handle_empty_migration(
-    db: &client::RpcTransport,
-    config: &SurrealAdapterConfig,
-    migration: &CompiledMigration,
-    state_fence: &StateFence,
-    updated_at: &str,
-) -> Result<MigrationReceipt, AdapterError> {
-    let sql = build_empty_sql(migration.statements.trim());
-    let bindings = build_empty_bindings(migration, updated_at, state_fence);
-    let mut response = client::query(db, config, "migration.apply", &sql, bindings).await?;
-    let errors = response.take_errors();
-    if errors.iter().any(|e| is_guard_conflict(e)) {
-        return Err(AdapterError::Config("forward guard conflict".to_owned()));
-    }
-    if !errors.is_empty() {
-        return Err(AdapterError::UnknownMigrationOutcome {
-            migration_id: migration.migration_id.clone(),
-        });
-    }
-    let observed = read_schema_meta(db, config).await?;
-    match migration_preflight(observed, migration) {
-        Ok(MigrationPreflight::ExactReplay) => {
-            let fence = read_fence(db, config).await?;
-            let Some(fence) = fence else {
-                return Err(AdapterError::PartialOutcome);
-            };
-            validate_fence_record(&fence)?;
-            if fence.state_fence != *state_fence {
-                return Err(AdapterError::PartialOutcome);
-            }
-            Ok(migration_receipt(migration))
-        }
-        _ => Err(AdapterError::PartialOutcome),
     }
 }
 
