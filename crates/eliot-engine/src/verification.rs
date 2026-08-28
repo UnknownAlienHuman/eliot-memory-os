@@ -1,21 +1,24 @@
 use crate::EngineError;
 use eliot_types::verification::VerificationRun;
 use eliot_types::{
-    FlakeReport, ProjectId, StatefulDbIsolationReport, TestCostClass, TestCostReport,
-    TestCountByCost, TestCountByIntent, TestCountByKind, TestIntent, TestInventory, TestKind,
-    TestMetadata, TestStatefulness, TestSuiteProfile, VerificationCommandResult,
-    VerificationCommandStatus, VerificationDecision, VerificationDoctorStatus, VerificationPlan,
-    VerificationRunStatus, VerificationRuntimeClass, VerificationVerdict,
+    FlakeReport, ProjectId, StatefulDbIsolationReport, TestCostClass, TestCostReport, TestIntent,
+    TestInventory, TestKind, TestMetadata, TestStatefulness, TestSuiteProfile,
+    VerificationCommandResult, VerificationCommandStatus, VerificationDecision,
+    VerificationDoctorStatus, VerificationPlan, VerificationRunStatus, VerificationRuntimeClass,
+    VerificationVerdict,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use time::OffsetDateTime;
+
+#[path = "test_cost.rs"]
+mod test_cost;
+pub use test_cost::TestCostService;
 
 pub struct TestInventoryService;
 pub struct VerificationProfileService;
 pub struct VerificationPlannerService;
 pub struct VerificationRunnerService;
 pub struct VerificationVerdictService;
-pub struct TestCostService;
 pub struct FlakeDetectionService;
 pub struct StatefulDbTestIsolationService;
 pub struct VerificationDoctorIntegration;
@@ -216,37 +219,6 @@ impl VerificationVerdictService {
             warnings,
             required_followups,
             created_at: OffsetDateTime::now_utc(),
-        }
-    }
-}
-
-impl TestCostService {
-    #[must_use]
-    pub fn report(
-        &self,
-        inventory: &TestInventory,
-        last_run: Option<&VerificationRun>,
-    ) -> TestCostReport {
-        TestCostReport {
-            report_id: new_id("test-cost"),
-            generated_at: OffsetDateTime::now_utc(),
-            total_tests: inventory.test_count,
-            by_kind: count_by_kind(&inventory.tests),
-            by_intent: count_by_intent(&inventory.tests),
-            by_cost: count_by_cost(&inventory.tests),
-            slowest_commands: last_run
-                .map(|run| {
-                    let mut results = run.command_results.clone();
-                    results.sort_by_key(|result| std::cmp::Reverse(result.duration_ms));
-                    results.truncate(5);
-                    results
-                })
-                .unwrap_or_default(),
-            recommendations: vec![
-                "use dev-fast for local edit feedback only".to_owned(),
-                "use change-gate or full before DONE_VERIFIED".to_owned(),
-                "keep stateful DB safety tests serial".to_owned(),
-            ],
         }
     }
 }
@@ -751,39 +723,6 @@ fn runtime_class_for(profile_id: &str) -> VerificationRuntimeClass {
         "deep" => VerificationRuntimeClass::Deep,
         _ => VerificationRuntimeClass::Full,
     }
-}
-
-fn count_by_kind(tests: &[TestMetadata]) -> Vec<TestCountByKind> {
-    let mut counts = BTreeMap::new();
-    for test in tests {
-        *counts.entry(test.test_kind).or_insert(0) += 1;
-    }
-    counts
-        .into_iter()
-        .map(|(key, count)| TestCountByKind { key, count })
-        .collect()
-}
-
-fn count_by_intent(tests: &[TestMetadata]) -> Vec<TestCountByIntent> {
-    let mut counts = BTreeMap::new();
-    for test in tests {
-        *counts.entry(test.intent).or_insert(0) += 1;
-    }
-    counts
-        .into_iter()
-        .map(|(key, count)| TestCountByIntent { key, count })
-        .collect()
-}
-
-fn count_by_cost(tests: &[TestMetadata]) -> Vec<TestCountByCost> {
-    let mut counts = BTreeMap::new();
-    for test in tests {
-        *counts.entry(test.estimated_cost).or_insert(0) += 1;
-    }
-    counts
-        .into_iter()
-        .map(|(key, count)| TestCountByCost { key, count })
-        .collect()
 }
 
 fn estimated_command_duration_ms(command: &str) -> u64 {
